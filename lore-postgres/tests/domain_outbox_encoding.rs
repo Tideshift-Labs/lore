@@ -48,8 +48,8 @@
 
 #[path = "common/case_namespace.rs"]
 mod case_namespace;
-
-use std::path::PathBuf;
+#[path = "common/fixture_resolution.rs"]
+mod fixture_resolution;
 
 use case_namespace::CaseNamespace;
 use lore_postgres::domain::outbox::OUTBOX_SCHEMA;
@@ -70,31 +70,45 @@ use tokio_postgres::error::SqlState;
 
 // ---------------------------------------------------------------------------
 // Fixture loading
+//
+// `lore-postgres` and `lorehub` are sibling checkouts under the `lorehub-all`
+// container in our own workspace, where the fixtures are always present. A
+// standalone checkout with no sibling `lorehub` repo at all (e.g. an upstream
+// contributor's clone) skips instead, with a loud printed notice. A sibling
+// repo that IS present but missing the named fixture is fixture drift in OUR
+// OWN workspace and must FAIL, never skip -- see `common/fixture_resolution.rs`.
 // ---------------------------------------------------------------------------
 
-/// Path to the idempotency-key fixture, relative to this crate's manifest
-/// directory. `lore-postgres` and `lorehub` are sibling checkouts under the
-/// `lorehub-all` container: `lore/lore-postgres/../.. == lorehub-all`.
-fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lorehub/docs/contracts/fixtures/lore-notification-plane/idempotency-key.json")
-}
-
-/// Load and parse the fixture. Panics (a genuine test failure, never a
-/// silent skip) when the file is absent or malformed, per the WP-119 Step A
-/// brief: the fixture is a hard dependency of this conformance suite, not an
-/// optional one.
-fn load_fixture() -> Value {
-    let path = fixture_path();
+/// Load and parse `name` from the `lore-notification-plane` fixture set for `test_name`. Returns
+/// `None` (after printing a loud skip notice) when this is a standalone checkout with no sibling
+/// `lorehub` repo at all. Otherwise panics (a genuine test failure, never a silent skip) when the
+/// file is absent or malformed, per the WP-119 Step A brief: the fixture is a hard dependency of
+/// this conformance suite in our own workspace, not an optional one.
+fn load_named_fixture(test_name: &str, name: &str) -> Option<Value> {
+    let dir = match fixture_resolution::resolve_fixture_set_dir() {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => dir,
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            fixture_resolution::print_standalone_skip_notice(test_name, &searched);
+            return None;
+        }
+    };
+    let path = dir.join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
         panic!(
-            "idempotency-key.json fixture is required and must not be skipped when absent \
+            "{name} fixture is required and must not be skipped when absent \
              (WP-119 Step A brief: \"FAIL if absent, never skip\"). Expected it at {}: {error}",
             path.display()
         )
     });
-    serde_json::from_str(&text)
-        .unwrap_or_else(|error| panic!("idempotency-key.json is not valid JSON: {error}"))
+    Some(
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}")),
+    )
+}
+
+/// `idempotency-key.json` specifically, for this file's many idempotency-key conformance tests.
+fn load_fixture(test_name: &str) -> Option<Value> {
+    load_named_fixture(test_name, "idempotency-key.json")
 }
 
 fn decode_hex(label: &str, s: &str) -> Vec<u8> {
@@ -206,7 +220,11 @@ fn push_field_8(buf: &mut Vec<u8>, field: &[u8]) {
 /// self-consistent before trusting it as an oracle for the crate function.
 #[test]
 fn idempotency_key_manual_preimage_matches_the_fixtures_own_preimage_hex() {
-    let fixture = load_fixture();
+    let Some(fixture) = load_fixture(
+        "domain_outbox_encoding::idempotency_key_manual_preimage_matches_the_fixtures_own_preimage_hex",
+    ) else {
+        return;
+    };
     let vs = vectors(&fixture);
     let v = find(&vs, "branch-pushed");
 
@@ -238,7 +256,11 @@ fn idempotency_key_manual_preimage_matches_the_fixtures_own_preimage_hex() {
 /// crate's shipped `idempotency_key` must reproduce the pinned key exactly.
 #[test]
 fn idempotency_key_matches_every_frozen_fixture_vector() {
-    let fixture = load_fixture();
+    let Some(fixture) =
+        load_fixture("domain_outbox_encoding::idempotency_key_matches_every_frozen_fixture_vector")
+    else {
+        return;
+    };
     for v in vectors(&fixture) {
         let event = as_event(&v, b"{}");
         assert_eq!(
@@ -257,7 +279,11 @@ fn idempotency_key_matches_every_frozen_fixture_vector() {
 /// unrelated hash mismatch.
 #[test]
 fn domain_prefix_constant_matches_the_fixtures_contract_pin() {
-    let fixture = load_fixture();
+    let Some(fixture) = load_fixture(
+        "domain_outbox_encoding::domain_prefix_constant_matches_the_fixtures_contract_pin",
+    ) else {
+        return;
+    };
     let ascii = fixture["contract_pins"]["domain_prefix_ascii"]["value"]
         .as_str()
         .expect("contract_pins.domain_prefix_ascii.value");
@@ -271,7 +297,11 @@ fn domain_prefix_constant_matches_the_fixtures_contract_pin() {
 /// `payload` is deliberately excluded from the preimage.
 #[test]
 fn idempotency_key_excludes_payload_bytes() {
-    let fixture = load_fixture();
+    let Some(fixture) =
+        load_fixture("domain_outbox_encoding::idempotency_key_excludes_payload_bytes")
+    else {
+        return;
+    };
     let vs = vectors(&fixture);
     let v = find(&vs, "branch-pushed");
 
@@ -295,7 +325,11 @@ fn idempotency_key_excludes_payload_bytes() {
 /// the field being dropped).
 #[test]
 fn five_field_preimage_collides_branch_pushed_with_its_next_generation() {
-    let fixture = load_fixture();
+    let Some(fixture) = load_fixture(
+        "domain_outbox_encoding::five_field_preimage_collides_branch_pushed_with_its_next_generation",
+    ) else {
+        return;
+    };
     let vs = vectors(&fixture);
     let a = find(&vs, "branch-pushed");
     let b = find(&vs, "branch-pushed-next-generation");
@@ -335,7 +369,11 @@ fn five_field_preimage_collides_branch_pushed_with_its_next_generation() {
 /// indistinguishable, because the concatenated bytes are identical.
 #[test]
 fn unprefixed_concatenation_collides_branch_pushed_with_boundary_shift() {
-    let fixture = load_fixture();
+    let Some(fixture) = load_fixture(
+        "domain_outbox_encoding::unprefixed_concatenation_collides_branch_pushed_with_boundary_shift",
+    ) else {
+        return;
+    };
     let vs = vectors(&fixture);
     let a = find(&vs, "branch-pushed");
     let b = find(&vs, "boundary-shift");
@@ -372,7 +410,11 @@ fn unprefixed_concatenation_collides_branch_pushed_with_boundary_shift() {
 /// ones (`stream_reset_derivation`'s `reset_fingerprint`).
 #[test]
 fn four_byte_length_prefix_changes_the_digest() {
-    let fixture = load_fixture();
+    let Some(fixture) =
+        load_fixture("domain_outbox_encoding::four_byte_length_prefix_changes_the_digest")
+    else {
+        return;
+    };
     let vs = vectors(&fixture);
     let v = find(&vs, "branch-pushed");
 
@@ -1134,16 +1176,12 @@ fn parse_version_vector(v: &Value) -> VersionVector {
 
 #[test]
 fn aggregate_version_fixture_vectors_match_decode_and_validate_encoded() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../lorehub/docs/contracts/fixtures/lore-notification-plane/aggregate-version.json",
-    );
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "aggregate-version.json fixture is required and must not be skipped when absent: {} ({e})",
-            path.display()
-        )
-    });
-    let fixture: Value = serde_json::from_str(&text).expect("valid JSON");
+    let Some(fixture) = load_named_fixture(
+        "domain_outbox_encoding::aggregate_version_fixture_vectors_match_decode_and_validate_encoded",
+        "aggregate-version.json",
+    ) else {
+        return;
+    };
 
     // Cross-check the fixture's stated widths against the crate's own
     // constants rather than trusting the fixture in isolation.
@@ -1197,11 +1235,12 @@ fn aggregate_version_fixture_vectors_match_decode_and_validate_encoded() {
 /// is what a consumer compares.
 #[test]
 fn aggregate_version_ordinal_extraction_cases() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-        "../../lorehub/docs/contracts/fixtures/lore-notification-plane/aggregate-version.json",
-    );
-    let text = std::fs::read_to_string(&path).expect("fixture present (checked above)");
-    let fixture: Value = serde_json::from_str(&text).expect("valid JSON");
+    let Some(fixture) = load_named_fixture(
+        "domain_outbox_encoding::aggregate_version_ordinal_extraction_cases",
+        "aggregate-version.json",
+    ) else {
+        return;
+    };
 
     let cases = fixture["ordinal_extraction_cases"]
         .as_array()
@@ -1296,15 +1335,12 @@ fn aggregate_version_ordinal_extraction_cases() {
 
 #[test]
 fn event_kinds_fixture_widths_and_counts_are_self_consistent() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lorehub/docs/contracts/fixtures/lore-notification-plane/event-kinds.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "event-kinds.json fixture is required and must not be skipped when absent: {} ({e})",
-            path.display()
-        )
-    });
-    let fixture: Value = serde_json::from_str(&text).expect("valid JSON");
+    let Some(fixture) = load_named_fixture(
+        "domain_outbox_encoding::event_kinds_fixture_widths_and_counts_are_self_consistent",
+        "event-kinds.json",
+    ) else {
+        return;
+    };
 
     let event_kind_max = fixture["widths"]["event_kind_max_utf8_bytes"]
         .as_u64()
@@ -1391,10 +1427,12 @@ fn event_kinds_fixture_widths_and_counts_are_self_consistent() {
 /// original).
 #[test]
 fn event_kind_rename_changes_the_idempotency_key() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lorehub/docs/contracts/fixtures/lore-notification-plane/event-kinds.json");
-    let text = std::fs::read_to_string(&path).expect("fixture present (checked above)");
-    let fixture: Value = serde_json::from_str(&text).expect("valid JSON");
+    let Some(fixture) = load_named_fixture(
+        "domain_outbox_encoding::event_kind_rename_changes_the_idempotency_key",
+        "event-kinds.json",
+    ) else {
+        return;
+    };
     let case = fixture["negative_cases"]
         .as_array()
         .expect("negative_cases array")

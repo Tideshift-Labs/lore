@@ -23,9 +23,14 @@
 //! same `PublishTransport` trait, so either is a valid double; keeping this file's own is simplest
 //! for a pure classification proof that doesn't need `fake_gateway.rs`'s broker-sequence/event-id
 //! echoing behavior.
+//!
+//! Fixture resolution (standalone checkout vs. fixture drift in our own workspace) follows
+//! `remote_notification_conformance.rs`'s convention — see `common/fixture_resolution.rs`.
+
+#[path = "common/fixture_resolution.rs"]
+mod fixture_resolution;
 
 use std::fs;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -53,22 +58,25 @@ use lore_server::plugins::remote_notification::wire;
 use serde_json::Value;
 use tonic::Status;
 
-fn fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("lorehub")
-        .join("docs")
-        .join("contracts")
-        .join("fixtures")
-        .join("lore-notification-plane")
-}
-
-fn load_fixture(name: &str) -> Value {
-    let path = fixture_dir().join(name);
+/// Loads and parses a fixture file for `test_name`. Returns `None` (after printing a loud skip
+/// notice) when this is a standalone checkout with no sibling `lorehub` repo at all; panics on any
+/// other failure (fixture drift within an existing sibling), per the fork-wide "must FAIL, never
+/// skip" convention. See `common/fixture_resolution.rs`.
+fn load_fixture(test_name: &str, name: &str) -> Option<Value> {
+    let dir = match fixture_resolution::resolve_fixture_set_dir() {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => dir,
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            fixture_resolution::print_standalone_skip_notice(test_name, &searched);
+            return None;
+        }
+    };
+    let path = dir.join(name);
     let raw = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("required fixture missing or unreadable at {path:?}: {e}"));
-    serde_json::from_str(&raw).unwrap_or_else(|e| panic!("fixture {path:?} is not valid JSON: {e}"))
+    Some(
+        serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("fixture {path:?} is not valid JSON: {e}")),
+    )
 }
 
 /// A scripted [`PublishTransport`]. Each call pops the next scripted answer (repeating the last one
@@ -350,7 +358,12 @@ fn transport_answer_for_result_vector(id: &str, event_id: EventId) -> TransportA
 
 #[tokio::test]
 async fn publish_result_fixture_vectors_classify_end_to_end_through_the_real_client() {
-    let fixture = load_fixture("publish-result.json");
+    let Some(fixture) = load_fixture(
+        "remote_notification_durable_publish::publish_result_fixture_vectors_classify_end_to_end_through_the_real_client",
+        "publish-result.json",
+    ) else {
+        return;
+    };
     let results = fixture["results"].as_array().expect("results is an array");
 
     let covered_ids = [

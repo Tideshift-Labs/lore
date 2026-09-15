@@ -42,8 +42,8 @@
 
 #[path = "common/case_namespace.rs"]
 mod case_namespace;
-
-use std::path::PathBuf;
+#[path = "common/fixture_resolution.rs"]
+mod fixture_resolution;
 
 use case_namespace::CaseNamespace;
 use lore_postgres::domain::PostgresDomainStore;
@@ -502,18 +502,25 @@ async fn a_report_for_an_unknown_cell_is_rejected_and_mutates_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Derivation fixture conformance -- pure, no Postgres. Fails if the fixture is
-// absent rather than skipping, per the fork-wide convention.
+// Derivation fixture conformance -- pure, no Postgres. Fails on fixture drift
+// within an existing sibling `lorehub` checkout rather than skipping; skips
+// (with a loud notice) only when the sibling repo is absent entirely (a
+// standalone checkout). See `common/fixture_resolution.rs`.
 // ---------------------------------------------------------------------------
 
-fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lorehub/docs/contracts/fixtures/lore-notification-plane")
-        .join(name)
-}
-
-fn load_fixture(name: &str) -> Value {
-    let path = fixture_path(name);
+/// Loads and parses a fixture file for `test_name`. Returns `None` (after printing a loud skip
+/// notice) when this is a standalone checkout with no sibling `lorehub` repo at all; panics on any
+/// other failure (fixture drift within an existing sibling), per the fork-wide "must FAIL, never
+/// skip" convention.
+fn load_fixture(test_name: &str, name: &str) -> Option<Value> {
+    let dir = match fixture_resolution::resolve_fixture_set_dir() {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => dir,
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            fixture_resolution::print_standalone_skip_notice(test_name, &searched);
+            return None;
+        }
+    };
+    let path = dir.join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
         panic!(
             "{name} fixture is required and must not be skipped when absent. Expected it at {}: \
@@ -521,12 +528,20 @@ fn load_fixture(name: &str) -> Value {
             path.display()
         )
     });
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}"))
+    Some(
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}")),
+    )
 }
 
 #[test]
 fn every_vector_in_the_stream_reset_derivation_fixture_file_reproduces() {
-    let fixture = load_fixture("stream-reset-derivation.json");
+    let Some(fixture) = load_fixture(
+        "event_relay_reset::every_vector_in_the_stream_reset_derivation_fixture_file_reproduces",
+        "stream-reset-derivation.json",
+    ) else {
+        return;
+    };
 
     let pins = &fixture["contract_pins"];
     assert_eq!(

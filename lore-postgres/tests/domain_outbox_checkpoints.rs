@@ -30,8 +30,9 @@
 
 #[path = "common/case_namespace.rs"]
 mod case_namespace;
+#[path = "common/fixture_resolution.rs"]
+mod fixture_resolution;
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use case_namespace::CaseNamespace;
@@ -1067,16 +1068,24 @@ async fn the_evaluation_batch_bound_is_respected_over_2500_accepted_rows() {
 // ---------------------------------------------------------------------------
 // Fixture conformance: checkpoint-vector.json's frontier-versus-required-set
 // arithmetic, driven from the fixture file on disk (not restated by hand).
+// Fails on fixture drift within an existing sibling `lorehub` checkout;
+// skips (with a loud notice) only when the sibling repo is absent entirely
+// (a standalone checkout). See `common/fixture_resolution.rs`.
 // ---------------------------------------------------------------------------
 
-fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lorehub/docs/contracts/fixtures/lore-notification-plane")
-        .join(name)
-}
-
-fn load_fixture(name: &str) -> Value {
-    let path = fixture_path(name);
+/// Loads and parses a fixture file for `test_name`. Returns `None` (after printing a loud skip
+/// notice) when this is a standalone checkout with no sibling `lorehub` repo at all; panics on any
+/// other failure (fixture drift within an existing sibling), per the fork-wide "must FAIL, never
+/// skip" convention.
+fn load_fixture(test_name: &str, name: &str) -> Option<Value> {
+    let dir = match fixture_resolution::resolve_fixture_set_dir() {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => dir,
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            fixture_resolution::print_standalone_skip_notice(test_name, &searched);
+            return None;
+        }
+    };
+    let path = dir.join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
         panic!(
             "{name} fixture is required and must not be skipped when absent. Expected it at {}: \
@@ -1084,7 +1093,10 @@ fn load_fixture(name: &str) -> Value {
             path.display()
         )
     });
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}"))
+    Some(
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}")),
+    )
 }
 
 /// The fixture's "one-member-lags-below-the-sequence" case, driven from the
@@ -1097,7 +1109,12 @@ async fn one_lagging_member_from_the_fixture_file_blocks_the_whole_vector() {
         eprintln!("LORE_TEST_PG_URL unset; skipping");
         return;
     };
-    let fixture = load_fixture("checkpoint-vector.json");
+    let Some(fixture) = load_fixture(
+        "domain_outbox_checkpoints::one_lagging_member_from_the_fixture_file_blocks_the_whole_vector",
+        "checkpoint-vector.json",
+    ) else {
+        return;
+    };
     let cases = fixture["cases"].as_array().expect("cases array");
     let case = cases
         .iter()

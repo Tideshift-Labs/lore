@@ -13,7 +13,13 @@
 //! assigns.
 //!
 //! Fixture loading follows `domain_outbox_encoding.rs`'s convention: FAIL if
-//! the fixture is absent, never skip.
+//! the sibling `lorehub` repo is present but the fixture is absent under it
+//! (fixture drift in OUR OWN workspace), never skip that case. A standalone
+//! checkout with no sibling `lorehub` repo at all skips instead, with a loud
+//! printed notice -- see `common/fixture_resolution.rs`.
+
+#[path = "common/fixture_resolution.rs"]
+mod fixture_resolution;
 
 use std::path::PathBuf;
 
@@ -27,14 +33,19 @@ use lore_postgres::domain::outbox::builders::PINNED_EVENT_KINDS;
 use lore_postgres::domain::outbox::idempotency_key;
 use serde_json::Value;
 
-fn fixture_path(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../lorehub/docs/contracts/fixtures/lore-notification-plane")
-        .join(name)
-}
-
-fn load_fixture(name: &str) -> Value {
-    let path = fixture_path(name);
+/// Loads and parses a fixture file for `test_name`. Returns `None` (after printing a loud skip
+/// notice) when this is a standalone checkout with no sibling `lorehub` repo at all; panics on any
+/// other failure (fixture drift within an existing sibling), per the fork-wide "must FAIL, never
+/// skip" convention.
+fn load_fixture(test_name: &str, name: &str) -> Option<Value> {
+    let dir = match fixture_resolution::resolve_fixture_set_dir() {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => dir,
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            fixture_resolution::print_standalone_skip_notice(test_name, &searched);
+            return None;
+        }
+    };
+    let path = dir.join(name);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
         panic!(
             "{name} fixture is required and must not be skipped when absent. Expected it at \
@@ -42,7 +53,10 @@ fn load_fixture(name: &str) -> Value {
             path.display()
         )
     });
-    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}"))
+    Some(
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("{name} is not valid JSON: {error}")),
+    )
 }
 
 fn decode_hex(label: &str, s: &str) -> Vec<u8> {
@@ -68,7 +82,12 @@ fn find_vector<'a>(fixture: &'a Value, id: &str) -> &'a Value {
 /// that stops being true.
 #[test]
 fn pinned_event_kinds_matches_the_fixture_exactly() {
-    let fixture = load_fixture("event-kinds.json");
+    let Some(fixture) = load_fixture(
+        "domain_outbox_builders::pinned_event_kinds_matches_the_fixture_exactly",
+        "event-kinds.json",
+    ) else {
+        return;
+    };
     let mut fixture_kinds: Vec<String> = fixture["aggregate_kinds"]
         .as_array()
         .expect("aggregate_kinds array")
@@ -100,7 +119,12 @@ fn pinned_event_kinds_matches_the_fixture_exactly() {
 /// values.
 #[test]
 fn pinned_aggregate_kinds_matches_the_fixture_exactly() {
-    let fixture = load_fixture("event-kinds.json");
+    let Some(fixture) = load_fixture(
+        "domain_outbox_builders::pinned_aggregate_kinds_matches_the_fixture_exactly",
+        "event-kinds.json",
+    ) else {
+        return;
+    };
     let mut fixture_kinds: Vec<String> = fixture["aggregate_kinds"]
         .as_array()
         .expect("aggregate_kinds array")
@@ -546,7 +570,12 @@ fn lock_acquired_shape() {
 /// the other reproduction tests resolve.
 #[test]
 fn lock_acquired_builder_reproduces_the_idempotency_key_fixture_vector() {
-    let fixture = load_fixture("idempotency-key.json");
+    let Some(fixture) = load_fixture(
+        "domain_outbox_builders::lock_acquired_builder_reproduces_the_idempotency_key_fixture_vector",
+        "idempotency-key.json",
+    ) else {
+        return;
+    };
     let vector = find_vector(&fixture, "lock-acquired");
     let cell_id = vector["inputs"]["cell_id"].as_str().expect("cell_id");
     let repository_id = decode_hex(
@@ -712,7 +741,12 @@ fn fragment_lifecycle_generation_advanced_shape() {
 /// through `builders::repository_obliterated`.
 #[test]
 fn repository_obliterated_builder_reproduces_the_idempotency_key_fixture_vector() {
-    let fixture = load_fixture("idempotency-key.json");
+    let Some(fixture) = load_fixture(
+        "domain_outbox_builders::repository_obliterated_builder_reproduces_the_idempotency_key_fixture_vector",
+        "idempotency-key.json",
+    ) else {
+        return;
+    };
     let vector = find_vector(&fixture, "repository-obliterated");
     let cell_id = vector["inputs"]["cell_id"].as_str().expect("cell_id");
     let repository_id = decode_hex(
@@ -785,7 +819,12 @@ fn repository_obliterated_builder_reproduces_the_idempotency_key_fixture_vector(
 /// `builders::branch_pushed`.
 #[test]
 fn branch_pushed_builder_reproduces_the_idempotency_key_fixture_vector() {
-    let fixture = load_fixture("idempotency-key.json");
+    let Some(fixture) = load_fixture(
+        "domain_outbox_builders::branch_pushed_builder_reproduces_the_idempotency_key_fixture_vector",
+        "idempotency-key.json",
+    ) else {
+        return;
+    };
     let vector = find_vector(&fixture, "branch-pushed");
     let cell_id = vector["inputs"]["cell_id"].as_str().expect("cell_id");
     let repository_id = decode_hex(
@@ -898,4 +937,111 @@ fn association_generation_advanced_shape() {
     assert_eq!(event.aggregate_id, repository_id.to_vec());
     assert_eq!(event.aggregate_ordinal, CommittedOrdinal::Exact(5));
     assert_eq!(event.aggregate_identity, epoch);
+}
+
+// ---------------------------------------------------------------------------
+// fixture_resolution::resolve_from proof -- executed, not merely inspected.
+// Deliberately NOT #[cfg(test)]: this file is compiled as an integration-test
+// binary, so cfg(test) is never set here and a #[cfg(test)] mod would compile
+// out silently, which is exactly the vacuous-pass shape this whole
+// fixture-resolution change exists to avoid. Collected once, in this one
+// consuming binary, rather than once per file that includes the module.
+// ---------------------------------------------------------------------------
+
+/// A fresh, empty, uniquely-named directory under the OS temp dir, removed when the guard drops.
+/// Deliberately hand-rolled rather than adding a `tempfile` dev-dependency just for this proof.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(label: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "lore-fixture-resolution-test-{label}-{}-{n}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create scratch dir for fixture_resolution proof");
+        Self(dir)
+    }
+
+    fn path(&self) -> PathBuf {
+        self.0.clone()
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn resolve_from_reports_standalone_when_the_lorehub_root_does_not_exist() {
+    let parent = ScratchDir::new("standalone-parent");
+    let missing_lorehub_root = parent.path().join("lorehub-does-not-exist");
+    match fixture_resolution::resolve_from(None, missing_lorehub_root.clone()) {
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            assert_eq!(searched, missing_lorehub_root);
+        }
+        fixture_resolution::FixtureSetLocation::Directory(dir) => {
+            panic!("expected Standalone for a nonexistent lorehub root, got Directory({dir:?})");
+        }
+    }
+}
+
+#[test]
+fn resolve_from_finds_the_fixture_directory_shape_even_when_the_fixture_directory_itself_is_absent()
+{
+    // The discrimination that matters: an EXISTING sibling `lorehub` repo root with no
+    // `docs/contracts/fixtures/lore-notification-plane` beneath it must still resolve to
+    // `Directory`, never `Standalone` -- that absence is fixture drift in an existing sibling,
+    // which the caller must panic on, not silently skip.
+    let lorehub_root = ScratchDir::new("existing-lorehub-root");
+    match fixture_resolution::resolve_from(None, lorehub_root.path()) {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => {
+            let expected_suffix = PathBuf::from("docs")
+                .join("contracts")
+                .join("fixtures")
+                .join("lore-notification-plane");
+            assert!(
+                dir.ends_with(&expected_suffix),
+                "expected the fixture-set path shape ending in {expected_suffix:?}, got {dir:?}"
+            );
+            assert!(
+                !dir.is_dir(),
+                "this test's premise is that the fixture directory does NOT exist yet"
+            );
+        }
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            panic!(
+                "an existing sibling lorehub root must never resolve to Standalone, even with no \
+                 fixtures beneath it; wrongly searched {searched:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn resolve_from_prefers_an_existing_override_directory_over_a_standalone_lorehub_root() {
+    let overridden = ScratchDir::new("override-dir");
+    let missing_lorehub_root = overridden.path().join("never-created-lorehub");
+    match fixture_resolution::resolve_from(Some(overridden.path()), missing_lorehub_root) {
+        fixture_resolution::FixtureSetLocation::Directory(dir) => {
+            assert_eq!(dir, overridden.path());
+        }
+        fixture_resolution::FixtureSetLocation::Standalone { searched } => {
+            panic!(
+                "an existing override directory must win over a standalone lorehub root; \
+                 wrongly reported Standalone searching {searched:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "is not a directory")]
+fn resolve_from_panics_when_the_override_directory_does_not_exist() {
+    let parent = ScratchDir::new("panic-probe-parent");
+    let nonexistent_override = parent.path().join("does-not-exist");
+    let _ = fixture_resolution::resolve_from(Some(nonexistent_override), parent.path());
 }
