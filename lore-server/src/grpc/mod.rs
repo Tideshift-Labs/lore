@@ -36,6 +36,7 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_postgres::domain::locks::VerifiedLockOwner;
 use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
@@ -466,6 +467,86 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
 /// administrative RPCs differ in which scope they demand and in nothing else.
 pub fn can_force_unlock(extensions: &Extensions, repository: RepositoryId) -> bool {
     has_required_permission(extensions, repository, "owner")
+}
+
+/// The second, role-independent half of the `ForceUnlock` bar: the caller IS
+/// the principal the force-release names.
+///
+/// Owner ruling D8 (2026-09-15). WP-117 fences a lock's ownership token to the
+/// client session that acquired it, not to the user, so a user holding their own
+/// lock on one client (the desktop agent, or Unreal through it) has no token for
+/// it on another (the web portal). Force-release is the only authorized way out
+/// of that state, and gating it on the `owner` permission alone left a
+/// `developer` or `maintainer` with no release path for a lock that is already
+/// theirs. Ownership of the lock is authority enough to break one's own.
+///
+/// This is a self-check, never a widening. It authorizes exactly the caller
+/// naming their own verified principal, and nothing about any other caller
+/// changes: [`can_force_unlock`] is untouched, and a caller without it who names
+/// somebody else is refused exactly as before.
+///
+/// **No second round trip, and no trust in the named string.** The wire value is
+/// client-supplied, but it is not believed here — it is only compared. What
+/// makes that sufficient is what the domain does with the same string
+/// afterwards: `fenced_force_release` always builds `ForceReleaseInput`'s
+/// `target_owner` with the CALLER's own `verified_issuer`, and `release_inner`
+/// matches `row.owner.ct_matches(target)` on every resource unconditionally,
+/// rejecting the batch otherwise. So a caller admitted by this check can only
+/// ever reach rows recorded to their own verified `(issuer, subject)` pair; a
+/// caller who names their own subject to reach a row held by a same-named
+/// subject under a different issuer clears this gate and is still refused by
+/// that match. The gate therefore never has to read the lock rows to decide.
+///
+/// **Still repository-scoped.** Naming oneself is authority over one's own lock,
+/// not a reason to be answered about a repository at all. Without the `read`
+/// conjunct below, any authenticated principal could name itself against an
+/// arbitrary repository id, clear this gate, and read cell state back out of
+/// what follows — `fenced_call` discloses whether fenced routing is active and
+/// whether the cell is wired for it, and the outcome then separates `NotFound`
+/// from `AuthorityMismatch`. That is precisely the disclosure the bar is
+/// ordered to prevent, and it does not stop being a disclosure because the
+/// release itself would have failed.
+///
+/// Fails closed on every ambiguity about who is calling, who is named, and
+/// whether the caller may be answered about this repository: no verified token
+/// (auth OFF), an anonymous token carrying no subject, an unnamed target, or no
+/// `read` scope here all answer `false` rather than self-authorize.
+///
+/// The comparison itself is [`VerifiedLockOwner::ct_matches`], the same
+/// comparator the domain uses to decide the identical question, rather than a
+/// short-circuiting `==`. Both sides are built from the caller's own issuer, so
+/// it reduces to a constant-time compare of the subject; the issuer half is
+/// carried anyway because it is the pair, not the subject, that the domain
+/// matches, and a future caller-supplied issuer must not quietly become a
+/// subject-only check.
+pub fn is_self_force_unlock(
+    extensions: &Extensions,
+    repository: RepositoryId,
+    target_owner: &str,
+) -> bool {
+    if target_owner.is_empty() {
+        return false;
+    }
+    if !has_required_permission(extensions, repository, "read") {
+        return false;
+    }
+    let Some(token) = extensions.get::<AuthorizationToken>() else {
+        return false; // auth OFF, or an unauthenticated call: never self-authorize
+    };
+    if token.user_id.is_empty() {
+        return false;
+    }
+    let caller = VerifiedLockOwner {
+        verified_issuer: token.issuer.clone(),
+        authenticated_subject: token.user_id.clone(),
+    };
+    // The issuer is the caller's own on both sides because that is precisely how
+    // `fenced_force_release` composes the target the domain will match against.
+    let named = VerifiedLockOwner {
+        verified_issuer: token.issuer.clone(),
+        authenticated_subject: target_owner.to_owned(),
+    };
+    caller.ct_matches(&named)
 }
 
 pub fn get_matching_permissions(
@@ -1236,6 +1317,141 @@ mod tests {
             assert!(matches!(
                 ProtocolError::from(Status::new(Code::Unavailable, "")),
                 ProtocolError::Disconnected(_)
+            ));
+        }
+    }
+
+    /// Owner ruling D8: `ForceUnlock`'s second authorization arm. Follows the
+    /// `get_matching_permissions_*` fixture style above (build `Extensions`,
+    /// insert an `AuthorizationToken` directly rather than a real JWT).
+    ///
+    /// `is_self_force_unlock` takes a `repository: RepositoryId` conjunct too
+    /// (fail-closed: the caller must hold `read` on THIS repository, or naming
+    /// oneself against an arbitrary repository id would leak whether fenced
+    /// routing is armed there via `fenced_call`'s later disclosures). Every
+    /// case below is explicit about which repository the token's permission
+    /// grant covers, rather than relying on a wildcard everywhere, so the
+    /// repository conjunct is actually exercised and not accidentally always
+    /// satisfied.
+    mod is_self_force_unlock_tests {
+        use super::*;
+
+        fn repository(hex: &str) -> RepositoryId {
+            Context::from_str(hex).unwrap().into()
+        }
+
+        // The repository the token's grants below are scoped to, unless a case
+        // says otherwise.
+        fn granted_repository() -> RepositoryId {
+            repository("0194b726b34e72b0b45550b88a967076")
+        }
+
+        // A different repository the token carries no grant for at all.
+        fn ungranted_repository() -> RepositoryId {
+            repository("0192ae48ccf17060bc1ba9d04f6acb2f")
+        }
+
+        fn extensions_with_token(
+            issuer: &str,
+            user_id: &str,
+            permissions_for_granted_repo: &[&str],
+        ) -> Extensions {
+            let mut extensions = Extensions::new();
+            let mut token = AuthorizationToken {
+                issuer: issuer.to_owned(),
+                user_id: user_id.to_owned(),
+                ..Default::default()
+            };
+            if !permissions_for_granted_repo.is_empty() {
+                token.resources = Some(vec![ResourcePermission {
+                    resource_id: format!("urc-{}", granted_repository()),
+                    permission: permissions_for_granted_repo
+                        .iter()
+                        .map(|p| p.to_string())
+                        .collect(),
+                }]);
+            }
+            extensions.insert(token);
+            extensions
+        }
+
+        #[test]
+        fn read_permission_alone_is_enough_without_owner_or_migrate() {
+            // The positive half of the repository conjunct: `read` alone --
+            // no `owner`, no `migrate` -- is sufficient, because this arm is
+            // about owning the lock, not about administrative rank.
+            let extensions = extensions_with_token("https://issuer.example", "user-1", &["read"]);
+            assert!(is_self_force_unlock(
+                &extensions,
+                granted_repository(),
+                "user-1"
+            ));
+        }
+
+        #[test]
+        fn subject_mismatch_does_not_self_authorize() {
+            let extensions = extensions_with_token("https://issuer.example", "user-1", &["read"]);
+            assert!(!is_self_force_unlock(
+                &extensions,
+                granted_repository(),
+                "someone-else"
+            ));
+        }
+
+        #[test]
+        fn empty_target_owner_does_not_self_authorize() {
+            // The caller carries a real, non-empty subject and read permission
+            // on this exact repository -- everything else about the call would
+            // otherwise clear the gate -- so an empty `target_owner` is the
+            // ONLY reason this must return false. Naming nobody must not be
+            // read as naming oneself.
+            let extensions = extensions_with_token("https://issuer.example", "user-1", &["read"]);
+            assert!(!is_self_force_unlock(&extensions, granted_repository(), ""));
+        }
+
+        #[test]
+        fn empty_token_user_id_does_not_self_authorize() {
+            // Defense in depth over the subject-mismatch case above: a token
+            // that carries no subject at all must never self-authorize a named
+            // target, whatever that target string is. Read permission is
+            // granted here specifically so this test exercises the user_id
+            // check itself rather than failing earlier on the permission gate.
+            let extensions = extensions_with_token("https://issuer.example", "", &["read"]);
+            assert!(!is_self_force_unlock(
+                &extensions,
+                granted_repository(),
+                "someone"
+            ));
+        }
+
+        #[test]
+        fn no_read_permission_on_the_named_repository_does_not_self_authorize() {
+            // Regression case for the repository conjunct: the caller names
+            // themselves correctly, but the repository passed in is one their
+            // token carries NO grant for at all (their `read` grant covers a
+            // different repository). Without the `has_required_permission(
+            // .., "read")` check, a same-subject match alone would clear this
+            // gate for ANY repository id the caller can name, disclosing
+            // fenced-routing/cell state for repositories the caller has no
+            // standing to be answered about.
+            let extensions = extensions_with_token("https://issuer.example", "user-1", &["read"]);
+            assert!(!is_self_force_unlock(
+                &extensions,
+                ungranted_repository(),
+                "user-1"
+            ));
+        }
+
+        #[test]
+        fn auth_off_does_not_self_authorize() {
+            // No `AuthorizationToken` in extensions at all -- the auth-disabled
+            // dev/CI shape. Absence of a verified principal must never be read
+            // as "the caller is whoever they name".
+            let extensions = Extensions::new();
+            assert!(!is_self_force_unlock(
+                &extensions,
+                granted_repository(),
+                "user-1"
             ));
         }
     }

@@ -162,6 +162,24 @@ async fn outbox_row_count(client: &Client, repository_id: &[u8]) -> i64 {
         .get(0)
 }
 
+/// How many `lore_outbox_events` rows for this repository carry the given
+/// `event_kind`. `lore-postgres`'s `release_inner` (coordinator.rs:877)
+/// classifies a release as `LockTransition::ForceReleased` (event kind
+/// `lock.force_released`) whenever an acting administrator is present, vs.
+/// plain `LockTransition::Released` (`lock.released`) otherwise -- the two
+/// are DIFFERENT event kinds, so this is how D8's case 2 proves a self-force
+/// still audits as a force, not a normal release.
+async fn outbox_event_kind_count(client: &Client, repository_id: &[u8], event_kind: &str) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM lore_outbox_events WHERE repository_id = $1 AND event_kind = $2",
+            &[&repository_id, &event_kind],
+        )
+        .await
+        .expect("count outbox rows by event_kind for repository")
+        .get(0)
+}
+
 /// A test double for the direct-authorization rail. Every method but
 /// `authorize_direct_repository_operation` is unreachable in this file --
 /// only the fenced-lock path is exercised here, never the mediated create
@@ -488,6 +506,21 @@ fn no_admin_permission_token(subject: &str) -> AuthorizationToken {
     }
 }
 
+/// D8 case 2's caller shape: ordinary `read`/`write` permission, deliberately
+/// carrying neither `owner` nor `migrate`. Only D8's self-force arm can ever
+/// let this caller reach `ForceUnlock` successfully.
+fn read_write_permission_token(subject: &str) -> AuthorizationToken {
+    AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: subject.to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["read".to_owned(), "write".to_owned()],
+        }]),
+        ..Default::default()
+    }
+}
+
 /// THE security assertion: `Query` and `Status` never expose an ownership
 /// token, including on the caller's own lock. The token is the bearer secret
 /// that authorizes releasing a row; these two RPCs read OTHER people's locks
@@ -570,6 +603,11 @@ async fn queried_and_status_locks_never_expose_an_ownership_token() {
 /// require the resource's ownership token, because an administrator
 /// legitimately holds none (`ForceUnlockRequest`'s own doc comment;
 /// `fenced_batch(resources, false)` in `fenced_force_release`).
+///
+/// D8 test-spec case 1: the `owner`-role caller here force-releases ANOTHER
+/// principal's lock (`wp120-force-unlock-owner`'s), which is exactly D8's
+/// first required case -- this test predates D8 but already proves it, so it
+/// is extended with this note rather than duplicated.
 #[tokio::test]
 #[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
 async fn admin_force_unlock_releases_another_owners_lock_without_a_token() {
@@ -754,6 +792,13 @@ async fn unarmed_legacy_route_succeeds_and_appends_nothing() {
 /// rather than one subsuming the other -- the mirror case,
 /// `admin_lock_is_refused_for_a_caller_holding_owner_but_not_migrate` below,
 /// proves the same independence from the other side.
+///
+/// D8 note: this stays valid after D8 added the self-force authorization arm
+/// only because `migrate_only`'s subject
+/// (`wp121-migrate-only-caller`) differs from the named `owner`
+/// (`wp121-migrate-only-target-owner`) -- `is_self_force_unlock` cannot fire
+/// for a caller naming someone else. `same_principal_without_owner_or_migrate_can_self_force_release_their_own_lock`
+/// below is the case where the caller names themselves.
 #[tokio::test]
 #[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
 async fn force_unlock_is_refused_for_a_caller_holding_migrate_but_not_owner() {
@@ -832,6 +877,13 @@ async fn admin_lock_is_refused_for_a_caller_holding_owner_but_not_migrate() {
 /// `force_unlock_with_no_fenced_coordinator_is_refused` above proves that
 /// `FailedPrecondition` shape for a caller that DOES hold `owner`, so the
 /// only variable here is the permission claim.
+///
+/// D8 test-spec case 3: this is also the "other principal, no owner
+/// permission, force-release naming a DIFFERENT subject" case D8 requires --
+/// `no_permission`'s subject (`wp121-no-permission-caller`) differs from the
+/// named owner (`"someone"`), so `is_self_force_unlock` cannot fire and the
+/// caller is refused on the permission gate alone, before the unarmed cell's
+/// `FailedPrecondition` fenced-routing disclosure is ever reached.
 #[tokio::test]
 #[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
 async fn force_unlock_permission_check_precedes_fenced_routing_disclosure() {
@@ -871,5 +923,172 @@ async fn force_unlock_permission_check_precedes_fenced_routing_disclosure() {
         error.code(),
         Code::PermissionDenied,
         "must never leak FailedPrecondition/fenced-routing detail to an unpermitted caller"
+    );
+}
+
+/// D8 (owner ruling, 2026-09-15) test-spec case 2: a caller holding only
+/// ordinary `read`/`write` -- no `owner`, no `migrate` -- acquires a lock and
+/// then force-releases it naming their OWN subject. `can_force_unlock` alone
+/// would refuse this; the new `is_self_force_unlock` arm is what lets it
+/// through. The CR-032 outbox proof is the part a status-code check alone
+/// cannot give: it must show `lock.force_released` (an audited force,
+/// `LockTransition::ForceReleased`, coordinator.rs:877-880), never plain
+/// `lock.released` -- D8 requires "still audits as a force" as part of the
+/// contract, not merely "still succeeds".
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn same_principal_without_owner_or_migrate_can_self_force_release_their_own_lock() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let db = client(&url).await;
+    // Deliberately read/write only -- neither `owner` nor `migrate`. The
+    // `read` grant is load-bearing for the force-release below:
+    // `is_self_force_unlock`'s repository conjunct requires it, or this
+    // caller would be refused `PermissionDenied` before ever reaching the
+    // self-authorization comparison this test is actually about. `write` is
+    // NOT load-bearing for the acquire above -- `armed_service` always
+    // builds its service with `enforce_write_permission: false`, so `Lock`'s
+    // permission check is a no-op here regardless; `write` is carried anyway
+    // because it is the realistic shape of the caller D8 exists for (a
+    // `developer`/`maintainer` role, not a bare read-only one).
+    let caller = read_write_permission_token("wp122-self-force-caller");
+    let resource = resource_for_branch(&branch_id);
+
+    service
+        .lock(authenticated_request(
+            LockRequest {
+                resources: vec![resource.clone()],
+            },
+            &repository_id,
+            &caller,
+        ))
+        .await
+        .expect("caller's own acquire must succeed");
+
+    // Deliberately no `expected_ownership_token`, same as an administrator's
+    // force-release: the self-force arm does not change that half of the
+    // contract.
+    let forced = service
+        .force_unlock(authenticated_request(
+            ForceUnlockRequest {
+                resources: vec![resource],
+                owner: caller.user_id.clone(),
+            },
+            &repository_id,
+            &caller,
+        ))
+        .await
+        .expect(
+            "a caller with no owner/migrate permission must still be able to force-release a \
+             lock they themselves hold",
+        )
+        .into_inner();
+    assert_eq!(forced.resources.len(), 1);
+
+    assert_eq!(
+        outbox_event_kind_count(&db, &repository_id, "lock.force_released").await,
+        1,
+        "a self-force-release must audit as lock.force_released, exactly like an \
+         administrator's force-release"
+    );
+    assert_eq!(
+        outbox_event_kind_count(&db, &repository_id, "lock.released").await,
+        0,
+        "a self-force-release must NOT audit as an ordinary lock.released"
+    );
+}
+
+/// D8's fourth (cheap) case: a caller whose subject STRING matches the lock's
+/// owner, but who authenticated under a DIFFERENT issuer, must not be able to
+/// release that lock via the self-force arm.
+///
+/// The gRPC gate (`is_self_force_unlock`) cannot see this distinction by
+/// itself -- per D8's contract it builds both `VerifiedLockOwner` values from
+/// the SAME calling token's issuer, so naming your own subject always clears
+/// the permission gate regardless of which issuer actually holds the row.
+/// The safety net named in D8's "why this is safe" note is one layer deeper:
+/// `fenced_force_release` builds `ForceReleaseInput.target_owner` with the
+/// CALLER's verified issuer (lock_service.rs:587-590), and
+/// `release_inner` (coordinator.rs:1002) requires `row.owner.ct_matches(target)`
+/// unconditionally -- a row locked under a different issuer can never match a
+/// target built from the caller's own issuer, even for an identical subject
+/// string. So the permission gate passes here, and the mutation itself must
+/// still refuse with `FailedPrecondition` (`LockRejection::AuthorityMismatch`
+/// -- "The presented lock ownership does not match"), never `PermissionDenied`
+/// and never a silent release.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn same_subject_string_under_a_different_issuer_cannot_self_force_release() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let shared_subject = "wp122-shared-subject-name";
+    // No `resources` grant needed here: `armed_service` always builds its
+    // `LoreLockService` with `enforce_write_permission: false` (the last
+    // constructor argument), so `Lock`'s `require_permission(.., "write",
+    // false)` is a no-op regardless of what the token carries -- verified by
+    // reading `armed_service` above rather than assumed.
+    let original_locker = AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: shared_subject.to_owned(),
+        ..Default::default()
+    };
+    // Same subject string, a DIFFERENT verified issuer, and no owner/migrate
+    // permission -- self-force is the only arm that could let this through.
+    // It DOES need `read` on this repository, though: without it,
+    // `is_self_force_unlock`'s repository conjunct refuses before ever
+    // reaching the issuer comparison this test is actually about, and the
+    // call would fail `PermissionDenied` for the wrong reason instead of
+    // `FailedPrecondition` for the right one. `urc-*` mirrors this file's
+    // existing wildcard tokens (`admin_token`, `owner_permission_token`)
+    // rather than requiring the exact repository id.
+    let foreign_issuer_caller = AuthorizationToken {
+        issuer: "https://other-issuer.example".to_owned(),
+        user_id: shared_subject.to_owned(),
+        resources: Some(vec![ResourcePermission {
+            resource_id: "urc-*".to_owned(),
+            permission: vec!["read".to_owned()],
+        }]),
+        ..Default::default()
+    };
+    let resource = resource_for_branch(&branch_id);
+
+    service
+        .lock(authenticated_request(
+            LockRequest {
+                resources: vec![resource.clone()],
+            },
+            &repository_id,
+            &original_locker,
+        ))
+        .await
+        .expect("original locker's acquire must succeed");
+
+    let error = service
+        .force_unlock(authenticated_request(
+            ForceUnlockRequest {
+                resources: vec![resource],
+                owner: shared_subject.to_owned(),
+            },
+            &repository_id,
+            &foreign_issuer_caller,
+        ))
+        .await
+        .expect_err(
+            "a same-subject-string caller under a different issuer must not force-release a \
+             row it does not actually hold",
+        );
+
+    assert_eq!(
+        error.code(),
+        Code::FailedPrecondition,
+        "the permission gate passes (self-named), but the coordinator's own owner match must \
+         still refuse a cross-issuer row -- this must never be PermissionDenied (that would mean \
+         the gate itself, not the row match, caught it) and never Ok (a silent release)"
     );
 }

@@ -52,6 +52,7 @@ use super::is_owner_or_admin;
 use super::timeout_grpc;
 use crate::grpc::can_admin_lock;
 use crate::grpc::can_force_unlock;
+use crate::grpc::is_self_force_unlock;
 use crate::grpc::require_permission;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -1129,20 +1130,39 @@ impl LoreLockService {
         let repository = get_repository(request.metadata())?;
         let extensions = request.extensions().clone();
         let user_id = get_user_id(request.extensions());
+        // Taken before the body is consumed: `fenced_call` needs the metadata,
+        // and the authorization decision below needs the named owner out of the
+        // body. Consuming the request early discloses nothing — decoding it is
+        // not an answer about this cell.
+        let metadata = request.metadata().clone();
+        let force_request = request.into_inner();
 
-        // The permission bar comes first, before this handler reports anything
-        // about the cell. `fenced_call`'s refusals name whether fenced routing
-        // is active and whether the cell is wired for it, and a caller with no
-        // administrative permission has no business learning either.
+        // The authorization bar comes first, before this handler reports
+        // anything about the cell. `fenced_call`'s refusals name whether fenced
+        // routing is active and whether the cell is wired for it, and a caller
+        // with no authority here has no business learning either.
         //
-        // CR-030 P-030-2: the bar is `owner`, not `AdminLock`'s `migrate`.
-        if !can_force_unlock(&extensions, repository) {
+        // The bar has two independent halves, and clearing either is enough:
+        //
+        //  * CR-030 P-030-2: the `owner` permission, and deliberately not
+        //    `AdminLock`'s `migrate`. This is the administrator taking a lock
+        //    away from somebody else.
+        //  * Owner ruling D8 (2026-09-15): the caller IS the principal named
+        //    and may read this repository, whatever their role beyond that.
+        //    Breaking one's own lock from a second client
+        //    is not an administrative act, and WP-117's per-client token
+        //    fencing means it is the only path a non-`owner` has back to a lock
+        //    that is already theirs. See [`is_self_force_unlock`] for why the
+        //    client-supplied name is safe to compare here and what still
+        //    enforces it downstream.
+        if !can_force_unlock(&extensions, repository)
+            && !is_self_force_unlock(&extensions, repository, &force_request.owner)
+        {
             warn!("Attempt to force unlock, but user does not have the correct permissions");
             return Err(Status::permission_denied("Permission denied"));
         }
 
-        let fenced = self.fenced_call(request.metadata(), request.extensions())?;
-        let force_request = request.into_inner();
+        let fenced = self.fenced_call(&metadata, &extensions)?;
 
         self.locking_histogram.record(
             force_request.resources.len() as u64,
