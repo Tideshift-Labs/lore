@@ -1351,7 +1351,7 @@ fn quota() -> ReservePutQuotaScope {
 /// list of known-secret substrings is deliberate: a substring list only catches the values the test
 /// author thought to plant, and an earlier version of this test missed a mutation that swapped a
 /// redacted field for an unredacted one because the newly disclosed value was not on the list.
-const RENDERABLE_KEYS: [&str; 29] = [
+const RENDERABLE_KEYS: [&str; 30] = [
     // Pool configuration. None of these name a subject; the URL and the CA bundle, which do, are
     // redacted by their own `Debug` impls and are checked by this same allowlist.
     "role",
@@ -1367,6 +1367,7 @@ const RENDERABLE_KEYS: [&str; 29] = [
     "lock_pool_max",
     "domain_pool_max",
     "dispatch_pool_max",
+    "relay_pool_max",
     "statement_timeout_ms",
     "lock_timeout_ms",
     "operation_timeout",
@@ -1709,8 +1710,9 @@ fn the_connection_budget_statement_is_present_and_arithmetically_true() {
     let exact_limit = DispatchConnectionBudget::new(2, 3, 4, 5, 6, 0).expect("exact limit");
     assert_eq!(exact_limit.connections_per_replica(), 20);
     for fragment in [
-        "immutable, mutable, lock, and domain pools plus",
-        "five independently configured maxima",
+        "immutable, mutable, lock, and domain pools, one ",
+        "event-relay pool when [outbox_relay] is enabled",
+        "six independently configured maxima",
         "sum above 20 PostgreSQL connections",
         "do-managed-pg-connection-budget.md",
     ] {
