@@ -65,7 +65,19 @@ $inventory = @(
             'beyond_horizon_prepare_at_retained_quota_limit_is_capacity_exhausted',
             'beyond_horizon_prepare_at_hourly_quota_limit_is_capacity_exhausted',
             'prepare_accepts_an_authorization_witness',
-            'concurrent_duplicate_future_marker_prepares_do_not_double_count_the_quota'
+            'concurrent_duplicate_future_marker_prepares_do_not_double_count_the_quota',
+            # The bounded online-bootstrap DDL cases. They live in this target
+            # because they exercise the schema install that the receipt store
+            # boots on, against a real database and a real concurrent writer.
+            'online_bootstrap_completes_while_receipt_writer_keeps_its_transaction_open',
+            'online_bootstrap_releases_previous_ddl_before_a_blocked_statement',
+            'online_bootstrap_skips_existing_index_during_an_open_write',
+            'online_bootstrap_rejects_a_failed_concurrent_index',
+            'online_bootstrap_refuses_missing_index_on_populated_table',
+            'online_bootstrap_preserves_quoted_semicolons_and_dollar_quoted_blocks',
+            'online_bootstrap_seed_replay_preserves_advanced_counters',
+            'online_bootstrap_rejects_mixed_alter_but_preserves_nested_and_quoted_commas',
+            'online_bootstrap_missing_index_refuses_an_uncommitted_writer_without_waiting'
         )
     }
 )

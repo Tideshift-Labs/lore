@@ -12,7 +12,10 @@
 //! get written for each temporal class, retry/mismatch semantics, single-use
 //! consumption, hard-TTL expiry, and terminal immutability.
 //!
-//! Gated on `LORE_TEST_PG_URL`; skipped when unset. Isolated per test by a
+//! Gated on `LORE_TEST_PG_URL`. The receipt cases return quietly when it is
+//! unset; the `online_bootstrap_*` cases panic on it instead, because a bounded
+//! DDL case that returned would be reported `passed` having proved nothing.
+//! Isolated per test by a
 //! random `(verified_issuer, tenant_scope_key)` pair, since the future-reject
 //! quota is namespaced by exactly that tuple and must not leak between tests.
 
