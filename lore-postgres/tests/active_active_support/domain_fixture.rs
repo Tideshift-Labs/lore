@@ -181,8 +181,17 @@ pub async fn create_repository(
 }
 
 /// A delete input that tombstones whatever generation is current.
-pub async fn delete_input(repository_id: [u8; 16], _ids: &mut Identities) -> RepositoryDeleteInput {
-    delete_observations::repository_delete_input(&repository_id).await
+///
+/// `url` must be the case's namespaced URL (`SharedBackend::url`), not the base
+/// `LORE_TEST_PG_URL`. A case here owns a schema, not a database, so a reader
+/// opened on the base URL resolves `search_path` to `public` and fails with
+/// `42P01` on `lore_domain_repositories`.
+pub async fn delete_input(
+    url: &str,
+    repository_id: [u8; 16],
+    _ids: &mut Identities,
+) -> RepositoryDeleteInput {
+    delete_observations::repository_delete_input_at(url, &repository_id).await
 }
 
 /// A push input carrying the exact five-scalar preflight the caller observed.

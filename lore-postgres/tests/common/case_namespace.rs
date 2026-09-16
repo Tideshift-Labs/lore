@@ -54,6 +54,15 @@
 //! work after bootstrap is unaffected -- the lock is held only for the duration
 //! of the `ensure_schema` transaction.
 //!
+//! # Readers that must be handed [`CaseNamespace::pg_url`], not the base URL
+//!
+//! A helper that opens its own connection from `LORE_TEST_PG_URL` resolves
+//! `search_path` to `public` and fails with `42P01` on a case's relations. Two
+//! such readers remain in `tests/common/`: `delete_observations.rs`, which now
+//! has `*_at(url, ..)` variants for exactly this, and
+//! `create_metadata_fixture.rs`, which has none yet. A namespaced case using
+//! either must pass this URL.
+//!
 //! # Cleanup
 //!
 //! [`CaseNamespace::release`] drops the schema. A namespace dropped without

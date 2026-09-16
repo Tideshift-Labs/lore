@@ -8,7 +8,18 @@ use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 #[allow(dead_code)]
 pub async fn repository_delete_input(repository_id: &[u8]) -> RepositoryDeleteInput {
     let url = std::env::var("LORE_TEST_PG_URL").expect("owned test Postgres URL required");
-    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+    repository_delete_input_at(&url, repository_id).await
+}
+
+/// As [`repository_delete_input`], but against a caller-supplied URL.
+///
+/// A suite whose case owns a schema namespace rather than a whole database must
+/// pass that namespace's URL. `LORE_TEST_PG_URL` names the base database, whose
+/// `search_path` never reaches the case's schema, so reading the preflight from
+/// it fails with `42P01` on `lore_domain_repositories`.
+#[allow(dead_code)]
+pub async fn repository_delete_input_at(url: &str, repository_id: &[u8]) -> RepositoryDeleteInput {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
         .expect("connect delete observation reader");
     lore_base::lore_spawn!(async move {
@@ -51,11 +62,27 @@ pub async fn branch_delete_input(
     branch_id: &[u8],
 ) -> lore_postgres::domain::coordinator::BranchDeleteInput {
     let url = std::env::var("LORE_TEST_PG_URL").expect("owned test Postgres URL required");
-    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+    branch_delete_input_at(&url, repository_id, branch_id).await
+}
+
+/// As [`branch_delete_input`], but against a caller-supplied URL. Same
+/// namespace rule as [`repository_delete_input_at`].
+///
+/// No call site yet. It exists so the next namespaced case needing a branch
+/// delete finds the namespaced reader instead of re-deriving the 42P01.
+#[allow(dead_code)]
+pub async fn branch_delete_input_at(
+    url: &str,
+    repository_id: &[u8],
+    branch_id: &[u8],
+) -> lore_postgres::domain::coordinator::BranchDeleteInput {
+    let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
         .await
-        .unwrap();
+        .expect("connect branch delete observation reader");
     lore_base::lore_spawn!(async move {
-        connection.await.unwrap();
+        connection
+            .await
+            .expect("branch delete observation connection");
     });
     let branch = client.query_opt("SELECT name,metadata_hash,latest_hash FROM lore_domain_branches WHERE repository_id=$1 AND branch_id=$2", &[&repository_id,&branch_id]).await.unwrap();
     lore_postgres::domain::coordinator::BranchDeleteInput {

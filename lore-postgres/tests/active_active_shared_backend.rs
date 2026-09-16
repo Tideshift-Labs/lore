@@ -379,7 +379,7 @@ async fn a2_a_name_released_by_one_set_is_reusable_by_the_other_but_the_identity
     assert!(seen_by_b.live);
 
     let delete = fixture::admitted(&backend.a.domain, "repository_delete", &mut ids).await;
-    let delete_input = fixture::delete_input(repository_id, &mut ids).await;
+    let delete_input = fixture::delete_input(&backend.url, repository_id, &mut ids).await;
     assert_eq!(
         backend
             .a
@@ -637,7 +637,7 @@ async fn b2_a_push_racing_a_repository_delete_never_advances_a_tombstoned_branch
     );
     let push_op = fixture::admitted(&backend.a.domain, "branch_push_commit", &mut ids).await;
     let delete_op = fixture::admitted(&backend.b.domain, "repository_delete", &mut ids).await;
-    let delete_input = fixture::delete_input(repository_id, &mut ids).await;
+    let delete_input = fixture::delete_input(&backend.url, repository_id, &mut ids).await;
 
     // Both transitions write `lore_domain_branches`: the push advances the tip,
     // the delete tombstones every live branch.
