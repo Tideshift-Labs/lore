@@ -14,6 +14,14 @@
 #
 # Postgres-specific settings are under [plugins.postgres.*]. Each store group
 # carries its own connection (they may point at the same database).
+#
+# POOL MAXIMA ARE MANDATORY, NOT TUNING. Every Postgres-mode loreserver sums
+# immutable + mutable + domain + lock + dispatch + relay pool maxima at boot
+# and refuses to start above DISPATCH_PROCESS_CONNECTION_LIMIT = 20
+# (../../lore-object-dispatch/src/dispatch_pool.rs). The deadpool defaults
+# (10/10/10 + domain 4) sum to 34 and DO NOT BOOT. This example enables
+# neither a fragment provider nor [outbox_relay], so dispatch and relay are 0
+# and the four pools below are the whole inventory: 3 + 3 + 3 + 2 = 11.
 
 [immutable_store]
 mode = "postgres"
@@ -43,7 +51,7 @@ mode = "postgres"
 # (encrypted but NOT authenticated — MITM-exposed; logs a warning).
 [plugins.postgres.immutable_store]
 url = "postgres://postgres:postgres@localhost:5432/lore?sslmode=require"
-# pool_max = 10
+pool_max = 3
 # ca_cert_path = "/etc/lore/do-ca-certificate.crt"
 # tls_insecure_skip_verify = false
 
@@ -66,9 +74,12 @@ force_path_style = false
 # Mutable store: branch-tip compare-and-swap. No object storage needed.
 [plugins.postgres.mutable_store]
 url = "postgres://postgres:postgres@localhost:5432/lore"
-# pool_max = 10
+pool_max = 3
+# The domain pool is its own knob and never inherits pool_max; unset it
+# defaults to 4 and pushes this example's inventory to 12.
+domain_pool_max = 3
 
 # Lock store: advisory locks. No object storage needed.
 [plugins.postgres.lock_store]
 url = "postgres://postgres:postgres@localhost:5432/lore"
-# pool_max = 10
+pool_max = 2
