@@ -752,8 +752,25 @@ async fn sustained_upload(cross_repository: bool) {
         pushes.await;
         pushes_done.store(true, std::sync::atomic::Ordering::SeqCst);
     };
+    // The property here is that a bulk upload never *starves* a real branch
+    // push: the failure this guards is unbounded blocking, not a few seconds of
+    // slowdown. A watchdog close to the observed runtime therefore reports load
+    // rather than starvation.
+    //
+    // At 30 seconds it did exactly that. Six runs of the two cases on an idle
+    // rig, against a disposable PostgreSQL 16 with a fresh database per case:
+    // three tripped the watchdog, and the three that passed reported 25.88 s,
+    // 27.84 s and 28.53 s, so 1.5 to 4 seconds of margin with nothing else
+    // competing.
+    //
+    // Under load it is worse. A full-registry run failed `same_repo` on the
+    // 30-second budget while the sibling `cross_repo` passed at 26.87 s of it.
+    //
+    // 60 seconds keeps the watchdog well inside "this never finished" while
+    // leaving the workload untouched, so the case still proves what it claims
+    // on a loaded machine.
     let ((), first, second, third) = tokio::time::timeout(
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         LORE_CONTEXT.scope(execution, async {
             tokio::join!(pushes, upload(0), upload(1), upload(2))
         }),
