@@ -193,7 +193,58 @@ $inventory = @(
         Target        = 'domain_migration_parity'
         Exact         = $true
         ExactPrefixes = @()
-        Cases         = @('migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs')
+        Cases         = @(
+            'migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs',
+            # L1 (WP-114/WP-115): the durable promotion send claim's new migration
+            # (0002_fragment_promotion_send_claims.sql) must be idempotent -- Postgres has
+            # no `ADD CONSTRAINT IF NOT EXISTS`.
+            'migration_0002_is_idempotent_against_an_already_migrated_database',
+            # L1 (WP-114/WP-115), review-flagged hazard: a cell migrated from 0001 alone
+            # must reach the schema_version ready_for_lifecycle's clean-init arm requires,
+            # or it refuses to enable lifecycle routing forever.
+            'a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readiness_gate_requires'
+        )
+    },
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
+        Target        = 'fragment_promotion_send_claim'
+        Exact         = $true
+        ExactPrefixes = @()
+        # L1 (WP-114/WP-115): the durable promotion send claim in the fragments
+        # coordinator. Kept as its own target rather than folded into
+        # domain_fragment_lifecycle.rs, which is co-owned by a sibling lane.
+        Cases         = @(
+            'promotion_admission_carries_a_durable_claim_and_leaves_the_head_staged',
+            'promotion_admission_is_fenced_for_every_non_staged_head_shape',
+            'an_ambiguous_direct_write_claim_at_the_legacy_key_blocks_promotion_admission',
+            'an_ambiguous_promotion_claim_at_the_legacy_key_blocks_direct_write_admission',
+            'a_repair_successor_is_not_blocked_by_a_live_claim_at_the_legacy_key',
+            'ordinary_direct_write_admission_is_unaffected_by_the_object_key_barrier',
+            'a_second_promotion_is_blocked_until_the_first_claims_hard_not_after_then_takeover_stamps_a_new_fence',
+            'authorization_refuses_when_the_staged_epoch_moved_under_the_claim',
+            'authorization_refuses_when_the_staged_manifest_was_replaced',
+            'authorization_refuses_when_the_fence_moved',
+            'authorization_refuses_when_the_promotion_token_was_cleared',
+            'reusing_an_attempt_identity_against_a_moved_staged_witness_is_rejected',
+            'authorization_after_the_send_deadline_settles_no_send_not_ambiguous',
+            'an_ambiguous_settlement_leaves_the_barrier_row_visible_and_blocks_a_fresh_promotion',
+            'decisive_promotion_publishes_with_provider_evidence_and_quarantines_the_predecessor',
+            'a_fence_moved_between_begin_and_commit_leaves_staged_bytes_readable_and_settles_the_claim',
+            'abandon_promotion_settles_ambiguous_and_leaves_staged_bytes_readable_when_the_fence_moved',
+            'abandon_promotion_settles_no_send_when_the_claim_was_never_authorized',
+            'abandon_promotion_reports_fenced_when_the_head_is_gone',
+            'abandon_promotion_leaves_the_head_staged_with_its_manifest_and_settles_the_claim',
+            # Review-flagged highest-risk case: the union barrier's per-state horizon split
+            # means a Prepared claim past its own send window no longer blocks admission --
+            # pin that this cannot let two live conditional PUTs land at one key.
+            'a_prepared_claim_past_its_send_window_no_longer_blocks_admission_but_can_never_itself_send',
+            'commit_promotion_refuses_a_no_send_settlement_on_a_valid_observation',
+            # Case 16 (owner-ruled D10 NARROW): a promotion send claim contributes a cleanup
+            # target only as unpublished residue; obliterate's ordinary current-epoch Remote
+            # purge path is unchanged for a promoted object.
+            'a_decisive_promotion_claim_contributes_a_cleanup_target_exactly_like_a_direct_write_claim_d10_narrow'
+        )
     },
     [pscustomobject]@{
         Package       = 'lore-postgres'

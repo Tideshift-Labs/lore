@@ -31,6 +31,14 @@ use lore_postgres::store::lock_store::PostgresLockStore;
 /// itself fails to build, not just this test.
 const MIGRATIONS_0001: &str = include_str!("../migrations/0001_init.sql");
 
+/// L1 (WP-114/WP-115): the first numbered follow-on this crate has ever had
+/// (DECISION 3 -- a new file rather than an edit to `0001_init.sql`, so an
+/// already-provisioned cell is not silently skipped). Applied wholesale,
+/// after `MIGRATIONS_0001`, to the migration-side database below, mirroring
+/// what an out-of-band-provisioned cell running both migrations in order
+/// actually has.
+const MIGRATIONS_0002: &str = include_str!("../migrations/0002_fragment_promotion_send_claims.sql");
+
 /// The relations that prove `migrations/0001_init.sql` (or the isolated test
 /// fixture) ran here. `lore_locks` is excluded because it also pre-dates
 /// SCHEMA-117 on an upgraded cell, so its presence proves nothing either way —
@@ -299,6 +307,14 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .batch_execute(MIGRATIONS_0001)
         .await
         .expect("apply migrations/0001_init.sql wholesale to the migration-side database");
+    migration_client
+        .batch_execute(MIGRATIONS_0002)
+        .await
+        .expect(
+            "apply migrations/0002_fragment_promotion_send_claims.sql wholesale to the \
+             migration-side database, mirroring an out-of-band-provisioned cell that has run \
+             both migrations in order",
+        );
 
     // Production boot order: the domain coordinator is built before the lock
     // store plugin connects (`server.rs`), so nothing has created `lore_locks`
@@ -655,4 +671,134 @@ fn lock_schema_carries_the_v2_fenced_shape_constraint_and_never_issued_column() 
         "LOCK_SCHEMA must not keep declaring the superseded v1 constraint \
          (lore_locks_fenced_shape) alongside its v2 replacement"
     );
+}
+
+// ---------------------------------------------------------------------------
+// L1 (WP-114/WP-115): the durable promotion send claim's new columns, in
+// both declarations, mirroring RULING B's pattern above for an
+// `ALTER TABLE ... ADD COLUMN` extension rather than a single contiguous
+// `CREATE TABLE` body (so `pin_premise`'s `create_table_body` helper does not
+// apply here either).
+// ---------------------------------------------------------------------------
+
+/// `0002_fragment_promotion_send_claims.sql` must declare the same claim
+/// columns and shape CHECK as the runtime `FRAGMENT_SCHEMA`, or an
+/// out-of-band-provisioned cell (this migration's whole reason to exist,
+/// DECISION 3) ends up with a claims table an up-to-date binary cannot use.
+#[test]
+fn migration_0002_declares_the_same_promotion_claim_columns_and_shape_check_as_fragment_schema() {
+    let migration = collapse_whitespace(MIGRATIONS_0002);
+    let runtime = collapse_whitespace(fragment_schema::FRAGMENT_SCHEMA);
+    for needle in [
+        "ALTER TABLE lore_fragment_write_claims",
+        "ADD COLUMN IF NOT EXISTS kind",
+        "CHECK (kind IN (0, 1))",
+        "ADD COLUMN IF NOT EXISTS source_epoch",
+        "ADD COLUMN IF NOT EXISTS source_manifest_id",
+        "octet_length(source_manifest_id) = 32",
+        "ADD CONSTRAINT lore_fragment_write_claim_promotion_shape",
+        "(kind = 1) = (source_epoch IS NOT NULL)",
+        "(kind = 1) = (source_manifest_id IS NOT NULL)",
+        "(kind = 0 OR source_epoch < epoch)",
+    ] {
+        let collapsed_needle = collapse_whitespace(needle);
+        assert!(
+            migration.contains(&collapsed_needle),
+            "migrations/0002_fragment_promotion_send_claims.sql must declare `{needle}`"
+        );
+        assert!(
+            runtime.contains(&collapsed_needle),
+            "fragment_schema::FRAGMENT_SCHEMA must declare `{needle}` too, or an already-running \
+             cell's idempotent re-apply on every boot never gets it"
+        );
+    }
+}
+
+/// `0002` must be idempotent: Postgres has no `ADD CONSTRAINT IF NOT EXISTS`,
+/// so a straight `ADD CONSTRAINT` re-run on an already-migrated cell errors.
+/// Applying the same file twice to one throwaway database is the direct,
+/// executable proof; a source-text read cannot rule out this failure mode.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn migration_0002_is_idempotent_against_an_already_migrated_database() {
+    let admin_url = pg_url();
+    let (db_name, url) = create_throwaway_database(&admin_url, "0002idempotent").await;
+    let client = pg_client(&url).await;
+    client
+        .batch_execute(MIGRATIONS_0001)
+        .await
+        .expect("apply migrations/0001_init.sql once");
+    client
+        .batch_execute(MIGRATIONS_0002)
+        .await
+        .expect("apply migrations/0002_fragment_promotion_send_claims.sql the first time");
+    client.batch_execute(MIGRATIONS_0002).await.expect(
+        "re-applying migrations/0002_fragment_promotion_send_claims.sql to an \
+             already-migrated database must not error -- Postgres has no \
+             `ADD CONSTRAINT IF NOT EXISTS`, so this is the property a straight `ADD CONSTRAINT` \
+             could silently lose",
+    );
+    drop(client);
+    drop_throwaway_database(&admin_url, &db_name).await;
+}
+
+/// A hazard flagged in review: `ready_for_lifecycle`'s clean-init arm now
+/// requires `schema_version >= FRAGMENT_SCHEMA_VERSION` (4). A fresh
+/// `FRAGMENT_SCHEMA` bootstrap seeds 4 directly, but a cell provisioned
+/// out-of-band from `0001_init.sql` alone (unmodified by DECISION 3, still
+/// seeding `FRAGMENT_SCHEMA_BASE_VERSION`) only reaches 4 if `0002` actually
+/// bumps the stored value. There is no migration runner to notice a version
+/// stuck at the base -- such a cell would apply `0002`, gain the columns,
+/// and then refuse to enable forever. This proves the migration series --
+/// `0001`'s base seed plus `0002`'s `UPDATE ... WHERE schema_version < 4` --
+/// actually reaches the runtime `FRAGMENT_SCHEMA_VERSION`, executed rather
+/// than read from source.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readiness_gate_requires() {
+    let admin_url = pg_url();
+    let (db_name, url) = create_throwaway_database(&admin_url, "0001to0002version").await;
+    let client = pg_client(&url).await;
+    client
+        .batch_execute(MIGRATIONS_0001)
+        .await
+        .expect("apply migrations/0001_init.sql alone, as an out-of-band-provisioned cell has");
+    let after_0001: i64 = client
+        .query_one(
+            "SELECT schema_version FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read schema_version after 0001 alone")
+        .get(0);
+    assert_eq!(
+        after_0001,
+        fragment_schema::FRAGMENT_SCHEMA_BASE_VERSION,
+        "a cell that has run only 0001_init.sql must be at the base revision -- DECISION 3 left \
+         this file unmodified"
+    );
+
+    client
+        .batch_execute(MIGRATIONS_0002)
+        .await
+        .expect("apply migrations/0002_fragment_promotion_send_claims.sql to raise it");
+    let after_0002: i64 = client
+        .query_one(
+            "SELECT schema_version FROM lore_fragment_schema_state WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("read schema_version after 0002")
+        .get(0);
+    assert_eq!(
+        after_0002,
+        fragment_schema::FRAGMENT_SCHEMA_VERSION,
+        "a cell migrated from 0001 through 0002 must end at the schema_version \
+         ready_for_lifecycle's clean-init arm requires ({}), or every such cell enables lifecycle \
+         routing never again",
+        fragment_schema::FRAGMENT_SCHEMA_VERSION
+    );
+
+    drop(client);
+    drop_throwaway_database(&admin_url, &db_name).await;
 }
