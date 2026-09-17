@@ -28,6 +28,14 @@
 //! erasure trait staying private, no AWS SDK in the manifest, no filesystem
 //! access, and the constructor signature.
 //!
+//! **Rule 5, added for WP-114 CD-6's `FragmentDrainCapability` (tranche
+//! D-L3-2):** the durable-PUT tokens Rule 3 used to forbid outright are now
+//! split — most stay forbidden everywhere (the operations this tranche cut),
+//! three are confined to the capability's own `impl` block instead of
+//! forbidden — plus an exhaustive method-set pin (equality, not containment,
+//! same idiom as [`the_cell_retention_client_buys_only_the_retention_procedures`])
+//! and two declaration-shape pins for the capability and its attempt type.
+//!
 //! # Known limit, recorded rather than fixed
 //!
 //! `shipped_code`'s walk from a `#[cfg(test)]` attribute to its item is not a
@@ -48,14 +56,17 @@
 //! whole comment-stripped file, so nothing the walker mis-parses can hide from
 //! it. Verified by reproducing the desync against it.
 //!
-//! The limit therefore still reaches exactly two checks, both about the *shape*
-//! of declarations rather than about reaching a provider:
+//! The limit therefore still reaches only checks about the *shape* of
+//! declarations and method sets, rather than about reaching a provider:
 //! [`only_a_real_readback_can_mint_a_cell_schema_attestation`]'s use of shipped
-//! code, and [`the_seam_addresses_only_its_own_boundary`]. Hiding a widened
-//! `verify_installed_layers` or a `target` field behind a desynchronising
-//! string literal is possible and would not be caught here. Recorded, not
-//! fixed; a reader should treat this file as regression detection over one
-//! file, not as a proof.
+//! code, [`the_seam_addresses_only_its_own_boundary`], and Rule 5's
+//! [`the_drain_capability_exposes_exactly_mark_spool_ready_and_attempt_drain`],
+//! [`the_drain_capability_declares_no_public_field`], and
+//! [`the_drain_attempt_cannot_name_a_traffic_class_or_declared_size`]. Hiding a
+//! widened `verify_installed_layers`, a `target` field, or a new
+//! `FragmentDrainCapability` method behind a desynchronising string literal is
+//! possible and would not be caught here. Recorded, not fixed; a reader should
+//! treat this file as regression detection over one file, not as a proof.
 
 use std::fs;
 use std::path::Path;
@@ -73,22 +84,68 @@ const FILESYSTEM_TOKENS: [&str; 7] = [
     "fs::",
 ];
 
-/// WP-114 retains durable PUT reservation/spooling, but WP-118's bounded
-/// fragment seam must not import, project, call, or publish that capability.
-const PHASE5_DURABLE_PUT_TOKENS: [&str; 12] = [
+/// WP-114 retains durable PUT reservation/spooling, but WP-118's original
+/// bounded fragment seam had none of it. The L3 drain capability (WP-114
+/// CD-6, tranche decision D-L3-2: `mark_spool_ready` + `attempt_drain` only,
+/// `reserve_bound` and `record_upload_progress` deliberately cut) now
+/// legitimately reuses three of these primitives — but only from inside
+/// `FragmentDrainCapability`'s own `impl` block. Split in two for that reason:
+/// tokens belonging to the cut operations must stay absent *everywhere*,
+/// including inside the capability, because a return of either name is
+/// exactly what this list exists to catch; tokens the capability legitimately
+/// reuses are checked for confinement instead, by
+/// [`the_drain_capability_is_the_only_place_the_reused_durable_put_primitives_appear`].
+const PHASE5_DURABLE_PUT_TOKENS_FORBIDDEN_EVERYWHERE: [&str; 9] = [
     "FragmentReservePutQuota",
     "FragmentReservePutRequest",
     "FragmentPutSpoolReady",
     "ReservedFragmentPutAttempt",
     "ReadyFragmentPutAttempt",
     "ReservePutRequest",
-    "PutSpoolReadyRequest",
-    "bind_durable_put_body_from_ready",
     "reserve_put(",
-    "put_spool_ready(",
     "SpoolLayout",
     "DurablePutSpoolExpectation",
 ];
+
+/// Reused by `FragmentDrainCapability` to bind a spooled body before a drain
+/// send. Permitted, but only from inside that capability's own `impl` block —
+/// see [`the_drain_capability_is_the_only_place_the_reused_durable_put_primitives_appear`].
+const DRAIN_CAPABILITY_CONFINED_TOKENS: [&str; 3] = [
+    "PutSpoolReadyRequest",
+    "bind_durable_put_body_from_ready",
+    "put_spool_ready(",
+];
+
+/// Every top-level block introduced by `prefix ... {`, collected in case the
+/// type has more than one `impl` block. Mirrors [`block_after`] but does not
+/// stop at the first match, because a confinement check that silently scanned
+/// only the first block would miss code hidden in a second one.
+fn all_blocks_after(text: &str, prefix: &str, open: char, close: char) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find(prefix) {
+        let candidate = &rest[start..];
+        let mut depth = 0usize;
+        let mut end_index = None;
+        for (index, character) in candidate.char_indices() {
+            if character == open {
+                depth += 1;
+            } else if character == close {
+                depth -= 1;
+                if depth == 0 {
+                    end_index = Some(index);
+                    break;
+                }
+            }
+        }
+        let Some(end_index) = end_index else {
+            panic!("unbalanced block starting at {prefix:?}");
+        };
+        blocks.push(candidate[..=end_index].to_string());
+        rest = &candidate[end_index + 1..];
+    }
+    blocks
+}
 
 /// Every entry is a type whose publication would falsify a named claim in the
 /// seam's authorised re-export assessment, paired with the claim it protects.
@@ -588,15 +645,58 @@ fn the_seam_performs_no_filesystem_work() {
 }
 
 #[test]
-fn the_phase5_seam_has_no_durable_reservation_or_spool_capability() {
-    let found = hits(
-        &shipped_code(&read("src/lib.rs")),
-        &PHASE5_DURABLE_PUT_TOKENS,
-    );
+fn the_phase5_seam_has_no_durable_reservation_or_spool_capability_outside_the_drain_capability() {
+    let shipped = shipped_code(&read("src/lib.rs"));
+
+    // Cut this tranche: reserve_bound and record_upload_progress were never
+    // implemented (D-L3-2), so nothing may name their primitives anywhere,
+    // including inside FragmentDrainCapability itself.
+    let found = hits(&shipped, &PHASE5_DURABLE_PUT_TOKENS_FORBIDDEN_EVERYWHERE);
     assert!(
         found.is_empty(),
-        "the bounded fragment seam names WP-114 durable PUT capability {found:?}",
+        "the seam names {found:?}, which this tranche deliberately cut \
+         (D-L3-2: mark_spool_ready + attempt_drain only); a name on this list \
+         reappearing means reserve_bound or record_upload_progress came back",
     );
+}
+
+/// The three durable-PUT primitives `FragmentDrainCapability` legitimately
+/// reuses must not appear anywhere else in the seam. A caller reaching
+/// `bind_durable_put_body_from_ready` or `put_spool_ready` from outside the
+/// capability is a route around the drain seam to the durable PUT primitive,
+/// exactly as forbidden as it was before the capability existed — the
+/// capability is the one place that changed, not a general widening.
+#[test]
+fn the_drain_capability_is_the_only_place_the_reused_durable_put_primitives_appear() {
+    let shipped = shipped_code(&read("src/lib.rs"));
+
+    let capability_blocks = all_blocks_after(&shipped, "impl FragmentDrainCapability", '{', '}');
+    assert!(
+        !capability_blocks.is_empty(),
+        "expected at least one `impl FragmentDrainCapability` block to scan; \
+         either the capability was renamed and this pin needs updating, or it \
+         does not exist and this pin is scanning nothing",
+    );
+    let inside: String = capability_blocks.concat();
+    let mut outside = shipped.clone();
+    for block in &capability_blocks {
+        outside = outside.replacen(block.as_str(), "", 1);
+    }
+
+    for token in DRAIN_CAPABILITY_CONFINED_TOKENS {
+        assert!(
+            inside.contains(token),
+            "{token} was expected inside FragmentDrainCapability's own impl \
+             block; if it moved, this pin's confinement claim needs \
+             re-deriving against the new location, not deleting",
+        );
+        assert!(
+            !outside.contains(token),
+            "{token} appears outside FragmentDrainCapability's own impl \
+             block — a route around the drain seam to the durable PUT \
+             primitive it is supposed to be the only caller of",
+        );
+    }
 }
 
 /// The filesystem rule scans one file, so the crate must be one file, and it
@@ -836,4 +936,115 @@ fn the_cell_retention_client_buys_only_the_retention_procedures() {
         !methods.iter().any(|method| method == "pool"),
         "a pool accessor on CellRetentionClient falsifies \"a dispatch client cannot be constructed\"",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Rule 5: FragmentDrainCapability (WP-114 CD-6, tranche D-L3-2) — the
+// mechanism, not the assertion
+// ---------------------------------------------------------------------------
+
+/// `FragmentDrainCapability`'s public method set, exhaustively. The privacy
+/// story is "private fields, no accessor" — this is the test that actually
+/// holds it: a compile-fail fixture calling a guessed accessor name only
+/// proves *that spelling* is absent, while this equality check proves the
+/// whole public surface is exactly two methods, named. Same idiom as
+/// [`the_cell_retention_client_buys_only_the_retention_procedures`] above,
+/// same equality-not-containment reasoning: a containment check passes just
+/// as happily once the scan has quietly stopped seeing methods.
+///
+/// Tranche D-L3-2 cut `reserve_bound` and `record_upload_progress` from this
+/// build entirely (a ≤256 KiB spooled body is one chunk), so the permitted
+/// set is two, not the four the ratified design named as an eventual full
+/// surface.
+#[test]
+fn the_drain_capability_exposes_exactly_mark_spool_ready_and_attempt_drain() {
+    const PERMITTED: [&str; 2] = ["mark_spool_ready", "attempt_drain"];
+
+    let shipped = shipped_code(&read("src/lib.rs"));
+    let capability_blocks = all_blocks_after(&shipped, "impl FragmentDrainCapability", '{', '}');
+    assert!(
+        !capability_blocks.is_empty(),
+        "expected at least one `impl FragmentDrainCapability` block to scan",
+    );
+
+    let mut methods = Vec::new();
+    for block in &capability_blocks {
+        let mut rest = strip_line_comments(block);
+        while let Some(offset) = rest.find("pub fn ").or_else(|| rest.find("pub async fn ")) {
+            let tail = rest[offset..]
+                .trim_start_matches("pub ")
+                .trim_start_matches("async ")
+                .trim_start_matches("fn ");
+            let end = tail.find(['(', '<']).expect("a method name ends somewhere");
+            methods.push(tail[..end].trim().to_string());
+            rest = rest[offset + 7..].to_string();
+        }
+    }
+    methods.sort();
+    let mut permitted: Vec<String> = PERMITTED.iter().map(|name| (*name).to_string()).collect();
+    permitted.sort();
+    assert_eq!(
+        methods, permitted,
+        "FragmentDrainCapability's public method set changed. A new method \
+         (reserve_bound, record_upload_progress, or an accessor) was assessed \
+         under a different tranche or not at all: add it here and say why it \
+         is safe, or it must not be public. A missing expected method means \
+         the scan stopped seeing methods and is proving nothing.",
+    );
+    for forbidden in ["pool", "dispatch", "gateway", "entry"] {
+        assert!(
+            !methods.iter().any(|method| method == forbidden),
+            "a `{forbidden}` accessor on FragmentDrainCapability falsifies \
+             \"no accessor returns the pool, the dispatch client, the \
+             gateway, or the entry\"",
+        );
+    }
+}
+
+/// `FragmentDrainCapability` declares no `pub` field — the same shape as the
+/// attestation pin ([`only_a_real_readback_can_mint_a_cell_schema_attestation`]):
+/// a public field is a one-word widening that compiles clean and defeats the
+/// "private fields, no accessor" mechanism the method-set pin above assumes.
+#[test]
+fn the_drain_capability_declares_no_public_field() {
+    let shipped = shipped_code(&read("src/lib.rs"));
+    let declaration = block_after(&shipped, "pub struct FragmentDrainCapability {", '{', '}');
+    let Some(body) = declaration.split_once('{').map(|(_, body)| body) else {
+        panic!("the FragmentDrainCapability declaration must have a body, got {declaration}");
+    };
+    assert!(
+        !body.contains("pub "),
+        "FragmentDrainCapability has a public field, so a caller can read it \
+         directly regardless of the method-set pin, got {declaration}",
+    );
+}
+
+/// `FragmentDrainAttempt` — the caller-supplied argument to `attempt_drain` —
+/// must not let a caller name a traffic class, an attempt class, a declared
+/// size, a declared hash, or a target. The class is forced by the seam; the
+/// size and hash come from the bound spooled body, never from the caller
+/// (plan §3.2). This is the structural half of that claim; the compile-fail
+/// fixture in `drain_capability_compile_fail.rs` demonstrates the diagnostic.
+#[test]
+fn the_drain_attempt_cannot_name_a_traffic_class_or_declared_size() {
+    let shipped = shipped_code(&read("src/lib.rs"));
+    let declaration = block_after(&shipped, "pub struct FragmentDrainAttempt {", '{', '}');
+    for forbidden in [
+        "traffic_class",
+        "attempt_class",
+        "declared_size",
+        "declared_blake3",
+        "target",
+    ] {
+        assert!(
+            !declaration.contains(forbidden),
+            "FragmentDrainAttempt must not let a caller name a {forbidden}, got {declaration}",
+        );
+    }
+    for expected in ["logical_request_id", "attempt_id", "attempt_ordinal"] {
+        assert!(
+            declaration.contains(expected),
+            "the extracted declaration must be the real one, got {declaration}",
+        );
+    }
 }

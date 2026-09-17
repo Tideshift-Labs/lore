@@ -29,3 +29,11 @@ path = "src/bound_provider_attempt_audit_cannot_be_constructed.rs"
 [[bin]]
 name = "compact-receipt-input-rejects-unbound-audit"
 path = "src/compact_receipt_input_rejects_unbound_audit.rs"
+
+[[bin]]
+name = "drain-capability-no-internal-accessor"
+path = "src/drain_capability_no_internal_accessor.rs"
+
+[[bin]]
+name = "drain-attempt-cannot-name-forbidden-fields"
+path = "src/drain_attempt_cannot_name_forbidden_fields.rs"
