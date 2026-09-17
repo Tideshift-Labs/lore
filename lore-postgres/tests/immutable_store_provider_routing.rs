@@ -116,11 +116,18 @@ fn coordinated_put_and_direct_provider_io_hold_no_store_connection_transaction_o
 fn ordinary_direct_write_supplies_the_legacy_hash_key_but_missing_uses_a_repair_epoch_key() {
     let immutable = source("src/store/immutable_store.rs");
     let ordinary = function(&immutable, "async fn put_coordinated(");
-    assert!(ordinary.contains(
-        ".upload_coordinated_representation(coordinator, provider, address, fragment, payload)"
+    // Whitespace-insensitive (no separator, matching this file's own
+    // `entry.split_whitespace().collect()` pattern below for the same
+    // reason): rustfmt wraps this call one-argument-per-line, with a
+    // trailing comma, once it is nested inside a match arm, and has already
+    // done so once (write-behind's admission-mode branch). Pin the call
+    // shape and argument order, not the line wrapping or trailing comma.
+    let ordinary_compact: String = ordinary.split_whitespace().collect();
+    assert!(ordinary_compact.contains(
+        ".upload_coordinated_representation(coordinator,provider,address,fragment,payload"
     ));
-    assert!(ordinary.contains(
-        ".create_association_if_current(&witness, repository.data(), address.context.data())"
+    assert!(ordinary_compact.contains(
+        ".create_association_if_current(&witness,repository.data(),address.context.data())"
     ));
     let coordinated = function(&immutable, "async fn upload_coordinated_representation(");
     assert!(coordinated.contains("let legacy_key = Self::hash_key(address.hash);"));
@@ -178,8 +185,11 @@ fn coordinated_put_without_payload_is_db_only_and_requires_an_exact_readable_ass
     let none = coordinated
         .find("let Some(payload) = payload else")
         .expect("None branch");
+    // Anchor on the binding itself, not what follows it on the same line --
+    // this now reads `let witness = match self` (write-behind's route match),
+    // and the exact RHS shape is not this test's property to pin.
     let preflight = coordinated
-        .find("let witness = self")
+        .find("let witness =")
         .expect("payload path");
     let none_branch = &coordinated[none..preflight];
 
