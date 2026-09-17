@@ -51,6 +51,16 @@ FROM (SELECT object_store_retention.object_store_dispatch_charge_provider_attemp
   $7::text::object_store_retention.uint64, $8, $9, $10, $11, $12
 ) AS r) q";
 
+// CR-034's head read. Two columns of one row of one table, through the only function the runtime
+// role may execute against the head. The `::text` cast on the uint64 domain mirrors CHARGE_SQL.
+const HEAD_READ_SQL: &str = "SELECT
+  (r).result_code,
+  (r).allocation_revision,
+  ((r).allocation_fence)::text
+FROM (SELECT object_store_retention.object_store_dispatch_read_current_budget_pin_v1(
+  $1, $2
+) AS r) q";
+
 // Three attempts total: retry after the first two, never after the last.
 const MUTATION_RETRY_SCHEDULE: [Option<Duration>; 3] = [
     Some(Duration::from_millis(25)),
@@ -318,6 +328,111 @@ impl ProviderChargeAuthority for PostgresProviderChargeAuthority {
         }
         Err(ProviderChargeError::AuthorityUnavailable)
     }
+
+    async fn refresh_budget_pin(
+        &self,
+        provider_boundary_id: &str,
+    ) -> Result<BudgetPin, ProviderChargeError> {
+        self.read_current_pin(provider_boundary_id).await
+    }
+}
+
+/// CR-034's head read.
+///
+/// **This block is placed after `charge_once` and after `charge_on_lease` deliberately.**
+/// `tests/shared_dispatch_pool.rs` proves the charge path's session disposition by mutating the
+/// *first* textual occurrence of `tokio::time::timeout_at(` and of `lease.poison();` in this file
+/// and requiring the proof to fail. A leased, timed-out helper placed above `charge_once` silently
+/// absorbs those mutations and turns those negative controls green against an unchanged charge
+/// path. Keep any future leased helper below the charge path for the same reason.
+impl PostgresProviderChargeAuthority {
+    /// Read the cell's currently published budget pin for one provider boundary.
+    ///
+    /// This exists so a writer fenced by a renewal can learn what the head became without a
+    /// restart. It commits nothing, so it never returns `AmbiguousCommit` or
+    /// `AttemptAlreadyCharged`: every failure -- pool, timeout, decode, or a non-`HEAD` result
+    /// code -- is `ConfigurationUnresolved`, a typed decisive refusal.
+    ///
+    /// It takes no boundary advisory lock. The database function is `STABLE`; taking
+    /// `CHARGE_BOUNDARY_LOCK_SQL` here would serialize head reads behind in-flight charges for no
+    /// benefit. It borrows the same runtime pool the charge uses and is serial with the charge it
+    /// retries, so it adds no concurrent lease demand.
+    async fn read_current_pin(
+        &self,
+        provider_boundary_id: &str,
+    ) -> Result<BudgetPin, ProviderChargeError> {
+        let mut lease = self.pool.acquire().await.map_err(|error| {
+            // DispatchPoolError carries only closed, redaction-safe diagnostics.
+            tracing::warn!(
+                stage = "head_read_pool_acquire",
+                reason = ?error,
+                "Provider budget head read refused"
+            );
+            ProviderChargeError::ConfigurationUnresolved
+        })?;
+        let head_read_deadline = tokio::time::Instant::now() + self.pool.operation_timeout();
+        let preamble = self.pool.bounded_execution_preamble();
+        // The preamble is SET LOCAL, so it needs a transaction to scope it. ReadCommitted is
+        // sufficient for a single STABLE read and, unlike the charge, needs no serializable
+        // snapshot: nothing is debited and no CAS is taken.
+        let read = tokio::time::timeout_at(head_read_deadline, async {
+            let client = lease.client().map_err(|_| ())?;
+            let transaction = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::ReadCommitted)
+                .start()
+                .await
+                .map_err(|_| ())?;
+            transaction.batch_execute(&preamble).await.map_err(|_| ())?;
+            let row = transaction
+                .query_one(
+                    HEAD_READ_SQL,
+                    &[&PROVIDER_CHARGE_API_REVISION_V1, &provider_boundary_id],
+                )
+                .await
+                .map_err(|_| ())?;
+            let decoded = decode_head_read_row(&row);
+            transaction.commit().await.map_err(|_| ())?;
+            Ok::<_, ()>(decoded)
+        })
+        .await;
+        let timed_out = read.is_err();
+        match read {
+            Ok(Ok(decoded)) => {
+                lease.release().await;
+                decoded
+            }
+            // A timed-out or failed read leaves the session's transaction state unproven, so the
+            // connection is retired rather than returned to the shared pool.
+            Ok(Err(())) | Err(_) => {
+                tracing::warn!(
+                    stage = "head_read",
+                    timed_out,
+                    "Provider budget head read refused"
+                );
+                lease.poison();
+                Err(ProviderChargeError::ConfigurationUnresolved)
+            }
+        }
+    }
+}
+
+/// `HEAD` yields the published pin; every other result code, and every decode or grammar failure,
+/// is `ConfigurationUnresolved`. A read commits nothing, so no arm here may be ambiguous.
+fn decode_head_read_row(row: &tokio_postgres::Row) -> Result<BudgetPin, ProviderChargeError> {
+    let result_code: &str = row
+        .try_get(0)
+        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+    if result_code != "HEAD" {
+        return Err(ProviderChargeError::ConfigurationUnresolved);
+    }
+    let revision: String = row
+        .try_get(1)
+        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+    let fence = parse_u64_text(row, 2)?;
+    // BudgetPin::new re-runs the same pin grammar every governed charge checks, so a head the cell
+    // somehow published outside that grammar is refused here rather than carried into a charge.
+    BudgetPin::new(&revision, fence).map_err(|_| ProviderChargeError::ConfigurationUnresolved)
 }
 
 enum ChargeAttempt {

@@ -168,12 +168,13 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     assert_eq!(report.attestation.replaced_functions_revoked, 4);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
-    // The install set is 20 artifacts; nothing outside it may have been applied. WP-114 CD-4 added
-    // 0021 and 0022 for the dark shared provider-budget limiter, and CD-8 added 0023 and 0024 for
-    // cell-scale retention. This literal is a deliberate manual tripwire (like
-    // `tests/cell_schema_install.rs`'s `CELL_INSTALLED_MIGRATION_NUMBERS`): a future migration must
-    // update it, not silently pass by comparing the constant to itself.
-    assert_eq!(CELL_INSTALL_SET.len(), 20);
+    // The install set is 21 artifacts; nothing outside it may have been applied. WP-114 CD-4 added
+    // 0021 and 0022 for the dark shared provider-budget limiter, CD-8 added 0023 and 0024 for
+    // cell-scale retention, and CR-034 added 0025 for the runtime budget-pin head read. This
+    // literal is a deliberate manual tripwire (like `tests/cell_schema_install.rs`'s
+    // `CELL_INSTALLED_MIGRATION_NUMBERS`): a future migration must update it, not silently pass by
+    // comparing the constant to itself.
+    assert_eq!(CELL_INSTALL_SET.len(), 21);
 
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...

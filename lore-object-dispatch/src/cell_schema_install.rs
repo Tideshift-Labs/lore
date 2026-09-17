@@ -123,7 +123,7 @@ macro_rules! cell_migration {
 }
 
 /// CR-033 D5's cell install set, in install order.
-pub const CELL_INSTALL_SET: [CellMigration; 20] = [
+pub const CELL_INSTALL_SET: [CellMigration; 21] = [
     cell_migration!(
         2,
         "0002_object_store_retention_authority.sql",
@@ -223,6 +223,11 @@ pub const CELL_INSTALL_SET: [CellMigration; 20] = [
         24,
         "0024_object_store_dispatch_cell_retention_provisioning.sql",
         "1c4da52ea7d7ae362038e1c1258d73195934022876a49eadbf8c2844ff48cb52"
+    ),
+    cell_migration!(
+        25,
+        "0025_object_store_dispatch_budget_head_read.sql",
+        "cd576219f08478998f47c08fa1542765760118191a376724cbbf1d4482fac42f"
     ),
 ];
 
@@ -913,6 +918,15 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// like any other relation. `constraints` and `function_acls` correctly stayed still -- the round
 /// added no constraint, created no function and revoked none -- and so did the same four that
 /// stayed still the first time.
+///
+/// Re-measured for CR-034's migration 0025, the runtime budget-pin head read. **Exactly two
+/// sections moved: `functions` and `function_acls`.** That two-section split is the whole check on
+/// 0025 and was predicted before the measurement, which is why the migration reuses the existing
+/// `dispatch_budget_publication_result_v1` composite instead of declaring one of its own: a new
+/// composite type would have moved `types` and `columns` as well and made the split unreadable.
+/// 0025 creates one function and one grant, adds no relation, no column, no constraint, no index
+/// and no type, so a move in any of the other ten sections would have meant the migration did
+/// something it does not claim to do. The other ten held still.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
     hex32("316036b2379716cfa8f437588afff7b0e51f5158c04146525589e9bfc00e07a4"),
@@ -920,8 +934,8 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("5c0279033f49f711b0ef2a70144a314a670b789fe27afd57129a4122f6ca294c"),
     hex32("e73d69307f2270734c4acb7b0e35e6fae8348abdbf88bec1b78d15ba7cfaec72"),
     hex32("f7f3af85ac11837251f1814f7e721f9f2df634bfcacb49782cd34f51c5879687"),
-    hex32("11bdc5927ce99423041176c5687b03e878ccd5a28a5e0f2d841975af25e5d929"),
-    hex32("8b0520688bb7ccd78c8ba7260e46331ddb50d04d7784fd69fffc5d14006ecaf6"),
+    hex32("99ba715475d61c65393cb42a54aafd2341ba23f32bddddce3b4fa0c1c07b415a"),
+    hex32("b5063dc0c02feafa2decaedcd73057af6682a52baa02aaca5530319bce328218"),
     hex32("ceb77a757063fe3514a25f80be242a241943cab76539cf201550a1fc976443d4"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
     hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
@@ -934,7 +948,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("0451b224cb7e8470fa27bd4c2673822dc515203565ec91ed51bcd92287939d1c");
+    hex32("ed7c07f323cd32412f77bc614741fa870da3a969c9668ff939ab80fcd2a94426");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {

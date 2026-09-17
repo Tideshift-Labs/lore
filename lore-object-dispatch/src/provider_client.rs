@@ -59,6 +59,8 @@
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::PoisonError;
+use std::sync::RwLock;
 
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use thiserror::Error;
@@ -924,6 +926,23 @@ impl ProviderChargeRequest {
         self.deadline_unix_ms
     }
 
+    /// Rebind this charge to a refreshed budget pin, leaving every other field exactly as it was.
+    ///
+    /// Crate-private and consuming, for the reason the type has no public constructor and no
+    /// `Clone`: this must not become a second way to obtain a chargeable value. It revalidates the
+    /// pin with the same grammar [`GovernedProviderClient::authorize_charge`] applied when the
+    /// original request was built, so a refreshed pin is held to the check the caller's was.
+    ///
+    /// The attempt identity, ordinal and deadline are deliberately carried across unchanged: the
+    /// retry is the same attempt, so the cell's `ATTEMPT_ALREADY_CHARGED` guard still covers it.
+    fn rebound_to_pin(self, pin: BudgetPin) -> Result<Self, ProviderClientError> {
+        validate_budget_pin(&pin)?;
+        Ok(Self {
+            budget_pin: pin,
+            ..self
+        })
+    }
+
     /// Every cap this charge must consume atomically: the cell's one shared physical budget, the
     /// traffic class cap, and the stricter listing cap when the attempt is a listing.
     pub fn cap_classes(&self) -> Vec<ProviderCapClass> {
@@ -1052,6 +1071,32 @@ pub trait ProviderChargeAuthority {
         &self,
         request: &ProviderChargeRequest,
     ) -> impl Future<Output = Result<ProviderChargeGrant, ProviderChargeError>> + Send;
+
+    /// Read the cell's currently published budget pin for one provider boundary (CR-034).
+    ///
+    /// [`GovernedProviderClient::execute`] calls this at most once per attempt, and only after the
+    /// authority has already answered [`ProviderChargeError::BudgetPinRejected`], the cell's
+    /// verdict that the pin this writer holds is no longer the head. Without it, publishing
+    /// revision N+1 fences every writer still pinned to N until the process restarts, so a renewal
+    /// is an outage window.
+    ///
+    /// This commits nothing and charges nothing. An implementation must therefore never return
+    /// [`ProviderChargeError::AmbiguousCommit`], [`ProviderChargeError::AttemptAlreadyCharged`], or
+    /// [`ProviderChargeError::RecoveredCommittedCharge`] from it: those three are the arms that
+    /// claim a durable charge may exist, and a read cannot create one.
+    ///
+    /// The default is a refusal, so every existing implementor keeps its current behaviour exactly.
+    /// It refuses with [`ProviderChargeError::ConfigurationUnresolved`] rather than
+    /// `BudgetPinRejected`, because `BudgetPinRejected` is a verdict the cell issues after comparing
+    /// a pin against the head. An authority with no head-read capability has issued no such verdict,
+    /// and saying otherwise would put a server verdict in the mouth of a client that never asked.
+    /// Both map to the same disposition; the refusal is simply honest about whose it is.
+    fn refresh_budget_pin(
+        &self,
+        _provider_boundary_id: &str,
+    ) -> impl Future<Output = Result<BudgetPin, ProviderChargeError>> + Send {
+        async { Err(ProviderChargeError::ConfigurationUnresolved) }
+    }
 }
 
 struct ChargeCancellationGuard<'a> {
@@ -1073,10 +1118,6 @@ impl<'a> ChargeCancellationGuard<'a> {
 
     fn disarm(&mut self) {
         self.armed = false;
-    }
-
-    fn ledger(&mut self) -> &mut ProviderAttemptLedger {
-        self.ledger
     }
 
     fn record_committed_grant(&mut self) -> Result<(), ProviderClientError> {
@@ -1839,6 +1880,26 @@ pub struct GovernedProviderClient<C, T> {
     retry_policy: ProviderRetryPolicy,
     charge_authority: C,
     transport: T,
+    /// CR-034's renewal override: the pin a refresh found and a retry then proved chargeable.
+    ///
+    /// `None` means no renewal has been observed on this client, and the pin each caller supplies
+    /// is used as it always was. The caller-supplied pin is therefore the *initial* value, not the
+    /// permanent one.
+    ///
+    /// Stored only on `Ok`, never at accept time. A head that is published but not yet resolvable
+    /// would otherwise become sticky for every later attempt on this client until the process
+    /// restarted, which is the exact failure this whole change exists to remove.
+    ///
+    /// Two handling rules this type forces, both load-bearing:
+    ///
+    /// - **The read guard is `!Send`, so it must never be held across an `await`.** Holding it
+    ///   across the charge would make `execute_metered`'s future `!Send` and break the boxed
+    ///   provider sink `lore-fragment-provider` constructs. Every access below clones the pin
+    ///   inside a scoped block and drops the guard first.
+    /// - **Poisoning is not a reason to fail an attempt.** The value under the lock is a plain
+    ///   `BudgetPin` with no multi-step invariant a panicking writer could have left half-built, so
+    ///   both accesses take `PoisonError::into_inner` rather than `unwrap`, which is banned here.
+    refreshed_pin: RwLock<Option<BudgetPin>>,
 }
 
 impl<C, T> GovernedProviderClient<C, T>
@@ -1859,6 +1920,7 @@ where
             retry_policy,
             charge_authority,
             transport,
+            refreshed_pin: RwLock::new(None),
         }
     }
 
@@ -1941,42 +2003,122 @@ where
         if ledger.no_dispatch_count() != 0 {
             return Err(ProviderClientError::DispatchAfterNoDispatch);
         }
-        let (charge_request, prepared) = self.authorize_input(input)?;
-
-        // The authority contract permits the database commit to outlive a dropped future. Arm the
-        // ledger before polling it, then disarm only after a concrete result is in hand.
-        let mut charge_guard = ChargeCancellationGuard::new(
-            ledger,
-            charge_request.attempt_id(),
-            charge_request.attempt_ordinal(),
-        );
-        let charge_result = self.charge_authority.charge(&charge_request).await;
-        charge_guard.disarm();
-        let grant = match charge_result {
-            Ok(grant) => grant,
-            Err(ProviderChargeError::AmbiguousCommit) => {
-                // The commit is unresolved, so conservative charging counts the grant and forbids
-                // the send. This is the valid, nonrefundable grant-without-attempt window.
-                charge_guard.record_committed_grant()?;
-                return Err(ProviderClientError::ChargeAmbiguous);
-            }
-            Err(ProviderChargeError::RecoveredCommittedCharge) => {
-                charge_guard.record_committed_grant()?;
-                return Err(ProviderClientError::ChargeRecovered);
-            }
-            Err(error) => return Err(ProviderClientError::ChargeRefused(error)),
+        let (mut charge_request, prepared) = self.authorize_input(input)?;
+        // CR-034. Prefer a pin an earlier refresh already proved chargeable on this client, so a
+        // writer that has renewed once does not pay a BUDGET_PIN_REJECTED round-trip on every
+        // later attempt. The guard is cloned out and dropped here, before any await.
+        let refreshed_override = {
+            let guard = self
+                .refreshed_pin
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.clone()
         };
+        if let Some(pin) = refreshed_override
+            && &pin != charge_request.budget_pin()
+        {
+            charge_request = charge_request.rebound_to_pin(pin)?;
+        }
+
+        // CR-034's bound: exactly one refresh and one retry per call, in a local counter rather
+        // than shared state or a config key. A second refresh within one attempt could only help
+        // if the head moved twice during one charge, which the successor-fence rule below refuses
+        // anyway, and a configurable bound invites a value that loops.
+        let mut refreshes_remaining: u32 = 1;
+        let mut refreshed_to: Option<BudgetPin> = None;
+        let grant = loop {
+            // The authority contract permits the database commit to outlive a dropped future. Arm
+            // the ledger before polling it, then disarm only after a concrete result is in hand.
+            let mut charge_guard = ChargeCancellationGuard::new(
+                ledger,
+                charge_request.attempt_id(),
+                charge_request.attempt_ordinal(),
+            );
+            let charge_result = self.charge_authority.charge(&charge_request).await;
+            charge_guard.disarm();
+            match charge_result {
+                Ok(grant) => break grant,
+                Err(ProviderChargeError::AmbiguousCommit) => {
+                    // The commit is unresolved, so conservative charging counts the grant and
+                    // forbids the send. This is the valid, nonrefundable grant-without-attempt
+                    // window.
+                    charge_guard.record_committed_grant()?;
+                    return Err(ProviderClientError::ChargeAmbiguous);
+                }
+                Err(ProviderChargeError::RecoveredCommittedCharge) => {
+                    charge_guard.record_committed_grant()?;
+                    return Err(ProviderClientError::ChargeRecovered);
+                }
+                Err(ProviderChargeError::BudgetPinRejected) if refreshes_remaining > 0 => {
+                    // The cell refuses a stale pin *before* its grant CAS and before the bucket
+                    // loop, so nothing was debited under the old pin and there is no overlap
+                    // window to double-spend. The retry reuses the same attempt identity, so a
+                    // charge that had somehow committed would come back as
+                    // `ATTEMPT_ALREADY_CHARGED` rather than charge twice.
+                    refreshes_remaining -= 1;
+                    drop(charge_guard);
+                    let refreshed = match self
+                        .charge_authority
+                        .refresh_budget_pin(charge_request.provider_boundary_id())
+                        .await
+                    {
+                        Ok(pin) => pin,
+                        // Report the refusal that actually happened to this attempt. The read's
+                        // own error is not the cell's verdict on the charge.
+                        Err(_) => {
+                            return Err(ProviderClientError::ChargeRefused(
+                                ProviderChargeError::BudgetPinRejected,
+                            ));
+                        }
+                    };
+                    // Successor-only, the exact predicate publish enforces. A head at N+2 or
+                    // higher is a generation whose accounting this writer never saw, and a fence
+                    // that did not move forward is not a renewal at all. Both stay a typed
+                    // decisive refusal and still need the restart cutover.
+                    let successor = charge_request.budget_pin().fence.checked_add(1);
+                    if Some(refreshed.fence) != successor
+                        || refreshed.revision == charge_request.budget_pin().revision
+                    {
+                        return Err(ProviderClientError::ChargeRefused(
+                            ProviderChargeError::BudgetPinRejected,
+                        ));
+                    }
+                    refreshed_to = Some(refreshed.clone());
+                    // The deadline is deliberately not extended. If the head read burned what was
+                    // left, the retry returns DEADLINE_EXCEEDED, which is already a transient
+                    // disposition, and the caller's next attempt starts from the stored pin.
+                    charge_request = charge_request.rebound_to_pin(refreshed)?;
+                }
+                Err(error) => return Err(ProviderClientError::ChargeRefused(error)),
+            }
+        };
+
+        // Only now, with a charge proved against it, does the refreshed pin become this client's
+        // override. Storing it at accept time would make an unchargeable head sticky until restart.
+        if let Some(pin) = refreshed_to {
+            let mut guard = self
+                .refreshed_pin
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            *guard = Some(pin);
+        }
 
         if let Err(error) = validate_grant(&charge_request, &grant) {
             // A returned grant may have committed even though it does not describe this attempt,
             // so it is counted and never refunded, and the ledger closes rather than sending.
-            charge_guard.record_committed_grant()?;
-            return Err(charge_guard.ledger().poison(error));
+            ledger.record_committed_grant_for(
+                charge_request.attempt_id(),
+                charge_request.attempt_ordinal(),
+            )?;
+            return Err(ledger.poison(error));
         }
-        charge_guard.record_committed_grant()?;
+        ledger.record_committed_grant_for(
+            charge_request.attempt_id(),
+            charge_request.attempt_ordinal(),
+        )?;
 
         let attempt = AuthorizedProviderAttempt::new(prepared, &grant, self.retry_policy);
-        let mut transport_guard = TransportCancellationGuard::new(charge_guard.ledger());
+        let mut transport_guard = TransportCancellationGuard::new(ledger);
         let report = match self.transport.issue(&attempt, operation).await {
             Ok(report) => report,
             Err(refusal) => {
