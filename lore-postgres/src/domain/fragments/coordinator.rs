@@ -80,6 +80,7 @@ use crate::domain::fragments::provider::FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLI
 use crate::domain::fragments::schema;
 use crate::domain::fragments::states::EpochAuthority;
 use crate::domain::fragments::states::FragmentLifecycleState;
+use crate::domain::fragments::states::FragmentWriteClaimKind;
 use crate::domain::fragments::states::FragmentWriteClaimState;
 use crate::domain::fragments::states::MissingDiagnostic;
 use crate::domain::lock_order::LockClass;
@@ -110,6 +111,15 @@ pub const MAX_LIFECYCLE_GENERATION_FANOUT: usize = MAX_PUSH_FRAGMENT_REVALIDATIO
 
 const DIRECT_WRITE_NORMAL_OPERATION: [u8; 16] = *b"wp118-direct-v1N";
 const DIRECT_WRITE_REPAIR_OPERATION: [u8; 16] = *b"wp118-direct-v1R";
+/// Exclusive promotion ownership of a `Staged` head.
+///
+/// Lives in the same `active_operation` column as the direct-write tokens. The
+/// column is nullable with no state-linked CHECK, and a `Staged` head carried
+/// no token before WP-115, so this value is unambiguous: only a promotion
+/// stamps it, and only on a `Staged` head. `obliterate_origin_from_head` maps
+/// `Staged` without reading the column, so stamping it changes no obliterate
+/// behaviour.
+const PROMOTION_OPERATION: [u8; 16] = *b"wp115-promote-v1";
 const OBLITERATE_OPERATION_PREFIX: [u8; 12] = *b"wp118-del-v1";
 const OBLITERATE_ORIGIN_PREPARING_STAGE: u8 = 1;
 const OBLITERATE_ORIGIN_PREPARING_REMOTE_NORMAL: u8 = 2;
@@ -362,7 +372,15 @@ impl FragmentLifecycleReadiness {
             && ((self.backfill_state == schema::BACKFILL_CUTOVER && self.cutover_at_present)
                 || (self.clean_initialized
                     && self.backfill_state == schema::BACKFILL_NOT_STARTED
-                    && self.schema_version >= 3
+                    // Raised from 3 for WP-115, and fail-closed on purpose.
+                    // `FRAGMENT_SCHEMA_RELATIONS` is a relation-level probe and
+                    // cannot see a missing COLUMN, so a cell provisioned at
+                    // revision 3 and never given
+                    // `0002_fragment_promotion_send_claims.sql` would otherwise
+                    // pass readiness against a revision-4 binary and then die at
+                    // runtime on SQLSTATE 42703 at the first promotion. At `>= 4`
+                    // it routes legacy instead.
+                    && self.schema_version >= 4
                     && self.lifecycle_enabled
                     && self.write_capability.claims_required()))
             && self.same_database
@@ -683,12 +701,23 @@ pub struct FragmentWriteClaim {
     logical_request_id: [u8; 16],
     attempt_id: [u8; 16],
     hash: Vec<u8>,
+    /// The epoch this attempt will publish. For a promotion that is the
+    /// **remote successor**, never the staged source.
     epoch: i64,
     fence: i64,
     authority: EpochAuthority,
     object_key: String,
     body_blake3: [u8; 32],
     body_size: u64,
+    /// Which lineage this claim binds. Carried in the value, not only in the
+    /// row, so `authorize_write_claim` decides on the kind rather than
+    /// inferring it from whatever state the head happens to be in.
+    kind: FragmentWriteClaimKind,
+    /// The exact staged epoch a promotion was admitted against. `None` for a
+    /// direct write or a repair; the database CHECK holds the same shape.
+    source_epoch: Option<i64>,
+    /// The exact staged manifest a promotion was admitted against.
+    source_manifest_id: Option<Vec<u8>>,
     send_not_after: SystemTime,
     hard_not_after: SystemTime,
 }
@@ -728,6 +757,22 @@ impl FragmentWriteClaim {
 
     pub fn body_size(&self) -> u64 {
         self.body_size
+    }
+
+    pub fn kind(&self) -> FragmentWriteClaimKind {
+        self.kind
+    }
+
+    /// The staged epoch a promotion was admitted against, `None` for every
+    /// other kind.
+    pub fn source_epoch(&self) -> Option<i64> {
+        self.source_epoch
+    }
+
+    /// The staged manifest a promotion was admitted against, `None` for every
+    /// other kind.
+    pub fn source_manifest_id(&self) -> Option<&[u8]> {
+        self.source_manifest_id.as_deref()
     }
 
     pub fn send_not_after(&self) -> SystemTime {
@@ -884,6 +929,22 @@ struct FragmentWriteClaimLineage<'a> {
     fence: i64,
     authority: EpochAuthority,
     object_key: &'a str,
+    kind: FragmentWriteClaimKind,
+    /// The staged witness a promotion was admitted against, read off the head
+    /// this caller already holds `FOR UPDATE`. `None` for every other kind.
+    ///
+    /// It lives here rather than on [`FragmentWriteClaimInput`] because the
+    /// witness is not the caller's to supply: it is whatever the locked head
+    /// said at admission. Carrying it in the lineage is also what makes
+    /// `create_write_claim_locked`'s `expected` equality reject a replay of one
+    /// attempt id against a head that has since moved.
+    source: Option<FragmentPromotionSource<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FragmentPromotionSource<'a> {
+    epoch: i64,
+    manifest_id: &'a [u8],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2339,16 +2400,68 @@ impl PostgresFragmentCoordinator {
         let mut sequence = LockSequence::new();
         let head = lock_fragment_head(&tx, &mut sequence, &claim.hash).await?;
         failpoint!("claim.authorize.locked")?;
-        let lineage_matches = head.as_ref().is_some_and(|head| {
-            head.current_epoch == claim.epoch
-                && head.last_fence == claim.fence
-                && head.state == FragmentLifecycleState::PreparingRemote
-                && head.active_operation.as_deref().is_some_and(|token| {
-                    (token == DIRECT_WRITE_NORMAL_OPERATION
-                        && claim.object_key == legacy_hash_key(&claim.hash))
-                        || (token == DIRECT_WRITE_REPAIR_OPERATION
-                            && claim.object_key == repair_epoch_key(&claim.hash, claim.epoch))
-                })
+        // The durable row is read BEFORE admission is decided, and the lineage
+        // test below runs against `locked.claim` rather than the caller's copy.
+        //
+        // Defence in depth rather than a live hole: the durable comparison used
+        // to sit after the lineage test, and a forged claim that passed the
+        // lineage test still hit it and returned `InvalidInput` without
+        // committing, so no send was ever authorized. Deciding admission
+        // against durable state is simply the right shape.
+        //
+        // The reorder has one visible edge: an absent claim row now
+        // short-circuits here instead of falling through the lineage refusal
+        // first. That is the correct outcome — there is nothing to settle, and
+        // `settle_write_claim_locked` itself errors on an absent row — but it
+        // does change which error a caller sees when both conditions hold.
+        let Some(locked) = lock_write_claim_identity(
+            &tx,
+            &mut sequence,
+            &claim.logical_request_id,
+            &claim.attempt_id,
+        )
+        .await?
+        else {
+            return Err(DomainError::NotReady(
+                "fragment write claim is absent".to_owned(),
+            ));
+        };
+        if locked.claim != *claim {
+            return Err(DomainError::InvalidInput(
+                "fragment write claim binding does not match durable state".to_owned(),
+            ));
+        }
+        // One function, two kinds, and the kind is matched rather than inferred
+        // from the head: a `DirectWrite` claim presented against a `Staged`
+        // head and a `Promotion` claim presented against a `PreparingRemote`
+        // head must both be lineage refusals, not accidental matches.
+        let durable = &locked.claim;
+        let lineage_matches = head.as_ref().is_some_and(|head| match durable.kind {
+            FragmentWriteClaimKind::DirectWrite => {
+                head.current_epoch == durable.epoch
+                    && head.last_fence == durable.fence
+                    && head.state == FragmentLifecycleState::PreparingRemote
+                    && head.active_operation.as_deref().is_some_and(|token| {
+                        (token == DIRECT_WRITE_NORMAL_OPERATION
+                            && durable.object_key == legacy_hash_key(&durable.hash))
+                            || (token == DIRECT_WRITE_REPAIR_OPERATION
+                                && durable.object_key
+                                    == repair_epoch_key(&durable.hash, durable.epoch))
+                    })
+            }
+            // The head stays `Staged` for the whole promotion, so its
+            // `current_epoch` is the claim's SOURCE epoch and never the
+            // successor the claim will publish. The manifest is compared too:
+            // a same-epoch head whose manifest a repair replaced is a different
+            // representation.
+            FragmentWriteClaimKind::Promotion => {
+                head.state == FragmentLifecycleState::Staged
+                    && head.last_fence == durable.fence
+                    && Some(head.current_epoch) == durable.source_epoch
+                    && head.manifest_id.as_deref() == durable.source_manifest_id.as_deref()
+                    && head.active_operation.as_deref() == Some(PROMOTION_OPERATION.as_slice())
+                    && durable.object_key == legacy_hash_key(&durable.hash)
+            }
         });
         if !lineage_matches {
             let published_same_representation = match head.as_ref() {
@@ -2378,23 +2491,6 @@ impl PostgresFragmentCoordinator {
             });
         }
 
-        let Some(locked) = lock_write_claim_identity(
-            &tx,
-            &mut sequence,
-            &claim.logical_request_id,
-            &claim.attempt_id,
-        )
-        .await?
-        else {
-            return Err(DomainError::NotReady(
-                "fragment write claim is absent".to_owned(),
-            ));
-        };
-        if locked.claim != *claim {
-            return Err(DomainError::InvalidInput(
-                "fragment write claim binding does not match durable state".to_owned(),
-            ));
-        }
         if locked.state != FragmentWriteClaimState::Prepared {
             return Err(DomainError::PreconditionRejected {
                 reason: "fragment_write_claim_not_prepared".to_owned(),
@@ -2827,8 +2923,14 @@ impl PostgresFragmentCoordinator {
         .await
     }
 
-    /// Publish `Staged` plus its manifest, metering, and association
-    /// atomically, once the file is finalized and durable.
+    /// Publish `Staged` plus its epoch row, head, and metering atomically, once
+    /// the file is finalized and durable.
+    ///
+    /// It does **not** publish an association, despite what this comment said
+    /// until WP-115: `commit_publication` takes no repository id and no
+    /// context, and writes no `lore_fragment_associations` row anywhere.
+    /// Associations are bound separately by [`Self::create_association`] and
+    /// [`Self::create_association_if_current`], in their own transactions.
     pub async fn commit_staged(
         &self,
         intent: &FragmentIntent,
@@ -2860,13 +2962,32 @@ impl PostgresFragmentCoordinator {
         .await
     }
 
-    /// Begin a promotion from `Staged` to `Remote`.
+    /// Begin a promotion from `Staged` to `Remote`, with a durable send claim.
     ///
     /// The head stays `Staged` while the upload runs, so reads keep using the
     /// staged authority and nothing becomes unreadable during promotion. Only
     /// [`Self::commit_promotion`] switches it, and only after exact object
     /// verification.
-    pub async fn begin_promotion(&self, hash: &[u8]) -> Result<BeginOutcome, DomainError> {
+    ///
+    /// # Why the claim is mandatory rather than optional
+    ///
+    /// A worker lease alone must not authorize a provider send. This operation
+    /// used to stamp a fence and hand back `write_claim: None`, which left the
+    /// send unbound to any durable evidence. Leaving a claimless promotion
+    /// reachable would leave that hole open, so the claim is in the signature
+    /// rather than in an `Option` — the same choice `begin_publication_once`
+    /// makes when it refuses `(Remote, None)` outright.
+    ///
+    /// One short transaction does all of it: the exact staged witness is
+    /// checked, exclusive promotion ownership is taken, the remote successor
+    /// epoch and the operation fence are allocated, and the claim is persisted.
+    /// No file or provider I/O is reachable from here — the provider seam's
+    /// types are unnameable in this crate.
+    pub async fn begin_promotion(
+        &self,
+        hash: &[u8],
+        claim: FragmentWriteClaimInput,
+    ) -> Result<BeginOutcome, DomainError> {
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2886,6 +3007,37 @@ impl PostgresFragmentCoordinator {
                 head.state.label()
             )));
         }
+        // The exact staged witness, read off the head this transaction holds
+        // `FOR UPDATE`. It is captured rather than caller-supplied, because
+        // what the claim must bind is what the head says at admission. A
+        // readable head always carries a manifest — the
+        // `lore_fragment_lifecycle_readable_shape` CHECK makes the alternative
+        // unrepresentable — so an absent one here is damage, not a race.
+        let Some(source_manifest_id) = head.manifest_id.clone() else {
+            return Err(DomainError::Internal(
+                "a Staged fragment head has no manifest".to_owned(),
+            ));
+        };
+        // Exclusive promotion ownership. A `Staged` head carried no token
+        // before WP-115, so anything other than the promotion token is a
+        // lineage this operation does not understand rather than a contender
+        // to fence.
+        match head.active_operation.as_deref() {
+            None => {}
+            Some(token) if token == PROMOTION_OPERATION => {
+                // A prior promotion owns this head. Whether it may be taken
+                // over is decided by that attempt's claim, not by the token: a
+                // crashed worker must not wedge the hash forever, and the claim
+                // barrier below is the thing that knows when its late effect
+                // can no longer land. A takeover stamps a NEW fence, which is
+                // what fences the displaced owner's intent at commit.
+            }
+            Some(_) => {
+                return Err(DomainError::NotReady(
+                    "Staged fragment head carries an unknown active-operation token".to_owned(),
+                ));
+            }
+        }
         // Promotion allocates a NEW epoch, and must.
         //
         // The remote object is a different representation from the staged file:
@@ -2901,17 +3053,47 @@ impl PostgresFragmentCoordinator {
         // reader leases over it drain.
         let epoch = next_fence(&tx).await?;
         let fence = next_fence(&tx).await?;
-        stamp_operation_fence(&tx, hash, fence).await?;
+        let object_key = legacy_hash_key(hash);
+        let lineage = FragmentWriteClaimLineage {
+            hash,
+            epoch,
+            fence,
+            authority: EpochAuthority::Remote,
+            object_key: &object_key,
+            kind: FragmentWriteClaimKind::Promotion,
+            source: Some(FragmentPromotionSource {
+                epoch: head.current_epoch,
+                manifest_id: &source_manifest_id,
+            }),
+        };
+        let write_claim =
+            match create_write_claim_locked(&tx, &mut sequence, lineage, &claim).await? {
+                FragmentWriteClaimCreation::Created(claim) => claim,
+                FragmentWriteClaimCreation::BlockedUntil(hard_not_after) => {
+                    return Ok(BeginOutcome::WriteClaimBlocked { hard_not_after });
+                }
+            };
+        // The fence stamp and the ownership token move together: the token is
+        // what `authorize_write_claim` checks, and the fence is what fences a
+        // displaced owner's intent at `commit_publication`.
+        tx.execute(
+            "UPDATE lore_fragment_lifecycle \
+                SET last_fence = $2, active_operation = $3, updated_at = clock_timestamp() \
+              WHERE hash = $1",
+            &[&hash, &fence, &PROMOTION_OPERATION.as_slice()],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("promotion ownership stamp", error))?;
         classify_commit(tx.commit().await, "promotion begin commit")?;
         failpoint!("promotion.begin.settled")?;
         Ok(BeginOutcome::Admitted(Box::new(FragmentIntent {
             hash: hash.to_vec(),
             epoch,
             fence,
-            object_key: legacy_hash_key(hash),
+            object_key,
             authority: EpochAuthority::Remote,
             direct_write_kind: None,
-            write_claim: None,
+            write_claim: Some(write_claim),
             captured: Some(EpochWitness {
                 hash: hash.to_vec(),
                 epoch: head.current_epoch,
@@ -2940,30 +3122,61 @@ impl PostgresFragmentCoordinator {
         &self,
         intent: &FragmentIntent,
         observation: IoObservation,
+        settlement: FragmentWriteSettlement,
     ) -> Result<CommitVerdict, DomainError> {
         let manifest = match observation {
             IoObservation::Valid(manifest) => manifest,
             IoObservation::Unusable(_) => {
+                // Checked before the `NoSend` refusal below, and deliberately.
+                // A drain worker whose bounded file validation fails produces
+                // exactly `(Unusable, NoSend)` — the claim is still `Prepared`
+                // and no send was ever authorized. Abandon settles by the
+                // claim's durable state, so the settlement argument carries no
+                // information on this path.
                 return self.abandon_promotion(intent).await;
             }
         };
+        if settlement == FragmentWriteSettlement::NoSend {
+            return Err(DomainError::InvalidInput(
+                "a no-send claim cannot publish a promotion observation".to_owned(),
+            ));
+        }
         self.commit_publication(
             intent,
             IoObservation::Valid(manifest),
             EpochAuthority::Remote,
-            None,
+            Some(settlement),
         )
         .await
     }
 
     /// Give up on a promotion without touching the staged representation.
     ///
-    /// A new fence is stamped so the abandoned intent cannot commit later, and
-    /// the head stays exactly where it was.
+    /// A new fence is stamped so the abandoned intent cannot commit later, the
+    /// promotion ownership token is cleared, and the head stays exactly where
+    /// it was — `Staged`, with its manifest, and readable throughout.
+    ///
+    /// # Settlement is decided by the claim, not by the arm
+    ///
+    /// Every exit settles, including the two fenced ones: returning before
+    /// settlement would leave a `Sending` claim blocking its own hash until
+    /// `hard_not_after` with nothing left to resolve it.
+    ///
+    /// *Which* settlement is read off the claim's durable state rather than
+    /// chosen per arm, because promotion can reach here with the claim still
+    /// `Prepared` and `Prepared -> Ambiguous` is not a legal transition.
+    /// Widening the transition table instead would weaken the latch: it would
+    /// let a fragment that provably never sent hold a barrier at its object key
+    /// until the hard deadline.
     async fn abandon_promotion(
         &self,
         intent: &FragmentIntent,
     ) -> Result<CommitVerdict, DomainError> {
+        let Some(claim) = intent.write_claim.as_ref() else {
+            return Err(DomainError::InvalidInput(
+                "a promotion intent must carry a durable write claim".to_owned(),
+            ));
+        };
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -2971,13 +3184,31 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| DomainError::from_pg("promotion abandon begin", error))?;
         let mut sequence = LockSequence::new();
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &intent.hash).await? else {
+            settle_abandoned_claim_locked(&tx, &mut sequence, claim).await?;
+            classify_commit(
+                tx.commit().await,
+                "promotion abandon fenced settlement commit",
+            )?;
             return Ok(CommitVerdict::Fenced);
         };
         if head.last_fence != intent.fence {
+            settle_abandoned_claim_locked(&tx, &mut sequence, claim).await?;
+            classify_commit(
+                tx.commit().await,
+                "promotion abandon moved settlement commit",
+            )?;
             return Ok(CommitVerdict::Fenced);
         }
         let fence = next_fence(&tx).await?;
-        stamp_operation_fence(&tx, &intent.hash, fence).await?;
+        tx.execute(
+            "UPDATE lore_fragment_lifecycle \
+                SET last_fence = $2, active_operation = NULL, updated_at = clock_timestamp() \
+              WHERE hash = $1",
+            &[&intent.hash, &fence],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("promotion abandon fence stamp", error))?;
+        settle_abandoned_claim_locked(&tx, &mut sequence, claim).await?;
         classify_commit(tx.commit().await, "promotion abandon commit")?;
         Ok(CommitVerdict::Abandoned)
     }
@@ -4254,6 +4485,8 @@ impl PostgresFragmentCoordinator {
                     fence: head.last_fence,
                     authority,
                     object_key: &object_key,
+                    kind: FragmentWriteClaimKind::DirectWrite,
+                    source: None,
                 };
                 let write_claim =
                     match create_write_claim_locked(&tx, &mut sequence, lineage, claim_input)
@@ -4345,6 +4578,8 @@ impl PostgresFragmentCoordinator {
                 fence,
                 authority,
                 object_key: &object_key,
+                kind: FragmentWriteClaimKind::DirectWrite,
+                source: None,
             };
             match create_write_claim_locked(&tx, &mut sequence, lineage, claim_input).await? {
                 FragmentWriteClaimCreation::Created(claim) => Some(claim),
@@ -4420,6 +4655,13 @@ impl PostgresFragmentCoordinator {
         // The fence this operation was issued at is the head's own fence only
         // while no other operation has touched it. Anything else means a
         // repair, an obliterate, or a competing write linearized in between.
+        //
+        // This is also the only recheck a promotion gets, and it is sufficient.
+        // There is no `active_operation` test here and none is needed: a
+        // promotion takeover stamps a NEW fence in the same transaction it
+        // stamps its token, so a displaced owner fails this comparison. The
+        // fence is how promotion ownership is enforced; the token is how a
+        // pre-send authorization recognises it.
         if head.last_fence != intent.fence {
             if let Some((claim, settlement)) = write_claim {
                 settle_write_claim_locked(&tx, &mut sequence, claim, settlement).await?;
@@ -4727,6 +4969,9 @@ async fn create_write_claim_locked(
             object_key: lineage.object_key.to_owned(),
             body_blake3: input.body_blake3,
             body_size: input.body_size,
+            kind: lineage.kind,
+            source_epoch: lineage.source.map(|source| source.epoch),
+            source_manifest_id: lineage.source.map(|source| source.manifest_id.to_vec()),
             send_not_after: existing.claim.send_not_after,
             hard_not_after: existing.claim.hard_not_after,
         };
@@ -4749,8 +4994,15 @@ async fn create_write_claim_locked(
         };
     }
 
-    if let FragmentWriteClaimBarrier::BlockedUntil(hard_not_after) =
-        write_claim_barrier_locked(tx, sequence, lineage.hash, lineage.epoch, lineage.fence).await?
+    if let FragmentWriteClaimBarrier::BlockedUntil(hard_not_after) = write_claim_barrier_locked(
+        tx,
+        sequence,
+        lineage.hash,
+        lineage.epoch,
+        lineage.fence,
+        lineage.object_key,
+    )
+    .await?
     {
         return Ok(FragmentWriteClaimCreation::BlockedUntil(hard_not_after));
     }
@@ -4759,14 +5011,17 @@ async fn create_write_claim_locked(
     let body_size = i64::try_from(input.body_size).map_err(|_| {
         DomainError::InvalidInput("fragment write claim body size exceeds i64".to_owned())
     })?;
+    let source_epoch = lineage.source.map(|source| source.epoch);
+    let source_manifest_id = lineage.source.map(|source| source.manifest_id);
     let row = tx
         .query_one(
             "WITH claim_clock AS (SELECT clock_timestamp() AS now) \
              INSERT INTO lore_fragment_write_claims ( \
                  logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
-                 body_blake3, body_size, state, send_not_after, hard_not_after, prepared_at \
+                 body_blake3, body_size, state, kind, source_epoch, source_manifest_id, \
+                 send_not_after, hard_not_after, prepared_at \
              ) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, \
+             SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $14, $15, \
                     claim_clock.now + ($11::bigint * interval '1 millisecond'), \
                     claim_clock.now + (($11::bigint + $12::bigint) * interval '1 millisecond'), \
                     claim_clock.now \
@@ -4785,6 +5040,9 @@ async fn create_write_claim_locked(
                 &FragmentWriteClaimState::Prepared.bits(),
                 &input.send_timeout_millis,
                 &input.late_effect_bound_millis,
+                &lineage.kind.bits(),
+                &source_epoch,
+                &source_manifest_id,
             ],
         )
         .await
@@ -4799,15 +5057,52 @@ async fn create_write_claim_locked(
         object_key: lineage.object_key.to_owned(),
         body_blake3: input.body_blake3,
         body_size: input.body_size,
+        kind: lineage.kind,
+        source_epoch,
+        source_manifest_id: source_manifest_id.map(<[u8]>::to_vec),
         send_not_after: row.get("send_not_after"),
         hard_not_after: row.get("hard_not_after"),
     }))
 }
 
 /// Inspect existing late-effect barriers while the caller holds the exact
-/// lifecycle head lock. Claim creation uses this lineage-scoped check; a repair
-/// successor may proceed on a new epoch while the hash-wide inventory retains
-/// an older ambiguous target for Phase 6B cleanup.
+/// lifecycle head lock. Every claim-creating path uses this one check, so the
+/// direct-write, repair and promotion arms stay symmetric.
+///
+/// # Why the scope is a UNION of two predicates
+///
+/// It was lineage-scoped alone (`hash`, `epoch`, `fence`) until WP-115, and
+/// that scope is still necessary — it is just no longer sufficient.
+///
+/// *Why the lineage arm stays.* On `begin_publication_once`'s fresh arm the
+/// epoch and fence are both freshly allocated, so this predicate is
+/// structurally always Clear. On its **resume** arm the lineage is an existing
+/// `PreparingRemote` head's `current_epoch`/`last_fence`, and there the
+/// predicate is live and load-bearing: that is the case
+/// [`BeginOutcome::WriteClaimBlocked`] describes, a prior attempt on the same
+/// exact head with an unresolved late effect. A repair claim is **never** at
+/// the legacy key — its key is `repair_epoch_key(hash, epoch)` on both arms —
+/// so the object-key arm below cannot see a prior repair attempt's `Ambiguous`
+/// claim, and dropping the lineage arm would let a resumed repair re-send over
+/// an unresolved late effect at its own key.
+///
+/// *Why the object-key arm is needed.* A promotion's epoch and fence are always
+/// freshly allocated, yet every promotion attempt on one hash targets the
+/// **same** `legacy_hash_key(hash)`. Under the lineage arm alone, a crashed
+/// worker's `Ambiguous` claim at epoch N would not block a fresh promotion at
+/// epoch N+2 against the identical object: two live conditional PUTs to one
+/// key, double-charged budget, and an outcome-unknown latch a second attempt
+/// walks straight past. The arm is scoped by object key rather than by claim
+/// kind because the hazard is two live sends to one key, and a direct write and
+/// a promotion share the legacy key.
+///
+/// # Why the deadlines split by state
+///
+/// `Prepared` blocks on `send_not_after`, `Sending` and `Ambiguous` on
+/// `hard_not_after`, mirroring `write_claim_barrier_for_prune`. A `Prepared`
+/// claim past its send window can never send — `authorize_write_claim` refuses
+/// it and settles `NoSend` — so blocking on its hard horizon would be stricter
+/// than the outcome it is guarding against.
 ///
 /// # Why the state list is a SQL literal
 ///
@@ -4819,28 +5114,54 @@ async fn create_write_claim_locked(
 /// table. There is no other index on that table with `hash` leading, so there
 /// is no fallback. This one sits on the live publication path.
 /// `write_claim_barrier_for_prune` carries the same literal for the same
-/// reason.
+/// reason. The new disjunct stays a residual filter and out of the indexed
+/// prefix.
 async fn write_claim_barrier_locked(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
     hash: &[u8],
     epoch: i64,
     fence: i64,
+    object_key: &str,
 ) -> Result<FragmentWriteClaimBarrier, DomainError> {
     sequence.enter(LockClass::Fragments)?;
+    let database_now: SystemTime = tx
+        .query_one("SELECT clock_timestamp()", &[])
+        .await
+        .map_err(|error| DomainError::from_pg("fragment write claim barrier clock", error))?
+        .get(0);
     let rows = tx
         .query(
-            "SELECT hard_not_after FROM lore_fragment_write_claims \
-              WHERE hash = $1 AND epoch = $2 AND fence = $3 \
-                AND state IN (0, 1, 3) AND hard_not_after > clock_timestamp() \
-              ORDER BY hard_not_after DESC FOR UPDATE",
-            &[&hash, &epoch, &fence],
+            "SELECT state, send_not_after, hard_not_after \
+               FROM lore_fragment_write_claims \
+              WHERE hash = $1 \
+                AND state IN (0, 1, 3) AND hard_not_after > $5 \
+                AND ((epoch = $2 AND fence = $3) OR object_key = $4) \
+              ORDER BY logical_request_id, attempt_id FOR UPDATE",
+            &[&hash, &epoch, &fence, &object_key, &database_now],
         )
         .await
         .map_err(|error| DomainError::from_pg("fragment write claim barrier", error))?;
-    Ok(rows
-        .first()
-        .map(|row| FragmentWriteClaimBarrier::BlockedUntil(row.get("hard_not_after")))
+    let mut blocked_until: Option<SystemTime> = None;
+    for row in rows {
+        let state = FragmentWriteClaimState::from_bits(row.get("state"))?;
+        let horizon: Option<SystemTime> = match state {
+            FragmentWriteClaimState::Prepared => Some(row.get("send_not_after")),
+            FragmentWriteClaimState::Sending | FragmentWriteClaimState::Ambiguous => {
+                Some(row.get("hard_not_after"))
+            }
+            FragmentWriteClaimState::Decisive | FragmentWriteClaimState::NoSend => None,
+        };
+        if let Some(horizon) = horizon.filter(|horizon| *horizon > database_now) {
+            blocked_until = Some(
+                blocked_until
+                    .map(|current| current.max(horizon))
+                    .unwrap_or(horizon),
+            );
+        }
+    }
+    Ok(blocked_until
+        .map(FragmentWriteClaimBarrier::BlockedUntil)
         .unwrap_or(FragmentWriteClaimBarrier::Clear))
 }
 
@@ -4962,7 +5283,8 @@ async fn write_claim_inventory_locked(
     let rows = tx
         .query(
             "SELECT logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
-                    body_blake3, body_size, state, send_not_after, hard_not_after, \
+                    body_blake3, body_size, state, kind, source_epoch, source_manifest_id, \
+                    send_not_after, hard_not_after, \
                     hard_not_after > $2 AS unexpired \
                FROM lore_fragment_write_claims \
               WHERE hash = $1 \
@@ -5464,7 +5786,8 @@ async fn lock_write_claim_identity(
     let row = tx
         .query_opt(
             "SELECT logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
-                    body_blake3, body_size, state, send_not_after, hard_not_after, \
+                    body_blake3, body_size, state, kind, source_epoch, source_manifest_id, \
+                    send_not_after, hard_not_after, \
                     hard_not_after > clock_timestamp() AS unexpired \
                FROM lore_fragment_write_claims \
               WHERE logical_request_id = $1 AND attempt_id = $2 FOR UPDATE",
@@ -5516,6 +5839,44 @@ async fn published_prepared_claim_matches(
         .await
         .map_err(|error| DomainError::from_pg("published prepared fragment claim lookup", error))?;
     Ok(row.get(0))
+}
+
+/// Settle one abandoned claim by the state the database holds for it.
+///
+/// The three arms are the whole vocabulary `settle_write_claim_locked` will
+/// accept from a non-publishing exit:
+///
+/// - `Sending` -> `Ambiguous`. Authorization committed, so a send may have had
+///   a late effect and the barrier must hold until `hard_not_after`.
+/// - `Prepared` -> `NoSend`. Authorization never ran, so this is a *confirmed*
+///   non-send — the same settlement `authorize_write_claim` uses for its own
+///   pre-send refusals.
+/// - already terminal -> nothing. `settle_write_claim_locked`'s same-state
+///   short-circuit would cover it, but deciding here keeps the rule readable.
+async fn settle_abandoned_claim_locked(
+    tx: &Transaction<'_>,
+    sequence: &mut LockSequence,
+    claim: &FragmentWriteClaim,
+) -> Result<(), DomainError> {
+    let Some(locked) =
+        lock_write_claim_identity(tx, sequence, &claim.logical_request_id, &claim.attempt_id)
+            .await?
+    else {
+        return Err(DomainError::NotReady(
+            "fragment write claim is absent".to_owned(),
+        ));
+    };
+    let settlement = match locked.state {
+        FragmentWriteClaimState::Sending => Some(FragmentWriteSettlement::Ambiguous),
+        FragmentWriteClaimState::Prepared => Some(FragmentWriteSettlement::NoSend),
+        FragmentWriteClaimState::Decisive
+        | FragmentWriteClaimState::Ambiguous
+        | FragmentWriteClaimState::NoSend => None,
+    };
+    if let Some(settlement) = settlement {
+        settle_write_claim_locked(tx, sequence, claim, settlement).await?;
+    }
+    Ok(())
 }
 
 async fn settle_write_claim_locked(
@@ -5609,6 +5970,9 @@ fn decode_locked_write_claim(
             body_size: u64::try_from(body_size).map_err(|_| {
                 DomainError::Internal("fragment write claim has a negative body size".to_owned())
             })?,
+            kind: FragmentWriteClaimKind::from_bits(row.get("kind"))?,
+            source_epoch: row.get("source_epoch"),
+            source_manifest_id: row.get("source_manifest_id"),
             send_not_after: row.get("send_not_after"),
             hard_not_after: row.get("hard_not_after"),
         },
@@ -5929,30 +6293,12 @@ fn duration_millis(context: &str, duration: Duration) -> Result<i64, DomainError
         .map_err(|_| DomainError::InvalidInput(format!("{context} exceeds i64 milliseconds")))
 }
 
-/// Stamp the head with the fence this operation was issued at, so a delayed
-/// commit can tell whether anything linearized in between.
-///
-/// It deliberately does **not** write `active_operation`. Phase 5 uses that
-/// column for the direct-publication lineage token, while the other operations
-/// that call this helper have no operation identity in scope. Clearing or
-/// replacing the token here would lose a recoverable `PreparingRemote`
-/// publication's exact object-key lineage. The naming is deliberate: an
-/// earlier `set_active_operation` name claimed a write this function never
-/// made.
-async fn stamp_operation_fence(
-    tx: &Transaction<'_>,
-    hash: &[u8],
-    fence: i64,
-) -> Result<(), DomainError> {
-    tx.execute(
-        "UPDATE lore_fragment_lifecycle \
-            SET last_fence = $2, updated_at = clock_timestamp() WHERE hash = $1",
-        &[&hash, &fence],
-    )
-    .await
-    .map_err(|error| DomainError::from_pg("fragment operation fence stamp", error))?;
-    Ok(())
-}
+// `stamp_operation_fence` lived here until WP-115. Its only two callers were
+// promotion's begin and abandon, and both now have an operation identity in
+// scope: begin stamps the promotion ownership token alongside the fence, and
+// abandon clears it alongside the fence. A helper that deliberately left
+// `active_operation` alone has no caller left, and keeping it would invite a
+// future promotion path to move a fence without settling its ownership.
 
 /// Classify the exact key while its Repository row is already locked.
 async fn association_key_exists(

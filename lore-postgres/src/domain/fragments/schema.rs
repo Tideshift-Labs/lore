@@ -12,15 +12,33 @@
 //!
 //! Two declarations, one shape. As with CR-029's `domain/schema.rs` and
 //! CR-030's `domain/locks/schema.rs`, [`FRAGMENT_SCHEMA`] is applied at boot by
-//! [`crate::pool::ensure_schema`] and `migrations/0001_init.sql` carries a
-//! byte-equivalent copy for out-of-band provisioning. **A change here is two
-//! edits, in one commit**, and `tests/domain_migration_parity.rs` fails the gate
-//! if they drift.
+//! [`crate::pool::ensure_schema`] and the `migrations/` series carries a
+//! semantically equivalent copy for out-of-band provisioning. **A change here is
+//! two edits, in one commit**, and `tests/domain_migration_parity.rs` fails the
+//! gate if they drift.
+//!
+//! The migration side is a **series**, not one file: `0001_init.sql` installs
+//! revision [`FRAGMENT_SCHEMA_BASE_VERSION`] and
+//! `0002_fragment_promotion_send_claims.sql` extends it to
+//! [`FRAGMENT_SCHEMA_VERSION`]. An already-provisioned cell never re-reads
+//! `0001`, so a new column belongs in a new numbered file; the parity test
+//! applies the whole series in order and compares catalogs against this
+//! declaration.
 
 /// First server-only fragment lifecycle schema revision. Recorded in
 /// `lore_fragment_schema_state.schema_version`; a server whose compiled value is
 /// below the stored value refuses to enable lifecycle routing.
-pub const FRAGMENT_SCHEMA_VERSION: i64 = 3;
+pub const FRAGMENT_SCHEMA_VERSION: i64 = 4;
+
+/// The revision `migrations/0001_init.sql` alone installs.
+///
+/// The migration series is no longer one file: `0001` seeds this base revision
+/// and `0002_fragment_promotion_send_claims.sql` raises the stored value to
+/// [`FRAGMENT_SCHEMA_VERSION`]. A cell that ran only `0001` therefore records
+/// revision 3, which is exactly what makes it route legacy rather than
+/// half-enable against a revision-4 binary (`ready_for_lifecycle`'s clean-init
+/// arm requires `>= 4`, and `enable_lifecycle` requires an exact match).
+pub const FRAGMENT_SCHEMA_BASE_VERSION: i64 = 3;
 
 /// Provider writes are allowed during a rolling upgrade, but destructive
 /// lifecycle work must remain off.
@@ -163,10 +181,14 @@ CREATE TABLE IF NOT EXISTS lore_fragment_lifecycle (
     manifest_id      bytea       CHECK (manifest_id IS NULL
                                         OR octet_length(manifest_id) = 32),
     last_fence       bigint      NOT NULL CHECK (last_fence >= 1),
-    -- RESERVED, always NULL until Phase 5. CR-031's model names an active
-    -- operation, but no CR-029 domain operation ID reaches this layer yet, and
-    -- nothing writes this column. The shape is declared now so adding it later
-    -- is not an ALTER under ensure_schema on a populated cell.
+    -- The durable ownership token of whatever operation currently owns this
+    -- head. Written and read: `begin_publication_once` stamps a direct-write or
+    -- repair token on a PreparingRemote head, `begin_promotion` stamps the
+    -- promotion token on a Staged head, `begin_obliterate` stamps an obliterate
+    -- token with its origin, `authorize_write_claim` reads the token to decide
+    -- whether a claim still binds this lineage, and every publication clears it.
+    -- Deliberately NOT state-linked by a CHECK: the legal token set differs per
+    -- state and the coordinator, not the column, is the authority on which.
     active_operation bytea       CHECK (active_operation IS NULL
                                         OR octet_length(active_operation) = 16),
     diagnostic_class smallint    NOT NULL DEFAULT 0 CHECK (diagnostic_class BETWEEN 0 AND 5),
@@ -330,6 +352,46 @@ CREATE INDEX IF NOT EXISTS lore_fragment_write_claims_terminal_prune
     ON lore_fragment_write_claims (settled_at, logical_request_id, attempt_id)
     WHERE state IN (2, 4);
 
+-- WP-115 write-behind: the durable promotion send claim.
+--
+-- ADDed rather than declared inline in the CREATE TABLE above, and the reason
+-- is operational rather than stylistic: `CREATE TABLE IF NOT EXISTS` is a
+-- no-op on an already-created table, so an inline column would never reach any
+-- dev, test, or fixture database that already carries this table. Those cells
+-- get the columns from this ALTER on the next `ensure_schema`;
+-- `migrations/0002_fragment_promotion_send_claims.sql` carries the same
+-- statements for an out-of-band-provisioned cell, which `ensure_schema` never
+-- touches.
+--
+-- `kind` 0 is a direct write or a repair — today's only shape, and the DEFAULT
+-- is what makes every pre-existing row legal. 1 is a promotion, and only a
+-- promotion carries the exact staged witness it was admitted against.
+-- `epoch`/`fence` keep their existing meaning on both: the REMOTE successor
+-- epoch and the operation fence, so the publication insert and the prune's
+-- evidence EXISTS are unaffected. `source_epoch < epoch` makes promotion's
+-- successor rule a database invariant rather than a code comment.
+--
+-- No index change. Both partial indexes already cover these rows, and the new
+-- predicates are too low-selectivity to earn a place in either index key.
+ALTER TABLE lore_fragment_write_claims
+    ADD COLUMN IF NOT EXISTS kind smallint NOT NULL DEFAULT 0 CHECK (kind IN (0, 1)),
+    ADD COLUMN IF NOT EXISTS source_epoch bigint CHECK (source_epoch IS NULL
+                                                        OR source_epoch >= 1),
+    ADD COLUMN IF NOT EXISTS source_manifest_id bytea CHECK (source_manifest_id IS NULL
+                                                        OR octet_length(source_manifest_id) = 32);
+
+-- Postgres has no ADD CONSTRAINT IF NOT EXISTS, and this block is re-applied on
+-- every boot and may be applied twice by hand (there is no migration runner).
+DO $promotion_shape$ BEGIN
+    ALTER TABLE lore_fragment_write_claims
+        ADD CONSTRAINT lore_fragment_write_claim_promotion_shape CHECK (
+            (kind = 1) = (source_epoch IS NOT NULL)
+        AND (kind = 1) = (source_manifest_id IS NOT NULL)
+        AND (kind = 0 OR source_epoch < epoch)
+        );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $promotion_shape$;
+
 -- Singleton. Read at boot for readiness, and the cutover marker's home.
 --
 -- The two CHECKs make the unsafe combinations unrepresentable: routing cannot be
@@ -410,7 +472,7 @@ INSERT INTO lore_fragment_schema_state (
 -- seed cannot, and parity compares catalog shape rather than row contents -- so without
 -- that test a version bump would diverge silently between the two paths (INV-EF P2-9).
 SELECT 1                                                                       AS id,
-       3                                                                       AS schema_version,
+       4                                                                       AS schema_version,
        0                                                                       AS backfill_version,
        0                                                                       AS backfill_state,
        control.system_identifier::text || ':' || database.oid::text || ':' || current_database()
@@ -419,6 +481,21 @@ SELECT 1                                                                       A
   FROM pg_control_system() AS control
   JOIN pg_database AS database ON database.datname = current_database()
 ON CONFLICT (id) DO NOTHING;
+
+-- The seed above is ON CONFLICT DO NOTHING, so on a cell that already carries
+-- this row it records nothing -- and every statement above is idempotent, so a
+-- dev, test, or fixture database created at an older revision would otherwise
+-- gain the new columns while still reporting the old revision, and be refused
+-- by the exact-revision gate with no visible cause. This raises the recorded
+-- revision to the shape the statements above just installed.
+--
+-- Monotonic and guarded: it never lowers a revision a newer binary wrote. It is
+-- not a production path -- `PostgresFragmentCoordinator::bootstrap` is the only
+-- caller of this DDL and production never calls it; `migrations/0002_*.sql`
+-- carries the same raise for a migration-provisioned cell.
+UPDATE lore_fragment_schema_state
+   SET schema_version = 4, updated_at = clock_timestamp()
+ WHERE id = 1 AND schema_version < 4;
 "#;
 
 #[cfg(test)]
@@ -479,21 +556,43 @@ mod tests {
     /// The Rust-side pin above is only half the guard.
     ///
     /// **Three** places carry this version: `bootstrap()` binds the constant,
-    /// [`FRAGMENT_SCHEMA`] seeds a literal, and `migrations/0001_init.sql`
-    /// carries its own copy of that seed. Migration/runtime parity compares
-    /// catalog *shape*, not row contents, so a bump applied to the Rust const
-    /// alone would still diverge from the migration silently — which is the
-    /// risk INV-EF P2-9 actually named, and which pinning only the const leaves
-    /// open.
+    /// [`FRAGMENT_SCHEMA`] seeds a literal, and the migration series carries its
+    /// own copy. Migration/runtime parity compares catalog *shape*, not row
+    /// contents, so a bump applied to the Rust const alone would still diverge
+    /// from the migrations silently — which is the risk INV-EF P2-9 actually
+    /// named, and which pinning only the const leaves open.
+    ///
+    /// **The series is no longer one file, and that is deliberate.**
+    /// `0001_init.sql` still seeds [`FRAGMENT_SCHEMA_BASE_VERSION`], because a
+    /// cell that ran only `0001` really is at that revision: it has none of
+    /// `0002`'s columns. Raising `0001`'s own literal would make such a cell
+    /// report a revision whose columns it does not have, which is precisely the
+    /// half-enabled cell the readiness guardrail exists to refuse. `0002` is
+    /// therefore what carries the raise to [`FRAGMENT_SCHEMA_VERSION`].
     #[test]
-    fn the_migration_seeds_the_same_schema_version_as_the_runtime_const() {
-        let migration = include_str!("../../../migrations/0001_init.sql");
+    fn the_migration_series_reaches_the_runtime_schema_version() {
+        let base = include_str!("../../../migrations/0001_init.sql");
         assert_eq!(
-            seeded_schema_version(migration, "migrations/0001_init.sql"),
-            FRAGMENT_SCHEMA_VERSION,
-            "the migration's fragment schema-state seed has drifted from \
-             FRAGMENT_SCHEMA_VERSION; a schema change is two edits in one commit"
+            seeded_schema_version(base, "migrations/0001_init.sql"),
+            FRAGMENT_SCHEMA_BASE_VERSION,
+            "migrations/0001_init.sql seeds a revision other than \
+             FRAGMENT_SCHEMA_BASE_VERSION; that file installs a fixed shape and its seed must \
+             keep naming it, so a cell that has run only 0001 reports what it actually has"
         );
+        let raise = format!("SET schema_version = {FRAGMENT_SCHEMA_VERSION}");
+        let follow_on = include_str!("../../../migrations/0002_fragment_promotion_send_claims.sql");
+        assert!(
+            collapse_whitespace(follow_on).contains(&collapse_whitespace(&raise)),
+            "migrations/0002_fragment_promotion_send_claims.sql must raise the stored revision \
+             with `{raise}`; without it an out-of-band-provisioned cell installs the columns and \
+             is then refused by the exact-revision gate with no visible cause"
+        );
+    }
+
+    /// Collapse every run of whitespace to one space, so the pin above is
+    /// tolerant of SQL alignment and intolerant of content.
+    fn collapse_whitespace(text: &str) -> String {
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
     }
 
     /// [`STAGED_LEASE_ID_LEN`] and the DDL's `octet_length(lease_id) = 16`

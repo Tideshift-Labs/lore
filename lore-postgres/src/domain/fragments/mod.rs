@@ -229,5 +229,6 @@ pub use provider::attest_cell_schema;
 pub use schema::FRAGMENT_SCHEMA_VERSION;
 pub use states::EpochAuthority;
 pub use states::FragmentLifecycleState;
+pub use states::FragmentWriteClaimKind;
 pub use states::FragmentWriteClaimState;
 pub use states::MissingDiagnostic;

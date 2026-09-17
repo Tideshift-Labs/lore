@@ -87,9 +87,24 @@ fn claim_creation_locks_head_before_claim_and_uses_one_database_clock_snapshot()
 
     let create = function(&source, "async fn create_write_claim_locked(");
     assert!(create.contains("lock_write_claim(tx, sequence, input).await?"));
-    assert!(create.contains(
-        "write_claim_barrier_locked(tx, sequence, lineage.hash, lineage.epoch, lineage.fence).await?"
-    ));
+    // The barrier takes the object key as well as the lineage, because WP-115
+    // made it a union: the lineage arm still guards a resumed publication or
+    // repair on the same `PreparingRemote` head, and the object-key arm guards
+    // two live sends to one key — which is the only thing that would catch a
+    // second promotion attempt, since a promotion's epoch and fence are always
+    // freshly allocated.
+    assert!(create.contains("write_claim_barrier_locked("));
+    for argument in [
+        "lineage.hash,",
+        "lineage.epoch,",
+        "lineage.fence,",
+        "lineage.object_key,",
+    ] {
+        assert!(
+            create.contains(argument),
+            "create_write_claim_locked must pass {argument} to the barrier"
+        );
+    }
     assert!(create.contains("WITH claim_clock AS (SELECT clock_timestamp() AS now)"));
     assert!(create.contains("claim_clock.now + ($11::bigint * interval '1 millisecond')"));
     assert!(
@@ -100,6 +115,14 @@ fn claim_creation_locks_head_before_claim_and_uses_one_database_clock_snapshot()
     assert!(!create.contains("SystemTime::now"));
 }
 
+/// The durable row is read and compared BEFORE the lineage test, and the
+/// lineage test runs against `locked.claim`.
+///
+/// This order is the point of the pin. Reading the caller's copy first and the
+/// durable row afterwards still refused a forged claim — the durable comparison
+/// caught it and nothing committed — but it decided admission against a value
+/// the caller supplied. A pin on the old order would now pass over exactly the
+/// shape the reorder removed.
 #[test]
 fn authorization_revalidates_lineage_and_claim_before_marking_sending() {
     let source = coordinator_source();
@@ -108,19 +131,104 @@ fn authorization_revalidates_lineage_and_claim_before_marking_sending() {
         authorize,
         &[
             "lock_fragment_head(&tx, &mut sequence, &claim.hash).await?",
-            "let lineage_matches",
             "lock_write_claim_identity(",
             "if locked.claim != *claim",
+            "let durable = &locked.claim",
+            "let lineage_matches",
             "SELECT clock_timestamp()",
             "SET state = $3, authorized_at = clock_timestamp()",
             "tx.commit().await",
         ],
     );
+    // Both kinds are covered by this one function, and the kind is matched
+    // rather than inferred from whichever state the head happens to be in.
     assert!(authorize.contains("head.state == FragmentLifecycleState::PreparingRemote"));
+    assert!(authorize.contains("head.state == FragmentLifecycleState::Staged"));
+    assert!(authorize.contains("FragmentWriteClaimKind::DirectWrite"));
+    assert!(authorize.contains("FragmentWriteClaimKind::Promotion"));
+    assert!(authorize.contains("durable.source_epoch"));
+    assert!(authorize.contains("durable.source_manifest_id"));
+    assert!(authorize.contains("PROMOTION_OPERATION"));
     assert!(authorize.contains("FragmentWriteSettlement::NoSend"));
     assert!(authorize.contains("fragment_write_lineage_moved"));
     assert!(authorize.contains("claim.send_not_after.duration_since(database_now)"));
     assert!(!authorize.contains("SystemTime::now"));
+}
+
+/// Promotion's abandon path settles on every exit, and settles by the claim's
+/// durable state rather than by which arm it took.
+///
+/// The two fenced early returns used to return before any settlement, leaving a
+/// `Sending` claim blocking its own object key until `hard_not_after` with
+/// nothing left to resolve it. The `Prepared -> NoSend` arm is equally
+/// load-bearing: promotion reaches abandon with the claim still `Prepared`
+/// whenever bounded validation fails before authorization runs, and
+/// `Prepared -> Ambiguous` is not a legal transition.
+#[test]
+fn abandoning_a_promotion_settles_its_claim_by_durable_state_on_every_exit() {
+    let source = coordinator_source();
+    let abandon = function(&source, "async fn abandon_promotion(");
+    for exit in [
+        "promotion abandon fenced settlement commit",
+        "promotion abandon moved settlement commit",
+        "promotion abandon commit",
+    ] {
+        assert!(
+            abandon.contains(exit),
+            "abandon_promotion must settle before committing at {exit}"
+        );
+    }
+    assert_eq!(
+        abandon.matches("settle_abandoned_claim_locked(").count(),
+        3,
+        "every abandon exit must settle; a bare return leaves a Sending claim blocking its key"
+    );
+    assert!(abandon.contains("active_operation = NULL"));
+
+    let settle = function(&source, "async fn settle_abandoned_claim_locked(");
+    assert!(
+        settle.contains(
+            "FragmentWriteClaimState::Sending => Some(FragmentWriteSettlement::Ambiguous)"
+        )
+    );
+    assert!(
+        settle
+            .contains("FragmentWriteClaimState::Prepared => Some(FragmentWriteSettlement::NoSend)")
+    );
+
+    // The transition table stays narrow. `Prepared -> Ambiguous` would let a
+    // fragment that provably never sent hold a barrier until the hard deadline.
+    let table = function(&source, "async fn settle_write_claim_locked(");
+    assert!(!table.contains(
+        "FragmentWriteClaimState::Prepared,\n            FragmentWriteClaimState::Ambiguous"
+    ));
+}
+
+/// Promotion admission is claim-bearing, and the head keeps its manifest.
+///
+/// A worker lease alone must not authorize a provider send. This operation used
+/// to stamp a fence and hand back `write_claim: None`, and leaving a claimless
+/// promotion reachable is what that hole was.
+#[test]
+fn promotion_admission_persists_a_claim_and_takes_exclusive_ownership() {
+    let source = coordinator_source();
+    let begin = function(&source, "pub async fn begin_promotion(");
+    assert_order(
+        begin,
+        &[
+            "lock_fragment_head(&tx, &mut sequence, hash).await?",
+            "head.state != FragmentLifecycleState::Staged",
+            "let epoch = next_fence(&tx).await?",
+            "let fence = next_fence(&tx).await?",
+            "create_write_claim_locked(",
+            "active_operation = $3",
+            "tx.commit().await",
+        ],
+    );
+    assert!(begin.contains("FragmentWriteClaimKind::Promotion"));
+    assert!(begin.contains("write_claim: Some(write_claim)"));
+    assert!(!begin.contains("write_claim: None"));
+    assert!(begin.contains("PROMOTION_OPERATION"));
 }
 
 #[test]
@@ -134,6 +242,15 @@ fn no_send_is_a_terminal_settlement_but_cannot_publish_an_observation() {
         (
             "pub async fn commit_repair(",
             "a no-send claim cannot publish a repair observation",
+        ),
+        // Promotion joined this rule in WP-115, and its refusal sits AFTER the
+        // `Unusable` arm rather than at the top of the function. That ordering
+        // is deliberate: a drain worker whose bounded validation fails before
+        // any send produces exactly `(Unusable, NoSend)`, and that pairing must
+        // route to abandon, not error.
+        (
+            "pub async fn commit_promotion(",
+            "a no-send claim cannot publish a promotion observation",
         ),
     ] {
         let commit = function(&source, signature);
@@ -445,28 +562,51 @@ fn publication_path_barrier_pins_its_sql_state_literal_and_keeps_its_claim_row_l
         !barrier_sql.contains("ANY($"),
         "the publication-path barrier must not bind its state list as an array"
     );
-    // The parameter list as a whole, not element by element: a fourth entry is
-    // exactly how the bound state list got here, and only the closed list
-    // refuses one.
+    // The parameter list as a whole, not element by element.
+    //
+    // It grew from three to five in WP-115, and the earlier "no fourth
+    // parameter" form of this assertion cannot simply be relaxed: a fourth
+    // bound parameter is exactly how the bound state list got here the first
+    // time. The list is therefore pinned exactly, so the two additions are
+    // named and a third would still fail: `$4` is the object key the union's
+    // same-key arm filters on, and `$5` is the one database clock reading the
+    // per-state horizons below are compared against.
     assert!(
-        barrier_sql.contains("&[&hash, &epoch, &fence],"),
-        "the barrier's parameters must be exactly the lineage keys, with no fourth"
+        barrier_sql.contains("&[&hash, &epoch, &fence, &object_key, &database_now],"),
+        "the barrier's parameters must be exactly the lineage keys, the object key, and the \
+         database clock -- a sixth is how a bound state list would get back in"
     );
-    // The whole predicate in one, so the literal list stays bound to the
-    // lineage keys it filters with and to the `hard_not_after` comparison that
-    // decides whether a barrier is still live. `>` and not `<`: a horizon in
-    // the past is an expired claim and no barrier at all.
+    // The whole predicate in one, so the literal state list stays bound to the
+    // keys it filters with.
+    //
+    // The scope is a UNION, and both arms are load-bearing. The lineage arm
+    // guards a resumed publication or repair on an existing `PreparingRemote`
+    // head, where the epoch and fence are the head's own. The object-key arm
+    // guards two live sends to one key, which is the only arm that can see a
+    // prior promotion attempt at all, because a promotion's epoch and fence are
+    // always freshly allocated. Dropping either one loses a real guard:
+    // lineage-only misses the second promotion, key-only misses the resumed
+    // repair (a repair claim is never at the legacy key).
     assert!(
         barrier_sql.contains(
-            "WHERE hash = $1 AND epoch = $2 AND fence = $3 \
-             AND state IN (0, 1, 3) AND hard_not_after > clock_timestamp()"
+            "WHERE hash = $1 \
+             AND state IN (0, 1, 3) AND hard_not_after > $5 \
+             AND ((epoch = $2 AND fence = $3) OR object_key = $4)"
         ),
-        "the publication-path barrier must test its state list as SQL literals"
+        "the publication-path barrier must test its state list as SQL literals, over the union \
+         of the lineage keys and the object key"
     );
     assert!(
-        barrier_sql.contains("ORDER BY hard_not_after DESC FOR UPDATE"),
+        barrier_sql.contains("ORDER BY logical_request_id, attempt_id FOR UPDATE"),
         "the publication-path barrier must lock the claim rows it reads"
     );
+    // Deadlines split by state, mirroring the prune barrier: a `Prepared` claim
+    // past its send window can never send, so blocking admission on its hard
+    // horizon would be stricter than the outcome being guarded against.
+    assert!(
+        barrier.contains("FragmentWriteClaimState::Prepared => Some(row.get(\"send_not_after\"))")
+    );
+    assert!(barrier.contains("Some(row.get(\"hard_not_after\"))"));
     assert!(!barrier.contains("SystemTime::now"));
 }
 

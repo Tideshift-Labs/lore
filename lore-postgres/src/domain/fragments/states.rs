@@ -157,6 +157,46 @@ impl EpochAuthority {
     }
 }
 
+/// Which lineage one exact provider-write attempt belongs to.
+///
+/// The kind is checked, never inferred from the head. A direct write or a
+/// repair binds a `PreparingRemote` head at the claim's own epoch; a promotion
+/// binds a `Staged` head whose `current_epoch` is the claim's **source** epoch
+/// and whose successor epoch the claim allocated. Inferring one from the other
+/// would make a `Staged` head authorize a direct-write claim, so
+/// `authorize_write_claim` matches on this value first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentWriteClaimKind {
+    /// A first publication at the legacy key, or a repair successor at its
+    /// immutable epoch key. The only shape that existed before WP-115.
+    DirectWrite,
+    /// A `Staged` to `Remote` promotion: the claim carries the exact staged
+    /// witness it was admitted against alongside its remote successor epoch.
+    Promotion,
+}
+
+impl FragmentWriteClaimKind {
+    /// Stored encoding. `0` is the column default, which is what makes every
+    /// row written before `0002_fragment_promotion_send_claims.sql` legal.
+    pub const fn bits(self) -> i16 {
+        match self {
+            Self::DirectWrite => 0,
+            Self::Promotion => 1,
+        }
+    }
+
+    /// Decode one stored encoding.
+    pub fn from_bits(bits: i16) -> Result<Self, DomainError> {
+        match bits {
+            0 => Ok(Self::DirectWrite),
+            1 => Ok(Self::Promotion),
+            other => Err(DomainError::Internal(format!(
+                "unknown fragment write-claim kind {other}"
+            ))),
+        }
+    }
+}
+
 /// Durable state of one exact provider-write attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentWriteClaimState {

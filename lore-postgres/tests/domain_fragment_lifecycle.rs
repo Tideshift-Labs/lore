@@ -434,6 +434,45 @@ fn write_claim() -> FragmentWriteClaimInput {
     .expect("valid test write claim")
 }
 
+/// Authorize a promotion's durable claim, then publish it.
+///
+/// These coordinator-level cases do no provider I/O, so nothing else moves the
+/// claim out of `Prepared` — and `Prepared -> Decisive` is not a legal
+/// settlement. `authorize_write_claim` is the step the real drain path runs
+/// immediately before its bounded send, so running it here is what keeps these
+/// cases on the shape production uses instead of a shortcut around the claim.
+///
+/// An `Unusable` observation deliberately skips authorization: that is exactly
+/// the drain worker whose bounded validation fails *before* any send, and
+/// `commit_promotion` routes it to abandon, which settles by the claim's own
+/// durable state rather than by the settlement passed here.
+async fn commit_promotion_authorized(
+    coordinator: &PostgresFragmentCoordinator,
+    intent: &FragmentIntent,
+    observation: IoObservation,
+) -> Result<CommitVerdict, DomainError> {
+    let claim = intent
+        .write_claim()
+        .expect("a promotion intent always carries a durable write claim")
+        .clone();
+    match observation {
+        IoObservation::Valid(_) => {
+            coordinator
+                .authorize_write_claim(&claim)
+                .await
+                .expect("authorize the promotion claim before publishing it");
+            coordinator
+                .commit_promotion(intent, observation, FragmentWriteSettlement::Decisive)
+                .await
+        }
+        IoObservation::Unusable(_) => {
+            coordinator
+                .commit_promotion(intent, observation, FragmentWriteSettlement::NoSend)
+                .await
+        }
+    }
+}
+
 struct TestDomainStore(PostgresDomainStore);
 
 impl Deref for TestDomainStore {
@@ -4533,7 +4572,7 @@ async fn a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote
     );
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
@@ -4545,13 +4584,13 @@ async fn a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote
     );
     let remote_manifest = manifest("promotion/remote", 0x81, EpochAuthority::Remote);
     assert_eq!(
-        coordinator
-            .commit_promotion(
-                &promotion_intent,
-                IoObservation::Valid(remote_manifest.clone())
-            )
-            .await
-            .expect("commit promotion"),
+        commit_promotion_authorized(
+            &coordinator,
+            &promotion_intent,
+            IoObservation::Valid(remote_manifest.clone())
+        )
+        .await
+        .expect("commit promotion"),
         CommitVerdict::Published
     );
     assert_eq!(remote_manifest.authority, EpochAuthority::Remote);
@@ -5251,7 +5290,7 @@ async fn revalidate_push_witness_refuses_missing_proof_after_equivalent_promotio
     // and `manifest_id`, but identical decoded_hash/size_content/size_payload/
     // payload_flags.
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
@@ -5270,10 +5309,13 @@ async fn revalidate_push_witness_refuses_missing_proof_after_equivalent_promotio
         "the successor manifest id must genuinely differ from the staged one"
     );
     assert_eq!(
-        coordinator
-            .commit_promotion(&promotion_intent, IoObservation::Valid(promoted_manifest))
-            .await
-            .expect("commit promotion"),
+        commit_promotion_authorized(
+            &coordinator,
+            &promotion_intent,
+            IoObservation::Valid(promoted_manifest)
+        )
+        .await
+        .expect("commit promotion"),
         CommitVerdict::Published
     );
 
@@ -5439,7 +5481,7 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
 
     // A: promote with a different decoded_hash.
     let BeginOutcome::Admitted(promotion_a) = coordinator
-        .begin_promotion(&hash_a)
+        .begin_promotion(&hash_a, write_claim())
         .await
         .expect("begin promotion a")
     else {
@@ -5452,8 +5494,7 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
     promoted_a.decoded_hash = vec![0xFF; 32];
     assert_ne!(promoted_a.decoded_hash, staged_manifest_a.decoded_hash);
     assert_eq!(
-        coordinator
-            .commit_promotion(&promotion_a, IoObservation::Valid(promoted_a))
+        commit_promotion_authorized(&coordinator, &promotion_a, IoObservation::Valid(promoted_a))
             .await
             .expect("commit promotion a"),
         CommitVerdict::Published
@@ -5461,7 +5502,7 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
 
     // B: promote with a different payload_flags.
     let BeginOutcome::Admitted(promotion_b) = coordinator
-        .begin_promotion(&hash_b)
+        .begin_promotion(&hash_b, write_claim())
         .await
         .expect("begin promotion b")
     else {
@@ -5474,8 +5515,7 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
     promoted_b.payload_flags = staged_manifest_b.payload_flags ^ 0x01;
     assert_ne!(promoted_b.payload_flags, staged_manifest_b.payload_flags);
     assert_eq!(
-        coordinator
-            .commit_promotion(&promotion_b, IoObservation::Valid(promoted_b))
+        commit_promotion_authorized(&coordinator, &promotion_b, IoObservation::Valid(promoted_b))
             .await
             .expect("commit promotion b"),
         CommitVerdict::Published
@@ -6390,19 +6430,19 @@ async fn abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repo
         .expect("repository must exist");
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
         panic!("a Staged head must admit begin_promotion");
     };
-    let verdict = coordinator
-        .commit_promotion(
-            &promotion_intent,
-            IoObservation::Unusable(MissingDiagnostic::Truncated),
-        )
-        .await
-        .expect("commit promotion must not error");
+    let verdict = commit_promotion_authorized(
+        &coordinator,
+        &promotion_intent,
+        IoObservation::Unusable(MissingDiagnostic::Truncated),
+    )
+    .await
+    .expect("commit promotion must not error");
     assert_eq!(verdict, CommitVerdict::Abandoned);
     assert!(verdict.left_representation_intact());
 
@@ -7371,24 +7411,24 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
     let staged_epoch = stage_intent.epoch;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
         panic!("a Staged head must admit begin_promotion");
     };
     assert_eq!(
-        coordinator
-            .commit_promotion(
-                &promotion_intent,
-                IoObservation::Valid(manifest(
-                    "quarantined-staged-member/promoted",
-                    0x92,
-                    EpochAuthority::Remote
-                ))
-            )
-            .await
-            .expect("commit promotion"),
+        commit_promotion_authorized(
+            &coordinator,
+            &promotion_intent,
+            IoObservation::Valid(manifest(
+                "quarantined-staged-member/promoted",
+                0x92,
+                EpochAuthority::Remote
+            ))
+        )
+        .await
+        .expect("commit promotion"),
         CommitVerdict::Published
     );
 
@@ -7465,20 +7505,20 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
     let staged_epoch = stage_intent.epoch;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
         panic!("a Staged head must admit begin_promotion");
     };
     assert_eq!(
-        coordinator
-            .commit_promotion(
-                &promotion_intent,
-                IoObservation::Valid(manifest(&legacy_key(&hash), 0x94, EpochAuthority::Remote))
-            )
-            .await
-            .expect("commit promotion"),
+        commit_promotion_authorized(
+            &coordinator,
+            &promotion_intent,
+            IoObservation::Valid(manifest(&legacy_key(&hash), 0x94, EpochAuthority::Remote))
+        )
+        .await
+        .expect("commit promotion"),
         CommitVerdict::Published
     );
     assert_eq!(
@@ -8067,7 +8107,7 @@ async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_
         (&hash_b, &staged_manifest_b, "mixed-batch/b-promoted"),
     ] {
         let BeginOutcome::Admitted(promotion_intent) = coordinator
-            .begin_promotion(hash)
+            .begin_promotion(hash, write_claim())
             .await
             .expect("begin promotion")
         else {
@@ -8078,17 +8118,20 @@ async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_
         promoted.object_key = key.to_owned();
         promoted.manifest_id = vec![0xAF; 32];
         assert_eq!(
-            coordinator
-                .commit_promotion(&promotion_intent, IoObservation::Valid(promoted))
-                .await
-                .expect("commit promotion"),
+            commit_promotion_authorized(
+                &coordinator,
+                &promotion_intent,
+                IoObservation::Valid(promoted)
+            )
+            .await
+            .expect("commit promotion"),
             CommitVerdict::Published
         );
     }
 
     // C: promote with a different decoded_hash -- genuinely different content.
     let BeginOutcome::Admitted(promotion_c) = coordinator
-        .begin_promotion(&hash_c)
+        .begin_promotion(&hash_c, write_claim())
         .await
         .expect("begin promotion c")
     else {
@@ -8101,8 +8144,7 @@ async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_
     promoted_c.decoded_hash = vec![0xFF; 32];
     assert_ne!(promoted_c.decoded_hash, staged_manifest_c.decoded_hash);
     assert_eq!(
-        coordinator
-            .commit_promotion(&promotion_c, IoObservation::Valid(promoted_c))
+        commit_promotion_authorized(&coordinator, &promotion_c, IoObservation::Valid(promoted_c))
             .await
             .expect("commit promotion c"),
         CommitVerdict::Published
@@ -8331,7 +8373,7 @@ async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_thou
     // to the one preflight captured -- if the fallback were ever reached, the
     // CR-031:266 equivalence allowance would accept it.
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
@@ -8346,10 +8388,13 @@ async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_thou
     promoted_manifest.object_key = "assoc-move/promoted".to_owned();
     promoted_manifest.manifest_id = vec![0xDA; 32];
     assert_eq!(
-        coordinator
-            .commit_promotion(&promotion_intent, IoObservation::Valid(promoted_manifest))
-            .await
-            .expect("commit promotion"),
+        commit_promotion_authorized(
+            &coordinator,
+            &promotion_intent,
+            IoObservation::Valid(promoted_manifest)
+        )
+        .await
+        .expect("commit promotion"),
         CommitVerdict::Published
     );
 
@@ -9443,7 +9488,7 @@ async fn shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increas
 
         // --- Staged -> Remote, which crosses nothing and writes none of them ---
         let BeginOutcome::Admitted(promotion_intent) = coordinator
-            .begin_promotion(&promotion_hash)
+            .begin_promotion(&promotion_hash, write_claim())
             .await
             .expect("begin the promotion")
         else {
@@ -9462,7 +9507,8 @@ async fn shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increas
         let promotion_start = Instant::now();
         let promotion_verdict = timeout(
             FANOUT_LIVENESS_BOUND,
-            coordinator.commit_promotion(
+            commit_promotion_authorized(
+                &coordinator,
                 &promotion_intent,
                 IoObservation::Valid(manifest(
                     &legacy_key(&promotion_hash),
@@ -10903,23 +10949,23 @@ async fn a_promotion_with_unchanged_readability_appends_no_lifecycle_summary_row
     let before = outbox_row_count_for_repository(&db, &repository_id).await;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash)
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("begin promotion")
     else {
         panic!("a Staged head must admit begin_promotion");
     };
-    let verdict = coordinator
-        .commit_promotion(
-            &promotion_intent,
-            IoObservation::Valid(manifest(
-                "f1-promotion/remote",
-                0x21,
-                EpochAuthority::Remote,
-            )),
-        )
-        .await
-        .expect("commit promotion must not error");
+    let verdict = commit_promotion_authorized(
+        &coordinator,
+        &promotion_intent,
+        IoObservation::Valid(manifest(
+            "f1-promotion/remote",
+            0x21,
+            EpochAuthority::Remote,
+        )),
+    )
+    .await
+    .expect("commit promotion must not error");
     assert_eq!(verdict, CommitVerdict::Published);
 
     let after = outbox_row_count_for_repository(&db, &repository_id).await;
