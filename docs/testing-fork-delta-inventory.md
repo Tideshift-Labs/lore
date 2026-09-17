@@ -184,6 +184,36 @@ delta produced. Keep it durable, not chronological — chronological execution n
   exercises the function's refusal of a non-serializable caller.
   Comparing a crate's counts across two commits needs `--no-fail-fast`; the default stops at the
   first failing target and tallies only what it reached (19 of 47 here), a plausible-looking count.
+  **CR-034 runtime budget pin re-read [SERVER]**, layered on the CD-4/CD-5 pair above: on
+  `BudgetPinRejected`, `execute` calls the new `refresh_budget_pin` trait method (default:
+  `Err(ConfigurationUnresolved)`, every pre-existing implementor unaffected) at most once, retries
+  the same attempt at most once, and accepts the refresh only when its fence is the exact successor
+  AND its revision token differs — a real publish always mints a fresh revision, so a fixture that
+  only bumps the fence and keeps the old revision string is refused for the wrong reason; pin that
+  case explicitly (`refresh_to_the_exact_successor_fence_but_an_unchanged_revision_is_still_refused`),
+  don't rely on catching it by accident. `PostgresProviderChargeAuthority::refresh_budget_pin`
+  (`provider_charge.rs`) reads migration 0025's `SECURITY DEFINER` head-read function through the
+  same dispatch pool the charge uses, `ReadCommitted` not `Serializable`, no boundary advisory lock.
+  Unit coverage (mocked authority, no database — 9 cases): `cargo test -p lore-object-dispatch
+  --test provider_client -- refresh_ non_budget_pin_rejected`, `tests/provider_client.rs` section
+  "7a" (`RefreshScriptedChargeAuthority` scripts `charge`/`refresh_budget_pin` independently and
+  records every pin observed; `PanicOnRefreshChargeAuthority` turns an unwanted refresh call into a
+  hard failure). Live coverage, `tests/run-budget-pin-refresh-live.ps1` (own throwaway Postgres 16
+  container per test, pattern of `provider_charge_live.rs`): 0025 least-privilege (runtime role
+  only, `42501` for maintenance/migrator, head table itself still unreachable), a real
+  renewal-and-retry (double-spend proof: old fence's bucket untouched, only the new fence's is
+  debited), N+2 drift refusing with zero debit anywhere, and expiry staying
+  `CONFIGURATION_UNRESOLVED` with zero refresh calls (`CountingRefreshAuthority` wraps the real
+  authority to count real `refresh_budget_pin` invocations, not a fake's). All 4 live tests and all
+  9 unit cases passed 2026-09-16. One fixture gotcha this file's `set_available` hit that
+  `provider_charge_live.rs`'s twin never needed: its bare-literal `{units} * {INTERVAL_MS}` SQL
+  multiplies as `int4` and overflows past ~2.1e9 (`int4mul`, SQLSTATE `22003`) the moment `units`
+  exceeds ~2 — cast both operands to `numeric(20,0)` (the `uint64` domain's own base type) before
+  multiplying. Not yet run as of 2026-09-16, owned by the implementation lane not this test lane:
+  the live catalog re-measure (`run-cell-schema-install-live.ps1 -Measure`) that pins 0025's two
+  moved sections (`functions`, `function_acls`) into `CELL_CATALOG_SECTION_BLAKE3_V1`/
+  `CELL_CATALOG_MANIFEST_BLAKE3_V1` — untouched by the install-set bump to 21 entries as of this
+  writing, invisible to the default (non-live) suite, caught only by the live installer tier.
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: `admit_operation`
   (`lore-fragment-provider/src/lib.rs`, the gateway method, not `FragmentProviderEntry`'s
   forwarder) shifts a queued attempt's `deadline_unix_ms` forward by the time actually spent
@@ -514,4 +544,103 @@ delta produced. Keep it durable, not chronological — chronological execution n
   `MAX_RESET_CHAIN_DEPTH`) are `cargo test -p lore-postgres --lib domain::outbox::prune::tests`. The
   64-hop `MAX_RESET_CHAIN_DEPTH` bound is pinned as a constant only -- building a real 64-row chain
   fixture to prove the depth cutoff itself was judged disproportionate and was not attempted.
+
+- **WP-114/WP-115 durable promotion send claim [SERVER, `lore-postgres/src/domain/fragments/`]**:
+  `begin_promotion` becomes claim-bearing (an exclusive promotion-ownership token plus a durable
+  `lore_fragment_write_claims` row, kind=Promotion) so a worker lease alone cannot authorize a
+  provider send; `authorize_write_claim` gains a staged-source admission arm. New migration
+  `migrations/0002_fragment_promotion_send_claims.sql` (the crate's first numbered follow-on to
+  `0001_init.sql`; edited files carry the new `kind`/`source_epoch`/`source_manifest_id` columns
+  and the `lore_fragment_write_claim_promotion_shape` CHECK, in lockstep with `FRAGMENT_SCHEMA` as
+  always). `ready_for_lifecycle`'s clean-init arm floor moved `schema_version >= 3` to `>= 4`
+  (a version-3 cell must route legacy against a version-4 binary, not half-enable and hit
+  SQLSTATE 42703 on the first promotion).
+  Offline (no DB): `fragment_write_claim_schema.rs` -- `FragmentWriteClaimKind` bits round-trip,
+  the schema-version-4 clean-init guardrail (constructs `FragmentLifecycleReadiness` directly, no
+  database needed), and DDL premise pins across both `FRAGMENT_SCHEMA` and the 0002 migration.
+  `domain_migration_parity.rs` applies 0001 then 0002 in the live catalog-parity case, plus an
+  idempotent-reapply case for 0002 (Postgres has no `ADD CONSTRAINT IF NOT EXISTS`, so a
+  straight `ADD CONSTRAINT` on a second apply is the failure a source read cannot rule out).
+  Live: `fragment_promotion_send_claim.rs` (new target, own `run-fragment-lifecycle-live.ps1`
+  inventory entry, kept separate from `domain_fragment_lifecycle.rs` which is co-owned by a
+  sibling lane) covers admission/refusal, the hash-wide **object-key** promotion barrier
+  (`legacy_hash_key(hash)`, not the lineage-scoped `(hash, epoch, fence)` barrier direct writes
+  still use -- both promotion and direct writes always allocate a fresh epoch/fence against the
+  same hash, so a lineage-scoped filter is structurally always clear), exclusivity plus
+  fence-stamping takeover after a crashed worker's barrier clears, authorization negatives
+  (staged epoch moved, manifest replaced, fence moved, ownership token cleared) settling NoSend
+  with `fragment_write_lineage_moved`, attempt-identity reuse against a moved witness rejected by
+  `create_write_claim_locked`'s durable equality check, send-deadline expiry settling NoSend (never
+  Ambiguous), an Ambiguous settlement's barrier row staying visible and blocking a fresh attempt
+  with no lease of any kind in the picture, Decisive publication (provider evidence copied onto
+  the epoch row, predecessor quarantined, no lifecycle summary since Staged->Remote crosses no
+  readability boundary), a fence moved between authorize and commit (`commit_publication`'s own
+  Fenced arm, distinct from `abandon_promotion`), and `abandon_promotion`'s two Fenced early-return
+  arms (fenced, and head gone) each still settling the claim rather than leaving it Sending
+  forever. Gate: `pwsh -File lore-postgres/tests/run-fragment-lifecycle-live.ps1` (its
+  `Assert-ExpectedCatalog` fails the run before Docker starts if the compiled catalog and its
+  `$inventory` disagree).
+  **A found contract disagreement, unresolved as of this note:** the ratified plan's barrier
+  section recommends restricting the new hash-wide barrier to `kind = 1` (Promotion) rows only,
+  "so a concurrent direct write does not block promotion, and vice versa" -- but the case a fresh
+  review round required is the opposite: an object-key barrier blocking *every* claim kind at the
+  shared `legacy_hash_key`, both directions (proven by `an_ambiguous_direct_write_claim_at_the
+  _legacy_key_blocks_promotion_admission` and its mirror). These cannot both be the shipped
+  predicate; confirm which one the coordinator actually implements before trusting either
+  description over the source.
+
+- **WP-114 CD-6/CD-7 write-behind store adapter [SERVER, `lore-postgres/src/store/write_behind/`]**:
+  the confined staging root, durable finalization, admission watermarks, and staged reads/cleanup
+  the coordinator's staging half (`begin_stage`/`commit_staged`, already covered by
+  `domain_fragment_lifecycle.rs`) gets its first production caller through. `immutable_store.rs` is
+  now fully wired (`with_write_behind`, `put_staged`, the staged read arm, all landed 2026-09-16).
+  Three tiers:
+  - **Offline, no Postgres** (`cargo test -p lore-postgres --test write_behind_stage --test
+    write_behind_source_pins`): `write_behind_stage.rs` (`#![cfg(unix)]`, drives the public
+    `WriteBehindStage` surface against a real temp dir -- the mandatory case is
+    `the_case_that_matters_most_an_unavailable_root_never_answers_absent`, a root that vanishes at
+    runtime must make `read_staged` answer `Unavailable`, never `Absent`) and
+    `write_behind_source_pins.rs` (cross-platform text scans: size-validation-before-route-branch,
+    finalize.rs's exact durability ordering, and **D11's and the staged-read integration's**
+    control-flow shape -- see below). **Executed on real Linux**, not just believed correct against
+    source: all 10 `write_behind_stage.rs` cases passed in a `rust:slim-trixie` container on
+    2026-09-16, container exit 0; the Docker-on-Windows recipe is in `testing-gotchas.md`'s "Running
+    a Unix-only fork crate's tests from the Windows dev rig".
+  - **D11 fallback and the staged-read store integration are structurally proven, not live-proven,
+    and that distinction must not blur.** `write_behind_source_pins.rs` proves by source: (1) the
+    four-way admission-mode match in `put_coordinated` is exhaustive and mutually exclusive, so
+    `put_staged` and `upload_coordinated_representation` running for the same PUT is a compile-time
+    impossibility, not an untested case; (2) the `DirectFallback`/`None` arm is byte-identical to the
+    pre-write-behind direct call; (3) both routes feed one shared `create_association_if_current`,
+    so neither can silently skip acknowledgement; (4) `load_coordinated`'s staged read arm reaches
+    `mark_coordinated_missing` from exactly one call site, only after the `Found`/`Absent` match, so
+    `StagedRead::Unavailable`'s early return (release lease, `SlowDown`) provably cannot reach it.
+    **What this does NOT prove**: an actual S3 PUT under `DirectFallback` reading back correctly, or
+    a real `EpochAuthority::Staged` head served through a live `Coordinated` route. Both need a real
+    `FragmentProviderEntry` (`put_coordinated`/`load_coordinated` require it unconditionally to be
+    reached at all), which needs a live S3-compatible endpoint, a dispatch pool, and
+    cell-schema-install migrations -- composition owned by `lore-server`, and as of 2026-09-16 no
+    test anywhere in `lore-postgres` constructs one (`grep -r "with_fragment_provider(" tests/`
+    returns nothing, including `active_active_shared_backend.rs`, which only exercises the Legacy
+    route). **REQUIRED-DEFERRED to round-3 activation** (the disposable governed two-replica cell on
+    slot 52), which names both round trips as gates: an actual S3 PUT under `DirectFallback` with a
+    correct read-back, and a real `Staged` head read through the live route.
+  - **Live Postgres, no provider** (`lore-postgres/tests/write_behind_staging_lifecycle.rs`,
+    `#![cfg(unix)]`, `#[ignore]`, needs `LORE_TEST_PG_URL`): drives `begin_stage`/`stage.stage`/
+    `commit_staged`/`capture_current_readable_epoch` directly against a real coordinator and a real
+    confined root -- everything `put_staged` does except go through the public `ImmutableStore`
+    trait, since that needs the same live provider as D11 above. **Found a live defect this way**:
+    `capture_current_readable_epoch` (`domain/fragments/creation.rs:24`) is Remote-only --
+    `remote_epoch_exists` hardcodes `EpochAuthority::Remote.bits()` in its SQL, and the function's own
+    doc comment says "after commit_remote" / "no readable Remote witness". `put_staged` reuses this
+    same function to capture its return witness after `commit_staged`, so **every successful
+    Stage-mode commit today returns `SlowDown` to the caller**, even though the bytes are durably
+    staged and the head is published `Staged` (confirmed live: `commit_staged` returns
+    `CommitVerdict::Published`, direct SQL confirms `state = Staged`, then
+    `capture_current_readable_epoch` returns `None`).
+    `staged_commit_then_witness_capture_through_the_put_staged_sequence` pins this and documents in
+    its own failure message how to flip it once fixed. Not owned by this seam's test lane to fix
+    (`domain/fragments/creation.rs` is coordinator territory) and not yet resolved as of this
+    writing -- check `domain/fragments/creation.rs` before trusting any future claim that Stage mode
+    works live.
 

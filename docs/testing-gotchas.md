@@ -28,6 +28,16 @@ topic — chronological execution notes belong in `docs/worklogs/`.
   then restore the file exactly (`git diff` should show only your intended lines) before finishing.
 - If an untouched file reports an impossible macro/import/rlib error after alternating Clippy and
   test builds, suspect stale incremental state. Clean only the affected crate before escalating.
+- **A timing-sensitive test can FAIL only inside a whole-crate `cargo test -p <crate>` run and PASS
+  when its own file is run alone**, under heavy multi-lane shared-checkout build contention (many
+  concurrent `cargo`/`rustc` processes queued on the same `target/` lock). Observed 2026-09-16:
+  `lore-object-dispatch`'s `tests/shared_dispatch_pool.rs`
+  (`ambiguous_commit_and_dead_sessions_poison_while_retry_sleep_follows_release`,
+  `outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_the_session`, both
+  sleep/timeout-classification cases) failed once in a full `cargo test -p lore-object-dispatch`
+  and passed cleanly on an immediate isolated rerun (`cargo test -p lore-object-dispatch --test
+  shared_dispatch_pool`). Before treating this shape as a regression: rerun the one failing test
+  binary alone; a pass there under load is a scheduling flake, not new evidence about the code.
 - Regenerate protobuf output and `Cargo.lock` from their sources; do not hand-splice generated files.
 - A large prost `oneof` can fail `clippy::large_enum_variant` after generation. Box every large
   branch through `Config::boxed`; the matching path includes the oneof name
@@ -143,6 +153,25 @@ topic — chronological execution notes belong in `docs/worklogs/`.
   comment. See cases K and L in
   `lore-integration-tests/tests/active_active_two_process_test.rs` and
   `SharedBackend::report_synthetic_checkpoint`.
+
+### A live `lore-postgres` test's bootstrap DDL has a 250ms bound, which a heavily loaded host can trip on its own
+
+Symptom: `PostgresDomainStore::connect`/`PostgresImmutableStore::connect` fails with `"postgres
+bounded schema DDL failed"`, SQLSTATE `57014` ("canceling statement due to statement timeout" or
+"... due to user request"), on a *freshly created, idle* disposable Postgres container --
+`docker stats` shows near-zero CPU on the Postgres container itself, and recreating the container
+from scratch does not fix it. Cause: `pool.rs`'s `ensure_schema` sets `SET LOCAL statement_timeout
+= '250ms'` before its bootstrap DDL (deliberately tight, to fail fast on a stuck migration rather
+than hang) -- and 250ms is not a generous bound on a host with many concurrent `cargo`/`docker`
+builds contending for CPU and disk (the same host-wide contention this guide's other entries
+describe, e.g. 14-minute `cargo test` builds from lock contention alone). This is environmental,
+not a code defect: reproduced 4/4 times in one session against both a reused and a freshly
+recreated container, ruling out a stuck advisory lock. What to do: don't chase it as a bug: retry
+once host load visibly drops (check sibling lanes' activity, or just wait), and don't read it as
+"my test/code is broken" without first checking `docker stats` shows the Postgres container itself
+idle. Worth knowing before spending time on lock-based theories, which look plausible (`pool.rs`'s
+own `SCHEMA_LOCK_KEY`/`pg_advisory_xact_lock` is real) but do not explain a failure that a fresh
+container reproduces identically.
 
 ### Postgres parameter typing and retry classification
 
@@ -391,6 +420,15 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
   `ObjectStorePayloadKindGetResult` -- not `...ResultPayload`. A minimal state/retention fixture that
   guesses the second name fails at compile time with a "did you mean" pointing at the right one.
 
+### A source-pin's own module doc comment can trip its own scan
+
+A `mod.rs`-level doc comment explaining *why* a rule holds often quotes the forbidden words in
+prose ("no type here names a `Pool`, a `Transaction`, or a connection checkout"). Scan for the
+narrowest *call/type shape* that could not appear in that prose (`.transaction()`, `pool.get(`,
+`deadpool_postgres::`), never a bare capitalized word — same convention as the existing
+`fragment_write_claim_source_pins.rs`. See `lore-postgres/tests/write_behind_source_pins.rs`
+(WP-114 CD-6/CD-7).
+
 ### Process-global state
 
 - OTel providers, connection maps, auth caches, and panic hooks are shared by the whole test binary.
@@ -456,6 +494,49 @@ current-thread/one-worker runs and event or stage-end counts do not prove topolo
   (`case_l_an_unresolved_gap_blocks_the_frontier_and_cannot_be_skipped`) proves the checkpoint
   store's own refusal of a self-contradictory report instead, and says so in its doc comment --
   don't read a future green run of it as evidence a live gap was ever observed.
+- A Unix-only module's platform gate can block its own *unit*-level tests, not only its crash/live
+  tiers. `lore-postgres/src/store/write_behind`'s `ConfinedRoot::open` refuses off-Unix
+  (`WriteBehindError::UnsupportedPlatform`), so on a Windows dev rig `#![cfg(unix)]`-gated
+  functional tests against it are absent from the build (correctly — `cfg`, not `#[ignore]`, since
+  this is a platform gate, not an infra gate). Docker Desktop's Linux engine is available on this
+  rig, though, so treat this as "needs a Linux run", not REQUIRED-DEFERRED by default — see the
+  recipe below. Only cross-platform text-scan pins (source-pin style) run on Windows for such a
+  module without one.
+
+### Running a Unix-only fork crate's tests from the Windows dev rig
+
+`docker info --format '{{.OSType}}'` reporting `linux` means Docker Desktop's Linux engine is
+already available — no WSL Rust toolchain install needed. Recipe, proven 2026-09-16 against
+`lore-postgres --test write_behind_stage` (10/10 passed, container exit 0):
+
+1. **Copy the working tree to a scratch directory first; do not bind-mount the live checkout
+   read-write.** `lore-proto`'s build script writes generated output back into its own source
+   directory (not just `OUT_DIR`), so a read-only bind mount fails the build
+   (`Os { code: 30, kind: ReadOnlyFilesystem }` on `lore-proto`'s build script) and a read-write
+   bind mount risks a container process touching files a sibling lane is mid-edit on in a shared
+   checkout. `robocopy <repo> <scratch> /E /XD target .git` (exclude the disk-hungry `target/` and
+   `.git/`) gives an isolated, disposable copy that still carries every *uncommitted* file — needed,
+   since the interesting state during a multi-lane run is usually not committed yet.
+2. Bind-mount that scratch copy read-write, and send `CARGO_TARGET_DIR` and the cargo registry
+   cache to **named Docker volumes**, not the bind mount, so a Linux build's artifacts never land
+   in the Windows `target/` another process might be reading.
+3. Base image `rust:slim-trixie` (same as `lore-server/Dockerfile`) plus `apt-get install -y
+   protobuf-compiler build-essential` — `lore-proto`'s `prost`/`tonic` build needs `protoc`.
+4. First run compiles the full dependency graph from cold (~2 minutes for this crate's tree on this
+   rig); the named volumes make a second run incremental.
+5. Launch detached (`docker run -d --name ...`), poll `docker inspect --format
+   '{{.State.Status}}'` in a bounded loop inside one tool call, `docker logs` once it exits,
+   `docker inspect --format '{{.State.ExitCode}}'` to confirm 0 before trusting the log's "ok"
+   lines, then `docker rm` — never run this in the foreground of a single tool call, it will
+   exceed most timeouts on a cold cache.
+6. **The `# allow-posix` escape hatch does not apply here and should not be reached for.** The
+   command is `docker run ... sh -c "..."`; the workspace's POSIX-shell-blocking hook parses at
+   *shell segment* granularity, splitting on `;`/`&&`/`|`/newlines, so a `sh -c "..."` argument
+   embedded inside a **single-line** `docker run` invocation is just one quoted argument token, not
+   a command position — permitted, correctly. The hook DOES trip if the same `docker run` is spread
+   across PowerShell backtick-continued lines: it splits the raw command on literal `\n` before
+   PowerShell's own continuation semantics apply, so a continued line beginning with `sh -c "..."`
+   reads as its own top-level shell invocation and is denied. Keep this one command on one line.
 - **Never source a candidate port from `bind(0)` when the port must be free for BOTH TCP and UDP;
   never "fix" the resulting failure by raising the retry count.** `scripts/test`'s
   `allocate_free_port` (gRPC and QUIC share one number) hard-failed all 20 attempts on Windows with
