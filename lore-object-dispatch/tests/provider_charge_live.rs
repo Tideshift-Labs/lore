@@ -1553,10 +1553,14 @@ fn charge_sql(
 }
 
 async fn set_available(client: &Client, cap_class: i16, units: u64) {
+    // Bare integer literals multiply as int4 (`int4mul`) and overflow past ~2.1e9: every call site
+    // in this file stays at units 1-2 today, which is just under that ceiling, so cast both
+    // operands to the uint64 domain's own base type before multiplying rather than rely on that
+    // margin. See budget_pin_refresh_live.rs's twin, which hit this at units=10.
     client
         .batch_execute(&format!(
             "UPDATE object_store_retention.object_dispatch_budget_bucket_state SET \
-             available_scaled = {units} * {INTERVAL_MS}, \
+             available_scaled = {units}::numeric(20,0) * {INTERVAL_MS}::numeric(20,0), \
              updated_at_unix_ms = object_store_retention.clock_unix_ms_v1(), \
              state_revision = state_revision + 1 \
              WHERE provider_boundary_id = '{BOUNDARY}' AND cap_class = {cap_class};"

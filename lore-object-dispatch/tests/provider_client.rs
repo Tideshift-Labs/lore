@@ -2502,6 +2502,512 @@ async fn execute_hands_the_transport_the_exact_authorized_permit() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// 7a. execute: runtime budget pin refresh-and-retry (CR-034)
+// ---------------------------------------------------------------------------------------------
+//
+// CR-034: a `BudgetPinRejected` refusal triggers exactly one `refresh_budget_pin` call and one
+// retry of the same attempt (same attempt_id/attempt_ordinal), accepted only when the refreshed
+// pin is the exact successor fence. Exhaustion is always a typed, decisive
+// `ChargeRefused(BudgetPinRejected)` -- never `OutcomeUnknown`. See
+// `lorehub/docs/lore-change-requests/cr-034-runtime-budget-pin-re-read.md`.
+
+/// A `ProviderChargeAuthority` test double that scripts `charge` and `refresh_budget_pin`
+/// independently. `charge_script` is keyed on the call's own 1-based call number so a test can
+/// script "reject the first attempt, grant the second" without any shared mutable state of its
+/// own. Every budget pin a charge request carried is recorded in call order.
+struct RefreshScriptedChargeAuthority<C, R> {
+    charge_script: C,
+    refresh_script: R,
+    charge_calls: Arc<TestCounter>,
+    refresh_calls: Arc<TestCounter>,
+    observed_pins: Arc<Mutex<Vec<BudgetPin>>>,
+}
+
+/// `(authority, charge_calls, refresh_calls, observed_pins)`, named only to keep
+/// `RefreshScriptedChargeAuthority::new`'s signature under clippy's type-complexity limit.
+type RefreshScriptedChargeAuthorityHandles<C, R> = (
+    RefreshScriptedChargeAuthority<C, R>,
+    Arc<TestCounter>,
+    Arc<TestCounter>,
+    Arc<Mutex<Vec<BudgetPin>>>,
+);
+
+impl<C, R> RefreshScriptedChargeAuthority<C, R>
+where
+    C: Fn(u32, &ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError>,
+    R: Fn(&str) -> Result<BudgetPin, ProviderChargeError>,
+{
+    fn new(charge_script: C, refresh_script: R) -> RefreshScriptedChargeAuthorityHandles<C, R> {
+        let charge_calls = Arc::new(TestCounter(AtomicU32::new(0)));
+        let refresh_calls = Arc::new(TestCounter(AtomicU32::new(0)));
+        let observed_pins = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                charge_script,
+                refresh_script,
+                charge_calls: charge_calls.clone(),
+                refresh_calls: refresh_calls.clone(),
+                observed_pins: observed_pins.clone(),
+            },
+            charge_calls,
+            refresh_calls,
+            observed_pins,
+        )
+    }
+}
+
+impl<C, R> ProviderChargeAuthority for RefreshScriptedChargeAuthority<C, R>
+where
+    C: Fn(u32, &ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError> + Sync,
+    R: Fn(&str) -> Result<BudgetPin, ProviderChargeError> + Sync,
+{
+    async fn charge(
+        &self,
+        request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError> {
+        self.charge_calls.increment();
+        let call = self.charge_calls.get();
+        self.observed_pins
+            .lock()
+            .expect("test mutex")
+            .push(request.budget_pin().clone());
+        (self.charge_script)(call, request)
+    }
+
+    async fn refresh_budget_pin(
+        &self,
+        provider_boundary_id: &str,
+    ) -> Result<BudgetPin, ProviderChargeError> {
+        self.refresh_calls.increment();
+        (self.refresh_script)(provider_boundary_id)
+    }
+}
+
+/// A `ProviderChargeAuthority` test double that panics if `refresh_budget_pin` is ever called --
+/// used to prove that only a `BudgetPinRejected` refusal enters the refresh branch.
+struct PanicOnRefreshChargeAuthority<F> {
+    respond: F,
+    calls: Arc<TestCounter>,
+}
+
+impl<F> PanicOnRefreshChargeAuthority<F>
+where
+    F: Fn(&ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError>,
+{
+    fn new(respond: F) -> (Self, Arc<TestCounter>) {
+        let calls = Arc::new(TestCounter(AtomicU32::new(0)));
+        (
+            Self {
+                respond,
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+}
+
+impl<F> ProviderChargeAuthority for PanicOnRefreshChargeAuthority<F>
+where
+    F: Fn(&ProviderChargeRequest) -> Result<ProviderChargeGrant, ProviderChargeError> + Sync,
+{
+    async fn charge(
+        &self,
+        request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError> {
+        self.calls.increment();
+        (self.respond)(request)
+    }
+
+    async fn refresh_budget_pin(
+        &self,
+        _provider_boundary_id: &str,
+    ) -> Result<BudgetPin, ProviderChargeError> {
+        panic!("refresh_budget_pin must not be called for a non-BudgetPinRejected refusal");
+    }
+}
+
+/// A real publish always mints a fresh revision token (a revision string cannot be reused after an
+/// intervening configuration -- see `provider_charge_live.rs`'s
+/// `live_postgres_successor_fence_and_stage3_publication_matrix`), so a genuine renewal changes
+/// both the fence AND the revision. `execute`'s successor check refuses an unchanged revision even
+/// when the fence is the exact successor, on the same belt-and-braces principle.
+fn refreshed_pin() -> BudgetPin {
+    let base = budget_pin();
+    BudgetPin {
+        revision: format!("{}-successor", base.revision),
+        fence: base.fence + 1,
+    }
+}
+
+/// Case 1 + 6: a rejected first attempt, refreshed to the exact successor fence, retried and
+/// granted. Exactly one committed grant, one issued attempt, and no poison. The grant the second
+/// (retried) charge returns echoes the refreshed pin exactly -- the case that would have poisoned
+/// the ledger under an authority-internal refresh design, where `validate_grant` compares
+/// `grant.budget_pin != request.budget_pin`.
+#[tokio::test]
+async fn refresh_then_retry_succeeds_the_grant_echoes_the_refreshed_pin_and_is_accepted() {
+    let refreshed = refreshed_pin();
+    let refreshed_for_script = refreshed.clone();
+    let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            move |call, request| {
+                if call == 1 {
+                    Err(ProviderChargeError::BudgetPinRejected)
+                } else {
+                    Ok(binding_grant(request))
+                }
+            },
+            move |_boundary| Ok(refreshed_for_script.clone()),
+        );
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+
+    let outcome = client.execute(&mut ledger, &request).await;
+
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.decisive_terminal_count(), 1);
+    assert_eq!(
+        ledger.poisoned(),
+        None,
+        "a validated grant echo must not poison the ledger"
+    );
+    assert_eq!(charge_calls.get(), 2, "one rejected attempt, one retry");
+    assert_eq!(refresh_calls.get(), 1);
+    assert_eq!(transport_calls.get(), 1);
+
+    let pins = observed_pins.lock().expect("test mutex");
+    assert_eq!(pins.len(), 2);
+    assert_eq!(
+        pins[0],
+        budget_pin(),
+        "the first charge opens with the caller-supplied pin"
+    );
+    assert_eq!(
+        pins[1], refreshed,
+        "the retry charges under the refreshed pin"
+    );
+}
+
+/// A genuine renewal always mints a fresh revision token (a revision string cannot be reused after
+/// an intervening configuration), so a "refresh" that lands on the exact successor fence but the
+/// SAME revision string is not a real renewal -- it is what a partial or hand-rolled renewal path
+/// would produce if it bumped a fence counter without publishing a new configuration. `execute`
+/// refuses this on the same belt-and-braces principle as a non-successor fence. Pinned explicitly,
+/// not only exercised incidentally through `refreshed_pin()`'s fixture (an earlier version of that
+/// fixture made exactly this mistake and was refused by the real implementation, which is what
+/// surfaced this as a case worth naming on its own).
+#[tokio::test]
+async fn refresh_to_the_exact_successor_fence_but_an_unchanged_revision_is_still_refused() {
+    let same_revision_next_fence = {
+        let base = budget_pin();
+        BudgetPin {
+            revision: base.revision,
+            fence: base.fence + 1,
+        }
+    };
+    let refresh_pin = same_revision_next_fence.clone();
+    let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            |_call, _request| Err(ProviderChargeError::BudgetPinRejected),
+            move |_boundary| Ok(refresh_pin.clone()),
+        );
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("a refused renewal must not send"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+
+    let outcome = client.execute(&mut ledger, &request).await;
+
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        )),
+        "an unchanged revision must be refused even at the exact successor fence"
+    );
+    assert_eq!(
+        charge_calls.get(),
+        1,
+        "an unrenewed pin must not be retried"
+    );
+    assert_eq!(refresh_calls.get(), 1);
+    assert_eq!(transport_calls.get(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+
+    let pins = observed_pins.lock().expect("test mutex");
+    assert_eq!(
+        pins.len(),
+        1,
+        "the refusal must not be retried under the unrenewed pin"
+    );
+    assert_eq!(pins[0], budget_pin());
+}
+
+/// Case 2: a refresh that lands on a non-successor fence (here, +2) is refused outright, with no
+/// retry -- and the rejected pin must never become sticky for a later, distinct attempt on the
+/// same client.
+#[tokio::test]
+async fn refresh_to_a_non_successor_fence_refuses_without_a_retry_and_never_becomes_sticky() {
+    let non_successor = {
+        let base = budget_pin();
+        // A distinct revision isolates this test to the fence check alone: it must fail for a
+        // non-successor fence specifically, not merely because the revision also matched.
+        BudgetPin {
+            revision: format!("{}-successor", base.revision),
+            fence: base.fence + 2,
+        }
+    };
+    let non_successor_for_script = non_successor.clone();
+    let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            |_call, _request| Err(ProviderChargeError::BudgetPinRejected),
+            move |_boundary| Ok(non_successor_for_script.clone()),
+        );
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("an exhausted refresh must not send"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let first = base_request(ProviderAttemptClass::Readiness);
+    let mut second = base_request(ProviderAttemptClass::Readiness);
+    second.attempt_id = other_attempt_id();
+    let mut ledger = new_ledger();
+
+    let outcome = client.execute(&mut ledger, &first).await;
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        ))
+    );
+    assert_eq!(
+        charge_calls.get(),
+        1,
+        "a non-successor fence must not be retried"
+    );
+    assert_eq!(refresh_calls.get(), 1);
+    assert_eq!(transport_calls.get(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+
+    let outcome2 = client.execute(&mut ledger, &second).await;
+    assert_eq!(
+        outcome2,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        ))
+    );
+
+    let pins = observed_pins.lock().expect("test mutex");
+    assert_eq!(pins.len(), 2);
+    assert_eq!(pins[0], budget_pin());
+    assert_eq!(
+        pins[1],
+        budget_pin(),
+        "the rejected non-successor pin must never become sticky"
+    );
+}
+
+/// Case 3: the retry itself is also rejected. The bound is exactly one refresh and one retry per
+/// `execute` call -- never a third charge, never a second refresh.
+#[tokio::test]
+async fn a_second_rejection_after_the_retry_exhausts_the_bound_and_refuses() {
+    let refreshed = refreshed_pin();
+    let refreshed_for_script = refreshed.clone();
+    let (charge_authority, charge_calls, refresh_calls, _observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            |_call, _request| Err(ProviderChargeError::BudgetPinRejected),
+            move |_boundary| Ok(refreshed_for_script.clone()),
+        );
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("an exhausted retry must not send"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+
+    let outcome = client.execute(&mut ledger, &request).await;
+
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        ))
+    );
+    assert_eq!(
+        charge_calls.get(),
+        2,
+        "exactly one retry, never a third charge"
+    );
+    assert_eq!(
+        refresh_calls.get(),
+        1,
+        "exactly one refresh, never a second"
+    );
+    assert_eq!(transport_calls.get(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+}
+
+/// Case 4: the head read itself fails. The attempt's own refusal (`BudgetPinRejected`) must be
+/// what is reported, not the read's error (`ConfigurationUnresolved`) -- and the read failure must
+/// not be retried.
+#[tokio::test]
+async fn a_failed_refresh_reports_the_attempts_own_refusal_not_the_reads_error() {
+    let (charge_authority, charge_calls, refresh_calls, _observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            |_call, _request| Err(ProviderChargeError::BudgetPinRejected),
+            |_boundary| Err(ProviderChargeError::ConfigurationUnresolved),
+        );
+    let (transport, transport_calls) =
+        ScriptedTransport::new(|_attempt| unreachable!("a failed refresh must not send"));
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let request = base_request(ProviderAttemptClass::Readiness);
+    let mut ledger = new_ledger();
+
+    let outcome = client.execute(&mut ledger, &request).await;
+
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        )),
+        "the attempt's own refusal must be reported, not the head read's error"
+    );
+    assert_eq!(
+        charge_calls.get(),
+        1,
+        "a failed refresh must not be retried"
+    );
+    assert_eq!(refresh_calls.get(), 1);
+    assert_eq!(transport_calls.get(), 0);
+    assert_eq!(ledger.committed_grant_count(), 0);
+    assert_eq!(ledger.poisoned(), None);
+}
+
+/// Case 5: override stickiness. Once a refresh has proved chargeable, the client's *next*
+/// `execute` call for a distinct attempt opens directly with the refreshed pin and issues no
+/// further refresh.
+#[tokio::test]
+async fn a_successful_refresh_stays_sticky_for_the_next_execute_on_the_same_client() {
+    let refreshed = refreshed_pin();
+    let refreshed_for_script = refreshed.clone();
+    let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            move |call, request| {
+                if call == 1 {
+                    Err(ProviderChargeError::BudgetPinRejected)
+                } else {
+                    Ok(binding_grant(request))
+                }
+            },
+            move |_boundary| Ok(refreshed_for_script.clone()),
+        );
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let first = base_request(ProviderAttemptClass::Readiness);
+    let mut second = base_request(ProviderAttemptClass::Readiness);
+    second.attempt_id = other_attempt_id();
+    let mut ledger = new_ledger();
+
+    assert_eq!(
+        client.execute(&mut ledger, &first).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(charge_calls.get(), 2);
+    assert_eq!(refresh_calls.get(), 1);
+
+    let outcome = client.execute(&mut ledger, &second).await;
+
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!(
+        charge_calls.get(),
+        3,
+        "the second attempt must succeed on its first charge"
+    );
+    assert_eq!(
+        refresh_calls.get(),
+        1,
+        "an already-sticky pin must not trigger another refresh"
+    );
+    assert_eq!(transport_calls.get(), 2);
+
+    let pins = observed_pins.lock().expect("test mutex");
+    assert_eq!(pins.len(), 3);
+    assert_eq!(
+        pins[2], refreshed,
+        "the second attempt opens with the refreshed pin, not the original"
+    );
+}
+
+/// Case 7: every refusal other than `BudgetPinRejected` must never enter the refresh branch.
+/// `PanicOnRefreshChargeAuthority` turns an unwanted `refresh_budget_pin` call into a hard test
+/// failure rather than a silently-passing assertion.
+#[tokio::test]
+async fn non_budget_pin_rejected_refusals_never_enter_the_refresh_branch() {
+    let cases = [
+        ProviderChargeError::Unwired,
+        ProviderChargeError::BudgetExhausted,
+        ProviderChargeError::ClassCapExhausted,
+        ProviderChargeError::ConfigurationUnresolved,
+        ProviderChargeError::AuthorityUnavailable,
+        ProviderChargeError::DeadlineExceeded,
+        ProviderChargeError::AttemptAlreadyCharged,
+        ProviderChargeError::AmbiguousCommit,
+        ProviderChargeError::RecoveredCommittedCharge,
+    ];
+
+    for error in cases {
+        let (charge_authority, charge_calls) =
+            PanicOnRefreshChargeAuthority::new(move |_request| Err(error));
+        let (transport, transport_calls) =
+            ScriptedTransport::new(|_attempt| unreachable!("transport must not be reached"));
+        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+        let mut ledger = new_ledger();
+
+        let outcome = client
+            .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+            .await;
+
+        let expected = match error {
+            ProviderChargeError::AmbiguousCommit => ProviderClientError::ChargeAmbiguous,
+            ProviderChargeError::RecoveredCommittedCharge => ProviderClientError::ChargeRecovered,
+            other => ProviderClientError::ChargeRefused(other),
+        };
+        assert_eq!(outcome, Err(expected), "case: {error:?}");
+        assert_eq!(charge_calls.get(), 1, "case: {error:?}");
+        assert_eq!(transport_calls.get(), 0, "case: {error:?}");
+    }
+}
+
+/// Case 8: `UnwiredChargeAuthority` never overrides `refresh_budget_pin`, so a direct call uses
+/// the trait's defaulted refusal (`ConfigurationUnresolved`) -- an honest "I have no head-read
+/// capability" refusal, deliberately distinct from a cell verdict the client never asked for.
+#[tokio::test]
+async fn unwired_charge_authority_uses_the_defaulted_refresh_refusal() {
+    let outcome = UnwiredChargeAuthority.refresh_budget_pin(BOUNDARY_ID).await;
+    assert_eq!(outcome, Err(ProviderChargeError::ConfigurationUnresolved));
+}
+
+// ---------------------------------------------------------------------------------------------
 // 7b. ProviderAttemptLedger::new and execute's ledger/request binding (INV-EJ P1)
 // ---------------------------------------------------------------------------------------------
 //
