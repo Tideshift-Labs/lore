@@ -981,6 +981,7 @@ dependencies = [
  "lore-object-dispatch",
  "thiserror",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

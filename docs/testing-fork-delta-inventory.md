@@ -184,6 +184,36 @@ delta produced. Keep it durable, not chronological — chronological execution n
   exercises the function's refusal of a non-serializable caller.
   Comparing a crate's counts across two commits needs `--no-fail-fast`; the default stops at the
   first failing target and tallies only what it reached (19 of 47 here), a plausible-looking count.
+  **CR-034 runtime budget pin re-read [SERVER]**, layered on the CD-4/CD-5 pair above: on
+  `BudgetPinRejected`, `execute` calls the new `refresh_budget_pin` trait method (default:
+  `Err(ConfigurationUnresolved)`, every pre-existing implementor unaffected) at most once, retries
+  the same attempt at most once, and accepts the refresh only when its fence is the exact successor
+  AND its revision token differs — a real publish always mints a fresh revision, so a fixture that
+  only bumps the fence and keeps the old revision string is refused for the wrong reason; pin that
+  case explicitly (`refresh_to_the_exact_successor_fence_but_an_unchanged_revision_is_still_refused`),
+  don't rely on catching it by accident. `PostgresProviderChargeAuthority::refresh_budget_pin`
+  (`provider_charge.rs`) reads migration 0025's `SECURITY DEFINER` head-read function through the
+  same dispatch pool the charge uses, `ReadCommitted` not `Serializable`, no boundary advisory lock.
+  Unit coverage (mocked authority, no database — 9 cases): `cargo test -p lore-object-dispatch
+  --test provider_client -- refresh_ non_budget_pin_rejected`, `tests/provider_client.rs` section
+  "7a" (`RefreshScriptedChargeAuthority` scripts `charge`/`refresh_budget_pin` independently and
+  records every pin observed; `PanicOnRefreshChargeAuthority` turns an unwanted refresh call into a
+  hard failure). Live coverage, `tests/run-budget-pin-refresh-live.ps1` (own throwaway Postgres 16
+  container per test, pattern of `provider_charge_live.rs`): 0025 least-privilege (runtime role
+  only, `42501` for maintenance/migrator, head table itself still unreachable), a real
+  renewal-and-retry (double-spend proof: old fence's bucket untouched, only the new fence's is
+  debited), N+2 drift refusing with zero debit anywhere, and expiry staying
+  `CONFIGURATION_UNRESOLVED` with zero refresh calls (`CountingRefreshAuthority` wraps the real
+  authority to count real `refresh_budget_pin` invocations, not a fake's). All 4 live tests and all
+  9 unit cases passed 2026-09-16. One fixture gotcha this file's `set_available` hit that
+  `provider_charge_live.rs`'s twin never needed: its bare-literal `{units} * {INTERVAL_MS}` SQL
+  multiplies as `int4` and overflows past ~2.1e9 (`int4mul`, SQLSTATE `22003`) the moment `units`
+  exceeds ~2 — cast both operands to `numeric(20,0)` (the `uint64` domain's own base type) before
+  multiplying. Not yet run as of 2026-09-16, owned by the implementation lane not this test lane:
+  the live catalog re-measure (`run-cell-schema-install-live.ps1 -Measure`) that pins 0025's two
+  moved sections (`functions`, `function_acls`) into `CELL_CATALOG_SECTION_BLAKE3_V1`/
+  `CELL_CATALOG_MANIFEST_BLAKE3_V1` — untouched by the install-set bump to 21 entries as of this
+  writing, invisible to the default (non-live) suite, caught only by the live installer tier.
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: `admit_operation`
   (`lore-fragment-provider/src/lib.rs`, the gateway method, not `FragmentProviderEntry`'s
   forwarder) shifts a queued attempt's `deadline_unix_ms` forward by the time actually spent

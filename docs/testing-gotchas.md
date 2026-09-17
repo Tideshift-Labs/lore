@@ -28,6 +28,16 @@ topic — chronological execution notes belong in `docs/worklogs/`.
   then restore the file exactly (`git diff` should show only your intended lines) before finishing.
 - If an untouched file reports an impossible macro/import/rlib error after alternating Clippy and
   test builds, suspect stale incremental state. Clean only the affected crate before escalating.
+- **A timing-sensitive test can FAIL only inside a whole-crate `cargo test -p <crate>` run and PASS
+  when its own file is run alone**, under heavy multi-lane shared-checkout build contention (many
+  concurrent `cargo`/`rustc` processes queued on the same `target/` lock). Observed 2026-09-16:
+  `lore-object-dispatch`'s `tests/shared_dispatch_pool.rs`
+  (`ambiguous_commit_and_dead_sessions_poison_while_retry_sleep_follows_release`,
+  `outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_the_session`, both
+  sleep/timeout-classification cases) failed once in a full `cargo test -p lore-object-dispatch`
+  and passed cleanly on an immediate isolated rerun (`cargo test -p lore-object-dispatch --test
+  shared_dispatch_pool`). Before treating this shape as a regression: rerun the one failing test
+  binary alone; a pass there under load is a scheduling flake, not new evidence about the code.
 - Regenerate protobuf output and `Cargo.lock` from their sources; do not hand-splice generated files.
 - A large prost `oneof` can fail `clippy::large_enum_variant` after generation. Box every large
   branch through `Config::boxed`; the matching path includes the oneof name
