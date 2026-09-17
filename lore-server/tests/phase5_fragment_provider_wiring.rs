@@ -22,6 +22,68 @@ fn between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
     &remainder[..end]
 }
 
+/// Removes `//`-to-end-of-line comments, conservatively.
+///
+/// Copied verbatim from `lore-fragment-provider/tests/seam_source_pins.rs`
+/// rather than re-derived: its known limit is recorded there, and two
+/// independently written walkers would drift.
+fn strip_line_comments(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            if line.trim_start().starts_with("//") {
+                return "";
+            }
+            if line.contains('"') {
+                return line;
+            }
+            match line.find("//") {
+                Some(index) => &line[..index],
+                None => line,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Comments stripped, and every `#[cfg(test)]`-attributed item removed by
+/// structure so that code after the test module stays visible.
+///
+/// **A whole-file scan that does not do this counts test fixtures as shipped
+/// code, and its premise expires the first time someone adds one.** That is
+/// exactly what happened to the pool-construction count below: WP-114 CD-6's
+/// drain unit cases needed a `FragmentProviderEntry`, their fixture built a
+/// pool, and a pin reading "one construction site in the file" started reading
+/// two — while shipped code still had exactly one.
+fn shipped_code(text: &str) -> String {
+    let stripped = strip_line_comments(text);
+    let mut out = String::with_capacity(stripped.len());
+    let mut rest = stripped.as_str();
+    while let Some(index) = rest.find("#[cfg(test)]") {
+        out.push_str(&rest[..index]);
+        rest = skip_attributed_item(&rest[index..]).unwrap_or_default();
+    }
+    out.push_str(rest);
+    out
+}
+
+fn skip_attributed_item(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (index, character) in text.char_indices() {
+        match character {
+            ';' if depth == 0 => return Some(&text[index + 1..]),
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(&text[index + 1..]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn assert_precedes(source: &str, first: &str, second: &str) {
     let first = source.find(first).expect("first marker must exist");
     let second = source.find(second).expect("second marker must exist");
@@ -341,23 +403,46 @@ fn one_arc_dispatch_pool_serves_attestation_and_charge_authority() {
         "PostgresProviderChargeAuthority::new",
         "with_transport_port(",
     );
-    // WP-114 CD-8 runs its retention pass on this same Arc rather than opening a
-    // second pool, so `DISPATCH_PROCESS_CONNECTION_LIMIT`'s process inventory is
-    // unchanged. Checked over the whole seam because the retained field and its
-    // accessor sit outside `connect`'s window: one construction site in the
-    // file, and the accessor mints its client from the retained field.
+    // WP-114 CD-8's retention pass and CD-6's drain capability both run on this
+    // same Arc rather than opening a second pool, so
+    // `DISPATCH_PROCESS_CONNECTION_LIMIT`'s process inventory is unchanged.
+    // Checked over the whole seam because the retained field and its accessors
+    // sit outside `connect`'s window.
+    //
+    // **Shipped code only.** An earlier revision scanned the raw file and so
+    // counted the drain cases' own `drain_entry` fixture as a second
+    // construction site. Shipped code had exactly one throughout; the pin was
+    // reading test code. See `shipped_code` for why that is the general trap.
+    let shipped_seam = shipped_code(FRAGMENT_SEAM);
     assert_eq!(
-        FRAGMENT_SEAM.matches("DispatchRuntimePool::new(").count(),
-        1
+        shipped_seam.matches("DispatchRuntimePool::new(").count(),
+        1,
+        "the seam must construct exactly one dispatch pool in shipped code"
     );
+
+    // The count alone is not the property, and on its own it stops biting the
+    // moment a third accessor is added: a new accessor that opened its own pool
+    // would be caught, but one that took a pool handed to it would not, and
+    // neither would a count that quietly moved. So each accessor is also
+    // asserted to MINT from the retained field. One pool, N accessors, each
+    // proven to reuse it — that is the invariant the process inventory rests on.
     let retention = between(
         FRAGMENT_SEAM,
         "    pub fn cell_retention(",
-        "#[derive(Debug, Clone, PartialEq, Eq)]",
+        "    pub fn drain_capability(",
     );
     assert!(
         retention.contains("CellRetentionClient::new(self.pool.clone())"),
         "the retention client must be minted from the entry's own retained pool"
+    );
+    let drain = between(
+        FRAGMENT_SEAM,
+        "    pub fn drain_capability(",
+        "    pub async fn admit_operation(",
+    );
+    assert!(
+        drain.contains("DispatchRuntimeClient::new(self.pool.clone())"),
+        "the drain capability must be minted from the entry's own retained pool"
     );
 }
 
