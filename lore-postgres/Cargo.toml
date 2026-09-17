@@ -54,6 +54,16 @@ lore-fragment-provider = { workspace = true }
 lore-revision = { workspace = true }
 lore-storage = { workspace = true }
 lore-telemetry = { workspace = true }
+# WP-114 CD-7's write-behind staging tier: the admission sampler is an
+# `AbortOnDropHandle` scoped to the stage, per `docs/developing/code-standards/tasks.md`.
+tokio-util = { workspace = true }
+
+# WP-114 CD-7 again. `O_NOFOLLOW` on the staged open and `statvfs` for the
+# admission sampler's free-space input are not in std, and both are Unix-only,
+# which is also what staging itself is. Nothing outside
+# `src/store/write_behind/root.rs`'s `cfg(unix)` platform module may name this.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [features]
 # CR-031: whether this build can DECODE an Oodle2-compressed payload.

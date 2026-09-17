@@ -13,3 +13,4 @@ mod fragment_transport;
 pub mod immutable_store;
 pub mod lock_store;
 pub mod mutable_store;
+pub mod write_behind;

@@ -114,6 +114,11 @@ use crate::domain::fragments::ProviderTrafficClass;
 use crate::domain::fragments::coordinator::DirectWriteKind;
 use crate::domain::fragments::decodable_encoding;
 use crate::domain::fragments::read_fragment_write_capability;
+use crate::store::write_behind::AdmissionSnapshot;
+use crate::store::write_behind::StagedRead;
+use crate::store::write_behind::StagingMode;
+use crate::store::write_behind::WriteBehindError;
+use crate::store::write_behind::WriteBehindStage;
 
 pub mod clean_namespace;
 pub mod creation_metadata;
@@ -281,6 +286,14 @@ pub struct PostgresImmutableStore {
     instruments: crate::metrics::Instruments,
     fragment_route: FragmentLifecycleRoute,
     staged_epoch_cleanup: Option<Arc<dyn StagedEpochCleanup>>,
+    /// WP-114 CD-7's staging tier, when this cell has one.
+    ///
+    /// Deliberately a field on the store rather than a third
+    /// [`FragmentLifecycleRoute`] variant: write-behind modifies how the
+    /// `Coordinated` route reaches the object store, and a third variant would
+    /// fork every match on the route for a distinction that only two call sites
+    /// care about.
+    write_behind: Option<Arc<WriteBehindStage>>,
     io_timeout: Duration,
 }
 
@@ -408,6 +421,7 @@ impl PostgresImmutableStore {
             instruments: crate::metrics::Instruments::new("immutable"),
             fragment_route: FragmentLifecycleRoute::Legacy,
             staged_epoch_cleanup: None,
+            write_behind: None,
             io_timeout,
         })
     }
@@ -462,6 +476,35 @@ impl PostgresImmutableStore {
     pub fn with_staged_epoch_cleanup(mut self, cleanup: Arc<dyn StagedEpochCleanup>) -> Self {
         self.staged_epoch_cleanup = Some(cleanup);
         self
+    }
+
+    /// Attach WP-114 CD-7's write-behind staging tier.
+    ///
+    /// The stage *is* the staged-epoch cleanup collaborator, so this sets both
+    /// fields from the one `Arc`. That is the whole reason there is a single
+    /// entry point: a store with a staging tier but no cleanup would refuse
+    /// every obliterate of a fragment it staged itself, and a store with
+    /// cleanup pointed at a different root than the one it stages into would
+    /// unlink the wrong filesystem. Neither is representable from here.
+    ///
+    /// Composition, configuration and the drain scheduler belong to
+    /// `lore-server`. This store never starts the drain, and never queries for
+    /// pending staged rows; the composing server must call
+    /// [`WriteBehindStage::note_pending_staged`] and
+    /// [`WriteBehindStage::note_drain_heartbeat`] repeatedly, because a
+    /// once-at-startup observation of either is exactly the per-process check
+    /// that would let a second replica demote healthy fragments.
+    pub fn with_write_behind(mut self, stage: Arc<WriteBehindStage>) -> Self {
+        self.staged_epoch_cleanup = Some(stage.clone());
+        self.write_behind = Some(stage);
+        self
+    }
+
+    /// The staging tier's current admission picture, for the composing server's
+    /// readiness probe. `None` in a cell with no staging tier.
+    #[must_use]
+    pub fn write_behind_snapshot(&self) -> Option<AdmissionSnapshot> {
+        self.write_behind.as_ref().map(|stage| stage.snapshot())
     }
 
     /// Read the durable cell-wide write capability through this store's
@@ -1006,22 +1049,50 @@ impl PostgresImmutableStore {
                     )
                     .await
                     .map_err(domain_store_err)?;
-                let read =
-                    tokio::time::timeout(self.io_timeout, tokio::fs::read(&manifest.object_key))
-                        .await;
-                let result = match read {
-                    Ok(Ok(bytes)) => Self::fragment_from_manifest(&manifest).and_then(|fragment| {
-                        Self::validate_candidate(
-                            address.hash,
-                            &manifest,
-                            fragment,
-                            Bytes::from(bytes),
+                // The staged read goes through the staging tier, never through a
+                // bare `tokio::fs::read` of the stored key.
+                //
+                // Two things turn on that. The stored key is a database string
+                // the coordinator persists without revalidating (unlike
+                // `begin_direct_write`, which checks its key against the hash),
+                // so the tier re-derives the path from the typed `(hash, epoch)`
+                // and requires byte-equality before opening anything. And the
+                // tier separates "this fragment is gone" from "this process
+                // cannot reach its root" at the type level, which the `Err`
+                // arms below depend on.
+                let staged = match self.write_behind.as_ref() {
+                    Some(stage) => {
+                        match tokio::time::timeout(
+                            self.io_timeout,
+                            stage.read_staged(&witness.hash, witness.epoch, &manifest.object_key),
                         )
-                    }),
-                    Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Err(MissingDiagnostic::Absent)
+                        .await
+                        {
+                            Ok(staged) => staged,
+                            Err(_) => StagedRead::Unavailable(WriteBehindError::Io {
+                                operation: "staged read timeout",
+                                kind: std::io::ErrorKind::TimedOut,
+                            }),
+                        }
                     }
-                    Ok(Err(_)) | Err(_) => {
+                    // A cell with a `Staged` head and no staging tier is an
+                    // upgraded or misconfigured replica, NOT evidence that the
+                    // fragment is absent. Answering `Absent` here would reach
+                    // `mark_coordinated_missing` and demote a healthy fragment
+                    // that a sibling replica is serving from the same bytes.
+                    // Retryable backpressure is the only honest answer; the
+                    // decisive signal for this condition is the store's
+                    // readiness verdict, which is cell-level, not this read.
+                    None => StagedRead::Unavailable(WriteBehindError::RootUnresolvable),
+                };
+                let result = match staged {
+                    StagedRead::Found(bytes) => {
+                        Self::fragment_from_manifest(&manifest).and_then(|fragment| {
+                            Self::validate_candidate(address.hash, &manifest, fragment, bytes)
+                        })
+                    }
+                    StagedRead::Absent => Err(MissingDiagnostic::Absent),
+                    StagedRead::Unavailable(_) => {
                         coordinator
                             .release_staged_lease(&lease_id)
                             .await
@@ -1207,11 +1278,19 @@ impl PostgresImmutableStore {
         Ok(fragment)
     }
 
-    fn direct_manifest(
+    /// Build the manifest one publication will commit.
+    ///
+    /// `authority` is a parameter rather than a constant because staging and a
+    /// direct write publish the same manifest identity over two different
+    /// keyspaces: the identity already binds `intent.object_key`, and a staged
+    /// key and a remote key for one fragment are never equal, so the two
+    /// authorities cannot collide on an identity.
+    fn epoch_manifest(
         intent: &crate::domain::fragments::FragmentIntent,
         address: Address,
         fragment: Fragment,
         payload: &Bytes,
+        authority: EpochAuthority,
     ) -> Result<FragmentManifest, StoreError> {
         let mut identity = blake3::Hasher::new();
         identity.update(b"lore-fragment-manifest-v1\0");
@@ -1223,7 +1302,7 @@ impl PostgresImmutableStore {
         identity.update(address.hash.data());
         identity.update(blake3::hash(payload).as_bytes());
         Ok(FragmentManifest {
-            authority: EpochAuthority::Remote,
+            authority,
             object_key: intent.object_key.clone(),
             manifest_id: identity.finalize().as_bytes().to_vec(),
             size_payload: i64::from(fragment.size_payload),
@@ -1472,9 +1551,46 @@ impl PostgresImmutableStore {
                 )),
             };
         };
-        let witness = self
-            .upload_coordinated_representation(coordinator, provider, address, fragment, payload)
-            .await?;
+        // The route branch. Staging is a modifier of this route, so the
+        // association commit below is shared: both paths produce a witness for
+        // an epoch that is already durable, and both acknowledge only after the
+        // association is published.
+        let witness = match self
+            .write_behind
+            .as_ref()
+            .map(|stage| (stage, stage.mode()))
+        {
+            Some((stage, StagingMode::Stage)) => {
+                self.put_staged(coordinator, stage, address, fragment, payload)
+                    .await?
+            }
+            // `Refuse` is the watermark or free-space ceiling: retryable
+            // backpressure applied before the filesystem is exhausted, rather
+            // than after.
+            //
+            // `Unready` is the stronger condition — this process must assume
+            // acknowledged staged bytes exist that it cannot read. Falling back
+            // to a direct write there would mask inaccessible acknowledged data
+            // behind apparently healthy writes, which is the worst failure this
+            // design can produce, so it refuses too.
+            Some((_, StagingMode::Refuse | StagingMode::Unready)) => {
+                return Err(StoreError::from(SlowDown));
+            }
+            // D11's fallback, and the no-staging-tier cell: the existing
+            // synchronous path, unchanged. It neither loses a write nor
+            // double-writes, because it is the same call the cell would have
+            // made with no staging tier configured at all.
+            Some((_, StagingMode::DirectFallback)) | None => {
+                self.upload_coordinated_representation(
+                    coordinator,
+                    provider,
+                    address,
+                    fragment,
+                    payload,
+                )
+                .await?
+            }
+        };
         match coordinator
             .create_association_if_current(&witness, repository.data(), address.context.data())
             .await
@@ -1495,26 +1611,7 @@ impl PostgresImmutableStore {
         fragment: Fragment,
         payload: Bytes,
     ) -> Result<crate::domain::fragments::EpochWitness, StoreError> {
-        let preflight_manifest = FragmentManifest {
-            authority: EpochAuthority::Remote,
-            object_key: String::new(),
-            manifest_id: vec![0; 32],
-            size_payload: i64::from(fragment.size_payload),
-            size_content: i64::try_from(fragment.size_content).map_err(|error| {
-                StoreError::internal_with_context(
-                    error,
-                    "fragment size_content exceeds manifest range",
-                )
-            })?,
-            decoded_hash: address.hash.data().to_vec(),
-            payload_flags: i64::from(fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK)),
-        };
-        Self::validate_candidate(address.hash, &preflight_manifest, fragment, payload.clone())
-            .map_err(|diagnostic| {
-                StoreError::internal(format!(
-                    "fragment direct PUT semantic validation failed: {diagnostic:?}"
-                ))
-            })?;
+        Self::validate_put_candidate(address, fragment, &payload, "direct")?;
         let legacy_key = Self::hash_key(address.hash);
         let logical_request_id = uuid::Uuid::now_v7();
         let attempt_id = uuid::Uuid::now_v7();
@@ -1539,7 +1636,8 @@ impl PostgresImmutableStore {
             }
             BeginOutcome::Admitted(intent) => intent,
         };
-        let manifest = Self::direct_manifest(&intent, address, fragment, &payload)?;
+        let manifest =
+            Self::epoch_manifest(&intent, address, fragment, &payload, EpochAuthority::Remote)?;
 
         let (observation, settlement) = self
             .issue_direct_put(
@@ -1567,6 +1665,134 @@ impl PostgresImmutableStore {
         }
         if !published_readable {
             return Err(StoreError::from(SlowDown));
+        }
+        let witness = coordinator
+            .capture_current_readable_epoch(address.hash.data())
+            .await
+            .map_err(domain_store_err)?
+            .ok_or_else(|| StoreError::from(SlowDown))?;
+        if witness.epoch != intent.epoch
+            || witness.manifest_id.as_ref() != Some(&manifest.manifest_id)
+        {
+            return Err(StoreError::from(SlowDown));
+        }
+        Ok(witness)
+    }
+
+    /// The shared write-side preflight, run before any epoch is allocated.
+    ///
+    /// One function for both routes on purpose: staging must not be able to
+    /// admit bytes a direct write would have refused, and the only way to
+    /// guarantee that is for there to be no second validator. `route` names the
+    /// caller in the failure text and nothing else.
+    fn validate_put_candidate(
+        address: Address,
+        fragment: Fragment,
+        payload: &Bytes,
+        route: &str,
+    ) -> Result<(), StoreError> {
+        let preflight_manifest = FragmentManifest {
+            authority: EpochAuthority::Remote,
+            object_key: String::new(),
+            manifest_id: vec![0; 32],
+            size_payload: i64::from(fragment.size_payload),
+            size_content: i64::try_from(fragment.size_content).map_err(|error| {
+                StoreError::internal_with_context(
+                    error,
+                    "fragment size_content exceeds manifest range",
+                )
+            })?,
+            decoded_hash: address.hash.data().to_vec(),
+            payload_flags: i64::from(fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK)),
+        };
+        Self::validate_candidate(address.hash, &preflight_manifest, fragment, payload.clone())
+            .map_err(|diagnostic| {
+                StoreError::internal(format!(
+                    "fragment {route} PUT semantic validation failed: {diagnostic:?}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    /// Durably stage one fragment locally and publish a `Staged` epoch.
+    ///
+    /// Returns the witness for that epoch. The caller publishes the association
+    /// and only then acknowledges.
+    ///
+    /// # Why the acknowledgement boundary is two transactions
+    ///
+    /// `commit_staged` does not publish the association: `commit_publication`
+    /// takes no repository and no context, and no association write falls
+    /// between its transaction's boundaries. (The coordinator's own doc comment
+    /// claims otherwise and is being corrected.) So this returns a witness and
+    /// `put_coordinated` runs `create_association_if_current` as a second short
+    /// transaction, exactly as the direct path already does. A crash between the
+    /// two leaves a `Staged` head with valid bytes and no association for this
+    /// repository; the next push of the same fragment takes
+    /// `BeginOutcome::AlreadyReadable` and re-runs only the association, which
+    /// is idempotent.
+    ///
+    /// # No database resource is held across the file work
+    ///
+    /// `begin_stage` commits and returns its connection before the first
+    /// syscall, and `commit_staged` takes a fresh checkout after the last one.
+    /// The staging tier itself cannot hold one: no type in
+    /// `store/write_behind/` names a pool, a transaction, or a checkout.
+    async fn put_staged(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        stage: &Arc<WriteBehindStage>,
+        address: Address,
+        fragment: Fragment,
+        payload: Bytes,
+    ) -> Result<crate::domain::fragments::EpochWitness, StoreError> {
+        Self::validate_put_candidate(address, fragment, &payload, "staged")?;
+        let begin = coordinator
+            .begin_stage(address.hash.data())
+            .await
+            .map_err(domain_store_err)?;
+        let intent = match begin {
+            BeginOutcome::AlreadyReadable(witness) => return Ok(*witness),
+            // Retryable backpressure, not an error, on both arms. `Fenced`
+            // means another operation on this hash won the head; with L1's
+            // write-claim barrier in its UNION form, `WriteClaimBlocked` can
+            // now also mean an unresolved claim at the same legacy hash key,
+            // which is likewise a condition a later attempt clears.
+            BeginOutcome::Fenced(_) | BeginOutcome::WriteClaimBlocked { .. } => {
+                return Err(StoreError::from(SlowDown));
+            }
+            BeginOutcome::Admitted(intent) => intent,
+        };
+        let manifest =
+            Self::epoch_manifest(&intent, address, fragment, &payload, EpochAuthority::Staged)?;
+        // File durability strictly precedes the authoritative commit. The
+        // reverse order would make a `Staged` row reachable before its bytes
+        // are durable, and a `Staged` row without readable bytes is corruption
+        // the read path must fail closed on.
+        if let Err(error) = stage
+            .stage(&intent.hash, intent.epoch, &intent.object_key, &payload)
+            .await
+        {
+            // Nothing is committed, so nothing advertises these bytes. The
+            // preparing intent is left for the next operation on this hash to
+            // fence; it is not abandoned here, because `commit_staged` with an
+            // `Unusable` observation would publish a `Missing` head for a
+            // fragment whose only problem is this replica's filesystem.
+            return Err(error.store_error());
+        }
+        match coordinator
+            .commit_staged(&intent, IoObservation::Valid(manifest.clone()))
+            .await
+            .map_err(domain_store_err)?
+        {
+            CommitVerdict::Published => {}
+            // The staged file stays on disk and stays valid. It is not
+            // unlinked: this route never decides that bytes are unreferenced,
+            // and a file whose commit lost a race is indistinguishable from one
+            // whose commit is still in flight on another replica.
+            CommitVerdict::Fenced | CommitVerdict::Abandoned => {
+                return Err(StoreError::from(SlowDown));
+            }
         }
         let witness = coordinator
             .capture_current_readable_epoch(address.hash.data())
