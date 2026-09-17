@@ -175,9 +175,58 @@
 //! sole permit across validation, charge, and transport execution. Durable
 //! spool vocabulary remains reserved for WP-114 dispatcher and drain work and
 //! is not part of this seam's direct-write entry.
+//!
+//! # WP-114 CD-6's drain capability, and the one guarantee it trades away
+//!
+//! [`FragmentDrainCapability`] is the drain-only view of the same composition
+//! door. It retains the entry — hence the one gateway, the one dispatch pool,
+//! and the process's participant identity — and publishes none of them. Its
+//! public surface is exactly two methods, [`FragmentDrainCapability::mark_spool_ready`]
+//! and [`FragmentDrainCapability::attempt_drain`]; `reserve_bound` and an
+//! upload-progress mirror were deliberately cut, because a body bounded by
+//! [`FRAGMENT_PROVIDER_INGRESS_CAP_BYTES`] is written in one chunk and has no
+//! caller for either. Narrowness is by construction in the same order the crate
+//! argues everywhere else: the dispatch pool, the dispatch request types, and
+//! the ledger stay unnameable outside this crate; the capability's three fields
+//! are private with no accessor; the private [`AttemptSink`] is untouched; the
+//! source pins are belt and braces.
+//!
+//! **The drain shares the one limiter and adds nothing.** It reuses
+//! [`FragmentProviderEntry::admit_put`], so it takes a permit from the same
+//! single in-flight PUT semaphore the direct fallback uses, and it charges
+//! through the same CD-5 kernel under
+//! [`ProviderTrafficClass::Drain`](lore_object_dispatch::ProviderTrafficClass::Drain),
+//! which is a subordinate cap inside the shared physical budget rather than a
+//! second ceiling. No second semaphore, no second pool, no second limiter.
+//!
+//! **A caller may not declare what is sent, but must supply the independent
+//! anchor the send is checked against.** `declared_size` and `declared_blake3`
+//! on the wire request come from the *bound spool body* and are unnameable on
+//! [`FragmentDrainAttempt`]. What the caller does supply is
+//! `claim_body_blake3` / `claim_body_size`, which originate in the lifecycle
+//! claim rather than in the drain worker's view of the filesystem. So the send
+//! requires three-way agreement across two independent sources — the claim, the
+//! dispatch database's ready row, and the actual bytes — where comparing the
+//! bytes only against a digest the same caller had already spooled would let a
+//! wrong file pass with both sides agreeing.
+//!
+//! **What this path loses, written down rather than left to be rediscovered.**
+//! `ProviderDirectPutAttemptRequest` carries no durable body field, so routing
+//! the drain through the direct-PUT primitive means CD-5's `validate_body` —
+//! the *type gate* that refuses a body-carrying class without a
+//! [`DurableProviderPutBody`] — never runs here. What runs instead is CD-5's
+//! direct-PUT body check, which exact-binds the bytes to a **declaration**
+//! rather than to a durable spool row. On the drain path the spool binding is
+//! therefore a seam-local sequence (bind, cross-check the request, check the
+//! claim anchor, check the bytes) plus the source pin that keeps that sequence
+//! the only route. The trade is accepted because the claim anchor is a binding
+//! the type gate never had. If it is later judged wrong, the fix is to carry a
+//! durable body into the transport, which is a change to the transport port and
+//! not to this capability.
 
 use std::fmt;
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -274,9 +323,15 @@ use lore_object_dispatch::dispatch_client::DispatchAuthorityError;
 pub use lore_object_dispatch::dispatch_client::DispatchRuntimeClient;
 use lore_object_dispatch::dispatch_client::DispatcherIdentityState;
 use lore_object_dispatch::dispatch_client::InstalledLayerIdentity;
+// The 0017 ready projection and the PUT-path identity. Neither is re-exported:
+// the projection travels inside `FragmentDrainReady`, whose field is private, so
+// a ready receipt cannot be forged or moved between requests.
+use lore_object_dispatch::dispatch_client::PutSpoolReadyOutcome;
+use lore_object_dispatch::dispatch_client::PutStreamIdentity;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use tokio::sync::TryAcquireError;
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // Frozen bounds
@@ -425,6 +480,37 @@ pub enum FragmentProviderError {
     #[error("charge admission is closed")]
     ChargeAdmissionClosed,
 
+    /// The drain's ready receipt could not be bound to a durable spool body, or
+    /// the body it binds belongs to another logical request.
+    ///
+    /// **Carries no source, deliberately.** One variant has to cover both the
+    /// binder's refusal and the seam's own request cross-check, and the second
+    /// has no dispatch error to carry. Splitting them would widen the closed
+    /// error set WP-114 CD-6 was ratified with; the two conditions are one
+    /// caller fault — a receipt that does not describe this attempt's body.
+    #[error("fragment drain spool binding does not describe this attempt's body")]
+    SpoolBindingRejected,
+
+    /// The bound spool body disagrees with the lifecycle claim's own digest or
+    /// size.
+    ///
+    /// This is the independent anchor, and it is the only check on this path
+    /// whose two sides did not both come from the drain worker's view of the
+    /// filesystem. Without it, a caller that spooled the wrong file would have
+    /// its bytes agree with its own spool-ready declaration and the send would
+    /// proceed.
+    #[error("fragment drain body does not match the lifecycle claim's digest or size")]
+    ClaimBindingMismatch,
+
+    /// The supplied bytes are not the bytes the bound spool body describes.
+    #[error("fragment drain body does not match the bound durable spool body")]
+    DrainBodyMismatch,
+
+    /// The cell authority refused the 0017 `SPOOL_READY` transition.
+    /// Source-preserving.
+    #[error("cell authority refused the drain spool-ready transition: {0}")]
+    SpoolReadyRefused(#[source] DispatchAuthorityError),
+
     /// The governed provider client refused, or its charge/transport kernel
     /// failed. Source-preserving.
     #[error("governed provider client refused the attempt: {0}")]
@@ -501,6 +587,15 @@ impl FragmentProviderError {
             // exhaustion this bound exists to prevent.
             Self::ChargeAdmissionTimedOut => Some("charge_admission_timeout"),
             Self::ChargeAdmissionClosed => Some("charge_admission_closed"),
+            // Derived from `disposition` rather than restated, so the two cannot
+            // drift: a refusal classified retryable there is always visible
+            // here. `disposition` does not call back into this method, so the
+            // guard cannot recurse.
+            Self::SpoolReadyRefused(_)
+                if self.disposition() == FragmentProviderDisposition::Transient =>
+            {
+                Some("drain_spool_ready_transient")
+            }
             Self::Provider(ProviderClientError::ChargeRefused(refusal)) => match refusal {
                 ProviderChargeError::BudgetExhausted => Some("charge_budget_exhausted"),
                 ProviderChargeError::ClassCapExhausted => Some("charge_class_cap_exhausted"),
@@ -531,7 +626,76 @@ impl FragmentProviderError {
             | Self::IngressCapExceeded
             | Self::OperationRequired
             | Self::OperationMismatch
+            | Self::SpoolBindingRejected
+            | Self::ClaimBindingMismatch
+            | Self::DrainBodyMismatch
             | Self::InvalidObjectKey => FragmentProviderDisposition::InvalidInput,
+            // Exhaustive over `DispatchAuthorityError` with **no wildcard**, for
+            // the same reason the charge arm below is: a variant added upstream
+            // must fail this build rather than land silently in a catch-all and
+            // be reclassified by accident.
+            Self::SpoolReadyRefused(refusal) => match refusal {
+                // Capacity and availability. The pool's own errors are here
+                // rather than split: this pool was already built and attested at
+                // activation, so a failure reaching a drain is contention or
+                // loss of the database, never misconfiguration discovered late.
+                DispatchAuthorityError::Pool(_)
+                | DispatchAuthorityError::OperationTimeout
+                | DispatchAuthorityError::RetryExhausted
+                | DispatchAuthorityError::AuthorityUnavailable
+                | DispatchAuthorityError::ConnectionSlotsExhausted
+                | DispatchAuthorityError::CapacityExhausted
+                | DispatchAuthorityError::QuotaUnavailable => {
+                    FragmentProviderDisposition::Transient
+                }
+
+                // The transition may or may not have been applied and the client
+                // already failed to resolve which. Same never-retried arm as an
+                // ambiguous charge commit.
+                DispatchAuthorityError::AmbiguousCommit => {
+                    FragmentProviderDisposition::OutcomeUnknown
+                }
+
+                // The cell is not configured to serve this call. Retrying it
+                // fails the same way until the cell changes.
+                DispatchAuthorityError::WrongPoolRole
+                | DispatchAuthorityError::Unauthorized
+                | DispatchAuthorityError::UnsupportedApiRevision
+                | DispatchAuthorityError::SchemaUnavailable
+                | DispatchAuthorityError::DigestProviderUnavailable
+                | DispatchAuthorityError::SerializableTransactionRequired => {
+                    FragmentProviderDisposition::NotReady
+                }
+
+                // A value this call supplied is wrong, or the reservation it
+                // names is gone. Decisive, nothing spooled, nothing sent.
+                DispatchAuthorityError::InvalidArgument
+                | DispatchAuthorityError::CanonicalRecordInvalid
+                | DispatchAuthorityError::IdentifierTimestampOutOfRange
+                | DispatchAuthorityError::ExpiredOrUnknown
+                | DispatchAuthorityError::ReservationExpired
+                | DispatchAuthorityError::UploadClosed
+                | DispatchAuthorityError::UploadStreamIdentityMismatch
+                | DispatchAuthorityError::ChunkGap
+                | DispatchAuthorityError::ReplayConflict
+                | DispatchAuthorityError::StoredRecordMismatch => {
+                    FragmentProviderDisposition::InvalidInput
+                }
+
+                // A call this seam should never have built, or a response it
+                // cannot read. A fault, not a condition to retry.
+                DispatchAuthorityError::CounterOverflow
+                | DispatchAuthorityError::TimeInvalid
+                | DispatchAuthorityError::StoredStateInvalid
+                | DispatchAuthorityError::GenerationNotMonotonic
+                | DispatchAuthorityError::ParticipantAuthenticationRequired
+                | DispatchAuthorityError::ParticipantStateInvalid
+                | DispatchAuthorityError::ParticipantKeyDigestInvalid
+                | DispatchAuthorityError::UnrecognizedResultCode
+                | DispatchAuthorityError::InvalidAuthorityResponse(_) => {
+                    FragmentProviderDisposition::Internal
+                }
+            },
             Self::PutAdmissionTimedOut
             | Self::PutAdmissionClosed
             | Self::ChargeAdmissionTimedOut
@@ -1760,6 +1924,308 @@ impl FragmentCellRetentionHandle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WP-114 CD-6: the drain capability
+// ---------------------------------------------------------------------------
+
+/// The canonical-record bounds and protocol revision the drain's spool-ready
+/// call is recorded under.
+///
+/// **Published so the reservation side agrees, not so a caller may choose.**
+/// 0016 folds all five values into the canonical record digest, so a reservation
+/// recorded under different bounds and this call would not describe the same
+/// record. They are constants rather than parameters for exactly the reason the
+/// gateway takes no retry policy: the way to forbid a caller naming its own
+/// protocol revision is to leave no way to say it.
+pub const FRAGMENT_DRAIN_PROTOCOL_REVISION: &str = "object-dispatch-v1";
+
+/// Canonical text bound for every identity column in the drain's spool-ready
+/// record. Inside 0016's accepted `1..=1024`.
+pub const FRAGMENT_DRAIN_MAXIMUM_IDENTITY_BYTES: i32 = 256;
+
+/// Canonical text bound for the boundary token. Inside 0016's `1..=4096`.
+pub const FRAGMENT_DRAIN_MAXIMUM_BOUNDARY_TOKEN_BYTES: i32 = 256;
+
+/// Canonical text bound for the durable handle. Set at 0016's ceiling rather
+/// than at the identity bound: the handle is a derived spool path, so it is the
+/// one field whose length is a property of the deployment's staging root.
+pub const FRAGMENT_DRAIN_MAXIMUM_DURABLE_HANDLE_BYTES: i32 = 4_096;
+
+/// Canonical record bound. Inside 0016's `1..=16777216`.
+pub const FRAGMENT_DRAIN_MAXIMUM_RECORD_BYTES: i32 = 16_384;
+
+/// A drain-only view of the one composition door.
+///
+/// Opaque by construction: it retains the entry — and through it the process's
+/// gateway, dispatch pool, and participant identity — and publishes none of
+/// them. Its three fields are private and it exposes no `pool`, no `dispatch`,
+/// no `gateway`, and no `entry`. The public method set is exactly
+/// [`Self::mark_spool_ready`] and [`Self::attempt_drain`], which
+/// `tests/seam_source_pins.rs` pins by equality rather than by containment.
+///
+/// **This grants no delete authority.** The drain builds a
+/// [`ProviderAttemptClass::PutObject`] and nothing else, so the delete variants
+/// of [`FragmentTransportOperation`] are not reachable from here. WP-114's D10
+/// ruling is narrow, and this is the half of it this seam owns.
+///
+/// Held by value rather than borrowed: a drain worker is a background task, so
+/// the capability retains an `Arc` and is `'static`.
+pub struct FragmentDrainCapability {
+    entry: Arc<FragmentProviderEntry>,
+    dispatch: DispatchRuntimeClient,
+    spool_root: PathBuf,
+}
+
+/// What a drain supplies to move its spool object to `SPOOL_READY`.
+///
+/// It restates only the fields a drain knows. There is deliberately **no
+/// provider boundary**: the seam addresses the boundary its own attestation
+/// carries, exactly as [`FragmentProviderAttempt`] does. The protocol revision
+/// and the four canonical-record bounds are the seam's constants above and are
+/// likewise not expressible here.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FragmentDrainSpoolReady {
+    /// The authenticated cell this drain runs for.
+    pub authenticated_cell_id: String,
+    /// The authenticated tenant the spooled body belongs to.
+    pub authenticated_tenant_id: String,
+    /// Canonical UUIDv7 identifying the logical request.
+    pub logical_request_id: Uuid,
+    /// Canonical UUIDv7 identifying the spool attempt that wrote the body.
+    pub attempt_id: Uuid,
+    /// The upload this spool object was reserved under.
+    pub upload_id: Uuid,
+    /// That upload's monotonic fence.
+    pub upload_fence: u64,
+    /// The index of the final chunk written, which for a body bounded by
+    /// [`FRAGMENT_PROVIDER_INGRESS_CAP_BYTES`] is the only chunk.
+    pub final_chunk_index: u64,
+    /// The fsynced body's size, as the writer observed it.
+    pub fsynced_body_size: u64,
+    /// The fsynced body's BLAKE3, as the writer observed it.
+    pub fsynced_body_blake3: [u8; 32],
+    /// The staged file's opaque durable handle.
+    pub durable_handle: String,
+}
+
+impl fmt::Debug for FragmentDrainSpoolReady {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FragmentDrainSpoolReady")
+            .field("authenticated_cell_id", &"[REDACTED]")
+            .field("authenticated_tenant_id", &"[REDACTED]")
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("upload_id", &"[REDACTED]")
+            .field("upload_fence", &"[REDACTED]")
+            .field("final_chunk_index", &self.final_chunk_index)
+            .field("fsynced_body_size", &self.fsynced_body_size)
+            .field("fsynced_body_blake3", &"[REDACTED]")
+            .field("durable_handle", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// An opaque ready receipt.
+///
+/// The projection inside is private with no accessor, so a receipt cannot be
+/// forged, inspected for a chargeable value, or moved between requests: the only
+/// thing a holder can do with one is present it to
+/// [`FragmentDrainCapability::attempt_drain`], which re-derives the binding
+/// rather than trusting it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct FragmentDrainReady(PutSpoolReadyOutcome);
+
+impl fmt::Debug for FragmentDrainReady {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FragmentDrainReady([REDACTED])")
+    }
+}
+
+/// One governed drain attempt.
+///
+/// **Non-`Clone` on purpose**, following the admitted-PUT token: an attempt
+/// identity is used once, and a `Clone` would make a second use expressible.
+///
+/// A caller cannot name a traffic class, an attempt class, a target, or the
+/// declared size and digest. The first two the seam forces; the last two come
+/// from the bound spool body. What the caller does supply is the pair below the
+/// send is *checked against*, which came from the lifecycle claim rather than
+/// from this worker's view of the filesystem.
+#[derive(PartialEq, Eq)]
+pub struct FragmentDrainAttempt {
+    /// Canonical UUIDv7 identifying the logical request.
+    pub logical_request_id: String,
+    /// Canonical UUIDv7 identifying this physical attempt.
+    pub attempt_id: String,
+    /// Positive ordinal of this attempt within its logical request.
+    pub attempt_ordinal: u32,
+    /// Attempt deadline, evaluated against the database admission clock.
+    pub deadline_unix_ms: i64,
+    /// WP-121's budget-configuration pin. Opaque here, and resolving it is
+    /// CD-4's obligation: this seam copies it and never inspects, compares,
+    /// refreshes, or re-reads it.
+    pub budget_pin: BudgetPin,
+    /// The destination key for the PUT.
+    pub object_key: String,
+    /// Object metadata for the PUT.
+    pub metadata: Vec<(String, String)>,
+    /// The lifecycle claim's own digest of the body. **The independent anchor**,
+    /// not a declaration: it did not come from the spool.
+    pub claim_body_blake3: [u8; 32],
+    /// The lifecycle claim's own size for the body.
+    pub claim_body_size: u64,
+}
+
+impl fmt::Debug for FragmentDrainAttempt {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FragmentDrainAttempt")
+            .field("logical_request_id", &"[REDACTED]")
+            .field("attempt_id", &"[REDACTED]")
+            .field("attempt_ordinal", &self.attempt_ordinal)
+            .field("deadline_unix_ms", &self.deadline_unix_ms)
+            .field("budget_pin", &self.budget_pin)
+            .field("object_key", &"[REDACTED]")
+            .field("metadata", &"[REDACTED]")
+            .field("claim_body_blake3", &"[REDACTED]")
+            .field("claim_body_size", &self.claim_body_size)
+            .finish()
+    }
+}
+
+impl FragmentDrainCapability {
+    /// Move this drain's spool object to `SPOOL_READY` and take the receipt a
+    /// drain attempt must present.
+    ///
+    /// The caller asserts the whole body is already durable at its handle. **No
+    /// filesystem access happens here** — readiness is the database's
+    /// assertion, and this seam opens no file, which the pins keep true.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FragmentProviderError::SpoolReadyRefused`] when the cell
+    /// authority refuses the transition.
+    pub async fn mark_spool_ready(
+        &self,
+        request: &FragmentDrainSpoolReady,
+    ) -> Result<FragmentDrainReady, FragmentProviderError> {
+        let call = lore_object_dispatch::dispatch_client::PutSpoolReadyRequest {
+            protocol_revision: FRAGMENT_DRAIN_PROTOCOL_REVISION.to_string(),
+            identity: PutStreamIdentity {
+                provider_boundary_id: self.entry.boundary().provider_boundary_id().to_string(),
+                authenticated_cell_id: request.authenticated_cell_id.clone(),
+                authenticated_tenant_id: request.authenticated_tenant_id.clone(),
+                logical_request_id: request.logical_request_id,
+                attempt_id: request.attempt_id,
+                upload_id: request.upload_id,
+                upload_fence: request.upload_fence,
+            },
+            final_chunk_index: request.final_chunk_index,
+            fsynced_body_size: request.fsynced_body_size,
+            fsynced_body_blake3: request.fsynced_body_blake3,
+            durable_handle: request.durable_handle.clone(),
+            maximum_identity_bytes: FRAGMENT_DRAIN_MAXIMUM_IDENTITY_BYTES,
+            maximum_boundary_token_bytes: FRAGMENT_DRAIN_MAXIMUM_BOUNDARY_TOKEN_BYTES,
+            maximum_durable_handle_bytes: FRAGMENT_DRAIN_MAXIMUM_DURABLE_HANDLE_BYTES,
+            maximum_record_bytes: FRAGMENT_DRAIN_MAXIMUM_RECORD_BYTES,
+        };
+        let accepted = self
+            .dispatch
+            .put_spool_ready(&call)
+            .await
+            .map_err(FragmentProviderError::SpoolReadyRefused)?;
+        Ok(FragmentDrainReady(accepted.value))
+    }
+
+    /// One governed drain send.
+    ///
+    /// Each step refuses before the next costs anything, and nothing is charged
+    /// or sent until all of them pass:
+    ///
+    /// 1. the transport port must be wired;
+    /// 2. the ready receipt binds to a durable spool body, whose derived handle
+    ///    must equal the one the database recorded;
+    /// 3. that body must belong to this attempt's logical request;
+    /// 4. **it must also equal the lifecycle claim's digest and size** — the one
+    ///    check on this path whose two sides come from different sources;
+    /// 5. it must be inside the existing 256 KiB ingress cap;
+    /// 6. the supplied bytes must be exactly that body.
+    ///
+    /// Only then does it go through [`FragmentProviderEntry::admit_put`], which
+    /// supplies the empty-key check, the cap check, and the one in-flight PUT
+    /// permit the direct fallback also takes. CD-5 then charges CD-4's limiter
+    /// before constructing the value a transport will accept, so
+    /// charge-before-send is inherited rather than re-implemented, and the
+    /// charge consumes the shared physical budget together with the subordinate
+    /// drain cap atomically.
+    ///
+    /// **`Ok(FragmentTransportExecution { outcome: Ambiguous, .. })` is not
+    /// success.** As on every other path through this seam, only the caller
+    /// knows what an unknown provider effect means for the operation it is in
+    /// the middle of, so the seam does not collapse it into an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FragmentProviderError::OperationRequired`],
+    /// [`FragmentProviderError::SpoolBindingRejected`],
+    /// [`FragmentProviderError::ClaimBindingMismatch`],
+    /// [`FragmentProviderError::IngressCapExceeded`],
+    /// [`FragmentProviderError::DrainBodyMismatch`], or whatever admission,
+    /// charge, or transport returns.
+    pub async fn attempt_drain(
+        &self,
+        ledger: &mut FragmentAttemptLedger,
+        request: FragmentDrainAttempt,
+        ready: &FragmentDrainReady,
+        body: &[u8],
+    ) -> Result<FragmentTransportExecution, FragmentProviderError> {
+        if !self.entry.gateway.port_wired {
+            return Err(FragmentProviderError::OperationRequired);
+        }
+        let bound = lore_object_dispatch::bind_durable_put_body_from_ready(
+            self.spool_root.clone(),
+            self.entry.boundary().provider_boundary_id(),
+            &ready.0,
+        )
+        .map_err(|_| FragmentProviderError::SpoolBindingRejected)?;
+        if bound.logical_request_id() != request.logical_request_id.as_str() {
+            return Err(FragmentProviderError::SpoolBindingRejected);
+        }
+        if bound.blake3() != &request.claim_body_blake3 || bound.size() != request.claim_body_size {
+            return Err(FragmentProviderError::ClaimBindingMismatch);
+        }
+        if bound.size() > FRAGMENT_PROVIDER_INGRESS_CAP_BYTES {
+            return Err(FragmentProviderError::IngressCapExceeded);
+        }
+        let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        if body_len != bound.size() || blake3::hash(body).as_bytes() != bound.blake3() {
+            return Err(FragmentProviderError::DrainBodyMismatch);
+        }
+        let attempt = FragmentProviderAttempt {
+            traffic_class: ProviderTrafficClass::Drain,
+            attempt_class: ProviderAttemptClass::PutObject,
+            logical_request_id: request.logical_request_id,
+            attempt_id: request.attempt_id,
+            attempt_ordinal: request.attempt_ordinal,
+            deadline_unix_ms: request.deadline_unix_ms,
+            budget_pin: request.budget_pin,
+            put_body: None,
+        };
+        let operation = FragmentDirectPutOperation {
+            object_key: request.object_key,
+            metadata: request.metadata,
+            declared_size: bound.size(),
+            declared_blake3: *bound.blake3(),
+        };
+        self.entry
+            .admit_put(attempt, operation)
+            .await?
+            .execute_direct_put(ledger, body)
+            .await
+    }
+}
+
 impl FragmentProviderEntry {
     pub async fn connect<P>(
         config: FragmentDispatchRuntimeConfig,
@@ -1839,6 +2305,40 @@ impl FragmentProviderEntry {
         let client = CellRetentionClient::new(self.pool.clone())
             .map_err(FragmentProviderActivationError::DispatchClient)?;
         Ok(FragmentCellRetentionHandle { client })
+    }
+
+    /// Mint WP-114 CD-6's drain capability on the pool this entry already owns.
+    ///
+    /// Opens no connection and no second pool, so the CR-033 D8 process
+    /// connection inventory is unchanged and WP-119's fleet ceiling is
+    /// untouched. The typed client's own constructor refuses a pool that does
+    /// not connect as the runtime role.
+    ///
+    /// **Takes `&Arc<Self>` rather than `&self`.** A drain worker is a
+    /// background task, so the capability must be `'static`; the retention
+    /// handle gets away with a borrow because it hands out an owned client,
+    /// while this one has to retain the gateway, which lives inside the entry.
+    ///
+    /// The staging root arrives as a parameter rather than as a field on
+    /// [`FragmentDispatchRuntimeConfig`], so composition's construction site
+    /// does not change. The seam stores it and passes it to the durable-body
+    /// binder; it opens no file with it, and the pins keep that true.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FragmentProviderActivationError::DispatchClient`] when the pool
+    /// is not the runtime pool.
+    pub fn drain_capability(
+        self: &Arc<Self>,
+        shared_spool_root: PathBuf,
+    ) -> Result<FragmentDrainCapability, FragmentProviderActivationError> {
+        let dispatch = DispatchRuntimeClient::new(self.pool.clone())
+            .map_err(FragmentProviderActivationError::DispatchClient)?;
+        Ok(FragmentDrainCapability {
+            entry: Arc::clone(self),
+            dispatch,
+            spool_root: shared_spool_root,
+        })
     }
 
     pub async fn admit_operation(
@@ -2524,6 +3024,13 @@ mod tests {
         /// attempt, so this is the closest honest way to see whether
         /// `admit_operation` shifted the deadline it built its request from.
         last_seen_deadline_unix_ms: AtomicI64,
+        /// The most recent `traffic_class` this authority observed. Added for
+        /// the WP-114 CD-6 drain tests, which need to prove — not merely read
+        /// from source — that a drain send is charged under
+        /// [`ProviderTrafficClass::Drain`] and that a caller cannot influence
+        /// it. `Mutex` rather than an atomic: the class is a small `Copy` enum
+        /// with no natural integer encoding worth inventing one for.
+        last_seen_traffic_class: Mutex<Option<ProviderTrafficClass>>,
     }
 
     impl ScriptedChargeAuthority {
@@ -2532,7 +3039,15 @@ mod tests {
                 script,
                 calls: AtomicU32::new(0),
                 last_seen_deadline_unix_ms: AtomicI64::new(0),
+                last_seen_traffic_class: Mutex::new(None),
             }
+        }
+
+        fn last_seen_traffic_class(&self) -> Option<ProviderTrafficClass> {
+            *self
+                .last_seen_traffic_class
+                .lock()
+                .expect("traffic class lock")
         }
     }
 
@@ -2544,6 +3059,10 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.last_seen_deadline_unix_ms
                 .store(request.deadline_unix_ms(), Ordering::SeqCst);
+            *self
+                .last_seen_traffic_class
+                .lock()
+                .expect("traffic class lock") = Some(request.traffic_class());
             let grant = |ordinal: u32| ProviderChargeGrant {
                 grant_id: GRANT_ID.to_string(),
                 traffic_class: request.traffic_class(),
@@ -4212,11 +4731,671 @@ mod tests {
                 )),
                 FragmentProviderDisposition::NotReady,
             ),
+            // WP-114 CD-6's drain refusals. All three are decisive caller
+            // faults the seam catches before any charge or send, so all three
+            // classify the same way the direct-PUT path's own local refusals
+            // above do.
+            (
+                FragmentProviderError::SpoolBindingRejected,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                FragmentProviderError::ClaimBindingMismatch,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                FragmentProviderError::DrainBodyMismatch,
+                FragmentProviderDisposition::InvalidInput,
+            ),
         ] {
             assert_eq!(
                 error.disposition(),
                 disposition,
                 "{error} must carry {disposition:?}",
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // WP-114 CD-6: FragmentDrainCapability
+    // -----------------------------------------------------------------------
+    //
+    // Narrowness by construction (no pool/dispatch/gateway/entry accessor, no
+    // caller-nameable traffic class or declared size/digest, the three-token
+    // confinement to this capability's own impl block) is proved structurally
+    // in `tests/seam_source_pins.rs` and demonstrated in
+    // `tests/drain_capability_compile_fail.rs`. What belongs here instead is
+    // behavior: the independent-anchor fail-open case, the refusal ordering,
+    // the shared limiter, and the disposition each refusal carries.
+
+    use lore_object_dispatch::SpoolLayout;
+    use lore_object_dispatch::SpoolObjectKey;
+    use lore_object_dispatch::SpoolObjectKind;
+
+    /// A one-permit put bound with a short timeout, so a drain that must
+    /// queue behind an already-held permit fails fast instead of hanging the
+    /// suite.
+    fn narrow_put_bound() -> InFlightPutBound {
+        match InFlightPutBound::new(1, Duration::from_millis(50)) {
+            Ok(bound) => bound,
+            Err(error) => panic!("fixture put bound must be valid: {error}"),
+        }
+    }
+
+    /// A syntactically absolute path that is never opened. `SpoolLayout::new`
+    /// only validates that a root is absolute and carries no `.`/`..`
+    /// component, and `bind_durable_put_body_from_ready` performs no
+    /// filesystem access at all — exactly the property these tests exercise
+    /// without a real spool directory.
+    fn drain_spool_root() -> PathBuf {
+        PathBuf::from(r"C:\lore-fragment-provider-test-spool")
+    }
+
+    /// The opaque handle a real spool write would have produced for this
+    /// logical request and attempt, computed the same way the seam derives
+    /// and checks it. Building this once per fixture, rather than guessing a
+    /// string, is what lets a fixture legitimately bind instead of failing
+    /// for the wrong reason.
+    fn drain_durable_handle(logical_request_id: &str, attempt_id: &str) -> String {
+        let key = SpoolObjectKey {
+            provider_boundary_id: BOUNDARY_ID.to_string(),
+            logical_request_id: logical_request_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            kind: SpoolObjectKind::Put,
+        };
+        let layout = match SpoolLayout::new(drain_spool_root()) {
+            Ok(layout) => layout,
+            Err(error) => panic!("fixture spool layout must be valid: {error}"),
+        };
+        match layout.derive_paths(&key) {
+            Ok(paths) => paths.opaque_handle().to_string(),
+            Err(error) => panic!("fixture spool paths must derive: {error}"),
+        }
+    }
+
+    /// A ready outcome that binds cleanly to `drain_durable_handle`'s own
+    /// handle for the given size and digest. Every field the binder does not
+    /// read is a fixed, arbitrary value.
+    fn drain_ready_outcome(
+        logical_request_id: &str,
+        attempt_id: &str,
+        committed_size: u64,
+        committed_blake3: [u8; 32],
+    ) -> PutSpoolReadyOutcome {
+        let parse = |value: &str| match Uuid::parse_str(value) {
+            Ok(id) => id,
+            Err(error) => panic!("fixture uuid {value} must parse: {error}"),
+        };
+        PutSpoolReadyOutcome {
+            spool_object_id: parse(attempt_id),
+            logical_request_id: parse(logical_request_id),
+            attempt_id: parse(attempt_id),
+            upload_id: parse(attempt_id),
+            upload_fence: 1,
+            durable_handle: drain_durable_handle(logical_request_id, attempt_id),
+            committed_size,
+            committed_blake3,
+            ready_at_unix_ms: ATTEMPT_TIMESTAMP_MS,
+            reserve_put_ack_canonical_bytes: Vec::new(),
+            reserve_put_ack_blake3: [0u8; 32],
+            spool_revision: 1,
+            record_blake3: [0u8; 32],
+        }
+    }
+
+    /// A drain attempt naming `claim_body_blake3`/`claim_body_size` exactly
+    /// as given — callers building the fail-open case pass a claim digest
+    /// that disagrees with the spool on purpose.
+    fn drain_attempt_fixture(
+        logical_request_id: &str,
+        attempt_id: &str,
+        claim_body_blake3: [u8; 32],
+        claim_body_size: u64,
+    ) -> FragmentDrainAttempt {
+        FragmentDrainAttempt {
+            logical_request_id: logical_request_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            attempt_ordinal: 1,
+            deadline_unix_ms: DEADLINE_MS,
+            budget_pin: pin(),
+            object_key: "objects/fragment.bin".to_string(),
+            metadata: vec![("codec".to_string(), "raw".to_string())],
+            claim_body_blake3,
+            claim_body_size,
+        }
+    }
+
+    /// A syntactically valid, never-connecting dispatch pool configuration.
+    /// `DispatchRuntimePool::new`'s own doc says configuration is validated
+    /// and an empty pool is built; no connection is opened. And
+    /// `DispatchRuntimeClient::new` only checks the pool's configured role.
+    /// So every case below that returns before `admit_put`'s doubles run
+    /// never touches Postgres. `cell.invalid` is the same deliberately
+    /// non-resolving host `lore-object-dispatch`'s own `dispatch_pool.rs`
+    /// tests use, for the same reason.
+    fn offline_dispatch_pool() -> Arc<DispatchRuntimePool> {
+        let budget = match DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0) {
+            Ok(budget) => budget,
+            Err(error) => panic!("fixture dispatch budget must be valid: {error}"),
+        };
+        let config = DispatchPoolConfig {
+            postgres_url: format!(
+                "postgres://{}:secret@cell.invalid:5432/lorecell?sslmode=disable",
+                lore_object_dispatch::DISPATCH_RUNTIME_ROLE,
+            ),
+            role: DispatchPoolRole::Runtime,
+            expected_database_identity: match DispatchDatabaseIdentity::new(1, 1) {
+                Ok(identity) => identity,
+                Err(error) => panic!("fixture database identity must be valid: {error}"),
+            },
+            pool_max: 1,
+            connect_timeout: Duration::from_millis(50),
+            acquire_timeout: Duration::from_millis(50),
+            statement_timeout: Duration::from_millis(50),
+            lock_timeout: Duration::from_millis(50),
+            tls: DispatchTlsMode::Disabled,
+            budget,
+        };
+        match DispatchRuntimePool::new(config) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) => panic!("fixture dispatch pool config must be valid: {error}"),
+        }
+    }
+
+    /// A wired `FragmentProviderEntry` (`port_wired` true, via
+    /// `with_transport_port`) built on the same `SharedAuthority`/
+    /// `SharedGetPort` doubles the rest of this module uses, plus an offline
+    /// dispatch pool. Private-field construction is legitimate here: this
+    /// helper lives inside the crate, the same access `FragmentProviderEntry::connect`
+    /// itself has, and it is the only way to reach a drain capability without
+    /// a live database.
+    fn drain_entry(
+        script: ChargeScript,
+        put_bound: InFlightPutBound,
+    ) -> (
+        Arc<FragmentProviderEntry>,
+        Arc<ScriptedChargeAuthority>,
+        Arc<CountingGetPort>,
+    ) {
+        let authority = Arc::new(ScriptedChargeAuthority::new(script));
+        let port = Arc::new(CountingGetPort {
+            get_calls: AtomicUsize::new(0),
+            metered_calls: AtomicUsize::new(0),
+            requests_per_call: 1,
+            outcome: ProviderAttemptOutcome::Decisive,
+            direct_body: Mutex::new(None),
+            metered_operations: Mutex::new(Vec::new()),
+        });
+        let gateway = FragmentProviderGateway::with_transport_port(
+            CellSchemaAttestation::for_tests(boundary()),
+            ProviderCapabilities::none().with_listing(),
+            put_bound,
+            test_charge_bound(),
+            SharedAuthority(Arc::clone(&authority)),
+            SharedGetPort(Arc::clone(&port)),
+        );
+        let pool = offline_dispatch_pool();
+        let dispatch = match DispatchRuntimeClient::new(pool.clone()) {
+            Ok(dispatch) => dispatch,
+            Err(error) => panic!("fixture dispatch client must construct: {error}"),
+        };
+        let entry = Arc::new(FragmentProviderEntry {
+            gateway,
+            _dispatch: dispatch,
+            pool,
+        });
+        (entry, authority, port)
+    }
+
+    fn mint_drain_capability(entry: &Arc<FragmentProviderEntry>) -> FragmentDrainCapability {
+        match entry.drain_capability(drain_spool_root()) {
+            Ok(capability) => capability,
+            Err(error) => panic!("fixture drain capability must construct: {error}"),
+        }
+    }
+
+    /// The fail-open case this tranche exists to close. The spool digest
+    /// agrees with itself — the sent bytes match the bound spool body
+    /// exactly — but the independent claim anchor does not. Before this
+    /// check existed, a caller that spooled the wrong file would have its
+    /// bytes agree with its own spool-ready declaration and the send would
+    /// proceed; comparing only against a digest the same caller had already
+    /// spooled lets a wrong file pass with both sides agreeing. Refused
+    /// before any charge, any send, or even the put permit.
+    #[tokio::test]
+    async fn attempt_drain_refuses_when_the_claim_digest_disagrees_even_though_the_spool_matches_itself()
+     {
+        let body = b"drain payload matches the spool exactly".to_vec();
+        let spool_blake3 = *blake3::hash(&body).as_bytes();
+        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+        let capability = mint_drain_capability(&entry);
+        let ready = FragmentDrainReady(drain_ready_outcome(
+            REQUEST_ID,
+            ATTEMPT_ID,
+            body.len() as u64,
+            spool_blake3,
+        ));
+        // A different digest than the spool's own — the independent anchor a
+        // caller cannot forge by spooling consistently with itself.
+        let wrong_claim_blake3 = *blake3::hash(b"a different file entirely").as_bytes();
+        let request = drain_attempt_fixture(
+            REQUEST_ID,
+            ATTEMPT_ID,
+            wrong_claim_blake3,
+            body.len() as u64,
+        );
+
+        let mut ledger = ledger();
+        let outcome = capability
+            .attempt_drain(&mut ledger, request, &ready, &body)
+            .await;
+
+        assert_eq!(outcome, Err(FragmentProviderError::ClaimBindingMismatch));
+        assert_eq!(
+            authority.calls.load(Ordering::SeqCst),
+            0,
+            "a claim mismatch must be refused before any charge",
+        );
+        assert_eq!(
+            port.metered_calls.load(Ordering::SeqCst),
+            0,
+            "a claim mismatch must be refused before any send",
+        );
+        assert_eq!(
+            entry.gateway.available_put_permits(),
+            1,
+            "a claim mismatch must be refused before the put permit is taken",
+        );
+    }
+
+    /// The ready receipt was minted for a different logical request than the
+    /// attempt claims. Caught by the seam's own cross-check, before the claim
+    /// anchor is read at all.
+    #[tokio::test]
+    async fn attempt_drain_refuses_when_the_ready_receipt_names_a_different_logical_request() {
+        const OTHER_REQUEST_ID: &str = "018bcfe5-6800-7abc-8def-000000000099";
+        let body = b"drain payload".to_vec();
+        let spool_blake3 = *blake3::hash(&body).as_bytes();
+        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+        let capability = mint_drain_capability(&entry);
+        // Minted for OTHER_REQUEST_ID, so it binds cleanly to its OWN
+        // identity — the mismatch is entirely in the cross-check against the
+        // attempt below, not in the spool binding itself.
+        let ready = FragmentDrainReady(drain_ready_outcome(
+            OTHER_REQUEST_ID,
+            ATTEMPT_ID,
+            body.len() as u64,
+            spool_blake3,
+        ));
+        let request =
+            drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, spool_blake3, body.len() as u64);
+
+        let mut ledger = ledger();
+        let outcome = capability
+            .attempt_drain(&mut ledger, request, &ready, &body)
+            .await;
+
+        assert_eq!(outcome, Err(FragmentProviderError::SpoolBindingRejected));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// The bound body is above the existing 256 KiB ingress cap. Refused
+    /// before the put permit is taken — the same "cheapest check first"
+    /// ordering the direct-PUT path already proves for itself.
+    #[tokio::test]
+    async fn attempt_drain_refuses_an_oversized_bound_body_before_taking_a_permit() {
+        let arbitrary_blake3 = [0xAB; 32];
+        let oversized = FRAGMENT_PROVIDER_INGRESS_CAP_BYTES + 1;
+        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+        let capability = mint_drain_capability(&entry);
+        let ready = FragmentDrainReady(drain_ready_outcome(
+            REQUEST_ID,
+            ATTEMPT_ID,
+            oversized,
+            arbitrary_blake3,
+        ));
+        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, arbitrary_blake3, oversized);
+
+        let mut ledger = ledger();
+        let outcome = capability
+            .attempt_drain(
+                &mut ledger,
+                request,
+                &ready,
+                b"irrelevant, refused before read",
+            )
+            .await;
+
+        assert_eq!(outcome, Err(FragmentProviderError::IngressCapExceeded));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            entry.gateway.available_put_permits(),
+            1,
+            "an oversized bound body must be refused before the put permit is taken",
+        );
+    }
+
+    /// The claim agrees with the spool; only the bytes actually handed to
+    /// `attempt_drain` disagree with both.
+    #[tokio::test]
+    async fn attempt_drain_refuses_when_the_supplied_bytes_do_not_match_the_bound_body() {
+        let spooled = b"the body the drain worker actually spooled".to_vec();
+        let spool_blake3 = *blake3::hash(&spooled).as_bytes();
+        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+        let capability = mint_drain_capability(&entry);
+        let ready = FragmentDrainReady(drain_ready_outcome(
+            REQUEST_ID,
+            ATTEMPT_ID,
+            spooled.len() as u64,
+            spool_blake3,
+        ));
+        let request =
+            drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, spool_blake3, spooled.len() as u64);
+        let wrong_bytes = b"a completely different body".to_vec();
+
+        let mut ledger = ledger();
+        let outcome = capability
+            .attempt_drain(&mut ledger, request, &ready, &wrong_bytes)
+            .await;
+
+        assert_eq!(outcome, Err(FragmentProviderError::DrainBodyMismatch));
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// An empty bound body passes every one of the seam's own pre-checks
+    /// (zero equals zero, and the empty hash agrees with itself), so the
+    /// refusal originates downstream in CD-5's own body-bounds check
+    /// (`DirectPutBodyOutOfBounds`) and must land on `Internal` via the
+    /// catch-all, not on `InvalidInput`: this is a request the seam should
+    /// never have let through, not a caller-supplied value it caught itself.
+    #[tokio::test]
+    async fn attempt_drain_maps_an_empty_bound_body_to_internal_not_invalid_input() {
+        let empty: Vec<u8> = Vec::new();
+        let empty_blake3 = *blake3::hash(&empty).as_bytes();
+        let (entry, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+        let capability = mint_drain_capability(&entry);
+        let ready =
+            FragmentDrainReady(drain_ready_outcome(REQUEST_ID, ATTEMPT_ID, 0, empty_blake3));
+        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, empty_blake3, 0);
+
+        let mut ledger = ledger();
+        let outcome = capability
+            .attempt_drain(&mut ledger, request, &ready, &empty)
+            .await;
+
+        let error = outcome.expect_err("an empty body must be refused, not sent");
+        assert_eq!(
+            error.disposition(),
+            FragmentProviderDisposition::Internal,
+            "got {error}",
+        );
+        assert_ne!(
+            error.disposition(),
+            FragmentProviderDisposition::InvalidInput
+        );
+    }
+
+    /// A fully agreeing drain succeeds, and the charge authority observes
+    /// exactly the forced `Drain` traffic class — never a caller-supplied
+    /// one, since `FragmentDrainAttempt` has no such field — while the
+    /// transport receives exactly the bound spool body's own bytes.
+    #[tokio::test]
+    async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_own_bytes() {
+        let body = b"a fully valid drain payload".to_vec();
+        let body_blake3 = *blake3::hash(&body).as_bytes();
+        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+        let capability = mint_drain_capability(&entry);
+        let ready = FragmentDrainReady(drain_ready_outcome(
+            REQUEST_ID,
+            ATTEMPT_ID,
+            body.len() as u64,
+            body_blake3,
+        ));
+        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, body_blake3, body.len() as u64);
+
+        let mut ledger = ledger();
+        let outcome = capability
+            .attempt_drain(&mut ledger, request, &ready, &body)
+            .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a fully agreeing drain must succeed: {outcome:?}",
+        );
+        assert_eq!(
+            authority.last_seen_traffic_class(),
+            Some(ProviderTrafficClass::Drain),
+            "the charge authority must see the drain traffic class, forced by the seam",
+        );
+        let sent = port.direct_body.lock().expect("direct body lock").clone();
+        assert_eq!(
+            sent,
+            Some(body),
+            "the transport must receive exactly the bound spool body's own bytes",
+        );
+    }
+
+    /// Dynamic proof, not just a source reading, that the drain shares the
+    /// one in-flight put semaphore with the direct fallback: holding the
+    /// cell's only put permit through the direct path leaves a otherwise-valid
+    /// drain nowhere to go but the admission queue, where it times out. A
+    /// drain with its own semaphore would have admitted immediately instead.
+    #[tokio::test]
+    async fn attempt_drain_shares_the_one_in_flight_put_permit_with_the_direct_fallback() {
+        let (entry, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+
+        let holder = entry
+            .admit_put(
+                attempt(ProviderAttemptClass::PutObject),
+                put_operation(b"held by the direct path"),
+            )
+            .await
+            .expect("the direct path must take the only put permit");
+        assert_eq!(entry.gateway.available_put_permits(), 0);
+
+        let body = b"a drain send with nowhere to queue".to_vec();
+        let body_blake3 = *blake3::hash(&body).as_bytes();
+        let capability = mint_drain_capability(&entry);
+        let ready = FragmentDrainReady(drain_ready_outcome(
+            REQUEST_ID,
+            ATTEMPT_ID,
+            body.len() as u64,
+            body_blake3,
+        ));
+        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, body_blake3, body.len() as u64);
+        let mut ledger = ledger();
+
+        let outcome = capability
+            .attempt_drain(&mut ledger, request, &ready, &body)
+            .await;
+
+        assert_eq!(
+            outcome,
+            Err(FragmentProviderError::PutAdmissionTimedOut),
+            "if the drain had its own semaphore this would admit instead of timing out; it \
+             must queue behind the direct path's already-held permit",
+        );
+        drop(holder);
+    }
+
+    /// `FragmentProviderError`'s derived `PartialEq` covers the new drain
+    /// variants, including a source-carrying one — proof, not the assumption
+    /// its `#[derive(PartialEq)]` alone would otherwise be.
+    #[test]
+    fn the_new_drain_error_variants_support_partial_eq() {
+        assert_eq!(
+            FragmentProviderError::SpoolBindingRejected,
+            FragmentProviderError::SpoolBindingRejected,
+        );
+        assert_ne!(
+            FragmentProviderError::SpoolBindingRejected,
+            FragmentProviderError::ClaimBindingMismatch,
+        );
+        assert_ne!(
+            FragmentProviderError::ClaimBindingMismatch,
+            FragmentProviderError::DrainBodyMismatch,
+        );
+        assert_eq!(
+            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AmbiguousCommit),
+            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AmbiguousCommit),
+        );
+        assert_ne!(
+            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AmbiguousCommit),
+            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AuthorityUnavailable),
+        );
+    }
+
+    /// Exhaustive over every `DispatchAuthorityError` variant, mirroring
+    /// `every_charge_refusal_carries_a_named_disposition`'s style for
+    /// `ProviderChargeError`. The production match this pins is itself
+    /// exhaustive with no wildcard, so a variant added upstream fails THAT
+    /// build; this test is what fails HERE if an existing variant's
+    /// classification silently changes.
+    #[test]
+    fn every_drain_spool_ready_refusal_carries_a_named_disposition() {
+        let expected: [(DispatchAuthorityError, FragmentProviderDisposition); 33] = [
+            (
+                DispatchAuthorityError::Pool(DispatchPoolError::PoolExhausted),
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::OperationTimeout,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::RetryExhausted,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::AuthorityUnavailable,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::ConnectionSlotsExhausted,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::CapacityExhausted,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::QuotaUnavailable,
+                FragmentProviderDisposition::Transient,
+            ),
+            (
+                DispatchAuthorityError::AmbiguousCommit,
+                FragmentProviderDisposition::OutcomeUnknown,
+            ),
+            (
+                DispatchAuthorityError::WrongPoolRole,
+                FragmentProviderDisposition::NotReady,
+            ),
+            (
+                DispatchAuthorityError::Unauthorized,
+                FragmentProviderDisposition::NotReady,
+            ),
+            (
+                DispatchAuthorityError::UnsupportedApiRevision,
+                FragmentProviderDisposition::NotReady,
+            ),
+            (
+                DispatchAuthorityError::SchemaUnavailable,
+                FragmentProviderDisposition::NotReady,
+            ),
+            (
+                DispatchAuthorityError::DigestProviderUnavailable,
+                FragmentProviderDisposition::NotReady,
+            ),
+            (
+                DispatchAuthorityError::SerializableTransactionRequired,
+                FragmentProviderDisposition::NotReady,
+            ),
+            (
+                DispatchAuthorityError::InvalidArgument,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::CanonicalRecordInvalid,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::IdentifierTimestampOutOfRange,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::ExpiredOrUnknown,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::ReservationExpired,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::UploadClosed,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::UploadStreamIdentityMismatch,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::ChunkGap,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::ReplayConflict,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::StoredRecordMismatch,
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                DispatchAuthorityError::CounterOverflow,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::TimeInvalid,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::StoredStateInvalid,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::GenerationNotMonotonic,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::ParticipantAuthenticationRequired,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::ParticipantStateInvalid,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::ParticipantKeyDigestInvalid,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::UnrecognizedResultCode,
+                FragmentProviderDisposition::Internal,
+            ),
+            (
+                DispatchAuthorityError::InvalidAuthorityResponse("unit test fixture"),
+                FragmentProviderDisposition::Internal,
+            ),
+        ];
+
+        for (refusal, disposition) in expected {
+            let observed = FragmentProviderError::SpoolReadyRefused(refusal).disposition();
+            assert_eq!(
+                observed, disposition,
+                "{refusal} must carry {disposition:?}"
             );
         }
     }

@@ -31,6 +31,11 @@ lore-base = { workspace = true }
 lore-object-dispatch = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+# WP-114 CD-6's drain capability: the 0017 SPOOL_READY identity is four UUIDv7
+# columns, so the seam-owned mirror type has to name `Uuid`. `lore-postgres` and
+# `lore-server` already carry the same workspace dependency, so no consumer gains
+# a new one. It publishes no dispatch vocabulary and touches no pin.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # Test-only. The seam itself spawns nothing; the admission tests do.

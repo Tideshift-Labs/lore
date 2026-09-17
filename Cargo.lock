@@ -2745,6 +2745,7 @@ dependencies = [
  "lore-object-dispatch",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2888,6 +2889,7 @@ dependencies = [
  "bytes",
  "deadpool-postgres",
  "hex",
+ "libc",
  "lore-aws",
  "lore-base",
  "lore-fragment-provider",
