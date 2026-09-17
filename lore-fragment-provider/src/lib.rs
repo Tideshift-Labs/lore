@@ -480,16 +480,26 @@ pub enum FragmentProviderError {
     #[error("charge admission is closed")]
     ChargeAdmissionClosed,
 
-    /// The drain's ready receipt could not be bound to a durable spool body, or
-    /// the body it binds belongs to another logical request.
+    /// The drain's ready receipt could not be bound to a durable spool body.
     ///
-    /// **Carries no source, deliberately.** One variant has to cover both the
-    /// binder's refusal and the seam's own request cross-check, and the second
-    /// has no dispatch error to carry. Splitting them would widen the closed
-    /// error set WP-114 CD-6 was ratified with; the two conditions are one
-    /// caller fault — a receipt that does not describe this attempt's body.
-    #[error("fragment drain spool binding does not describe this attempt's body")]
-    SpoolBindingRejected,
+    /// Source-preserving, and **separate from
+    /// [`FragmentProviderError::SpoolBindingRequestMismatch`] on purpose**: an
+    /// operator chasing a refused drain has to be able to tell a binding the
+    /// dispatch layer refused — a non-ready row, a handle that is not the
+    /// canonically derived one, a key that is not a PUT key — from the seam's
+    /// own identity cross-check below. One variant covering both would drop
+    /// this cause entirely, and the two send a reader to different places.
+    #[error("fragment drain spool binding was refused: {0}")]
+    SpoolBindingRejected(#[source] ProviderClientError),
+
+    /// The bound spool body belongs to a different logical request than the
+    /// attempt claims.
+    ///
+    /// The binding itself succeeded: the receipt is internally consistent and
+    /// canonically derived. It simply describes another request, which the
+    /// dispatch layer cannot see and only this seam can check.
+    #[error("fragment drain spool binding names a different logical request")]
+    SpoolBindingRequestMismatch,
 
     /// The bound spool body disagrees with the lifecycle claim's own digest or
     /// size.
@@ -626,7 +636,8 @@ impl FragmentProviderError {
             | Self::IngressCapExceeded
             | Self::OperationRequired
             | Self::OperationMismatch
-            | Self::SpoolBindingRejected
+            | Self::SpoolBindingRejected(_)
+            | Self::SpoolBindingRequestMismatch
             | Self::ClaimBindingMismatch
             | Self::DrainBodyMismatch
             | Self::InvalidObjectKey => FragmentProviderDisposition::InvalidInput,
@@ -2169,6 +2180,7 @@ impl FragmentDrainCapability {
     ///
     /// Returns [`FragmentProviderError::OperationRequired`],
     /// [`FragmentProviderError::SpoolBindingRejected`],
+    /// [`FragmentProviderError::SpoolBindingRequestMismatch`],
     /// [`FragmentProviderError::ClaimBindingMismatch`],
     /// [`FragmentProviderError::IngressCapExceeded`],
     /// [`FragmentProviderError::DrainBodyMismatch`], or whatever admission,
@@ -2188,9 +2200,9 @@ impl FragmentDrainCapability {
             self.entry.boundary().provider_boundary_id(),
             &ready.0,
         )
-        .map_err(|_| FragmentProviderError::SpoolBindingRejected)?;
+        .map_err(FragmentProviderError::SpoolBindingRejected)?;
         if bound.logical_request_id() != request.logical_request_id.as_str() {
-            return Err(FragmentProviderError::SpoolBindingRejected);
+            return Err(FragmentProviderError::SpoolBindingRequestMismatch);
         }
         if bound.blake3() != &request.claim_body_blake3 || bound.size() != request.claim_body_size {
             return Err(FragmentProviderError::ClaimBindingMismatch);
@@ -4731,12 +4743,16 @@ mod tests {
                 )),
                 FragmentProviderDisposition::NotReady,
             ),
-            // WP-114 CD-6's drain refusals. All three are decisive caller
-            // faults the seam catches before any charge or send, so all three
+            // WP-114 CD-6's drain refusals. All four are decisive caller
+            // faults the seam catches before any charge or send, so all four
             // classify the same way the direct-PUT path's own local refusals
             // above do.
             (
-                FragmentProviderError::SpoolBindingRejected,
+                FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
+                FragmentProviderDisposition::InvalidInput,
+            ),
+            (
+                FragmentProviderError::SpoolBindingRequestMismatch,
                 FragmentProviderDisposition::InvalidInput,
             ),
             (
@@ -5035,7 +5051,13 @@ mod tests {
             .attempt_drain(&mut ledger, request, &ready, &body)
             .await;
 
-        assert_eq!(outcome, Err(FragmentProviderError::SpoolBindingRejected));
+        assert_eq!(
+            outcome,
+            Err(FragmentProviderError::SpoolBindingRequestMismatch),
+            "the binding itself succeeded — the receipt is canonically derived \
+             for its own identity — so this must be the seam's cross-check, not \
+             a dispatch binding refusal",
+        );
         assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
         assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
     }
@@ -5227,11 +5249,22 @@ mod tests {
     #[test]
     fn the_new_drain_error_variants_support_partial_eq() {
         assert_eq!(
-            FragmentProviderError::SpoolBindingRejected,
-            FragmentProviderError::SpoolBindingRejected,
+            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
+            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
+        );
+        // The split's whole point: the binder's cause is carried, so two
+        // refusals that would have compared equal as one unit variant no
+        // longer do.
+        assert_ne!(
+            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
+            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyHandleMismatch,),
         );
         assert_ne!(
-            FragmentProviderError::SpoolBindingRejected,
+            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
+            FragmentProviderError::SpoolBindingRequestMismatch,
+        );
+        assert_ne!(
+            FragmentProviderError::SpoolBindingRequestMismatch,
             FragmentProviderError::ClaimBindingMismatch,
         );
         assert_ne!(
