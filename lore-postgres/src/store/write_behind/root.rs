@@ -38,11 +38,11 @@
 //!
 //! `O_NOFOLLOW` covers the **final** component, and the recorded device covers a
 //! move to another filesystem. Neither catches a same-device symlink planted at
-//! an intermediate fan-out component. [`ConfinedRoot::ensure_parent`] uses
-//! `create_dir`, which fails on an existing symlink, so a fan-out directory this
-//! process created cannot be swapped for one; but a symlink planted *before*
-//! first use, by something already able to write inside the root, is not
-//! detected. Closing it needs an `openat`-from-root-dirfd walk, which needs raw
+//! an intermediate fan-out component. [`ConfinedRoot::ensure_parent`] accepts
+//! `AlreadyExists` from `create_dir`, which does not prove the existing entry
+//! is a directory rather than a symlink. A party able to modify the root can
+//! plant or replace an intermediate component; this module does not prevent
+//! that substitution. Closing it needs an `openat`-from-root-dirfd walk, which needs raw
 //! fd `unsafe` FFI this crate does not otherwise have — and an attacker who can
 //! write inside the root already owns the staged bytes. The residual is
 //! documented rather than silently accepted.
@@ -209,6 +209,10 @@ mod platform {
                     return Err(WriteBehindError::io("root directory create", &error));
                 }
             }
+            // Both entry points must survive a crash before any stage can be
+            // acknowledged. AlreadyExists is not durability evidence: another
+            // process may have created the directory without syncing this root.
+            sync_directory(&canonical)?;
             let root = Self {
                 inner: Arc::new(RootInner {
                     canonical,
@@ -276,10 +280,10 @@ mod platform {
         /// authoritative — a `Staged` row with no readable file, which
         /// ADR-00027 classifies as corruption.
         ///
-        /// `create_dir` (not `create_dir_all`) is deliberate: it fails on an
-        /// existing symlink, so a fan-out component this process created cannot
-        /// later be swapped for one. See the module header for the residual it
-        /// does not cover.
+        /// Each level is created separately so its parent can be synced before
+        /// proceeding. `AlreadyExists` does not establish the entry's type or
+        /// durability. See the module header for the intermediate-symlink
+        /// residual this path does not close.
         pub(crate) fn ensure_parent(
             &self,
             resolved: &ResolvedStagedPath,
@@ -288,24 +292,21 @@ mod platform {
             let Some(grandparent) = parent.parent() else {
                 return Err(WriteBehindError::RootUnresolvable);
             };
-            let mut created_grandparent = false;
             match fs::create_dir(grandparent) {
-                Ok(()) => created_grandparent = true,
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(WriteBehindError::io("fanout create", &error)),
             }
-            if created_grandparent {
-                sync_directory(&self.inner.staged)?;
-            }
-            let mut created_parent = false;
+            // Every finalizer establishes its own durability barrier. A peer
+            // can pause after mkdir, so observing its entry is not proof that
+            // the peer has synced the parent before this writer acknowledges.
+            sync_directory(&self.inner.staged)?;
             match fs::create_dir(parent) {
-                Ok(()) => created_parent = true,
+                Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(WriteBehindError::io("fanout create", &error)),
             }
-            if created_parent {
-                sync_directory(grandparent)?;
-            }
+            sync_directory(grandparent)?;
             Ok(())
         }
 
@@ -402,11 +403,16 @@ mod platform {
 
     /// fsync one directory so its entries survive a crash.
     pub(crate) fn sync_directory(directory: &Path) -> Result<(), WriteBehindError> {
+        #[cfg(test)]
+        super::durability_tests::observe_sync(directory, false)?;
         let handle = fs::File::open(directory)
             .map_err(|error| WriteBehindError::io("directory open", &error))?;
         handle
             .sync_all()
-            .map_err(|error| WriteBehindError::io("directory fsync", &error))
+            .map_err(|error| WriteBehindError::io("directory fsync", &error))?;
+        #[cfg(test)]
+        super::durability_tests::observe_sync(directory, true)?;
+        Ok(())
     }
 
     fn free_bytes(path: &Path) -> Result<u64, WriteBehindError> {
@@ -501,6 +507,10 @@ mod platform {
 }
 
 pub(crate) use platform::sync_directory;
+
+#[cfg(all(test, unix))]
+#[path = "durability_tests.rs"]
+mod durability_tests;
 
 #[cfg(test)]
 mod tests {

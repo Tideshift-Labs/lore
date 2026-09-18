@@ -47,6 +47,57 @@ impl PostgresFragmentCoordinator {
         classify_commit(tx.commit().await, "create metadata capture commit")?;
         Ok(readable.then_some(witness))
     }
+
+    /// Capture the current readable epoch backed by the requested authority.
+    ///
+    /// This grants no repository access or staged reader lease. The caller must
+    /// revalidate the returned witness when publishing its association. No
+    /// database resource is held on return. Missing, non-readable, or mismatched
+    /// epoch evidence returns `None`, including an authority changed by promotion.
+    /// The synchronous metadata path keeps its separate Remote-only capture.
+    pub async fn capture_current_readable_epoch_for_authority(
+        &self,
+        hash: &[u8],
+        authority: EpochAuthority,
+    ) -> Result<Option<EpochWitness>, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|error| DomainError::from_pg("authority epoch capture begin", error))?;
+        let mut sequence = LockSequence::new();
+        let Some(head) = lock_fragment_head(&tx, &mut sequence, hash).await? else {
+            classify_commit(tx.commit().await, "authority epoch absent capture commit")?;
+            return Ok(None);
+        };
+        let witness = EpochWitness {
+            hash: hash.to_vec(),
+            epoch: head.current_epoch,
+            state: head.state,
+            manifest_id: head.manifest_id.clone(),
+            fence: head.last_fence,
+        };
+        let readable = if witness.state == authority.readable_state() {
+            tx.query_one(
+                "SELECT EXISTS(SELECT 1 FROM lore_fragment_epochs WHERE hash=$1 AND epoch=$2 \
+                 AND manifest_id=$3 AND authority=$4 AND disposition=$5)",
+                &[
+                    &witness.hash,
+                    &witness.epoch,
+                    &witness.manifest_id,
+                    &authority.bits(),
+                    &schema::DISPOSITION_CURRENT_ELIGIBLE,
+                ],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("authority epoch capture evidence", error))?
+            .get::<_, bool>(0)
+        } else {
+            false
+        };
+        classify_commit(tx.commit().await, "authority epoch capture commit")?;
+        Ok(readable.then_some(witness))
+    }
 }
 
 // Creation uses the synchronous provider route. An exact Remote epoch avoids treating a staged

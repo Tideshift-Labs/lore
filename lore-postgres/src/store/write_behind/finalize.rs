@@ -9,7 +9,8 @@
 //! durability operation completed, all **before** the authoritative `Staged`
 //! commit. This module performs, in exactly this order:
 //!
-//! 1. create the fan-out directories and fsync **their** parents;
+//! 1. ensure the fan-out directories exist and fsync **their** parents,
+//!    including directories created by another writer;
 //! 2. write the payload to a temporary file under `incoming/`;
 //! 3. fsync the temporary file;
 //! 4. rename it onto its staged path;

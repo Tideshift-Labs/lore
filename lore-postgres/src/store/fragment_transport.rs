@@ -26,6 +26,9 @@ use lore_fragment_provider::ProviderAttemptOutcome;
 
 use super::immutable_store::PostgresFragmentTransportConfigError;
 
+#[cfg(test)]
+mod tests;
+
 /// A retry-disabled S3 client that can be invoked only with a request minted by
 /// the fragment-provider seam after admission and charge.
 pub(crate) struct PostgresFragmentS3Transport {

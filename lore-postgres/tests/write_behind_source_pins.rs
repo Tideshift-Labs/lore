@@ -169,7 +169,9 @@ fn d11_fallback_and_staging_are_mutually_exclusive_and_reach_one_shared_acknowle
     // stage.mode()))` -- so the two calls below are different arms of the
     // same match, not two independent `if`s that could both run.
     let scrutinee_at = put_coordinated
-        .find(".write_behind\n            .as_ref()\n            .map(|stage| (stage, stage.mode()))")
+        .find(
+            ".write_behind\n            .as_ref()\n            .map(|stage| (stage, stage.mode()))",
+        )
         .expect("the route decision must read write_behind's mode through one match scrutinee");
     let staged_arm_at = put_coordinated
         .find("Some((stage, StagingMode::Stage)) => {")
@@ -197,7 +199,8 @@ fn d11_fallback_and_staging_are_mutually_exclusive_and_reach_one_shared_acknowle
          which arm each call now belongs to"
     );
     assert!(
-        !put_coordinated.contains("put_staged") || put_coordinated.matches("put_staged").count() == 1,
+        !put_coordinated.contains("put_staged")
+            || put_coordinated.matches("put_staged").count() == 1,
         "put_staged must be called from exactly the Stage arm, not duplicated into another arm"
     );
 

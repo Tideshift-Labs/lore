@@ -1886,9 +1886,10 @@ pub struct GovernedProviderClient<C, T> {
     /// is used as it always was. The caller-supplied pin is therefore the *initial* value, not the
     /// permanent one.
     ///
-    /// Stored only on `Ok`, never at accept time. A head that is published but not yet resolvable
-    /// would otherwise become sticky for every later attempt on this client until the process
-    /// restarted, which is the exact failure this whole change exists to remove.
+    /// Stored only after a successful charge and exact grant validation, never at accept time.
+    /// A head that is published but not yet resolvable would otherwise become sticky for every
+    /// later attempt on this client until the process restarted. Cache publication is monotonic:
+    /// a delayed older grant cannot replace a newer pin another attempt already proved.
     ///
     /// Two handling rules this type forces, both load-bearing:
     ///
@@ -2093,16 +2094,6 @@ where
             }
         };
 
-        // Only now, with a charge proved against it, does the refreshed pin become this client's
-        // override. Storing it at accept time would make an unchargeable head sticky until restart.
-        if let Some(pin) = refreshed_to {
-            let mut guard = self
-                .refreshed_pin
-                .write()
-                .unwrap_or_else(PoisonError::into_inner);
-            *guard = Some(pin);
-        }
-
         if let Err(error) = validate_grant(&charge_request, &grant) {
             // A returned grant may have committed even though it does not describe this attempt,
             // so it is counted and never refunded, and the ledger closes rather than sending.
@@ -2116,6 +2107,30 @@ where
             charge_request.attempt_id(),
             charge_request.attempt_ordinal(),
         )?;
+
+        // Validate against this attempt's exact pin before publishing its successful refresh.
+        // A charge reply can arrive after a peer already proved a later renewal. Never let that
+        // delayed reply rewind the shared cache, or overwrite its revision at the same fence.
+        // This does not relax the per-attempt successor-only check above.
+        if let Some(pin) = refreshed_to {
+            let mut guard = self
+                .refreshed_pin
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if guard.as_ref().is_some_and(|current| {
+                pin.fence == current.fence && pin.revision != current.revision
+            }) {
+                // The grant is already counted. Conflicting authority cannot
+                // permit a send or replace the pin a peer previously proved.
+                return Err(ledger.poison(ProviderClientError::BudgetPinConflict));
+            }
+            if guard
+                .as_ref()
+                .is_none_or(|current| pin.fence > current.fence)
+            {
+                *guard = Some(pin);
+            }
+        }
 
         let attempt = AuthorizedProviderAttempt::new(prepared, &grant, self.retry_policy);
         let mut transport_guard = TransportCancellationGuard::new(ledger);
@@ -2507,6 +2522,8 @@ pub enum ProviderClientError {
     ChargeRecovered,
     #[error("cell dispatch grant does not bind this attempt")]
     GrantDoesNotBindAttempt,
+    #[error("cell dispatch grants disagree on the budget revision at one fence")]
+    BudgetPinConflict,
     #[error("cell provider transport issued nothing: {0}")]
     TransportRefused(ProviderTransportRefusal),
     #[error("cell provider transport reported a successful call that issued no request")]

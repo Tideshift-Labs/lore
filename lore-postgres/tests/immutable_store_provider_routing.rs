@@ -188,9 +188,7 @@ fn coordinated_put_without_payload_is_db_only_and_requires_an_exact_readable_ass
     // Anchor on the binding itself, not what follows it on the same line --
     // this now reads `let witness = match self` (write-behind's route match),
     // and the exact RHS shape is not this test's property to pin.
-    let preflight = coordinated
-        .find("let witness =")
-        .expect("payload path");
+    let preflight = coordinated.find("let witness =").expect("payload path");
     let none_branch = &coordinated[none..preflight];
 
     assert!(none_branch.contains("Self::resolve_one(coordinator, repository, address)"));

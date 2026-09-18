@@ -1795,7 +1795,10 @@ impl PostgresImmutableStore {
             }
         }
         let witness = coordinator
-            .capture_current_readable_epoch(address.hash.data())
+            .capture_current_readable_epoch_for_authority(
+                address.hash.data(),
+                EpochAuthority::Staged,
+            )
             .await
             .map_err(domain_store_err)?
             .ok_or_else(|| StoreError::from(SlowDown))?;
@@ -3190,6 +3193,93 @@ mod tests {
     use crate::domain::fragments::IoObservation;
     use crate::domain::fragments::schema;
     use crate::pool::TlsConfig;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires owned LORE_TEST_PG_URL and Unix staging filesystem"]
+    async fn first_put_staged_call_returns_exact_readable_witness_without_retry() {
+        let url = std::env::var("LORE_TEST_PG_URL").expect("owned Postgres URL");
+        let domain = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+            .await
+            .unwrap();
+        let coordinator = domain.fragment_coordinator();
+        coordinator.bootstrap().await.unwrap();
+        // No provider call is available: this test drives the production
+        // private staging helper; public route/association acceptance is separate.
+        let s3_config = aws_sdk_s3::config::Builder::new()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .build();
+        let store = PostgresImmutableStore {
+            pool: crate::pool::build_pool(&url, 4, &TlsConfig::default()).unwrap(),
+            s3: S3Impl::new(
+                aws_sdk_s3::Client::from_conf(s3_config),
+                Duration::from_secs(30),
+                None,
+            ),
+            bucket: "unused-staging-only".to_owned(),
+            instruments: crate::metrics::Instruments::new("staged-test"),
+            fragment_route: FragmentLifecycleRoute::Legacy,
+            staged_epoch_cleanup: None,
+            write_behind: None,
+            io_timeout: Duration::from_secs(30),
+        };
+        let root = std::env::temp_dir().join(format!("lore-private-staged-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let stage = WriteBehindStage::open(crate::store::write_behind::WriteBehindSettings {
+            root: root.clone(),
+            watermarks: crate::store::write_behind::WriteBehindWatermarks {
+                low_bytes: 10_000_000,
+                high_bytes: 20_000_000,
+                hard_bytes: 30_000_000,
+                low_count: 1000,
+                high_count: 2000,
+                hard_count: 3000,
+                min_free_bytes: 0,
+            },
+            drain_stale_after: Duration::from_secs(60),
+            sample_interval: Duration::from_secs(3600),
+        })
+        .unwrap();
+        let payload = Bytes::from(format!(
+            "first staging call without retry: {}",
+            Uuid::now_v7()
+        ));
+        let address = Address {
+            context: random(),
+            hash: Hash::from(blake3::hash(&payload).as_bytes().as_slice()),
+        };
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        let outcome = store
+            .put_staged(&coordinator, &stage, address, fragment, payload.clone())
+            .await;
+        let witness = outcome.expect("first production put_staged call succeeds");
+        assert_eq!(witness.state, FragmentLifecycleState::Staged);
+        assert_eq!(witness.hash, address.hash.data().to_vec());
+        let key = format!("{}.s{}", hex::encode(address.hash.data()), witness.epoch);
+        let read = stage
+            .read_staged(address.hash.data(), witness.epoch, &key)
+            .await;
+        assert!(
+            matches!(read, StagedRead::Found(ref bytes) if bytes == &payload),
+            "exact staged bytes: {read:?}"
+        );
+        let captured = coordinator
+            .capture_current_readable_epoch_for_authority(
+                address.hash.data(),
+                EpochAuthority::Staged,
+            )
+            .await
+            .unwrap()
+            .expect("current staged witness");
+        assert_eq!(captured.epoch, witness.epoch);
+        assert_eq!(captured.manifest_id, witness.manifest_id);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn service_error(error: GetObjectError, status: u16) -> AwsError<SdkError<GetObjectError>> {
         AwsError::AwsSdkError(Box::new(SdkError::service_error(

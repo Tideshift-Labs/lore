@@ -14,7 +14,7 @@
 //! composition is `lore-server`'s). So this file drives the coordinator and
 //! `WriteBehindStage` directly, in the exact sequence `put_staged` uses
 //! (`begin_stage` -> `stage.stage` -> `commit_staged` ->
-//! `capture_current_readable_epoch` -> `create_association_if_current`),
+//! `capture_current_readable_epoch_for_authority` -> `create_association_if_current`),
 //! rather than through the public `ImmutableStore` trait. This proves
 //! everything staging itself does; it does not exercise `put_coordinated`'s
 //! routing (see `write_behind_source_pins.rs`'s D11 structural pin for that
@@ -186,7 +186,8 @@ async fn prepare_operation(store: &PostgresDomainStore, method: &str) -> Governe
 async fn create_repository(store: &PostgresDomainStore) -> [u8; 16] {
     let repository_id: [u8; 16] = rand::random();
     let branch_id: [u8; 16] = rand::random();
-    let operation = prepare_operation(store, "lore.domain.v1.test/WriteBehindRepositoryCreate").await;
+    let operation =
+        prepare_operation(store, "lore.domain.v1.test/WriteBehindRepositoryCreate").await;
     let input = RepositoryCreateInput {
         metadata_witnesses: Vec::new(),
         repository_id: repository_id.to_vec(),
@@ -257,21 +258,7 @@ async fn head_state(direct: &Client, hash: &[u8]) -> Option<i16> {
         .map(|row| row.get(0))
 }
 
-/// THE FOUNDATIONAL CASE. Everything else in this file's `put_staged`-shaped
-/// sequence depends on this succeeding, so it runs first and is written to
-/// fail loudly and specifically if it does not.
-///
-/// `capture_current_readable_epoch` (`domain/fragments/creation.rs`) computes
-/// `readable = witness.state == FragmentLifecycleState::Remote &&
-/// remote_epoch_exists(..)` -- `remote_epoch_exists` hardcodes
-/// `EpochAuthority::Remote.bits()` in its SQL. Its own doc comment says
-/// "after commit_remote" and "no readable Remote witness". Nothing in that
-/// function accepts `EpochAuthority::Staged`. `put_staged`
-/// (`store/immutable_store.rs`) calls this exact function to capture the
-/// witness it returns after a successful `commit_staged` -- so if this read
-/// is source-accurate, every successful Stage-mode commit is followed
-/// immediately by a guaranteed `SlowDown`, even though the bytes are staged,
-/// durable, and the association is about to publish.
+/// First publication returns exact staged evidence; metadata capture stays Remote-only.
 #[tokio::test]
 #[ignore = "run with LORE_TEST_PG_URL and Unix; see file header"]
 async fn staged_commit_then_witness_capture_through_the_put_staged_sequence() {
@@ -326,29 +313,30 @@ async fn staged_commit_then_witness_capture_through_the_put_staged_sequence() {
     );
 
     let captured = coordinator
-        .capture_current_readable_epoch(&hash)
+        .capture_current_readable_epoch_for_authority(&hash, EpochAuthority::Staged)
         .await
-        .expect("capture_current_readable_epoch must not error, whatever it returns");
-
-    // This assertion states what the source predicts, not what the seam
-    // should do: `capture_current_readable_epoch` is Remote-only. If this
-    // assertion ever fails (i.e. `captured` is `Some(..)`), that is GOOD NEWS
-    // -- it means either this read of the source was wrong or the function
-    // has been widened since -- and this test should be corrected to assert
-    // the success path (epoch/manifest_id equality) instead of deleted.
+        .expect("capture staged authority")
+        .expect("first staged publication must yield its exact witness");
+    assert_eq!(captured.epoch, intent.epoch);
+    assert_eq!(captured.manifest_id, Some(manifest.manifest_id.clone()));
     assert!(
-        captured.is_none(),
-        "capture_current_readable_epoch unexpectedly returned a witness for a Staged \
-         head ({captured:?}) -- the seam may have been fixed; update this test to assert \
-         success (epoch == intent.epoch, manifest_id == manifest.manifest_id) rather than \
-         treating this as still broken"
+        coordinator
+            .capture_current_readable_epoch(&hash)
+            .await
+            .unwrap()
+            .is_none(),
+        "synchronous metadata capture must remain Remote-only"
+    );
+    assert!(
+        coordinator
+            .capture_current_readable_epoch_for_authority(&hash, EpochAuthority::Remote)
+            .await
+            .unwrap()
+            .is_none(),
+        "Remote authority must refuse a staged head"
     );
 
-    // The severity qualifier: this is one spurious client-visible SlowDown on
-    // the FIRST attempt, not permanent unreachability. `put_staged`'s own top
-    // arm short-circuits `BeginOutcome::AlreadyReadable` back to the caller
-    // BEFORE ever calling the broken function again -- a retry's `begin_stage`
-    // for the same hash never re-enters `capture_current_readable_epoch`.
+    // Retry reuses the already published epoch.
     let BeginOutcome::AlreadyReadable(retry_witness) = coordinator
         .begin_stage(&hash)
         .await
@@ -361,7 +349,10 @@ async fn staged_commit_then_witness_capture_through_the_put_staged_sequence() {
     };
     assert_eq!(retry_witness.epoch, intent.epoch);
     assert_eq!(retry_witness.state, FragmentLifecycleState::Staged);
-    assert_eq!(retry_witness.manifest_id, Some(manifest.manifest_id.clone()));
+    assert_eq!(
+        retry_witness.manifest_id,
+        Some(manifest.manifest_id.clone())
+    );
 }
 
 /// C2-equivalent crash window (L2 plan §2.2, "crash between 4 and 6" renumbered
@@ -429,7 +420,10 @@ async fn crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_get
         )
         .await;
     assert!(
-        matches!(orphan_read, lore_postgres::store::write_behind::StagedRead::Found(_)),
+        matches!(
+            orphan_read,
+            lore_postgres::store::write_behind::StagedRead::Found(_)
+        ),
         "the orphaned file must still be present and byte-readable, got {orphan_read:?}"
     );
 
@@ -489,10 +483,7 @@ async fn crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_get
 /// resolved for this tranche (`commit_staged` does not publish the
 /// association; `create_association_if_current` is a separate transaction),
 /// so this test is that resolution's crash-safety proof, not a generic one.
-/// Recovery is the same `BeginOutcome::AlreadyReadable` short-circuit the
-/// foundational test above proves does not touch the broken witness-capture
-/// function -- deliberately reused here as the production recovery path
-/// `put_staged`'s own doc comment describes, not a test-only substitute.
+/// Recovery reuses the already readable epoch without writing another file.
 #[tokio::test]
 #[ignore = "run with LORE_TEST_PG_URL and Unix; see file header"]
 async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_file() {
@@ -566,7 +557,7 @@ async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_f
     );
 
     // Recovery: re-push the same fragment. `begin_stage` short-circuits to
-    // AlreadyReadable (never touching the broken capture_current_readable_epoch),
+    // AlreadyReadable (without repeating the capture or file publication),
     // and the caller binds the association exactly as put_coordinated would.
     let BeginOutcome::AlreadyReadable(witness) = coordinator
         .begin_stage(&hash)
@@ -603,32 +594,20 @@ async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_f
     // And still exactly one file on disk for this hash -- recovery re-ran
     // begin_stage but never re-staged bytes, because it never left the
     // Admitted path.
-    let read_after = stage.read_staged(&hash, intent.epoch, &intent.object_key).await;
+    let read_after = stage
+        .read_staged(&hash, intent.epoch, &intent.object_key)
+        .await;
     assert!(matches!(
         read_after,
         lore_postgres::store::write_behind::StagedRead::Found(_)
     ));
 }
 
-/// THE SEVERITY-DETERMINING CASE for the witness-capture defect
-/// (`staged_commit_then_witness_capture_through_the_put_staged_sequence`,
-/// same file). That test proves the first attempt's `SlowDown`. This one
-/// proves what happens next, because "very likely self-healing" is not a
-/// finding -- the difference between "first write returns a spurious error,
-/// retry succeeds and binds the association" and "retry succeeds but the
-/// association is never bound" is the difference between an ugly bug and
-/// silent, invisible data loss.
-///
-/// This drives the REAL bug scenario end to end, not a crash simulation:
-/// `capture_current_readable_epoch` is called and its `None` is observed
-/// (the actual defect, reproduced), a live PRE-retry assertion proves
-/// **zero** associations exist at exactly the moment a real `put_staged`
-/// caller would see the spurious `SlowDown`, and only THEN does the retry
-/// run, through the exact production recovery path (`begin_stage`'s
-/// `AlreadyReadable` short-circuit) rather than a hand-rolled substitute.
+/// A single first-attempt coordinator sequence binds readable staged bytes.
+/// This is coordinator-seam evidence; the public ImmutableStore route is not exercised.
 #[tokio::test]
 #[ignore = "run with LORE_TEST_PG_URL and Unix; see file header"]
-async fn first_attempt_fails_on_the_witness_capture_bug_then_retry_binds_the_association() {
+async fn first_attempt_captures_staged_authority_and_binds_the_association() {
     let Some(base_url) = pg_url() else {
         panic!("LORE_TEST_PG_URL required");
     };
@@ -642,14 +621,14 @@ async fn first_attempt_fails_on_the_witness_capture_bug_then_retry_binds_the_ass
         .await
         .expect("install isolated SCHEMA-118 fixture");
     let direct = direct_client(&url).await;
-    let root = ScratchRoot::new("severity");
+    let root = ScratchRoot::new("first-association");
     let stage = open_stage(&root);
     let hash = random_hash();
     let context = random_context();
-    let payload = Bytes::from_static(b"proves-retry-binds-the-association-or-proves-it-does-not");
+    let payload = Bytes::from_static(b"first-attempt-association-and-exact-readable-bytes");
     let repository_id = create_repository(&store).await;
 
-    // ---- First attempt: the real bug, reproduced, not assumed. ----
+    // No retry occurs in this test.
     let BeginOutcome::Admitted(intent) = coordinator
         .begin_stage(&hash)
         .await
@@ -678,23 +657,12 @@ async fn first_attempt_fails_on_the_witness_capture_bug_then_retry_binds_the_ass
         CommitVerdict::Published
     );
     let first_attempt_witness = coordinator
-        .capture_current_readable_epoch(&hash)
+        .capture_current_readable_epoch_for_authority(&hash, EpochAuthority::Staged)
         .await
-        .expect("capture_current_readable_epoch must not error");
-    // This is the actual production defect firing, live, in this test run --
-    // not a simulated crash. If this assertion ever fails, the defect is
-    // fixed upstream; see the companion test's own note on what to do then.
-    assert!(
-        first_attempt_witness.is_none(),
-        "expected the known witness-capture defect to fire; got {first_attempt_witness:?} \
-         instead -- if the defect is fixed, this whole test should be rewritten to assert the \
-         FIRST attempt binds the association directly, since there would be no SlowDown to retry"
-    );
-    // This is the load-bearing assertion. Taken at the EXACT moment a real
-    // `put_staged` caller would have already received `Err(SlowDown)` and
-    // returned control to its own caller -- proving what state the fragment
-    // is ACTUALLY left in when that happens, not what we assume it is in.
-    let association_count_after_failed_first_attempt: i64 = direct
+        .expect("capture staged authority")
+        .expect("first attempt must capture a witness without retry");
+    // Capture grants no repository access before association publication.
+    let association_count_before_binding: i64 = direct
         .query_one(
             "SELECT count(*) FROM lore_fragment_associations WHERE hash = $1",
             &[&hash],
@@ -703,40 +671,27 @@ async fn first_attempt_fails_on_the_witness_capture_bug_then_retry_binds_the_ass
         .expect("query associations")
         .get(0);
     assert_eq!(
-        association_count_after_failed_first_attempt, 0,
-        "ground truth immediately after the spurious SlowDown: no association exists yet -- \
-         this is expected (put_staged never reaches create_association_if_current on this path) \
-         and is NOT itself the defect; the defect is whether the NEXT assertion below ever runs"
+        association_count_before_binding, 0,
+        "capture must not publish an association"
     );
 
-    // ---- Retry: the production recovery path, not a hand-rolled one. ----
-    let BeginOutcome::AlreadyReadable(retry_witness) = coordinator
-        .begin_stage(&hash)
-        .await
-        .expect("retried begin_stage must not error")
-    else {
-        panic!(
-            "a retried begin_stage against an already-Staged head must short-circuit to \
-             AlreadyReadable -- if this panics, the 'self-healing' claim is FALSE and the \
-             fragment may be durably staged with no path to ever binding an association"
-        );
-    };
-    assert_eq!(retry_witness.epoch, intent.epoch);
-    assert_eq!(retry_witness.manifest_id, Some(manifest.manifest_id.clone()));
-
-    let retry_association_verdict = coordinator
-        .create_association_if_current(&retry_witness, &repository_id, &context)
-        .await
-        .expect("create_association_if_current must not error on retry");
-
-    // THE ANSWER.
+    assert_eq!(first_attempt_witness.epoch, intent.epoch);
     assert_eq!(
-        retry_association_verdict,
+        first_attempt_witness.manifest_id,
+        Some(manifest.manifest_id.clone())
+    );
+
+    let association_verdict = coordinator
+        .create_association_if_current(&first_attempt_witness, &repository_id, &context)
+        .await
+        .expect("first attempt binds association");
+
+    assert_eq!(
+        association_verdict,
         CommitVerdict::Published,
-        "if this is not Published, the retry path itself is broken and the fragment can be \
-         durably staged FOREVER with no association -- silent data loss, not a spurious error"
+        "the first attempt must publish the association"
     );
-    let association_count_after_retry: i64 = direct
+    let association_count_after_binding: i64 = direct
         .query_one(
             "SELECT count(*) FROM lore_fragment_associations WHERE hash = $1",
             &[&hash],
@@ -745,9 +700,14 @@ async fn first_attempt_fails_on_the_witness_capture_bug_then_retry_binds_the_ass
         .expect("query associations")
         .get(0);
     assert_eq!(
-        association_count_after_retry, 1,
-        "CONFIRMED: the retry binds exactly one association through the real production \
-         recovery path. Severity is an ugly bug (one spurious client-visible SlowDown and one \
-         extra round trip per staged fragment's first write), not silent data loss."
+        association_count_after_binding, 1,
+        "one first-attempt association must exist"
+    );
+    let read = stage
+        .read_staged(&hash, intent.epoch, &intent.object_key)
+        .await;
+    assert!(
+        matches!(read, lore_postgres::store::write_behind::StagedRead::Found(ref bytes) if bytes == &payload),
+        "published association must have exact readable bytes: {read:?}"
     );
 }

@@ -80,6 +80,147 @@ use uuid::Uuid;
 
 const TEST_PROVIDER_WRITE_AUTHORITY_REVISION: &str = "write-claims-v1";
 
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn authority_capture_requires_exact_current_eligible_epoch_evidence() {
+    let url = pg_url().expect("runner must set LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    for authority in [EpochAuthority::Staged, EpochAuthority::Remote] {
+        let hash = random_hash();
+        assert!(
+            coordinator
+                .capture_current_readable_epoch_for_authority(&hash, authority)
+                .await
+                .unwrap()
+                .is_none(),
+            "absent head"
+        );
+        let (epoch, manifest) = stage_hash(&coordinator, &hash, 0x53).await;
+        // Relabel both sides together for the Remote capture fixture. No I/O
+        // behavior is claimed here; this test isolates SQL evidence matching.
+        direct
+            .execute(
+                "UPDATE lore_fragment_lifecycle SET state=$2 WHERE hash=$1",
+                &[&hash, &authority.readable_state().bits()],
+            )
+            .await
+            .unwrap();
+        direct
+            .execute(
+                "UPDATE lore_fragment_epochs SET authority=$2 WHERE hash=$1",
+                &[&hash, &authority.bits()],
+            )
+            .await
+            .unwrap();
+        let positive = coordinator
+            .capture_current_readable_epoch_for_authority(&hash, authority)
+            .await
+            .unwrap()
+            .expect("matching current evidence");
+        assert_eq!(positive.epoch, epoch);
+        assert_eq!(positive.manifest_id, Some(manifest.manifest_id.clone()));
+        let opposite = if authority == EpochAuthority::Staged {
+            EpochAuthority::Remote
+        } else {
+            EpochAuthority::Staged
+        };
+        assert!(
+            coordinator
+                .capture_current_readable_epoch_for_authority(&hash, opposite)
+                .await
+                .unwrap()
+                .is_none(),
+            "wrong head authority"
+        );
+        assert_eq!(
+            coordinator
+                .capture_current_readable_epoch(&hash)
+                .await
+                .unwrap()
+                .is_some(),
+            authority == EpochAuthority::Remote,
+            "metadata helper remains Remote-only"
+        );
+
+        for (damage, restore) in [
+            (
+                "UPDATE lore_fragment_epochs SET epoch=epoch+100000 WHERE hash=$1",
+                "UPDATE lore_fragment_epochs SET epoch=epoch-100000 WHERE hash=$1",
+            ),
+            (
+                "UPDATE lore_fragment_epochs SET manifest_id=decode(repeat('ff',32),'hex') WHERE hash=$1",
+                "UPDATE lore_fragment_epochs SET manifest_id=(SELECT manifest_id FROM lore_fragment_lifecycle WHERE hash=$1) WHERE hash=$1",
+            ),
+            (
+                "UPDATE lore_fragment_epochs SET authority=3-authority WHERE hash=$1",
+                "UPDATE lore_fragment_epochs SET authority=3-authority WHERE hash=$1",
+            ),
+            (
+                "UPDATE lore_fragment_epochs SET disposition=1 WHERE hash=$1",
+                "UPDATE lore_fragment_epochs SET disposition=0 WHERE hash=$1",
+            ),
+            (
+                "UPDATE lore_fragment_epochs SET disposition=2 WHERE hash=$1",
+                "UPDATE lore_fragment_epochs SET disposition=0 WHERE hash=$1",
+            ),
+        ] {
+            direct
+                .execute(damage, &[&hash])
+                .await
+                .expect("damage isolated epoch evidence");
+            assert!(
+                coordinator
+                    .capture_current_readable_epoch_for_authority(&hash, authority)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "must refuse {authority:?}: {damage}"
+            );
+            direct
+                .execute(restore, &[&hash])
+                .await
+                .expect("restore evidence");
+            assert!(
+                coordinator
+                    .capture_current_readable_epoch_for_authority(&hash, authority)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "control after {damage}"
+            );
+        }
+        direct
+            .execute("DELETE FROM lore_fragment_epochs WHERE hash=$1", &[&hash])
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .capture_current_readable_epoch_for_authority(&hash, authority)
+                .await
+                .unwrap()
+                .is_none(),
+            "missing epoch row"
+        );
+        direct
+            .execute(
+                "UPDATE lore_fragment_lifecycle SET state=$2,manifest_id=NULL WHERE hash=$1",
+                &[&hash, &FragmentLifecycleState::Missing.bits()],
+            )
+            .await
+            .unwrap();
+        assert!(
+            coordinator
+                .capture_current_readable_epoch_for_authority(&hash, authority)
+                .await
+                .unwrap()
+                .is_none(),
+            "unreadable head"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers (self-contained: this file is its own compiled test binary, so
 // these deliberately mirror rather than share `domain_fragment_lifecycle.rs`'s
@@ -205,6 +346,10 @@ async fn insert_raw_claim(
     kind: i16,
     state: i16,
 ) {
+    assert_eq!(
+        kind, 0,
+        "promotion fixtures must use begin_promotion to bind source evidence"
+    );
     let logical_request_id = rand::random::<[u8; 16]>();
     let attempt_id = rand::random::<[u8; 16]>();
     let hard_not_after = SystemTime::now() + Duration::from_secs(3600);
@@ -547,18 +692,34 @@ async fn an_ambiguous_promotion_claim_at_the_legacy_key_blocks_direct_write_admi
     let direct = client(&url).await;
     let hash = random_hash();
 
-    // A Missing head so an ordinary direct write would otherwise admit
-    // freely (the mirror of the case above: this time the interfering claim
-    // is the promotion kind).
+    stage_hash(&coordinator, &hash, 0x51).await;
+    let BeginOutcome::Admitted(promotion) = coordinator
+        .begin_promotion(&hash, write_claim())
+        .await
+        .expect("admit promotion")
+    else {
+        panic!("Staged head must admit promotion");
+    };
+    let claim = promotion.write_claim().expect("promotion claim");
+    coordinator
+        .authorize_write_claim(claim)
+        .await
+        .expect("authorize promotion");
+    coordinator
+        .settle_write_claim(claim, FragmentWriteSettlement::Ambiguous)
+        .await
+        .expect("settle outcome-unknown promotion");
+
+    // Synthetic lineage relocation isolates the object-key barrier. The
+    // promotion claim itself was produced by the public API, including its
+    // mandatory source epoch and manifest. This is not a reachable workflow.
     direct
         .execute(
-            "INSERT INTO lore_fragment_lifecycle (hash, current_epoch, state, manifest_id, last_fence) \
-             VALUES ($1, 1, $2, NULL, 1)",
-            &[&hash, &FragmentLifecycleState::Missing.bits()],
+            "UPDATE lore_fragment_lifecycle SET state=$2, manifest_id=NULL, active_operation=$3 WHERE hash=$1",
+            &[&hash, &FragmentLifecycleState::PreparingRemote.bits(), &b"wp118-direct-v1N".as_slice()],
         )
         .await
-        .expect("insert Missing head fixture");
-    insert_raw_claim(&direct, &hash, 9002, 9002, &legacy_key(&hash), 1, 3).await;
+        .expect("place head on ordinary direct-resume lineage");
 
     let outcome = coordinator
         .begin_direct_write(&hash, &legacy_key(&hash), write_claim())
@@ -569,6 +730,22 @@ async fn an_ambiguous_promotion_claim_at_the_legacy_key_blocks_direct_write_admi
         "a live Ambiguous promotion claim at the shared legacy key must block direct-write \
          admission, got {outcome:?}"
     );
+
+    direct
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET state=$2, active_operation=NULL WHERE hash=$1",
+            &[&hash, &FragmentLifecycleState::Missing.bits()],
+        )
+        .await
+        .expect("move to Missing repair fixture");
+    let BeginOutcome::Admitted(repair) = coordinator
+        .begin_direct_write(&hash, &legacy_key(&hash), write_claim())
+        .await
+        .expect("repair successor")
+    else {
+        panic!("Missing repair must bypass the legacy-key claim");
+    };
+    assert_ne!(repair.object_key, legacy_key(&hash));
 }
 
 #[tokio::test]
@@ -663,12 +840,13 @@ async fn a_second_promotion_is_blocked_until_the_first_claims_hard_not_after_the
     };
     let store = store(&url).await;
     let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
     let hash = random_hash();
 
     stage_hash(&coordinator, &hash, 0x13).await;
 
     let BeginOutcome::Admitted(first) = coordinator
-        .begin_promotion(&hash, short_lived_write_claim())
+        .begin_promotion(&hash, write_claim())
         .await
         .expect("first begin_promotion")
     else {
@@ -687,9 +865,14 @@ async fn a_second_promotion_is_blocked_until_the_first_claims_hard_not_after_the
         "a concurrent promotion attempt on the same hash must be blocked, got {blocked:?}"
     );
 
-    // Let the first claim's hard_not_after pass. A crashed worker must not
-    // wedge the hash forever.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Move the database-clock horizons past deterministically after proving
+    // the live barrier. A 1 ms claim can expire before that assertion runs.
+    direct.execute(
+        "UPDATE lore_fragment_write_claims SET prepared_at=clock_timestamp()-interval '3 seconds', \
+         send_not_after=clock_timestamp()-interval '2 seconds', \
+         hard_not_after=clock_timestamp()-interval '1 second' WHERE hash=$1",
+        &[&hash],
+    ).await.expect("expire claim horizons");
 
     let BeginOutcome::Admitted(second) = coordinator
         .begin_promotion(&hash, write_claim())

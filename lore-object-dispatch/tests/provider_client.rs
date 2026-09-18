@@ -4452,6 +4452,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
         ProviderClientError::InvalidAttemptOrdinal,
         ProviderClientError::InvalidAttemptDeadline,
         ProviderClientError::InvalidBudgetPin,
+        ProviderClientError::BudgetPinConflict,
         ProviderClientError::InvalidPutLimits,
         ProviderClientError::MultipartPartCountExceeded,
         ProviderClientError::InvalidSpoolKind,
@@ -4491,7 +4492,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
     // `LedgerAlgebraViolation` were all missing from this sweep).
     assert_eq!(
         errors.len(),
-        41,
+        42,
         "a new ProviderClientError variant must be added to this array, not only to the match \
          below"
     );
@@ -4510,6 +4511,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
             | ProviderClientError::InvalidAttemptOrdinal
             | ProviderClientError::InvalidAttemptDeadline
             | ProviderClientError::InvalidBudgetPin
+            | ProviderClientError::BudgetPinConflict
             | ProviderClientError::InvalidPutLimits
             | ProviderClientError::MultipartPartCountExceeded
             | ProviderClientError::InvalidSpoolKind
@@ -4579,6 +4581,240 @@ async fn attempt_class_all_has_eleven_entries_with_distinct_metric_labels() {
         .map(|class| class.metric_label())
         .collect();
     assert_distinct_labels(&labels);
+}
+// A delayed successful grant must not overwrite a newer proven budget pin.
+struct LateGrantAuthority {
+    conflicting_revisions: bool,
+    refreshes: AtomicU32,
+    revisions: Arc<Mutex<Vec<String>>>,
+    head: Arc<AtomicU32>,
+    committed: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    seen: Arc<Mutex<Vec<(u32, u64)>>>,
+}
+fn late_grant_pin(fence: u64) -> BudgetPin {
+    BudgetPin {
+        revision: format!("late-grant.rev.{fence}"),
+        fence,
+    }
+}
+impl ProviderChargeAuthority for LateGrantAuthority {
+    async fn charge(
+        &self,
+        request: &ProviderChargeRequest,
+    ) -> Result<ProviderChargeGrant, ProviderChargeError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((request.attempt_ordinal(), request.budget_pin().fence));
+        self.revisions
+            .lock()
+            .unwrap()
+            .push(request.budget_pin().revision.clone());
+        let current = u64::from(self.head.load(Ordering::SeqCst));
+        if request.budget_pin().fence != current {
+            return Err(ProviderChargeError::BudgetPinRejected);
+        }
+        let committed_grant = binding_grant(request);
+        if request.attempt_ordinal() == 1 {
+            // The DB already committed N+1; delay only its successful response.
+            self.committed.notify_one();
+            self.release.notified().await;
+        }
+        Ok(committed_grant)
+    }
+    async fn refresh_budget_pin(&self, _: &str) -> Result<BudgetPin, ProviderChargeError> {
+        let mut pin = late_grant_pin(u64::from(self.head.load(Ordering::SeqCst)));
+        if self.conflicting_revisions {
+            pin.revision = format!(
+                "conflict.rev.{}",
+                self.refreshes.fetch_add(1, Ordering::SeqCst)
+            );
+        }
+        Ok(pin)
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_successful_grant_must_not_regress_the_proven_pin() {
+    let head = Arc::new(AtomicU32::new(43));
+    let committed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let authority = LateGrantAuthority {
+        conflicting_revisions: false,
+        refreshes: AtomicU32::new(0),
+        revisions: Arc::new(Mutex::new(Vec::new())),
+        head: head.clone(),
+        committed: committed.clone(),
+        release: release.clone(),
+        seen: seen.clone(),
+    };
+    let (transport, _) = ScriptedTransport::new(|_| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = Arc::new(client_with(
+        ProviderCapabilities::none(),
+        authority,
+        transport,
+    ));
+    let late_client = client.clone();
+    let late = lore_base::lore_spawn!(async move {
+        let mut ledger = new_ledger();
+        let request = request_for_attempt_number(1);
+        late_client.execute(&mut ledger, &request).await
+    });
+    tokio::time::timeout(Duration::from_secs(5), committed.notified())
+        .await
+        .unwrap();
+    for (number, fence) in [(2, 43), (3, 44)] {
+        head.store(fence, Ordering::SeqCst);
+        let mut ledger = new_ledger();
+        assert_eq!(
+            client
+                .execute(&mut ledger, &request_for_attempt_number(number))
+                .await,
+            Ok(ProviderAttemptOutcome::Decisive)
+        );
+    }
+    release.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), late)
+            .await
+            .unwrap()
+            .unwrap(),
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    head.store(45, Ordering::SeqCst);
+    let mut ledger = new_ledger();
+    let outcome = client
+        .execute(&mut ledger, &request_for_attempt_number(4))
+        .await;
+    assert_eq!(
+        outcome,
+        Ok(ProviderAttemptOutcome::Decisive),
+        "a proven N+2 pin must survive a delayed N+1 success; then N+3 is one generation of \
+         drift; observed charge pins = {:?}",
+        seen.lock().unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_revision_at_proven_fence_counts_grant_refuses_send_and_keeps_cache() {
+    let committed = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let revisions = Arc::new(Mutex::new(Vec::new()));
+    let authority = LateGrantAuthority {
+        head: Arc::new(AtomicU32::new(43)),
+        conflicting_revisions: true,
+        refreshes: AtomicU32::new(0),
+        revisions: revisions.clone(),
+        committed: committed.clone(),
+        release: release.clone(),
+        seen: Arc::new(Mutex::new(Vec::new())),
+    };
+    let (transport, sends) = ScriptedTransport::new(|_| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = Arc::new(client_with(
+        ProviderCapabilities::none(),
+        authority,
+        transport,
+    ));
+    let late_client = client.clone();
+    let late = lore_base::lore_spawn!(async move {
+        let mut ledger = new_ledger();
+        let outcome = late_client
+            .execute(&mut ledger, &request_for_attempt_number(1))
+            .await;
+        (outcome, ledger)
+    });
+    tokio::time::timeout(Duration::from_secs(5), committed.notified())
+        .await
+        .unwrap();
+    let mut peer_ledger = new_ledger();
+    let peer = client
+        .execute(&mut peer_ledger, &request_for_attempt_number(2))
+        .await;
+    release.notify_one();
+    let (outcome, ledger) = tokio::time::timeout(Duration::from_secs(5), late)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(peer, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!(outcome, Err(ProviderClientError::BudgetPinConflict));
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::BudgetPinConflict)
+    );
+    assert_eq!(sends.get(), 1, "only peer sent; conflicting grant did not");
+    let mut next = new_ledger();
+    assert_eq!(
+        client
+            .execute(&mut next, &request_for_attempt_number(3))
+            .await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(
+        revisions.lock().unwrap().last().unwrap(),
+        "conflict.rev.1",
+        "delayed conflict must not replace peer's proven revision"
+    );
+}
+
+#[tokio::test]
+async fn malformed_refreshed_grant_does_not_publish_the_cache() {
+    let (authority, _, _, pins) = RefreshScriptedChargeAuthority::new(
+        |call, request| match call {
+            1 => Err(ProviderChargeError::BudgetPinRejected),
+            2 => {
+                let mut grant = binding_grant(request);
+                grant.charged_units += 1;
+                Ok(grant)
+            }
+            _ => Ok(binding_grant(request)),
+        },
+        |_| Ok(refreshed_pin()),
+    );
+    let (transport, sends) = ScriptedTransport::new(|_| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), authority, transport);
+    let mut failed = new_ledger();
+    assert_eq!(
+        client
+            .execute(&mut failed, &request_for_attempt_number(1))
+            .await,
+        Err(ProviderClientError::GrantDoesNotBindAttempt)
+    );
+    assert_eq!(failed.committed_grant_count(), 1);
+    assert_eq!(failed.attempt_count(), 0);
+    assert_eq!(sends.get(), 0);
+    let mut next = new_ledger();
+    assert_eq!(
+        client
+            .execute(&mut next, &request_for_attempt_number(2))
+            .await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(
+        pins.lock().unwrap().as_slice(),
+        &[budget_pin(), refreshed_pin(), budget_pin()],
+        "malformed grant must not make its refreshed pin sticky"
+    );
 }
 
 #[tokio::test]

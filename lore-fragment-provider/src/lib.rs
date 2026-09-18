@@ -746,6 +746,11 @@ impl FragmentProviderError {
                     FragmentProviderDisposition::OutcomeUnknown
                 }
             },
+            // Conflicting successful grants are an authority invariant failure.
+            // The grant stays counted, but no provider request was issued.
+            Self::Provider(ProviderClientError::BudgetPinConflict) => {
+                FragmentProviderDisposition::Internal
+            }
             // Every remaining `ProviderClientError` is a request this seam
             // should never have built — a bad identity, a body that does not
             // belong to its request, a ledger naming another request.
