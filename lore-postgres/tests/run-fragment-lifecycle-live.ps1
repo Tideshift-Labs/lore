@@ -22,6 +22,14 @@ anonymous volume.
 No `lore-server` target is in this inventory. Server activation/configuration has its own
 non-live suites; this runner owns only coordinator and migration behavior requiring a real
 PostgreSQL clock, transaction locks, or catalog inspection.
+
+PLATFORM SKIPS. Some cases are `cfg(unix)`-gated and therefore unenumerable on a Windows
+host. They are listed in the inventory UNCONDITIONALLY and reported
+`NOT RUN (platform: Unix-only - owned by run-write-behind-linux.ps1)` from static source
+knowledge, never from the compiled catalog. The exit code stays 0: this tier may pass for
+work it did not run only because the summary names each skipped case and its owning runner.
+A conditionally-built inventory instead would make those cases not exist to be reported, and
+that silent drop is the false green this contract exists to prevent.
 #>
 
 [CmdletBinding()]
@@ -258,31 +266,54 @@ $inventory = @(
         Kind          = 'lib'
         Target        = 'lib'
         Exact         = $false
-        ExactPrefixes = @('store::immutable_store::tests::exact_purge_proofs_')
-        Cases         = @('store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone')
-    }
-)
-
-# Staging is compiled only on Unix. Keep its live cases owned here without
-# pretending a Windows catalog's absence is an executed staging test.
-if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
-    $libraryTarget = $inventory | Where-Object { $_.Kind -eq 'lib' }
-    $libraryTarget.ExactPrefixes += 'store::immutable_store::tests::first_put_staged_'
-    $libraryTarget.Cases += 'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry'
-    $inventory += [pscustomobject]@{
-        Package = 'lore-postgres'
-        Kind = 'test'
-        Target = 'write_behind_staging_lifecycle'
-        Exact = $true
+        ExactPrefixes = @(
+            'store::immutable_store::tests::exact_purge_proofs_',
+            # Unix-only (see $unixOnlyCases). Listed here unconditionally so the prefix
+            # scope still forbids an unowned sibling case on a Unix host; off Unix the
+            # prefix simply matches nothing in the catalog.
+            'store::immutable_store::tests::first_put_staged_'
+        )
+        Cases         = @(
+            'store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone',
+            'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry'
+        )
+    },
+    # Staging is compiled only on Unix (`write_behind_staging_lifecycle.rs` is whole-file
+    # `#![cfg(unix)]`). The target is listed UNCONDITIONALLY: a `cfg`-gated case is absent
+    # from an off-platform catalog, so a conditionally-built inventory would make these
+    # cases not exist to be reported at all, and this tier would exit 0 on Windows having
+    # silently dropped them. `docs/testing-gotchas.md`'s runner section states the rule --
+    # name such a case NOT RUN from static source knowledge, never from the catalog.
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
+        Target        = 'write_behind_staging_lifecycle'
+        Exact         = $true
         ExactPrefixes = @()
-        Cases = @(
+        Cases         = @(
             'staged_commit_then_witness_capture_through_the_put_staged_sequence',
             'crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_gets_a_fresh_epoch',
             'crash_between_commit_staged_and_association_recovers_with_exactly_one_file',
             'first_attempt_captures_staged_authority_and_binds_the_association'
         )
     }
-}
+)
+
+$isUnixHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
+
+# Every case above that the `cfg(unix)` gate compiles out on a non-Unix host. Off Unix these
+# are reported NOT RUN with their owning runner named, and are excluded from the catalog
+# assertion (the compiler never built them, so the catalog cannot enumerate them) and from
+# the pass total -- this tier stays exit 0 for work it honestly names as not run.
+$unixOnlyCases = @(
+    'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry',
+    'staged_commit_then_witness_capture_through_the_put_staged_sequence',
+    'crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_gets_a_fresh_epoch',
+    'crash_between_commit_staged_and_association_recovers_with_exactly_one_file',
+    'first_attempt_captures_staged_authority_and_binds_the_association'
+)
+$unixOnlyOwner = 'lore-postgres/tests/run-write-behind-linux.ps1'
+$platformSkipStatus = "NOT RUN (platform: Unix-only - owned by $(Split-Path -Leaf $unixOnlyOwner))"
 
 # Cases whose captured stdout is evidence in its own right, not just failure
 # context. Every case runs with `--nocapture`, but the runner only echoes the
@@ -299,14 +330,15 @@ $results = @(
     foreach ($target in $inventory) {
         foreach ($testName in $target.Cases) {
             [pscustomobject]@{
-                Package = $target.Package
-                Kind    = $target.Kind
-                Target  = $target.Target
-                Test    = $testName
-                Status  = 'NOT RUN'
-                Passed  = 0
-                Failed  = 0
-                Ran     = 0
+                Package      = $target.Package
+                Kind         = $target.Kind
+                Target       = $target.Target
+                Test         = $testName
+                Status       = 'NOT RUN'
+                Passed       = 0
+                Failed       = 0
+                Ran          = 0
+                PlatformSkip = (-not $isUnixHost) -and ($testName -in $unixOnlyCases)
             }
         }
     }
@@ -382,21 +414,29 @@ function Get-TestCatalog {
 
 function Assert-ExpectedCatalog {
     foreach ($target in $inventory) {
-        $catalog = @(Get-TestCatalog -Package $target.Package -Target $target.Target -Kind $target.Kind)
         $label = "$($target.Package)/$($target.Kind):$($target.Target)"
-        $missing = @($target.Cases | Where-Object { $_ -notin $catalog })
+        # A `cfg`-gated case is compiled out, so it is absent from this host's catalog by
+        # construction. Comparing against it would either fail setup or push the runner back
+        # to a conditional inventory. The cases stay listed and are reported NOT RUN from
+        # static source knowledge instead; only the catalog COMPARISON is host-scoped.
+        $expected = @($target.Cases | Where-Object { $isUnixHost -or $_ -notin $unixOnlyCases })
+        if ($expected.Count -eq 0) {
+            continue
+        }
+        $catalog = @(Get-TestCatalog -Package $target.Package -Target $target.Target -Kind $target.Kind)
+        $missing = @($expected | Where-Object { $_ -notin $catalog })
         if ($missing.Count -ne 0) {
             throw "$label is missing pinned cases: [$($missing -join ', ')]"
         }
-        foreach ($case in $target.Cases) {
+        foreach ($case in $expected) {
             if (@($catalog | Where-Object { $_ -eq $case }).Count -ne 1) {
                 throw "$label must contain the pinned case '$case' exactly once"
             }
         }
         if ($target.Exact) {
-            $unexpected = @($catalog | Where-Object { $_ -notin $target.Cases })
-            if ($catalog.Count -ne $target.Cases.Count -or $unexpected.Count -ne 0) {
-                throw ("$label must hold exactly $($target.Cases.Count) ignored cases; catalog has " +
+            $unexpected = @($catalog | Where-Object { $_ -notin $expected })
+            if ($catalog.Count -ne $expected.Count -or $unexpected.Count -ne 0) {
+                throw ("$label must hold exactly $($expected.Count) ignored cases; catalog has " +
                     "$($catalog.Count). Unexpected=[$($unexpected -join ', ')]")
             }
         }
@@ -406,7 +446,7 @@ function Assert-ExpectedCatalog {
             }
             foreach ($prefix in $target.ExactPrefixes) {
                 $scoped = @($catalog | Where-Object { $_.StartsWith($prefix) })
-                $unexpected = @($scoped | Where-Object { $_ -notin $target.Cases })
+                $unexpected = @($scoped | Where-Object { $_ -notin $expected })
                 if ($unexpected.Count -ne 0) {
                     throw ("$label has ignored cases under '$prefix' that this runner does not " +
                         "execute, so they are NOT RUN: [$($unexpected -join ', ')]")
@@ -491,6 +531,11 @@ try {
     try {
         $testOrdinal = 0
         foreach ($result in $selectedResults) {
+            if ($result.PlatformSkip) {
+                $result.Status = $platformSkipStatus
+                Write-Host "Skipping $($result.Test): Unix-only, owned by $unixOnlyOwner"
+                continue
+            }
             $testOrdinal += 1
             $databaseName = "wp118_fragment_$($testOrdinal)_$($runId.Substring(0, 12))"
             Invoke-Checked docker @(
@@ -566,7 +611,12 @@ try {
     }
 
     $passCount = @($selectedResults | Where-Object { $_.Status -eq 'PASS' }).Count
-    if ($passCount -eq $selectedResults.Count) {
+    $skipCount = @($selectedResults | Where-Object { $_.PlatformSkip }).Count
+    # A tier may exit 0 for work it did not run only because it NAMES what it skipped and who
+    # owns it (see the summary below). Turning the only rig we develop on permanently red for
+    # a platform gate would be the worse trade; silently dropping the cases is what this
+    # runner previously did and is the defect being fixed.
+    if (($passCount + $skipCount) -eq $selectedResults.Count) {
         $runPassed = $true
     }
 }
@@ -603,11 +653,20 @@ finally {
     }
 }
 
-$results | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+$results | Format-Table -AutoSize | Out-String -Width 320 | Write-Host
 $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
-Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount EXPECTED=$($results.Count)"
+$platformSkipped = @($results | Where-Object { $_.PlatformSkip })
+Write-Host ("Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount " +
+    "PLATFORM-SKIPPED=$($platformSkipped.Count) EXPECTED=$($results.Count)")
+if ($platformSkipped.Count -ne 0) {
+    Write-Host ("$($platformSkipped.Count) case(s) are Unix-only and were NOT RUN on this host. " +
+        "They are owned by $unixOnlyOwner, which must be run to cover them:")
+    foreach ($skipped in $platformSkipped) {
+        Write-Host "  $($skipped.Kind):$($skipped.Target) $($skipped.Test)"
+    }
+}
 
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"

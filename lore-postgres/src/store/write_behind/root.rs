@@ -192,8 +192,23 @@ mod platform {
         /// stage makes, so a mount that cannot fsync a directory fails at boot
         /// rather than at the first acknowledged PUT.
         pub(crate) fn open(configured: &Path) -> Result<Self, WriteBehindError> {
+            // Not a discard worth preserving: `RootUnresolvable` is a *closed*
+            // classification of operator configuration, deliberately distinct from
+            // `Io`, which `to_store_error` treats as a retryable environmental
+            // failure. A root path that cannot be canonicalized is a refusal to
+            // start whatever the underlying `ErrorKind` says, and `WriteBehindError`
+            // is `Copy + PartialEq` by design (see its doc comment) so it cannot
+            // carry the `io::Error` as a source either way.
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "the ErrorKind must not reclassify a configuration refusal as retryable Io"
+            )]
             let canonical =
                 fs::canonicalize(configured).map_err(|_| WriteBehindError::RootUnresolvable)?;
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "the ErrorKind must not reclassify a configuration refusal as retryable Io"
+            )]
             let metadata =
                 fs::metadata(&canonical).map_err(|_| WriteBehindError::RootUnresolvable)?;
             if !metadata.is_dir() {
@@ -262,6 +277,15 @@ mod platform {
         /// distinction that keeps a healthy fragment from being demoted to
         /// `Missing`.
         pub(crate) fn verify_device(&self) -> Result<(), WriteBehindError> {
+            // The verdict this call exists to produce is "the mount is no longer the
+            // one recorded at open", and an unreadable root proves exactly that. Any
+            // `ErrorKind` here must collapse to `RootDeviceChanged`: surfacing `Io`
+            // instead would let a caller retry, and a retry is what the doc comment
+            // above forbids -- it is how a healthy fragment gets demoted to `Missing`.
+            #[expect(
+                clippy::map_err_ignore,
+                reason = "every failure to stat the root IS the device-changed verdict, not a retryable Io"
+            )]
             let metadata = fs::metadata(&self.inner.canonical)
                 .map_err(|_| WriteBehindError::RootDeviceChanged)?;
             if metadata.dev() != self.inner.device {
@@ -415,7 +439,24 @@ mod platform {
         Ok(())
     }
 
+    // `f_bavail` and `f_frsize` are `fsblkcnt_t`/`fsfilcnt_t`, whose width is
+    // target-dependent: 64-bit on glibc x86_64, 32-bit on several musl and 32-bit
+    // targets. The conversions are identity only on the target clippy happens to be
+    // linting, and dropping them makes this function stop compiling everywhere else.
+    // The lint cannot see the other targets; the `saturating_mul` below is already
+    // written for the widened type.
+    #[expect(
+        clippy::useless_conversion,
+        reason = "statvfs field widths are target-dependent; the widening is identity only on this target"
+    )]
     fn free_bytes(path: &Path) -> Result<u64, WriteBehindError> {
+        // A `NulError` carries only the byte offset of an interior NUL in a path this
+        // process was configured with. There is nothing here worth preserving, and
+        // `WriteBehindError` is `Copy + PartialEq` by design and cannot carry a source.
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "a NulError in the configured root path adds nothing to the configuration refusal"
+        )]
         let raw = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| WriteBehindError::RootUnresolvable)?;
         // SAFETY: `statvfs` writes into a fully owned, correctly sized value and
