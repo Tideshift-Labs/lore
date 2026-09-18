@@ -521,7 +521,15 @@ already available — no WSL Rust toolchain install needed. Recipe, proven 2026-
    cache to **named Docker volumes**, not the bind mount, so a Linux build's artifacts never land
    in the Windows `target/` another process might be reading.
 3. Base image `rust:slim-trixie` (same as `lore-server/Dockerfile`) plus `apt-get install -y
-   protobuf-compiler build-essential` — `lore-proto`'s `prost`/`tonic` build needs `protoc`.
+   protobuf-compiler libprotobuf-dev build-essential` — `lore-proto`'s `prost`/`tonic` build needs
+   `protoc`, and on Debian trixie `protobuf-compiler` alone is not enough: the well-known types
+   (`google/protobuf/timestamp.proto`, imported by `lock.proto`) ship in `libprotobuf-dev`'s
+   `/usr/include`, and without it the build fails at `protoc failed:
+   google/protobuf/timestamp.proto: File not found` (measured 2026-09-18). If the same image also
+   needs to run `cargo clippy`, add `RUN rustup component add clippy` — `rust:slim-*` ships without
+   the clippy component, so an unmodified image fails with `'cargo-clippy' is not installed for the
+   toolchain` (also measured 2026-09-18). Full recipe with both fixes baked in:
+   `lore-postgres/tests/run-write-behind-linux.ps1`.
 4. First run compiles the full dependency graph from cold (~2 minutes for this crate's tree on this
    rig); the named volumes make a second run incremental.
 5. Launch detached (`docker run -d --name ...`), poll `docker inspect --format
