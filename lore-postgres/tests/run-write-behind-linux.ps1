@@ -57,7 +57,8 @@ best-effort here: they are reported, never gate the exit code, and are off by de
 param(
     [switch]$KeepOnFailure,
     [switch]$SkipLive,
-    [switch]$IncludeCompileFail
+    [switch]$IncludeCompileFail,
+    [switch]$Clippy
 )
 
 $ErrorActionPreference = 'Stop'
@@ -143,19 +144,31 @@ function Add-Result {
         [Parameter(Mandatory)][string]$Target,
         [Parameter(Mandatory)][string]$Case,
         [Parameter(Mandatory)][string]$Status,
+        # ENUMERATED and PASSED are separate columns on purpose. Two lanes reported this same
+        # tree accurately on 2026-09-18 and appeared to disagree (192 vs 188) purely because one
+        # counted the catalog and the other counted passes. A harness that prints one number
+        # invites exactly that, and here the catalog size is the load-bearing figure: it is what
+        # a `cfg` gate silently takes away.
+        [int]$Enumerated = 0,
         [int]$Ran = 0,
         [int]$Passed = 0,
         [int]$Failed = 0,
-        [string]$Note = ''
+        [string]$Note = '',
+        # A row that is REPORTED but does not decide the exit code. Used for the opt-in
+        # best-effort rows, and for anything `-SkipLive` deliberately did not run, so the
+        # gating set is a property of the row rather than a string match on its note.
+        [switch]$NonGating
     )
     $results.Add([pscustomobject]@{
-            Target = $Target
-            Case   = $Case
-            Status = $Status
-            Ran    = $Ran
-            Passed = $Passed
-            Failed = $Failed
-            Note   = $Note
+            Target     = $Target
+            Case       = $Case
+            Status     = $Status
+            Enumerated = $Enumerated
+            Ran        = $Ran
+            Passed     = $Passed
+            Failed     = $Failed
+            Gating     = -not $NonGating
+            Note       = $Note
         })
 }
 
@@ -253,6 +266,16 @@ try {
         throw "another write-behind Linux container exists; refusing to overlap:`n$($collisions -join "`n")"
     }
 
+    # The copy carries UNCOMMITTED files (that is the point during a multi-lane run), so the
+    # HEAD alone does not identify what ran. Print both, and say plainly when the tree was dirty:
+    # a reader comparing these counts against another lane's needs to know whether the two ran
+    # the same bytes.
+    $headSha = (& git -C $loreRoot rev-parse HEAD 2>$null | Out-String).Trim()
+    $dirtyCount = @(& git -C $loreRoot status --porcelain 2>$null | Where-Object { $_ }).Count
+    $treeLabel = if ($dirtyCount -eq 0) { "$headSha (clean tree)" } else { "$headSha + $dirtyCount uncommitted path(s)" }
+    Write-Host "Tree under test: $treeLabel"
+    $global:LASTEXITCODE = 0
+
     # ---- isolated source copy ------------------------------------------------------------
     New-Item -ItemType Directory -Path $sourceCopy -Force | Out-Null
     New-Item -ItemType Directory -Path $imageContext -Force | Out-Null
@@ -270,10 +293,13 @@ try {
     # at `protoc failed: google/protobuf/timestamp.proto: File not found` (measured 2026-09-18).
     $dockerfile = @(
         'FROM rust:slim-trixie',
-        'RUN apt-get update && apt-get install -y --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config && rm -rf /var/lib/apt/lists/*'
+        'RUN apt-get update && apt-get install -y --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config && rm -rf /var/lib/apt/lists/*',
+        # `rust:slim-*` ships no clippy component, so `-Clippy` fails with "'cargo-clippy' is not
+        # installed for the toolchain" unless it is added here (measured 2026-09-18).
+        'RUN rustup component add clippy'
     ) -join "`n"
     Set-Content -Path (Join-Path $imageContext 'Dockerfile') -Value $dockerfile -NoNewline
-    $imageTag = 'lore-write-behind-linux:2'
+    $imageTag = 'lore-write-behind-linux:3'
     & docker image inspect $imageTag *> $null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Building $imageTag ..."
@@ -357,8 +383,8 @@ try {
         $status = if ($run.ExitCode -eq 0 -and $counts.Ran -eq $target.Enumerated -and
             $counts.Passed -eq $target.Enumerated -and $counts.Failed -eq 0) { 'PASS' } else { 'FAIL' }
         Add-Result -Target $target.Target -Case '(whole target)' -Status $status `
-            -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed `
-            -Note "enumerated $($target.Enumerated), floor $($target.MinimumCases)"
+            -Enumerated $target.Enumerated -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed `
+            -Note "floor $($target.MinimumCases)"
         if ($status -ne 'PASS') { Write-Warning "  FAIL`n$($run.Output)" } else { Write-Host "  PASS ($($counts.Passed)/$($target.Enumerated))" }
     }
 
@@ -368,8 +394,8 @@ try {
     $libCounts = Read-TestCounts -Output $libRun.Output
     $libStatus = if ($libRun.ExitCode -eq 0 -and $libCounts.Failed -eq 0 -and $libCounts.Passed -gt 0) { 'PASS' } else { 'FAIL' }
     Add-Result -Target 'lib' -Case '(non-ignored)' -Status $libStatus `
-        -Ran $libCounts.Ran -Passed $libCounts.Passed -Failed $libCounts.Failed `
-        -Note "enumerated $($libCatalog.Count) vs Windows $windowsLibEnumerated; $($libCounts.Ignored) ignored"
+        -Enumerated $libCatalog.Count -Ran $libCounts.Ran -Passed $libCounts.Passed -Failed $libCounts.Failed `
+        -Note "Windows enumerates $windowsLibEnumerated for the same tree; $($libCounts.Ignored) ignored"
     if ($libStatus -ne 'PASS') { Write-Warning "  FAIL`n$($libRun.Output)" } else { Write-Host "  PASS ($($libCounts.Passed) passed, $($libCounts.Ignored) ignored)" }
 
     if ($IncludeCompileFail) {
@@ -383,20 +409,59 @@ try {
             $counts = Read-TestCounts -Output $run.Output
             Add-Result -Target $target -Case '(whole target)' `
                 -Status $(if ($run.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }) `
-                -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed -Note 'best effort, not pinned'
+                -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed `
+                -Note 'best effort, not pinned' -NonGating
             if ($run.ExitCode -ne 0) { Write-Warning "  FAIL`n$($run.Output)" }
         }
+    }
+
+    if ($Clippy) {
+        # The `cfg(unix)` blind spot is a LINT gap as well as a test gap: `cargo clippy` on the
+        # Windows rig never lints `write_behind/root.rs`'s Unix arm at all, so findings there are
+        # invisible until someone runs clippy on Linux. This step closes that.
+        #
+        # REPORTED, NOT GATING, and off by default -- deliberately. As of 22361e11 the Unix arm
+        # carries pre-existing findings that belong to the write-behind lane, not to this runner,
+        # and this runner changes no Rust source. Making it gate today would turn a REGISTERED
+        # required tier red for someone else's backlog; leaving it silent would repeat the exact
+        # mistake this runner exists to fix. Flip `-NonGating` off once the Unix arm is clean.
+        # Read the per-FILE breakdown, not the total. Measured 2026-09-18 at 0188a6bb: a blanket
+        # `-D warnings` over this crate in the container reports 129 findings, and the large
+        # majority are in files the Windows rig lints perfectly well (coordinator.rs, 33;
+        # maintenance.rs, 23) -- i.e. they are a container-vs-rig TOOLCHAIN VERSION difference,
+        # not a platform blind spot. The signal is the handful in the Unix-gated module, which
+        # no Windows clippy run can ever emit. Report both, and never let the total gate.
+        Write-Host 'Running cargo clippy -p lore-postgres --all-targets (Linux, reported only) ...'
+        $rustcVersion = (Invoke-InContainer -Command @('rustc', '--version')).Output.Trim()
+        $clippyRun = Invoke-InContainer -Command @(
+            'cargo', 'clippy', '-p', 'lore-postgres', '--all-targets', '--no-deps', '-j4', '--', '-D', 'warnings'
+        )
+        $locations = @(
+            foreach ($line in ($clippyRun.Output -split "`r?`n")) {
+                $match = [regex]::Match($line, '^\s*-->\s*(?<file>[^:]+):')
+                if ($match.Success) { $match.Groups['file'].Value }
+            }
+        )
+        $unixGated = @($locations | Where-Object { $_ -like '*store/write_behind/*' })
+        Write-Host "  toolchain in container: $rustcVersion"
+        Write-Host "  findings by file:"
+        $locations | Group-Object | Sort-Object Count -Descending |
+            ForEach-Object { Write-Host "    $($_.Count)`t$($_.Name)" }
+        Add-Result -Target 'clippy' -Case 'store/write_behind (Unix-gated)' `
+            -Status $(if ($unixGated.Count -eq 0) { 'PASS' } else { 'FAIL' }) `
+            -Note "$($unixGated.Count) finding(s) the Windows rig can never emit; $($locations.Count) total crate-wide, mostly toolchain-version noise. Reported, does not gate." `
+            -NonGating
     }
 
     # ---- live cases ----------------------------------------------------------------------
     if ($SkipLive) {
         foreach ($target in $liveInventory) {
             foreach ($case in $target.Cases) {
-                Add-Result -Target $target.Target -Case $case -Status 'NOT RUN' -Note '-SkipLive'
+                Add-Result -Target $target.Target -Case $case -Status 'NOT RUN' -Note '-SkipLive' -NonGating
             }
         }
         foreach ($case in $libUnixOnlyLive) {
-            Add-Result -Target 'lib' -Case $case -Status 'NOT RUN' -Note '-SkipLive'
+            Add-Result -Target 'lib' -Case $case -Status 'NOT RUN' -Note '-SkipLive' -NonGating
         }
     }
     else {
@@ -473,12 +538,12 @@ try {
             }
             elseif ($counts.Ran -eq 1) { 'FAIL' } else { 'NOT RUN' }
             Add-Result -Target $entry.Target -Case $entry.Case -Status $status `
-                -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed
+                -Enumerated 1 -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed
             if ($status -eq 'PASS') { Write-Host '  PASS' } else { Write-Warning "  $status`n$($run.Output)" }
         }
     }
 
-    $failures = @($results | Where-Object { $_.Status -ne 'PASS' -and -not ($_.Note -eq '-SkipLive' -or $_.Note -eq 'best effort, not pinned') })
+    $failures = @($results | Where-Object { $_.Gating -and $_.Status -ne 'PASS' })
     $runPassed = $failures.Count -eq 0
 }
 catch {
@@ -517,6 +582,7 @@ $passCount = @($results | Where-Object { $_.Status -eq 'PASS' }).Count
 $failCount = @($results | Where-Object { $_.Status -eq 'FAIL' }).Count
 $notRunCount = @($results | Where-Object { $_.Status -eq 'NOT RUN' }).Count
 Write-Host "Summary: PASS=$passCount FAIL=$failCount NOT RUN=$notRunCount"
+if ($treeLabel) { Write-Host "Tree under test: $treeLabel" }
 
 if ($null -ne $setupError) {
     Write-Warning "Setup failed: $setupError"
