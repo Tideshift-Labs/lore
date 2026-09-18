@@ -7,6 +7,11 @@
 //! runs a syscall on the PUT path: a `statvfs` per fragment would put back the
 //! per-fragment I/O cost that write-behind exists to remove.
 //!
+//! Moving a syscall off the PUT path does not make it safe to run anywhere. The
+//! sampler's own `stat`/`statvfs` goes to the blocking pool under a bounded
+//! wait — `super::sample_within_budget` — because a hung mount must report
+//! [`AdmissionSample::RootUnavailable`], not park a runtime worker.
+//!
 //! # Drain lag is deliberately not an input
 //!
 //! Staleness of the drain worker's **heartbeat** selects direct fallback,
@@ -116,9 +121,15 @@ impl Admission {
                 staged_bytes: 0,
                 staged_count: 0,
                 free_bytes: None,
-                // Unknown until the first sample. Unknown reads as unavailable,
-                // which costs one sampler interval of direct writes at boot and
-                // is the safe direction.
+                // Unknown until the first sample, and unknown reads as
+                // unavailable, which is the safe direction.
+                //
+                // It is not a boot cost, because no PUT is served from this
+                // state: `WriteBehindStage::open` takes the first sample
+                // synchronously before it returns. That matters more than it
+                // looks. The stage starts with `pending_staged` set, so an
+                // unknown root there is `Unready` — `SlowDown` on every PUT —
+                // not the direct writes an unavailable root alone would give.
                 root_available: false,
                 last_heartbeat: None,
                 elevated: false,

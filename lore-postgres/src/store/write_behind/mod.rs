@@ -50,12 +50,25 @@ use bytes::Bytes;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_storage::StoreError;
 use lore_storage::errors::SlowDown;
+use tokio::task::JoinHandle;
 use tokio_util::task::AbortOnDropHandle;
 
 use self::admission::Admission;
+use self::admission::AdmissionSample;
 pub use self::admission::StagingMode;
 pub use self::admission::WriteBehindWatermarks;
 use self::root::ConfinedRoot;
+
+/// How long one admission sample may run before the sampler reports the root
+/// unavailable for that tick.
+///
+/// Deliberately a constant rather than a function of `sample_interval`. The
+/// interval is how often an operator wants the picture refreshed; this is how
+/// long the tier is willing to say nothing about a mount that has stopped
+/// answering. Tying the second to the first would mean a cell configured with a
+/// relaxed interval also takes that long to notice a wedge, which is backwards:
+/// the slower the sampling, the more each missed sample matters.
+const SAMPLE_BUDGET: Duration = Duration::from_secs(5);
 
 /// Closed failures from the staging tier.
 ///
@@ -194,6 +207,25 @@ impl WriteBehindStage {
     /// path, so a mount that cannot fsync a directory fails here rather than at
     /// the first acknowledged PUT.
     ///
+    /// # The first sample is taken here, synchronously, on purpose
+    ///
+    /// An `Admission` starts with an *unknown* root, and unknown reads as
+    /// unavailable. Because [`Self::pending_staged`] also starts `true`, an
+    /// unknown root is not merely `DirectFallback` at boot — it is
+    /// [`StagingMode::Unready`], which takes `SlowDown` on every PUT. Waiting a
+    /// whole sampler interval to leave that state is a window this call can
+    /// simply close.
+    ///
+    /// Doing it here costs nothing new: `open` is already synchronous and has
+    /// already canonicalized, created, fsynced and probed this root through the
+    /// real finalization path a few lines above. A `stat` plus a `statvfs` on a
+    /// mount that has just accepted a write, an fsync and a rename adds no
+    /// failure mode the probe did not already take — a mount that would wedge
+    /// this sample wedges the probe first.
+    ///
+    /// After this call the cell is therefore in `DirectFallback`, not `Unready`,
+    /// and reaches `Stage` on the first drain heartbeat.
+    ///
     /// # Errors
     ///
     /// Returns [`WriteBehindError::UnsupportedPlatform`] off Unix, and the
@@ -201,6 +233,7 @@ impl WriteBehindStage {
     pub fn open(settings: WriteBehindSettings) -> Result<Arc<Self>, WriteBehindError> {
         let root = ConfinedRoot::open(&settings.root)?;
         let admission = Admission::new(settings.watermarks, settings.drain_stale_after);
+        admission.observe_root(root.sample());
         let sampler_root = root.clone();
         let sampler_admission = admission.clone();
         let interval = settings.sample_interval;
@@ -209,9 +242,20 @@ impl WriteBehindStage {
             async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // `interval`'s first tick fires immediately. `open` has just
+                // sampled this root synchronously, so that tick would re-run
+                // the same two syscalls for the same answer; consume it.
+                ticker.tick().await;
+                let mut in_flight = None;
                 loop {
                     ticker.tick().await;
-                    sampler_admission.observe_root(sampler_root.sample());
+                    let sample = sample_within_budget(&mut in_flight, SAMPLE_BUDGET, || {
+                        let root = sampler_root.clone();
+                        lore_base::lore_spawn_blocking!("write-behind-sample", move || root
+                            .sample())
+                    })
+                    .await;
+                    sampler_admission.observe_root(sample);
                 }
             }
         ));
@@ -324,5 +368,194 @@ impl WriteBehindStage {
     }
 }
 
+/// Take one admission sample without running it on a runtime worker, and
+/// without letting a wedged mount accumulate blocking threads.
+///
+/// `ConfinedRoot::sample` is `stat` then `statvfs`, both blocking FFI. Running
+/// it inline in the sampler task would mean that a hung mount — the exact
+/// condition the sampler exists to report — parks a Tokio worker instead of
+/// producing [`AdmissionSample::RootUnavailable`]. So it goes to the blocking
+/// pool, and the wait for it is bounded.
+///
+/// # Why the handle is carried across ticks
+///
+/// A blocking task cannot be cancelled. Dropping or aborting its
+/// [`JoinHandle`] stops this task waiting; it does not unpark the thread
+/// sitting inside `statvfs`. Spawning a fresh sample on every tick would
+/// therefore leak one pool thread per tick for as long as the mount stays
+/// wedged, and the blocking pool is bounded — the tier would eventually starve
+/// every other blocking caller in the process, including the staged read path.
+///
+/// `in_flight` is that defence. A new task is spawned only when the slot is
+/// empty, so **N consecutive wedged samples cost exactly one blocked thread,
+/// not N**. Each of those N ticks still reports `RootUnavailable`, which is
+/// the answer a wedged mount deserves, and the tick that finally sees the task
+/// finish observes its real result and frees the slot.
+///
+/// A panicked or cancelled join is `RootUnavailable` too, following
+/// `root.rs`'s `join` helper: a sample that did not complete is not evidence
+/// that the root is fine.
+async fn sample_within_budget<F>(
+    in_flight: &mut Option<JoinHandle<AdmissionSample>>,
+    budget: Duration,
+    spawn_sample: F,
+) -> AdmissionSample
+where
+    F: FnOnce() -> JoinHandle<AdmissionSample>,
+{
+    let handle = in_flight.get_or_insert_with(spawn_sample);
+    let outcome = tokio::time::timeout(budget, handle).await;
+    match outcome {
+        Ok(Ok(sample)) => {
+            in_flight.take();
+            sample
+        }
+        Ok(Err(_)) => {
+            in_flight.take();
+            AdmissionSample::RootUnavailable
+        }
+        // Still running. Keep the handle so the next tick waits on this task
+        // rather than spawning a second one.
+        Err(_) => AdmissionSample::RootUnavailable,
+    }
+}
+
 /// One admission snapshot, exposed for the store's metrics and readiness.
 pub use self::admission::AdmissionSnapshot;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Instant;
+
+    use super::*;
+
+    /// Budget short enough that an unanswered sample is decided quickly.
+    const SHORT_BUDGET: Duration = Duration::from_millis(100);
+    /// Budget long enough that an answered sample is never cut off by it.
+    const GENEROUS_BUDGET: Duration = Duration::from_secs(10);
+    /// How long a stand-in sample refuses to answer before giving up.
+    ///
+    /// Bounded rather than infinite on purpose: a regression that ran the
+    /// sample inline must fail an assertion, not hang the test binary.
+    const WEDGE_LIMIT: Duration = Duration::from_secs(5);
+
+    /// A sample that does not answer until `released` is set — the shape of a
+    /// mount that has stopped responding.
+    fn wedged_sample(
+        released: &Arc<AtomicBool>,
+        spawns: &Arc<AtomicUsize>,
+    ) -> JoinHandle<AdmissionSample> {
+        spawns.fetch_add(1, Ordering::Relaxed);
+        let released = Arc::clone(released);
+        lore_base::lore_spawn_blocking!("write-behind-sample-test", move || {
+            let deadline = Instant::now() + WEDGE_LIMIT;
+            while !released.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            AdmissionSample::Reachable { free_bytes: 42 }
+        })
+    }
+
+    #[tokio::test]
+    async fn a_sample_that_does_not_answer_degrades_to_root_unavailable() {
+        let released = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let mut in_flight = None;
+
+        let started = Instant::now();
+        let sample = sample_within_budget(&mut in_flight, SHORT_BUDGET, || {
+            wedged_sample(&released, &spawns)
+        })
+        .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(sample, AdmissionSample::RootUnavailable);
+        // The point of the whole change: the wait is bounded and the sampler
+        // task stayed on the runtime. A sample run inline on the worker would
+        // take the full `WEDGE_LIMIT` and report `Reachable`.
+        assert!(
+            elapsed < WEDGE_LIMIT,
+            "a wedged sample must be decided by the budget, not by the mount; took {elapsed:?}"
+        );
+        assert!(
+            in_flight.is_some(),
+            "the unfinished task must be kept, not dropped and forgotten"
+        );
+        released.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn consecutive_wedged_samples_never_spawn_a_second_blocking_task() {
+        let released = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let mut in_flight = None;
+
+        for tick in 1..=3 {
+            let sample = sample_within_budget(&mut in_flight, SHORT_BUDGET, || {
+                wedged_sample(&released, &spawns)
+            })
+            .await;
+            assert_eq!(
+                sample,
+                AdmissionSample::RootUnavailable,
+                "tick {tick} of a wedged mount must report the root unavailable"
+            );
+        }
+
+        // The defence that matters over time. A blocking task cannot be
+        // cancelled, so one spawn per tick would park one pool thread per tick
+        // until the mount recovers, starving the shared core blocking pool.
+        assert_eq!(
+            spawns.load(Ordering::Relaxed),
+            1,
+            "three wedged ticks must cost exactly one blocked thread"
+        );
+        released.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn the_tick_after_a_wedge_clears_observes_the_real_sample() {
+        let released = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let mut in_flight = None;
+
+        let wedged = sample_within_budget(&mut in_flight, SHORT_BUDGET, || {
+            wedged_sample(&released, &spawns)
+        })
+        .await;
+        assert_eq!(wedged, AdmissionSample::RootUnavailable);
+
+        released.store(true, Ordering::Release);
+        let recovered = sample_within_budget(&mut in_flight, GENEROUS_BUDGET, || {
+            wedged_sample(&released, &spawns)
+        })
+        .await;
+        assert_eq!(
+            recovered,
+            AdmissionSample::Reachable { free_bytes: 42 },
+            "the tick that finally sees the task finish must observe its real answer"
+        );
+        assert_eq!(
+            spawns.load(Ordering::Relaxed),
+            1,
+            "the recovering tick must wait on the existing task, not spawn another"
+        );
+        assert!(
+            in_flight.is_none(),
+            "a finished task must free the slot for the next tick"
+        );
+
+        let next = sample_within_budget(&mut in_flight, GENEROUS_BUDGET, || {
+            wedged_sample(&released, &spawns)
+        })
+        .await;
+        assert_eq!(next, AdmissionSample::Reachable { free_bytes: 42 });
+        assert_eq!(
+            spawns.load(Ordering::Relaxed),
+            2,
+            "with the slot free the next tick samples again"
+        );
+    }
+}

@@ -26,16 +26,9 @@
 //! Staging is Unix-only by owner ruling (2026-09-16): `WriteBehindStage::open`
 //! returns `Err(WriteBehindError::UnsupportedPlatform)` off Unix (see
 //! `root.rs`'s `#[cfg(not(unix))]` arm), so every case below is `#[cfg(unix)]`.
-//! On the Windows dev rig this file compiles (once `cleanup.rs` lands -- see
-//! below) but contributes zero tests; that is `cfg`, not `#[ignore]`, because
-//! this is a platform gate, not an infrastructure gate.
-//!
-//! # Blocked at the time this file was written
-//!
-//! `lore-postgres/src/store/write_behind/mod.rs` declares `pub mod cleanup;`
-//! but `cleanup.rs` does not exist yet (`cargo check -p lore-postgres --lib`
-//! fails with E0583 for `cleanup` as of this writing). This file cannot run
-//! until that lands; it is not a mistake on this file's part.
+//! On the Windows dev rig this file compiles but contributes zero tests; that
+//! is `cfg`, not `#[ignore]`, because this is a platform gate, not an
+//! infrastructure gate.
 
 #![cfg(unix)]
 
@@ -97,10 +90,9 @@ fn settings(root: PathBuf) -> WriteBehindSettings {
         watermarks: generous_watermarks(),
         drain_stale_after: Duration::from_secs(60),
         // Long enough that the admission sampler's periodic re-fire never
-        // lands mid-test; its *first* tick still fires as soon as the runtime
-        // polls the spawned task (`tokio::time::interval`'s documented
-        // behavior), which is why `mode()`-focused cases below read it
-        // synchronously, before this test's first `.await`.
+        // lands mid-test. Its first tick is consumed by `open` (which has
+        // already sampled the root synchronously), so with this interval no
+        // background sample runs during a case that does not ask for one.
         sample_interval: Duration::from_secs(3_600),
     }
 }
@@ -364,32 +356,74 @@ async fn a_symlink_planted_at_the_staged_leaf_is_refused_not_followed() {
     );
 }
 
+/// `open` must return with the root already sampled.
+///
+/// Before that sample existed, a freshly opened stage read its own root as
+/// *unknown*, unknown read as unavailable, and `pending_staged` starts `true`
+/// -- so the boot mode was `Unready`, which takes `SlowDown` on every PUT
+/// until the first sampler tick. `DirectFallback` here is the whole point: the
+/// root is available and only the absent drain heartbeat keeps the tier off
+/// `Stage` (see `admission.rs`'s `a_missing_drain_heartbeat_falls_back`).
+///
+/// No `.await` before the assertion, deliberately: this pins the mode at
+/// `open`'s return, not a mode the sampler reached afterwards.
+#[tokio::test]
+async fn open_returns_with_the_root_already_sampled_so_no_put_sees_unready() {
+    let root = ScratchRoot::new("boot-mode");
+    let stage = open(&root);
+
+    assert_eq!(
+        stage.mode(),
+        StagingMode::DirectFallback,
+        "a proven root must not read as unknown at open's return"
+    );
+    let snapshot = stage.snapshot();
+    assert!(
+        snapshot.root_available,
+        "open's synchronous first sample must have reached admission"
+    );
+    assert!(
+        snapshot.free_bytes.is_some(),
+        "the first sample carries free space, not just reachability"
+    );
+}
+
 /// `WriteBehindStage::mode()` upgrades an unavailable root to `Unready`
 /// specifically while `pending_staged` has not been cleared -- the escape
 /// hatch `admission.rs`'s own tests cannot see, because they exercise
 /// `Admission` directly and never go through the wrapping stage.
 ///
-/// Relies on the current-thread test runtime never polling the spawned
-/// admission sampler before this test's first synchronous `mode()` call --
-/// the same assumption every other case here makes implicitly, stated once
-/// here because this is the one case that would silently pass for the wrong
-/// reason if it were violated (a sampled-available root also reads
-/// `DirectFallback`, not `Stage`, absent a drain heartbeat -- see
-/// `admission.rs`'s `a_missing_drain_heartbeat_falls_back`).
+/// Reaching the unavailable state now takes a real event (the root vanishing)
+/// plus a real sampler tick, because `open` no longer leaves the root unknown.
+/// That makes this case also the one that proves the sampler still observes a
+/// root through its blocking-pool detour.
 #[tokio::test]
-async fn pending_staged_upgrades_an_unavailable_root_to_unready_by_default() {
+async fn a_vanished_root_upgrades_to_unready_while_pending_staged_stands() {
     let root = ScratchRoot::new("mode-unready");
-    let stage = open(&root);
+    let mut settings = settings(root.path().to_path_buf());
+    settings.sample_interval = Duration::from_millis(10);
+    let stage = WriteBehindStage::open(settings).expect("open a healthy root");
 
-    // No `.await` yet: the admission sampler has not been polled, so the root
-    // reads as not-yet-available, and `pending_staged` defaults to `true`.
-    assert_eq!(stage.mode(), StagingMode::Unready);
+    assert_eq!(stage.mode(), StagingMode::DirectFallback);
 
-    stage.note_pending_staged(false);
-    assert_ne!(
+    std::fs::remove_dir_all(root.path()).expect("simulate the staging root vanishing");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while stage.mode() != StagingMode::Unready && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
         stage.mode(),
         StagingMode::Unready,
+        "a sampler tick must observe the vanished root, and pending_staged must \
+         upgrade that to Unready rather than mask it with direct writes"
+    );
+
+    stage.note_pending_staged(false);
+    assert_eq!(
+        stage.mode(),
+        StagingMode::DirectFallback,
         "clearing pending_staged must remove the Unready upgrade even though \
-         the root is still (as far as this process knows) unavailable"
+         the root is still unavailable"
     );
 }
