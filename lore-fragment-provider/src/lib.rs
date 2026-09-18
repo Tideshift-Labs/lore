@@ -4808,8 +4808,17 @@ mod tests {
     /// component, and `bind_durable_put_body_from_ready` performs no
     /// filesystem access at all — exactly the property these tests exercise
     /// without a real spool directory.
+    ///
+    /// The `cfg!(windows)` fork is load-bearing, not cosmetic: a `C:\` root is
+    /// not `is_absolute()` on Linux, so a Windows-only literal makes
+    /// `SpoolLayout::new` return `InvalidSharedSpoolRoot` and every case in
+    /// this module panic in its fixture — on the platform production runs on.
     fn drain_spool_root() -> PathBuf {
-        PathBuf::from(r"C:\lore-fragment-provider-test-spool")
+        if cfg!(windows) {
+            PathBuf::from(r"C:\lore-fragment-provider-test-spool")
+        } else {
+            PathBuf::from("/var/lib/lore-fragment-provider-test-spool")
+        }
     }
 
     /// The opaque handle a real spool write would have produced for this
