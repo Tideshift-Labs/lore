@@ -244,7 +244,13 @@ $inventory = @(
             # Case 16 (owner-ruled D10 NARROW): a promotion send claim contributes a cleanup
             # target only as unpublished residue; obliterate's ordinary current-epoch Remote
             # purge path is unchanged for a promoted object.
-            'a_decisive_promotion_claim_contributes_a_cleanup_target_exactly_like_a_direct_write_claim_d10_narrow'
+            'a_decisive_promotion_claim_contributes_a_cleanup_target_exactly_like_a_direct_write_claim_d10_narrow',
+            # Close-out reviewer finding: the lineage-refusal arm settled by a literal
+            # NoSend before its own Prepared check, so an already-authorized claim was
+            # recorded as a CONFIRMED non-send. Every other lineage-refusal case enters
+            # that arm from Prepared, which is why it survived; this one enters from
+            # Sending.
+            'a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirmed_no_send'
         )
     },
     [pscustomobject]@{

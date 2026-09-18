@@ -2474,8 +2474,18 @@ impl PostgresFragmentCoordinator {
                 }
                 _ => false,
             };
-            settle_write_claim_locked(&tx, &mut sequence, claim, FragmentWriteSettlement::NoSend)
-                .await?;
+            // Settled by the claim's DURABLE state, not by a literal. This arm
+            // is reached before the `Prepared` check below, so it can see a
+            // claim that already authorized -- and a `Sending` claim may have a
+            // live conditional PUT in flight. Recording that as a *confirmed*
+            // non-send would erase the outcome-unknown latch and take the
+            // unpublished-residue cleanup target with it.
+            //
+            // `Prepared -> NoSend` is unchanged, which is what keeps the
+            // `published_same_representation` arm below exact: its lookup
+            // predicate pins `claim.state = 0` (`Prepared`), so a `Contention`
+            // return can only ever follow a confirmed `NoSend`.
+            settle_abandoned_claim_locked(&tx, &mut sequence, claim).await?;
             classify_commit(tx.commit().await, "fragment write lineage refusal commit")?;
             if published_same_representation {
                 // The sibling finished the exact representation before this

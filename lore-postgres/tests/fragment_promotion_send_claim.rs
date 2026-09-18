@@ -2011,3 +2011,118 @@ async fn a_decisive_promotion_claim_contributes_a_cleanup_target_exactly_like_a_
         deleting.purge_targets()
     );
 }
+
+// ---------------------------------------------------------------------------
+// The lineage-refusal arm must settle by the claim's DURABLE state.
+//
+// Every other lineage-refusal case in this suite (and in
+// `domain_fragment_lifecycle.rs`) enters the arm from `Prepared`, which is the
+// one state for which a confirmed `NoSend` is correct. That is why the defect
+// survived. This case is the only one that enters it from `Sending`.
+// ---------------------------------------------------------------------------
+
+/// A claim that already authorized, whose head fence then moved, must settle
+/// `Ambiguous` -- never a confirmed `NoSend`.
+///
+/// A `Sending` claim may have a live conditional PUT in flight. Recording it as
+/// a confirmed non-send erases the outcome-unknown latch and drops the
+/// unpublished-residue cleanup target the deletion barrier still needs. The
+/// assertion is on durable state alone: no wall-clock margin, deliberately, so
+/// this case cannot join the two takeover/deadline cases in flaking under load.
+///
+/// KNOWN-UNPINNED, and deliberately not covered here: `begin_obliterate`
+/// against a hash carrying a live unexpired promotion claim. It stamps a fence
+/// with no `write_claim_barrier_locked` consult, which is the reachability path
+/// for this very arm. The fence bump below is a fixture standing in for that
+/// interaction, not a proof of it.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirmed_no_send() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    stage_hash(&coordinator, &hash, 0x36).await;
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_promotion(&hash, write_claim())
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("Staged head must admit promotion");
+    };
+    let claim = intent.write_claim().expect("promotion claim").clone();
+
+    // Authorization commits, so from here the claim is `Sending` and its send
+    // may have had an effect no later reader can rule out.
+    coordinator
+        .authorize_write_claim(&claim)
+        .await
+        .expect("authorize the promotion claim");
+    let authorized: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &claim.logical_request_id().as_slice(),
+                &claim.attempt_id().as_slice(),
+            ],
+        )
+        .await
+        .expect("read the claim after authorization")
+        .get(0);
+    assert_eq!(
+        authorized,
+        FragmentWriteClaimState::Sending.bits(),
+        "the case is meaningless unless the claim really reached Sending"
+    );
+
+    // The head fence moves under the live claim, exactly as a barrier-blind
+    // fence stamp would leave it. The claim is untouched and still Sending.
+    direct
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET last_fence = last_fence + 1 WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("move the head fence under the live claim");
+
+    let refusal = coordinator.authorize_write_claim(&claim).await;
+    assert!(
+        matches!(
+            refusal,
+            Err(DomainError::PreconditionRejected { ref reason, .. })
+                if reason == "fragment_write_lineage_moved"
+        ),
+        "a moved head fence must refuse the claim as lineage-moved, got {refusal:?}"
+    );
+
+    let settled: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &claim.logical_request_id().as_slice(),
+                &claim.attempt_id().as_slice(),
+            ],
+        )
+        .await
+        .expect("read the claim after the lineage refusal")
+        .get(0);
+    assert_ne!(
+        settled,
+        FragmentWriteClaimState::NoSend.bits(),
+        "THE PIN: a claim that already authorized must never be recorded as a CONFIRMED \
+         non-send -- that erases the outcome-unknown latch and drops the unpublished-residue \
+         cleanup target with it"
+    );
+    assert_eq!(
+        settled,
+        FragmentWriteClaimState::Ambiguous.bits(),
+        "the durable-state mapping is Sending -> Ambiguous, so the barrier holds until \
+         hard_not_after and the residue stays a cleanup target"
+    );
+}
