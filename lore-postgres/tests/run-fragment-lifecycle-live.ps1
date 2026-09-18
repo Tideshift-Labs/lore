@@ -215,6 +215,7 @@ $inventory = @(
         # coordinator. Kept as its own target rather than folded into
         # domain_fragment_lifecycle.rs, which is co-owned by a sibling lane.
         Cases         = @(
+            'authority_capture_requires_exact_current_eligible_epoch_evidence',
             'promotion_admission_carries_a_durable_claim_and_leaves_the_head_staged',
             'promotion_admission_is_fenced_for_every_non_staged_head_shape',
             'an_ambiguous_direct_write_claim_at_the_legacy_key_blocks_promotion_admission',
@@ -255,6 +256,27 @@ $inventory = @(
         Cases         = @('store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone')
     }
 )
+
+# Staging is compiled only on Unix. Keep its live cases owned here without
+# pretending a Windows catalog's absence is an executed staging test.
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Unix) {
+    $libraryTarget = $inventory | Where-Object { $_.Kind -eq 'lib' }
+    $libraryTarget.ExactPrefixes += 'store::immutable_store::tests::first_put_staged_'
+    $libraryTarget.Cases += 'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry'
+    $inventory += [pscustomobject]@{
+        Package = 'lore-postgres'
+        Kind = 'test'
+        Target = 'write_behind_staging_lifecycle'
+        Exact = $true
+        ExactPrefixes = @()
+        Cases = @(
+            'staged_commit_then_witness_capture_through_the_put_staged_sequence',
+            'crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_gets_a_fresh_epoch',
+            'crash_between_commit_staged_and_association_recovers_with_exactly_one_file',
+            'first_attempt_captures_staged_authority_and_binds_the_association'
+        )
+    }
+}
 
 # Cases whose captured stdout is evidence in its own right, not just failure
 # context. Every case runs with `--nocapture`, but the runner only echoes the
