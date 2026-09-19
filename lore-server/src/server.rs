@@ -31,7 +31,6 @@ use lore_base::runtime::runtime_with_settings;
 use lore_base::runtime::set_task_lifecycle_callback;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_postgres::domain::fragments::FragmentCellRetentionHandle;
-use lore_postgres::store::write_behind::WriteBehindSettings;
 use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
@@ -1220,8 +1219,13 @@ async fn configure_immutable_store_via_plugin(
                 // unlinking a probe file through the real finalization path, so
                 // a mount that cannot fsync a directory fails startup here
                 // rather than at the first acknowledged PUT.
+                // Only the staging half of the block is consumed here. The
+                // spool root the same block carries is the drain worker's
+                // input, and the drain worker is composed further out, so it is
+                // read there from this same settings reader rather than
+                // threaded through a store constructor that has no use for it.
                 let write_behind = postgres_write_behind_settings(settings)?
-                    .map(WriteBehindStage::open)
+                    .map(|composition| WriteBehindStage::open(composition.settings))
                     .transpose()
                     .map_err(|error| {
                         anyhow!("Failed to open the write-behind staging root: {error}")
@@ -1257,7 +1261,9 @@ async fn configure_immutable_store_via_plugin(
 /// Reads the same resolved immutable-store configuration as the two scheduler
 /// settings readers above, because the `write_behind` block lives beside
 /// `fragment_provider` and its enablement is decided in the same place.
-fn postgres_write_behind_settings(settings: &Settings) -> Result<Option<WriteBehindSettings>> {
+fn postgres_write_behind_settings(
+    settings: &Settings,
+) -> Result<Option<plugins::postgres::WriteBehindComposition>> {
     if settings.immutable_store.mode != "postgres" {
         return Ok(None);
     }

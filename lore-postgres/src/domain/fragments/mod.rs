@@ -203,6 +203,16 @@ pub use provider::FragmentDatabaseIdentityError;
 pub use provider::FragmentDirectPutOperation;
 pub use provider::FragmentDispatchRuntimeConfig;
 pub use provider::FragmentDispatchTls;
+// WP-114 CD-6's drain vocabulary, re-exported opaquely for the same reason
+// `FragmentCellRetentionHandle` is: the composition root that builds the drain
+// worker lives in `lore-server`, and the values have to cross this crate to
+// reach it. None of them names a `lore-object-dispatch` type, so re-exporting
+// them does not widen this crate's dependency graph — which is the boundary
+// rule `lore-server/Cargo.toml` records.
+pub use provider::FragmentDrainAttempt;
+pub use provider::FragmentDrainCapability;
+pub use provider::FragmentDrainReady;
+pub use provider::FragmentDrainSpoolReady;
 pub use provider::FragmentGetAttempt;
 pub use provider::FragmentGetExecution;
 pub use provider::FragmentGetOperation;

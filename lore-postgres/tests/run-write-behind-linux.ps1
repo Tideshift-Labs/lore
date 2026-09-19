@@ -20,6 +20,14 @@ zero tests, not a failure:
     (4, offline) plus `store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry`
     (1, `#[ignore]`, live).
 
+  * The `lore-server` LIB target's Unix-only write-behind case --
+    `plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_unix`, paired with a
+    differently-named `cfg(not(unix))` twin. This runner was scoped `-p lore-postgres` until
+    2026-09-19, so that arm sat outside it and had never been compiled on this rig. NOTE the
+    count differential CANNOT detect this one: the `lore-server` lib catalog is IDENTICAL on both
+    platforms, because each platform drops one case and gains the other. The discriminating
+    evidence is name presence, which is what this runner now pins.
+
 This runner executes all of them on Linux and reports ENUMERATED COUNTS, not just exit codes.
 
 .NOTES
@@ -242,15 +250,16 @@ function Get-Catalog {
     param(
         [Parameter(Mandatory)][ValidateSet('lib', 'test')][string]$Kind,
         [string]$Target,
+        [string]$Package = 'lore-postgres',
         [switch]$IgnoredOnly
     )
     $targetArgs = if ($Kind -eq 'lib') { @('--lib') } else { @('--test', $Target) }
-    $command = @('cargo', 'test', '-p', 'lore-postgres') + $targetArgs + @('--')
+    $command = @('cargo', 'test', '-p', $Package) + $targetArgs + @('--')
     if ($IgnoredOnly) { $command += '--ignored' }
     $command += '--list'
     $run = Invoke-InContainer -Command $command
     if ($run.ExitCode -ne 0) {
-        throw "catalog for lore-postgres/$Kind`:$Target failed:`n$($run.Output)"
+        throw "catalog for $Package/$Kind`:$Target failed:`n$($run.Output)"
     }
     return @(
         foreach ($line in ($run.Output -split "`r?`n")) {
@@ -435,6 +444,47 @@ try {
         -Enumerated $libCatalog.Count -Ran $libCounts.Ran -Passed $libCounts.Passed -Failed $libCounts.Failed `
         -Note "Windows enumerates $windowsLibEnumerated for the same tree; $($libCounts.Ignored) ignored"
     if ($libStatus -ne 'PASS') { Write-Warning "  FAIL`n$($libRun.Output)" } else { Write-Host "  PASS ($($libCounts.Passed) passed, $($libCounts.Ignored) ignored)" }
+
+    # ---- lore-server's Unix arm ------------------------------------------------------------
+    # This runner was scoped `-p lore-postgres`, so `lore-server`'s own Unix-gated case sat
+    # outside it and `the_same_write_behind_block_is_accepted_on_unix` had never been compiled on
+    # this rig until it was run by hand on 2026-09-19. The gap is invisible to a count
+    # differential -- the catalog was 1,842 on BOTH platforms, measured 2026-09-19 -- because the two
+    # arms are a `cfg(unix)`/`cfg(not(unix))` PAIR with DIFFERENT NAMES: each platform drops one
+    # case and gains the other, so the total never moves. The only evidence that discriminates is
+    # "was this exact name in the catalog", which is what the pin below asserts.
+    Write-Host 'Enumerating lore-server lib ...'
+    $serverCatalog = @(Get-Catalog -Kind 'lib' -Package 'lore-server')
+    $serverUnixOnly = 'plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_unix'
+    $serverNonUnixOnly = 'plugins::postgres::tests::an_otherwise_valid_write_behind_block_is_refused_at_boot_off_unix'
+    foreach ($suffix in @($serverUnixOnly)) {
+        $matched = @($serverCatalog | Where-Object { $_ -eq $suffix -or $_.EndsWith(":$suffix") })
+        if ($matched.Count -ne 1) {
+            throw "lore-server lib catalog must contain the Unix-only case '$suffix' exactly once; found $($matched.Count)"
+        }
+    }
+    # The negative half, and it is not decoration: it is what proves the positive pin above
+    # measured the PLATFORM rather than a case that happens to exist everywhere. If the
+    # `cfg(not(unix))` twin were also present here, the pair would not be a pair.
+    $nonUnixPresent = @($serverCatalog | Where-Object { $_ -eq $serverNonUnixOnly -or $_.EndsWith(":$serverNonUnixOnly") })
+    if ($nonUnixPresent.Count -ne 0) {
+        throw "the cfg(not(unix)) twin '$serverNonUnixOnly' must be ABSENT from a Linux catalog; found $($nonUnixPresent.Count)"
+    }
+    Write-Host "lore-server lib: Linux enumerates $($serverCatalog.Count); the Unix-only case is present and its non-Unix twin is absent."
+
+    Write-Host 'Running lore-server --lib ...'
+    $serverRun = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-server', '--lib')
+    $serverCounts = Read-TestCounts -Output $serverRun.Output
+    # `Ran -eq $serverCatalog.Count` for the same reason the `lore-postgres` lib row uses it: it
+    # accounts for every enumerated case (passed, failed or ignored) and so catches a
+    # filtered-to-zero run that an exit code alone would call green.
+    $serverStatus = if ($serverRun.ExitCode -eq 0 -and $serverCounts.Failed -eq 0 -and
+        $serverCounts.Passed -gt 0 -and $serverCounts.Ran -eq $serverCatalog.Count) { 'PASS' } else { 'FAIL' }
+    Add-Result -Target 'lore-server lib' -Case '(non-ignored)' -Status $serverStatus `
+        -Enumerated $serverCatalog.Count -Ran $serverCounts.Ran -Passed $serverCounts.Passed `
+        -Failed $serverCounts.Failed `
+        -Note "carries the cfg(unix) write-behind arm; $($serverCounts.Ignored) ignored"
+    if ($serverStatus -ne 'PASS') { Write-Warning "  FAIL`n$($serverRun.Output)" } else { Write-Host "  PASS ($($serverCounts.Passed) passed, $($serverCounts.Ignored) ignored)" }
 
     if ($IncludeCompileFail) {
         # Best-effort, and in a DIFFERENT crate: both compile-fail targets belong to

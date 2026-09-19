@@ -81,6 +81,7 @@ use crate::domain::fragments::FragmentAttemptLedger;
 use crate::domain::fragments::FragmentCellRetentionHandle;
 use crate::domain::fragments::FragmentDirectPutOperation;
 use crate::domain::fragments::FragmentDispatchRuntimeConfig;
+use crate::domain::fragments::FragmentDrainCapability;
 use crate::domain::fragments::FragmentGetAttempt;
 use crate::domain::fragments::FragmentGetOperation;
 use crate::domain::fragments::FragmentGetResponse;
@@ -469,6 +470,42 @@ impl PostgresImmutableStore {
             return Ok(None);
         };
         Ok(Some(provider.cell_retention()?))
+    }
+
+    /// WP-114 CD-6's drain capability, on the dispatch pool this store's
+    /// provider entry already opened.
+    ///
+    /// `None` on the legacy route: a cell with no governed fragment path opened
+    /// no dispatch pool, and the staged route is reachable only from the
+    /// coordinated PUT path, so there is nothing for a drain to promote.
+    ///
+    /// This is a pass-through and nothing more, and the returned capability is
+    /// opaque here for the same reason [`Self::cell_retention`]'s handle is:
+    /// naming what is inside it would mean depending on `lore-object-dispatch`,
+    /// which this crate must not do. `lore-server` composes the worker.
+    ///
+    /// `shared_spool_root` is the **object-dispatch spool root**, not this
+    /// store's staging root. Owner ruling D15 made those two separate
+    /// directories with separate configuration keys, and this signature is
+    /// where the distinction is easiest to lose: passing
+    /// `WriteBehindSettings::root` here would place foreign spool files inside
+    /// the tree contract C2's reclaimer enumerates. The store does not hold the
+    /// spool root and deliberately does not learn it — it arrives from
+    /// configuration at the composition root, which is the one place that reads
+    /// both keys and can tell them apart.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PostgresFragmentProviderActivationError`] when the pool is not
+    /// the runtime pool.
+    pub fn drain_capability(
+        &self,
+        shared_spool_root: std::path::PathBuf,
+    ) -> Result<Option<FragmentDrainCapability>, PostgresFragmentProviderActivationError> {
+        let FragmentLifecycleRoute::Coordinated { provider, .. } = &self.fragment_route else {
+            return Ok(None);
+        };
+        Ok(Some(provider.drain_capability(shared_spool_root)?))
     }
 
     /// Attach the staged cleanup collaborator without changing provider or

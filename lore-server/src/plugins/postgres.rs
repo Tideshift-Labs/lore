@@ -340,6 +340,19 @@ pub struct WriteBehindConfig {
     pub enabled: bool,
     /// The confined staging root. Must be absolute.
     pub root: Option<String>,
+    /// The object-dispatch shared spool root. Must be absolute, and must be a
+    /// **different tree** from `root`.
+    ///
+    /// These are two directories by owner ruling D15, not one path used twice.
+    /// The spool root is fed to `SpoolLayout::new` and consumed by
+    /// `bind_durable_put_body_from_ready`; `root` is ADR-00027's confined
+    /// staging root. Contract C2's orphan reclaimer joins the staging tree
+    /// against the epoch table and reclaims what the coordinator confirms
+    /// absent — and a spool file legitimately has no epoch row, so a shared or
+    /// nested tree would put in-flight upload bytes inside the reclaimer's
+    /// delete set. A shared tree would also add a foreign writer under the
+    /// directory `ConfinedRoot` fsyncs on every staged write.
+    pub spool_root: Option<String>,
     /// Staged bytes at or below which the tier leaves its elevated state.
     pub low_bytes: Option<u64>,
     /// Staged bytes at or above which it enters the elevated state.
@@ -358,6 +371,36 @@ pub struct WriteBehindConfig {
     pub drain_stale_after_millis: Option<u64>,
     /// How often the admission sampler refreshes its snapshot.
     pub sample_interval_millis: Option<u64>,
+}
+
+/// One enabled `[write_behind]` block, validated, as the two values composition
+/// actually needs.
+///
+/// The spool root is carried beside [`WriteBehindSettings`] rather than inside
+/// it because it is not the staging tier's property: `WriteBehindSettings` is
+/// `lore-postgres`'s type and governs the confined staging root only. D15 made
+/// the two roots distinct, so the one configuration block yields two values and
+/// this is the pair.
+#[derive(Debug, Clone)]
+pub(crate) struct WriteBehindComposition {
+    /// ADR-00027's confined staging root and its admission bounds.
+    pub(crate) settings: WriteBehindSettings,
+    /// The object-dispatch spool root the drain capability is minted against.
+    ///
+    /// Validated here and **not yet consumed by a production caller**, in the
+    /// same deliberate state step 1 left `_write_behind_stage` in: WP-122's
+    /// drain step is its only consumer, and inventing an interim one would mean
+    /// composing a drain worker that cannot promote. The validation is the
+    /// value this key has today — a cell whose two roots share a tree is
+    /// refused at boot rather than discovered when contract C2's reclaimer
+    /// deletes an in-flight upload. The `allow` comes off when the worker reads
+    /// it; until then a `dead_code` warning here would be noise about a state
+    /// that is intended and recorded.
+    #[allow(
+        dead_code,
+        reason = "consumed by WP-122's drain worker; validated and carried until then"
+    )]
+    pub(crate) shared_spool_root: PathBuf,
 }
 
 struct EnabledFragmentProviderConfig {
@@ -628,6 +671,31 @@ fn required_write_behind_u64(
     value.ok_or_else(|| write_behind_error(name, format!("requires {field}")))
 }
 
+/// One required, non-empty, absolute root, named by its own configuration key.
+///
+/// Absoluteness is required here rather than left to canonicalization. A
+/// relative path resolves against the process working directory, which is an
+/// operator-invisible input, so the same configuration would address different
+/// filesystems depending on how the unit was launched.
+fn required_write_behind_root(
+    name: &str,
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<PathBuf, PluginError> {
+    let root = value
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| write_behind_error(name, format!("requires a non-empty {field}")))?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err(write_behind_error(
+            name,
+            format!("requires an absolute {field}"),
+        ));
+    }
+    Ok(root)
+}
+
 /// Turn one enabled block into the store crate's own settings type, refusing
 /// every value the staging tier could not honour.
 ///
@@ -639,20 +707,34 @@ fn required_write_behind_u64(
 fn validated_write_behind_settings(
     name: &str,
     raw: &WriteBehindConfig,
-) -> Result<WriteBehindSettings, PluginError> {
-    let root = raw
-        .root
-        .as_deref()
-        .map(str::trim)
-        .filter(|root| !root.is_empty())
-        .ok_or_else(|| write_behind_error(name, "requires a non-empty root"))?;
-    let root = PathBuf::from(root);
-    // An absolute root is required here rather than left to canonicalization.
-    // A relative one resolves against the process working directory, which is
-    // an operator-invisible input, so the same configuration would stage into
-    // different filesystems depending on how the unit was launched.
-    if !root.is_absolute() {
-        return Err(write_behind_error(name, "requires an absolute root"));
+) -> Result<WriteBehindComposition, PluginError> {
+    let root = required_write_behind_root(name, "root", raw.root.as_deref())?;
+    let shared_spool_root =
+        required_write_behind_root(name, "spool_root", raw.spool_root.as_deref())?;
+    // D15: two directories, not one path used twice. Nesting is refused in both
+    // directions, not just equality, because the hazard is a shared *tree*: the
+    // C2 reclaimer enumerates the staging tree and deletes what the coordinator
+    // confirms absent, and a spool file legitimately carries no epoch row. A
+    // spool root under the staging root would therefore put in-flight upload
+    // bytes in the delete set; a staging root under the spool root puts
+    // acknowledged staged bytes under a foreign writer inside the tree
+    // `ConfinedRoot` fsyncs on every staged write.
+    //
+    // This is a lexical check on two absolute paths, and it is stated as such:
+    // it does not resolve symlinks, and two distinct spellings of one directory
+    // pass it. That is the same limit the absolute-path rule above accepts, and
+    // the alternative — resolving both roots at configuration parse time —
+    // performs filesystem work inside a pure validator on a rig that may not
+    // have either directory yet.
+    if root == shared_spool_root
+        || root.starts_with(&shared_spool_root)
+        || shared_spool_root.starts_with(&root)
+    {
+        return Err(write_behind_error(
+            name,
+            "requires root and spool_root to be separate trees, neither equal to nor nested \
+             inside the other",
+        ));
     }
 
     let low_bytes = required_write_behind_u64(name, "low_bytes", raw.low_bytes)?;
@@ -713,7 +795,7 @@ fn validated_write_behind_settings(
         }
     }
 
-    Ok(WriteBehindSettings {
+    let settings = WriteBehindSettings {
         root,
         watermarks: WriteBehindWatermarks {
             low_bytes,
@@ -726,6 +808,10 @@ fn validated_write_behind_settings(
         },
         drain_stale_after: Duration::from_millis(drain_stale_after),
         sample_interval: Duration::from_millis(sample_interval),
+    };
+    Ok(WriteBehindComposition {
+        settings,
+        shared_spool_root,
     })
 }
 
@@ -775,7 +861,7 @@ fn write_behind_requires_governed_route(
 fn enabled_write_behind_settings(
     name: &str,
     cfg: &PostgresStoreConfig,
-) -> Result<Option<WriteBehindSettings>, PluginError> {
+) -> Result<Option<WriteBehindComposition>, PluginError> {
     let Some(raw) = cfg
         .write_behind
         .as_ref()
@@ -783,10 +869,10 @@ fn enabled_write_behind_settings(
     else {
         return Ok(None);
     };
-    let settings = validated_write_behind_settings(name, raw)?;
+    let composition = validated_write_behind_settings(name, raw)?;
     write_behind_requires_governed_route(name, cfg)?;
     write_behind_platform_gate(name)?;
-    Ok(Some(settings))
+    Ok(Some(composition))
 }
 
 /// D13's boot-time half, on a host that can stage.
@@ -818,7 +904,7 @@ fn write_behind_platform_gate(name: &str) -> Result<(), PluginError> {
 /// immutable-store configuration every other scheduler reads.
 pub(crate) fn write_behind_settings(
     config: &toml::Value,
-) -> Result<Option<WriteBehindSettings>, PluginError> {
+) -> Result<Option<WriteBehindComposition>, PluginError> {
     let cfg = parse_config(PLUGIN_NAME, config)?;
     enabled_write_behind_settings(PLUGIN_NAME, &cfg)
 }
@@ -2675,6 +2761,21 @@ pool_max = 5
         }
     }
 
+    /// The object-dispatch spool root, on the same platform fork and for the
+    /// same reason as [`staging_root`].
+    ///
+    /// A sibling of the staging root rather than a child of it, because D15's
+    /// whole point is that these are two trees. A fixture that nested them
+    /// would be refused by the separateness check and every case built on it
+    /// would fail for the wrong reason.
+    fn spool_root() -> &'static str {
+        if cfg!(windows) {
+            "C:/lore/spool"
+        } else {
+            "/var/lib/loreserver/spool"
+        }
+    }
+
     /// A `[write_behind]` block with every required key present and coherent.
     fn valid_write_behind_block() -> String {
         format!(
@@ -2682,6 +2783,7 @@ pool_max = 5
 [write_behind]
 enabled = true
 root = "{}"
+spool_root = "{}"
 low_bytes = 1000
 high_bytes = 2000
 hard_bytes = 3000
@@ -2692,7 +2794,8 @@ min_free_bytes = 4096
 drain_stale_after_millis = 30000
 sample_interval_millis = 5000
 "#,
-            staging_root()
+            staging_root(),
+            spool_root()
         )
     }
 
@@ -2727,12 +2830,22 @@ enabled = true
     #[test]
     fn a_complete_write_behind_block_converts_to_the_stages_own_settings() {
         let raw = raw_write_behind(&valid_write_behind_block());
-        let settings = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
-            Ok(settings) => settings,
+        let composition = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+            Ok(composition) => composition,
             Err(error) => panic!("a complete block must validate: {error}"),
         };
+        let settings = composition.settings;
 
         assert_eq!(settings.root, PathBuf::from(staging_root()));
+        // D15's two roots arrive as two distinct values from the one block. The
+        // inequality is asserted as well as each value, because the failure this
+        // guards is not a wrong path but the SAME path arriving twice.
+        assert_eq!(
+            composition.shared_spool_root,
+            PathBuf::from(spool_root()),
+            "the spool root must be the spool_root key, not the staging root",
+        );
+        assert_ne!(composition.shared_spool_root, settings.root);
         assert_eq!(settings.watermarks.low_bytes, 1000);
         assert_eq!(settings.watermarks.high_bytes, 2000);
         assert_eq!(settings.watermarks.hard_bytes, 3000);
@@ -2769,11 +2882,12 @@ enabled = true
 
     /// There are no defaults, deliberately, so each omitted key must be refused
     /// **by name**. A refusal that does not name the key sends an operator
-    /// looking through a block of eleven of them.
+    /// looking through a block of twelve of them.
     #[test]
     fn every_omitted_write_behind_key_is_refused_by_its_own_name() {
-        const REQUIRED: [&str; 10] = [
+        const REQUIRED: [&str; 11] = [
             "root",
+            "spool_root",
             "low_bytes",
             "high_bytes",
             "hard_bytes",
@@ -2913,23 +3027,79 @@ staging_root = "/var/lib/loreserver/staging"
     #[test]
     fn a_relative_or_empty_staging_root_is_refused() {
         let complete = valid_write_behind_block();
-        for (root, expected) in [
-            ("staging", "absolute"),
-            ("", "non-empty"),
-            ("   ", "non-empty"),
+        // Both keys, because `spool_root` is a second absolute path with the
+        // same working-directory hazard and nothing about the first key's
+        // coverage carries over to it.
+        for (key, configured) in [("root", staging_root()), ("spool_root", spool_root())] {
+            for (root, expected) in [
+                ("staging", "absolute"),
+                ("", "non-empty"),
+                ("   ", "non-empty"),
+            ] {
+                let mutated = complete.replace(
+                    &format!(r#"{key} = "{configured}""#),
+                    &format!(r#"{key} = "{root}""#),
+                );
+                assert_ne!(
+                    mutated, complete,
+                    "the fixture must contain `{key} = \"{configured}\"`"
+                );
+                let raw = raw_write_behind(&mutated);
+                let error = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+                    Ok(_) => panic!("{key} `{root}` must be refused"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(
+                    error.contains(expected) && error.contains(key),
+                    "{key} `{root}` must be refused naming {expected} and {key}; got {error}"
+                );
+            }
+        }
+    }
+
+    /// Owner ruling D15: the staging root and the spool root are two separate
+    /// trees, and a configuration that merges them is refused rather than
+    /// honoured.
+    ///
+    /// This is a correctness refusal, not tidiness. Contract C2's orphan
+    /// reclaimer enumerates the staging tree and reclaims what the coordinator
+    /// confirms absent from the epoch table — and a spool file legitimately has
+    /// no epoch row. So a spool root at, or under, the staging root puts
+    /// in-flight upload bytes inside the reclaimer's delete set. The reverse
+    /// nesting is refused too, because it puts a foreign writer inside the tree
+    /// `ConfinedRoot` fsyncs on every staged write.
+    ///
+    /// All three shapes are covered — equal, spool under staging, staging under
+    /// spool — because an equality-only check passes the two that matter.
+    #[test]
+    fn a_spool_root_sharing_the_staging_tree_is_refused() {
+        let complete = valid_write_behind_block();
+        let nested_spool = format!("{}/spool", staging_root());
+        let parent_spool = match PathBuf::from(staging_root()).parent() {
+            Some(parent) => parent.to_string_lossy().replace('\\', "/"),
+            None => panic!("the staging-root fixture must have a parent"),
+        };
+        for (label, spool) in [
+            ("equal", staging_root().to_owned()),
+            ("spool under staging", nested_spool),
+            ("staging under spool", parent_spool),
         ] {
             let mutated = complete.replace(
-                &format!(r#"root = "{}""#, staging_root()),
-                &format!(r#"root = "{root}""#),
+                &format!(r#"spool_root = "{}""#, spool_root()),
+                &format!(r#"spool_root = "{spool}""#),
+            );
+            assert_ne!(
+                mutated, complete,
+                "the {label} case must mutate the fixture"
             );
             let raw = raw_write_behind(&mutated);
             let error = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
-                Ok(_) => panic!("root `{root}` must be refused"),
+                Ok(_) => panic!("a {label} spool root must be refused"),
                 Err(error) => error.to_string(),
             };
             assert!(
-                error.contains(expected),
-                "root `{root}` must be refused naming {expected}; got {error}"
+                error.contains("separate trees"),
+                "the {label} case must be refused naming the separateness rule; got {error}"
             );
         }
     }
@@ -3037,12 +3207,13 @@ bucket = "fragments"
     #[test]
     fn the_same_write_behind_block_is_accepted_on_unix() {
         let parsed = parsed_config_with(&valid_write_behind_block());
-        let settings = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
-            Ok(Some(settings)) => settings,
+        let composition = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
+            Ok(Some(composition)) => composition,
             Ok(None) => panic!("an enabled block must produce settings"),
             Err(error) => panic!("an enabled block must be accepted on Unix: {error}"),
         };
-        assert_eq!(settings.root, PathBuf::from(staging_root()));
+        assert_eq!(composition.settings.root, PathBuf::from(staging_root()));
+        assert_eq!(composition.shared_spool_root, PathBuf::from(spool_root()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
