@@ -74,8 +74,14 @@ impl Default for LoreVergen {
 
         let lib_version;
         let warning;
-        // golden path
-        if let Ok(name) = std::env::var("LORE_BUILD_VERSION_NAME") {
+        // golden path. An empty or whitespace-only value is treated as unset: a
+        // build site that passes `--build-arg LORE_REVISION=` would otherwise
+        // bake "{version}+" and claim nothing at all.
+        if let Some(name) = std::env::var("LORE_BUILD_VERSION_NAME")
+            .ok()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+        {
             lib_version = name;
             warning = vec![];
         }
@@ -101,6 +107,13 @@ impl vergen::AddCustomEntries<&str, String> for LoreVergen {
         _cargo_rerun_if_changed: &mut vergen::CargoRerunIfChanged,
         cargo_warning: &mut vergen::CargoWarning,
     ) -> Result<(), anyhow::Error> {
+        // Without this, cargo never re-runs the build script when only the
+        // version name changes, so a warm `target/` (e.g. the Docker build's
+        // cache mount) keeps baking in the PREVIOUS revision: the image is
+        // rebuilt at a new sha and the binary still reports the old one.
+        // Verified 2026-09-18 — a no-arg rebuild reported the prior sha.
+        println!("cargo:rerun-if-env-changed=LORE_BUILD_VERSION_NAME");
+
         if !self.warning.is_empty() {
             cargo_warning.extend_from_slice(&self.warning);
         }

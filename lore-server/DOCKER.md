@@ -14,11 +14,26 @@ telemetry integration, or replication is configured.
 From the repository root:
 
 ```sh
-docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver .
+docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver \
+  --build-arg LORE_REVISION="$(git rev-parse --short HEAD)" .
 ```
 
 The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
 using `scripts/server/make-certs.sh`.
+
+### Recording the revision
+
+`.dockerignore` excludes `.git/`, so the build container cannot read git metadata. Pass
+`--build-arg LORE_REVISION=<sha>` to record which source the image was built from. The value
+lands in two places:
+
+- `org.opencontainers.image.revision` on the image
+  (`docker inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' loreserver`)
+- the binary's own version string — `ServerInfoResponse.version`, the OTel resource and the
+  outbound user-agent all report `{crate version}+{LORE_REVISION}`.
+
+Omit the arg and both degrade to the literal `unknown` rather than claiming a revision. Every
+deploy path must pass it.
 
 ## Running
 
