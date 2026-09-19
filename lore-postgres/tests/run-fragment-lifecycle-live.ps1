@@ -305,6 +305,24 @@ $inventory = @(
             'crash_between_commit_staged_and_association_recovers_with_exactly_one_file',
             'first_attempt_captures_staged_authority_and_binds_the_association'
         )
+    },
+    # WP-122: `staged_drain_candidates`'s bounded plan query. NOT Unix-gated (pure SQL, no
+    # filesystem interaction), unlike its `write_behind_staging_lifecycle` sibling above.
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
+        Target        = 'fragment_drain_candidates'
+        Exact         = $true
+        ExactPrefixes = @()
+        Cases         = @(
+            'a_staged_head_with_a_matching_current_epoch_is_returned_with_every_accessor_equal_to_the_durable_row',
+            'a_remote_head_is_not_returned',
+            'preparing_stage_missing_and_tombstoned_heads_are_not_returned',
+            'a_staged_head_with_active_operation_stamped_by_a_real_promotion_is_not_returned',
+            'a_live_prepared_claim_blocks_the_hash_and_an_elapsed_one_releases_it',
+            'batch_bound_and_order_returns_exactly_n_in_ascending_hash_order',
+            'a_commit_staged_candidate_never_carries_a_provider_body_digest'
+        )
     }
 )
 

@@ -139,6 +139,15 @@ pub const MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH: u32 = 1_000;
 /// `MAX_LIFECYCLE_GENERATION_FANOUT` carries. Nothing has measured a real
 /// legacy fragment population, and nothing can until a staging cell exists.
 pub const MAX_FRAGMENT_BACKFILL_CURSOR_BATCH: u32 = 1_000;
+/// Largest drain-candidate batch one
+/// [`PostgresFragmentCoordinator::staged_drain_candidates`] call reads.
+///
+/// A bound, not a measurement, on the same footing as
+/// [`MAX_FRAGMENT_BACKFILL_CURSOR_BATCH`]. It is smaller than its siblings on
+/// purpose: each candidate this returns becomes a file read, a spool write, and
+/// a provider send in the drain worker, so a batch is a unit of real I/O rather
+/// than of row bookkeeping.
+pub const MAX_FRAGMENT_DRAIN_CANDIDATE_BATCH: u32 = 256;
 const MAX_FRAGMENT_WRITE_CLAIM_DURATION_MILLIS: u128 = i32::MAX as u128;
 
 /// How many members one staged reader lease may cover.
@@ -826,6 +835,145 @@ impl FragmentWriteClaimPruneBatch {
                 terminal_retention,
             )?,
         })
+    }
+}
+
+/// Bounded request for one drain-candidate enumeration pass.
+///
+/// A newtype rather than a bare `u32` for the same reason
+/// [`FragmentWriteClaimPruneBatch`] is one: the bound is validated once, at the
+/// caller's boundary, so no statement in this module can be reached with an
+/// unbounded `LIMIT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentDrainCandidateBatch {
+    max_candidates: i64,
+}
+
+impl FragmentDrainCandidateBatch {
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidInput`] outside
+    /// `1..=MAX_FRAGMENT_DRAIN_CANDIDATE_BATCH`. Zero is refused rather than
+    /// treated as "no work": a scheduler asking for nothing is a configuration
+    /// defect, and silently returning an empty batch would make it look like a
+    /// drained cell.
+    pub fn new(max_candidates: u32) -> Result<Self, DomainError> {
+        if !(1..=MAX_FRAGMENT_DRAIN_CANDIDATE_BATCH).contains(&max_candidates) {
+            return Err(DomainError::InvalidInput(format!(
+                "fragment drain candidate batch must be between 1 and {MAX_FRAGMENT_DRAIN_CANDIDATE_BATCH}"
+            )));
+        }
+        Ok(Self {
+            max_candidates: i64::from(max_candidates),
+        })
+    }
+}
+
+/// One `Staged` head a drain worker may attempt to promote.
+///
+/// **This is a plan row, not an admission.** It is read on a pooled connection
+/// with no row lock, so every field is a snapshot that
+/// [`PostgresFragmentCoordinator::begin_promotion`] revalidates under
+/// `FOR UPDATE` before anything is claimed. A candidate that has since been
+/// promoted, obliterated, or taken over is refused there, which is the only
+/// place that decision is safe to make.
+///
+/// # Why the manifest travels with the candidate
+///
+/// WP-122's contract C4 requires the promotion claim's body anchor to come from
+/// the coordinator's durable state rather than from the drain worker's own view
+/// of the filesystem. This row carries the exact staged epoch's durable
+/// manifest — [`Self::manifest_id`], [`Self::size_payload`],
+/// [`Self::size_content`], [`Self::payload_flags`], [`Self::decoded_hash`] — so
+/// the worker has something independent to check the bytes it reads against.
+///
+/// **The anchor this row can supply is a preimage commitment, not a stored
+/// digest**, and a reader must not mistake one for the other.
+/// `lore_fragment_epochs.provider_body_blake3` is populated only from a write
+/// claim, and the staging path (`commit_staged`) creates none, so
+/// [`Self::provider_body_blake3`] is `None` for every epoch a drain will ever
+/// see. What is durable is `manifest_id`, which the store derives over
+/// `(payload_flags, size_payload, size_content, hash, blake3(payload))`. Whether
+/// re-deriving that digest is an acceptable substitute for a stored
+/// `body_blake3` is an open WP-122 decision and is **not** settled by this type
+/// existing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentDrainCandidate {
+    hash: Vec<u8>,
+    epoch: i64,
+    last_fence: i64,
+    object_key: String,
+    manifest_id: Vec<u8>,
+    size_payload: u64,
+    size_content: i64,
+    decoded_hash: Vec<u8>,
+    payload_flags: i64,
+    provider_body_blake3: Option<[u8; 32]>,
+    provider_body_size: Option<u64>,
+}
+
+impl FragmentDrainCandidate {
+    /// The FragmentId.
+    pub fn hash(&self) -> &[u8] {
+        &self.hash
+    }
+
+    /// The staged epoch that was current when this row was read.
+    pub fn epoch(&self) -> i64 {
+        self.epoch
+    }
+
+    /// The head fence that was current when this row was read.
+    pub fn last_fence(&self) -> i64 {
+        self.last_fence
+    }
+
+    /// The staged epoch's stored key. `ConfinedRoot::resolve` requires it to be
+    /// byte-equal to the key derived from `(hash, epoch)`, so it is carried
+    /// rather than re-derived.
+    pub fn object_key(&self) -> &str {
+        &self.object_key
+    }
+
+    /// The staged epoch's durable manifest identity.
+    pub fn manifest_id(&self) -> &[u8] {
+        &self.manifest_id
+    }
+
+    /// Encoded size of the staged payload. Bounded by
+    /// [`MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES`] at read time.
+    pub fn size_payload(&self) -> u64 {
+        self.size_payload
+    }
+
+    /// Decoded size of the staged payload.
+    pub fn size_content(&self) -> i64 {
+        self.size_content
+    }
+
+    /// The decoded content hash the manifest names.
+    pub fn decoded_hash(&self) -> &[u8] {
+        &self.decoded_hash
+    }
+
+    /// Persisted payload flags, already masked by the store.
+    pub fn payload_flags(&self) -> i64 {
+        self.payload_flags
+    }
+
+    /// The durable provider-body digest, when one exists.
+    ///
+    /// **Always `None` on a staged epoch today** — see this type's header. It is
+    /// returned rather than omitted so a caller that gains one later does not
+    /// have to re-derive where it lives.
+    pub fn provider_body_blake3(&self) -> Option<&[u8; 32]> {
+        self.provider_body_blake3.as_ref()
+    }
+
+    /// The durable provider-body size, when one exists. Paired with
+    /// [`Self::provider_body_blake3`] by a table CHECK.
+    pub fn provider_body_size(&self) -> Option<u64> {
+        self.provider_body_size
     }
 }
 
@@ -4339,6 +4487,182 @@ impl PostgresFragmentCoordinator {
             .await
             .map_err(|error| DomainError::from_pg("staged lease release", error))?;
         Ok(())
+    }
+
+    /// Enumerate a bounded batch of `Staged` heads a drain worker may attempt.
+    ///
+    /// WP-122 L5. Nothing else in this module enumerates staged heads:
+    /// [`Self::resolve`], [`Self::resolve_query_matches`] and
+    /// [`Self::resolve_partition`] all take hashes as input, and
+    /// [`Self::begin_promotion`] needs a hash its caller already holds. This is
+    /// the only place that hash comes from.
+    ///
+    /// # This is a plan, and the distinction is load-bearing
+    ///
+    /// It runs unlocked on a pooled connection and takes no row lock, exactly
+    /// like [`Self::prune_terminal_write_claims`]'s plan query. Every row it
+    /// returns may be stale by the time the worker acts on it, and
+    /// [`Self::begin_promotion`] is the locked check that actually admits the
+    /// work: it re-reads the head `FOR UPDATE`, refuses a head that is no longer
+    /// `Staged`, and refuses an unknown active-operation token. **A caller must
+    /// not treat a candidate as permission to send anything.**
+    ///
+    /// # Fail-closed selection
+    ///
+    /// Four terms, and each excludes a row this enumeration cannot honestly
+    /// call a candidate:
+    ///
+    /// * `l.state = 3` — only a `Staged` head. Every other state is either not
+    ///   readable, already remote, or mid-delete.
+    /// * `l.active_operation IS NULL` — a head already owned by a promotion, an
+    ///   obliterate, or a direct write is not available. Without this term the
+    ///   same wedged head would occupy a slot on every pass, which is the
+    ///   head-of-line shape [`Self::prune_terminal_write_claims`]'s anti-join
+    ///   exists to remove.
+    /// * The epoch join is the canonical readability join used by
+    ///   [`Self::resolve`]: the epoch must be the head's current one, carry the
+    ///   head's exact manifest, be `Staged` authority, and be current-eligible.
+    ///   A quarantined or purged epoch is not drainable.
+    /// * The write-claim anti-join excludes a hash carrying a live send barrier,
+    ///   mirroring `write_claim_barrier_for_prune`'s arms exactly — `Prepared`
+    ///   blocks on `send_not_after`, `Sending` and `Ambiguous` on
+    ///   `hard_not_after`. A hash whose previous attempt is still live would be
+    ///   refused by `create_write_claim_locked` anyway, so selecting it would
+    ///   burn a slot to learn something this query already knows.
+    ///
+    /// **One residual, recorded rather than closed.** The order is by `hash`,
+    /// so a candidate that is selectable here but permanently unclaimable at
+    /// `begin_promotion` would hold its slot on every pass. The two shapes that
+    /// can do that — an owned head and a barriered hash — are both excluded
+    /// above; a third would need a refusal in `begin_promotion` that this
+    /// predicate does not model, and whoever adds one owes this query a matching
+    /// term.
+    ///
+    /// # Statement shape, and the index this does NOT have
+    ///
+    /// Every state, authority and disposition test is an **SQL literal**, and
+    /// must stay that way. `state = $n` returns the same rows, passes every
+    /// test, and silently loses the planner's ability to prove implication with
+    /// a partial index — which is what INV-FJ measured on this crate's three
+    /// other literal sites. The batch bound is the only bound parameter. The
+    /// anti-join's `state IN (0, 1, 3)` is already matched by
+    /// `lore_fragment_write_claims_barrier`.
+    ///
+    /// **The outer predicate has no index, deliberately, and this plans as a
+    /// sequential scan of `lore_fragment_lifecycle` on every tick.** The index
+    /// it wants is
+    /// `(hash) WHERE state = 3 AND active_operation IS NULL`, which would also
+    /// serve the `ORDER BY hash` and let the walk stop at `LIMIT` instead of
+    /// sorting every staged head. It is not installed here because
+    /// `FRAGMENT_SCHEMA` is versioned: adding it means a new numbered migration
+    /// and a raise of `FRAGMENT_SCHEMA_VERSION`, and `enable_lifecycle` requires
+    /// an **exact** version match, so the bump would stop every
+    /// already-provisioned cell at the previous revision from enabling lifecycle
+    /// routing until the new file is applied. That is a cutover decision, not a
+    /// query decision. The literals above are what make it a one-line change
+    /// when it is taken; nothing here has to move.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::Internal`] when a returned row violates a column
+    /// CHECK this code relies on — a manifest wider or narrower than 32 bytes,
+    /// or a staged payload over [`MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES`]. That is
+    /// damage rather than a race, and the whole batch is refused rather than the
+    /// row skipped: skipping would hide a corrupt epoch behind a plausible
+    /// shorter batch.
+    pub async fn staged_drain_candidates(
+        &self,
+        batch: FragmentDrainCandidateBatch,
+    ) -> Result<Vec<FragmentDrainCandidate>, DomainError> {
+        let client = self.checkout().await?;
+        let rows = client
+            .query(
+                "SELECT l.hash AS hash, \
+                        l.current_epoch AS epoch, \
+                        l.last_fence AS last_fence, \
+                        e.object_key AS object_key, \
+                        e.manifest_id AS manifest_id, \
+                        e.size_payload AS size_payload, \
+                        e.size_content AS size_content, \
+                        e.decoded_hash AS decoded_hash, \
+                        e.payload_flags AS payload_flags, \
+                        e.provider_body_blake3 AS provider_body_blake3, \
+                        e.provider_body_size AS provider_body_size \
+                   FROM lore_fragment_lifecycle AS l \
+                   JOIN lore_fragment_epochs AS e \
+                     ON e.hash = l.hash \
+                    AND e.epoch = l.current_epoch \
+                    AND e.manifest_id = l.manifest_id \
+                  WHERE l.state = 3 \
+                    AND l.active_operation IS NULL \
+                    AND e.authority = 1 \
+                    AND e.disposition = 0 \
+                    AND NOT EXISTS ( \
+                        SELECT 1 FROM lore_fragment_write_claims AS active \
+                         WHERE active.hash = l.hash \
+                           AND active.state IN (0, 1, 3) \
+                           AND (CASE WHEN active.state = 0 \
+                                     THEN active.send_not_after \
+                                     ELSE active.hard_not_after END) \
+                               > clock_timestamp()) \
+                  ORDER BY l.hash \
+                  LIMIT $1",
+                &[&batch.max_candidates],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("fragment drain candidates", error))?;
+
+        let mut candidates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let manifest_id: Vec<u8> = row.get("manifest_id");
+            if manifest_id.len() != 32 {
+                return Err(DomainError::Internal(
+                    "a staged epoch manifest identity is not 32 bytes".to_owned(),
+                ));
+            }
+            let size_payload = u64::try_from(row.get::<_, i64>("size_payload")).map_err(|_| {
+                DomainError::Internal("a staged epoch payload size is negative".to_owned())
+            })?;
+            if size_payload > MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES {
+                return Err(DomainError::Internal(format!(
+                    "a staged epoch payload exceeds {MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES} bytes"
+                )));
+            }
+            let provider_body_blake3 = row
+                .get::<_, Option<Vec<u8>>>("provider_body_blake3")
+                .map(|digest| {
+                    <[u8; 32]>::try_from(digest.as_slice()).map_err(|_| {
+                        DomainError::Internal(
+                            "a staged epoch provider body digest is not 32 bytes".to_owned(),
+                        )
+                    })
+                })
+                .transpose()?;
+            let provider_body_size = row
+                .get::<_, Option<i64>>("provider_body_size")
+                .map(|size| {
+                    u64::try_from(size).map_err(|_| {
+                        DomainError::Internal(
+                            "a staged epoch provider body size is negative".to_owned(),
+                        )
+                    })
+                })
+                .transpose()?;
+            candidates.push(FragmentDrainCandidate {
+                hash: row.get("hash"),
+                epoch: row.get("epoch"),
+                last_fence: row.get("last_fence"),
+                object_key: row.get("object_key"),
+                manifest_id,
+                size_payload,
+                size_content: row.get("size_content"),
+                decoded_hash: row.get("decoded_hash"),
+                payload_flags: row.get("payload_flags"),
+                provider_body_blake3,
+                provider_body_size,
+            });
+        }
+        Ok(candidates)
     }
 
     // -----------------------------------------------------------------------
