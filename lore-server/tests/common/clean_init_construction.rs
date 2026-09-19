@@ -56,7 +56,7 @@ async fn normal_construction_attests_clean_namespace_before_dispatch_setup() {
             inventory,
             store.identity().clone(),
         );
-        let error = match connect_immutable_store(&config, Some(activation)).await {
+        let error = match connect_immutable_store(&config, Some(activation), None).await {
             Ok(_) => panic!("fixture's missing dispatch CA must prevent activation"),
             Err(error) => error.to_string(),
         };
@@ -95,7 +95,7 @@ async fn normal_construction_attests_clean_namespace_before_dispatch_setup() {
         inventory,
         store.identity().clone(),
     );
-    let error = match connect_immutable_store(base, Some(activation)).await {
+    let error = match connect_immutable_store(base, Some(activation), None).await {
         Ok(_) => panic!("damaged clean fence must prevent startup"),
         Err(error) => error.to_string(),
     };
@@ -159,7 +159,7 @@ async fn clean_initialized_normal_provider_upload_query_read_and_grants_are_live
         domain.identity().clone(),
     );
     let immutable = Arc::new(
-        connect_immutable_store(&config, Some(activation))
+        connect_immutable_store(&config, Some(activation), None)
             .await
             .expect("normal provider construction must fully succeed"),
     );

@@ -191,7 +191,10 @@ fn lifecycle_is_composed_and_proven_ready_before_provider_activation() {
     let legacy = between(
         startup,
         "} else {",
-        "(immutable_store, cell_retention_handle, configured_domain)\n        };",
+        // The tuple gained WP-114 CD-7's staging handle, so it is now formatted
+        // across lines. The pin follows the shape rather than relaxing to a
+        // substring that would also match the enabled arm above it.
+        "                configured_domain,\n            )\n        };",
     );
     assert_precedes(
         legacy,

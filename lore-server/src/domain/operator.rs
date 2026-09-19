@@ -595,7 +595,7 @@ impl DomainOperatorContext {
             )
         })?;
         let immutable: Arc<dyn ImmutableStore> = Arc::new(
-            connect_immutable_store(&immutable_config, None)
+            connect_immutable_store(&immutable_config, None, None)
                 .await
                 .map_err(|error| anyhow!("Failed to open the cell's immutable store: {error}"))?,
         );

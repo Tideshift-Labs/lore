@@ -20,6 +20,7 @@
 //! already parses the config so misconfiguration surfaces early.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -49,6 +50,9 @@ use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
+use lore_postgres::store::write_behind::WriteBehindSettings;
+use lore_postgres::store::write_behind::WriteBehindStage;
+use lore_postgres::store::write_behind::WriteBehindWatermarks;
 use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -110,6 +114,16 @@ pub struct PostgresStoreConfig {
     /// Absence and `enabled = false` leave the exact legacy route active.
     #[serde(default)]
     pub fragment_provider: Option<FragmentProviderConfig>,
+    /// Optional WP-114 CD-7 write-behind staging tier (ADR-00027).
+    ///
+    /// Absence and `enabled = false` leave every PUT on the synchronous
+    /// object-store path, which is also D11's fallback when an enabled tier is
+    /// unavailable. Consumed only by the immutable store; the field sits on the
+    /// shared connection shape for the same reason `fragment_in_flight_puts`
+    /// does, so an operator who puts it under the mutable or lock section is
+    /// told the value is impossible rather than that it was ignored.
+    #[serde(default)]
+    pub write_behind: Option<WriteBehindConfig>,
     /// CR-031's bounded concurrent in-flight put count for the WP-118 fragment
     /// lifecycle provider seam.
     ///
@@ -304,6 +318,46 @@ impl fmt::Debug for FragmentProviderConfig {
             )
             .finish()
     }
+}
+
+/// Raw optional WP-114 CD-7 write-behind staging configuration.
+///
+/// Every field but `enabled` stays optional at deserialization so an explicitly
+/// disabled block needs only `enabled = false`.
+/// [`enabled_write_behind_settings`] converts an enabled block into the store
+/// crate's own [`WriteBehindSettings`] before any construction.
+///
+/// **There are no defaults for the thresholds, deliberately.** A defaulted
+/// watermark is a guess about a filesystem this process has never seen, and the
+/// consequence of guessing high is the condition C2 exists to prevent: a root
+/// driven to 100% with acknowledged bytes on it. `root` has no default for the
+/// reason ADR-00027 gives — a defaulted path stages onto a container's ephemeral
+/// layer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteBehindConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// The confined staging root. Must be absolute.
+    pub root: Option<String>,
+    /// Staged bytes at or below which the tier leaves its elevated state.
+    pub low_bytes: Option<u64>,
+    /// Staged bytes at or above which it enters the elevated state.
+    pub high_bytes: Option<u64>,
+    /// Staged bytes at or above which new fragments are refused.
+    pub hard_bytes: Option<u64>,
+    /// Staged fragment-count counterparts of the three byte thresholds.
+    pub low_count: Option<u64>,
+    pub high_count: Option<u64>,
+    pub hard_count: Option<u64>,
+    /// Free space below which new fragments are refused regardless of
+    /// occupancy, so a filesystem shared with anything else cannot be driven to
+    /// zero.
+    pub min_free_bytes: Option<u64>,
+    /// A drain heartbeat older than this selects direct fallback.
+    pub drain_stale_after_millis: Option<u64>,
+    /// How often the admission sampler refreshes its snapshot.
+    pub sample_interval_millis: Option<u64>,
 }
 
 struct EnabledFragmentProviderConfig {
@@ -553,6 +607,222 @@ fn enabled_fragment_provider_config(
     }))
 }
 
+/// Upper bound on both write-behind duration knobs.
+///
+/// One hour, and not a tuning opinion. Each value decides how long the cell may
+/// go on believing a stale picture of its own staging root, so a number large
+/// enough to be a unit mistake — a milliseconds field filled in as if it were
+/// seconds — is refused rather than honoured for the next eleven days.
+const MAX_WRITE_BEHIND_INTERVAL_MILLIS: u64 = 3_600_000;
+
+fn write_behind_error(name: &str, message: impl Into<String>) -> PluginError {
+    let message: String = message.into();
+    config_error(name, format!("enabled write_behind {message}"))
+}
+
+fn required_write_behind_u64(
+    name: &str,
+    field: &'static str,
+    value: Option<u64>,
+) -> Result<u64, PluginError> {
+    value.ok_or_else(|| write_behind_error(name, format!("requires {field}")))
+}
+
+/// Turn one enabled block into the store crate's own settings type, refusing
+/// every value the staging tier could not honour.
+///
+/// Deliberately separate from [`enabled_write_behind_settings`]'s platform and
+/// coupling gates, and deliberately reached *before* them, so that every content
+/// refusal below is exercised on the development rig as well as on the hosts
+/// that can actually stage. A check that only ever runs on Unix is a check this
+/// Windows workspace never sees fail.
+fn validated_write_behind_settings(
+    name: &str,
+    raw: &WriteBehindConfig,
+) -> Result<WriteBehindSettings, PluginError> {
+    let root = raw
+        .root
+        .as_deref()
+        .map(str::trim)
+        .filter(|root| !root.is_empty())
+        .ok_or_else(|| write_behind_error(name, "requires a non-empty root"))?;
+    let root = PathBuf::from(root);
+    // An absolute root is required here rather than left to canonicalization.
+    // A relative one resolves against the process working directory, which is
+    // an operator-invisible input, so the same configuration would stage into
+    // different filesystems depending on how the unit was launched.
+    if !root.is_absolute() {
+        return Err(write_behind_error(name, "requires an absolute root"));
+    }
+
+    let low_bytes = required_write_behind_u64(name, "low_bytes", raw.low_bytes)?;
+    let high_bytes = required_write_behind_u64(name, "high_bytes", raw.high_bytes)?;
+    let hard_bytes = required_write_behind_u64(name, "hard_bytes", raw.hard_bytes)?;
+    let low_count = required_write_behind_u64(name, "low_count", raw.low_count)?;
+    let high_count = required_write_behind_u64(name, "high_count", raw.high_count)?;
+    let hard_count = required_write_behind_u64(name, "hard_count", raw.hard_count)?;
+    let min_free_bytes = required_write_behind_u64(name, "min_free_bytes", raw.min_free_bytes)?;
+
+    // The hysteresis latch is set at the high watermark and cleared at the low
+    // one. Ordering them wrongly does not fail anywhere in the admission layer;
+    // it just produces a latch that can never clear, which reads as a cell
+    // permanently in direct fallback with no error anywhere to explain it.
+    if low_bytes > high_bytes || high_bytes > hard_bytes {
+        return Err(write_behind_error(
+            name,
+            "requires low_bytes <= high_bytes <= hard_bytes",
+        ));
+    }
+    if low_count > high_count || high_count > hard_count {
+        return Err(write_behind_error(
+            name,
+            "requires low_count <= high_count <= hard_count",
+        ));
+    }
+    // A zero hard ceiling refuses every PUT the moment occupancy is observed at
+    // all, because the comparison is `>=`. A zero free-space floor disables the
+    // shared-filesystem protection outright. Neither is a configuration anyone
+    // means.
+    if hard_bytes == 0 || hard_count == 0 || min_free_bytes == 0 {
+        return Err(write_behind_error(
+            name,
+            "requires positive hard_bytes, hard_count and min_free_bytes",
+        ));
+    }
+
+    let drain_stale_after = required_write_behind_u64(
+        name,
+        "drain_stale_after_millis",
+        raw.drain_stale_after_millis,
+    )?;
+    let sample_interval =
+        required_write_behind_u64(name, "sample_interval_millis", raw.sample_interval_millis)?;
+    for (field, value) in [
+        ("drain_stale_after_millis", drain_stale_after),
+        ("sample_interval_millis", sample_interval),
+    ] {
+        // The lower bound is load-bearing rather than tidy: the sampler builds
+        // a `tokio::time::interval` from this value, and that constructor
+        // panics on a zero period. A refusal here is the difference between a
+        // configuration error and a panicking background task.
+        if !(1..=MAX_WRITE_BEHIND_INTERVAL_MILLIS).contains(&value) {
+            return Err(write_behind_error(
+                name,
+                format!("requires {field} between 1 and {MAX_WRITE_BEHIND_INTERVAL_MILLIS}"),
+            ));
+        }
+    }
+
+    Ok(WriteBehindSettings {
+        root,
+        watermarks: WriteBehindWatermarks {
+            low_bytes,
+            high_bytes,
+            hard_bytes,
+            low_count,
+            high_count,
+            hard_count,
+            min_free_bytes,
+        },
+        drain_stale_after: Duration::from_millis(drain_stale_after),
+        sample_interval: Duration::from_millis(sample_interval),
+    })
+}
+
+/// Refuse a staging tier that nothing would ever consult.
+///
+/// The staged route lives entirely inside the coordinated PUT path: the branch
+/// at `lore-postgres/src/store/immutable_store.rs:1558` is reached only with a
+/// coordinator and a provider entry in hand. A legacy cell — `fragment_provider`
+/// absent or `enabled = false` — would therefore attach a proven staging root,
+/// run its sampler, publish its admission facet, and never stage a single byte.
+///
+/// That is the failure shape this package exists to refuse rather than discover:
+/// inert wiring that reports healthy. It is the same refusal
+/// [`crate::fragment_retention::CellRetentionWiringError::NoDispatchPool`] makes
+/// for the same reason.
+fn write_behind_requires_governed_route(
+    name: &str,
+    cfg: &PostgresStoreConfig,
+) -> Result<(), PluginError> {
+    if cfg
+        .fragment_provider
+        .as_ref()
+        .is_some_and(|fragment_provider| fragment_provider.enabled)
+    {
+        return Ok(());
+    }
+    Err(write_behind_error(
+        name,
+        "requires an enabled fragment_provider; the staged route is reachable only from the \
+         coordinated PUT path, so a legacy cell would run a staging tier that never stages",
+    ))
+}
+
+/// The reviewed staging settings for this cell, or `None` when no staging tier
+/// should be opened.
+///
+/// `None` covers both inert cases with one answer: no `write_behind` block, and
+/// one that is `enabled = false`. Either leaves every PUT on the synchronous
+/// object-store path.
+///
+/// # Refusal order
+///
+/// Content first, then the governed-route coupling, then the platform. The
+/// platform gate is last on purpose. It is unconditional on a non-Unix host, so
+/// putting it first would make every content refusal below unreachable — and
+/// therefore untestable — on the rig this fork is developed on.
+fn enabled_write_behind_settings(
+    name: &str,
+    cfg: &PostgresStoreConfig,
+) -> Result<Option<WriteBehindSettings>, PluginError> {
+    let Some(raw) = cfg
+        .write_behind
+        .as_ref()
+        .filter(|write_behind| write_behind.enabled)
+    else {
+        return Ok(None);
+    };
+    let settings = validated_write_behind_settings(name, raw)?;
+    write_behind_requires_governed_route(name, cfg)?;
+    write_behind_platform_gate(name)?;
+    Ok(Some(settings))
+}
+
+/// D13's boot-time half, on a host that can stage.
+///
+/// The compile-time half is `ConfinedRoot`'s own `cfg(not(unix))` module, which
+/// refuses every operation. This gate is a `cfg` fork rather than a runtime
+/// probe for the reason D13 gives: the difference is in directory fsync and
+/// rename semantics, which a probe would have to *perform* to discover, on the
+/// root it is deciding whether to trust.
+#[cfg(unix)]
+fn write_behind_platform_gate(_name: &str) -> Result<(), PluginError> {
+    Ok(())
+}
+
+/// D13's boot-time half, on a host that cannot.
+///
+/// Without it an operator configures a staging tier, boots, sees a healthy
+/// process, and learns the truth one failed PUT at a time.
+#[cfg(not(unix))]
+fn write_behind_platform_gate(name: &str) -> Result<(), PluginError> {
+    Err(write_behind_error(
+        name,
+        "requires a Unix host; write-behind staging depends on directory fsync and rename \
+         semantics this platform does not provide",
+    ))
+}
+
+/// The reviewed staging settings for this cell, read from the same resolved
+/// immutable-store configuration every other scheduler reads.
+pub(crate) fn write_behind_settings(
+    config: &toml::Value,
+) -> Result<Option<WriteBehindSettings>, PluginError> {
+    let cfg = parse_config(PLUGIN_NAME, config)?;
+    enabled_write_behind_settings(PLUGIN_NAME, &cfg)
+}
+
 /// Validates CR-031's in-flight put configuration through the same type the
 /// seam itself takes, so the startup check and the runtime bound cannot drift.
 fn validate_fragment_put_bound(
@@ -667,6 +937,12 @@ fn parse_config(name: &str, config: &toml::Value) -> Result<PostgresStoreConfig,
     // connection error instead of the admission message.
     validate_fragment_charge_bound(name, &parsed)?;
     let _ = enabled_fragment_provider_config(name, &parsed)?;
+    // Beside its sibling, and on the boot path rather than in `validate_config`
+    // alone, for the reason this function's own documentation gives. The field
+    // sits on the shared connection shape, so an operator who puts an enabled
+    // `write_behind` block under the mutable or lock section is refused here
+    // rather than told nothing and ignored.
+    let _ = enabled_write_behind_settings(name, &parsed)?;
     Ok(parsed)
 }
 
@@ -865,9 +1141,17 @@ pub(crate) async fn connect_clean_namespace_inspector(
 /// Both normal server startup and offline maintenance use this path so config
 /// fallback, TLS, object-store settings, and the standard AWS credential chain
 /// cannot drift between them.
+///
+/// `write_behind` is the already-opened staging tier, or `None` for every cell
+/// and every caller that composes none. It arrives as a parameter rather than
+/// being opened here because the composing server must keep its own handle:
+/// `note_pending_staged` and `note_drain_heartbeat` have to be driven
+/// repeatedly from a recurring task, and a stage this function opened and gave
+/// away would leave that half with no owner.
 pub(crate) async fn connect_immutable_store(
     config: &toml::Value,
     fragment_activation: Option<FragmentProviderActivation>,
+    write_behind: Option<Arc<WriteBehindStage>>,
 ) -> Result<PostgresImmutableStore, PluginError> {
     let plugin_name = PLUGIN_NAME;
     let cfg = parse_config(plugin_name, config)?;
@@ -931,6 +1215,18 @@ pub(crate) async fn connect_immutable_store(
         })?;
     let Some((fragment_provider, activation, expected_database_identity)) = fragment_activation
     else {
+        // Unreachable through the configuration path — an enabled
+        // `write_behind` block requires an enabled `fragment_provider`, and an
+        // enabled provider with no activation is refused above — and refused
+        // rather than assumed away. Attaching a stage here would give the cell
+        // a proven staging root, a running sampler and a healthy-looking
+        // admission facet on a route that never stages.
+        if write_behind.is_some() {
+            return Err(config_error(
+                plugin_name,
+                "write_behind cannot be attached to the legacy fragment route",
+            ));
+        }
         let capability = store
             .fragment_write_capability_readiness()
             .await
@@ -1071,6 +1367,15 @@ pub(crate) async fn connect_immutable_store(
         statement_timeout: fragment_provider.dispatch_statement_timeout,
         lock_timeout: fragment_provider.dispatch_lock_timeout,
         tls: FragmentDispatchTls::PinnedRootCa(dispatch_ca),
+    };
+
+    // Attached before the provider route is activated, so no PUT can observe a
+    // coordinated store whose staging tier is still half-composed.
+    // `with_write_behind` sets the staged-epoch cleanup collaborator from the
+    // same `Arc`, which is why there is one call and not two.
+    let store = match write_behind {
+        Some(stage) => store.with_write_behind(stage),
+        None => store,
     };
 
     store
@@ -1254,7 +1559,7 @@ impl ImmutableStorePluginFactory for PostgresImmutableStorePluginFactory {
         // at most one runtime core is handed off at a time.
         #[allow(clippy::disallowed_methods)]
         let store = tokio::task::block_in_place(|| {
-            runtime().block_on(Box::pin(connect_immutable_store(config, None)))
+            runtime().block_on(Box::pin(connect_immutable_store(config, None, None)))
         })?;
 
         Ok(Arc::new(store))
@@ -1642,7 +1947,7 @@ bucket = "fragments"
             let immutable = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map(|runtime| runtime.block_on(connect_immutable_store(&config, None)));
+                .map(|runtime| runtime.block_on(connect_immutable_store(&config, None, None)));
             match immutable {
                 Ok(Err(error)) => assert!(
                     format!("{error}").contains(ADMISSION_REFUSAL),
@@ -1758,7 +2063,7 @@ bucket = "fragments"
             let immutable = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map(|runtime| runtime.block_on(connect_immutable_store(&config, None)));
+                .map(|runtime| runtime.block_on(connect_immutable_store(&config, None, None)));
             match immutable {
                 Ok(Err(error)) => assert!(
                     format!("{error}").contains(CHARGE_ADMISSION_REFUSAL),
@@ -2344,6 +2649,400 @@ pool_max = 5
             parsed.domain_pool_max, 4,
             "domain_pool_max must not inherit pool_max"
         );
+    }
+
+    // WP-114 CD-7 / WP-122 L5: the `[write_behind]` block.
+    //
+    // Every case below is executed on both platforms except the two that name a
+    // platform in their own title. That is why `enabled_write_behind_settings`
+    // runs its content and coupling checks *before* D13's Unix gate: with the
+    // gate first, none of this would ever run on the rig this fork is written
+    // on.
+
+    /// An absolute path on the host running the test.
+    ///
+    /// The `cfg!(windows)` fork is load-bearing, not cosmetic, and it is the
+    /// same trap that made all seven of `lore-fragment-provider`'s drain cases
+    /// fail on Linux while passing here: a `C:\` literal is not `is_absolute()`
+    /// on Linux, and a `/var/...` literal is not `is_absolute()` on Windows, so
+    /// a single literal makes the valid fixture invalid on one of the two
+    /// platforms — and production is the Linux one.
+    fn staging_root() -> &'static str {
+        if cfg!(windows) {
+            "C:/lore/staging"
+        } else {
+            "/var/lib/loreserver/staging"
+        }
+    }
+
+    /// A `[write_behind]` block with every required key present and coherent.
+    fn valid_write_behind_block() -> String {
+        format!(
+            r#"
+[write_behind]
+enabled = true
+root = "{}"
+low_bytes = 1000
+high_bytes = 2000
+hard_bytes = 3000
+low_count = 10
+high_count = 20
+hard_count = 30
+min_free_bytes = 4096
+drain_stale_after_millis = 30000
+sample_interval_millis = 5000
+"#,
+            staging_root()
+        )
+    }
+
+    /// The raw block, parsed out of a config that also enables a provider, so
+    /// the coupling check has something to find.
+    fn parsed_config_with(write_behind: &str) -> PostgresStoreConfig {
+        let text = format!(
+            r#"
+url = "postgres://localhost/lore"
+[object_store]
+bucket = "fragments"
+[fragment_provider]
+enabled = true
+{write_behind}
+"#
+        );
+        match toml::from_str::<toml::Value>(&text).and_then(toml::Value::try_into) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("fixture config must deserialize: {error}"),
+        }
+    }
+
+    fn raw_write_behind(write_behind: &str) -> WriteBehindConfig {
+        match parsed_config_with(write_behind).write_behind {
+            Some(raw) => raw,
+            None => panic!("fixture must carry a write_behind block"),
+        }
+    }
+
+    /// The content half, end to end: a complete block becomes exactly the
+    /// settings the staging tier takes, with no value invented or rounded.
+    #[test]
+    fn a_complete_write_behind_block_converts_to_the_stages_own_settings() {
+        let raw = raw_write_behind(&valid_write_behind_block());
+        let settings = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+            Ok(settings) => settings,
+            Err(error) => panic!("a complete block must validate: {error}"),
+        };
+
+        assert_eq!(settings.root, PathBuf::from(staging_root()));
+        assert_eq!(settings.watermarks.low_bytes, 1000);
+        assert_eq!(settings.watermarks.high_bytes, 2000);
+        assert_eq!(settings.watermarks.hard_bytes, 3000);
+        assert_eq!(settings.watermarks.low_count, 10);
+        assert_eq!(settings.watermarks.high_count, 20);
+        assert_eq!(settings.watermarks.hard_count, 30);
+        assert_eq!(settings.watermarks.min_free_bytes, 4096);
+        assert_eq!(settings.drain_stale_after, Duration::from_millis(30_000));
+        assert_eq!(settings.sample_interval, Duration::from_millis(5_000));
+    }
+
+    /// Absence and `enabled = false` are the two inert cases, and neither is an
+    /// error: they leave every PUT on the synchronous object-store path.
+    #[test]
+    fn an_absent_or_disabled_write_behind_block_opens_no_staging_tier() {
+        let absent = parsed_config_with("");
+        assert!(matches!(
+            enabled_write_behind_settings(PLUGIN_NAME, &absent),
+            Ok(None)
+        ));
+
+        let disabled = parsed_config_with("[write_behind]\nenabled = false\n");
+        assert!(matches!(
+            enabled_write_behind_settings(PLUGIN_NAME, &disabled),
+            Ok(None)
+        ));
+
+        // And the same two through the real boot door, for all three factories.
+        for extra in ["", "[write_behind]\nenabled = false\n"] {
+            let config = immutable_config(extra);
+            assert!(parse_config(PLUGIN_NAME, &config).is_ok());
+        }
+    }
+
+    /// There are no defaults, deliberately, so each omitted key must be refused
+    /// **by name**. A refusal that does not name the key sends an operator
+    /// looking through a block of eleven of them.
+    #[test]
+    fn every_omitted_write_behind_key_is_refused_by_its_own_name() {
+        const REQUIRED: [&str; 10] = [
+            "root",
+            "low_bytes",
+            "high_bytes",
+            "hard_bytes",
+            "low_count",
+            "high_count",
+            "hard_count",
+            "min_free_bytes",
+            "drain_stale_after_millis",
+            "sample_interval_millis",
+        ];
+        let complete = valid_write_behind_block();
+        for key in REQUIRED {
+            let without = complete
+                .lines()
+                .filter(|line| !line.starts_with(&format!("{key} =")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_ne!(
+                without, complete,
+                "the fixture must actually contain {key}, or this case removes nothing"
+            );
+            let raw = raw_write_behind(&without);
+            let error = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+                Ok(_) => panic!("a block missing {key} must be refused"),
+                Err(error) => error.to_string(),
+            };
+            let named = if key == "root" { "root" } else { key };
+            assert!(
+                error.contains(named),
+                "the refusal for a missing {key} must name it; got {error}"
+            );
+        }
+    }
+
+    /// An unknown key is a typo, and a typo in a block with no defaults would
+    /// otherwise be reported as the *adjacent* key being missing.
+    #[test]
+    fn an_unknown_write_behind_key_is_refused_rather_than_ignored() {
+        let text = format!(
+            r#"
+url = "postgres://localhost/lore"
+{}
+staging_root = "/var/lib/loreserver/staging"
+"#,
+            valid_write_behind_block()
+        );
+        let value: toml::Value = match toml::from_str(&text) {
+            Ok(value) => value,
+            Err(error) => panic!("fixture must parse as TOML: {error}"),
+        };
+        let error = match value.try_into::<PostgresStoreConfig>() {
+            Ok(_) => panic!("an unknown write_behind key must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("staging_root"),
+            "the refusal must name the unknown key; got {error}"
+        );
+    }
+
+    /// The values that are individually present and jointly impossible.
+    ///
+    /// Each of these produces no error anywhere in the staging tier itself. A
+    /// mis-ordered pair yields a hysteresis latch that can never clear, which
+    /// reads as a cell permanently in direct fallback with nothing to explain
+    /// it; a zero ceiling refuses every PUT the moment occupancy is observed at
+    /// all, because the watermark comparison is `>=`.
+    #[test]
+    fn incoherent_write_behind_thresholds_are_refused_at_configuration_time() {
+        // Each case is a set of substitutions, because a zero ceiling on its
+        // own also breaks the ordering rule and would be refused by the wrong
+        // check — which would leave the positivity check itself unproved.
+        const CASES: [(&[(&str, &str)], &str); 7] = [
+            (
+                &[("low_bytes = 1000", "low_bytes = 2500")],
+                "low_bytes <= high_bytes",
+            ),
+            (
+                &[("high_bytes = 2000", "high_bytes = 4000")],
+                "high_bytes <= hard_bytes",
+            ),
+            (
+                &[("low_count = 10", "low_count = 25")],
+                "low_count <= high_count",
+            ),
+            (
+                &[("high_count = 20", "high_count = 40")],
+                "high_count <= hard_count",
+            ),
+            (
+                &[
+                    ("low_bytes = 1000", "low_bytes = 0"),
+                    ("high_bytes = 2000", "high_bytes = 0"),
+                    ("hard_bytes = 3000", "hard_bytes = 0"),
+                ],
+                "positive",
+            ),
+            (
+                &[
+                    ("low_count = 10", "low_count = 0"),
+                    ("high_count = 20", "high_count = 0"),
+                    ("hard_count = 30", "hard_count = 0"),
+                ],
+                "positive",
+            ),
+            (
+                &[("min_free_bytes = 4096", "min_free_bytes = 0")],
+                "positive",
+            ),
+        ];
+        let complete = valid_write_behind_block();
+        for (substitutions, expected) in CASES {
+            let mut mutated = complete.clone();
+            for (from, to) in substitutions {
+                let next = mutated.replace(from, to);
+                assert_ne!(
+                    next, mutated,
+                    "the fixture must contain `{from}`, or this case mutates nothing"
+                );
+                mutated = next;
+            }
+            let raw = raw_write_behind(&mutated);
+            let error = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+                Ok(_) => panic!("{substitutions:?} must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(expected),
+                "{substitutions:?} must be refused naming {expected}; got {error}"
+            );
+        }
+    }
+
+    /// A relative root resolves against the process working directory, which is
+    /// an operator-invisible input: the same configuration would stage into
+    /// different filesystems depending on how the unit was launched.
+    #[test]
+    fn a_relative_or_empty_staging_root_is_refused() {
+        let complete = valid_write_behind_block();
+        for (root, expected) in [
+            ("staging", "absolute"),
+            ("", "non-empty"),
+            ("   ", "non-empty"),
+        ] {
+            let mutated = complete.replace(
+                &format!(r#"root = "{}""#, staging_root()),
+                &format!(r#"root = "{root}""#),
+            );
+            let raw = raw_write_behind(&mutated);
+            let error = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+                Ok(_) => panic!("root `{root}` must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(expected),
+                "root `{root}` must be refused naming {expected}; got {error}"
+            );
+        }
+    }
+
+    /// The lower bound is not tidiness. The sampler builds a
+    /// `tokio::time::interval` from `sample_interval_millis`, and that
+    /// constructor **panics** on a zero period, so without this refusal a
+    /// zero would be a panicking background task rather than a config error.
+    /// The upper bound catches the unit mistake: a milliseconds field filled in
+    /// as if it were seconds.
+    #[test]
+    fn out_of_range_write_behind_intervals_are_refused() {
+        let complete = valid_write_behind_block();
+        const CASES: [(&str, &str); 4] = [
+            (
+                "sample_interval_millis = 5000",
+                "sample_interval_millis = 0",
+            ),
+            (
+                "sample_interval_millis = 5000",
+                "sample_interval_millis = 3600001",
+            ),
+            (
+                "drain_stale_after_millis = 30000",
+                "drain_stale_after_millis = 0",
+            ),
+            (
+                "drain_stale_after_millis = 30000",
+                "drain_stale_after_millis = 3600001",
+            ),
+        ];
+        for (from, to) in CASES {
+            let mutated = complete.replace(from, to);
+            assert_ne!(mutated, complete, "the fixture must contain `{from}`");
+            let raw = raw_write_behind(&mutated);
+            let field = to.split(' ').next().unwrap_or_default();
+            let error = match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+                Ok(_) => panic!("`{to}` must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains(field) && error.contains("between 1 and 3600000"),
+                "`{to}` must be refused naming {field} and its bounds; got {error}"
+            );
+        }
+    }
+
+    /// The inert-wiring refusal. The staged route is reached only from the
+    /// coordinated PUT path, so a legacy cell would prove a staging root, run
+    /// its sampler, publish a healthy admission picture, and never stage a
+    /// byte.
+    #[test]
+    fn an_enabled_write_behind_without_a_governed_route_is_refused() {
+        for provider in ["", "[fragment_provider]\nenabled = false\n"] {
+            let text = format!(
+                r#"
+url = "postgres://localhost/lore"
+[object_store]
+bucket = "fragments"
+{provider}
+{}
+"#,
+                valid_write_behind_block()
+            );
+            let parsed: PostgresStoreConfig =
+                match toml::from_str::<toml::Value>(&text).and_then(toml::Value::try_into) {
+                    Ok(parsed) => parsed,
+                    Err(error) => panic!("fixture config must deserialize: {error}"),
+                };
+            let error = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
+                Ok(_) => panic!("an enabled tier with no governed route must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("requires an enabled fragment_provider"),
+                "the refusal must name the coupling; got {error}"
+            );
+        }
+    }
+
+    /// D13's boot-time half, on a host that cannot stage.
+    ///
+    /// The compile-time half is `ConfinedRoot`'s `cfg(not(unix))` module, which
+    /// refuses every operation. This is the other half, and it is the one that
+    /// matters to an operator: without it a cell configured for staging boots,
+    /// reports healthy, and learns the truth one failed PUT at a time.
+    #[cfg(not(unix))]
+    #[test]
+    fn an_otherwise_valid_write_behind_block_is_refused_at_boot_off_unix() {
+        let parsed = parsed_config_with(&valid_write_behind_block());
+        let error = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
+            Ok(_) => panic!("staging must be refused off Unix"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("requires a Unix host"),
+            "the refusal must name the platform, not a field; got {error}"
+        );
+    }
+
+    /// The same block, on the platform that can stage, must be accepted — so
+    /// the case above is proved to be refusing for its stated reason rather
+    /// than tripping over a fixture that was never valid anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn the_same_write_behind_block_is_accepted_on_unix() {
+        let parsed = parsed_config_with(&valid_write_behind_block());
+        let settings = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
+            Ok(Some(settings)) => settings,
+            Ok(None) => panic!("an enabled block must produce settings"),
+            Err(error) => panic!("an enabled block must be accepted on Unix: {error}"),
+        };
+        assert_eq!(settings.root, PathBuf::from(staging_root()));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

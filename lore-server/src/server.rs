@@ -31,6 +31,8 @@ use lore_base::runtime::runtime_with_settings;
 use lore_base::runtime::set_task_lifecycle_callback;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_postgres::domain::fragments::FragmentCellRetentionHandle;
+use lore_postgres::store::write_behind::WriteBehindSettings;
+use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
 use lore_revision::lock::LockStore;
@@ -250,7 +252,10 @@ async fn rebuild_postgres_metering(settings: &Settings) -> Result<u64> {
 
     // The absent/disabled route keeps the legacy construction and provider
     // metadata rebuild unchanged.
-    let store = plugins::postgres::connect_immutable_store(&plugin_config, None)
+    // No staging tier on the maintenance path, for the same reason it passes no
+    // fragment activation: rebuilding the metering projection serves no PUT, so
+    // a proven root and a running sampler would be cost without a consumer.
+    let store = plugins::postgres::connect_immutable_store(&plugin_config, None, None)
         .await
         .map_err(|e| anyhow!("Failed to create Postgres immutable store: {e}"))?;
 
@@ -1145,7 +1150,11 @@ async fn configure_immutable_store_via_plugin(
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
     fragment_activation: Option<plugins::postgres::FragmentProviderActivation>,
-) -> Result<(Arc<dyn ImmutableStore>, Option<FragmentCellRetentionHandle>)> {
+) -> Result<(
+    Arc<dyn ImmutableStore>,
+    Option<FragmentCellRetentionHandle>,
+    Option<Arc<WriteBehindStage>>,
+)> {
     let mode = &settings.immutable_store.mode;
 
     // Only the Postgres plugin path can produce a retention handle: it is the
@@ -1198,19 +1207,39 @@ async fn configure_immutable_store_via_plugin(
             info!(mode, "Creating immutable store via plugin system");
 
             if mode == "postgres" {
-                let store =
-                    plugins::postgres::connect_immutable_store(&plugin_config, fragment_activation)
-                        .await
-                        .map_err(|e| {
-                            anyhow!("Failed to create immutable store plugin '{mode}': {e}")
-                        })?;
+                // WP-114 CD-7's staging tier is opened here, before the store,
+                // and the handle is kept rather than only handed over. The
+                // store's own documentation is explicit that it never queries
+                // for pending staged rows and never starts a drain: the
+                // composing server owes `note_pending_staged` and
+                // `note_drain_heartbeat` from a recurring task, and a
+                // once-at-boot observation of either is the exact per-process
+                // check that lets a second replica demote healthy fragments.
+                //
+                // `open` proves the root by writing, fsyncing, renaming and
+                // unlinking a probe file through the real finalization path, so
+                // a mount that cannot fsync a directory fails startup here
+                // rather than at the first acknowledged PUT.
+                let write_behind = postgres_write_behind_settings(settings)?
+                    .map(WriteBehindStage::open)
+                    .transpose()
+                    .map_err(|error| {
+                        anyhow!("Failed to open the write-behind staging root: {error}")
+                    })?;
+                let store = plugins::postgres::connect_immutable_store(
+                    &plugin_config,
+                    fragment_activation,
+                    write_behind.clone(),
+                )
+                .await
+                .map_err(|e| anyhow!("Failed to create immutable store plugin '{mode}': {e}"))?;
                 // Taken before the concrete store is erased behind the trait
                 // object: WP-114 CD-8's client is reachable only from the
                 // concrete Postgres store, and only on the coordinated route.
                 let cell_retention = store.cell_retention().map_err(|error| {
                     anyhow!("Failed to take the cell retention client: {error}")
                 })?;
-                return Ok((Arc::new(store), cell_retention));
+                return Ok((Arc::new(store), cell_retention, write_behind));
             }
 
             registry
@@ -1219,7 +1248,22 @@ async fn configure_immutable_store_via_plugin(
         }
     }?;
 
-    Ok((store, None))
+    Ok((store, None, None))
+}
+
+/// WP-114 CD-7's reviewed staging settings, or `None` on a cell that opens no
+/// staging tier.
+///
+/// Reads the same resolved immutable-store configuration as the two scheduler
+/// settings readers above, because the `write_behind` block lives beside
+/// `fragment_provider` and its enablement is decided in the same place.
+fn postgres_write_behind_settings(settings: &Settings) -> Result<Option<WriteBehindSettings>> {
+    if settings.immutable_store.mode != "postgres" {
+        return Ok(None);
+    }
+    let immutable_config = resolved_postgres_store_config(settings, "immutable_store")?;
+    plugins::postgres::write_behind_settings(&immutable_config)
+        .map_err(|error| anyhow!("Invalid Postgres write-behind configuration: {error}"))
 }
 
 fn resolved_postgres_store_config(settings: &Settings, store_type: &str) -> Result<toml::Value> {
@@ -2290,7 +2334,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .map(lore_postgres::domain::fragments::FragmentProcessPoolInventory::validate)
         .transpose()
         .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))?;
-    let (immutable_store, cell_retention_handle, configured_domain) =
+    // The staging handle is composed and held here and is **not yet driven**.
+    // WP-122's next step owns the three tasks that consume it: the recurring
+    // `note_pending_staged` / `note_drain_heartbeat` observer (contract C3), the
+    // drain scheduler and worker, and the staged-orphan reconciliation pass
+    // (contract C2).
+    //
+    // Composing the tier without those tasks is safe, and safe by the admission
+    // layer's own rule rather than by hope. No heartbeat is ever fed, so
+    // `drain_healthy` is false on every snapshot and a reachable root selects
+    // `DirectFallback` — the synchronous object-store path this cell already
+    // used. Nothing stages until a drain exists to promote it. An unreachable
+    // root is `Unready` instead, because `pending_staged` starts `true` and only
+    // the observer this step does not have can clear it; that is retryable
+    // `SlowDown`, which is the conservative direction of the same rule.
+    let (immutable_store, cell_retention_handle, _write_behind_stage, configured_domain) =
         if let Some(process_pool_inventory) = fragment_process_pool_inventory
             .filter(|inventory| inventory.budget().opens_dispatch_pool())
         {
@@ -2314,24 +2372,36 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 process_pool_inventory,
                 expected_database_identity,
             );
-            let (immutable_store, cell_retention_handle) = configure_immutable_store_via_plugin(
-                &plugin_registry,
-                &settings,
-                topology.clone(),
-                Some(fragment_activation),
+            let (immutable_store, cell_retention_handle, write_behind_stage) =
+                configure_immutable_store_via_plugin(
+                    &plugin_registry,
+                    &settings,
+                    topology.clone(),
+                    Some(fragment_activation),
+                )
+                .await?;
+            (
+                immutable_store,
+                cell_retention_handle,
+                write_behind_stage,
+                configured_domain,
             )
-            .await?;
-            (immutable_store, cell_retention_handle, configured_domain)
         } else {
-            let (immutable_store, cell_retention_handle) = configure_immutable_store_via_plugin(
-                &plugin_registry,
-                &settings,
-                topology.clone(),
-                None,
-            )
-            .await?;
+            let (immutable_store, cell_retention_handle, write_behind_stage) =
+                configure_immutable_store_via_plugin(
+                    &plugin_registry,
+                    &settings,
+                    topology.clone(),
+                    None,
+                )
+                .await?;
             let configured_domain = crate::domain::configure_domain_context(&settings).await?;
-            (immutable_store, cell_retention_handle, configured_domain)
+            (
+                immutable_store,
+                cell_retention_handle,
+                write_behind_stage,
+                configured_domain,
+            )
         };
 
     // A retention handle is published only by the constructed Postgres store's

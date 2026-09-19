@@ -85,7 +85,10 @@ fn absent_or_disabled_rebuild_preserves_the_legacy_store_path() {
         .nth(1)
         .expect("legacy store branch");
 
-    assert!(legacy.contains("(&plugin_config, None)"));
+    // The third `None` is WP-114 CD-7's staging tier, which the maintenance
+    // path composes for the same reason it composes no fragment activation: a
+    // metering rebuild serves no PUT.
+    assert!(legacy.contains("(&plugin_config, None, None)"));
     assert!(legacy.contains("store\n        .rebuild_metering_projection()"));
     assert_eq!(
         rebuild.matches(".rebuild_metering_projection()").count(),
