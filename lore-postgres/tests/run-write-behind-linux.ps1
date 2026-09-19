@@ -281,7 +281,11 @@ try {
     New-Item -ItemType Directory -Path $imageContext -Force | Out-Null
     # /E all subdirectories, /XD the disk-hungry target/ and .git/. The copy still carries every
     # UNCOMMITTED file, which is the interesting state during a multi-lane run.
-    & robocopy $loreRoot $sourceCopy /E /XD target .git /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+    # /XJ excludes junctions and symlinks. There are none under `lore` today, and because robocopy
+    # materialises a junction's CONTENTS rather than a link, the scratch copy could not have let
+    # cleanup escape into another tree either -- so this is a COST guard, not a safety one: without
+    # it a junction appearing later (a `node_modules` link, a worktree) would be copied wholesale.
+    & robocopy $loreRoot $sourceCopy /E /XJ /XD target .git /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy of the working tree failed with code $LASTEXITCODE" }
     $global:LASTEXITCODE = 0
 
@@ -392,7 +396,16 @@ try {
     Write-Host 'Running lore-postgres --lib ...'
     $libRun = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-postgres', '--lib')
     $libCounts = Read-TestCounts -Output $libRun.Output
-    $libStatus = if ($libRun.ExitCode -eq 0 -and $libCounts.Failed -eq 0 -and $libCounts.Passed -gt 0) { 'PASS' } else { 'FAIL' }
+    # The enumerated count is GATING here, not decoration. Without the `Ran -eq $libCatalog.Count`
+    # term a single passing case satisfied `Passed -gt 0` and the row still PRINTED
+    # `Enumerated=195` beside it -- the exact shape of green-for-work-not-run this runner exists
+    # to stop. RAN is the honest partner for ENUMERATED, not PASSED: `--list` enumerates the
+    # `#[ignore]` cases too and libtest counts them in `running N tests`, so with 3 ignored cases
+    # `Passed -eq $libCatalog.Count` would be red on a perfectly good run, while
+    # `Ran -eq $libCatalog.Count` says exactly what is wanted -- every enumerated case was
+    # accounted for (passed, failed or ignored), nothing was filtered away.
+    $libStatus = if ($libRun.ExitCode -eq 0 -and $libCounts.Failed -eq 0 -and $libCounts.Passed -gt 0 -and
+        $libCounts.Ran -eq $libCatalog.Count) { 'PASS' } else { 'FAIL' }
     Add-Result -Target 'lib' -Case '(non-ignored)' -Status $libStatus `
         -Enumerated $libCatalog.Count -Ran $libCounts.Ran -Passed $libCounts.Passed -Failed $libCounts.Failed `
         -Note "Windows enumerates $windowsLibEnumerated for the same tree; $($libCounts.Ignored) ignored"
@@ -425,6 +438,9 @@ try {
         # and this runner changes no Rust source. Making it gate today would turn a REGISTERED
         # required tier red for someone else's backlog; leaving it silent would repeat the exact
         # mistake this runner exists to fix. Flip `-NonGating` off once the Unix arm is clean.
+        # Measured again 2026-09-18 at b86d3083: the Unix arm now reports ZERO span lines, so the
+        # backlog this deferral was written for looks cleared -- confirm on the write-behind lane's
+        # own tree before flipping, since this runner changes no Rust source and cannot keep it so.
         # Read the per-FILE breakdown, not the total. Measured 2026-09-18 at 0188a6bb: a blanket
         # `-D warnings` over this crate in the container reports 129 findings, and the large
         # majority are in files the Windows rig lints perfectly well (coordinator.rs, 33;
@@ -436,20 +452,26 @@ try {
         $clippyRun = Invoke-InContainer -Command @(
             'cargo', 'clippy', '-p', 'lore-postgres', '--all-targets', '--no-deps', '-j4', '--', '-D', 'warnings'
         )
-        $locations = @(
+        # These are `-->` SPAN LINES, not findings: one finding with a primary span plus a
+        # `note:`/`help:` span contributes several. Counting distinct findings from the human
+        # renderer is not reliably possible (`--message-format=json` would be, at the cost of a
+        # second parse this non-gating step does not earn), so the column is NAMED for what it
+        # actually counts. Zero span lines in a file still means zero findings in it, which is all
+        # the Unix-gated check below asserts.
+        $spanLines = @(
             foreach ($line in ($clippyRun.Output -split "`r?`n")) {
                 $match = [regex]::Match($line, '^\s*-->\s*(?<file>[^:]+):')
                 if ($match.Success) { $match.Groups['file'].Value }
             }
         )
-        $unixGated = @($locations | Where-Object { $_ -like '*store/write_behind/*' })
+        $unixGated = @($spanLines | Where-Object { $_ -like '*store/write_behind/*' })
         Write-Host "  toolchain in container: $rustcVersion"
-        Write-Host "  findings by file:"
-        $locations | Group-Object | Sort-Object Count -Descending |
+        Write-Host "  span lines by file (upper bound on findings, not a finding count):"
+        $spanLines | Group-Object | Sort-Object Count -Descending |
             ForEach-Object { Write-Host "    $($_.Count)`t$($_.Name)" }
         Add-Result -Target 'clippy' -Case 'store/write_behind (Unix-gated)' `
             -Status $(if ($unixGated.Count -eq 0) { 'PASS' } else { 'FAIL' }) `
-            -Note "$($unixGated.Count) finding(s) the Windows rig can never emit; $($locations.Count) total crate-wide, mostly toolchain-version noise. Reported, does not gate." `
+            -Note "$($unixGated.Count) span line(s) the Windows rig can never emit; $($spanLines.Count) span lines crate-wide, mostly toolchain-version noise. Span lines over-count findings. Reported, does not gate." `
             -NonGating
     }
 
@@ -492,7 +514,14 @@ try {
 
         $versionRun = Invoke-Captured docker @('exec', $pgContainer, 'psql', '-tA', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres', '-c', 'SHOW server_version_num;')
         if ($versionRun.ExitCode -ne 0) { throw 'failed to query the disposable PostgreSQL server version' }
-        $serverVersion = [int]($versionRun.Output.Trim())
+        # The capture carries stderr as well as stdout, so it is not guaranteed to be a clean
+        # integer. A bare [int] cast on a psql notice would throw a PowerShell conversion error
+        # that says nothing about what happened; match first and report the capture instead.
+        $versionText = $versionRun.Output.Trim()
+        if ($versionText -notmatch '^\d+$') {
+            throw "expected server_version_num to be a bare integer; psql returned:`n$versionText"
+        }
+        $serverVersion = [int]$versionText
         if ($serverVersion -lt 160000 -or $serverVersion -ge 170000) {
             throw "expected PostgreSQL 16, found server_version_num=$serverVersion"
         }
@@ -527,10 +556,18 @@ try {
                 )
             }
             finally {
-                Invoke-Checked docker @(
+                # Deliberately NOT Invoke-Checked. A throw from a `finally` replaces whatever
+                # exception was already in flight, so a failed cleanup drop would erase the real
+                # failure that caused it. Report it and let the original error stand; the whole
+                # PostgreSQL container is removed at teardown anyway, so a leaked throwaway
+                # database costs nothing.
+                $dropRun = Invoke-Captured docker @(
                     'exec', $pgContainer, 'psql', '-v', 'ON_ERROR_STOP=1',
                     '-U', 'postgres', '-d', 'postgres', '-c', "DROP DATABASE $databaseName WITH (FORCE);"
                 )
+                if ($dropRun.ExitCode -ne 0) {
+                    Write-Warning "failed to drop throwaway database $databaseName (exit $($dropRun.ExitCode)):`n$($dropRun.Output)"
+                }
             }
             $counts = Read-TestCounts -Output $run.Output
             $status = if ($counts.Ran -eq 1 -and $counts.Passed -eq 1 -and $counts.Failed -eq 0 -and $run.ExitCode -eq 0) {
