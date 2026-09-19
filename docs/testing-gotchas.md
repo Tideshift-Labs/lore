@@ -545,6 +545,30 @@ already available — no WSL Rust toolchain install needed. Recipe, proven 2026-
    across PowerShell backtick-continued lines: it splits the raw command on literal `\n` before
    PowerShell's own continuation semantics apply, so a continued line beginning with `sh -c "..."`
    reads as its own top-level shell invocation and is denied. Keep this one command on one line.
+7. **A test that shells out to `cargo check --offline` against a *fixture crate* needs its own
+   prefetch — warming the workspace registry can never satisfy it.**
+   `lore-fragment-provider`'s `direct_put_compile_fail` and `drain_capability_compile_fail` are not
+   trybuild targets (this workspace has no trybuild dependency). Each runs `cargo check --offline
+   --manifest-path lore-object-dispatch/tests/compile_fail/get_only_rejects_metered/Cargo.toml` and
+   asserts on the rustc diagnostic. That fixture is a separate crate with its **own checked-in
+   `Cargo.lock`**, resolved independently of the workspace, so the versions the nested check demands
+   are ones no workspace build ever downloads — a cold-vs-warm `CARGO_HOME` volume is simply the
+   wrong axis, and `attempting to make an HTTP request, but --offline was specified` naming
+   `aho-corasick`/`anyhow` is a *different dependency graph*, not a cache miss. Three attempts read
+   it as cache warmth and concluded it was unfixable. One network-enabled, fixture-scoped command
+   fixes it, with no source change:
+
+   ```
+   cargo fetch --manifest-path lore-object-dispatch/tests/compile_fail/get_only_rejects_metered/Cargo.toml
+   ```
+
+   `cargo fetch` honours that manifest's own lockfile, so `$CARGO_HOME` then holds exactly what the
+   nested `--offline` check asks for. With it, both targets pass in the container: each
+   1 passed / 0 failed / 0 ignored, exit 0 (measured 2026-09-18, `rust:slim-trixie`). Wired into
+   `run-write-behind-linux.ps1`'s `-IncludeCompileFail` block, which stays opt-in because the
+   prefetch needs network and nothing else in that runner does. Generalize the rule: before blaming
+   an offline nested build on cache warmth, check whether the manifest it targets resolves against
+   the workspace lockfile at all.
 - **Never source a candidate port from `bind(0)` when the port must be free for BOTH TCP and UDP;
   never "fix" the resulting failure by raising the retry count.** `scripts/test`'s
   `allocate_free_port` (gRPC and QUIC share one number) hard-failed all 20 attempts on Windows with

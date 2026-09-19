@@ -43,14 +43,39 @@ required: a box that cannot reach a Linux Docker engine has not run these tests.
 
 Cleanup checks the run label AND the owning PowerShell process id before removing anything.
 
-STATED LIMIT -- `-IncludeCompileFail`. `lore-fragment-provider`'s two trybuild targets
-(`direct_put_compile_fail`, `drain_capability_compile_fail`) still do NOT pass in this container,
-and a warm `$cargoVolume` does not fix it: trybuild's nested build runs `--offline`, and the
-deps that nested build resolves (`aho-corasick v1.1.5`, then `anyhow`) are not the versions the
-workspace build put in the registry cache, so it fails with "attempting to make an HTTP request,
-but --offline was specified" (measured 2026-09-18 on a warm volume, and twice before on a cold
-one). Both pass on Windows and neither touches the Unix-gated staging code, so they stay
-best-effort here: they are reported, never gate the exit code, and are off by default.
+`-IncludeCompileFail` -- WHAT THESE TARGETS ACTUALLY ARE, and the one command they need.
+
+`lore-fragment-provider`'s `direct_put_compile_fail` and `drain_capability_compile_fail` are NOT
+trybuild targets. There is no trybuild dependency and no trybuild scratch directory anywhere in
+this workspace. Each is a plain `#[test]` that SHELLS OUT to
+
+  cargo check --offline --quiet --manifest-path
+      lore-object-dispatch/tests/compile_fail/get_only_rejects_metered/Cargo.toml --bin <name>
+
+and asserts on the resulting rustc diagnostic. That fixture is a SEPARATE CRATE with its OWN
+CHECKED-IN `Cargo.lock`, outside the workspace and resolved independently of it.
+
+That is the whole mechanism, and it is why three earlier attempts concluded this was unfixable:
+they warmed the WORKSPACE registry (a cold-vs-warm `$cargoVolume` question) and read the
+resulting "attempting to make an HTTP request, but --offline was specified" as a cache-warmth
+problem. Warming the workspace registry can NEVER satisfy a lockfile naming versions the
+workspace never resolves -- `aho-corasick v1.1.5` and `anyhow` were symptoms of a DIFFERENT
+dependency graph, not of a cold cache. No amount of workspace building fixes it.
+
+The fix is one network-enabled, FIXTURE-SCOPED prefetch before the targets run:
+
+  cargo fetch --manifest-path
+      lore-object-dispatch/tests/compile_fail/get_only_rejects_metered/Cargo.toml
+
+`cargo fetch` honours that manifest's own `Cargo.lock`, so it populates `$CARGO_HOME` with
+exactly the versions the nested `--offline` check will ask for. The block below runs it. With it,
+both targets pass in this container; measured 2026-09-18 in `rust:slim-trixie` against a clean
+`git archive` of `d34386e0` -- `direct_put_compile_fail` 1 passed / 0 failed / 0 ignored and
+`drain_capability_compile_fail` 1 passed / 0 failed / 0 ignored, exit 0.
+
+They remain opt-in and NON-GATING: they belong to a different crate, neither touches the
+Unix-gated staging code this runner exists for, and the prefetch needs network, which this
+runner does not otherwise require.
 #>
 
 [CmdletBinding()]
@@ -413,18 +438,35 @@ try {
 
     if ($IncludeCompileFail) {
         # Best-effort, and in a DIFFERENT crate: both compile-fail targets belong to
-        # `lore-fragment-provider`, not `lore-postgres`. Nested trybuild runs `--offline`; with a
-        # COLD cargo registry it cannot fetch its transitive deps, which is why this is opt-in
-        # rather than pinned. A warm $cargoVolume from a previous run is what makes it viable.
+        # `lore-fragment-provider`, not `lore-postgres`.
+        #
+        # Neither is a trybuild target (see the header). Each shells out to
+        # `cargo check --offline --manifest-path <fixture>/Cargo.toml`, and that fixture crate
+        # carries its OWN `Cargo.lock` resolved independently of this workspace. So the deps that
+        # nested check needs are ones NO workspace build ever downloads, warm volume or not. The
+        # only thing that puts them in `$CARGO_HOME` is a fetch scoped to that manifest, which is
+        # what this does. It needs NETWORK; nothing else in this runner does.
+        $fixtureManifest = 'lore-object-dispatch/tests/compile_fail/get_only_rejects_metered/Cargo.toml'
+        Write-Host "Prefetching the compile-fail fixture crate's own lockfile ($fixtureManifest) ..."
+        $fetchRun = Invoke-InContainer -Command @('cargo', 'fetch', '--manifest-path', $fixtureManifest)
+        if ($fetchRun.ExitCode -ne 0) {
+            # Reported, not fatal: this whole block is non-gating, and a failed prefetch turns
+            # into two honest FAIL rows below rather than aborting the Unix-gated tiers that are
+            # the point of the runner.
+            Write-Warning "fixture prefetch failed (exit $($fetchRun.ExitCode)); the compile-fail rows below will fail offline:`n$($fetchRun.Output)"
+        }
         foreach ($target in @('direct_put_compile_fail', 'drain_capability_compile_fail')) {
             Write-Host "Running lore-fragment-provider --test $target (best effort) ..."
             $run = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-fragment-provider', '--test', $target)
             $counts = Read-TestCounts -Output $run.Output
-            Add-Result -Target $target -Case '(whole target)' `
-                -Status $(if ($run.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }) `
-                -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed `
-                -Note 'best effort, not pinned' -NonGating
-            if ($run.ExitCode -ne 0) { Write-Warning "  FAIL`n$($run.Output)" }
+            # Each target holds exactly one `#[test]`. Exit code alone would call a
+            # filtered-to-zero run green, so require the case to have actually run and passed.
+            $status = if ($run.ExitCode -eq 0 -and $counts.Ran -eq 1 -and $counts.Passed -eq 1 -and
+                $counts.Failed -eq 0) { 'PASS' } elseif ($counts.Ran -eq 1) { 'FAIL' } else { 'NOT RUN' }
+            Add-Result -Target $target -Case '(whole target)' -Status $status `
+                -Enumerated 1 -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed `
+                -Note 'opt-in, needs network for the fixture prefetch; reported, does not gate' -NonGating
+            if ($status -eq 'PASS') { Write-Host "  PASS (1/1)" } else { Write-Warning "  $status`n$($run.Output)" }
         }
     }
 
