@@ -60,7 +60,9 @@ use lore_postgres::domain::fragments::EpochAuthority;
 use lore_postgres::domain::fragments::FragmentManifest;
 use lore_postgres::domain::fragments::FragmentObliterateBegin;
 use lore_postgres::domain::fragments::FragmentObliteratePhase;
+use lore_postgres::domain::fragments::FragmentPurgeTarget;
 use lore_postgres::domain::fragments::FragmentWriteCapabilityCutover;
+use lore_postgres::domain::fragments::FragmentWriteClaim;
 use lore_postgres::domain::fragments::FragmentWriteClaimInput;
 use lore_postgres::domain::fragments::FragmentWriteClaimState;
 use lore_postgres::domain::fragments::FragmentWriteSettlement;
@@ -2030,11 +2032,10 @@ async fn a_decisive_promotion_claim_contributes_a_cleanup_target_exactly_like_a_
 /// assertion is on durable state alone: no wall-clock margin, deliberately, so
 /// this case cannot join the two takeover/deadline cases in flaking under load.
 ///
-/// KNOWN-UNPINNED, and deliberately not covered here: `begin_obliterate`
-/// against a hash carrying a live unexpired promotion claim. It stamps a fence
-/// with no `write_claim_barrier_locked` consult, which is the reachability path
-/// for this very arm. The fence bump below is a fixture standing in for that
-/// interaction, not a proof of it.
+/// The fence bump below is a fixture standing in for a barrier-blind fence
+/// stamp, not a proof of one. `begin_obliterate` against a live unexpired
+/// promotion claim is now pinned directly by the three cases at the end of this
+/// file.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirmed_no_send() {
@@ -2124,5 +2125,374 @@ async fn a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirm
         FragmentWriteClaimState::Ambiguous.bits(),
         "the durable-state mapping is Sending -> Ambiguous, so the barrier holds until \
          hard_not_after and the residue stays a cleanup target"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `begin_obliterate` against a hash carrying a LIVE UNEXPIRED promotion claim.
+//
+// This was unpinned in BOTH directions: nothing said the deletion waits for the
+// claim, and nothing said it does not. These three cases pin the CURRENT
+// behavior only. No source under `lore-postgres/src/` was changed for them.
+//
+// What the implementation actually does (read off
+// `domain/fragments/coordinator.rs`): `begin_obliterate` does not consult
+// `write_claim_barrier_locked` -- the admission barrier -- but it does take the
+// whole hash's claim inventory under `FOR UPDATE` via
+// `write_claim_inventory_locked`, which is kind-blind. A live claim therefore
+// reaches the obliterate path as a BARRIER (`blocked_until`), never as a
+// cleanup target, and the association tombstone plus the head transition to
+// `DeletingChildren` commit ANYWAY. So the deletion takes durable ownership at
+// once and reports a deadline; it does not defer taking ownership.
+//
+// That matches ruling D10-A in both halves: promotion joins the deletion-barrier
+// inventory, and it never authorizes deleting the promoted bare-hash object --
+// a live claim contributes no target at all, and a settled one contributes one
+// only as unpublished residue.
+//
+// Case 3 is the negative control. Without it, cases 1 and 2 could not
+// distinguish "the live claim blocked the deletion" from "an obliterate on a
+// Staged head is always Blocked".
+// ---------------------------------------------------------------------------
+
+/// Stage a hash whose staged epoch sits at the CANONICAL staged object key.
+///
+/// `stage_hash` publishes at a fixed literal key, which is fine for every case
+/// that never obliterates a `Staged` head. These cases do, and
+/// `validate_purge_target_key` refuses a `Staged` target whose key is not
+/// `<hex>.s<epoch>` -- so the intent capture would fail on the fixture rather
+/// than on the behavior under test. Returns the staged epoch.
+async fn stage_hash_at_canonical_staged_key(
+    coordinator: &PostgresFragmentCoordinator,
+    hash: &[u8],
+    seed: u8,
+) -> i64 {
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(hash)
+        .await
+        .expect("begin stage on a fresh hash")
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    let epoch = stage_intent.epoch;
+    let key = format!("{}.s{epoch}", legacy_key(hash));
+    assert_eq!(
+        coordinator
+            .commit_staged(
+                &stage_intent,
+                IoObservation::Valid(manifest(&key, seed, EpochAuthority::Staged)),
+            )
+            .await
+            .expect("commit staged at the canonical staged key"),
+        CommitVerdict::Published
+    );
+    epoch
+}
+
+/// The bare-hash key is absent from the capture -- and the capture is not
+/// empty.
+///
+/// `all(|t| t.object_key() != legacy)` is true of an empty slice, so on its own
+/// it cannot tell "promotion contributed nothing" from "the whole capture
+/// failed". The staged current representation must be there, at the canonical
+/// staged key, for the absence to mean anything.
+fn assert_non_vacuous_no_legacy_target(targets: &[FragmentPurgeTarget], hash: &[u8], legacy: &str) {
+    let staged = format!("{}.s", legacy_key(hash));
+    assert!(
+        targets
+            .iter()
+            .any(|target| target.authority() == EpochAuthority::Staged
+                && target.object_key().starts_with(&staged)),
+        "the capture must carry the staged current representation, or the legacy-key absence \
+         below is vacuous; purge_targets={targets:?}"
+    );
+    assert!(
+        targets.iter().all(|target| target.object_key() != legacy),
+        "no cleanup target may name the bare-hash key -- promotion never authorizes deleting \
+         the promoted bare-hash object (D10-A); purge_targets={targets:?}"
+    );
+}
+
+/// Read one claim's durable state, so every assertion below is about the row
+/// rather than about a value the coordinator handed back.
+async fn claim_state(direct: &Client, claim: &FragmentWriteClaim) -> i16 {
+    direct
+        .query_one(
+            "SELECT state FROM lore_fragment_write_claims \
+              WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[
+                &claim.logical_request_id().as_slice(),
+                &claim.attempt_id().as_slice(),
+            ],
+        )
+        .await
+        .expect("read the claim row")
+        .get(0)
+}
+
+/// Stage a hash, associate it, enable write claims, and admit one promotion.
+/// Returns everything the three cases below assert against.
+async fn promotion_in_flight(
+    url: &str,
+    store: &PostgresDomainStore,
+    coordinator: &PostgresFragmentCoordinator,
+    hash: &[u8],
+    seed: u8,
+    claim_input: FragmentWriteClaimInput,
+) -> ([u8; 16], Vec<u8>, FragmentWriteClaim) {
+    stage_hash_at_canonical_staged_key(coordinator, hash, seed).await;
+    let repository = create_repository(store).await;
+    let context = random_context();
+    assert_eq!(
+        coordinator
+            .create_association(hash, &repository, &context)
+            .await
+            .expect("associate the staged fragment"),
+        CommitVerdict::Published
+    );
+    enable_write_claims(url, coordinator).await;
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_promotion(hash, claim_input)
+        .await
+        .expect("begin promotion")
+    else {
+        panic!("a Staged head must admit promotion");
+    };
+    let claim = intent.write_claim().expect("promotion claim").clone();
+    (repository, context, claim)
+}
+
+/// A `Prepared` promotion claim still inside its send window makes
+/// `begin_obliterate` report `Blocked` until that claim's `send_not_after` --
+/// while still committing the association tombstone and the head transition,
+/// and while leaving the claim row untouched.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn begin_obliterate_is_blocked_by_a_live_prepared_promotion_claim_but_still_takes_ownership()
+{
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    let (repository, context, claim) = promotion_in_flight(
+        &url,
+        &store,
+        &coordinator,
+        &hash,
+        0x40,
+        // Generous deadlines: this case must not race the clock.
+        write_claim(),
+    )
+    .await;
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::Prepared.bits(),
+        "the case is meaningless unless the claim is Prepared and unexpired"
+    );
+
+    let begun = coordinator
+        .begin_obliterate(
+            &hash,
+            &repository,
+            &context,
+            TEST_PROVIDER_WRITE_AUTHORITY_REVISION,
+        )
+        .await
+        .expect("begin obliterate must not error with a live claim present");
+    let FragmentObliterateBegin::Blocked {
+        intent,
+        blocked_until,
+    } = begun
+    else {
+        panic!("a live unexpired Prepared promotion claim must report Blocked, got {begun:?}");
+    };
+    assert!(
+        blocked_until >= claim.send_not_after(),
+        "the barrier deadline must be at least the live claim's send_not_after; \
+         blocked_until={blocked_until:?} send_not_after={:?}",
+        claim.send_not_after()
+    );
+    assert_eq!(intent.phase(), FragmentObliteratePhase::Children);
+
+    // D10-A, the half that is easy to lose: a LIVE claim is a barrier, not a
+    // licence. Nothing in the intent names the bare-hash key the promotion
+    // would have published to. Asserted against a NON-EMPTY target set -- the
+    // staged current representation is there, so "no legacy key" is a real
+    // absence rather than an empty list passing an `all`.
+    let legacy = legacy_key(&hash);
+    assert_non_vacuous_no_legacy_target(intent.purge_targets(), &hash, &legacy);
+
+    // Ownership is taken regardless of the barrier: both rows moved.
+    let head_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&hash],
+        )
+        .await
+        .expect("read the head")
+        .get(0);
+    assert_eq!(
+        head_state,
+        FragmentLifecycleState::DeletingChildren.bits(),
+        "Blocked still commits the head transition -- the deletion owns the hash now"
+    );
+    let association_state: i16 = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_associations \
+              WHERE hash = $1 AND repository_id = $2 AND context = $3",
+            &[&hash, &repository.as_slice(), &context],
+        )
+        .await
+        .expect("read the association")
+        .get(0);
+    assert_eq!(
+        association_state,
+        schema::ASSOCIATION_TOMBSTONED,
+        "Blocked still commits the association tombstone"
+    );
+
+    // The claim itself is not settled by the obliterate. It is settled by the
+    // promotion worker's own next call, which now finds a head it cannot match.
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::Prepared.bits(),
+        "begin_obliterate must not settle a LIVE claim; only an expired Prepared claim is \
+         settled by the inventory sweep"
+    );
+    let refusal = coordinator.authorize_write_claim(&claim).await;
+    assert!(
+        matches!(
+            refusal,
+            Err(DomainError::PreconditionRejected { ref reason, .. })
+                if reason == "fragment_write_lineage_moved"
+        ),
+        "the promotion must be fenced by the head the obliterate left behind, got {refusal:?}"
+    );
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::NoSend.bits(),
+        "a Prepared claim refused for moved lineage is a CONFIRMED non-send"
+    );
+}
+
+/// The same shape one state later: a claim that already authorized is
+/// `Sending`, so the barrier runs to `hard_not_after`, not `send_not_after`.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn begin_obliterate_is_blocked_by_a_sending_promotion_claim_until_its_hard_deadline() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    let (repository, context, claim) =
+        promotion_in_flight(&url, &store, &coordinator, &hash, 0x41, write_claim()).await;
+    coordinator
+        .authorize_write_claim(&claim)
+        .await
+        .expect("authorize the promotion claim");
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::Sending.bits(),
+        "the case is meaningless unless the claim really reached Sending"
+    );
+
+    let begun = coordinator
+        .begin_obliterate(
+            &hash,
+            &repository,
+            &context,
+            TEST_PROVIDER_WRITE_AUTHORITY_REVISION,
+        )
+        .await
+        .expect("begin obliterate must not error with a Sending claim present");
+    let FragmentObliterateBegin::Blocked {
+        intent,
+        blocked_until,
+    } = begun
+    else {
+        panic!("a live unexpired Sending promotion claim must report Blocked, got {begun:?}");
+    };
+    assert!(
+        blocked_until >= claim.hard_not_after(),
+        "a Sending claim's barrier runs to hard_not_after, not send_not_after; \
+         blocked_until={blocked_until:?} hard_not_after={:?}",
+        claim.hard_not_after()
+    );
+    // An UNEXPIRED Sending claim is a barrier, not residue: it must contribute
+    // no cleanup target while its late effect can still land.
+    let legacy = legacy_key(&hash);
+    assert_non_vacuous_no_legacy_target(intent.purge_targets(), &hash, &legacy);
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::Sending.bits(),
+        "begin_obliterate must leave a live Sending claim exactly where it found it"
+    );
+}
+
+/// NEGATIVE CONTROL. The same fixture with a claim whose send window has
+/// already closed is NOT blocked -- so the two cases above measure the claim's
+/// liveness, not merely "obliterate on a Staged head".
+///
+/// It also pins the inventory's write side: the expired `Prepared` claim is
+/// settled to a confirmed `NoSend` by `begin_obliterate` itself.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn begin_obliterate_is_not_blocked_once_the_promotion_claims_send_window_has_closed() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    let (repository, context, claim) = promotion_in_flight(
+        &url,
+        &store,
+        &coordinator,
+        &hash,
+        0x42,
+        // 50 ms send window, 60 s hard bound: the claim can never send again,
+        // but its row is nowhere near its late-effect deadline. That is the
+        // shape that isolates `send_not_after` as the thing being measured.
+        short_send_long_late_effect_write_claim(),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::Prepared.bits(),
+        "nothing should have settled the claim before the obliterate runs"
+    );
+
+    let begun = coordinator
+        .begin_obliterate(
+            &hash,
+            &repository,
+            &context,
+            TEST_PROVIDER_WRITE_AUTHORITY_REVISION,
+        )
+        .await
+        .expect("begin obliterate must not error");
+    let FragmentObliterateBegin::Ready(intent) = begun else {
+        panic!(
+            "a Prepared claim past its send window must NOT block the deletion, got {begun:?} \
+             -- if this is Blocked the two cases above prove nothing about claim liveness"
+        );
+    };
+    assert_eq!(intent.phase(), FragmentObliteratePhase::Children);
+    // A claim that never authorized leaves no residue at the bare-hash key.
+    let legacy = legacy_key(&hash);
+    assert_non_vacuous_no_legacy_target(intent.purge_targets(), &hash, &legacy);
+    assert_eq!(
+        claim_state(&direct, &claim).await,
+        FragmentWriteClaimState::NoSend.bits(),
+        "the obliterate's own inventory sweep settles an expired Prepared claim to a \
+         CONFIRMED non-send"
     );
 }
