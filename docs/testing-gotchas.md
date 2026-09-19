@@ -517,6 +517,14 @@ already available — no WSL Rust toolchain install needed. Recipe, proven 2026-
    checkout. `robocopy <repo> <scratch> /E /XD target .git` (exclude the disk-hungry `target/` and
    `.git/`) gives an isolated, disposable copy that still carries every *uncommitted* file — needed,
    since the interesting state during a multi-lane run is usually not committed yet.
+   **The scratch copy goes stale the moment ANY lane edits a source file after it was made, not just
+   when you forget to add your own new test file.** A container built earlier in a session can hold a
+   pre-formatting or pre-fix version of a `src/*.rs` a sibling lane (or the same lane, moments before)
+   changed on the live checkout. `docker cp`-ing only your own new test file leaves that staleness
+   undetected — the build succeeds against the stale source and the run looks trustworthy. Before
+   trusting a container run, `Get-FileHash` the live checkout's file against the scratch copy's for
+   every file the test target depends on that changed recently; on a mismatch, re-`robocopy` the whole
+   tree (cheap, seconds) rather than hand-picking which files moved.
 2. Bind-mount that scratch copy read-write, and send `CARGO_TARGET_DIR` and the cargo registry
    cache to **named Docker volumes**, not the bind mount, so a Linux build's artifacts never land
    in the Windows `target/` another process might be reading.

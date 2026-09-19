@@ -644,3 +644,20 @@ delta produced. Keep it durable, not chronological — chronological execution n
     writing -- check `domain/fragments/creation.rs` before trusting any future claim that Stage mode
     works live.
 
+- **WP-122 L5 [SERVER]**: `staged_drain_candidates` (bounded plan query, `lore-postgres`) and
+  `LinuxSpoolWriter` (drain-body placement, `lore-object-dispatch/src/spool_writer.rs`).
+  `staged_drain_candidates` is pure SQL with no filesystem interaction, so unlike its
+  `write_behind_staging_lifecycle.rs` sibling it is **not** Unix-gated: `tests/fragment_drain_candidates.rs`
+  (7 `#[ignore]` cases, registered in `run-fragment-lifecycle-live.ps1`) runs on Windows and Linux
+  alike; the batch bound is `fragment_drain_candidate_schema.rs`, one file per batch newtype like
+  `FragmentWriteClaimPruneBatch`'s precedent. `provider_body_blake3()` is pinned `None` on a
+  `commit_staged` candidate since staging creates no write claim to populate it.
+  `LinuxSpoolWriter` is a platform gate, not an infra gate, so `tests/spool_writer.rs` (10 cases)
+  follows `write_behind_stage.rs`'s plain-`#[test]`-under-`cfg(linux)` convention, not
+  `spool_verifier.rs`'s `#[ignore]`d one. Measured (not guessed): `open()` on an absent root and on a
+  regular-file root both fold to `RootUnavailable` (same `openat2(O_DIRECTORY)` call, `ENOENT`/`ENOTDIR`,
+  before the code's own `is_dir()` check ever runs); a symlinked intermediate path component fails
+  `UnsafeOrNonRegular` (`mkdirat` swallows `EEXIST`, the following `openat2` with `NO_SYMLINKS` hits
+  `ELOOP`). A Windows run reports 1 test (the `UnsupportedPlatform` half only), not evidence for the
+  Linux 10 -- run inside the Linux build container (testing-gotchas.md).
+

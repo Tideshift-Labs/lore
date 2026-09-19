@@ -56,6 +56,7 @@ pub mod retention_readback;
 pub mod retention_schema;
 pub mod spool;
 pub mod spool_verifier;
+pub mod spool_writer;
 pub mod terminal_result;
 pub mod upload;
 
