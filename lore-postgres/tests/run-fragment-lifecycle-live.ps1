@@ -258,7 +258,16 @@ $inventory = @(
             # recorded as a CONFIRMED non-send. Every other lineage-refusal case enters
             # that arm from Prepared, which is why it survived; this one enters from
             # Sending.
-            'a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirmed_no_send'
+            'a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirmed_no_send',
+            # D10-A pins, 2026-09-18: `begin_obliterate` against a live unexpired promotion
+            # claim, current behavior only. A live claim reaches obliterate as a BARRIER
+            # (`blocked_until`) and never as a cleanup target, while the association tombstone
+            # and the head's move to DeletingChildren commit anyway. The third case is the
+            # negative control -- an expired Prepared claim -- so the first two measure claim
+            # liveness rather than "a Staged head is always Blocked".
+            'begin_obliterate_is_blocked_by_a_live_prepared_promotion_claim_but_still_takes_ownership',
+            'begin_obliterate_is_blocked_by_a_sending_promotion_claim_until_its_hard_deadline',
+            'begin_obliterate_is_not_blocked_once_the_promotion_claims_send_window_has_closed'
         )
     },
     [pscustomobject]@{
