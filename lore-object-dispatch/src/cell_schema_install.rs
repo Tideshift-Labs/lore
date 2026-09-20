@@ -232,7 +232,7 @@ pub const CELL_INSTALL_SET: [CellMigration; 23] = [
     cell_migration!(
         26,
         "0026_object_store_dispatch_drain_policy.sql",
-        "b5c416e136b32adb3600695e903e0b7014a9d4c2400d5c1b353abfceb75c9061"
+        "cb33d909e51a555701f62f8ed5924c3e6d651cd7d1027c238ffa17d55902db5d"
     ),
     cell_migration!(
         27,

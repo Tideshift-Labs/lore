@@ -195,6 +195,38 @@ fn embedded_bytes_are_the_frozen_bytes() {
     }
 }
 
+fn has_canonical_sql_line_endings(bytes: &[u8]) -> bool {
+    !bytes.contains(&b'\r')
+}
+
+#[test]
+fn installed_sql_bytes_are_lf_before_git_normalization() {
+    for migration in &CELL_INSTALL_SET {
+        let bytes = std::fs::read(migrations_dir().join(migration.file_name)).unwrap();
+        assert!(
+            has_canonical_sql_line_endings(&bytes),
+            "{} contains CR bytes: Git's eol=lf clean filter would change the pinned artifact",
+            migration.file_name
+        );
+        assert!(has_canonical_sql_line_endings(migration.sql.as_bytes()));
+    }
+}
+
+#[test]
+fn canonical_sql_guard_refuses_full_and_mixed_crlf_even_when_raw_digest_matches() {
+    let canonical = b"BEGIN;\nSELECT 1;\nCOMMIT;\n";
+    assert!(has_canonical_sql_line_endings(canonical));
+    for noncanonical in [
+        &b"BEGIN;\r\nSELECT 1;\r\nCOMMIT;\r\n"[..],
+        &b"BEGIN;\nSELECT 1;\nCOMMIT;\r\n"[..],
+    ] {
+        let self_consistent_pin = blake3::hash(noncanonical);
+        assert_eq!(blake3::hash(noncanonical), self_consistent_pin);
+        assert!(!has_canonical_sql_line_endings(noncanonical));
+        assert_ne!(self_consistent_pin, blake3::hash(canonical));
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // 3. Plan ordering.
 // ---------------------------------------------------------------------------------------------
