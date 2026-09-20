@@ -56,6 +56,149 @@ async fn event_state(client: &Client) -> String {
     client.query_one("SELECT json_build_array((SELECT row_to_json(s) FROM lore_outbox_schema_state s),(SELECT json_agg(r) FROM lore_outbox_fresh_initialization r),(SELECT json_agg(m) FROM lore_outbox_membership_state m))::text",&[]).await.unwrap().get(0)
 }
 
+async fn publish_stage_policy(direct: &Client) {
+    direct.batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance;
+        SELECT stage_policy_publish_v1('test-cell','event-init-policy',decode(repeat('ab',32),'hex'),1048576,100,1048576,100,60000,4102444800000);
+        RESET SESSION AUTHORIZATION;").await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "owned empty PostgreSQL fixture required"]
+async fn fresh_event_initialization_accepts_published_stage_policy_and_exact_zero_usage() {
+    let (pool, direct) = armed().await;
+    publish_stage_policy(&direct).await;
+    let policy: String = direct
+        .query_one(
+            "SELECT row_to_json(p)::text FROM lore_fragment_stage_policy p",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        initialize_empty(&pool, &input(0)).await.unwrap(),
+        FreshEventInitializationOutcome::Initialized
+    );
+    assert_eq!(
+        direct
+            .query_one(
+                "SELECT row_to_json(p)::text FROM lore_fragment_stage_policy p",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, String>(0),
+        policy
+    );
+    let row = direct.query_one("SELECT count(*),bool_and(singleton AND live_bytes=0 AND live_files=0 AND metadata_bytes=0 AND metadata_rows=0) FROM lore_fragment_stage_usage", &[]).await.unwrap();
+    assert_eq!(row.get::<_, i64>(0), 1);
+    assert!(row.get::<_, bool>(1));
+    assert_eq!(
+        initialize_empty(&pool, &input(0)).await.unwrap(),
+        FreshEventInitializationOutcome::AlreadyInitialized
+    );
+}
+
+#[tokio::test]
+#[ignore = "owned empty PostgreSQL fixture required"]
+async fn fresh_event_initialization_refuses_used_or_missing_stage_usage() {
+    let (pool, direct) = armed().await;
+    publish_stage_policy(&direct).await;
+    for column in [
+        "live_bytes",
+        "live_files",
+        "metadata_bytes",
+        "metadata_rows",
+    ] {
+        direct
+            .batch_execute(&format!("UPDATE lore_fragment_stage_usage SET {column}=1"))
+            .await
+            .unwrap();
+        let before = event_state(&direct).await;
+        let error = initialize_empty(&pool, &input(0)).await.unwrap_err();
+        assert!(
+            matches!(error, DomainError::NotReady(_)),
+            "{column}: {error:?}"
+        );
+        assert!(error.to_string().contains("stage counters"), "{error:?}");
+        assert_eq!(event_state(&direct).await, before);
+        assert_eq!(
+            direct
+                .query_one(
+                    &format!("SELECT {column} FROM lore_fragment_stage_usage"),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        direct
+            .batch_execute(&format!("UPDATE lore_fragment_stage_usage SET {column}=0"))
+            .await
+            .unwrap();
+    }
+    direct
+        .batch_execute("DELETE FROM lore_fragment_stage_usage")
+        .await
+        .unwrap();
+    let before = event_state(&direct).await;
+    let error = initialize_empty(&pool, &input(0)).await.unwrap_err();
+    assert!(matches!(error, DomainError::NotReady(_)), "{error:?}");
+    assert!(error.to_string().contains("stage counters"), "{error:?}");
+    assert_eq!(event_state(&direct).await, before);
+    assert_eq!(
+        direct
+            .query_one("SELECT count(*) FROM lore_fragment_stage_usage", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    direct
+        .batch_execute("INSERT INTO lore_fragment_stage_usage(singleton) VALUES(true)")
+        .await
+        .unwrap();
+    assert_eq!(
+        initialize_empty(&pool, &input(0)).await.unwrap(),
+        FreshEventInitializationOutcome::Initialized
+    );
+}
+
+#[tokio::test]
+#[ignore = "owned empty PostgreSQL fixture required"]
+async fn fresh_event_initialization_refuses_retained_stage_custody() {
+    let (pool, direct) = armed().await;
+    publish_stage_policy(&direct).await;
+    let url = std::env::var("LORE_TEST_PG_URL").unwrap();
+    let store = PostgresDomainStore::connect(&url, 2, &TlsConfig::default())
+        .await
+        .unwrap();
+    let coordinator = store.fragment_coordinator();
+    let orphan = coordinator
+        .begin_stage_cleanup(&[0x42; 32], 71)
+        .await
+        .unwrap()
+        .unwrap();
+    coordinator.commit_stage_cleanup(&orphan).await.unwrap();
+    let before = event_state(&direct).await;
+    let error = initialize_empty(&pool, &input(0)).await.unwrap_err();
+    assert!(matches!(error, DomainError::NotReady(_)), "{error:?}");
+    assert!(
+        error.to_string().contains("lore_fragment_stage_custody"),
+        "{error:?}"
+    );
+    assert_eq!(event_state(&direct).await, before);
+    assert_eq!(
+        direct
+            .query_one("SELECT count(*) FROM lore_fragment_stage_custody", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+}
+
 #[tokio::test]
 #[ignore = "owned empty PostgreSQL fixture required"]
 async fn fresh_event_initialization_is_atomic_repeatable_and_not_receiver_readiness() {
@@ -304,6 +447,8 @@ impl DomainBackfillSource for EmptySource {
 async fn fixture(arm: bool) -> (String, PostgresDomainStore, Client) {
     let url = std::env::var("LORE_TEST_PG_URL").expect("isolated empty PostgreSQL required");
     let direct = client(&url).await;
+    // Bootstrap grants procedure access only to roles that already exist.
+    direct.batch_execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_maintenance') THEN CREATE ROLE object_dispatch_retention_maintenance; END IF; END $$;").await.unwrap();
     direct
         .batch_execute(include_str!("../migrations/0001_init.sql"))
         .await

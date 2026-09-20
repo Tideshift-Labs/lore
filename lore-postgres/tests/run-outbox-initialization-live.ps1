@@ -27,6 +27,9 @@ $target = 'domain_outbox_initialization'
 # Exact: this target must hold no ignored case beyond this list, so a case added
 # without updating this runner is a setup failure rather than a silent NOT RUN.
 $cases = @(
+ 'fresh_event_initialization_accepts_published_stage_policy_and_exact_zero_usage',
+ 'fresh_event_initialization_refuses_used_or_missing_stage_usage',
+ 'fresh_event_initialization_refuses_retained_stage_custody',
  'fresh_event_initialization_is_atomic_repeatable_and_not_receiver_readiness',
  'fresh_event_initialization_refuses_unarmed_retained_or_populated_state',
  'fresh_event_initialization_refuses_receipt_placement_and_contract_drift',
