@@ -52,6 +52,11 @@ required: a box that cannot reach a Linux Docker engine has not run these tests.
 
 Cleanup checks the run label AND the owning PowerShell process id before removing anything.
 
+Use `-RunNamespace <lowercase-name>` to isolate the ownership guard and both writable Cargo
+volumes from a retained run. The default label and cache names are unchanged. `-NetworkSubnet`
+passes an explicitly chosen CIDR to Docker; check existing networks before selecting it. Docker
+still rejects overlaps. `-PlanOnly` prints resource names without creating or inspecting resources.
+
 `-IncludeCompileFail` -- WHAT THESE TARGETS ACTUALLY ARE, and the one command they need.
 
 `lore-fragment-provider`'s `direct_put_compile_fail` and `drain_capability_compile_fail` are NOT
@@ -89,6 +94,12 @@ runner does not otherwise require.
 
 [CmdletBinding()]
 param(
+    # A separate ownership guard must also get separate writable caches.
+    [ValidatePattern('(?-i:^[a-z0-9][a-z0-9-]{0,39}$)')]
+    [string]$RunNamespace,
+    [ValidatePattern('^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/(?:[1-9]|[12][0-9]|3[0-2])$')]
+    [string]$NetworkSubnet,
+    [switch]$PlanOnly,
     [switch]$KeepOnFailure,
     [switch]$SkipLive,
     [switch]$IncludeCompileFail,
@@ -109,9 +120,28 @@ $pgContainer = "wb-linux-pg-$shortId"
 $networkName = "wb-linux-net-$shortId"
 $targetVolume = 'lore-write-behind-linux-target'
 $cargoVolume = 'lore-write-behind-linux-cargo'
+if ($RunNamespace) {
+    $labelName = "$labelName.$RunNamespace"
+    $targetVolume = "lore-write-behind-linux-$RunNamespace-target"
+    $cargoVolume = "lore-write-behind-linux-$RunNamespace-cargo"
+}
 $scratchRoot = Join-Path ([System.IO.Path]::GetTempPath()) "lore-write-behind-linux-$shortId"
 $sourceCopy = Join-Path $scratchRoot 'lore'
 $imageContext = Join-Path $scratchRoot 'image'
+
+if ($PlanOnly) {
+    [pscustomobject]@{
+        OwnershipLabel = $labelName
+        TargetVolume = $targetVolume
+        CargoVolume = $cargoVolume
+        SourceCopy = $sourceCopy
+        BuildContainer = $buildContainer
+        PostgresContainer = $pgContainer
+        Network = $networkName
+        NetworkSubnet = $NetworkSubnet
+    } | ConvertTo-Json
+    return
+}
 
 $createdContainers = [System.Collections.Generic.List[string]]::new()
 $createdNetwork = $false
@@ -430,7 +460,9 @@ try {
     Invoke-Checked docker @('volume', 'create', $targetVolume)
     Invoke-Checked docker @('volume', 'create', $cargoVolume)
 
-    Invoke-Checked docker @('network', 'create', $networkName)
+    $networkArguments = @('network', 'create')
+    if ($NetworkSubnet) { $networkArguments += @('--subnet', $NetworkSubnet) }
+    Invoke-Checked docker ($networkArguments + @($networkName))
     $createdNetwork = $true
 
     # ---- build container -----------------------------------------------------------------
