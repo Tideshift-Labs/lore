@@ -30,6 +30,70 @@ pub(super) fn observe_sync(path: &Path, completed: bool) -> Result<(), WriteBehi
 }
 
 struct Hook;
+
+type ReadGate = Arc<(mpsc::SyncSender<()>, Mutex<mpsc::Receiver<()>>)>;
+static READ_GATES: std::sync::LazyLock<Mutex<std::collections::BTreeMap<PathBuf, ReadGate>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
+
+pub(super) fn before_read(path: &Path) {
+    let gate = READ_GATES.lock().unwrap().get(path).cloned();
+    if let Some(gate) = gate {
+        gate.0.send(()).unwrap();
+        gate.1
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(20))
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cancelled_file_reader_retains_its_io_slot_until_the_blocking_job_finishes() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let hash = [0x44; 32];
+    let resolved = root
+        .resolve(&hash, 1, &derived_staged_key(&hash, 1).unwrap())
+        .unwrap();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (release_tx, release_rx) = mpsc::sync_channel(1);
+    READ_GATES.lock().unwrap().insert(
+        resolved.path().to_path_buf(),
+        Arc::new((entered_tx, Mutex::new(release_rx))),
+    );
+    let reader_root = root.clone();
+    let reader_path = resolved.clone();
+    let reader =
+        lore_base::lore_spawn!(async move { reader_root.read_regular(&reader_path).await });
+    lore_base::lore_spawn_blocking!(move || entered_rx.recv_timeout(Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .expect("real blocking read entered");
+    let permits = (0..15)
+        .map(|_| root.try_io_permit().unwrap())
+        .collect::<Vec<_>>();
+    reader.abort();
+    assert!(reader.await.unwrap_err().is_cancelled());
+    assert!(
+        root.try_io_permit().is_err(),
+        "cancelling the waiter cannot free a live blocking job's slot"
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(permit) = root.try_io_permit() {
+                drop(permit);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed blocking read releases its slot");
+    READ_GATES.lock().unwrap().remove(resolved.path());
+    drop(permits);
+    assert!(root.read_regular(&resolved).await.unwrap().is_none());
+}
 impl Hook {
     fn install(
         observer: impl FnMut(&Path, bool) -> Result<(), WriteBehindError> + 'static,
@@ -71,6 +135,67 @@ fn record_completed() -> (Hook, Arc<Mutex<Vec<PathBuf>>>) {
         Ok(())
     });
     (hook, paths)
+}
+
+#[tokio::test]
+async fn root_clones_share_the_bounded_io_capacity_before_read_or_finalize() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let clone = root.clone();
+    let hash = [0x42; 32];
+    let key = derived_staged_key(&hash, 1).unwrap();
+    let resolved = root.resolve(&hash, 1, &key).unwrap();
+    let mut permits = (0..16)
+        .map(|_| root.try_io_permit().unwrap())
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        clone.read_regular(&resolved).await,
+        Err(WriteBehindError::Io {
+            operation: "staging I/O capacity",
+            kind: std::io::ErrorKind::WouldBlock
+        })
+    ));
+    assert!(matches!(
+        super::super::finalize::finalize(&clone, &resolved, &bytes::Bytes::from_static(b"blocked"))
+            .await,
+        Err(WriteBehindError::Io {
+            operation: "staging I/O capacity",
+            kind: std::io::ErrorKind::WouldBlock
+        })
+    ));
+    assert_eq!(
+        std::fs::read_dir(scratch.0.join("incoming"))
+            .unwrap()
+            .count(),
+        0
+    );
+    permits.pop();
+    assert!(clone.read_regular(&resolved).await.unwrap().is_none());
+}
+
+#[test]
+fn absent_cleanup_requires_the_nearest_parent_fsync_to_complete() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let hash = [0x43; 32];
+    let key = derived_staged_key(&hash, 1).unwrap();
+    let resolved = root.resolve(&hash, 1, &key).unwrap();
+    let expected = scratch.0.canonicalize().unwrap().join("staged");
+    let hook = Hook::install(move |path, done| {
+        if path == expected && !done {
+            return Err(WriteBehindError::RootProbeFailed);
+        }
+        Ok(())
+    });
+    assert!(
+        matches!(
+            root.remove_placement_blocking(&resolved, false),
+            Err(WriteBehindError::RootProbeFailed)
+        ),
+        "ENOENT alone cannot certify durable cleanup"
+    );
+    drop(hook);
+    root.remove_placement_blocking(&resolved, false).unwrap();
 }
 
 #[test]

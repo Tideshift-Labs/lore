@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -19,6 +20,13 @@ pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoRespons
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     if state.store_health_check && !state.available.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    if state
+        .write_behind
+        .as_ref()
+        .is_some_and(|facet| !facet.snapshot().ready)
+    {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
     StatusCode::OK
@@ -76,6 +84,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: true,
             drain: None,
+            write_behind: None,
             event_relay: None,
             fragment_prune: None,
             cell_retention: None,
@@ -109,6 +118,7 @@ mod tests {
             store_health_check: false,
             drain: None,
             event_relay: None,
+            write_behind: None,
             fragment_prune: None,
             cell_retention: None,
         });
@@ -137,6 +147,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: false,
             drain: Some(drain),
+            write_behind: None,
             event_relay: None,
             fragment_prune: None,
             cell_retention: None,
@@ -166,6 +177,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: false,
             drain: Some(drain),
+            write_behind: None,
             event_relay: None,
             fragment_prune: None,
             cell_retention: None,
@@ -198,6 +210,7 @@ mod tests {
             interval_timeout: None,
             store_health_check: true,
             drain: Some(drain),
+            write_behind: None,
             event_relay: None,
             fragment_prune: None,
             cell_retention: None,

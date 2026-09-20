@@ -87,11 +87,33 @@ fn verifier_remains_source_dark_and_unwired() {
         }
         let source = std::fs::read_to_string(&path).expect("read production source");
         assert!(
-            !source.contains("LinuxSpoolVerifier::open")
-                && !source.contains("LinuxSpoolVerifier::new"),
+            !contains_verifier_constructor(&source),
             "verifier wired from {}",
             path.display()
         );
+    }
+}
+
+fn contains_verifier_constructor(source: &str) -> bool {
+    // The writer documents the same root-opening rules without calling the verifier.
+    // Only discard whole comment lines; executable lines remain subject to the ban.
+    source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .any(|line| {
+            line.contains("LinuxSpoolVerifier::open") || line.contains("LinuxSpoolVerifier::new")
+        })
+}
+
+#[test]
+fn verifier_source_guard_ignores_documentation_but_rejects_actual_constructors() {
+    let writer = include_str!("../src/spool_writer.rs");
+    assert!(writer.contains("/// Mirrors `LinuxSpoolVerifier::open`"));
+    assert!(!contains_verifier_constructor(writer));
+    for constructor in ["open", "new"] {
+        assert!(contains_verifier_constructor(&format!(
+            "{writer}\nlet verifier = LinuxSpoolVerifier::{constructor}(&layout, 1);"
+        )));
     }
 }
 

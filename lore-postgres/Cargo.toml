@@ -64,6 +64,7 @@ tokio-util = { workspace = true }
 # `src/store/write_behind/root.rs`'s `cfg(unix)` platform module may name this.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [features]
 # CR-031: whether this build can DECODE an Oodle2-compressed payload.
@@ -118,3 +119,5 @@ tokio-util = { workspace = true }
 # WP-119 Step A tests only (domain_outbox_encoding.rs): parses the
 # idempotency-key.json conformance fixture once the docs lane lands it.
 serde_json = { workspace = true }
+lore-object-dispatch = { path = "../lore-object-dispatch" }
+toml = { workspace = true }

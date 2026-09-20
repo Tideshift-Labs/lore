@@ -94,6 +94,22 @@ for the wire interface.
 Run `pwsh -NoProfile -File lore-server/tests/run-clean-init-actual-cli-live.ps1` from the repository
 root for the disposable actual-CLI happy-path proof. Its auth callbacks are test doubles.
 
+### Fragment write-behind on Linux
+
+The Postgres store can compose `write_behind` with the governed `fragment_provider`. Each enabled
+replica runs bounded promotion, cleanup and observation tasks. Replicas share a Linux staging and
+spool volume, and PostgreSQL owns claims, reader leases and exact capacity release. Missing or
+disabled configuration starts no write-behind tasks. Invalid roots, schema or policy pins refuse
+startup; stale observations stop staged admission.
+
+The image includes `cell-drain-policy-configure <publish|verify|rotate> <json-path>` for maintenance
+policy management. `rotate` requires `--replicas-excluded`; follow the
+[offline rollover procedure](../lore-object-dispatch/README.md#verification) before restarting replicas.
+Use the [implementation contract](../../lorehub/docs/work-packages/wp-122-implementation-contract.md)
+for configuration, cleanup guarantees and required proof. Keep staging and spool roots separate and
+non-nested. Do not switch modes while acknowledged staged bytes remain; retain the database and both
+roots if recovery cannot proceed.
+
 ## Plugin System
 
 The Lore Server uses a plugin system for swappable storage backends and topology discovery.

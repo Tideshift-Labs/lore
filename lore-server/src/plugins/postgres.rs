@@ -371,6 +371,15 @@ pub struct WriteBehindConfig {
     pub drain_stale_after_millis: Option<u64>,
     /// How often the admission sampler refreshes its snapshot.
     pub sample_interval_millis: Option<u64>,
+    /// Maintenance-published policy identity, shared by every replica.
+    pub cell_id: Option<String>,
+    pub policy_revision: Option<String>,
+    pub policy_digest: Option<String>,
+    pub worker_interval_millis: Option<u64>,
+    pub worker_batch: Option<u32>,
+    pub observer_interval_millis: Option<u64>,
+    pub cleanup_interval_millis: Option<u64>,
+    pub cleanup_batch: Option<u32>,
 }
 
 /// One enabled `[write_behind]` block, validated, as the two values composition
@@ -387,20 +396,11 @@ pub(crate) struct WriteBehindComposition {
     pub(crate) settings: WriteBehindSettings,
     /// The object-dispatch spool root the drain capability is minted against.
     ///
-    /// Validated here and **not yet consumed by a production caller**, in the
-    /// same deliberate state step 1 left `_write_behind_stage` in: WP-122's
-    /// drain step is its only consumer, and inventing an interim one would mean
-    /// composing a drain worker that cannot promote. The validation is the
-    /// value this key has today — a cell whose two roots share a tree is
-    /// refused at boot rather than discovered when contract C2's reclaimer
-    /// deletes an in-flight upload. The `allow` comes off when the worker reads
-    /// it; until then a `dead_code` warning here would be noise about a state
-    /// that is intended and recorded.
-    #[allow(
-        dead_code,
-        reason = "consumed by WP-122's drain worker; validated and carried until then"
-    )]
     pub(crate) shared_spool_root: PathBuf,
+    pub(crate) cell_id: String,
+    pub(crate) policy_revision: String,
+    pub(crate) policy_digest: [u8; 32],
+    pub(crate) runtime: crate::fragment_write_behind::FragmentWriteBehindSettings,
 }
 
 struct EnabledFragmentProviderConfig {
@@ -809,9 +809,52 @@ fn validated_write_behind_settings(
         drain_stale_after: Duration::from_millis(drain_stale_after),
         sample_interval: Duration::from_millis(sample_interval),
     };
+    let required_text = |field: &str, value: &Option<String>| {
+        value
+            .as_ref()
+            .filter(|value| {
+                !value.is_empty()
+                    && value.len() <= 128
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+            })
+            .cloned()
+            .ok_or_else(|| write_behind_error(name, format!("requires a bounded {field}")))
+    };
+    let cell_id = required_text("cell_id", &raw.cell_id)?;
+    let policy_revision = required_text("policy_revision", &raw.policy_revision)?;
+    let digest = raw
+        .policy_digest
+        .as_deref()
+        .ok_or_else(|| write_behind_error(name, "requires policy_digest"))?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(write_behind_error(
+            name,
+            "requires a 64-character hexadecimal policy_digest",
+        ));
+    }
+    let mut policy_digest = [0u8; 32];
+    for (index, byte) in policy_digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&digest[index * 2..index * 2 + 2], 16)
+            .map_err(|_error| write_behind_error(name, "invalid policy_digest"))?;
+    }
+    let runtime = crate::fragment_write_behind::FragmentWriteBehindSettings::new(
+        raw.worker_interval_millis.unwrap_or(1_000),
+        raw.worker_batch.unwrap_or(64),
+        raw.observer_interval_millis.unwrap_or(1_000),
+        drain_stale_after,
+        raw.cleanup_interval_millis.unwrap_or(5_000),
+        raw.cleanup_batch.unwrap_or(64),
+    )
+    .map_err(|error| write_behind_error(name, error.to_string()))?;
     Ok(WriteBehindComposition {
         settings,
         shared_spool_root,
+        cell_id,
+        policy_revision,
+        policy_digest,
+        runtime,
     })
 }
 
@@ -882,7 +925,7 @@ fn enabled_write_behind_settings(
 /// probe for the reason D13 gives: the difference is in directory fsync and
 /// rename semantics, which a probe would have to *perform* to discover, on the
 /// root it is deciding whether to trust.
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn write_behind_platform_gate(_name: &str) -> Result<(), PluginError> {
     Ok(())
 }
@@ -891,12 +934,11 @@ fn write_behind_platform_gate(_name: &str) -> Result<(), PluginError> {
 ///
 /// Without it an operator configures a staging tier, boots, sees a healthy
 /// process, and learns the truth one failed PUT at a time.
-#[cfg(not(unix))]
+#[cfg(not(target_os = "linux"))]
 fn write_behind_platform_gate(name: &str) -> Result<(), PluginError> {
     Err(write_behind_error(
         name,
-        "requires a Unix host; write-behind staging depends on directory fsync and rename \
-         semantics this platform does not provide",
+        "requires a Linux host; the durable drain spool writer requires Linux openat2 semantics",
     ))
 }
 
@@ -2793,6 +2835,9 @@ hard_count = 30
 min_free_bytes = 4096
 drain_stale_after_millis = 30000
 sample_interval_millis = 5000
+cell_id = "fixture-cell"
+policy_revision = "fixture-policy-v1"
+policy_digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 "#,
             staging_root(),
             spool_root()
@@ -2885,7 +2930,7 @@ enabled = true
     /// looking through a block of twelve of them.
     #[test]
     fn every_omitted_write_behind_key_is_refused_by_its_own_name() {
-        const REQUIRED: [&str; 11] = [
+        const REQUIRED: [&str; 14] = [
             "root",
             "spool_root",
             "low_bytes",
@@ -2897,6 +2942,9 @@ enabled = true
             "min_free_bytes",
             "drain_stale_after_millis",
             "sample_interval_millis",
+            "cell_id",
+            "policy_revision",
+            "policy_digest",
         ];
         let complete = valid_write_behind_block();
         for key in REQUIRED {
@@ -3186,16 +3234,16 @@ bucket = "fragments"
     /// refuses every operation. This is the other half, and it is the one that
     /// matters to an operator: without it a cell configured for staging boots,
     /// reports healthy, and learns the truth one failed PUT at a time.
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     #[test]
-    fn an_otherwise_valid_write_behind_block_is_refused_at_boot_off_unix() {
+    fn an_otherwise_valid_write_behind_block_is_refused_at_boot_off_linux() {
         let parsed = parsed_config_with(&valid_write_behind_block());
         let error = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
-            Ok(_) => panic!("staging must be refused off Unix"),
+            Ok(_) => panic!("write-behind must be refused off Linux"),
             Err(error) => error.to_string(),
         };
         assert!(
-            error.contains("requires a Unix host"),
+            error.contains("requires a Linux host"),
             "the refusal must name the platform, not a field; got {error}"
         );
     }
@@ -3203,9 +3251,9 @@ bucket = "fragments"
     /// The same block, on the platform that can stage, must be accepted — so
     /// the case above is proved to be refusing for its stated reason rather
     /// than tripping over a fixture that was never valid anywhere.
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
-    fn the_same_write_behind_block_is_accepted_on_unix() {
+    fn the_same_write_behind_block_is_accepted_on_linux() {
         let parsed = parsed_config_with(&valid_write_behind_block());
         let composition = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
             Ok(Some(composition)) => composition,

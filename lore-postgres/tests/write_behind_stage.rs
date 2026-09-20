@@ -134,6 +134,174 @@ fn found_bytes(read: StagedRead) -> Bytes {
 }
 
 #[tokio::test]
+async fn bounded_inventory_finds_typed_temps_and_final_files_but_retains_unknown_names() {
+    use lore_postgres::store::write_behind::cleanup::StageFileScanner;
+    let root = ScratchRoot::new("typed-inventory");
+    let stage = open(&root);
+    let hash = [0x12; 32];
+    let key = staged_key(&hash, 7);
+    stage
+        .stage(&hash, 7, &key, &Bytes::from_static(b"final"))
+        .await
+        .unwrap();
+    let temporary = root
+        .path()
+        .join("incoming")
+        .join(format!("{}.tmp", staged_key(&hash, 8)));
+    std::fs::write(&temporary, b"identified temp").unwrap();
+    let unknown = root.path().join("incoming").join("legacy-unowned.tmp");
+    std::fs::write(&unknown, b"retain unknown custody").unwrap();
+    let mut scanner = StageFileScanner::default();
+    assert!(scanner.scan(&stage, 0).is_err());
+    assert!(scanner.scan(&stage, 257).is_err());
+    let mut found = std::collections::BTreeSet::new();
+    for _ in 0..32 {
+        let batch = scanner.scan(&stage, 1).unwrap();
+        assert!(batch.len() <= 1);
+        for candidate in batch {
+            found.insert((candidate.hash, candidate.epoch));
+        }
+    }
+    assert_eq!(
+        found,
+        std::collections::BTreeSet::from([(hash, 7), (hash, 8)])
+    );
+    assert!(temporary.exists());
+    assert!(unknown.exists());
+    let (_, bytes, files, unknown_count) = scanner
+        .physical_observation()
+        .expect("a full cycle completed");
+    assert_eq!(bytes, 5 + 15 + 22);
+    assert_eq!(files, 3);
+    assert_eq!(unknown_count, 1);
+    let mut scanner = StageFileScanner::default();
+    for _ in 0..64 {
+        scanner.scan(&stage, 1).unwrap();
+        if scanner.physical_observation().is_some() {
+            break;
+        }
+    }
+    let completed = scanner.physical_observation();
+    assert!(completed.is_some());
+    scanner.scan(&stage, 1).unwrap();
+    assert_eq!(
+        scanner.physical_observation(),
+        completed,
+        "partial traversal retains the last complete occupancy"
+    );
+}
+
+#[tokio::test]
+async fn deterministic_temp_collision_preserves_the_existing_file() {
+    let root = ScratchRoot::new("temp-collision");
+    let stage = open(&root);
+    let hash = [0x32; 32];
+    let key = staged_key(&hash, 4);
+    let temporary = root.path().join("incoming").join(format!("{key}.tmp"));
+    std::fs::write(&temporary, b"existing writer custody").unwrap();
+    assert!(
+        stage
+            .stage(&hash, 4, &key, &Bytes::from_static(b"second writer"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(&temporary).unwrap(),
+        b"existing writer custody"
+    );
+    assert!(!staged_path(root.path(), &hash, 4).exists());
+}
+
+#[tokio::test]
+async fn replacement_of_root_on_the_same_device_refuses_read_and_stage() {
+    let root = ScratchRoot::new("replaced-root");
+    let stage = open(&root);
+    let hash = [0x33; 32];
+    let key = staged_key(&hash, 4);
+    stage
+        .stage(&hash, 4, &key, &Bytes::from_static(b"original"))
+        .await
+        .unwrap();
+    let moved = ScratchRoot::new("moved-original");
+    std::fs::remove_dir(moved.path()).unwrap();
+    std::fs::rename(root.path(), moved.path()).unwrap();
+    std::fs::create_dir(root.path()).unwrap();
+    assert!(matches!(
+        stage.read_staged(&hash, 4, &key).await,
+        StagedRead::Unavailable(_)
+    ));
+    assert!(
+        stage
+            .stage(&hash, 4, &key, &Bytes::from_static(b"replacement"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        std::fs::read(staged_path(moved.path(), &hash, 4)).unwrap(),
+        b"original"
+    );
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn inventory_retains_directory_handles_when_a_shard_is_replaced_by_a_symlink() {
+    use lore_postgres::store::write_behind::cleanup::StageFileScanner;
+    let root = ScratchRoot::new("inventory-substitution");
+    let stage = open(&root);
+    let hash = [0x45; 32];
+    for epoch in 0..32 {
+        stage
+            .stage(
+                &hash,
+                epoch,
+                &staged_key(&hash, epoch),
+                &Bytes::from_static(b"owned"),
+            )
+            .await
+            .unwrap();
+    }
+    let mut scanner = StageFileScanner::default();
+    let mut entered = false;
+    for _ in 0..64 {
+        if !scanner.scan(&stage, 1).unwrap().is_empty() {
+            entered = true;
+            break;
+        }
+    }
+    assert!(
+        entered,
+        "scan has entered the real leaf and retains its cursor"
+    );
+    let leaf = staged_path(root.path(), &hash, 0)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let moved = ScratchRoot::new("retained-leaf");
+    std::fs::remove_dir(moved.path()).unwrap();
+    std::fs::rename(&leaf, moved.path()).unwrap();
+    let external = ScratchRoot::new("external-inventory");
+    let sentinel = external.path().join(staged_key(&hash, 999));
+    std::fs::write(&sentinel, vec![0x6a; 100_000]).unwrap();
+    std::os::unix::fs::symlink(external.path(), &leaf).unwrap();
+    for _ in 0..128 {
+        for candidate in scanner.scan(&stage, 1).unwrap() {
+            assert_ne!(
+                candidate.epoch, 999,
+                "replacement path must never redirect the retained descriptor"
+            );
+        }
+        if let Some((_, bytes, _, _)) = scanner.physical_observation() {
+            assert!(
+                bytes <= 32 * 5,
+                "external sentinel cannot enter occupancy evidence"
+            );
+        }
+    }
+    assert_eq!(std::fs::metadata(sentinel).unwrap().len(), 100_000);
+    std::fs::remove_file(leaf).unwrap();
+}
+
+#[tokio::test]
 async fn stage_then_read_staged_round_trips_byte_identical_payload() {
     let root = ScratchRoot::new("roundtrip");
     let stage = open(&root);

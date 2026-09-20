@@ -25,7 +25,7 @@ tokio-postgres-rustls = { version = "0.13", default-features = false }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 unicode-normalization = "0.1.25"
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["serde"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }

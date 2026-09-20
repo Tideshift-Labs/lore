@@ -67,6 +67,12 @@ $target = 'cell_schema_install_live'
 
 $gateTests = @(
     @{
+        EnvVar   = 'LORE_TEST_DRAIN_POLICY_PG_URL'
+        Name     = 'live_drain_policy_publication_is_maintenance_only_and_replays_exactly'
+        Database = 'drain_policy'
+        ExtraEnv = @{ 'LORE_TEST_DRAIN_POLICY_ADMIN_PG_URL' = 'postgres' }
+    },
+    @{
         EnvVar   = 'LORE_TEST_CELL_SCHEMA_CLEAN_PG_URL'
         Name     = 'live_postgres_cell_schema_installs_clean_and_attests'
         Database = 'cell_schema_clean'

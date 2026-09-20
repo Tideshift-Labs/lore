@@ -58,6 +58,20 @@ $inventory = @(
     [pscustomobject]@{
         Package       = 'lore-postgres'
         Kind          = 'test'
+        Target        = 'fragment_stage_custody'
+        Exact         = $true
+        ExactPrefixes = @()
+        Cases         = @(
+            'two_replicas_cannot_overbook_the_last_stage_bytes',
+            'two_replicas_cannot_overbook_the_last_stage_file',
+            'missing_policy_refuses_stage_without_leaving_custody_or_usage',
+            'already_readable_replay_does_not_reserve_capacity_twice',
+            'stage_policy_identity_must_match_the_published_cell_revision_and_digest'
+        )
+    }
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
         Target        = 'domain_fragment_lifecycle'
         Exact         = $true
         ExactPrefixes = @()
@@ -280,11 +294,29 @@ $inventory = @(
             # Unix-only (see $unixOnlyCases). Listed here unconditionally so the prefix
             # scope still forbids an unowned sibling case on a Unix host; off Unix the
             # prefix simply matches nothing in the catalog.
-            'store::immutable_store::tests::first_put_staged_'
+            'store::immutable_store::tests::first_put_staged_',
+            'store::immutable_store::fragment_write_behind::source_tests::',
+            'store::immutable_store::fragment_write_behind::adapter_tests::'
         )
         Cases         = @(
             'store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone',
-            'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry'
+            'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry',
+            'store::immutable_store::fragment_write_behind::adapter_tests::adapter_valid_bytes_with_conflicting_content_flags_cannot_replace_staged_authority',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_staged_source_creates_neither_claim_nor_provider_request',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_cleanup_recovers_after_finished_purge_and_scan_tasks_panic',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_drain_progresses_while_foreground_gets_share_the_provider_budget',
+    'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::observer_sees_peer_stage_then_refuses_a_replaced_local_mount_without_restart',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observer_completes_inventory_across_more_than_one_bounded_scan',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_stalled_put_releases_the_single_domain_connection_and_survives_task_abort',
+    'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_before_object_effect_keeps_source_and_send_barrier',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_precondition_adopts_actual_alternate_compression_manifest',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_remote_readback_keeps_staged_source_and_late_effect_barrier',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_reads_back_without_repeating_the_put',
+    'store::immutable_store::fragment_write_behind::source_tests::orphan_temp_cleanup_is_confined_and_replayed_without_double_refund',
+    'store::immutable_store::fragment_write_behind::source_tests::source_validation_round_trips_raw_lz4_zstd_and_refuses_corrupt_or_missing_bytes'
         )
     },
     # Staging is compiled only on Unix (`write_behind_staging_lifecycle.rs` is whole-file
@@ -321,7 +353,14 @@ $inventory = @(
             'a_staged_head_with_active_operation_stamped_by_a_real_promotion_is_not_returned',
             'a_live_prepared_claim_blocks_the_hash_and_an_elapsed_one_releases_it',
             'batch_bound_and_order_returns_exactly_n_in_ascending_hash_order',
-            'a_commit_staged_candidate_never_carries_a_provider_body_digest'
+            'a_commit_staged_candidate_never_carries_a_provider_body_digest',
+            'expired_prepared_promotion_is_selected_and_taken_over',
+            'expired_sending_promotion_is_selected_only_after_hard_deadline',
+            'expired_ambiguous_promotion_is_selected_only_after_hard_deadline',
+            'unknown_active_operation_is_never_a_drain_candidate',
+            'generic_keyset_plan_uses_recovery_index_on_a_mixed_state_population',
+            'changed_source_witness_is_fenced_before_any_claim_is_created',
+            'keyset_pages_reach_later_hashes_and_wrap_without_repeating_the_first_batch'
         )
     }
 )
@@ -334,6 +373,22 @@ $isUnixHost = [Environment]::OSVersion.Platform -eq [PlatformID]::Unix
 # the pass total -- this tier stays exit 0 for work it honestly names as not run.
 $unixOnlyCases = @(
     'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry',
+            'store::immutable_store::fragment_write_behind::adapter_tests::adapter_valid_bytes_with_conflicting_content_flags_cannot_replace_staged_authority',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_staged_source_creates_neither_claim_nor_provider_request',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_cleanup_recovers_after_finished_purge_and_scan_tasks_panic',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_drain_progresses_while_foreground_gets_share_the_provider_budget',
+    'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::observer_sees_peer_stage_then_refuses_a_replaced_local_mount_without_restart',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observer_completes_inventory_across_more_than_one_bounded_scan',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_stalled_put_releases_the_single_domain_connection_and_survives_task_abort',
+    'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_before_object_effect_keeps_source_and_send_barrier',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_precondition_adopts_actual_alternate_compression_manifest',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_remote_readback_keeps_staged_source_and_late_effect_barrier',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_reads_back_without_repeating_the_put',
+    'store::immutable_store::fragment_write_behind::source_tests::orphan_temp_cleanup_is_confined_and_replayed_without_double_refund',
+    'store::immutable_store::fragment_write_behind::source_tests::source_validation_round_trips_raw_lz4_zstd_and_refuses_corrupt_or_missing_bytes',
     'staged_commit_then_witness_capture_through_the_put_staged_sequence',
     'crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_gets_a_fresh_epoch',
     'crash_between_commit_staged_and_association_recovers_with_exactly_one_file',
@@ -347,6 +402,7 @@ $platformSkipStatus = "NOT RUN (platform: Unix-only - owned by $(Split-Path -Lea
 # captured output on FAIL/NOT RUN; a measurement that PASSES would otherwise
 # have its numbers swallowed, which is the one thing it exists to produce.
 $printOutputCases = @(
+    'generic_keyset_plan_uses_recovery_index_on_a_mixed_state_population',
     'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout',
     'same_repo_lifecycle_traffic_requires_complete_proof',
     'cross_repo_bulk_upload_does_not_abort_unrelated_push',

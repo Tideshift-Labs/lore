@@ -336,6 +336,7 @@ fn health(cell_retention: Option<Arc<CellRetentionReadiness>>) -> Arc<ServerHeal
         drain: None,
         event_relay: None,
         fragment_prune: None,
+        write_behind: None,
         cell_retention,
     })
 }

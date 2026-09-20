@@ -144,22 +144,30 @@ fn stored_state_shape_and_barrier_index_match_the_closed_typed_vocabulary() {
         );
     }
 
-    // WP-115/L1: the two declarations now legitimately seed DIFFERENT
-    // literals. `MIGRATION` (`0001_init.sql`) is unmodified by DECISION 3 and
-    // still seeds the base revision 3; a fresh `FRAGMENT_SCHEMA` bootstrap
-    // applies the whole current schema (including the promotion-claim ALTER
-    // extension) in one pass, so it seeds the current
-    // `FRAGMENT_SCHEMA_VERSION` (4) directly rather than needing `0002`'s
-    // UPDATE-based raise afterward.
+    // The base migration seeds 3; the claim bootstrap seeds 4. Both the
+    // composed runtime stage schema and migration 0003 then raise to 5.
     assert!(
         collapse_whitespace(MIGRATION).contains("3 AS schema_version"),
         "migrations/0001_init.sql must still seed the base revision 3"
     );
     assert!(
-        collapse_whitespace(FRAGMENT_SCHEMA)
-            .contains(&format!("{FRAGMENT_SCHEMA_VERSION} AS schema_version")),
-        "a fresh FRAGMENT_SCHEMA bootstrap must seed the current schema_version directly"
+        collapse_whitespace(FRAGMENT_SCHEMA).contains("4 AS schema_version"),
+        "the claim schema must retain its base revision"
     );
+    for stage_schema in [
+        include_str!("../src/domain/fragments/stage_schema.rs"),
+        include_str!("../migrations/0003_fragment_stage_custody.sql"),
+    ] {
+        let compact: String = stage_schema.split_whitespace().collect();
+        assert!(compact.contains("SETschema_version=5"));
+    }
+    for rotation_schema in [
+        include_str!("../src/domain/fragments/stage_rotation_schema.rs"),
+        include_str!("../migrations/0004_fragment_stage_policy_rotation.sql"),
+    ] {
+        let compact: String = rotation_schema.split_whitespace().collect();
+        assert!(compact.contains(&format!("SETschema_version={FRAGMENT_SCHEMA_VERSION}")));
+    }
 
     // D10 NARROW (owner ruling): a promotion send claim never authorizes a
     // new disposition value. `lore_fragment_epochs.disposition` must stay

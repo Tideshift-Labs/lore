@@ -143,7 +143,7 @@ fn ordinary_direct_write_supplies_the_legacy_hash_key_but_missing_uses_a_repair_
     let entry = function(&coordinator, "async fn begin_publication(");
     let delegated: String = entry.split_whitespace().collect();
     assert!(delegated.contains(
-        ".begin_publication_once(hash,authority,legacy_object_key,claim_input,require_missing,).await?"
+        ".begin_publication_once(hash,authority,legacy_object_key,claim_input,require_missing,stage_reservation,).await?"
     ));
     let publication = function(&coordinator, "async fn begin_publication_once(");
     assert!(publication.contains("(Some(_), Some(FragmentLifecycleState::Missing)) =>"));

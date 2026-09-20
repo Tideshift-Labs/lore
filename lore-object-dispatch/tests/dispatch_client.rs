@@ -1782,7 +1782,7 @@ fn test_budget(dispatch_pool_max: u32) -> DispatchConnectionBudget {
 // Source-dark boundary
 // ------------------------------------------------------------------------------------------
 
-fn bounded_maintenance_cli_pool(source: &str) -> bool {
+fn bounded_maintenance_pool_config(source: &str) -> bool {
     if source.matches("DispatchRuntimePool::new(").count() != 1 {
         return false;
     }
@@ -1803,9 +1803,81 @@ fn bounded_maintenance_cli_pool(source: &str) -> bool {
     ]
     .iter()
     .all(|required| config.contains(required))
-        && source.contains("Duration::from_secs(30)")
         && !source.contains("DispatchRuntimeClient")
         && !source.contains("DispatchMaintenanceClient")
+}
+
+fn bounded_maintenance_cli_pool(source: &str) -> bool {
+    bounded_maintenance_pool_config(source) && source.contains("Duration::from_secs(30)")
+}
+
+fn bounded_drain_maintenance_cli_pool(source: &str) -> bool {
+    bounded_maintenance_pool_config(source)
+        && source.contains("tls: DispatchTlsMode::PinnedRootCa(ca),")
+        && source.contains("expected_database_identity: identity,")
+        && source.contains("DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0)")
+        && source.matches("DrainClient::new(").count() == 1
+        && source.contains("DrainClient::new(Arc::new(pool))")
+        && source.contains(".configure(&config.drain, publish)")
+}
+
+#[test]
+fn drain_maintenance_cli_exception_requires_one_bounded_pinned_maintenance_pool() {
+    let source =
+        std::fs::read_to_string(crate_root().join("src/bin/cell-drain-policy-configure.rs"))
+            .expect("drain maintenance CLI source");
+    assert!(bounded_drain_maintenance_cli_pool(&source));
+    assert!(!bounded_drain_maintenance_cli_pool(&format!(
+        "{source}\nDispatchRuntimePool::new(config)"
+    )));
+    for (original, replacement) in [
+        (
+            "role: DispatchPoolRole::Maintenance,",
+            "role: DispatchPoolRole::Runtime,",
+        ),
+        ("pool_max: 1,", "pool_max: 2,"),
+        (
+            "connect_timeout: Duration::from_secs(10),",
+            "connect_timeout: Duration::MAX,",
+        ),
+        (
+            "acquire_timeout: Duration::from_secs(10),",
+            "acquire_timeout: Duration::MAX,",
+        ),
+        (
+            "statement_timeout: Duration::from_secs(10),",
+            "statement_timeout: Duration::MAX,",
+        ),
+        (
+            "lock_timeout: Duration::from_secs(2),",
+            "lock_timeout: Duration::MAX,",
+        ),
+        (
+            "tls: DispatchTlsMode::PinnedRootCa(ca),",
+            "tls: DispatchTlsMode::Disabled,",
+        ),
+        (
+            "expected_database_identity: identity,",
+            "expected_database_identity: other_identity,",
+        ),
+        (
+            "DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0)",
+            "DispatchConnectionBudget::new(1, 1, 1, 1, 2, 0)",
+        ),
+        (
+            ".configure(&config.drain, publish)",
+            ".reserve(&descriptor)",
+        ),
+    ] {
+        assert!(
+            source.contains(original),
+            "mutation must change the fixture"
+        );
+        assert!(
+            !bounded_drain_maintenance_cli_pool(&source.replace(original, replacement)),
+            "accepted {replacement}"
+        );
+    }
 }
 
 #[test]
@@ -1876,6 +1948,13 @@ fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
                 );
                 continue;
             }
+            if path == crate_root().join("src/bin/cell-drain-policy-configure.rs") {
+                assert!(
+                    bounded_drain_maintenance_cli_pool(&source),
+                    "drain maintenance CLI escaped its exact bounded configuration"
+                );
+                continue;
+            }
             pool_consumers.push(name.to_string());
             assert!(
                 !source.contains("DispatchRuntimePool::new("),
@@ -1884,11 +1963,11 @@ fn no_other_crate_source_file_calls_the_typed_clients_or_builds_another_pool() {
             );
         }
     }
+    pool_consumers.sort();
     assert_eq!(
         pool_consumers,
-        vec!["cell_retention.rs", "provider_charge.rs"],
-        "only the charge authority and cell-scale retention (WP-114 CD-8) may consume the shared \
-         runtime pool"
+        vec!["cell_retention.rs", "drain_policy.rs", "provider_charge.rs"],
+        "only charge, retention, and drain authority may consume the existing shared runtime pool"
     );
 }
 

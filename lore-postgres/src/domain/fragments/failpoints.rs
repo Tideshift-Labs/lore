@@ -103,6 +103,22 @@ const PAUSE_POLL: Duration = Duration::from_millis(5);
 /// [`hit`] — the configuration parser drops it.
 const ANCHORS: &[(&str, &str)] = &[
     (
+        "stage.cleanup.settled",
+        "WP-122 lost cleanup acknowledgement after durable capacity release, racing exact obliteration",
+    ),
+    (
+        "stage.temp.synced",
+        "WP-122 process loss after staging temp fsync, before rename or publication; no database resource held",
+    ),
+    (
+        "stage.final.renamed",
+        "WP-122 process loss after staging rename, before directory durability or publication; no database resource held",
+    ),
+    (
+        "drain.source.entry",
+        "WP-122 two-replica ACK before promotion and accepting-process loss; no database or provider resource held",
+    ),
+    (
         "repository_create.metadata_bound",
         "WP-118 single-server create: failure between metadata associations must roll back the entire publication",
     ),
@@ -380,7 +396,7 @@ impl Action {
 /// `enable_lifecycle`'s, which is a single autocommit `UPDATE` rather than a
 /// transaction.
 ///
-/// The last five are CR-032's outbox relay store, which needed its own names
+/// The outbox windows are CR-032's relay store, which needed its own names
 /// rather than being forced into the coordinator's three. That store has no
 /// single transaction shape to name windows against: `claim_batch` and
 /// `dead_letter` open their own short transactions, while
@@ -388,6 +404,8 @@ impl Action {
 /// windows are therefore statement-relative, and calling the point between a
 /// dead letter's copy and its delete `.locked` would have been a name that
 /// told a harness author nothing about what is on either side of it.
+/// Staging also names temporary-file fsync and final-file rename boundaries.
+/// Repository creation binds metadata inside its publication transaction.
 #[cfg(test)]
 const WINDOW_SUFFIXES: &[&str] = &[
     ".entry",
@@ -400,6 +418,9 @@ const WINDOW_SUFFIXES: &[&str] = &[
     ".before_update",
     ".after_update",
     ".between_copy_and_delete",
+    ".synced",
+    ".renamed",
+    ".metadata_bound",
 ];
 
 /// Whether an anchor names a window that is past its commit, and so can carry
@@ -681,6 +702,9 @@ mod tests {
             ".before_commit",
             ".before_update",
             ".between_copy_and_delete",
+            ".synced",
+            ".renamed",
+            ".metadata_bound",
         ] {
             assert!(!is_post_commit(&format!("some.anchor{suffix}")));
         }

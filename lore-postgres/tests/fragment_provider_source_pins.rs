@@ -7,8 +7,8 @@
 //! # Why this file shrank
 //!
 //! The provider seam moved to `lore-fragment-provider`, and with it most of what
-//! this file used to check. `lore-postgres` no longer depends on
-//! `lore-object-dispatch`, so nothing here can name
+//! this file used to check. `lore-postgres` has no shipped dependency on
+//! `lore-object-dispatch` (test fixtures may use it), so production code cannot name
 //! `GovernedProviderClient::execute`'s parameter types and therefore nothing
 //! here can call it — the alias scans, accessor scans, re-export scans and the
 //! scaffolding they needed were all guarding a property the compiler now holds,
@@ -55,11 +55,103 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+fn shipped_dispatch_dependencies(manifest: &str, workspace: &str) -> Vec<String> {
+    let manifest: toml::Value = toml::from_str(manifest).expect("valid package manifest");
+    let workspace: toml::Value = toml::from_str(workspace).expect("valid workspace manifest");
+    let mut found = Vec::new();
+    let mut check = |scope: &str, owner: &toml::Value| {
+        for section in ["dependencies", "build-dependencies"] {
+            let Some(dependencies) = owner.get(section) else {
+                continue;
+            };
+            for (name, declaration) in dependencies.as_table().expect("dependency table") {
+                let resolved =
+                    if declaration.get("workspace").and_then(toml::Value::as_bool) == Some(true) {
+                        workspace
+                            .get("workspace")
+                            .and_then(|value| value.get("dependencies"))
+                            .and_then(|value| value.get(name))
+                            .expect("inherited dependency must exist in workspace")
+                    } else {
+                        declaration
+                    };
+                let package = resolved
+                    .get("package")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or(name);
+                if package.replace('_', "-") == "lore-object-dispatch" {
+                    found.push(format!("{scope}.{section}.{name}"));
+                }
+            }
+        }
+    };
+    check("package", &manifest);
+    if let Some(targets) = manifest.get("target") {
+        for (target, owner) in targets.as_table().expect("target table") {
+            check(&format!("target.{target}"), owner);
+        }
+    }
+    found
+}
+
+#[test]
+fn dispatch_is_absent_from_regular_and_build_dependencies_on_every_target() {
+    assert!(
+        shipped_dispatch_dependencies(
+            include_str!("../Cargo.toml"),
+            include_str!("../../Cargo.toml"),
+        )
+        .is_empty(),
+        "dispatch may be a dev dependency only; production must use the provider seam"
+    );
+}
+
+#[test]
+fn dispatch_dependency_guard_accepts_only_dev_sections() {
+    let manifest = r#"
+        [dev-dependencies]
+        lore-object-dispatch = { path = "../lore-object-dispatch" }
+        [target.'cfg(unix)'.dev-dependencies]
+        renamed = { package = "lore-object-dispatch", version = "1" }
+        [dependencies]
+        lore-fragment-provider = "1"
+        [build-dependencies]
+        harmless = "1"
+    "#;
+    assert!(shipped_dispatch_dependencies(manifest, "").is_empty());
+}
+
+#[test]
+fn dispatch_dependency_guard_rejects_regular_build_target_and_workspace_aliases() {
+    let workspace = r#"
+        [workspace.dependencies]
+        dispatch_alias = { package = "lore-object-dispatch", path = "lore-object-dispatch" }
+    "#;
+    for scope in ["", "target.'cfg(unix)'.", "target.x86_64-pc-windows-msvc."] {
+        for section in ["dependencies", "build-dependencies"] {
+            for declaration in [
+                "lore-object-dispatch = '1'",
+                "renamed = { package = 'lore-object-dispatch', version = '1' }",
+                "dispatch_alias = { workspace = true }",
+            ] {
+                // A dev section before the forbidden dependency must not hide it.
+                let manifest =
+                    format!("[dev-dependencies]\nfixture = '1'\n[{scope}{section}]\n{declaration}");
+                assert_eq!(
+                    shipped_dispatch_dependencies(&manifest, workspace).len(),
+                    1,
+                    "missed forbidden dependency: {manifest}"
+                );
+            }
+        }
+    }
+}
+
 /// The files this rule covers — every package file but one. `provider.rs` is
 /// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 9] = [
+const SCANNED_FILES: [&str; 12] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -68,12 +160,15 @@ const SCANNED_FILES: [&str; 9] = [
     "membership.rs",
     "mod.rs",
     "schema.rs",
+    "stage_custody.rs",
+    "stage_rotation_schema.rs",
+    "stage_schema.rs",
     "states.rs",
 ];
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
-const PACKAGE_FILES: [&str; 10] = [
+const PACKAGE_FILES: [&str; 13] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -83,6 +178,9 @@ const PACKAGE_FILES: [&str; 10] = [
     "mod.rs",
     "provider.rs",
     "schema.rs",
+    "stage_custody.rs",
+    "stage_rotation_schema.rs",
+    "stage_schema.rs",
     "states.rs",
 ];
 
@@ -232,14 +330,17 @@ fn the_scanned_file_list_is_what_the_package_compiles() {
         .collect();
     declared.push("mod.rs".to_string());
     let coordinator_source = strip_line_comments(&read("coordinator.rs"));
-    assert_eq!(
-        coordinator_source
-            .lines()
-            .filter(|line| line.trim() == "mod creation;")
-            .count(),
-        1
-    );
-    declared.push("creation.rs".to_string());
+    for sibling in ["creation", "stage_custody"] {
+        let declaration = format!("mod {sibling};");
+        assert_eq!(
+            coordinator_source
+                .lines()
+                .filter(|line| line.trim() == declaration)
+                .count(),
+            1
+        );
+        declared.push(format!("{sibling}.rs"));
+    }
     declared.sort();
     assert_eq!(
         declared,
@@ -513,9 +614,11 @@ fn the_package_splices_in_no_source_from_outside_itself() {
         let mut source = strip_line_comments(&read(file));
         if file == "coordinator.rs" {
             // This sibling is explicitly included in PACKAGE_FILES and scanned above.
-            let local_creation = "#[path = \"creation.rs\"]";
-            assert_eq!(source.matches(local_creation).count(), 1);
-            source = source.replace(local_creation, "");
+            for sibling in ["creation.rs", "stage_custody.rs"] {
+                let local_module = format!("#[path = \"{sibling}\"]");
+                assert_eq!(source.matches(&local_module).count(), 1);
+                source = source.replace(&local_module, "");
+            }
         }
         let found = hits(&source, &["include!", "#[path"]);
         assert!(

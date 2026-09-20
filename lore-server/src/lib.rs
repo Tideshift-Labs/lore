@@ -10,6 +10,7 @@ pub mod event_relay;
 pub mod execution_state;
 pub mod fragment_prune;
 pub mod fragment_retention;
+pub mod fragment_write_behind;
 pub mod grpc;
 pub mod hooks;
 pub mod http;

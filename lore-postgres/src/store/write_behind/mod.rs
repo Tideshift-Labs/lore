@@ -190,6 +190,11 @@ pub struct WriteBehindStage {
     /// state must read as unready. Only a positive observation of zero pending
     /// staged rows clears it, through [`WriteBehindStage::note_pending_staged`].
     pending_staged: AtomicBool,
+    pending_observed: std::sync::Mutex<Option<std::time::Instant>>,
+    observation_stale_after: Duration,
+    capacity_available: AtomicBool,
+    min_free_bytes: u64,
+    hard_limits: (u64, u64),
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -263,6 +268,14 @@ impl WriteBehindStage {
             root,
             admission,
             pending_staged: AtomicBool::new(true),
+            pending_observed: std::sync::Mutex::new(None),
+            observation_stale_after: settings.drain_stale_after,
+            capacity_available: AtomicBool::new(true),
+            min_free_bytes: settings.watermarks.min_free_bytes,
+            hard_limits: (
+                settings.watermarks.hard_bytes,
+                settings.watermarks.hard_count,
+            ),
             sampler,
         }))
     }
@@ -270,8 +283,19 @@ impl WriteBehindStage {
     /// The current admission mode.
     #[must_use]
     pub fn mode(&self) -> StagingMode {
-        if self.admission.root_unavailable() && self.pending_staged.load(Ordering::Acquire) {
+        let fresh = self
+            .pending_observed
+            .lock()
+            .ok()
+            .and_then(|time| *time)
+            .is_some_and(|time| time.elapsed() < self.observation_stale_after);
+        if self.admission.root_unavailable()
+            && (!fresh || self.pending_staged.load(Ordering::Acquire))
+        {
             return StagingMode::Unready;
+        }
+        if !self.capacity_available.load(Ordering::Acquire) {
+            return StagingMode::Refuse;
         }
         self.admission.mode()
     }
@@ -299,6 +323,32 @@ impl WriteBehindStage {
     /// inaccessible acknowledged bytes forever.
     pub fn note_pending_staged(&self, pending: bool) {
         self.pending_staged.store(pending, Ordering::Release);
+        if let Ok(mut time) = self.pending_observed.lock() {
+            *time = Some(std::time::Instant::now());
+        }
+    }
+
+    pub fn note_observation_unknown(&self) {
+        self.pending_staged.store(true, Ordering::Release);
+        if let Ok(mut time) = self.pending_observed.lock() {
+            *time = None;
+        }
+    }
+
+    pub(crate) fn note_capacity(&self, available: bool) {
+        self.capacity_available.store(available, Ordering::Release);
+    }
+
+    pub(crate) fn min_free_bytes(&self) -> u64 {
+        self.min_free_bytes
+    }
+
+    pub(crate) fn hard_limits(&self) -> (u64, u64) {
+        self.hard_limits
+    }
+
+    pub fn note_worker_stopped(&self) {
+        self.admission.note_worker_stopped();
     }
 
     /// Feed one drain heartbeat. A stale heartbeat selects direct fallback.

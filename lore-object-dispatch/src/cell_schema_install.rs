@@ -123,7 +123,7 @@ macro_rules! cell_migration {
 }
 
 /// CR-033 D5's cell install set, in install order.
-pub const CELL_INSTALL_SET: [CellMigration; 21] = [
+pub const CELL_INSTALL_SET: [CellMigration; 23] = [
     cell_migration!(
         2,
         "0002_object_store_retention_authority.sql",
@@ -228,6 +228,16 @@ pub const CELL_INSTALL_SET: [CellMigration; 21] = [
         25,
         "0025_object_store_dispatch_budget_head_read.sql",
         "cd576219f08478998f47c08fa1542765760118191a376724cbbf1d4482fac42f"
+    ),
+    cell_migration!(
+        26,
+        "0026_object_store_dispatch_drain_policy.sql",
+        "b5c416e136b32adb3600695e903e0b7014a9d4c2400d5c1b353abfceb75c9061"
+    ),
+    cell_migration!(
+        27,
+        "0027_object_store_dispatch_drain_policy_rotation.sql",
+        "1b25bdec9659bef41e70c7d54aded3d58ec69affbf127e731b2595f72db5a665"
     ),
 ];
 
@@ -927,18 +937,24 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// 0025 creates one function and one grant, adds no relation, no column, no constraint, no index
 /// and no type, so a move in any of the other ten sections would have meant the migration did
 /// something it does not claim to do. The other ten held still.
+///
+/// WP-122 migration 0026 adds policy/custody relations and guarded runtime procedures.
+/// `PostgreSQL` 16 fresh-install measurement changes relations, columns, constraints,
+/// indexes, types, functions and their ACLs, plus relation ACLs. The remaining sections hold.
+/// Migration 0027 changes columns, constraints, functions, function ACLs and triggers
+/// for offline rotation and immutable per-reservation replay horizons.
 pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
-    hex32("316036b2379716cfa8f437588afff7b0e51f5158c04146525589e9bfc00e07a4"),
-    hex32("a034c938af4fe80ed2e47aae05b84de1d2164c71a1f4ba7c17598f834fa4a496"),
-    hex32("5c0279033f49f711b0ef2a70144a314a670b789fe27afd57129a4122f6ca294c"),
-    hex32("e73d69307f2270734c4acb7b0e35e6fae8348abdbf88bec1b78d15ba7cfaec72"),
-    hex32("f7f3af85ac11837251f1814f7e721f9f2df634bfcacb49782cd34f51c5879687"),
-    hex32("99ba715475d61c65393cb42a54aafd2341ba23f32bddddce3b4fa0c1c07b415a"),
-    hex32("b5063dc0c02feafa2decaedcd73057af6682a52baa02aaca5530319bce328218"),
-    hex32("ceb77a757063fe3514a25f80be242a241943cab76539cf201550a1fc976443d4"),
+    hex32("1d67f06a797f9b45c588b83014b9bd451136f7fc7e84d6c2ae8276dcf66bd7dd"),
+    hex32("a88e3821de78ba6a7e20de17fe0ecf559c4e776f772d1cbf3a053ec4c7bfe905"),
+    hex32("d0b58ffa07b21982002126b18c919ef4b2efa3f9c1fc0a0f7ebc31bacec2ceab"),
+    hex32("6898e9237db8491cae578032baa6f17692d3af29d43733f7755453b8dc884f68"),
+    hex32("dc1a82b516bbc4da26221f3805cb2137f53fbaca582d5648d0ffcf6784551d72"),
+    hex32("05ba867912d4d7a1c0349ba1a5912e8e361ca6a4c80c571c1ff48fe302d6e9c8"),
+    hex32("17bf87ddf3a16cbc522f8a61deeaf5f258383b71f8b0bf4a9243164794c78c00"),
+    hex32("6cf8d9abe5837ecab6c5df79b4ab3b5f8d2086b52eb3e9e10e60696ea9d6bd5a"),
     hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
-    hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
+    hex32("1dc93be73ec145b886d59f53d48f0b5e30edb4bbf33a2933451036cce626fc7f"),
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
 ];
 
@@ -948,7 +964,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
-    hex32("ed7c07f323cd32412f77bc614741fa870da3a969c9668ff939ab80fcd2a94426");
+    hex32("5297269d1975f58e610821e87c8e4c344249084cbd42d7704fc2f2b9993e4f87");
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {

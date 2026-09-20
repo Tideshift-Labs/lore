@@ -19,21 +19,21 @@
 //!
 //! The migration side is a **series**, not one file: `0001_init.sql` installs
 //! revision [`FRAGMENT_SCHEMA_BASE_VERSION`] and
-//! `0002_fragment_promotion_send_claims.sql` extends it to
-//! [`FRAGMENT_SCHEMA_VERSION`]. An already-provisioned cell never re-reads
+//! the numbered follow-ons extend it to [`FRAGMENT_SCHEMA_VERSION`].
+//! An already-provisioned cell never re-reads
 //! `0001`, so a new column belongs in a new numbered file; the parity test
 //! applies the whole series in order and compares catalogs against this
 //! declaration.
 
-/// First server-only fragment lifecycle schema revision. Recorded in
+/// Current server-only fragment lifecycle schema revision. Recorded in
 /// `lore_fragment_schema_state.schema_version`; a server whose compiled value is
 /// below the stored value refuses to enable lifecycle routing.
-pub const FRAGMENT_SCHEMA_VERSION: i64 = 4;
+pub const FRAGMENT_SCHEMA_VERSION: i64 = 6;
 
 /// The revision `migrations/0001_init.sql` alone installs.
 ///
 /// The migration series is no longer one file: `0001` seeds this base revision
-/// and `0002_fragment_promotion_send_claims.sql` raises the stored value to
+/// and its numbered follow-ons raise the stored value to
 /// [`FRAGMENT_SCHEMA_VERSION`]. A cell that ran only `0001` therefore records
 /// revision 3, which is exactly what makes it route legacy rather than
 /// half-enable against a revision-4 binary (`ready_for_lifecycle`'s clean-init
@@ -124,7 +124,7 @@ pub const DIAGNOSTIC_UNREPAIRABLE_ENCODING: i16 = 5;
 /// `lore_fragment_metering`) are deliberately excluded: the immutable store
 /// self-bootstraps them, so they exist on every Postgres-mode cell and their
 /// presence proves nothing about this migration.
-pub const FRAGMENT_SCHEMA_RELATIONS: [&str; 8] = [
+pub const FRAGMENT_SCHEMA_RELATIONS: [&str; 11] = [
     "lore_fragment_lifecycle",
     "lore_fragment_epochs",
     "lore_fragment_associations",
@@ -133,6 +133,9 @@ pub const FRAGMENT_SCHEMA_RELATIONS: [&str; 8] = [
     "lore_fragment_staged_leases",
     "lore_fragment_staged_lease_members",
     "lore_fragment_schema_state",
+    "lore_fragment_stage_policy",
+    "lore_fragment_stage_usage",
+    "lore_fragment_stage_custody",
 ];
 
 /// Runtime copy of the SCHEMA-118 DDL. Keep byte-for-byte semantics aligned
@@ -545,14 +548,21 @@ mod tests {
 
     #[test]
     fn seed_schema_version_matches_the_constant() {
-        let literal = seeded_schema_version(FRAGMENT_SCHEMA, "the FRAGMENT_SCHEMA seed");
         assert_eq!(
-            literal, FRAGMENT_SCHEMA_VERSION,
-            "the FRAGMENT_SCHEMA seed writes schema_version {literal} but bootstrap() binds \
-             FRAGMENT_SCHEMA_VERSION = {FRAGMENT_SCHEMA_VERSION}; bump both or neither"
+            seeded_schema_version(FRAGMENT_SCHEMA, "base runtime schema"),
+            4
+        );
+        assert_eq!(
+            raised_schema_version(super::super::stage_schema::STAGE_CUSTODY_SCHEMA),
+            5
+        );
+        assert_eq!(
+            raised_schema_version(
+                super::super::stage_rotation_schema::STAGE_POLICY_ROTATION_SCHEMA
+            ),
+            FRAGMENT_SCHEMA_VERSION
         );
     }
-
     /// The Rust-side pin above is only half the guard.
     ///
     /// **Three** places carry this version: `bootstrap()` binds the constant,
@@ -567,8 +577,8 @@ mod tests {
     /// cell that ran only `0001` really is at that revision: it has none of
     /// `0002`'s columns. Raising `0001`'s own literal would make such a cell
     /// report a revision whose columns it does not have, which is precisely the
-    /// half-enabled cell the readiness guardrail exists to refuse. `0002` is
-    /// therefore what carries the raise to [`FRAGMENT_SCHEMA_VERSION`].
+    /// half-enabled cell the readiness guardrail exists to refuse. Each additive
+    /// migration raises the version only after installing its own schema changes.
     #[test]
     fn the_migration_series_reaches_the_runtime_schema_version() {
         let base = include_str!("../../../migrations/0001_init.sql");
@@ -580,19 +590,28 @@ mod tests {
              keep naming it, so a cell that has run only 0001 reports what it actually has"
         );
         let raise = format!("SET schema_version = {FRAGMENT_SCHEMA_VERSION}");
-        let follow_on = include_str!("../../../migrations/0002_fragment_promotion_send_claims.sql");
+        let stage = include_str!("../../../migrations/0003_fragment_stage_custody.sql");
+        assert_eq!(raised_schema_version(stage), 5);
+        let follow_on = include_str!("../../../migrations/0004_fragment_stage_policy_rotation.sql");
         assert!(
-            collapse_whitespace(follow_on).contains(&collapse_whitespace(&raise)),
-            "migrations/0002_fragment_promotion_send_claims.sql must raise the stored revision \
+            raised_schema_version(follow_on) == FRAGMENT_SCHEMA_VERSION,
+            "migrations/0004_fragment_stage_policy_rotation.sql must raise the stored revision \
              with `{raise}`; without it an out-of-band-provisioned cell installs the columns and \
              is then refused by the exact-revision gate with no visible cause"
         );
     }
 
-    /// Collapse every run of whitespace to one space, so the pin above is
-    /// tolerant of SQL alignment and intolerant of content.
-    fn collapse_whitespace(text: &str) -> String {
-        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    fn raised_schema_version(text: &str) -> i64 {
+        let compact = text.split_whitespace().collect::<String>();
+        compact
+            .split_once("SETschema_version=")
+            .expect("schema revision update")
+            .1
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .expect("numeric schema revision")
     }
 
     /// [`STAGED_LEASE_ID_LEN`] and the DDL's `octet_length(lease_id) = 16`
@@ -623,14 +642,19 @@ mod tests {
         // would find it, but presence of a sequence says nothing about whether
         // the tables installed. Miscounting this is what INV-EF P2-13 caught in
         // the skill's prose.
-        assert_eq!(FRAGMENT_SCHEMA_RELATIONS.len(), 8);
+        assert_eq!(FRAGMENT_SCHEMA_RELATIONS.len(), 11);
+        let composed = format!(
+            "{}{}",
+            FRAGMENT_SCHEMA,
+            super::super::stage_schema::STAGE_CUSTODY_SCHEMA
+        );
         assert!(
             !FRAGMENT_SCHEMA_RELATIONS.contains(&"lore_fragment_fence_seq"),
             "the fence sequence must stay out of the relation-presence probe"
         );
         for relation in FRAGMENT_SCHEMA_RELATIONS {
             assert!(
-                FRAGMENT_SCHEMA.contains(relation),
+                composed.contains(relation),
                 "{relation} is probed for but never created by FRAGMENT_SCHEMA"
             );
         }

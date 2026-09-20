@@ -96,7 +96,6 @@ pub use lore_fragment_provider::FragmentDispatchTls;
 pub use lore_fragment_provider::FragmentDrainAttempt;
 pub use lore_fragment_provider::FragmentDrainCapability;
 pub use lore_fragment_provider::FragmentDrainReady;
-pub use lore_fragment_provider::FragmentDrainSpoolReady;
 pub use lore_fragment_provider::FragmentGetAttempt;
 pub use lore_fragment_provider::FragmentGetExecution;
 pub use lore_fragment_provider::FragmentGetOperation;

@@ -18,6 +18,8 @@ pub mod config;
 mod contract;
 pub mod dispatch_client;
 pub mod dispatch_pool;
+pub mod drain_policy;
+pub mod drain_spool;
 pub mod fetch_lease;
 pub mod full_to_compact;
 pub mod local_authority_budget_limiter_provisioning;

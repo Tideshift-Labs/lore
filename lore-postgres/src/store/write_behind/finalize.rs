@@ -29,18 +29,15 @@
 //!
 //! # What a crash leaves at each point
 //!
-//! - before step 4: an orphan under `incoming/`. Reclaimed by the orphan sweep
-//!   (owned by `lore-server`, per the 2026-09-16 lane split).
-//! - between step 4 and the caller's `commit_staged`: a finalized, valid,
-//!   **unreferenced** file under `staged/`. It is not swept. `cleanup.rs`'s rule
-//!   removes a `staged/` file only on a coordinator-computed purge target, and a
-//!   file with no epoch row is indistinguishable from one whose `commit_staged`
-//!   is still in flight on another replica. It therefore **leaks** until the same
-//!   fragment is pushed again, which re-derives the same `(hash, epoch)` only if
-//!   the epoch is reused — it is not — so in practice it leaks until an operator
-//!   or a future reconciliation pass removes it. This is a known, accepted cost
-//!   of never guessing that bytes are unreferenced; it is recorded here because
-//!   an earlier draft of this plan wrongly claimed the sweep covered it.
+//! - before step 4: an identified temporary file under `incoming/`.
+//! - between step 4 and the caller's `commit_staged`: a finalized file under
+//!   `staged/` whose publication may still be in flight.
+//!
+//! Both remain under coordinator custody. The bounded cleanup pass requests an
+//! exact reclaim grant after preparation expires and ownership/readers permit
+//! it. Missing epoch rows alone never authorize unlinking either kind of file.
+//! A paused finalizer can leave late residue after fencing; retained custody
+//! markers allow a later pass to remove it without releasing capacity twice.
 
 use bytes::Bytes;
 use lore_base::lore_spawn_blocking;
@@ -55,17 +52,22 @@ use super::root::sync_directory;
 /// # Errors
 ///
 /// Returns [`WriteBehindError::UnsupportedPlatform`] off Unix and `Io` for any
-/// filesystem failure. The temporary file is removed on every failure arm.
+/// filesystem failure or exhausted I/O capacity. Temporary-file removal on an
+/// I/O failure is best effort; coordinator-fenced cleanup handles residue.
 pub(crate) async fn finalize(
     root: &ConfinedRoot,
     resolved: &ResolvedStagedPath,
     payload: &Bytes,
 ) -> Result<(), WriteBehindError> {
-    root.verify_device()?;
+    let permit = root.try_io_permit()?;
     let root = root.clone();
     let resolved = resolved.clone();
     let payload = payload.clone();
-    let handle = lore_spawn_blocking!(move || finalize_blocking(&root, &resolved, &payload));
+    let handle = lore_spawn_blocking!(move || {
+        let _permit = permit;
+        root.verify_device()?;
+        finalize_blocking(&root, &resolved, &payload)
+    });
     match handle.await {
         Ok(result) => result,
         Err(_) => Err(WriteBehindError::Io {
@@ -86,29 +88,44 @@ fn finalize_blocking(
     // Step 1, and it must precede the rename. See the module header.
     root.ensure_parent(resolved)?;
 
-    let token = uuid::Uuid::now_v7().simple().to_string();
-    let temporary = root.incoming().join(format!("{token}.tmp"));
+    let key = resolved
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(WriteBehindError::KeyMismatch)?;
+    let temporary = root.incoming().join(format!("{key}.tmp"));
 
+    // A failed create grants no ownership of an existing deterministic temp.
+    // Return before the cleanup arm so a retry cannot unlink another writer.
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| WriteBehindError::io("staging temp create", &error))?;
     let outcome = (|| -> Result<(), WriteBehindError> {
-        // `create_new` rather than `create`: a UUIDv7 collision is not expected,
-        // and if one ever happened, silently truncating another in-flight
-        // fragment's temporary file is the worst available response.
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|error| WriteBehindError::io("staging temp create", &error))?;
         file.write_all(payload.as_ref())
             .map_err(|error| WriteBehindError::io("staging temp write", &error))?;
         // Step 3. Contents and metadata, because the rename publishes both.
         file.sync_all()
             .map_err(|error| WriteBehindError::io("staging temp fsync", &error))?;
+        #[cfg(feature = "failure_generator")]
+        blocking_failpoint(async { crate::domain::fragments::failpoint!("stage.temp.synced") })
+            .map_err(|_| WriteBehindError::Io {
+                operation: "staging temp synced failpoint",
+                kind: std::io::ErrorKind::Interrupted,
+            })?;
         drop(file);
         // Step 4. Atomic within one filesystem, which the recorded device
         // guarantees. The target cannot already exist: `(hash, epoch)` is unique
         // by construction and an epoch row is immutable.
         fs::rename(&temporary, resolved.path())
             .map_err(|error| WriteBehindError::io("staging rename", &error))?;
+        #[cfg(feature = "failure_generator")]
+        blocking_failpoint(async { crate::domain::fragments::failpoint!("stage.final.renamed") })
+            .map_err(|_| WriteBehindError::Io {
+            operation: "staging final renamed failpoint",
+            kind: std::io::ErrorKind::Interrupted,
+        })?;
         // Step 5.
         sync_directory(resolved.parent())
     })();
@@ -117,7 +134,19 @@ fn finalize_blocking(
         // Best effort. The rename either happened or it did not; if it did, this
         // removes nothing, and if it did not, this is the orphan that would
         // otherwise wait for the sweep.
-        let _ = fs::remove_file(&temporary);
+        let _ = root.remove_placement_blocking(resolved, true);
     }
     outcome
+}
+
+/// Finalization runs on a retained blocking worker. Its failpoint can wait on
+/// the runtime without blocking an asynchronous executor thread.
+#[cfg(feature = "failure_generator")]
+fn blocking_failpoint(
+    future: impl std::future::Future<Output = Result<(), crate::domain::DomainError>>,
+) -> Result<(), crate::domain::DomainError> {
+    let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+        crate::domain::DomainError::Internal(format!("staging failpoint runtime: {error}"))
+    })?;
+    runtime.block_on(future)
 }

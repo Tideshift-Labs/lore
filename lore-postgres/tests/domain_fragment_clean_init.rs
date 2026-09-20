@@ -126,6 +126,9 @@ fn clean_initialization_identity_rejects_empty_values() {
 #[ignore = "isolated empty PostgreSQL required"]
 async fn empty_initialization_establishes_readiness_without_claiming_backfill() {
     let (_, store, direct) = fixture(true).await;
+    let usage = direct.query_one("SELECT count(*), bool_and(singleton AND live_bytes=0 AND live_files=0 AND metadata_bytes=0 AND metadata_rows=0) FROM lore_fragment_stage_usage", &[]).await.unwrap();
+    assert_eq!(usage.get::<_, i64>(0), 1);
+    assert!(usage.get::<_, bool>(1));
     assert_dark(&store).await;
     let coordinator = store.fragment_coordinator();
     assert_eq!(
@@ -151,6 +154,84 @@ async fn empty_initialization_establishes_readiness_without_claiming_backfill() 
         state(&direct).await,
         before,
         "rerun must preserve durable initialization evidence"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated empty PostgreSQL required"]
+async fn used_or_missing_stage_counter_seed_refuses_clean_initialization() {
+    let (_, store, direct) = fixture(true).await;
+    let coordinator = store.fragment_coordinator();
+    for column in [
+        "live_bytes",
+        "live_files",
+        "metadata_bytes",
+        "metadata_rows",
+    ] {
+        direct
+            .batch_execute(&format!("UPDATE lore_fragment_stage_usage SET {column}=1"))
+            .await
+            .unwrap();
+        let before = state(&direct).await;
+        let error = coordinator.initialize_empty(&input()).await.unwrap_err();
+        assert!(
+            matches!(error, DomainError::NotReady(_)),
+            "{column}: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("used counter seed lore_fragment_stage_usage"),
+            "{error:?}"
+        );
+        assert_eq!(state(&direct).await, before);
+        assert_dark(&store).await;
+        assert_eq!(
+            direct
+                .query_one(
+                    &format!("SELECT {column} FROM lore_fragment_stage_usage"),
+                    &[]
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0),
+            1
+        );
+        direct
+            .batch_execute(&format!("UPDATE lore_fragment_stage_usage SET {column}=0"))
+            .await
+            .unwrap();
+    }
+    direct
+        .batch_execute("DELETE FROM lore_fragment_stage_usage")
+        .await
+        .unwrap();
+    let before = state(&direct).await;
+    let error = coordinator.initialize_empty(&input()).await.unwrap_err();
+    assert!(matches!(error, DomainError::NotReady(_)), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("used counter seed lore_fragment_stage_usage"),
+        "{error:?}"
+    );
+    assert_eq!(state(&direct).await, before);
+    assert_dark(&store).await;
+    assert_eq!(
+        direct
+            .query_one("SELECT count(*) FROM lore_fragment_stage_usage", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        0
+    );
+    direct
+        .batch_execute("INSERT INTO lore_fragment_stage_usage(singleton) VALUES(true)")
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.initialize_empty(&input()).await.unwrap(),
+        CleanCellInitializationOutcome::Initialized
     );
 }
 

@@ -16,6 +16,12 @@
 //! or `tests/run-fragment-lifecycle-live.ps1`, which gives each case its own
 //! fresh database.
 
+#[path = "common/drain_candidate.rs"]
+mod drain_candidate;
+
+#[path = "common/stage_policy.rs"]
+mod stage_policy;
+
 use std::time::Duration;
 
 use lore_postgres::domain::PostgresDomainStore;
@@ -30,6 +36,7 @@ use lore_postgres::domain::fragments::FragmentWriteSettlement;
 use lore_postgres::domain::fragments::IoObservation;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::fragments::states::FragmentLifecycleState;
+use lore_postgres::domain::fragments::states::FragmentWriteClaimState;
 use lore_postgres::pool::TlsConfig;
 use tokio_postgres::Client;
 use uuid::Uuid;
@@ -53,6 +60,7 @@ async fn store(url: &str) -> PostgresDomainStore {
         .bootstrap()
         .await
         .expect("install isolated SCHEMA-118 fixture");
+    stage_policy::initialize(url, &store.fragment_coordinator()).await;
     store
 }
 
@@ -111,7 +119,13 @@ async fn stage_hash(
     seed: u8,
 ) -> (i64, FragmentManifest) {
     let BeginOutcome::Admitted(stage_intent) = coordinator
-        .begin_stage(hash)
+        .begin_stage(
+            hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 7,
+            },
+        )
         .await
         .expect("begin stage on a fresh hash")
     else {
@@ -192,7 +206,8 @@ async fn elapse_claim_send_window(direct: &Client, hash: &[u8]) {
     direct
         .execute(
             "UPDATE lore_fragment_write_claims \
-                SET send_not_after = clock_timestamp() - interval '1 second' \
+                SET prepared_at = clock_timestamp() - interval '3 seconds', \
+                    send_not_after = clock_timestamp() - interval '1 second' \
               WHERE hash = $1",
             &[&hash],
         )
@@ -399,7 +414,10 @@ async fn a_staged_head_with_active_operation_stamped_by_a_real_promotion_is_not_
     stage_hash(&coordinator, &hash, 0x31).await;
 
     let BeginOutcome::Admitted(_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion on a Staged head")
     else {
@@ -498,4 +516,278 @@ async fn a_commit_staged_candidate_never_carries_a_provider_body_digest() {
         "commit_staged creates no write claim, so no epoch it produces can carry provider evidence"
     );
     assert!(candidate.provider_body_size().is_none());
+}
+
+// Use real promotion ownership and state transitions. Only database deadlines
+// are shortened by the fixture, so no scheduler timing assumption proves expiry.
+async fn expired_promotion_is_selected_and_taken_over(state: FragmentWriteClaimState) {
+    let url = pg_url().expect("runner must set LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    stage_hash(&coordinator, &hash, 0x71).await;
+    let BeginOutcome::Admitted(first) = coordinator
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
+        .await
+        .expect("admit first promotion")
+    else {
+        panic!("fresh staged source must admit promotion");
+    };
+    let claim = first.write_claim().expect("promotion claim");
+    if state != FragmentWriteClaimState::Prepared {
+        coordinator.authorize_write_claim(claim).await.unwrap();
+    }
+    if state == FragmentWriteClaimState::Ambiguous {
+        coordinator
+            .settle_write_claim(claim, FragmentWriteSettlement::Ambiguous)
+            .await
+            .unwrap();
+    }
+    let row = direct
+        .query_one(
+            "SELECT state FROM lore_fragment_write_claims WHERE logical_request_id = $1 AND attempt_id = $2",
+            &[&claim.logical_request_id().as_slice(), &claim.attempt_id().as_slice()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i16>(0), state.bits());
+    assert!(!hashes(&candidates(&coordinator, 10).await).contains(&hash));
+
+    elapse_claim_send_window(&direct, &hash).await;
+    if state != FragmentWriteClaimState::Prepared {
+        assert!(
+            !hashes(&candidates(&coordinator, 10).await).contains(&hash),
+            "Sending/Ambiguous must remain barred after only send_not_after expires"
+        );
+        direct
+            .execute(
+                "UPDATE lore_fragment_write_claims SET prepared_at = clock_timestamp() - interval '3 seconds', send_not_after = clock_timestamp() - interval '2 seconds', hard_not_after = clock_timestamp() - interval '1 second' WHERE hash = $1",
+                &[&hash],
+            )
+            .await
+            .unwrap();
+    }
+    assert!(
+        hashes(&candidates(&coordinator, 10).await).contains(&hash),
+        "expired {state:?} promotion ownership must not wedge selection"
+    );
+    let BeginOutcome::Admitted(second) = coordinator
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
+        .await
+        .expect("take over abandoned promotion")
+    else {
+        panic!("expired promotion must admit takeover");
+    };
+    assert!(second.fence > first.fence);
+    assert_ne!(second.epoch, first.epoch);
+    assert!(coordinator.authorize_write_claim(claim).await.is_err());
+    assert!(!hashes(&candidates(&coordinator, 10).await).contains(&hash));
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn expired_prepared_promotion_is_selected_and_taken_over() {
+    expired_promotion_is_selected_and_taken_over(FragmentWriteClaimState::Prepared).await;
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn expired_sending_promotion_is_selected_only_after_hard_deadline() {
+    expired_promotion_is_selected_and_taken_over(FragmentWriteClaimState::Sending).await;
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn expired_ambiguous_promotion_is_selected_only_after_hard_deadline() {
+    expired_promotion_is_selected_and_taken_over(FragmentWriteClaimState::Ambiguous).await;
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn unknown_active_operation_is_never_a_drain_candidate() {
+    let url = pg_url().expect("runner must set LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    let hash = random_hash();
+    stage_hash(&coordinator, &hash, 0x72).await;
+    assert!(hashes(&candidates(&coordinator, 10).await).contains(&hash));
+    direct
+        .execute(
+            "UPDATE lore_fragment_lifecycle SET active_operation = $2 WHERE hash = $1",
+            &[&hash, &vec![0xEE_u8; 16]],
+        )
+        .await
+        .unwrap();
+    assert!(!hashes(&candidates(&coordinator, 10).await).contains(&hash));
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn generic_keyset_plan_uses_recovery_index_on_a_mixed_state_population() {
+    let url = pg_url().expect("runner must set LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    // Bulk rows are planner-only fixtures, never a substitute for admission.
+    direct.batch_execute("INSERT INTO lore_fragment_lifecycle(hash,current_epoch,state,manifest_id,last_fence,active_operation)
+        SELECT decode(md5(i::text)||md5(i::text),'hex'),1,
+          CASE WHEN i%3=0 THEN 3 WHEN i%3=1 THEN 4 ELSE 8 END,
+          CASE WHEN i%3<>2 THEN decode(repeat('aa',32),'hex') END,1,
+          CASE WHEN i%3=0 THEN decode(repeat('ee',16),'hex') END
+        FROM generate_series(1,30000) i;
+        INSERT INTO lore_fragment_epochs(hash,epoch,authority,object_key,manifest_id,size_payload,size_content,decoded_hash,payload_flags,fence)
+        SELECT hash,1,1,encode(hash,'hex')||'.s1',decode(repeat('aa',32),'hex'),128,128,hash,0,1 FROM lore_fragment_lifecycle;
+        INSERT INTO lore_fragment_stage_custody(hash,epoch,operation_fence,original_flags,size_payload,prepare_deadline,state,metadata_bytes)
+        SELECT hash,1,1,0,128,clock_timestamp(),1,1024 FROM lore_fragment_lifecycle;").await.unwrap();
+    for index in 0..12u8 {
+        let hash = [index; 32];
+        stage_hash(&coordinator, &hash, 0x74).await;
+        if index % 2 == 0 {
+            coordinator
+                .begin_promotion(
+                    &drain_candidate::candidate(&coordinator, &hash).await,
+                    write_claim(),
+                )
+                .await
+                .unwrap();
+            elapse_claim_send_window(&direct, &hash).await;
+        }
+    }
+    direct.batch_execute("ANALYZE lore_fragment_lifecycle; ANALYZE lore_fragment_epochs; ANALYZE lore_fragment_stage_custody; ANALYZE lore_fragment_write_claims; SET plan_cache_mode=force_generic_plan;").await.unwrap();
+    // Extract the production literal so this measures the shipped query,
+    // including its known promotion token and keyset predicate.
+    let source = include_str!("../src/domain/fragments/coordinator.rs");
+    let method = source
+        .split_once("pub async fn staged_drain_candidates_after(")
+        .unwrap()
+        .1;
+    let literal = method
+        .split_once("\"SELECT l.hash AS hash,")
+        .unwrap()
+        .1
+        .split_once("\",")
+        .unwrap()
+        .0;
+    let query = format!(
+        "SELECT l.hash AS hash,{}",
+        literal
+            .lines()
+            .map(|line| line.trim().trim_end_matches('\\'))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    direct
+        .batch_execute(&format!("PREPARE drain_plan(bigint,bytea) AS {query}"))
+        .await
+        .unwrap();
+    for cursor in [String::new(), "05".repeat(32)] {
+        let rows = direct.query(&format!("EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) EXECUTE drain_plan(4,decode('{cursor}','hex'))"), &[]).await.unwrap();
+        let plan = rows
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        println!("generic mixed-state plan cursor={cursor}:\n{plan}");
+        assert!(
+            plan.contains("lore_fragment_stage_drain_recovery"),
+            "production generic keyset query must use recovery partial index: {plan}"
+        );
+        assert!(
+            !plan.contains("Seq Scan on lore_fragment_lifecycle"),
+            "candidate lookup must not scan the cell head population: {plan}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn changed_source_witness_is_fenced_before_any_claim_is_created() {
+    let url = pg_url().expect("runner must set LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let direct = client(&url).await;
+    for mutation in [
+        "UPDATE lore_fragment_lifecycle SET current_epoch = current_epoch + 1 WHERE hash = $1",
+        "UPDATE lore_fragment_lifecycle SET last_fence = last_fence + 1 WHERE hash = $1",
+        "UPDATE lore_fragment_lifecycle SET manifest_id = decode(repeat('aa',32),'hex') WHERE hash = $1",
+        "UPDATE lore_fragment_epochs SET object_key = 'changed-source' WHERE hash = $1",
+        "UPDATE lore_fragment_epochs SET size_payload = size_payload + 1 WHERE hash = $1",
+        "UPDATE lore_fragment_epochs SET size_content = size_content + 1 WHERE hash = $1",
+        "UPDATE lore_fragment_epochs SET payload_flags = payload_flags + 1 WHERE hash = $1",
+        "UPDATE lore_fragment_epochs SET decoded_hash = decode(repeat('bb',32),'hex') WHERE hash = $1",
+        "UPDATE lore_fragment_epochs SET manifest_id = decode(repeat('cc',32),'hex') WHERE hash = $1",
+    ] {
+        let hash = random_hash();
+        stage_hash(&coordinator, &hash, 0x73).await;
+        let source = drain_candidate::candidate(&coordinator, &hash).await;
+        assert_eq!(direct.execute(mutation, &[&hash]).await.unwrap(), 1);
+        let result = coordinator
+            .begin_promotion(&source, write_claim())
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, BeginOutcome::Fenced(_)),
+            "{mutation}: {result:?}"
+        );
+        let claims: i64 = direct
+            .query_one(
+                "SELECT count(*) FROM lore_fragment_write_claims WHERE hash = $1",
+                &[&hash],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            claims, 0,
+            "a stale source must not mint send authority: {mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn keyset_pages_reach_later_hashes_and_wrap_without_repeating_the_first_batch() {
+    let url = pg_url().expect("runner must set LORE_TEST_PG_URL");
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let mut expected = Vec::new();
+    for seed in 1..=5 {
+        let hash = vec![seed; 32];
+        stage_hash(&coordinator, &hash, seed).await;
+        expected.push(hash);
+    }
+    let mut cursor = Vec::new();
+    let mut seen = Vec::new();
+    for expected_length in [2, 2, 1, 0] {
+        let page = coordinator
+            .staged_drain_candidates_after(FragmentDrainCandidateBatch::new(2).unwrap(), &cursor)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), expected_length);
+        if let Some(last) = page.last() {
+            cursor = last.hash().to_vec();
+        }
+        seen.extend(hashes(&page));
+    }
+    assert_eq!(seen, expected);
+    assert_eq!(hashes(&candidates(&coordinator, 2).await), expected[..2]);
+    for invalid in [vec![0; 31], vec![0; 33]] {
+        assert!(
+            coordinator
+                .staged_drain_candidates_after(
+                    FragmentDrainCandidateBatch::new(2).unwrap(),
+                    &invalid
+                )
+                .await
+                .is_err()
+        );
+    }
 }

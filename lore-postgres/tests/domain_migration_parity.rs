@@ -38,6 +38,8 @@ const MIGRATIONS_0001: &str = include_str!("../migrations/0001_init.sql");
 /// what an out-of-band-provisioned cell running both migrations in order
 /// actually has.
 const MIGRATIONS_0002: &str = include_str!("../migrations/0002_fragment_promotion_send_claims.sql");
+const MIGRATIONS_0003: &str = include_str!("../migrations/0003_fragment_stage_custody.sql");
+const MIGRATIONS_0004: &str = include_str!("../migrations/0004_fragment_stage_policy_rotation.sql");
 
 /// The relations that prove `migrations/0001_init.sql` (or the isolated test
 /// fixture) ran here. `lore_locks` is excluded because it also pre-dates
@@ -246,7 +248,9 @@ async fn domain_catalog_snapshot(client: &tokio_postgres::Client) -> Vec<String>
         .query(
             "SELECT p.proname, pg_get_functiondef(p.oid) AS def \
                FROM pg_proc AS p JOIN pg_namespace AS n ON n.oid = p.pronamespace \
-              WHERE n.nspname = 'public' AND p.proname LIKE 'lore_domain_%' \
+              WHERE n.nspname = 'public' AND (p.proname LIKE 'lore_domain_%' \
+                 OR p.proname IN ('stage_policy_publish_v1', 'stage_policy_verify_v1', \
+                                  'stage_policy_rotate_v1')) \
               ORDER BY p.proname, p.oid",
             &[],
         )
@@ -315,6 +319,15 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
              migration-side database, mirroring an out-of-band-provisioned cell that has run \
              both migrations in order",
         );
+
+    migration_client
+        .batch_execute(MIGRATIONS_0003)
+        .await
+        .expect("apply stage custody migration");
+    migration_client
+        .batch_execute(MIGRATIONS_0004)
+        .await
+        .expect("apply stage policy rotation migration");
 
     // Production boot order: the domain coordinator is built before the lock
     // store plugin connects (`server.rs`), so nothing has created `lore_locks`
@@ -742,22 +755,14 @@ async fn migration_0002_is_idempotent_against_an_already_migrated_database() {
     drop_throwaway_database(&admin_url, &db_name).await;
 }
 
-/// A hazard flagged in review: `ready_for_lifecycle`'s clean-init arm now
-/// requires `schema_version >= FRAGMENT_SCHEMA_VERSION` (4). A fresh
-/// `FRAGMENT_SCHEMA` bootstrap seeds 4 directly, but a cell provisioned
-/// out-of-band from `0001_init.sql` alone (unmodified by DECISION 3, still
-/// seeding `FRAGMENT_SCHEMA_BASE_VERSION`) only reaches 4 if `0002` actually
-/// bumps the stored value. There is no migration runner to notice a version
-/// stuck at the base -- such a cell would apply `0002`, gain the columns,
-/// and then refuse to enable forever. This proves the migration series --
-/// `0001`'s base seed plus `0002`'s `UPDATE ... WHERE schema_version < 4` --
-/// actually reaches the runtime `FRAGMENT_SCHEMA_VERSION`, executed rather
-/// than read from source.
+/// Applying the additive migration series must advance the stored revision to
+/// the exact runtime version. Catalog parity alone cannot detect a stale row
+/// value that would leave an otherwise migrated cell unable to enable routing.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readiness_gate_requires() {
     let admin_url = pg_url();
-    let (db_name, url) = create_throwaway_database(&admin_url, "0001to0002version").await;
+    let (db_name, url) = create_throwaway_database(&admin_url, "migrationseriesversion").await;
     let client = pg_client(&url).await;
     client
         .batch_execute(MIGRATIONS_0001)
@@ -782,18 +787,26 @@ async fn a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readines
         .batch_execute(MIGRATIONS_0002)
         .await
         .expect("apply migrations/0002_fragment_promotion_send_claims.sql to raise it");
-    let after_0002: i64 = client
+    client
+        .batch_execute(MIGRATIONS_0003)
+        .await
+        .expect("apply stage custody migration");
+    client
+        .batch_execute(MIGRATIONS_0004)
+        .await
+        .expect("apply stage policy rotation migration");
+    let after_series: i64 = client
         .query_one(
             "SELECT schema_version FROM lore_fragment_schema_state WHERE id = 1",
             &[],
         )
         .await
-        .expect("read schema_version after 0002")
+        .expect("read schema_version after the migration series")
         .get(0);
     assert_eq!(
-        after_0002,
+        after_series,
         fragment_schema::FRAGMENT_SCHEMA_VERSION,
-        "a cell migrated from 0001 through 0002 must end at the schema_version \
+        "a cell migrated from 0001 through 0004 must end at the schema_version \
          ready_for_lifecycle's clean-init arm requires ({}), or every such cell enables lifecycle \
          routing never again",
         fragment_schema::FRAGMENT_SCHEMA_VERSION

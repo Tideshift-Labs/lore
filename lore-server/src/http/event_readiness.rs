@@ -30,6 +30,8 @@ use crate::http::server::ServerHealth;
 /// The event-plane readiness body.
 #[derive(Serialize)]
 pub struct EventReadinessResponse {
+    pub write_behind_configured: bool,
+    pub write_behind: Option<crate::fragment_write_behind::Snapshot>,
     /// Whether this loreserver is configured to run a relay at all.
     pub configured: bool,
     /// CR-032's relay facet.
@@ -123,6 +125,8 @@ impl EventReadinessResponse {
     /// The body for a cell with no relay configured.
     fn unconfigured() -> Self {
         Self {
+            write_behind_configured: false,
+            write_behind: None,
             configured: false,
             relay_ready: false,
             event_ready: false,
@@ -163,6 +167,8 @@ pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoRespons
         Some(readiness) => {
             let snapshot = readiness.snapshot();
             EventReadinessResponse {
+                write_behind_configured: false,
+                write_behind: None,
                 configured: true,
                 relay_ready: snapshot.relay_ready,
                 event_ready: snapshot.event_ready,
@@ -226,6 +232,8 @@ pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoRespons
         response.retention_last_blocked_backlog = snapshot.last_blocked_backlog;
         response.retention_last_grant_backlog = snapshot.last_grant_backlog;
     }
+    response.write_behind_configured = state.write_behind.is_some();
+    response.write_behind = state.write_behind.as_ref().map(|facet| facet.snapshot());
     Json(response)
 }
 
@@ -252,6 +260,7 @@ mod tests {
             store_health_check: false,
             drain: None,
             event_relay,
+            write_behind: None,
             fragment_prune: None,
             cell_retention: None,
         })

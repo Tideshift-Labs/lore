@@ -43,7 +43,23 @@ impl Fixture {
             .await
             .unwrap();
         let fragments = Arc::new(pg.fragment_coordinator());
+        let (policy_client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        lore_base::lore_spawn!(async move {
+            connection.await.unwrap();
+        });
+        policy_client.batch_execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_maintenance') THEN CREATE ROLE object_dispatch_retention_maintenance; END IF; END $$").await.unwrap();
         fragments.bootstrap().await.unwrap();
+        policy_client
+            .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance")
+            .await
+            .unwrap();
+        policy_client.execute("SELECT stage_policy_publish_v1('membership-tests','fixture-policy-v1',decode(repeat('aa',32),'hex'),1073741824,100000,1073741824,100000,60000,4102444800000)", &[]).await.unwrap();
+        policy_client
+            .batch_execute("RESET SESSION AUTHORIZATION")
+            .await
+            .unwrap();
         let locks = Arc::new(pg.lock_coordinator());
         let store = Arc::new(PausedStore {
             inner,

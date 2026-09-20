@@ -59,6 +59,7 @@
 use std::fmt;
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::PoisonError;
 use std::sync::RwLock;
 
@@ -1873,6 +1874,14 @@ impl fmt::Debug for ProviderAttemptLedger {
     }
 }
 
+/// A caller-owned, fresh authority check performed after a committed charge.
+/// The returned monotonic expiry is checked synchronously before transport.
+pub trait ProviderPreTransportGuard: Send + Sync {
+    fn check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio::time::Instant, ProviderClientError>> + Send + '_>>;
+}
+
 /// The cell's one governed provider client.
 pub struct GovernedProviderClient<C, T> {
     boundary: CellProviderBoundary,
@@ -1948,8 +1957,13 @@ where
         request: &MeteredProviderAttemptRequest,
         operation: &T::Operation,
     ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
-        self.execute_metered(ledger, MeteredAttemptInput::Durable(&request.0), operation)
-            .await
+        self.execute_metered(
+            ledger,
+            MeteredAttemptInput::Durable(&request.0),
+            operation,
+            None,
+        )
+        .await
     }
 
     /// Charges and issues one direct, bounded `PutObject`.
@@ -1965,10 +1979,25 @@ where
         body: &[u8],
         operation: &T::Operation,
     ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
+        self.execute_direct_put_guarded(ledger, request, body, operation, None)
+            .await
+    }
+
+    /// Charges a direct PUT, then checks fresh caller authority before transport.
+    /// A guard refusal retains the committed grant and issues no request.
+    pub async fn execute_direct_put_guarded(
+        &self,
+        ledger: &mut ProviderAttemptLedger,
+        request: &ProviderDirectPutAttemptRequest,
+        body: &[u8],
+        operation: &T::Operation,
+        guard: Option<&dyn ProviderPreTransportGuard>,
+    ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
         self.execute_metered(
             ledger,
             MeteredAttemptInput::DirectPut { request, body },
             operation,
+            guard,
         )
         .await
     }
@@ -1978,6 +2007,7 @@ where
         ledger: &mut ProviderAttemptLedger,
         input: MeteredAttemptInput<'_>,
         operation: &T::Operation,
+        guard: Option<&dyn ProviderPreTransportGuard>,
     ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
         // Identity first, ahead of the poison flag and the no-dispatch guard alike, and the same
         // order `ProviderAttemptLedger::audit_for` uses: "is this even my ledger" precedes every
@@ -2133,6 +2163,15 @@ where
         }
 
         let attempt = AuthorizedProviderAttempt::new(prepared, &grant, self.retry_policy);
+        if let Some(guard) = guard {
+            let expires_at = guard.check().await?;
+            // A timeout may poll its inner future first after a delayed charge.
+            // Refuse here explicitly, before arming transport accounting or
+            // constructing/polling the transport future. The grant stays spent.
+            if tokio::time::Instant::now() >= expires_at {
+                return Err(ProviderClientError::PreTransportGuardRefused);
+            }
+        }
         let mut transport_guard = TransportCancellationGuard::new(ledger);
         let report = match self.transport.issue(&attempt, operation).await {
             Ok(report) => report,
@@ -2456,6 +2495,8 @@ fn validate_grant(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
 pub enum ProviderClientError {
+    #[error("fresh send authority expired or was refused after charge")]
+    PreTransportGuardRefused,
     #[error("cell provider boundary ID is invalid")]
     InvalidProviderBoundaryId,
     #[error("cell provider bucket name is invalid")]

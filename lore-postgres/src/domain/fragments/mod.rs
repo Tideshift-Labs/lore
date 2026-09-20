@@ -88,6 +88,8 @@ pub mod masks;
 pub mod membership;
 pub mod provider;
 pub mod schema;
+pub mod stage_rotation_schema;
+pub mod stage_schema;
 pub mod states;
 
 /// Whether this build carries WP-118 Phase 9's fragment failpoints.
@@ -183,6 +185,9 @@ pub use coordinator::STAGED_LEASE_ALREADY_RELEASED;
 pub use coordinator::STAGED_LEASE_MEMBER_NOT_STAGED;
 pub use coordinator::STAGED_LEASE_MEMBER_SET_MISMATCH;
 pub use coordinator::STAGED_LEASE_VANISHED;
+pub use coordinator::StageCleanupIntent;
+pub use coordinator::StageObservation;
+pub use coordinator::StageReservationInput;
 pub use coordinator::StagedReaderLease;
 pub use coordinator::read_fragment_write_capability;
 pub(crate) use failpoint;
@@ -215,7 +220,6 @@ pub use provider::FragmentDispatchTls;
 pub use provider::FragmentDrainAttempt;
 pub use provider::FragmentDrainCapability;
 pub use provider::FragmentDrainReady;
-pub use provider::FragmentDrainSpoolReady;
 pub use provider::FragmentGetAttempt;
 pub use provider::FragmentGetExecution;
 pub use provider::FragmentGetOperation;

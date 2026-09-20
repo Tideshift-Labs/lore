@@ -162,6 +162,27 @@ impl PostgresFragmentCoordinator {
         }
         for table in &tables {
             let name: String = table.get("relname");
+            if name == "lore_fragment_stage_usage" {
+                let unused_seed: bool = tx
+                    .query_one(
+                        "SELECT count(*) = 1 AND COALESCE(bool_and(singleton \
+                     AND live_bytes = 0 AND live_files = 0 \
+                     AND metadata_bytes = 0 AND metadata_rows = 0), false) \
+                     FROM lore_fragment_stage_usage",
+                        &[],
+                    )
+                    .await
+                    .map_err(|e| {
+                        DomainError::from_pg("clean initialization stage counter seed", e)
+                    })?
+                    .get(0);
+                if !unused_seed {
+                    return Err(DomainError::NotReady(format!(
+                        "clean initialization refuses used counter seed {name}"
+                    )));
+                }
+                continue;
+            }
             if name == "lore_domain_proof_global_counters" {
                 let unused_seed: bool = tx
                     .query_one(

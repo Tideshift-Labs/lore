@@ -181,15 +181,16 @@
 //! [`FragmentDrainCapability`] is the drain-only view of the same composition
 //! door. It retains the entry — hence the one gateway, the one dispatch pool,
 //! and the process's participant identity — and publishes none of them. Its
-//! public surface is exactly two methods, [`FragmentDrainCapability::mark_spool_ready`]
-//! and [`FragmentDrainCapability::attempt_drain`]; `reserve_bound` and an
-//! upload-progress mirror were deliberately cut, because a body bounded by
-//! [`FRAGMENT_PROVIDER_INGRESS_CAP_BYTES`] is written in one chunk and has no
-//! caller for either. Narrowness is by construction in the same order the crate
+//! public surface is exactly three methods: `reserve_spool`, `mark_spool_ready`,
+//! and `attempt_drain`. WP-122 reservations use a maintenance-published policy
+//! and preserve an immutable descriptor before the first database mutation.
+//! Cleanup and observation use a separate opaque maintenance handle.
+//! Narrowness is by construction in the same order the crate
 //! argues everywhere else: the dispatch pool, the dispatch request types, and
 //! the ledger stay unnameable outside this crate; the capability's three fields
 //! are private with no accessor; the private [`AttemptSink`] is untouched; the
-//! source pins are belt and braces.
+//! source pins are belt and braces. Reservation values expose only bounded
+//! durable placement and their budget pin, never a raw provider operation.
 //!
 //! **The drain shares the one limiter and adds nothing.** It reuses
 //! [`FragmentProviderEntry::admit_put`], so it takes a permit from the same
@@ -225,12 +226,20 @@
 //! not to this capability.
 
 use std::fmt;
+mod drain;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+pub use drain::FragmentDrainMaintenanceHandle;
+pub use drain::FragmentDrainObservation;
+pub use drain::FragmentDrainPolicyPin;
+pub use drain::FragmentDrainReservation;
+pub use drain::FragmentDrainReservationInput;
+pub use drain::FragmentDrainReservationPlan;
+pub use drain::FragmentDrainWriteReceipt;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 // ---------------------------------------------------------------------------
 // The re-export boundary — read the rule before adding to it
@@ -328,6 +337,8 @@ use lore_object_dispatch::dispatch_client::InstalledLayerIdentity;
 // a ready receipt cannot be forged or moved between requests.
 use lore_object_dispatch::dispatch_client::PutSpoolReadyOutcome;
 use lore_object_dispatch::dispatch_client::PutStreamIdentity;
+pub use lore_object_dispatch::drain_policy::DrainError as FragmentDrainAuthorityError;
+use lore_object_dispatch::provider_client::ProviderPreTransportGuard;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use tokio::sync::TryAcquireError;
@@ -515,6 +526,11 @@ pub enum FragmentProviderError {
     /// The supplied bytes are not the bytes the bound spool body describes.
     #[error("fragment drain body does not match the bound durable spool body")]
     DrainBodyMismatch,
+
+    #[error("drain reservation authority refused: {0}")]
+    DrainAuthority(#[source] lore_object_dispatch::drain_policy::DrainError),
+    #[error("drain spool filesystem operation failed")]
+    DrainSpoolIo,
 
     /// The cell authority refused the 0017 `SPOOL_READY` transition.
     /// Source-preserving.
@@ -707,10 +723,15 @@ impl FragmentProviderError {
                     FragmentProviderDisposition::Internal
                 }
             },
-            Self::PutAdmissionTimedOut
+            Self::DrainSpoolIo
+            | Self::DrainAuthority(_)
+            | Self::PutAdmissionTimedOut
             | Self::PutAdmissionClosed
             | Self::ChargeAdmissionTimedOut
-            | Self::ChargeAdmissionClosed => FragmentProviderDisposition::Transient,
+            | Self::ChargeAdmissionClosed
+            | Self::Provider(ProviderClientError::PreTransportGuardRefused) => {
+                FragmentProviderDisposition::Transient
+            }
             Self::Provider(ProviderClientError::ChargeAmbiguous)
             | Self::Provider(ProviderClientError::ChargeRecovered) => {
                 FragmentProviderDisposition::OutcomeUnknown
@@ -883,6 +904,7 @@ trait AttemptSink: Send + Sync {
         request: &'a ProviderDirectPutAttemptRequest,
         body: &'a [u8],
         operation: &'a FragmentDirectPutOperation,
+        guard: Option<&'a dyn ProviderPreTransportGuard>,
     ) -> Pin<
         Box<
             dyn Future<
@@ -962,6 +984,7 @@ where
         request: &'a ProviderDirectPutAttemptRequest,
         body: &'a [u8],
         _operation: &'a FragmentDirectPutOperation,
+        guard: Option<&'a dyn ProviderPreTransportGuard>,
     ) -> Pin<
         Box<
             dyn Future<
@@ -976,7 +999,7 @@ where
         Box::pin(async move {
             let execution = self
                 .0
-                .execute_direct_put(ledger, request, body, &())
+                .execute_direct_put_guarded(ledger, request, body, &(), guard)
                 .await?;
             Ok(ProviderAttemptExecution {
                 outcome: execution.outcome,
@@ -1051,6 +1074,7 @@ where
         request: &'a ProviderDirectPutAttemptRequest,
         body: &'a [u8],
         operation: &'a FragmentDirectPutOperation,
+        guard: Option<&'a dyn ProviderPreTransportGuard>,
     ) -> Pin<
         Box<
             dyn Future<
@@ -1065,7 +1089,7 @@ where
         Box::pin(async move {
             let operation = GovernedFragmentOperation::DirectPut(operation.clone());
             self.0
-                .execute_direct_put(ledger, request, body, &operation)
+                .execute_direct_put_guarded(ledger, request, body, &operation, guard)
                 .await
         })
     }
@@ -1974,9 +1998,9 @@ pub const FRAGMENT_DRAIN_MAXIMUM_RECORD_BYTES: i32 = 16_384;
 ///
 /// Opaque by construction: it retains the entry — and through it the process's
 /// gateway, dispatch pool, and participant identity — and publishes none of
-/// them. Its three fields are private and it exposes no `pool`, no `dispatch`,
+/// them. Its fields are private and it exposes no `pool`, no `dispatch`,
 /// no `gateway`, and no `entry`. The public method set is exactly
-/// [`Self::mark_spool_ready`] and [`Self::attempt_drain`], which
+/// [`Self::reserve_spool`], [`Self::mark_spool_ready`] and [`Self::attempt_drain`], which
 /// `tests/seam_source_pins.rs` pins by equality rather than by containment.
 ///
 /// **This grants no delete authority.** The drain builds a
@@ -1990,56 +2014,8 @@ pub struct FragmentDrainCapability {
     entry: Arc<FragmentProviderEntry>,
     dispatch: DispatchRuntimeClient,
     spool_root: PathBuf,
-}
-
-/// What a drain supplies to move its spool object to `SPOOL_READY`.
-///
-/// It restates only the fields a drain knows. There is deliberately **no
-/// provider boundary**: the seam addresses the boundary its own attestation
-/// carries, exactly as [`FragmentProviderAttempt`] does. The protocol revision
-/// and the four canonical-record bounds are the seam's constants above and are
-/// likewise not expressible here.
-#[derive(Clone, PartialEq, Eq)]
-pub struct FragmentDrainSpoolReady {
-    /// The authenticated cell this drain runs for.
-    pub authenticated_cell_id: String,
-    /// The authenticated tenant the spooled body belongs to.
-    pub authenticated_tenant_id: String,
-    /// Canonical UUIDv7 identifying the logical request.
-    pub logical_request_id: Uuid,
-    /// Canonical UUIDv7 identifying the spool attempt that wrote the body.
-    pub attempt_id: Uuid,
-    /// The upload this spool object was reserved under.
-    pub upload_id: Uuid,
-    /// That upload's monotonic fence.
-    pub upload_fence: u64,
-    /// The index of the final chunk written, which for a body bounded by
-    /// [`FRAGMENT_PROVIDER_INGRESS_CAP_BYTES`] is the only chunk.
-    pub final_chunk_index: u64,
-    /// The fsynced body's size, as the writer observed it.
-    pub fsynced_body_size: u64,
-    /// The fsynced body's BLAKE3, as the writer observed it.
-    pub fsynced_body_blake3: [u8; 32],
-    /// The staged file's opaque durable handle.
-    pub durable_handle: String,
-}
-
-impl fmt::Debug for FragmentDrainSpoolReady {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("FragmentDrainSpoolReady")
-            .field("authenticated_cell_id", &"[REDACTED]")
-            .field("authenticated_tenant_id", &"[REDACTED]")
-            .field("logical_request_id", &"[REDACTED]")
-            .field("attempt_id", &"[REDACTED]")
-            .field("upload_id", &"[REDACTED]")
-            .field("upload_fence", &"[REDACTED]")
-            .field("final_chunk_index", &self.final_chunk_index)
-            .field("fsynced_body_size", &self.fsynced_body_size)
-            .field("fsynced_body_blake3", &"[REDACTED]")
-            .field("durable_handle", &"[REDACTED]")
-            .finish()
-    }
+    policy_pin: Option<FragmentDrainPolicyPin>,
+    spool_writer: Option<Arc<lore_object_dispatch::spool_writer::LinuxSpoolWriter>>,
 }
 
 /// An opaque ready receipt.
@@ -2114,9 +2090,8 @@ impl FragmentDrainCapability {
     /// Move this drain's spool object to `SPOOL_READY` and take the receipt a
     /// drain attempt must present.
     ///
-    /// The caller asserts the whole body is already durable at its handle. **No
-    /// filesystem access happens here** — readiness is the database's
-    /// assertion, and this seam opens no file, which the pins keep true.
+    /// The reservation and writer receipt bind all fields. The database rechecks
+    /// live custody and expiry before first publication or replay.
     ///
     /// # Errors
     ///
@@ -2124,23 +2099,37 @@ impl FragmentDrainCapability {
     /// authority refuses the transition.
     pub async fn mark_spool_ready(
         &self,
-        request: &FragmentDrainSpoolReady,
+        reservation: &FragmentDrainReservation,
+        receipt: &FragmentDrainWriteReceipt,
     ) -> Result<FragmentDrainReady, FragmentProviderError> {
+        let d = &reservation.descriptor;
+        if d.boundary != self.entry.boundary().provider_boundary_id()
+            || self.policy_pin.as_ref().is_none_or(|pin| {
+                pin.cell_id != d.cell
+                    || pin.revision != d.policy_revision
+                    || lore_object_dispatch::drain_policy::hex(&pin.digest) != d.policy_digest
+            })
+            || !reservation.matches_receipt(&receipt.0)
+            || receipt.0.size() != d.body_size
+            || lore_object_dispatch::drain_policy::hex(receipt.0.blake3()) != d.body_digest
+        {
+            return Err(FragmentProviderError::ClaimBindingMismatch);
+        }
         let call = lore_object_dispatch::dispatch_client::PutSpoolReadyRequest {
             protocol_revision: FRAGMENT_DRAIN_PROTOCOL_REVISION.to_string(),
             identity: PutStreamIdentity {
                 provider_boundary_id: self.entry.boundary().provider_boundary_id().to_string(),
-                authenticated_cell_id: request.authenticated_cell_id.clone(),
-                authenticated_tenant_id: request.authenticated_tenant_id.clone(),
-                logical_request_id: request.logical_request_id,
-                attempt_id: request.attempt_id,
-                upload_id: request.upload_id,
-                upload_fence: request.upload_fence,
+                authenticated_cell_id: d.cell.clone(),
+                authenticated_tenant_id: d.service.clone(),
+                logical_request_id: d.logical_request_id,
+                attempt_id: d.attempt_id,
+                upload_id: d.upload_id,
+                upload_fence: d.upload_fence,
             },
-            final_chunk_index: request.final_chunk_index,
-            fsynced_body_size: request.fsynced_body_size,
-            fsynced_body_blake3: request.fsynced_body_blake3,
-            durable_handle: request.durable_handle.clone(),
+            final_chunk_index: 0,
+            fsynced_body_size: receipt.0.size(),
+            fsynced_body_blake3: *receipt.0.blake3(),
+            durable_handle: receipt.0.opaque_handle().to_owned(),
             maximum_identity_bytes: FRAGMENT_DRAIN_MAXIMUM_IDENTITY_BYTES,
             maximum_boundary_token_bytes: FRAGMENT_DRAIN_MAXIMUM_BOUNDARY_TOKEN_BYTES,
             maximum_durable_handle_bytes: FRAGMENT_DRAIN_MAXIMUM_DURABLE_HANDLE_BYTES,
@@ -2206,7 +2195,9 @@ impl FragmentDrainCapability {
             &ready.0,
         )
         .map_err(FragmentProviderError::SpoolBindingRejected)?;
-        if bound.logical_request_id() != request.logical_request_id.as_str() {
+        if bound.logical_request_id() != request.logical_request_id.as_str()
+            || ready.0.attempt_id.to_string() != request.attempt_id
+        {
             return Err(FragmentProviderError::SpoolBindingRequestMismatch);
         }
         if bound.blake3() != &request.claim_body_blake3 || bound.size() != request.claim_body_size {
@@ -2215,10 +2206,17 @@ impl FragmentDrainCapability {
         if bound.size() > FRAGMENT_PROVIDER_INGRESS_CAP_BYTES {
             return Err(FragmentProviderError::IngressCapExceeded);
         }
+        if bound.size() == 0 {
+            return Err(FragmentProviderError::Provider(
+                ProviderClientError::DirectPutBodyOutOfBounds,
+            ));
+        }
         let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
         if body_len != bound.size() || blake3::hash(body).as_bytes() != bound.blake3() {
             return Err(FragmentProviderError::DrainBodyMismatch);
         }
+        let ready_key = request.object_key.clone();
+        let ready_deadline = request.deadline_unix_ms;
         let attempt = FragmentProviderAttempt {
             traffic_class: ProviderTrafficClass::Drain,
             attempt_class: ProviderAttemptClass::PutObject,
@@ -2235,11 +2233,84 @@ impl FragmentDrainCapability {
             declared_size: bound.size(),
             declared_blake3: *bound.blake3(),
         };
-        self.entry
-            .admit_put(attempt, operation)
-            .await?
-            .execute_direct_put(ledger, body)
-            .await
+        let mut admitted = self.entry.admit_put(attempt, operation).await?;
+        // Waiting for the shared permit cannot outlive the ready authority check.
+        let check_started = tokio::time::Instant::now();
+        let (effective_deadline, remaining_ms) =
+            lore_object_dispatch::drain_policy::DrainClient::new(self.entry.pool.clone())
+                .check_ready(
+                    ready.0.spool_object_id,
+                    ready.0.attempt_id,
+                    &ready.0.record_blake3,
+                    &ready_key,
+                    ready_deadline,
+                )
+                .await
+                .map_err(FragmentProviderError::DrainAuthority)?;
+        admitted.attempt.deadline_unix_ms = effective_deadline;
+        let remaining = Duration::from_millis(remaining_ms)
+            .checked_sub(check_started.elapsed())
+            .ok_or(FragmentProviderError::DrainAuthority(
+                lore_object_dispatch::drain_policy::DrainError::Refused,
+            ))?;
+        let guard = DrainPreTransportGuard {
+            client: lore_object_dispatch::drain_policy::DrainClient::new(self.entry.pool.clone()),
+            ready: &ready.0,
+            object_key: &ready_key,
+            deadline_unix_ms: effective_deadline,
+            expires_at: check_started
+                .checked_add(Duration::from_millis(remaining_ms))
+                .ok_or(FragmentProviderError::DrainAuthority(
+                    lore_object_dispatch::drain_policy::DrainError::Refused,
+                ))?,
+        };
+        tokio::time::timeout(
+            remaining,
+            admitted.execute_direct_put_guarded(ledger, body, Some(&guard)),
+        )
+        .await
+        .map_err(|_error| FragmentProviderError::Provider(ProviderClientError::ChargeAmbiguous))?
+    }
+}
+
+/// Kept inside the seam: the caller cannot substitute ready evidence or extend
+/// the database-derived window after waiting for charge authority.
+struct DrainPreTransportGuard<'a> {
+    client: lore_object_dispatch::drain_policy::DrainClient,
+    ready: &'a PutSpoolReadyOutcome,
+    object_key: &'a str,
+    deadline_unix_ms: i64,
+    expires_at: tokio::time::Instant,
+}
+
+impl ProviderPreTransportGuard for DrainPreTransportGuard<'_> {
+    fn check(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<tokio::time::Instant, ProviderClientError>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let started = tokio::time::Instant::now();
+            if started >= self.expires_at {
+                return Err(ProviderClientError::PreTransportGuardRefused);
+            }
+            let (_, remaining_ms) = self
+                .client
+                .check_ready(
+                    self.ready.spool_object_id,
+                    self.ready.attempt_id,
+                    &self.ready.record_blake3,
+                    self.object_key,
+                    self.deadline_unix_ms,
+                )
+                .await
+                .map_err(|_error| ProviderClientError::PreTransportGuardRefused)?;
+            // Start the lease before the database round trip, so neither query
+            // latency nor a backward wall-clock change can extend admission.
+            started
+                .checked_add(Duration::from_millis(remaining_ms))
+                .map(|expires_at| expires_at.min(self.expires_at))
+                .ok_or(ProviderClientError::PreTransportGuardRefused)
+        })
     }
 }
 
@@ -2336,7 +2407,7 @@ impl FragmentProviderEntry {
     /// handle gets away with a borrow because it hands out an owned client,
     /// while this one has to retain the gateway, which lives inside the entry.
     ///
-    /// The staging root arrives as a parameter rather than as a field on
+    /// The spool root arrives as a parameter rather than as a field on
     /// [`FragmentDispatchRuntimeConfig`], so composition's construction site
     /// does not change. The seam stores it and passes it to the durable-body
     /// binder; it opens no file with it, and the pins keep that true.
@@ -2345,7 +2416,7 @@ impl FragmentProviderEntry {
     ///
     /// Returns [`FragmentProviderActivationError::DispatchClient`] when the pool
     /// is not the runtime pool.
-    pub fn drain_capability(
+    fn drain_capability(
         self: &Arc<Self>,
         shared_spool_root: PathBuf,
     ) -> Result<FragmentDrainCapability, FragmentProviderActivationError> {
@@ -2355,6 +2426,8 @@ impl FragmentProviderEntry {
             entry: Arc::clone(self),
             dispatch,
             spool_root: shared_spool_root,
+            policy_pin: None,
+            spool_writer: None,
         })
     }
 
@@ -2447,6 +2520,15 @@ impl AdmittedFragmentPutAttempt<'_> {
         ledger: &mut FragmentAttemptLedger,
         body: &[u8],
     ) -> Result<FragmentTransportExecution, FragmentProviderError> {
+        self.execute_direct_put_guarded(ledger, body, None).await
+    }
+
+    async fn execute_direct_put_guarded(
+        self,
+        ledger: &mut FragmentAttemptLedger,
+        body: &[u8],
+        guard: Option<&dyn ProviderPreTransportGuard>,
+    ) -> Result<FragmentTransportExecution, FragmentProviderError> {
         let request = ProviderDirectPutAttemptRequest {
             traffic_class: self.attempt.traffic_class,
             target: self.gateway.boundary().target().clone(),
@@ -2461,7 +2543,7 @@ impl AdmittedFragmentPutAttempt<'_> {
         let execution = self
             .gateway
             .client
-            .issue_direct_put(&mut ledger.0, &request, body, &self.operation)
+            .issue_direct_put(&mut ledger.0, &request, body, &self.operation, guard)
             .await
             .map_err(FragmentProviderError::Provider)?;
         Ok(FragmentTransportExecution {
@@ -2904,2546 +2986,4 @@ impl std::fmt::Debug for FragmentProviderGateway {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicI64;
-    use std::sync::atomic::AtomicU32;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-
-    use lore_object_dispatch::AuthorizedProviderAttempt;
-    use lore_object_dispatch::PROVIDER_MAX_MULTIPART_PARTS;
-    use lore_object_dispatch::ProviderAttemptReport;
-    use lore_object_dispatch::ProviderChargeError;
-    use lore_object_dispatch::ProviderChargeGrant;
-    use lore_object_dispatch::ProviderChargeRequest;
-    use lore_object_dispatch::ProviderPutLimits;
-    use lore_object_dispatch::ProviderTarget;
-    use lore_object_dispatch::ProviderTransportRefusal;
-    use lore_object_dispatch::PutObjectPlan;
-    use lore_object_dispatch::cell_schema_install::CellSchemaLayer;
-    use lore_object_dispatch::plan_put_object;
-
-    use super::*;
-
-    // -----------------------------------------------------------------------
-    // Fixtures
-    // -----------------------------------------------------------------------
-
-    /// Canonical UUIDv7s whose 48-bit timestamp is 1_700_000_000_000 ms.
-    const REQUEST_ID: &str = "018bcfe5-6800-7abc-8def-000000000001";
-    const ATTEMPT_ID: &str = "018bcfe5-6800-7abc-8def-000000000002";
-    const GRANT_ID: &str = "018bcfe5-6800-7abc-8def-000000000003";
-    const ATTEMPT_TIMESTAMP_MS: i64 = 1_700_000_000_000;
-    const DEADLINE_MS: i64 = ATTEMPT_TIMESTAMP_MS + 60_000;
-    const BOUNDARY_ID: &str = "cell-alpha-boundary";
-
-    fn boundary() -> CellProviderBoundary {
-        match CellProviderBoundary::new(
-            BOUNDARY_ID,
-            "cell-alpha-fragments",
-            "us-east-1",
-            "obj.example.invalid",
-        ) {
-            Ok(boundary) => boundary,
-            Err(error) => panic!("fixture boundary must be valid: {error}"),
-        }
-    }
-
-    fn other_boundary() -> CellProviderBoundary {
-        match CellProviderBoundary::new(
-            "cell-beta-boundary",
-            "cell-beta-fragments",
-            "eu-west-1",
-            "obj-eu.example.invalid",
-        ) {
-            Ok(boundary) => boundary,
-            Err(error) => panic!("fixture boundary must be valid: {error}"),
-        }
-    }
-
-    fn bound() -> InFlightPutBound {
-        match InFlightPutBound::new(2, Duration::from_millis(50)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture bound must be valid: {error}"),
-        }
-    }
-
-    /// Wide enough that no existing test queues on it, so adding the charge bound
-    /// changes no assertion that was not about the charge bound. A test that wants
-    /// to observe the queue builds its own narrow bound instead.
-    fn test_charge_bound() -> InFlightChargeBound {
-        match InFlightChargeBound::new(64, Duration::from_millis(50)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture charge bound must be valid: {error}"),
-        }
-    }
-
-    fn pin() -> BudgetPin {
-        BudgetPin {
-            revision: "cell-alpha-budget-r1".to_string(),
-            fence: 1,
-        }
-    }
-
-    fn attempt(class: ProviderAttemptClass) -> FragmentProviderAttempt {
-        FragmentProviderAttempt {
-            traffic_class: ProviderTrafficClass::Repair,
-            attempt_class: class,
-            logical_request_id: REQUEST_ID.to_string(),
-            attempt_id: ATTEMPT_ID.to_string(),
-            attempt_ordinal: 1,
-            deadline_unix_ms: DEADLINE_MS,
-            budget_pin: pin(),
-            put_body: None,
-        }
-    }
-
-    fn put_operation(body: &[u8]) -> FragmentDirectPutOperation {
-        FragmentDirectPutOperation {
-            object_key: "objects/fragment.bin".to_string(),
-            metadata: vec![("codec".to_string(), "raw".to_string())],
-            declared_size: body.len() as u64,
-            declared_blake3: *blake3::hash(body).as_bytes(),
-        }
-    }
-
-    fn ledger() -> FragmentAttemptLedger {
-        match FragmentAttemptLedger::new(BOUNDARY_ID, REQUEST_ID) {
-            Ok(ledger) => ledger,
-            Err(error) => panic!("fixture ledger must open: {error}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Doubles
-    // -----------------------------------------------------------------------
-
-    /// What a scripted authority does with one charge.
-    #[derive(Clone, Copy)]
-    enum ChargeScript {
-        /// Mint a grant that exactly binds the request.
-        Grant,
-        /// Mint a grant naming a different ordinal, so it does not bind.
-        GrantForAnotherAttempt,
-        /// Refuse with this error.
-        Refuse(ProviderChargeError),
-        /// Never resolve, so the caller keeps its admission permit.
-        Hang,
-    }
-
-    struct ScriptedChargeAuthority {
-        script: ChargeScript,
-        calls: AtomicU32,
-        /// The most recent `deadline_unix_ms` this authority observed in a
-        /// charge request. There is no public accessor on an admitted
-        /// attempt, so this is the closest honest way to see whether
-        /// `admit_operation` shifted the deadline it built its request from.
-        last_seen_deadline_unix_ms: AtomicI64,
-        /// The most recent `traffic_class` this authority observed. Added for
-        /// the WP-114 CD-6 drain tests, which need to prove — not merely read
-        /// from source — that a drain send is charged under
-        /// [`ProviderTrafficClass::Drain`] and that a caller cannot influence
-        /// it. `Mutex` rather than an atomic: the class is a small `Copy` enum
-        /// with no natural integer encoding worth inventing one for.
-        last_seen_traffic_class: Mutex<Option<ProviderTrafficClass>>,
-    }
-
-    impl ScriptedChargeAuthority {
-        fn new(script: ChargeScript) -> Self {
-            Self {
-                script,
-                calls: AtomicU32::new(0),
-                last_seen_deadline_unix_ms: AtomicI64::new(0),
-                last_seen_traffic_class: Mutex::new(None),
-            }
-        }
-
-        fn last_seen_traffic_class(&self) -> Option<ProviderTrafficClass> {
-            *self
-                .last_seen_traffic_class
-                .lock()
-                .expect("traffic class lock")
-        }
-    }
-
-    impl ProviderChargeAuthority for ScriptedChargeAuthority {
-        async fn charge(
-            &self,
-            request: &ProviderChargeRequest,
-        ) -> Result<ProviderChargeGrant, ProviderChargeError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.last_seen_deadline_unix_ms
-                .store(request.deadline_unix_ms(), Ordering::SeqCst);
-            *self
-                .last_seen_traffic_class
-                .lock()
-                .expect("traffic class lock") = Some(request.traffic_class());
-            let grant = |ordinal: u32| ProviderChargeGrant {
-                grant_id: GRANT_ID.to_string(),
-                traffic_class: request.traffic_class(),
-                attempt_class: request.attempt_class(),
-                charged_units: request.attempt_units(),
-                budget_pin: request.budget_pin().clone(),
-                logical_request_id: request.logical_request_id().to_string(),
-                attempt_id: request.attempt_id().to_string(),
-                attempt_ordinal: ordinal,
-                granted_at_database_unix_ms: ATTEMPT_TIMESTAMP_MS,
-            };
-            match self.script {
-                ChargeScript::Grant => Ok(grant(request.attempt_ordinal())),
-                ChargeScript::GrantForAnotherAttempt => {
-                    Ok(grant(request.attempt_ordinal().saturating_add(1)))
-                }
-                ChargeScript::Refuse(error) => Err(error),
-                ChargeScript::Hang => {
-                    std::future::pending::<()>().await;
-                    Err(ProviderChargeError::Unwired)
-                }
-            }
-        }
-    }
-
-    /// Counts what actually reached the wire. That count is the only observable
-    /// that can contradict a charge-before-send claim.
-    struct CountingTransport {
-        issued: AtomicUsize,
-        requests_per_call: u32,
-        outcome: ProviderAttemptOutcome,
-    }
-
-    impl CountingTransport {
-        fn new(requests_per_call: u32, outcome: ProviderAttemptOutcome) -> Self {
-            Self {
-                issued: AtomicUsize::new(0),
-                requests_per_call,
-                outcome,
-            }
-        }
-    }
-
-    impl ProviderTransport for CountingTransport {
-        type Operation = ();
-        type Response = ();
-
-        async fn issue(
-            &self,
-            _attempt: &AuthorizedProviderAttempt<'_>,
-            _operation: &Self::Operation,
-        ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
-            self.issued.fetch_add(1, Ordering::SeqCst);
-            Ok(ProviderAttemptReport {
-                outcome: self.outcome,
-                provider_requests_issued: self.requests_per_call,
-                response: (),
-            })
-        }
-    }
-
-    /// A gateway plus the two counters its doubles keep, so a test can assert on
-    /// what was charged and what was sent without reaching through the gateway's
-    /// private client.
-    struct Harness {
-        gateway: FragmentProviderGateway,
-        authority: Arc<ScriptedChargeAuthority>,
-        transport: Arc<CountingTransport>,
-    }
-
-    impl Harness {
-        fn new(script: ChargeScript, requests_per_call: u32, bound: InFlightPutBound) -> Self {
-            Self::with_boundary(script, requests_per_call, bound, boundary())
-        }
-
-        fn with_boundary(
-            script: ChargeScript,
-            requests_per_call: u32,
-            bound: InFlightPutBound,
-            boundary: CellProviderBoundary,
-        ) -> Self {
-            Self::with_outcome(
-                script,
-                requests_per_call,
-                bound,
-                boundary,
-                ProviderAttemptOutcome::Decisive,
-            )
-        }
-
-        fn with_outcome(
-            script: ChargeScript,
-            requests_per_call: u32,
-            bound: InFlightPutBound,
-            boundary: CellProviderBoundary,
-            outcome: ProviderAttemptOutcome,
-        ) -> Self {
-            let authority = Arc::new(ScriptedChargeAuthority::new(script));
-            let transport = Arc::new(CountingTransport::new(requests_per_call, outcome));
-            Self {
-                gateway: FragmentProviderGateway::new(
-                    CellSchemaAttestation::for_tests(boundary),
-                    ProviderCapabilities::none().with_listing(),
-                    bound,
-                    test_charge_bound(),
-                    SharedAuthority(Arc::clone(&authority)),
-                    SharedTransport(Arc::clone(&transport)),
-                ),
-                authority,
-                transport,
-            }
-        }
-
-        fn charge_calls(&self) -> u32 {
-            self.authority.calls.load(Ordering::SeqCst)
-        }
-
-        fn issued(&self) -> usize {
-            self.transport.issued.load(Ordering::SeqCst)
-        }
-    }
-
-    /// Local newtypes so the test can hold a counter the gateway also owns.
-    /// `Arc<T>` is foreign for these two foreign traits, so a wrapper is the
-    /// only way to share the doubles with the assertions.
-    struct SharedAuthority(Arc<ScriptedChargeAuthority>);
-
-    struct SharedTransport(Arc<CountingTransport>);
-
-    struct CountingGetPort {
-        get_calls: AtomicUsize,
-        metered_calls: AtomicUsize,
-        requests_per_call: u32,
-        outcome: ProviderAttemptOutcome,
-        direct_body: Mutex<Option<Vec<u8>>>,
-        metered_operations: Mutex<Vec<FragmentTransportOperation>>,
-    }
-
-    struct SharedGetPort(Arc<CountingGetPort>);
-
-    impl ProviderChargeAuthority for SharedAuthority {
-        fn charge(
-            &self,
-            request: &ProviderChargeRequest,
-        ) -> impl std::future::Future<Output = Result<ProviderChargeGrant, ProviderChargeError>> + Send
-        {
-            ScriptedChargeAuthority::charge(self.0.as_ref(), request)
-        }
-    }
-
-    impl ProviderTransport for SharedTransport {
-        type Operation = ();
-        type Response = ();
-
-        async fn issue(
-            &self,
-            attempt: &AuthorizedProviderAttempt<'_>,
-            operation: &Self::Operation,
-        ) -> Result<ProviderAttemptReport<Self::Response>, ProviderTransportRefusal> {
-            CountingTransport::issue(self.0.as_ref(), attempt, operation).await
-        }
-    }
-
-    impl FragmentTransportPort for SharedGetPort {
-        fn issue<'a>(
-            &'a self,
-            request: FragmentTransportRequest<'a>,
-        ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>> {
-            self.0.metered_calls.fetch_add(1, Ordering::SeqCst);
-            self.0
-                .metered_operations
-                .lock()
-                .expect("metered operation lock")
-                .push(request.operation().clone());
-            let requests_per_call = self.0.requests_per_call;
-            let response = match request.operation() {
-                FragmentTransportOperation::Head { .. } => FragmentTransportResponse::Head {
-                    metadata: Vec::new(),
-                    content_length: 1,
-                },
-                FragmentTransportOperation::ListVersions { .. } => {
-                    FragmentTransportResponse::Versions(Vec::new())
-                }
-                FragmentTransportOperation::DeleteVersion { .. } => {
-                    FragmentTransportResponse::Deleted
-                }
-                FragmentTransportOperation::DeleteExact { .. } => {
-                    FragmentTransportResponse::Deleted
-                }
-            };
-            Box::pin(async move {
-                FragmentTransportExchange {
-                    outcome: self.0.outcome,
-                    provider_requests_issued: requests_per_call,
-                    response,
-                }
-            })
-        }
-    }
-
-    impl FragmentDirectPutPort for SharedGetPort {
-        fn issue_direct_put<'a>(
-            &'a self,
-            request: FragmentDirectPutRequest<'a>,
-        ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>> {
-            self.0.metered_calls.fetch_add(1, Ordering::SeqCst);
-            let requests_per_call = self.0.requests_per_call;
-            let body = request.body().expect("direct PUT request carries bytes");
-            assert_eq!(request.size(), Some(body.len() as u64));
-            assert_eq!(request.blake3(), Some(blake3::hash(body).as_bytes()));
-            *self.0.direct_body.lock().expect("direct body lock") = Some(body.to_vec());
-            Box::pin(async move {
-                FragmentTransportExchange {
-                    outcome: self.0.outcome,
-                    provider_requests_issued: requests_per_call,
-                    response: FragmentTransportResponse::PutCreated,
-                }
-            })
-        }
-    }
-
-    impl FragmentGetPort for SharedGetPort {
-        fn issue_get<'a>(
-            &'a self,
-            request: FragmentGetRequest<'a>,
-        ) -> Pin<Box<dyn Future<Output = FragmentGetExchange> + Send + 'a>> {
-            self.0.get_calls.fetch_add(1, Ordering::SeqCst);
-            let requests_per_call = self.0.requests_per_call;
-            Box::pin(async move {
-                assert_eq!(request.target().bucket(), "cell-alpha-fragments");
-                assert_eq!(request.operation().object_key, "objects/fragment.bin");
-                FragmentGetExchange {
-                    outcome: ProviderAttemptOutcome::Decisive,
-                    provider_requests_issued: requests_per_call,
-                    response: FragmentGetResponse::Found {
-                        bytes: vec![1, 2, 3],
-                        metadata: vec![("codec".to_string(), "raw".to_string())],
-                    },
-                }
-            })
-        }
-    }
-
-    fn get_attempt() -> FragmentGetAttempt {
-        FragmentGetAttempt {
-            logical_request_id: REQUEST_ID.to_string(),
-            attempt_id: ATTEMPT_ID.to_string(),
-            attempt_ordinal: 1,
-        }
-    }
-
-    fn get_operation() -> FragmentGetOperation {
-        FragmentGetOperation {
-            object_key: "objects/fragment.bin".to_string(),
-        }
-    }
-
-    fn get_harness(
-        requests_per_call: u32,
-    ) -> (
-        FragmentProviderGateway,
-        Arc<ScriptedChargeAuthority>,
-        Arc<CountingGetPort>,
-    ) {
-        port_harness(ChargeScript::Grant, requests_per_call, bound())
-    }
-
-    fn port_harness(
-        script: ChargeScript,
-        requests_per_call: u32,
-        put_bound: InFlightPutBound,
-    ) -> (
-        FragmentProviderGateway,
-        Arc<ScriptedChargeAuthority>,
-        Arc<CountingGetPort>,
-    ) {
-        port_harness_with_bounds(script, requests_per_call, put_bound, test_charge_bound())
-    }
-
-    /// Same as [`port_harness`], with the charge bound also caller-supplied, so
-    /// a test that wants to observe the charge queue does not have to widen the
-    /// put bound to get there.
-    fn port_harness_with_bounds(
-        script: ChargeScript,
-        requests_per_call: u32,
-        put_bound: InFlightPutBound,
-        charge_bound: InFlightChargeBound,
-    ) -> (
-        FragmentProviderGateway,
-        Arc<ScriptedChargeAuthority>,
-        Arc<CountingGetPort>,
-    ) {
-        let authority = Arc::new(ScriptedChargeAuthority::new(script));
-        let port = Arc::new(CountingGetPort {
-            get_calls: AtomicUsize::new(0),
-            metered_calls: AtomicUsize::new(0),
-            requests_per_call,
-            outcome: ProviderAttemptOutcome::Decisive,
-            direct_body: Mutex::new(None),
-            metered_operations: Mutex::new(Vec::new()),
-        });
-        let gateway = FragmentProviderGateway::with_transport_port(
-            CellSchemaAttestation::for_tests(boundary()),
-            ProviderCapabilities::none().with_listing(),
-            put_bound,
-            charge_bound,
-            SharedAuthority(Arc::clone(&authority)),
-            SharedGetPort(Arc::clone(&port)),
-        );
-        (gateway, authority, port)
-    }
-
-    fn harness(script: ChargeScript) -> Harness {
-        Harness::new(script, 1, bound())
-    }
-
-    /// Waits until every in-flight put slot is taken, then returns.
-    ///
-    /// Bounded rather than an open spin: if admission ever stops taking a permit
-    /// for a put, the condition becomes unreachable, and an unbounded loop would
-    /// hang the suite instead of reporting the regression. A hang is not a test
-    /// result.
-    async fn wait_until_puts_are_saturated(gateway: &FragmentProviderGateway) {
-        for _ in 0..100_000 {
-            if gateway.available_put_permits() == 0 {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("an in-flight put never took its admission permit");
-    }
-
-    /// Waits until the scripted authority has observed `n` charge calls.
-    ///
-    /// Mirrors [`wait_until_puts_are_saturated`]'s bounded-spin shape for the
-    /// same reason: an open loop would hang the suite, not fail it, if
-    /// admission ever stopped reaching the limiter. Reaching the limiter
-    /// proves the admission permit was already taken, since
-    /// `admit_operation`/`admit_put` acquire it before `execute` can ever call
-    /// the charge authority.
-    async fn wait_until_charge_calls_reach(authority: &ScriptedChargeAuthority, n: u32) {
-        for _ in 0..100_000 {
-            if authority.calls.load(Ordering::SeqCst) >= n {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("the charge authority never observed {n} call(s)");
-    }
-
-    /// A one-permit charge bound, so a second concurrent charge-carrying
-    /// attempt has nowhere to go and must queue or fail closed.
-    fn narrow_charge_bound() -> InFlightChargeBound {
-        match InFlightChargeBound::new(1, Duration::from_millis(40)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture charge bound must be valid: {error}"),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Property 1: installed cell schema and the typed authority client
-    // -----------------------------------------------------------------------
-
-    fn expected_layer(id: CellSchemaLayerId) -> &'static CellSchemaLayer {
-        match CELL_SCHEMA_LAYERS.iter().find(|layer| layer.id == id) {
-            Some(layer) => layer,
-            None => panic!("every attested layer must exist in CELL_SCHEMA_LAYERS"),
-        }
-    }
-
-    fn installed(id: CellSchemaLayerId) -> InstalledLayerIdentity {
-        let layer = expected_layer(id);
-        let decoded = match hex::decode(layer.migration_blake3_hex) {
-            Ok(decoded) => decoded,
-            Err(error) => panic!("frozen layer digest must be hex: {error}"),
-        };
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(&decoded);
-        InstalledLayerIdentity {
-            schema_revision: layer.schema_revision.to_string(),
-            migration_blake3: digest,
-            install_revision: 1,
-            installed_at_unix_ms: ATTEMPT_TIMESTAMP_MS,
-        }
-    }
-
-    fn installed_state() -> DispatcherIdentityState {
-        DispatcherIdentityState {
-            retention: installed(CellSchemaLayerId::Retention),
-            local_authority: installed(CellSchemaLayerId::Authority),
-            put_reservation: installed(CellSchemaLayerId::PutReservation),
-            dispatcher_identity: installed(CellSchemaLayerId::DispatcherIdentity),
-        }
-    }
-
-    fn layer_slot(
-        state: &mut DispatcherIdentityState,
-        index: usize,
-    ) -> &mut InstalledLayerIdentity {
-        match index {
-            0 => &mut state.retention,
-            1 => &mut state.local_authority,
-            2 => &mut state.put_reservation,
-            3 => &mut state.dispatcher_identity,
-            _ => panic!("ATTESTED_LAYERS has exactly four slots"),
-        }
-    }
-
-    /// The recorded install revisions must come from the readback, not from a
-    /// local constant. A distinctive revision per layer is what makes that
-    /// falsifiable: comparing against `ATTESTED_LAYERS` alone would restate the
-    /// module's own definition and could not fail.
-    #[test]
-    fn an_attestation_records_the_readbacks_own_install_revisions() {
-        let mut state = installed_state();
-        state.retention.install_revision = 11;
-        state.local_authority.install_revision = 22;
-        state.put_reservation.install_revision = 33;
-        state.dispatcher_identity.install_revision = 44;
-
-        let attestation = match verify_installed_layers(&state, boundary()) {
-            Ok(attestation) => attestation,
-            Err(error) => panic!("a fully installed cell must attest: {error}"),
-        };
-        assert_eq!(
-            attestation.attested_layers(),
-            [
-                (CellSchemaLayerId::Retention.label(), 11),
-                (CellSchemaLayerId::Authority.label(), 22),
-                (CellSchemaLayerId::PutReservation.label(), 33),
-                (CellSchemaLayerId::DispatcherIdentity.label(), 44),
-            ],
-        );
-        assert_eq!(attestation.boundary(), &boundary());
-        assert_ne!(
-            attestation,
-            CellSchemaAttestation::for_tests(boundary()),
-            "a fabricated attestation must not compare equal to an attested one",
-        );
-    }
-
-    /// The gateway addresses the cell its attestation was minted for, and there
-    /// is no second boundary that could disagree.
-    #[test]
-    fn a_gateway_addresses_the_boundary_its_attestation_carries() {
-        let here = harness(ChargeScript::Grant);
-        let elsewhere = Harness::with_boundary(ChargeScript::Grant, 1, bound(), other_boundary());
-        assert_eq!(here.gateway.boundary(), &boundary());
-        assert_eq!(elsewhere.gateway.boundary(), &other_boundary());
-        assert_eq!(
-            here.gateway.attestation().boundary(),
-            here.gateway.boundary(),
-        );
-        assert_eq!(
-            elsewhere.gateway.attestation().boundary(),
-            elsewhere.gateway.boundary(),
-        );
-    }
-
-    /// Drives every attested layer against every field the attestation reads,
-    /// rather than a hand-picked pair.
-    ///
-    /// The loop ranges over the local `ATTESTED_LAYERS`, so it cannot by itself
-    /// notice a fifth layer appearing in the readback — an earlier version of
-    /// this comment claimed it could. What notices that is
-    /// [`the_attestation_does_not_cover_the_budget_limiter_layer`], which ranges
-    /// over `CELL_SCHEMA_LAYERS` instead and names the one deliberate
-    /// exclusion.
-    #[test]
-    fn each_attested_layer_and_each_read_field_independently_refuses() {
-        assert_eq!(ATTESTED_LAYERS.len(), 4);
-        for (index, id) in ATTESTED_LAYERS.iter().enumerate() {
-            for mutation in 0..3 {
-                let mut state = installed_state();
-                {
-                    let slot = layer_slot(&mut state, index);
-                    match mutation {
-                        0 => slot.schema_revision.push('x'),
-                        1 => slot.migration_blake3[0] ^= 0xff,
-                        _ => slot.install_revision = 0,
-                    }
-                }
-                assert_eq!(
-                    verify_installed_layers(&state, boundary()),
-                    Err(FragmentSchemaAttestationError::Mismatch { layer: *id }),
-                    "layer {} mutation {mutation} must refuse and name its own layer",
-                    id.label(),
-                );
-            }
-        }
-    }
-
-    /// Pins the honest scope of the attestation. 0019's readback covers four of
-    /// the six installed layers, and the two it leaves out are left out for
-    /// different reasons rather than by oversight.
-    ///
-    /// CD-4's budget-limiter layer — the one the charge itself executes against
-    /// — has no readback at all here. CD-8's cell-retention layer has one, but
-    /// it is 0024's own `read_state`, called by `lore-server` when it schedules
-    /// the retention pass, not by this connect-time attestation. A cell may run
-    /// the governed provider route with the retention layer absent; that is a
-    /// refusal at the scheduler, not at provider activation.
-    #[test]
-    fn the_attestation_covers_every_layer_with_a_readback_here() {
-        const UNATTESTED: [CellSchemaLayerId; 2] = [
-            CellSchemaLayerId::BudgetLimiter,
-            CellSchemaLayerId::CellRetention,
-        ];
-        assert_eq!(CELL_SCHEMA_LAYERS.len(), 6);
-        for excluded in UNATTESTED {
-            assert!(
-                !ATTESTED_LAYERS.contains(&excluded),
-                "layer {} is documented as unattested here but appears in ATTESTED_LAYERS",
-                excluded.label(),
-            );
-        }
-        for layer in CELL_SCHEMA_LAYERS {
-            if !UNATTESTED.contains(&layer.id) {
-                assert!(
-                    ATTESTED_LAYERS.contains(&layer.id),
-                    "layer {} must be attested or explicitly excluded",
-                    layer.id.label(),
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Property 2: through the shared limiter and the governed client
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn a_refused_charge_reaches_no_transport_and_counts_no_grant() {
-        let harness = harness(ChargeScript::Refuse(ProviderChargeError::BudgetExhausted));
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
-            .await;
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::Provider(
-                ProviderClientError::ChargeRefused(ProviderChargeError::BudgetExhausted)
-            ))
-        );
-        assert_eq!(harness.charge_calls(), 1);
-        assert_eq!(harness.issued(), 0);
-        assert_eq!(ledger.committed_grant_count(), 0);
-        assert_eq!(ledger.attempt_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn a_granted_charge_binds_exactly_one_issued_attempt() {
-        let harness = harness(ChargeScript::Grant);
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
-            .await;
-        assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
-        assert_eq!(harness.charge_calls(), 1);
-        assert_eq!(harness.issued(), 1);
-        assert_eq!(ledger.committed_grant_count(), 1);
-        assert_eq!(ledger.attempt_count(), 1);
-        assert_eq!(ledger.decisive_terminal_count(), 1);
-    }
-
-    #[tokio::test]
-    async fn get_returns_the_typed_response_with_zero_database_authority_calls() {
-        let (gateway, authority, port) = get_harness(1);
-
-        let execution = gateway.get(&get_attempt(), &get_operation()).await;
-
-        assert_eq!(
-            execution,
-            Ok(FragmentGetExecution {
-                outcome: ProviderAttemptOutcome::Decisive,
-                response: FragmentGetResponse::Found {
-                    bytes: vec![1, 2, 3],
-                    metadata: vec![("codec".to_string(), "raw".to_string())],
-                },
-            })
-        );
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(port.get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn get_exposes_a_response_only_for_exactly_one_wire_request() {
-        for (reported, expected) in [
-            (
-                0,
-                Err(FragmentProviderError::Provider(
-                    ProviderClientError::TransportReportInconsistent,
-                )),
-            ),
-            (
-                2,
-                Err(FragmentProviderError::Provider(
-                    ProviderClientError::TransportIssuedUnauthorizedRequests,
-                )),
-            ),
-        ] {
-            let (gateway, authority, port) = get_harness(reported);
-
-            assert_eq!(
-                gateway.get(&get_attempt(), &get_operation()).await,
-                expected
-            );
-            assert_eq!(
-                authority.calls.load(Ordering::SeqCst),
-                0,
-                "reported={reported}"
-            );
-            assert_eq!(
-                port.get_calls.load(Ordering::SeqCst),
-                1,
-                "reported={reported}"
-            );
-            assert_eq!(
-                port.metered_calls.load(Ordering::SeqCst),
-                0,
-                "reported={reported}"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn head_list_and_delete_each_charge_and_send_once_while_get_stays_unmetered() {
-        let cases = [
-            (
-                ProviderAttemptClass::HeadObject,
-                FragmentTransportOperation::Head {
-                    object_key: "objects/fragment.bin".to_string(),
-                },
-            ),
-            (
-                ProviderAttemptClass::ListObjectVersions,
-                FragmentTransportOperation::ListVersions {
-                    object_key: "objects/fragment.bin".to_string(),
-                },
-            ),
-            (
-                ProviderAttemptClass::DeleteObject,
-                FragmentTransportOperation::DeleteVersion {
-                    object_key: "objects/fragment.bin".to_string(),
-                    version_id: "version-1".to_string(),
-                },
-            ),
-            (
-                ProviderAttemptClass::DeleteObject,
-                FragmentTransportOperation::DeleteExact {
-                    object_key: "objects/exact-fragment.bin".to_string(),
-                },
-            ),
-        ];
-        for (class, operation) in cases {
-            let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
-            let admitted = gateway
-                .admit_operation(attempt(class), operation.clone())
-                .await
-                .expect("metered non-GET admission");
-            admitted
-                .execute(&mut ledger())
-                .await
-                .expect("metered non-GET execution");
-            assert_eq!(authority.calls.load(Ordering::SeqCst), 1, "{class:?}");
-            assert_eq!(port.metered_calls.load(Ordering::SeqCst), 1, "{class:?}");
-            assert_eq!(port.get_calls.load(Ordering::SeqCst), 0, "{class:?}");
-            assert_eq!(
-                port.metered_operations
-                    .lock()
-                    .expect("metered operation lock")
-                    .as_slice(),
-                std::slice::from_ref(&operation),
-                "the gateway must preserve the exact operation and key"
-            );
-        }
-
-        let (gateway, authority, port) = get_harness(1);
-        gateway
-            .get(&get_attempt(), &get_operation())
-            .await
-            .expect("unmetered GET");
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(port.get_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn an_ambiguous_commit_stays_charged_and_sends_nothing() {
-        let harness = harness(ChargeScript::Refuse(ProviderChargeError::AmbiguousCommit));
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
-            .await;
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::Provider(
-                ProviderClientError::ChargeAmbiguous
-            ))
-        );
-        assert_eq!(harness.issued(), 0);
-        assert_eq!(ledger.committed_grant_count(), 1);
-        assert_eq!(ledger.attempt_count(), 0);
-    }
-
-    /// A provider that gave no definite answer is reported as `Ok`, and the
-    /// seam must hand that back rather than flattening it into success or into
-    /// an error. The ledger counts one charged, one issued, one ambiguous, and
-    /// no decisive terminal, which is what a caller has to distinguish on.
-    #[tokio::test]
-    async fn a_transport_reported_ambiguous_outcome_is_returned_as_itself() {
-        let harness = Harness::with_outcome(
-            ChargeScript::Grant,
-            1,
-            bound(),
-            boundary(),
-            ProviderAttemptOutcome::Ambiguous,
-        );
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
-            .await;
-        assert_eq!(
-            outcome,
-            Ok(ProviderAttemptOutcome::Ambiguous),
-            "an unknown provider effect must not arrive as Decisive",
-        );
-        assert_eq!(harness.issued(), 1);
-        assert_eq!(ledger.committed_grant_count(), 1);
-        assert_eq!(ledger.attempt_count(), 1);
-        assert_eq!(ledger.ambiguous_count(), 1);
-        assert_eq!(
-            ledger.decisive_terminal_count(),
-            0,
-            "an ambiguous outcome is not a terminal one",
-        );
-    }
-
-    #[tokio::test]
-    async fn a_grant_that_does_not_bind_the_attempt_sends_nothing_and_closes_the_ledger() {
-        let harness = harness(ChargeScript::GrantForAnotherAttempt);
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::DeleteObject))
-            .await;
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::Provider(
-                ProviderClientError::GrantDoesNotBindAttempt
-            ))
-        );
-        assert_eq!(harness.issued(), 0);
-        assert_eq!(ledger.committed_grant_count(), 1);
-        assert!(ledger.poisoned().is_some());
-    }
-
-    #[tokio::test]
-    async fn the_shipped_gateway_charges_nothing_and_sends_nothing() {
-        let gateway = FragmentProviderGateway::unwired(
-            CellSchemaAttestation::for_tests(boundary()),
-            ProviderCapabilities::none(),
-            bound(),
-            test_charge_bound(),
-        );
-        let mut ledger = ledger();
-        let outcome = gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
-            .await;
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::Provider(
-                ProviderClientError::ChargeRefused(ProviderChargeError::Unwired)
-            ))
-        );
-        assert_eq!(ledger.committed_grant_count(), 0);
-        assert_eq!(ledger.attempt_count(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // Property 3: no SDK automatic retries
-    // -----------------------------------------------------------------------
-
-    /// The observable half of the no-auto-retry rule. A declaration proves
-    /// nothing about an SDK's internals; the count a transport reports does, and
-    /// more than the one charged request closes the ledger.
-    #[tokio::test]
-    async fn a_transport_that_issued_more_than_the_charged_request_poisons_the_ledger() {
-        let harness = Harness::new(ChargeScript::Grant, 3, bound());
-        let mut ledger = ledger();
-        let outcome = harness
-            .gateway
-            .execute(&mut ledger, &attempt(ProviderAttemptClass::HeadObject))
-            .await;
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::Provider(
-                ProviderClientError::TransportIssuedUnauthorizedRequests
-            ))
-        );
-        assert!(ledger.poisoned().is_some());
-        assert_eq!(ledger.committed_grant_count(), 1);
-    }
-
-    /// A shape assertion, not an independent pin: `ProviderRetryPolicy` has one
-    /// constructible value, so this cannot fail on its own. It is here to state
-    /// what the constructor chose. The falsifiable enforcement is the test above
-    /// and the constructor-signature pin in
-    /// `tests/seam_source_pins.rs`.
-    #[test]
-    fn the_gateway_states_retries_disabled() {
-        let harness = harness(ChargeScript::Grant);
-        assert_eq!(
-            harness.gateway.retry_policy(),
-            ProviderRetryPolicy::disabled()
-        );
-        assert_eq!(harness.gateway.retry_policy().max_attempts(), 1);
-    }
-
-    // -----------------------------------------------------------------------
-    // Property 4: the ingress cap, the class allowlist, and in-flight puts
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn the_ingress_cap_is_lore_bases_existing_fragment_threshold() {
-        // Comparing the constant to `FRAGMENT_SIZE_THRESHOLD` would restate its
-        // own definition and could not fail. What the literals catch is a
-        // *value* change on either side: `lore-base` raising the fragment
-        // threshold, or this seam's cap drifting away from it. They do not catch
-        // a re-spelling of the cap as its own `256 * 1024` literal — that keeps
-        // the value and only loses the coupling, and the guard against it is the
-        // constant's own definition, which is one line and reviewable.
-        assert_eq!(FRAGMENT_PROVIDER_INGRESS_CAP_BYTES, 256 * 1024);
-        assert_eq!(FRAGMENT_SIZE_THRESHOLD, 256 * 1024);
-    }
-
-    #[tokio::test]
-    async fn direct_put_bounds_are_zero_one_cap_and_cap_plus_one_before_charge() {
-        for (size, expected) in [
-            (
-                0,
-                Err(FragmentProviderError::Provider(
-                    ProviderClientError::DirectPutBodyOutOfBounds,
-                )),
-            ),
-            (1, Ok(())),
-            (FRAGMENT_PROVIDER_INGRESS_CAP_BYTES as usize, Ok(())),
-            (
-                FRAGMENT_PROVIDER_INGRESS_CAP_BYTES as usize + 1,
-                Err(FragmentProviderError::IngressCapExceeded),
-            ),
-        ] {
-            let body = vec![0x5a; size];
-            let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
-            let admitted = gateway
-                .admit_put(
-                    attempt(ProviderAttemptClass::PutObject),
-                    put_operation(&body),
-                )
-                .await;
-            let result = match admitted {
-                Ok(admitted) => admitted
-                    .execute_direct_put(&mut ledger(), &body)
-                    .await
-                    .map(|_| ()),
-                Err(error) => Err(error),
-            };
-            assert_eq!(result, expected, "body size {size}");
-            let expected_calls = u32::from(expected.is_ok());
-            assert_eq!(authority.calls.load(Ordering::SeqCst), expected_calls);
-            assert_eq!(
-                port.metered_calls.load(Ordering::SeqCst),
-                expected_calls as usize
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn direct_put_admission_is_body_free_and_precedes_charge_and_send() {
-        let body = b"body-arrives-only-after-admission";
-        let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
-        let admitted = gateway
-            .admit_put(
-                attempt(ProviderAttemptClass::PutObject),
-                put_operation(body),
-            )
-            .await
-            .expect("body-free PUT admission");
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            gateway.available_put_permits(),
-            gateway.in_flight_put_bound().permits() - 1
-        );
-
-        let execution = admitted
-            .execute_direct_put(&mut ledger(), body)
-            .await
-            .expect("admitted direct PUT");
-        assert_eq!(execution.response, FragmentTransportResponse::PutCreated);
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            port.direct_body
-                .lock()
-                .expect("direct body lock")
-                .as_deref(),
-            Some(body.as_slice())
-        );
-    }
-
-    #[tokio::test]
-    async fn direct_put_declared_size_and_hash_mismatch_before_charge() {
-        let body = b"bound-body";
-        for mutation in [0, 1] {
-            let (gateway, authority, port) = port_harness(ChargeScript::Grant, 1, bound());
-            let mut operation = put_operation(body);
-            let FragmentDirectPutOperation {
-                declared_size,
-                declared_blake3,
-                ..
-            } = &mut operation;
-            if mutation == 0 {
-                *declared_size += 1;
-            } else {
-                declared_blake3[0] ^= 0x80;
-            }
-            let admitted = gateway
-                .admit_put(attempt(ProviderAttemptClass::PutObject), operation)
-                .await
-                .expect("declaration shape admits without body");
-            assert_eq!(
-                admitted.execute_direct_put(&mut ledger(), body).await,
-                Err(FragmentProviderError::Provider(
-                    ProviderClientError::DirectPutBodyBindingMismatch
-                )),
-                "mutation {mutation}"
-            );
-            assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-            assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn refused_direct_put_charge_sends_zero_wire_requests() {
-        let body = b"refused-direct-put";
-        let (gateway, authority, port) = port_harness(
-            ChargeScript::Refuse(ProviderChargeError::BudgetExhausted),
-            1,
-            bound(),
-        );
-        let admitted = gateway
-            .admit_put(
-                attempt(ProviderAttemptClass::PutObject),
-                put_operation(body),
-            )
-            .await
-            .expect("body-free PUT admission");
-        let mut ledger = ledger();
-        assert_eq!(
-            admitted.execute_direct_put(&mut ledger, body).await,
-            Err(FragmentProviderError::Provider(
-                ProviderClientError::ChargeRefused(ProviderChargeError::BudgetExhausted)
-            ))
-        );
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(ledger.committed_grant_count(), 0);
-        assert_eq!(ledger.attempt_count(), 0);
-    }
-
-    /// Iterates the closed `ProviderAttemptClass::ALL`, so a variant added
-    /// upstream must be classified here rather than defaulting into either set.
-    #[test]
-    fn every_attempt_class_is_either_permitted_or_refused_by_name() {
-        let mut refused = Vec::new();
-        for class in ProviderAttemptClass::ALL {
-            let verdict = FragmentProviderGateway::check_attempt_class(class);
-            if FRAGMENT_PROVIDER_ATTEMPT_CLASSES.contains(&class) {
-                assert_eq!(
-                    verdict,
-                    Ok(()),
-                    "{} must be permitted",
-                    class.metric_label()
-                );
-            } else {
-                assert_eq!(
-                    verdict,
-                    Err(FragmentProviderError::AttemptClassNotPermitted {
-                        class: class.metric_label()
-                    }),
-                    "{} must be refused by its own name",
-                    class.metric_label(),
-                );
-                refused.push(class);
-            }
-        }
-        assert_eq!(
-            refused,
-            vec![
-                ProviderAttemptClass::GetObject,
-                ProviderAttemptClass::CreateMultipartUpload,
-                ProviderAttemptClass::UploadPart,
-                ProviderAttemptClass::CompleteMultipartUpload,
-                ProviderAttemptClass::AbortMultipartUpload,
-            ],
-            "the refused set is GET, which has its own path, plus unreachable multipart",
-        );
-    }
-
-    /// The arithmetic reason multipart is refused rather than merely unused: a
-    /// capped body cannot plan as multipart under any limits the provider itself
-    /// accepts, because the smallest legal part is 5 MiB.
-    #[test]
-    fn a_capped_body_can_never_plan_as_multipart() {
-        let limits = ProviderPutLimits {
-            multipart_threshold_bytes: PROVIDER_MIN_PART_SIZE_BYTES,
-            part_size_bytes: PROVIDER_MIN_PART_SIZE_BYTES,
-            max_parts: PROVIDER_MAX_MULTIPART_PARTS,
-        };
-        let plan = match plan_put_object(FRAGMENT_PROVIDER_INGRESS_CAP_BYTES, &limits) {
-            Ok(plan) => plan,
-            Err(error) => panic!("the smallest legal limits must plan a capped body: {error}"),
-        };
-        assert!(matches!(plan, PutObjectPlan::SingleShot { .. }));
-    }
-
-    #[test]
-    fn the_in_flight_put_bound_refuses_every_out_of_domain_configuration() {
-        assert_eq!(
-            InFlightPutBound::new(0, Duration::from_millis(1)),
-            Err(FragmentProviderError::InvalidInFlightPutBound)
-        );
-        assert_eq!(
-            InFlightPutBound::new(MAX_IN_FLIGHT_PUTS + 1, Duration::from_millis(1)),
-            Err(FragmentProviderError::InvalidInFlightPutBound)
-        );
-        assert_eq!(
-            InFlightPutBound::new(1, Duration::ZERO),
-            Err(FragmentProviderError::InvalidInFlightPutBound)
-        );
-        assert!(InFlightPutBound::new(DEFAULT_IN_FLIGHT_PUTS, Duration::from_secs(1)).is_ok());
-        assert!(InFlightPutBound::new(MAX_IN_FLIGHT_PUTS, Duration::from_secs(1)).is_ok());
-    }
-
-    /// Drives the bound to exhaustion with a real in-flight put and proves the
-    /// next put fails closed rather than joining an unbounded queue.
-    #[tokio::test]
-    async fn a_put_beyond_the_configured_bound_fails_closed_while_a_slot_is_held() {
-        let single = match InFlightPutBound::new(1, Duration::from_millis(40)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture bound must be valid: {error}"),
-        };
-        let (gateway, authority, _port) = port_harness(ChargeScript::Hang, 1, single);
-        let gateway = Arc::new(gateway);
-
-        let holder = Arc::clone(&gateway);
-        let held = lore_base::lore_spawn!(async move {
-            let body = vec![0x5a; 1_024];
-            let mut ledger = ledger();
-            let admitted = holder
-                .admit_put(
-                    attempt(ProviderAttemptClass::PutObject),
-                    put_operation(&body),
-                )
-                .await;
-            if let Ok(admitted) = admitted {
-                let _ = admitted.execute_direct_put(&mut ledger, &body).await;
-            }
-        });
-        // Wait for the first put to actually own the only slot. No sleep: the
-        // permit count is the condition, so this cannot pass early.
-        wait_until_puts_are_saturated(&gateway).await;
-
-        let body = vec![0x5a; 1_024];
-        let outcome = gateway
-            .admit_put(
-                attempt(ProviderAttemptClass::PutObject),
-                put_operation(&body),
-            )
-            .await;
-        assert!(matches!(
-            outcome,
-            Err(FragmentProviderError::PutAdmissionTimedOut)
-        ));
-        assert_eq!(
-            authority.calls.load(Ordering::SeqCst),
-            1,
-            "only the admitted put may reach the limiter",
-        );
-        held.abort();
-    }
-
-    /// The bound is a *put* bound. A HEAD carries no body, so it must proceed
-    /// while every put slot is taken.
-    #[tokio::test]
-    async fn a_non_body_class_takes_no_in_flight_put_slot() {
-        let single = match InFlightPutBound::new(1, Duration::from_millis(40)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture bound must be valid: {error}"),
-        };
-        let (gateway, authority, _port) = port_harness(ChargeScript::Hang, 1, single);
-        let gateway = Arc::new(gateway);
-
-        let holder = Arc::clone(&gateway);
-        let held = lore_base::lore_spawn!(async move {
-            let body = vec![0x5a; 1_024];
-            let mut ledger = ledger();
-            let admitted = holder
-                .admit_put(
-                    attempt(ProviderAttemptClass::PutObject),
-                    put_operation(&body),
-                )
-                .await;
-            if let Ok(admitted) = admitted {
-                let _ = admitted.execute_direct_put(&mut ledger, &body).await;
-            }
-        });
-        wait_until_puts_are_saturated(&gateway).await;
-
-        // The scripted authority hangs, so a HEAD that took a put slot would time
-        // out on admission first. Racing it against a bounded timeout separates
-        // "queued behind the put bound" from "reached the limiter and is waiting
-        // there", which are the two outcomes this test has to tell apart.
-        let mut ledger = ledger();
-        let raced = tokio::time::timeout(Duration::from_millis(200), async {
-            gateway
-                .admit_operation(
-                    attempt(ProviderAttemptClass::HeadObject),
-                    FragmentTransportOperation::Head {
-                        object_key: "objects/fragment.bin".to_string(),
-                    },
-                )
-                .await?
-                .execute(&mut ledger)
-                .await
-        })
-        .await;
-        match raced {
-            Err(_elapsed) => {
-                assert_eq!(
-                    authority.calls.load(Ordering::SeqCst),
-                    2,
-                    "the bodyless attempt must have reached the limiter, not the put queue",
-                );
-            }
-            Ok(outcome) => panic!(
-                "a bodyless attempt must not resolve while the limiter hangs, got {outcome:?}"
-            ),
-        }
-        held.abort();
-    }
-
-    // -----------------------------------------------------------------------
-    // The charge-admission bound (CR-033 charge authority pool exhaustion)
-    // -----------------------------------------------------------------------
-
-    /// CR-033's cell charge authority pool is at most 4-5 leases, and every
-    /// charge takes one of them. With no bound on the attempts themselves, a
-    /// 1550-fragment push issued HeadObject/ListObjectVersions/DeleteObject
-    /// charges as fast as its fan-out allowed and the pool refused 50 of them
-    /// with `PoolExhausted`. This drives the narrow charge bound to exhaustion
-    /// with a real held admission for every accepted non-body class and proves
-    /// a concurrent second attempt of that class fails closed rather than
-    /// joining an unbounded queue, then proves the slot is usable again once
-    /// released — the same shape as
-    /// `a_put_beyond_the_configured_bound_fails_closed_while_a_slot_is_held`
-    /// for the put bound.
-    #[tokio::test]
-    async fn a_charge_carrying_attempt_beyond_the_configured_bound_fails_closed_then_releases() {
-        let (gateway, _authority, _port) =
-            port_harness_with_bounds(ChargeScript::Grant, 1, bound(), narrow_charge_bound());
-        let gateway = Arc::new(gateway);
-
-        for (class, operation) in [
-            (
-                ProviderAttemptClass::HeadObject,
-                FragmentTransportOperation::Head {
-                    object_key: "objects/fragment.bin".to_string(),
-                },
-            ),
-            (
-                ProviderAttemptClass::ListObjectVersions,
-                FragmentTransportOperation::ListVersions {
-                    object_key: "objects/fragment.bin".to_string(),
-                },
-            ),
-            (
-                ProviderAttemptClass::DeleteObject,
-                FragmentTransportOperation::DeleteVersion {
-                    object_key: "objects/fragment.bin".to_string(),
-                    version_id: "v1".to_string(),
-                },
-            ),
-        ] {
-            let admitted_signal = Arc::new(tokio::sync::Notify::new());
-            let release_signal = Arc::new(tokio::sync::Notify::new());
-            let holder = Arc::clone(&gateway);
-            let holder_operation = operation.clone();
-            let admitted_signal_task = Arc::clone(&admitted_signal);
-            let release_signal_task = Arc::clone(&release_signal);
-            let held = lore_base::lore_spawn!(async move {
-                let admitted = holder
-                    .admit_operation(attempt(class), holder_operation)
-                    .await
-                    .expect("the first attempt must take the only charge slot");
-                admitted_signal_task.notify_one();
-                release_signal_task.notified().await;
-                drop(admitted);
-            });
-            admitted_signal.notified().await;
-
-            // A second attempt of the same class queues behind the held slot
-            // and times out rather than joining an unbounded queue.
-            let refused = gateway
-                .admit_operation(attempt(class), operation.clone())
-                .await
-                .err();
-            assert_eq!(
-                refused,
-                Some(FragmentProviderError::ChargeAdmissionTimedOut),
-                "{} must fail closed while the only charge slot is held",
-                class.metric_label(),
-            );
-
-            release_signal.notify_one();
-            held.await.expect("holder task must complete");
-
-            // Once released, a fresh attempt of the same class admits again
-            // rather than hanging behind a permit that was never returned.
-            let admitted = tokio::time::timeout(
-                Duration::from_millis(200),
-                gateway.admit_operation(attempt(class), operation),
-            )
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "{} admission must not hang once the charge slot is released",
-                    class.metric_label(),
-                )
-            })
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{} must admit once the charge slot is released: {error}",
-                    class.metric_label(),
-                )
-            });
-            drop(admitted);
-        }
-    }
-
-    /// The charge bound governs non-body attempts only. A put must proceed
-    /// while the charge bound is fully saturated, or CR-031's put bound would
-    /// stop meaning what it says — the two numbers must stay independent in
-    /// both directions, and `a_non_body_class_takes_no_in_flight_put_slot`
-    /// above already pins the other direction (a saturated put bound does not
-    /// block a non-body attempt).
-    #[tokio::test]
-    async fn charge_admission_saturation_does_not_block_a_put() {
-        let (gateway, authority, _port) =
-            port_harness_with_bounds(ChargeScript::Hang, 1, bound(), narrow_charge_bound());
-        let gateway = Arc::new(gateway);
-
-        let holder = Arc::clone(&gateway);
-        let held = lore_base::lore_spawn!(async move {
-            let mut ledger = ledger();
-            let admitted = holder
-                .admit_operation(
-                    attempt(ProviderAttemptClass::HeadObject),
-                    FragmentTransportOperation::Head {
-                        object_key: "objects/fragment.bin".to_string(),
-                    },
-                )
-                .await;
-            if let Ok(admitted) = admitted {
-                let _ = admitted.execute(&mut ledger).await;
-            }
-        });
-        // Wait for the HEAD to actually own the only charge slot and reach the
-        // (hanging) limiter. No sleep: the call count is the condition, so this
-        // cannot pass early.
-        wait_until_charge_calls_reach(&authority, 1).await;
-
-        // The scripted authority hangs, so a put that queued behind the charge
-        // bound would time out on admission first. Racing it against a bounded
-        // timeout separates "queued behind the charge bound" from "reached the
-        // limiter and is waiting there", the two outcomes this test has to
-        // tell apart — the mirror of `a_non_body_class_takes_no_in_flight_put_slot`.
-        let body = vec![0x5a; 1_024];
-        let mut ledger = ledger();
-        let raced = tokio::time::timeout(Duration::from_millis(200), async {
-            gateway
-                .admit_put(
-                    attempt(ProviderAttemptClass::PutObject),
-                    put_operation(&body),
-                )
-                .await?
-                .execute_direct_put(&mut ledger, &body)
-                .await
-        })
-        .await;
-        match raced {
-            Err(_elapsed) => {
-                assert_eq!(
-                    authority.calls.load(Ordering::SeqCst),
-                    2,
-                    "the put must have reached the limiter, not queued behind the charge bound",
-                );
-            }
-            Ok(outcome) => {
-                panic!("a put must not resolve while the limiter hangs, got {outcome:?}")
-            }
-        }
-        held.abort();
-    }
-
-    /// **The deadline must survive the charge queue.** Callers mint
-    /// `deadline_unix_ms` while building the attempt, before any admission
-    /// wait. Without `admit_operation` shifting it by the time actually
-    /// spent queueing, a deep charge queue would burn the caller's whole
-    /// `io_timeout` waiting and then fail as `charge_deadline_exceeded` — the
-    /// same push failure wearing a different name.
-    ///
-    /// There is no public accessor on an admitted attempt or on
-    /// `AdmittedFragmentAttempt`, so this observes the shift the closest
-    /// honest way available: the exact `deadline_unix_ms` the scripted charge
-    /// authority receives in the request `execute` builds from the (shifted)
-    /// attempt. **Missing observability, not filled in here** — flagged as
-    /// requested rather than adding a public accessor.
-    ///
-    /// This deliberately stays on the real, unpaused clock rather than
-    /// `#[tokio::test(start_paused = true)]`. The holder task below is
-    /// dispatched with `lore_base::lore_spawn!`, which puts it on
-    /// `lore_base::runtime::runtime()` — a separate, lazily-built, real
-    /// multi-thread Tokio runtime shared process-wide (see
-    /// `lore-base/src/runtime.rs`), not on this test's own `#[tokio::test]`
-    /// runtime. Pausing time is scoped to the calling runtime's time driver;
-    /// it would not slow or synchronize the holder's `tokio::time::sleep`,
-    /// which runs for real regardless. Worse, `admit_operation`'s own
-    /// `queued_at.elapsed()` is read from *this* task's (paused) clock, so
-    /// pausing here would make the production shift arithmetic observe ~0ms
-    /// waited despite the holder genuinely sleeping for real — an unsound
-    /// combination, the same shape as the `IoDriver` case in
-    /// `docs/testing-gotchas.md`'s "Deterministic async tests" section.
-    ///
-    /// So instead of a tight real-clock margin, this widens both sides: the
-    /// hold is long enough (400ms) that ordinary scheduling jitter under a
-    /// loaded machine (this rig also runs Docker and cargo builds) cannot
-    /// plausibly eat the whole interval, and the assertion only requires a
-    /// third of that (100ms) rather than requiring most of it — proving a
-    /// real, substantial forward shift occurred without demanding a value
-    /// close to the nominal hold.
-    #[tokio::test]
-    async fn a_charge_carrying_attempts_deadline_survives_the_admission_queue() {
-        const HOLD: Duration = Duration::from_millis(400);
-        const MIN_OBSERVED_SHIFT_MS: i64 = 100;
-
-        let generous = match InFlightChargeBound::new(1, Duration::from_secs(5)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture charge bound must be valid: {error}"),
-        };
-        let (gateway, authority, _port) =
-            port_harness_with_bounds(ChargeScript::Grant, 1, bound(), generous);
-        let gateway = Arc::new(gateway);
-
-        let admitted_signal = Arc::new(tokio::sync::Notify::new());
-        let holder = Arc::clone(&gateway);
-        let admitted_signal_task = Arc::clone(&admitted_signal);
-        let held = lore_base::lore_spawn!(async move {
-            let admitted = holder
-                .admit_operation(
-                    attempt(ProviderAttemptClass::HeadObject),
-                    FragmentTransportOperation::Head {
-                        object_key: "objects/fragment.bin".to_string(),
-                    },
-                )
-                .await
-                .expect("the first attempt must take the only charge slot");
-            admitted_signal_task.notify_one();
-            // Hold the slot for a measurable interval so the second attempt
-            // has a real, known-minimum wait to observe.
-            tokio::time::sleep(HOLD).await;
-            drop(admitted);
-        });
-        admitted_signal.notified().await;
-
-        let mut ledger = ledger();
-        let admitted = gateway
-            .admit_operation(
-                attempt(ProviderAttemptClass::HeadObject),
-                FragmentTransportOperation::Head {
-                    object_key: "objects/fragment.bin".to_string(),
-                },
-            )
-            .await
-            .expect("the second attempt must admit once the slot frees");
-        admitted
-            .execute(&mut ledger)
-            .await
-            .expect("a granted charge must execute");
-        held.await.expect("holder task must complete");
-
-        let observed = authority.last_seen_deadline_unix_ms.load(Ordering::SeqCst);
-        assert!(
-            observed >= DEADLINE_MS + MIN_OBSERVED_SHIFT_MS,
-            "the deadline the charge authority observed ({observed}) must be shifted forward \
-             by a substantial fraction of the {HOLD:?} the second attempt waited for the charge \
-             slot, starting from {DEADLINE_MS}",
-        );
-    }
-
-    /// The companion negative control: an admission that never queues must
-    /// not shift the deadline. Without this, the test above alone could pass
-    /// against an implementation that inflates every deadline unconditionally
-    /// rather than by the actual wait.
-    ///
-    /// Unlike the queueing test above, this one calls `admit_operation`
-    /// directly with no `lore_spawn!` holder and no real wait at all, so it
-    /// is safe to run on a fully paused virtual clock: `queued_at` and the
-    /// `Instant::now()` it is measured against both come from this same
-    /// test's own runtime, and nothing here ever calls `tokio::time::advance`,
-    /// so the clock cannot move. That makes the old ~50ms real-clock
-    /// tolerance unnecessary — the wait is exactly zero, deterministically,
-    /// not just usually.
-    #[tokio::test(start_paused = true)]
-    async fn a_charge_carrying_attempts_deadline_is_unchanged_on_the_fast_path() {
-        let (gateway, authority, _port) = port_harness(ChargeScript::Grant, 1, bound());
-
-        let mut ledger = ledger();
-        let admitted = gateway
-            .admit_operation(
-                attempt(ProviderAttemptClass::HeadObject),
-                FragmentTransportOperation::Head {
-                    object_key: "objects/fragment.bin".to_string(),
-                },
-            )
-            .await
-            .expect("an unsaturated charge bound must admit immediately");
-        admitted
-            .execute(&mut ledger)
-            .await
-            .expect("a granted charge must execute");
-
-        let observed = authority.last_seen_deadline_unix_ms.load(Ordering::SeqCst);
-        assert_eq!(
-            observed, DEADLINE_MS,
-            "an immediate admission on a paused clock that never advances must not shift the \
-             deadline at all",
-        );
-    }
-
-    #[test]
-    fn the_in_flight_charge_bound_refuses_every_out_of_domain_configuration() {
-        assert_eq!(
-            InFlightChargeBound::new(0, Duration::from_millis(1)),
-            Err(FragmentProviderError::InvalidInFlightChargeBound)
-        );
-        assert_eq!(
-            InFlightChargeBound::new(MAX_IN_FLIGHT_CHARGES + 1, Duration::from_millis(1)),
-            Err(FragmentProviderError::InvalidInFlightChargeBound)
-        );
-        assert_eq!(
-            InFlightChargeBound::new(1, Duration::ZERO),
-            Err(FragmentProviderError::InvalidInFlightChargeBound)
-        );
-        let valid =
-            match InFlightChargeBound::new(DEFAULT_IN_FLIGHT_CHARGES, Duration::from_secs(1)) {
-                Ok(bound) => bound,
-                Err(error) => panic!("a valid charge bound must construct: {error}"),
-            };
-        assert_eq!(valid.permits(), DEFAULT_IN_FLIGHT_CHARGES as usize);
-        assert_eq!(valid.acquire_timeout(), Duration::from_secs(1));
-        assert!(InFlightChargeBound::new(MAX_IN_FLIGHT_CHARGES, Duration::from_secs(1)).is_ok());
-    }
-
-    /// Without these two arms, `transient_diagnostic`'s `_ => None` catch-all
-    /// would swallow both — exactly the blindness the charge bound exists to
-    /// fix, since a refusal that cannot be counted is invisible.
-    #[test]
-    fn charge_admission_refusals_carry_their_own_transient_diagnostic() {
-        assert_eq!(
-            FragmentProviderError::ChargeAdmissionTimedOut.transient_diagnostic(),
-            Some("charge_admission_timeout"),
-        );
-        assert_eq!(
-            FragmentProviderError::ChargeAdmissionClosed.transient_diagnostic(),
-            Some("charge_admission_closed"),
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Property 5: the cell's own region and nothing else
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn every_built_request_addresses_exactly_this_cells_boundary() {
-        let harness = harness(ChargeScript::Grant);
-        let expected: &ProviderTarget = harness.gateway.boundary().target();
-        for class in FRAGMENT_PROVIDER_ATTEMPT_CLASSES {
-            let request = harness.gateway.build_request(&attempt(class));
-            assert_eq!(
-                &request.target,
-                expected,
-                "{} must address the cell's own bucket, region, and endpoint",
-                class.metric_label(),
-            );
-            assert_eq!(request.put_part, None);
-        }
-    }
-
-    #[test]
-    fn a_gateway_never_addresses_another_cells_boundary() {
-        let here = harness(ChargeScript::Grant);
-        let elsewhere = Harness::with_boundary(ChargeScript::Grant, 1, bound(), other_boundary());
-        let here_target = here
-            .gateway
-            .build_request(&attempt(ProviderAttemptClass::GetObject))
-            .target;
-        let elsewhere_target = elsewhere
-            .gateway
-            .build_request(&attempt(ProviderAttemptClass::GetObject))
-            .target;
-        assert_ne!(here_target.bucket, elsewhere_target.bucket);
-        assert_ne!(here_target.region, elsewhere_target.region);
-        assert_ne!(here_target.endpoint_host, elsewhere_target.endpoint_host);
-        assert_eq!(&here_target, here.gateway.boundary().target());
-        assert_eq!(&elsewhere_target, elsewhere.gateway.boundary().target());
-    }
-
-    // -----------------------------------------------------------------------
-    // Disposition — the dispatch-free classification consumers match on
-    // -----------------------------------------------------------------------
-
-    /// Every charge refusal, named, with the disposition it carries. The list is
-    /// exhaustive over `ProviderChargeError`; `disposition`'s charge arm is too,
-    /// with no wildcard, so a variant added upstream breaks the build there and
-    /// this list here rather than landing in a catch-all.
-    ///
-    /// The four that used to fall through untested are `BudgetPinRejected`,
-    /// `ConfigurationUnresolved`, `DeadlineExceeded` and `AttemptAlreadyCharged`.
-    #[test]
-    fn every_charge_refusal_carries_a_named_disposition() {
-        let expected: [(ProviderChargeError, FragmentProviderDisposition); 10] = [
-            (
-                ProviderChargeError::Unwired,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                ProviderChargeError::BudgetExhausted,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                ProviderChargeError::ClassCapExhausted,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                ProviderChargeError::AuthorityUnavailable,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                ProviderChargeError::DeadlineExceeded,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                ProviderChargeError::BudgetPinRejected,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                ProviderChargeError::ConfigurationUnresolved,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                ProviderChargeError::AttemptAlreadyCharged,
-                FragmentProviderDisposition::OutcomeUnknown,
-            ),
-            (
-                ProviderChargeError::AmbiguousCommit,
-                FragmentProviderDisposition::OutcomeUnknown,
-            ),
-            (
-                ProviderChargeError::RecoveredCommittedCharge,
-                FragmentProviderDisposition::OutcomeUnknown,
-            ),
-        ];
-
-        for (refusal, disposition) in expected {
-            let observed =
-                FragmentProviderError::Provider(ProviderClientError::ChargeRefused(refusal))
-                    .disposition();
-            assert_eq!(
-                observed, disposition,
-                "{refusal} must carry {disposition:?}"
-            );
-            assert_ne!(
-                observed,
-                FragmentProviderDisposition::Internal,
-                "{refusal} must not reach the catch-all",
-            );
-        }
-    }
-
-    /// An unresolved outcome must never be classified as retryable capacity.
-    #[test]
-    fn an_unresolved_charge_outcome_is_never_transient() {
-        for error in [
-            FragmentProviderError::Provider(ProviderClientError::ChargeAmbiguous),
-            FragmentProviderError::Provider(ProviderClientError::ChargeRecovered),
-            FragmentProviderError::Provider(ProviderClientError::ChargeRefused(
-                ProviderChargeError::AmbiguousCommit,
-            )),
-        ] {
-            assert_eq!(
-                error.disposition(),
-                FragmentProviderDisposition::OutcomeUnknown,
-                "{error} must be OutcomeUnknown",
-            );
-        }
-    }
-
-    /// The seam's own refusals classify without touching the provider at all.
-    #[test]
-    fn every_local_refusal_carries_a_named_disposition() {
-        for (error, disposition) in [
-            (
-                FragmentProviderError::IngressCapExceeded,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::InvalidInFlightPutBound,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::AttemptClassNotPermitted {
-                    class: "UploadPart",
-                },
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::PutAdmissionTimedOut,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                FragmentProviderError::PutAdmissionClosed,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                FragmentProviderError::InvalidInFlightChargeBound,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::ChargeAdmissionTimedOut,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                FragmentProviderError::ChargeAdmissionClosed,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                FragmentProviderError::Provider(ProviderClientError::ChargeRefused(
-                    ProviderChargeError::BudgetPinRejected,
-                )),
-                FragmentProviderDisposition::NotReady,
-            ),
-            // WP-114 CD-6's drain refusals. All four are decisive caller
-            // faults the seam catches before any charge or send, so all four
-            // classify the same way the direct-PUT path's own local refusals
-            // above do.
-            (
-                FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::SpoolBindingRequestMismatch,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::ClaimBindingMismatch,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                FragmentProviderError::DrainBodyMismatch,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-        ] {
-            assert_eq!(
-                error.disposition(),
-                disposition,
-                "{error} must carry {disposition:?}",
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // WP-114 CD-6: FragmentDrainCapability
-    // -----------------------------------------------------------------------
-    //
-    // Narrowness by construction (no pool/dispatch/gateway/entry accessor, no
-    // caller-nameable traffic class or declared size/digest, the three-token
-    // confinement to this capability's own impl block) is proved structurally
-    // in `tests/seam_source_pins.rs` and demonstrated in
-    // `tests/drain_capability_compile_fail.rs`. What belongs here instead is
-    // behavior: the independent-anchor fail-open case, the refusal ordering,
-    // the shared limiter, and the disposition each refusal carries.
-
-    use lore_object_dispatch::SpoolLayout;
-    use lore_object_dispatch::SpoolObjectKey;
-    use lore_object_dispatch::SpoolObjectKind;
-
-    /// A one-permit put bound with a short timeout, so a drain that must
-    /// queue behind an already-held permit fails fast instead of hanging the
-    /// suite.
-    fn narrow_put_bound() -> InFlightPutBound {
-        match InFlightPutBound::new(1, Duration::from_millis(50)) {
-            Ok(bound) => bound,
-            Err(error) => panic!("fixture put bound must be valid: {error}"),
-        }
-    }
-
-    /// A syntactically absolute path that is never opened. `SpoolLayout::new`
-    /// only validates that a root is absolute and carries no `.`/`..`
-    /// component, and `bind_durable_put_body_from_ready` performs no
-    /// filesystem access at all — exactly the property these tests exercise
-    /// without a real spool directory.
-    ///
-    /// The `cfg!(windows)` fork is load-bearing, not cosmetic: a `C:\` root is
-    /// not `is_absolute()` on Linux, so a Windows-only literal makes
-    /// `SpoolLayout::new` return `InvalidSharedSpoolRoot` and every case in
-    /// this module panic in its fixture — on the platform production runs on.
-    fn drain_spool_root() -> PathBuf {
-        if cfg!(windows) {
-            PathBuf::from(r"C:\lore-fragment-provider-test-spool")
-        } else {
-            PathBuf::from("/var/lib/lore-fragment-provider-test-spool")
-        }
-    }
-
-    /// The opaque handle a real spool write would have produced for this
-    /// logical request and attempt, computed the same way the seam derives
-    /// and checks it. Building this once per fixture, rather than guessing a
-    /// string, is what lets a fixture legitimately bind instead of failing
-    /// for the wrong reason.
-    fn drain_durable_handle(logical_request_id: &str, attempt_id: &str) -> String {
-        let key = SpoolObjectKey {
-            provider_boundary_id: BOUNDARY_ID.to_string(),
-            logical_request_id: logical_request_id.to_string(),
-            attempt_id: attempt_id.to_string(),
-            kind: SpoolObjectKind::Put,
-        };
-        let layout = match SpoolLayout::new(drain_spool_root()) {
-            Ok(layout) => layout,
-            Err(error) => panic!("fixture spool layout must be valid: {error}"),
-        };
-        match layout.derive_paths(&key) {
-            Ok(paths) => paths.opaque_handle().to_string(),
-            Err(error) => panic!("fixture spool paths must derive: {error}"),
-        }
-    }
-
-    /// A ready outcome that binds cleanly to `drain_durable_handle`'s own
-    /// handle for the given size and digest. Every field the binder does not
-    /// read is a fixed, arbitrary value.
-    fn drain_ready_outcome(
-        logical_request_id: &str,
-        attempt_id: &str,
-        committed_size: u64,
-        committed_blake3: [u8; 32],
-    ) -> PutSpoolReadyOutcome {
-        let parse = |value: &str| match Uuid::parse_str(value) {
-            Ok(id) => id,
-            Err(error) => panic!("fixture uuid {value} must parse: {error}"),
-        };
-        PutSpoolReadyOutcome {
-            spool_object_id: parse(attempt_id),
-            logical_request_id: parse(logical_request_id),
-            attempt_id: parse(attempt_id),
-            upload_id: parse(attempt_id),
-            upload_fence: 1,
-            durable_handle: drain_durable_handle(logical_request_id, attempt_id),
-            committed_size,
-            committed_blake3,
-            ready_at_unix_ms: ATTEMPT_TIMESTAMP_MS,
-            reserve_put_ack_canonical_bytes: Vec::new(),
-            reserve_put_ack_blake3: [0u8; 32],
-            spool_revision: 1,
-            record_blake3: [0u8; 32],
-        }
-    }
-
-    /// A drain attempt naming `claim_body_blake3`/`claim_body_size` exactly
-    /// as given — callers building the fail-open case pass a claim digest
-    /// that disagrees with the spool on purpose.
-    fn drain_attempt_fixture(
-        logical_request_id: &str,
-        attempt_id: &str,
-        claim_body_blake3: [u8; 32],
-        claim_body_size: u64,
-    ) -> FragmentDrainAttempt {
-        FragmentDrainAttempt {
-            logical_request_id: logical_request_id.to_string(),
-            attempt_id: attempt_id.to_string(),
-            attempt_ordinal: 1,
-            deadline_unix_ms: DEADLINE_MS,
-            budget_pin: pin(),
-            object_key: "objects/fragment.bin".to_string(),
-            metadata: vec![("codec".to_string(), "raw".to_string())],
-            claim_body_blake3,
-            claim_body_size,
-        }
-    }
-
-    /// A syntactically valid, never-connecting dispatch pool configuration.
-    /// `DispatchRuntimePool::new`'s own doc says configuration is validated
-    /// and an empty pool is built; no connection is opened. And
-    /// `DispatchRuntimeClient::new` only checks the pool's configured role.
-    /// So every case below that returns before `admit_put`'s doubles run
-    /// never touches Postgres. `cell.invalid` is the same deliberately
-    /// non-resolving host `lore-object-dispatch`'s own `dispatch_pool.rs`
-    /// tests use, for the same reason.
-    fn offline_dispatch_pool() -> Arc<DispatchRuntimePool> {
-        let budget = match DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0) {
-            Ok(budget) => budget,
-            Err(error) => panic!("fixture dispatch budget must be valid: {error}"),
-        };
-        let config = DispatchPoolConfig {
-            postgres_url: format!(
-                "postgres://{}:secret@cell.invalid:5432/lorecell?sslmode=disable",
-                lore_object_dispatch::DISPATCH_RUNTIME_ROLE,
-            ),
-            role: DispatchPoolRole::Runtime,
-            expected_database_identity: match DispatchDatabaseIdentity::new(1, 1) {
-                Ok(identity) => identity,
-                Err(error) => panic!("fixture database identity must be valid: {error}"),
-            },
-            pool_max: 1,
-            connect_timeout: Duration::from_millis(50),
-            acquire_timeout: Duration::from_millis(50),
-            statement_timeout: Duration::from_millis(50),
-            lock_timeout: Duration::from_millis(50),
-            tls: DispatchTlsMode::Disabled,
-            budget,
-        };
-        match DispatchRuntimePool::new(config) {
-            Ok(pool) => Arc::new(pool),
-            Err(error) => panic!("fixture dispatch pool config must be valid: {error}"),
-        }
-    }
-
-    /// A wired `FragmentProviderEntry` (`port_wired` true, via
-    /// `with_transport_port`) built on the same `SharedAuthority`/
-    /// `SharedGetPort` doubles the rest of this module uses, plus an offline
-    /// dispatch pool. Private-field construction is legitimate here: this
-    /// helper lives inside the crate, the same access `FragmentProviderEntry::connect`
-    /// itself has, and it is the only way to reach a drain capability without
-    /// a live database.
-    fn drain_entry(
-        script: ChargeScript,
-        put_bound: InFlightPutBound,
-    ) -> (
-        Arc<FragmentProviderEntry>,
-        Arc<ScriptedChargeAuthority>,
-        Arc<CountingGetPort>,
-    ) {
-        let authority = Arc::new(ScriptedChargeAuthority::new(script));
-        let port = Arc::new(CountingGetPort {
-            get_calls: AtomicUsize::new(0),
-            metered_calls: AtomicUsize::new(0),
-            requests_per_call: 1,
-            outcome: ProviderAttemptOutcome::Decisive,
-            direct_body: Mutex::new(None),
-            metered_operations: Mutex::new(Vec::new()),
-        });
-        let gateway = FragmentProviderGateway::with_transport_port(
-            CellSchemaAttestation::for_tests(boundary()),
-            ProviderCapabilities::none().with_listing(),
-            put_bound,
-            test_charge_bound(),
-            SharedAuthority(Arc::clone(&authority)),
-            SharedGetPort(Arc::clone(&port)),
-        );
-        let pool = offline_dispatch_pool();
-        let dispatch = match DispatchRuntimeClient::new(pool.clone()) {
-            Ok(dispatch) => dispatch,
-            Err(error) => panic!("fixture dispatch client must construct: {error}"),
-        };
-        let entry = Arc::new(FragmentProviderEntry {
-            gateway,
-            _dispatch: dispatch,
-            pool,
-        });
-        (entry, authority, port)
-    }
-
-    fn mint_drain_capability(entry: &Arc<FragmentProviderEntry>) -> FragmentDrainCapability {
-        match entry.drain_capability(drain_spool_root()) {
-            Ok(capability) => capability,
-            Err(error) => panic!("fixture drain capability must construct: {error}"),
-        }
-    }
-
-    /// The fail-open case this tranche exists to close. The spool digest
-    /// agrees with itself — the sent bytes match the bound spool body
-    /// exactly — but the independent claim anchor does not. Before this
-    /// check existed, a caller that spooled the wrong file would have its
-    /// bytes agree with its own spool-ready declaration and the send would
-    /// proceed; comparing only against a digest the same caller had already
-    /// spooled lets a wrong file pass with both sides agreeing. Refused
-    /// before any charge, any send, or even the put permit.
-    #[tokio::test]
-    async fn attempt_drain_refuses_when_the_claim_digest_disagrees_even_though_the_spool_matches_itself()
-     {
-        let body = b"drain payload matches the spool exactly".to_vec();
-        let spool_blake3 = *blake3::hash(&body).as_bytes();
-        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-        let capability = mint_drain_capability(&entry);
-        let ready = FragmentDrainReady(drain_ready_outcome(
-            REQUEST_ID,
-            ATTEMPT_ID,
-            body.len() as u64,
-            spool_blake3,
-        ));
-        // A different digest than the spool's own — the independent anchor a
-        // caller cannot forge by spooling consistently with itself.
-        let wrong_claim_blake3 = *blake3::hash(b"a different file entirely").as_bytes();
-        let request = drain_attempt_fixture(
-            REQUEST_ID,
-            ATTEMPT_ID,
-            wrong_claim_blake3,
-            body.len() as u64,
-        );
-
-        let mut ledger = ledger();
-        let outcome = capability
-            .attempt_drain(&mut ledger, request, &ready, &body)
-            .await;
-
-        assert_eq!(outcome, Err(FragmentProviderError::ClaimBindingMismatch));
-        assert_eq!(
-            authority.calls.load(Ordering::SeqCst),
-            0,
-            "a claim mismatch must be refused before any charge",
-        );
-        assert_eq!(
-            port.metered_calls.load(Ordering::SeqCst),
-            0,
-            "a claim mismatch must be refused before any send",
-        );
-        assert_eq!(
-            entry.gateway.available_put_permits(),
-            1,
-            "a claim mismatch must be refused before the put permit is taken",
-        );
-    }
-
-    /// The ready receipt was minted for a different logical request than the
-    /// attempt claims. Caught by the seam's own cross-check, before the claim
-    /// anchor is read at all.
-    #[tokio::test]
-    async fn attempt_drain_refuses_when_the_ready_receipt_names_a_different_logical_request() {
-        const OTHER_REQUEST_ID: &str = "018bcfe5-6800-7abc-8def-000000000099";
-        let body = b"drain payload".to_vec();
-        let spool_blake3 = *blake3::hash(&body).as_bytes();
-        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-        let capability = mint_drain_capability(&entry);
-        // Minted for OTHER_REQUEST_ID, so it binds cleanly to its OWN
-        // identity — the mismatch is entirely in the cross-check against the
-        // attempt below, not in the spool binding itself.
-        let ready = FragmentDrainReady(drain_ready_outcome(
-            OTHER_REQUEST_ID,
-            ATTEMPT_ID,
-            body.len() as u64,
-            spool_blake3,
-        ));
-        let request =
-            drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, spool_blake3, body.len() as u64);
-
-        let mut ledger = ledger();
-        let outcome = capability
-            .attempt_drain(&mut ledger, request, &ready, &body)
-            .await;
-
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::SpoolBindingRequestMismatch),
-            "the binding itself succeeded — the receipt is canonically derived \
-             for its own identity — so this must be the seam's cross-check, not \
-             a dispatch binding refusal",
-        );
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// The bound body is above the existing 256 KiB ingress cap. Refused
-    /// before the put permit is taken — the same "cheapest check first"
-    /// ordering the direct-PUT path already proves for itself.
-    #[tokio::test]
-    async fn attempt_drain_refuses_an_oversized_bound_body_before_taking_a_permit() {
-        let arbitrary_blake3 = [0xAB; 32];
-        let oversized = FRAGMENT_PROVIDER_INGRESS_CAP_BYTES + 1;
-        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-        let capability = mint_drain_capability(&entry);
-        let ready = FragmentDrainReady(drain_ready_outcome(
-            REQUEST_ID,
-            ATTEMPT_ID,
-            oversized,
-            arbitrary_blake3,
-        ));
-        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, arbitrary_blake3, oversized);
-
-        let mut ledger = ledger();
-        let outcome = capability
-            .attempt_drain(
-                &mut ledger,
-                request,
-                &ready,
-                b"irrelevant, refused before read",
-            )
-            .await;
-
-        assert_eq!(outcome, Err(FragmentProviderError::IngressCapExceeded));
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-        assert_eq!(
-            entry.gateway.available_put_permits(),
-            1,
-            "an oversized bound body must be refused before the put permit is taken",
-        );
-    }
-
-    /// The claim agrees with the spool; only the bytes actually handed to
-    /// `attempt_drain` disagree with both.
-    #[tokio::test]
-    async fn attempt_drain_refuses_when_the_supplied_bytes_do_not_match_the_bound_body() {
-        let spooled = b"the body the drain worker actually spooled".to_vec();
-        let spool_blake3 = *blake3::hash(&spooled).as_bytes();
-        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-        let capability = mint_drain_capability(&entry);
-        let ready = FragmentDrainReady(drain_ready_outcome(
-            REQUEST_ID,
-            ATTEMPT_ID,
-            spooled.len() as u64,
-            spool_blake3,
-        ));
-        let request =
-            drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, spool_blake3, spooled.len() as u64);
-        let wrong_bytes = b"a completely different body".to_vec();
-
-        let mut ledger = ledger();
-        let outcome = capability
-            .attempt_drain(&mut ledger, request, &ready, &wrong_bytes)
-            .await;
-
-        assert_eq!(outcome, Err(FragmentProviderError::DrainBodyMismatch));
-        assert_eq!(authority.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(port.metered_calls.load(Ordering::SeqCst), 0);
-    }
-
-    /// An empty bound body passes every one of the seam's own pre-checks
-    /// (zero equals zero, and the empty hash agrees with itself), so the
-    /// refusal originates downstream in CD-5's own body-bounds check
-    /// (`DirectPutBodyOutOfBounds`) and must land on `Internal` via the
-    /// catch-all, not on `InvalidInput`: this is a request the seam should
-    /// never have let through, not a caller-supplied value it caught itself.
-    #[tokio::test]
-    async fn attempt_drain_maps_an_empty_bound_body_to_internal_not_invalid_input() {
-        let empty: Vec<u8> = Vec::new();
-        let empty_blake3 = *blake3::hash(&empty).as_bytes();
-        let (entry, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-        let capability = mint_drain_capability(&entry);
-        let ready =
-            FragmentDrainReady(drain_ready_outcome(REQUEST_ID, ATTEMPT_ID, 0, empty_blake3));
-        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, empty_blake3, 0);
-
-        let mut ledger = ledger();
-        let outcome = capability
-            .attempt_drain(&mut ledger, request, &ready, &empty)
-            .await;
-
-        let error = outcome.expect_err("an empty body must be refused, not sent");
-        assert_eq!(
-            error.disposition(),
-            FragmentProviderDisposition::Internal,
-            "got {error}",
-        );
-        assert_ne!(
-            error.disposition(),
-            FragmentProviderDisposition::InvalidInput
-        );
-    }
-
-    /// A fully agreeing drain succeeds, and the charge authority observes
-    /// exactly the forced `Drain` traffic class — never a caller-supplied
-    /// one, since `FragmentDrainAttempt` has no such field — while the
-    /// transport receives exactly the bound spool body's own bytes.
-    #[tokio::test]
-    async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_own_bytes() {
-        let body = b"a fully valid drain payload".to_vec();
-        let body_blake3 = *blake3::hash(&body).as_bytes();
-        let (entry, authority, port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-        let capability = mint_drain_capability(&entry);
-        let ready = FragmentDrainReady(drain_ready_outcome(
-            REQUEST_ID,
-            ATTEMPT_ID,
-            body.len() as u64,
-            body_blake3,
-        ));
-        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, body_blake3, body.len() as u64);
-
-        let mut ledger = ledger();
-        let outcome = capability
-            .attempt_drain(&mut ledger, request, &ready, &body)
-            .await;
-
-        assert!(
-            outcome.is_ok(),
-            "a fully agreeing drain must succeed: {outcome:?}",
-        );
-        assert_eq!(
-            authority.last_seen_traffic_class(),
-            Some(ProviderTrafficClass::Drain),
-            "the charge authority must see the drain traffic class, forced by the seam",
-        );
-        let sent = port.direct_body.lock().expect("direct body lock").clone();
-        assert_eq!(
-            sent,
-            Some(body),
-            "the transport must receive exactly the bound spool body's own bytes",
-        );
-    }
-
-    /// Dynamic proof, not just a source reading, that the drain shares the
-    /// one in-flight put semaphore with the direct fallback: holding the
-    /// cell's only put permit through the direct path leaves a otherwise-valid
-    /// drain nowhere to go but the admission queue, where it times out. A
-    /// drain with its own semaphore would have admitted immediately instead.
-    #[tokio::test]
-    async fn attempt_drain_shares_the_one_in_flight_put_permit_with_the_direct_fallback() {
-        let (entry, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
-
-        let holder = entry
-            .admit_put(
-                attempt(ProviderAttemptClass::PutObject),
-                put_operation(b"held by the direct path"),
-            )
-            .await
-            .expect("the direct path must take the only put permit");
-        assert_eq!(entry.gateway.available_put_permits(), 0);
-
-        let body = b"a drain send with nowhere to queue".to_vec();
-        let body_blake3 = *blake3::hash(&body).as_bytes();
-        let capability = mint_drain_capability(&entry);
-        let ready = FragmentDrainReady(drain_ready_outcome(
-            REQUEST_ID,
-            ATTEMPT_ID,
-            body.len() as u64,
-            body_blake3,
-        ));
-        let request = drain_attempt_fixture(REQUEST_ID, ATTEMPT_ID, body_blake3, body.len() as u64);
-        let mut ledger = ledger();
-
-        let outcome = capability
-            .attempt_drain(&mut ledger, request, &ready, &body)
-            .await;
-
-        assert_eq!(
-            outcome,
-            Err(FragmentProviderError::PutAdmissionTimedOut),
-            "if the drain had its own semaphore this would admit instead of timing out; it \
-             must queue behind the direct path's already-held permit",
-        );
-        drop(holder);
-    }
-
-    /// `FragmentProviderError`'s derived `PartialEq` covers the new drain
-    /// variants, including a source-carrying one — proof, not the assumption
-    /// its `#[derive(PartialEq)]` alone would otherwise be.
-    #[test]
-    fn the_new_drain_error_variants_support_partial_eq() {
-        assert_eq!(
-            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
-            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
-        );
-        // The split's whole point: the binder's cause is carried, so two
-        // refusals that would have compared equal as one unit variant no
-        // longer do.
-        assert_ne!(
-            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
-            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyHandleMismatch,),
-        );
-        assert_ne!(
-            FragmentProviderError::SpoolBindingRejected(ProviderClientError::PutBodyNotDurable),
-            FragmentProviderError::SpoolBindingRequestMismatch,
-        );
-        assert_ne!(
-            FragmentProviderError::SpoolBindingRequestMismatch,
-            FragmentProviderError::ClaimBindingMismatch,
-        );
-        assert_ne!(
-            FragmentProviderError::ClaimBindingMismatch,
-            FragmentProviderError::DrainBodyMismatch,
-        );
-        assert_eq!(
-            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AmbiguousCommit),
-            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AmbiguousCommit),
-        );
-        assert_ne!(
-            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AmbiguousCommit),
-            FragmentProviderError::SpoolReadyRefused(DispatchAuthorityError::AuthorityUnavailable),
-        );
-    }
-
-    /// Exhaustive over every `DispatchAuthorityError` variant, mirroring
-    /// `every_charge_refusal_carries_a_named_disposition`'s style for
-    /// `ProviderChargeError`. The production match this pins is itself
-    /// exhaustive with no wildcard, so a variant added upstream fails THAT
-    /// build; this test is what fails HERE if an existing variant's
-    /// classification silently changes.
-    #[test]
-    fn every_drain_spool_ready_refusal_carries_a_named_disposition() {
-        let expected: [(DispatchAuthorityError, FragmentProviderDisposition); 33] = [
-            (
-                DispatchAuthorityError::Pool(DispatchPoolError::PoolExhausted),
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::OperationTimeout,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::RetryExhausted,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::AuthorityUnavailable,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::ConnectionSlotsExhausted,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::CapacityExhausted,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::QuotaUnavailable,
-                FragmentProviderDisposition::Transient,
-            ),
-            (
-                DispatchAuthorityError::AmbiguousCommit,
-                FragmentProviderDisposition::OutcomeUnknown,
-            ),
-            (
-                DispatchAuthorityError::WrongPoolRole,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                DispatchAuthorityError::Unauthorized,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                DispatchAuthorityError::UnsupportedApiRevision,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                DispatchAuthorityError::SchemaUnavailable,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                DispatchAuthorityError::DigestProviderUnavailable,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                DispatchAuthorityError::SerializableTransactionRequired,
-                FragmentProviderDisposition::NotReady,
-            ),
-            (
-                DispatchAuthorityError::InvalidArgument,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::CanonicalRecordInvalid,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::IdentifierTimestampOutOfRange,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::ExpiredOrUnknown,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::ReservationExpired,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::UploadClosed,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::UploadStreamIdentityMismatch,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::ChunkGap,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::ReplayConflict,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::StoredRecordMismatch,
-                FragmentProviderDisposition::InvalidInput,
-            ),
-            (
-                DispatchAuthorityError::CounterOverflow,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::TimeInvalid,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::StoredStateInvalid,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::GenerationNotMonotonic,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::ParticipantAuthenticationRequired,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::ParticipantStateInvalid,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::ParticipantKeyDigestInvalid,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::UnrecognizedResultCode,
-                FragmentProviderDisposition::Internal,
-            ),
-            (
-                DispatchAuthorityError::InvalidAuthorityResponse("unit test fixture"),
-                FragmentProviderDisposition::Internal,
-            ),
-        ];
-
-        for (refusal, disposition) in expected {
-            let observed = FragmentProviderError::SpoolReadyRefused(refusal).disposition();
-            assert_eq!(
-                observed, disposition,
-                "{refusal} must carry {disposition:?}"
-            );
-        }
-    }
-}
+mod tests;

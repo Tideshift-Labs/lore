@@ -12,23 +12,24 @@ surfaces are therefore `#![cfg(unix)]`/`#[cfg(all(test, unix))]` and are SILENTL
 Windows dev rig -- a `cfg` gate absents a test rather than failing it, so a Windows run reports
 zero tests, not a failure:
 
-  * `tests/write_behind_stage.rs`          -- 10 offline cases, whole file `#![cfg(unix)]`.
-  * `tests/write_behind_staging_lifecycle.rs` -- 4 `#[ignore]` live-Postgres cases, whole file
-    `#![cfg(unix)]`. `run-fragment-lifecycle-live.ps1` only adds this target to its inventory
-    when the HOST is Unix, so on Windows that runner is green with the target never enumerated.
-  * The `lore-postgres` LIB target's 5 Unix-only cases -- `write_behind::root::durability_tests`
-    (4, offline) plus `store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry`
-    (1, `#[ignore]`, live).
+  * `tests/write_behind_stage.rs` -- offline confined-filesystem cases, whole file `#![cfg(unix)]`.
+  * `tests/write_behind_staging_lifecycle.rs` -- ignored live-Postgres cases, including a
+    separately inventoried feature-enabled subprocess crash case. The lifecycle runner names
+    these cases as NOT RUN on Windows rather than silently dropping them.
+  * The `lore-postgres` LIB target's Unix-only durability tests and ignored source-validator,
+    adapter, and first staged-PUT cases. Feature-enabled acknowledgement-loss and active-token
+    process-takeover cases have their own exact catalog checks below.
 
   * The `lore-server` LIB target's Unix-only write-behind case --
-    `plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_unix`, paired with a
-    differently-named `cfg(not(unix))` twin. This runner was scoped `-p lore-postgres` until
-    2026-09-19, so that arm sat outside it and had never been compiled on this rig. NOTE the
+    `plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_linux`, paired with a
+    differently-named `cfg(not(target_os = "linux"))` twin. NOTE the
     count differential CANNOT detect this one: the `lore-server` lib catalog is IDENTICAL on both
     platforms, because each platform drops one case and gains the other. The discriminating
     evidence is name presence, which is what this runner now pins.
 
 This runner executes all of them on Linux and reports ENUMERATED COUNTS, not just exit codes.
+It also runs the provider's default library and the feature-enabled postgres library offline.
+`-Clippy` adds strict, exit-code-gating lint checks for dispatch, provider, postgres and server.
 
 .NOTES
 Isolation, and why each piece is the way it is:
@@ -91,7 +92,8 @@ param(
     [switch]$KeepOnFailure,
     [switch]$SkipLive,
     [switch]$IncludeCompileFail,
-    [switch]$Clippy
+    [switch]$Clippy,
+    [string]$PostgresImage = 'commit0-postgres-blake3:local-tests'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -133,7 +135,11 @@ $windowsLibEnumerated = 190
 # pin is a FLOOR on the enumerated count plus "every enumerated case ran, and none was ignored",
 # which survives a sibling lane renaming or adding a case without going stale the same day.
 $offlineInventory = @(
+    [pscustomobject]@{ Package = 'lore-object-dispatch'; Kind = 'test'; Target = 'spool_writer'; MinimumCases = 11 },
+    [pscustomobject]@{ Package = 'lore-object-dispatch'; Kind = 'test'; Target = 'drain_policy'; MinimumCases = 5 },
+    [pscustomobject]@{ Package = 'lore-fragment-provider'; Kind = 'test'; Target = 'seam_source_pins'; MinimumCases = 18 },
     [pscustomobject]@{
+        Package      = 'lore-postgres'
         Kind         = 'test'
         Target       = 'write_behind_stage'
         # 10 cases at the time this runner was written (2026-09-18); a sibling lane was adding an
@@ -147,16 +153,40 @@ $offlineInventory = @(
 # and asserted present-exactly-once in the Linux catalog: this is the direct evidence that the
 # Linux run contained what the Windows run cannot contain.
 $libUnixOnlyOffline = @(
+    'durability_tests::root_clones_share_the_bounded_io_capacity_before_read_or_finalize',
+    'durability_tests::cancelled_file_reader_retains_its_io_slot_until_the_blocking_job_finishes',
+    'durability_tests::absent_cleanup_requires_the_nearest_parent_fsync_to_complete',
     'durability_tests::open_syncs_root_after_provisioning_both_top_level_directories',
     'durability_tests::root_fsync_failure_refuses_open',
     'durability_tests::each_writer_syncs_both_ancestors_even_when_creator_has_not_synced_them',
     'durability_tests::existing_fanout_parent_fsync_failure_refuses_the_second_writer'
 )
 $libUnixOnlyLive = @(
-    'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry'
+        'store::immutable_store::fragment_write_behind::adapter_tests::adapter_valid_bytes_with_conflicting_content_flags_cannot_replace_staged_authority',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_staged_source_creates_neither_claim_nor_provider_request',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_cleanup_recovers_after_finished_purge_and_scan_tasks_panic',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_drain_progresses_while_foreground_gets_share_the_provider_budget',
+    'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::observer_sees_peer_stage_then_refuses_a_replaced_local_mount_without_restart',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observer_completes_inventory_across_more_than_one_bounded_scan',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_stalled_put_releases_the_single_domain_connection_and_survives_task_abort',
+    'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_before_object_effect_keeps_source_and_send_barrier',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_precondition_adopts_actual_alternate_compression_manifest',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_remote_readback_keeps_staged_source_and_late_effect_barrier',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_reads_back_without_repeating_the_put',
+    'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry',
+    'store::immutable_store::fragment_write_behind::source_tests::orphan_temp_cleanup_is_confined_and_replayed_without_double_refund',
+    'store::immutable_store::fragment_write_behind::source_tests::source_validation_round_trips_raw_lz4_zstd_and_refuses_corrupt_or_missing_bytes'
 )
+$providerLiveCase = 'tests::attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_own_bytes'
+$publicationLossCase = 'store::immutable_store::fragment_write_behind::adapter_tests::adapter_lost_publication_ack_rereads_exact_successor_without_another_put'
+$stageCrashCase = 'stage_crash_tests::actual_process_crashes_preserve_committed_stages_and_reclaim_unpublished_residue'
+$cleanupLossCase = 'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_fault_tests::cleanup_lost_ack_and_obliterate_reconcile_one_stage_capacity_release'
+$activeKillCase = 'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::killed_active_promotion_is_barriered_then_a_peer_sends_with_a_new_fence'
 
-# `#[ignore]` + Unix + live Postgres. Nothing has ever executed this target, on any platform.
+# Named live Postgres cases. Non-exact inventories select their cases from a broader target.
 $liveInventory = @(
     [pscustomobject]@{
         Kind   = 'test'
@@ -167,6 +197,27 @@ $liveInventory = @(
             'crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_gets_a_fresh_epoch',
             'crash_between_commit_staged_and_association_recovers_with_exactly_one_file',
             'first_attempt_captures_staged_authority_and_binds_the_association'
+        )
+    },
+    [pscustomobject]@{
+        Kind   = 'test'
+        Target = 'domain_fragment_clean_init'
+        Exact  = $false
+        Cases  = @(
+            'empty_initialization_establishes_readiness_without_claiming_backfill',
+            'used_or_missing_stage_counter_seed_refuses_clean_initialization'
+        )
+    },
+    [pscustomobject]@{
+        Kind   = 'test'
+        Target = 'write_behind_policy_rotation'
+        Exact  = $true
+        Cases  = @(
+            'paired_rotation_succeeds_before_and_after_expiry_and_old_pins_fail',
+            'paired_rotation_requires_maintenance_exact_cas_and_monotonic_revision',
+            'paired_rotation_refuses_active_stage_and_rolls_back_dispatch_changes',
+            'paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_usage',
+            'paired_rotation_rolls_back_stage_when_dispatch_update_fails'
         )
     }
 )
@@ -251,10 +302,13 @@ function Get-Catalog {
         [Parameter(Mandatory)][ValidateSet('lib', 'test')][string]$Kind,
         [string]$Target,
         [string]$Package = 'lore-postgres',
+        [string[]]$Features = @(),
         [switch]$IgnoredOnly
     )
     $targetArgs = if ($Kind -eq 'lib') { @('--lib') } else { @('--test', $Target) }
-    $command = @('cargo', 'test', '-p', $Package) + $targetArgs + @('--')
+    $command = @('cargo', 'test', '-p', $Package) + $targetArgs
+    if ($Features.Count -gt 0) { $command += @('--features', ($Features -join ',')) }
+    $command += '--'
     if ($IgnoredOnly) { $command += '--ignored' }
     $command += '--list'
     $run = Invoke-InContainer -Command $command
@@ -319,27 +373,55 @@ try {
     # materialises a junction's CONTENTS rather than a link, the scratch copy could not have let
     # cleanup escape into another tree either -- so this is a COST guard, not a safety one: without
     # it a junction appearing later (a `node_modules` link, a worktree) would be copied wholesale.
-    & robocopy $loreRoot $sourceCopy /E /XJ /XD target .git /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
+    & robocopy $loreRoot $sourceCopy /E /XJ /XD target .git .venv .pytest_cache .ruff_cache /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "robocopy of the working tree failed with code $LASTEXITCODE" }
+    # Cargo sees the same /src paths on every run. Robocopy preserves old mtimes,
+    # which can otherwise make an older source snapshot reuse a newer binary.
+    # Refresh only this owned copy; external dependency artifacts stay reusable.
+    $sourcePrefix = [IO.Path]::GetFullPath($sourceCopy).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $sourceTimestamp = [DateTime]::UtcNow
+    $pendingDirectories = [Collections.Generic.Stack[string]]::new()
+    $pendingDirectories.Push($sourceCopy)
+    while ($pendingDirectories.Count -gt 0) {
+        foreach ($entry in Get-ChildItem -LiteralPath $pendingDirectories.Pop() -Force) {
+            $entryPath = [IO.Path]::GetFullPath($entry.FullName)
+            if (-not $entryPath.StartsWith($sourcePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                throw "copied source escaped its owned directory: $entryPath"
+            }
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "copied source unexpectedly contains a reparse point: $entryPath"
+            }
+            if ($entry.PSIsContainer) {
+                if ($entry.Name -notin @('target', '.git', '.venv', '.pytest_cache', '.ruff_cache', 'node_modules')) {
+                    $pendingDirectories.Push($entryPath)
+                }
+            }
+            else {
+                $entry.LastWriteTimeUtc = $sourceTimestamp
+            }
+        }
+    }
     $global:LASTEXITCODE = 0
 
     # ---- toolchain image -----------------------------------------------------------------
-    # Same base as lore-server/Dockerfile. protobuf-compiler is required: lore-proto's
+    # Pin the host's Rust release so repeat runs use the same compiler and lint rules.
+    # Strict warnings-as-errors flags remain unchanged. protobuf-compiler is required: lore-proto's
     # prost/tonic build script shells out to protoc. `libprotobuf-dev` is required TOO and is
     # NOT implied by it on Debian trixie: the well-known types (google/protobuf/timestamp.proto,
     # imported by lock.proto) ship in that package's /usr/include, and without it the build fails
     # at `protoc failed: google/protobuf/timestamp.proto: File not found` (measured 2026-09-18).
     $dockerfile = @(
-        'FROM rust:slim-trixie',
+        'FROM rust:1.95.0-slim-trixie',
+        'LABEL com.tideshift.rust-version="1.95.0"',
         'RUN apt-get update && apt-get install -y --no-install-recommends build-essential protobuf-compiler libprotobuf-dev pkg-config && rm -rf /var/lib/apt/lists/*',
         # `rust:slim-*` ships no clippy component, so `-Clippy` fails with "'cargo-clippy' is not
         # installed for the toolchain" unless it is added here (measured 2026-09-18).
         'RUN rustup component add clippy'
     ) -join "`n"
     Set-Content -Path (Join-Path $imageContext 'Dockerfile') -Value $dockerfile -NoNewline
-    $imageTag = 'lore-write-behind-linux:3'
-    & docker image inspect $imageTag *> $null
-    if ($LASTEXITCODE -ne 0) {
+    $imageTag = 'lore-write-behind-linux:rust-1.95.0-v4'
+    $cachedRustVersion = (& docker image inspect --format '{{index .Config.Labels "com.tideshift.rust-version"}}' $imageTag 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $cachedRustVersion -ne '1.95.0') {
         Write-Host "Building $imageTag ..."
         Invoke-Checked docker @('build', '--tag', $imageTag, $imageContext)
     }
@@ -362,10 +444,37 @@ try {
         '--volume', "$($cargoVolume):/cargo-home",
         '--env', 'CARGO_TARGET_DIR=/cargo-target',
         '--env', 'CARGO_HOME=/cargo-home',
+        '--env', 'CARGO_BUILD_JOBS=2',
         '--workdir', '/src',
         $imageTag, 'sleep', 'infinity'
     )
     $createdContainers.Add($buildContainer)
+
+    $compilerRun = Invoke-InContainer -Command @('rustc', '--version')
+    if ($compilerRun.ExitCode -ne 0 -or $compilerRun.Output.Trim() -notmatch '^rustc 1\.95\.0(?:\s|$)') {
+        throw "Linux runner requires rustc 1.95.0; found: $($compilerRun.Output)"
+    }
+
+    if ($Clippy) {
+        # A clean exit is the lint gate. Diagnostic span counts are not findings,
+        # and absence of a span in one directory cannot certify a failed command.
+        $versionRun = Invoke-InContainer -Command @('rustc', '--version')
+        if ($versionRun.ExitCode -ne 0) { throw "failed to read Linux toolchain version: $($versionRun.Output)" }
+        $rustcVersion = $versionRun.Output.Trim()
+        foreach ($package in @('lore-object-dispatch', 'lore-fragment-provider', 'lore-postgres', 'lore-server')) {
+            Write-Host "Running strict Linux Clippy for $package ($rustcVersion) ..."
+            $clippyRun = Invoke-InContainer -Command @(
+                'cargo', 'clippy', '-p', $package, '--all-targets', '--no-deps', '-j2', '--', '-D', 'warnings'
+            )
+            $status = if ($clippyRun.ExitCode -eq 0) { 'PASS' } else { 'FAIL' }
+            Add-Result -Target "clippy $package" -Case '(all targets, warnings denied)' -Status $status `
+                -Note "exit $($clippyRun.ExitCode); $rustcVersion; strict optional gate enabled by -Clippy"
+            if ($status -ne 'PASS') { Write-Warning "  FAIL`n$($clippyRun.Output)" } else { Write-Host '  PASS' }
+        }
+        if (@($results | Where-Object { $_.Gating -and $_.Target -like 'clippy *' -and $_.Status -ne 'PASS' }).Count -ne 0) {
+            throw 'Strict Linux Clippy failed; behavioral compilation and tests were not started.'
+        }
+    }
 
     # ---- enumeration ---------------------------------------------------------------------
     Write-Host 'Enumerating catalogs (cold build; this compiles the dependency graph) ...'
@@ -381,12 +490,12 @@ try {
     }
 
     foreach ($target in $offlineInventory) {
-        $catalog = @(Get-Catalog -Kind $target.Kind -Target $target.Target)
+        $catalog = @(Get-Catalog -Kind $target.Kind -Target $target.Target -Package $target.Package)
         if ($catalog.Count -lt $target.MinimumCases) {
             throw ("$($target.Target) enumerated $($catalog.Count) cases, below its floor of " +
                 "$($target.MinimumCases). On a non-Unix host this target enumerates ZERO.")
         }
-        $ignoredCatalog = @(Get-Catalog -Kind $target.Kind -Target $target.Target -IgnoredOnly)
+        $ignoredCatalog = @(Get-Catalog -Kind $target.Kind -Target $target.Target -Package $target.Package -IgnoredOnly)
         if ($ignoredCatalog.Count -ne 0) {
             throw ("$($target.Target) gained #[ignore] cases this runner does not opt into, so " +
                 "they would be silently NOT RUN: [$($ignoredCatalog -join ', ')]")
@@ -410,11 +519,26 @@ try {
         }
     }
 
+    if (-not $SkipLive) {
+        $adapterPrefix = 'store::immutable_store::fragment_write_behind::adapter_tests::'
+        $featureCatalog = @(Get-Catalog -Kind 'lib' -IgnoredOnly -Features @('failure_generator'))
+        $actual = @($featureCatalog | Where-Object { $_.StartsWith($adapterPrefix) } | Sort-Object)
+        $expected = @(@($libUnixOnlyLive | Where-Object { $_.StartsWith($adapterPrefix) }) + @($publicationLossCase, $cleanupLossCase, $activeKillCase) | Sort-Object)
+        if (@(Compare-Object $expected $actual).Count -ne 0) {
+            throw "feature-enabled adapter catalog differs from the runner inventory: expected=[$($expected -join ', ')] actual=[$($actual -join ', ')]"
+        }
+        $actual = @(Get-Catalog -Kind 'test' -Target 'write_behind_staging_lifecycle' -IgnoredOnly -Features @('failure_generator') | Sort-Object)
+        $expected = @(@($liveInventory | Where-Object Target -eq 'write_behind_staging_lifecycle' | ForEach-Object Cases) + @($stageCrashCase) | Sort-Object)
+        if (@(Compare-Object $expected $actual).Count -ne 0) {
+            throw 'feature-enabled staged crash catalog differs from the runner inventory'
+        }
+    }
+
     # ---- offline targets -----------------------------------------------------------------
     foreach ($target in $offlineInventory) {
-        Write-Host "Running lore-postgres --test $($target.Target) ..."
+        Write-Host "Running $($target.Package) --test $($target.Target) ..."
         $run = Invoke-InContainer -Command @(
-            'cargo', 'test', '-p', 'lore-postgres', '--test', $target.Target,
+            'cargo', 'test', '-p', $target.Package, '--test', $target.Target,
             '--', '--test-threads=1'
         )
         $counts = Read-TestCounts -Output $run.Output
@@ -439,24 +563,64 @@ try {
     # `Ran -eq $libCatalog.Count` says exactly what is wanted -- every enumerated case was
     # accounted for (passed, failed or ignored), nothing was filtered away.
     $libStatus = if ($libRun.ExitCode -eq 0 -and $libCounts.Failed -eq 0 -and $libCounts.Passed -gt 0 -and
-        $libCounts.Ran -eq $libCatalog.Count) { 'PASS' } else { 'FAIL' }
+        $libCounts.Ran -eq $libCatalog.Count -and $libCounts.Ignored -eq $libIgnored.Count -and
+        ($libCounts.Passed + $libCounts.Ignored) -eq $libCatalog.Count) { 'PASS' } else { 'FAIL' }
     Add-Result -Target 'lib' -Case '(non-ignored)' -Status $libStatus `
         -Enumerated $libCatalog.Count -Ran $libCounts.Ran -Passed $libCounts.Passed -Failed $libCounts.Failed `
         -Note "Windows enumerates $windowsLibEnumerated for the same tree; $($libCounts.Ignored) ignored"
     if ($libStatus -ne 'PASS') { Write-Warning "  FAIL`n$($libRun.Output)" } else { Write-Host "  PASS ($($libCounts.Passed) passed, $($libCounts.Ignored) ignored)" }
 
+    # These variants have distinct catalogs. Enumerate ignored cases separately so a
+    # successful subset or an all-ignored target cannot appear as a complete offline pass.
+    $offlineLibVariants = @(
+        [pscustomobject]@{
+            Package = 'lore-fragment-provider'; Features = @(); Label = 'default'
+            RequiredCases = @()
+        },
+        [pscustomobject]@{
+            Package = 'lore-postgres'; Features = @('failure_generator'); Label = 'failure_generator'
+            RequiredCases = @('domain::fragments::failpoints::tests::every_anchor_names_one_of_the_documented_windows')
+        }
+    )
+    foreach ($variant in $offlineLibVariants) {
+        $catalog = @(Get-Catalog -Kind 'lib' -Package $variant.Package -Features $variant.Features)
+        $ignored = @(Get-Catalog -Kind 'lib' -Package $variant.Package -Features $variant.Features -IgnoredOnly)
+        foreach ($case in $variant.RequiredCases) {
+            if (@($catalog | Where-Object { $_ -eq $case }).Count -ne 1 -or $case -in $ignored) {
+                throw "$($variant.Package) ($($variant.Label)) must enumerate non-ignored case '$case' exactly once"
+            }
+        }
+        $command = @('cargo', 'test', '-p', $variant.Package, '--lib')
+        if ($variant.Features.Count -gt 0) { $command += @('--features', ($variant.Features -join ',')) }
+        $command += @('--', '--test-threads=1')
+        Write-Host "Running $($variant.Package) --lib ($($variant.Label)) ..."
+        $run = Invoke-InContainer -Command $command
+        $counts = Read-TestCounts -Output $run.Output
+        $status = if ($run.ExitCode -eq 0 -and $counts.Passed -gt 0 -and $counts.Failed -eq 0 -and
+            $counts.Ran -eq $catalog.Count -and $counts.Ignored -eq $ignored.Count -and
+            ($counts.Passed + $counts.Ignored) -eq $catalog.Count) { 'PASS' } else { 'FAIL' }
+        Add-Result -Target "$($variant.Package) lib ($($variant.Label))" -Case '(non-ignored)' -Status $status `
+            -Enumerated $catalog.Count -Ran $counts.Ran -Passed $counts.Passed -Failed $counts.Failed `
+            -Note "$($counts.Ignored) ignored (catalog $($ignored.Count)); live cases run separately"
+        if ($status -ne 'PASS') { Write-Warning "  FAIL`n$($run.Output)" } else { Write-Host "  PASS ($($counts.Passed) passed, $($counts.Ignored) ignored)" }
+    }
+
     # ---- lore-server's Unix arm ------------------------------------------------------------
     # This runner was scoped `-p lore-postgres`, so `lore-server`'s own Unix-gated case sat
-    # outside it and `the_same_write_behind_block_is_accepted_on_unix` had never been compiled on
+    # outside it and `the_same_write_behind_block_is_accepted_on_linux` had never been compiled on
     # this rig until it was run by hand on 2026-09-19. The gap is invisible to a count
     # differential -- the catalog was 1,842 on BOTH platforms, measured 2026-09-19 -- because the two
     # arms are a `cfg(unix)`/`cfg(not(unix))` PAIR with DIFFERENT NAMES: each platform drops one
     # case and gains the other, so the total never moves. The only evidence that discriminates is
     # "was this exact name in the catalog", which is what the pin below asserts.
     Write-Host 'Enumerating lore-server lib ...'
+    $providerIgnored = @(Get-Catalog -Kind 'lib' -Package 'lore-fragment-provider' -IgnoredOnly)
+    if (@($providerIgnored | Where-Object { $_ -eq $providerLiveCase }).Count -ne 1) {
+        throw "provider live case must be enumerated exactly once: $providerLiveCase"
+    }
     $serverCatalog = @(Get-Catalog -Kind 'lib' -Package 'lore-server')
-    $serverUnixOnly = 'plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_unix'
-    $serverNonUnixOnly = 'plugins::postgres::tests::an_otherwise_valid_write_behind_block_is_refused_at_boot_off_unix'
+    $serverUnixOnly = 'plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_linux'
+    $serverNonUnixOnly = 'plugins::postgres::tests::an_otherwise_valid_write_behind_block_is_refused_at_boot_off_linux'
     foreach ($suffix in @($serverUnixOnly)) {
         $matched = @($serverCatalog | Where-Object { $_ -eq $suffix -or $_.EndsWith(":$suffix") })
         if ($matched.Count -ne 1) {
@@ -520,55 +684,13 @@ try {
         }
     }
 
-    if ($Clippy) {
-        # The `cfg(unix)` blind spot is a LINT gap as well as a test gap: `cargo clippy` on the
-        # Windows rig never lints `write_behind/root.rs`'s Unix arm at all, so findings there are
-        # invisible until someone runs clippy on Linux. This step closes that.
-        #
-        # REPORTED, NOT GATING, and off by default -- deliberately. As of 22361e11 the Unix arm
-        # carries pre-existing findings that belong to the write-behind lane, not to this runner,
-        # and this runner changes no Rust source. Making it gate today would turn a REGISTERED
-        # required tier red for someone else's backlog; leaving it silent would repeat the exact
-        # mistake this runner exists to fix. Flip `-NonGating` off once the Unix arm is clean.
-        # Measured again 2026-09-18 at b86d3083: the Unix arm now reports ZERO span lines, so the
-        # backlog this deferral was written for looks cleared -- confirm on the write-behind lane's
-        # own tree before flipping, since this runner changes no Rust source and cannot keep it so.
-        # Read the per-FILE breakdown, not the total. Measured 2026-09-18 at 0188a6bb: a blanket
-        # `-D warnings` over this crate in the container reports 129 findings, and the large
-        # majority are in files the Windows rig lints perfectly well (coordinator.rs, 33;
-        # maintenance.rs, 23) -- i.e. they are a container-vs-rig TOOLCHAIN VERSION difference,
-        # not a platform blind spot. The signal is the handful in the Unix-gated module, which
-        # no Windows clippy run can ever emit. Report both, and never let the total gate.
-        Write-Host 'Running cargo clippy -p lore-postgres --all-targets (Linux, reported only) ...'
-        $rustcVersion = (Invoke-InContainer -Command @('rustc', '--version')).Output.Trim()
-        $clippyRun = Invoke-InContainer -Command @(
-            'cargo', 'clippy', '-p', 'lore-postgres', '--all-targets', '--no-deps', '-j4', '--', '-D', 'warnings'
-        )
-        # These are `-->` SPAN LINES, not findings: one finding with a primary span plus a
-        # `note:`/`help:` span contributes several. Counting distinct findings from the human
-        # renderer is not reliably possible (`--message-format=json` would be, at the cost of a
-        # second parse this non-gating step does not earn), so the column is NAMED for what it
-        # actually counts. Zero span lines in a file still means zero findings in it, which is all
-        # the Unix-gated check below asserts.
-        $spanLines = @(
-            foreach ($line in ($clippyRun.Output -split "`r?`n")) {
-                $match = [regex]::Match($line, '^\s*-->\s*(?<file>[^:]+):')
-                if ($match.Success) { $match.Groups['file'].Value }
-            }
-        )
-        $unixGated = @($spanLines | Where-Object { $_ -like '*store/write_behind/*' })
-        Write-Host "  toolchain in container: $rustcVersion"
-        Write-Host "  span lines by file (upper bound on findings, not a finding count):"
-        $spanLines | Group-Object | Sort-Object Count -Descending |
-            ForEach-Object { Write-Host "    $($_.Count)`t$($_.Name)" }
-        Add-Result -Target 'clippy' -Case 'store/write_behind (Unix-gated)' `
-            -Status $(if ($unixGated.Count -eq 0) { 'PASS' } else { 'FAIL' }) `
-            -Note "$($unixGated.Count) span line(s) the Windows rig can never emit; $($spanLines.Count) span lines crate-wide, mostly toolchain-version noise. Span lines over-count findings. Reported, does not gate." `
-            -NonGating
-    }
-
     # ---- live cases ----------------------------------------------------------------------
     if ($SkipLive) {
+        Add-Result -Target 'lib (failure_generator)' -Case $publicationLossCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
+        Add-Result -Target 'lib (failure_generator)' -Case $cleanupLossCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
+        Add-Result -Target 'lib (failure_generator)' -Case $activeKillCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
+        Add-Result -Target 'write_behind_staging_lifecycle (failure_generator)' -Case $stageCrashCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
+        Add-Result -Target 'lore-fragment-provider lib' -Case $providerLiveCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
         foreach ($target in $liveInventory) {
             foreach ($case in $target.Cases) {
                 Add-Result -Target $target.Target -Case $case -Status 'NOT RUN' -Note '-SkipLive' -NonGating
@@ -579,6 +701,20 @@ try {
         }
     }
     else {
+        if (-not $PSBoundParameters.ContainsKey('PostgresImage')) {
+            & docker image inspect $PostgresImage *> $null
+            if ($LASTEXITCODE -ne 0) {
+                $postgresContext = [IO.Path]::GetFullPath((Join-Path $loreRoot '../lorehub/docker/dev-cell'))
+                $postgresDockerfile = Join-Path $postgresContext 'Dockerfile.postgres-blake3'
+                if (-not (Test-Path -LiteralPath $postgresDockerfile)) {
+                    throw "local PostgreSQL fixture Dockerfile missing: $postgresDockerfile; supply -PostgresImage explicitly"
+                }
+                Invoke-Checked docker @('build', '--file', $postgresDockerfile, '--tag', $PostgresImage, $postgresContext)
+            }
+            $global:LASTEXITCODE = 0
+        }
+        $fixtureBuild = Invoke-InContainer -Command @('cargo', 'build', '-p', 'lore-object-dispatch', '--example', 'write-behind-test-fixture')
+        if ($fixtureBuild.ExitCode -ne 0) { throw "adapter fixture build failed: $($fixtureBuild.Output)" }
         Invoke-Checked docker @(
             'run', '--detach', '--name', $pgContainer,
             '--label', "$labelName=$runId",
@@ -586,7 +722,7 @@ try {
             '--network', $networkName,
             '--network-alias', 'wb-postgres',
             '--env', 'POSTGRES_HOST_AUTH_METHOD=trust',
-            'postgres:16'
+            $PostgresImage
         )
         $createdContainers.Add($pgContainer)
 
@@ -619,13 +755,18 @@ try {
         }
 
         $liveCases = @(
+            [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $publicationLossCase }
+            [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $cleanupLossCase }
+            [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $activeKillCase }
+            [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'test'; Target = 'write_behind_staging_lifecycle'; Case = $stageCrashCase }
+            [pscustomobject]@{ Package = 'lore-fragment-provider'; Kind = 'lib'; Target = 'lib'; Case = $providerLiveCase }
             foreach ($target in $liveInventory) {
                 foreach ($case in $target.Cases) {
-                    [pscustomobject]@{ Kind = $target.Kind; Target = $target.Target; Case = $case }
+                    [pscustomobject]@{ Package = 'lore-postgres'; Kind = $target.Kind; Target = $target.Target; Case = $case }
                 }
             }
             foreach ($case in $libUnixOnlyLive) {
-                [pscustomobject]@{ Kind = 'lib'; Target = 'lib'; Case = $case }
+                [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $case }
             }
         )
 
@@ -640,12 +781,21 @@ try {
             Write-Host "Running $($entry.Target)::$($entry.Case) ..."
             try {
                 $targetArgs = if ($entry.Kind -eq 'lib') { @('--lib') } else { @('--test', $entry.Target) }
-                $command = @('cargo', 'test', '-p', 'lore-postgres') + $targetArgs + @(
+                $featureArgs = if ($entry.Case -in @($publicationLossCase, $stageCrashCase, $cleanupLossCase, $activeKillCase)) { @('--features', 'failure_generator') } else { @() }
+                $command = @('cargo', 'test', '-p', $entry.Package) + $targetArgs + $featureArgs + @(
                     '--', '--ignored', '--exact', $entry.Case, '--test-threads=1', '--nocapture'
                 )
-                $run = Invoke-InContainer -Command $command -EnvironmentPairs @(
-                    "LORE_TEST_PG_URL=postgresql://postgres@wb-postgres:5432/$databaseName"
+                $environmentPairs = @(
+                    "LORE_TEST_PG_URL=postgresql://postgres@wb-postgres:5432/$databaseName",
+                    'LORE_TEST_ADAPTER_SETUP_BIN=/cargo-target/debug/examples/write-behind-test-fixture'
                 )
+                if ($entry.Case -eq $publicationLossCase) {
+                    $environmentPairs += 'LORE_FRAGMENT_FAILPOINTS=publication.commit.settled=unknown'
+                }
+                if ($entry.Case -eq $cleanupLossCase) {
+                    $environmentPairs += 'LORE_FRAGMENT_FAILPOINTS=stage.cleanup.settled=unknown'
+                }
+                $run = Invoke-InContainer -Command $command -EnvironmentPairs $environmentPairs
             }
             finally {
                 # Deliberately NOT Invoke-Checked. A throw from a `finally` replaces whatever

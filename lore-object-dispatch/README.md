@@ -9,8 +9,8 @@ disabled.
 There is no separate dispatcher process, no in-cell mTLS service, and no surviving RPC (CR-033 D1,
 2026-08-28). The cell dispatch authority is the retained PostgreSQL procedures below, installed in
 the cell database and called by the enabled loreserver direct path through the typed Rust client in
-`dispatch_client.rs`. Future drain workers share that path and pool. The client uses a separately
-credentialed pool of its own
+`dispatch_client.rs`. Enabled fragment drain workers share that path and pool. The client uses a
+separately credentialed pool of its own
 (`dispatch_pool.rs`), not a `lore-postgres` store pool, because every retained mutation asserts
 `session_user = 'object_dispatch_retention_runtime'` and grants `EXECUTE` only to that role, while a
 store pool connects as the store identity. Enabled composition requires one ASCII DNS host,
@@ -36,7 +36,8 @@ drift guard over the surviving proto source in the same commit as any further pr
 ## Embedded migration
 
 The cell install set includes migrations 0002/0003, the local-authority chain and cell retention
-0023/0024. Migrations 0004 through 0006
+0023/0024, followed by provider-attempt guards and the drain policy chain through 0027.
+Migrations 0004 through 0006
 (`retention_readback`/`retention_mutations`/`retention_prune_receipts`)
 are deferred and not installed, alongside the pure compact-receipt, full-to-compact, and
 compact-prune planners in `compaction.rs`, `full_to_compact.rs`, and `compact_prune.rs`: correct,
@@ -233,7 +234,7 @@ resolver cannot repeat that three-way agreement check. Charge-time cell scope is
 `provider_boundary_id` alone; the resolver does not read `cell_id`.
 
 `PostgresProviderChargeAuthority` accepts a preconnected dispatch-runtime client. Composition draws
-that client from the one dispatch pool shared by the replica's request path and future drain tasks.
+that client from the one dispatch pool shared by the replica's request path and drain tasks.
 It does not create a pool per limiter or worker. The hard process inventory is six pools: immutable,
 mutable, lock, domain, and dispatch, plus CR-032's relay pool when `[outbox_relay]` is enabled.
 Every maximum is positive except the relay's, which is zero exactly when the relay is disabled, and
@@ -487,7 +488,7 @@ cargo test -p lore-object-dispatch
 # installs the CD-1 set, runs all twelve by exact name, reports PASS/FAIL/NOT RUN)
 tests/run-local-authority-live.ps1
 
-# Cell-schema installer/attester live tier (WP-114 CD-1): five gates over the real
+# Cell-schema installer/attester live tier: gates over the real
 # migrator-role install path, on its own disposable PostgreSQL 16
 tests/run-cell-schema-install-live.ps1
 
@@ -558,10 +559,9 @@ evidence. Prefer the runner; the manual fallback exists for isolating one fixtur
 does not share CD-2's, because its tests connect **as** `object_dispatch_retention_migrator`, a real
 LOGIN role with a non-inheriting owner membership, rather than as a superuser using
 `SET SESSION AUTHORIZATION`. That is the production install path, and only a real login exercises
-it. Its five gates are a clean install on an empty database, an idempotent re-run that neither
-re-migrates nor moves the catalog, refusal on a truncated chain with the schema left exactly as
-found, refusal on seven distinct catalog drift classes each caught in its own manifest section, and
-the revoke-after-replacement path restoring the exact pinned ACL state. Verified 5/5 PASS.
+it. Gates cover clean install, unchanged exact replay, refusal on a truncated chain or catalog
+drift, restored ACLs after function replacement, and maintenance-only drain-policy publication
+with exact replay.
 
 Limitations: `object_store_retention_read_state_v1` (0003's readback) still
 has no live caller among the runner's twelve tests, but `cell-schema-install attest`
@@ -573,4 +573,22 @@ layers instead, behaviourally, not through catalog readback. Migration 0019's di
 readback does not share that gap: it is a live caller for every layer named above it, itself
 included, and CD-2 carries live cases for both its schema and provisioning halves. Phase 5 now calls
 the runtime readback and attests the exact physical database identity before schema, charging, or
-provider routing. CD-6 and CD-7 still owe drain and shared-filesystem write-behind behavior.
+provider routing. The drain reservation policy and shared-filesystem worker
+[implementation contract](../../lorehub/docs/work-packages/wp-122-implementation-contract.md)
+defines the policy, reservation, cleanup and local acceptance boundaries. Runtime can reserve only
+through the guarded policy procedure. Cleanup retains compact placement markers for late files,
+and expiry never restores provider-send authority.
+
+Policy rollover is offline. Finish drain and cleanup, then stop and exclude every replica.
+Run `cell-drain-policy-configure rotate policy.json --replicas-excluded` with the maintenance
+credentials. The JSON includes `previous: { revision, digest }` alongside the new `drain` policy.
+New revision strings must strictly increase in PostgreSQL `C` byte order; use fixed-width revision
+numbers (for example, `local-drain-000002`). The command atomically checks and replaces both policy
+stores. It refuses live work, conflicting database locks, changed predecessor pins, or limits below
+retained metadata usage. Restart replicas only with the new revision and digest pinned.
+
+Retry a lost command response with the exact same file. The predecessor receipt, reservation expiry
+times, custody markers and counters remain intact. `publish` remains initial publication or exact
+replay; it does not rotate. The exclusion flag records an operator prerequisite, not proof that all
+replicas are stopped. If expiry leaves pending staged data, retain the database and both roots;
+this command does not bypass the quiescence check or authorize a mode change.

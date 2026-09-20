@@ -59,6 +59,8 @@
 use std::collections::BTreeMap;
 #[path = "creation.rs"]
 mod creation;
+#[path = "stage_custody.rs"]
+mod stage_custody;
 use std::collections::BTreeSet;
 use std::time::Duration;
 use std::time::Instant;
@@ -68,6 +70,9 @@ pub(crate) use creation::bind_branch_creation_metadata;
 pub(crate) use creation::bind_creation_metadata;
 use deadpool_postgres::Pool;
 use deadpool_postgres::Transaction;
+pub use stage_custody::StageCleanupIntent;
+pub use stage_custody::StageObservation;
+pub use stage_custody::StageReservationInput;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::coordinator::CommittedVersions;
@@ -908,11 +913,15 @@ pub struct FragmentDrainCandidate {
     size_content: i64,
     decoded_hash: Vec<u8>,
     payload_flags: i64,
+    original_flags: u32,
     provider_body_blake3: Option<[u8; 32]>,
     provider_body_size: Option<u64>,
 }
 
 impl FragmentDrainCandidate {
+    pub fn original_flags(&self) -> u32 {
+        self.original_flags
+    }
     /// The FragmentId.
     pub fn hash(&self) -> &[u8] {
         &self.hash
@@ -1476,6 +1485,15 @@ impl PostgresFragmentCoordinator {
             .map_err(|error| {
                 DomainError::Internal(format!("fragment schema bootstrap: {error}"))
             })?;
+        crate::pool::ensure_schema(&self.pool, super::stage_schema::STAGE_CUSTODY_SCHEMA)
+            .await
+            .map_err(|error| DomainError::Internal(format!("stage custody bootstrap: {error}")))?;
+        crate::pool::ensure_schema(
+            &self.pool,
+            super::stage_rotation_schema::STAGE_POLICY_ROTATION_SCHEMA,
+        )
+        .await
+        .map_err(|error| DomainError::Internal(format!("stage rotation bootstrap: {error}")))?;
         let client = self.checkout().await?;
         client
             .execute(
@@ -2498,6 +2516,7 @@ impl PostgresFragmentCoordinator {
             Some(legacy_object_key),
             Some(&claim),
             false,
+            None,
         )
         .await
     }
@@ -2505,9 +2524,20 @@ impl PostgresFragmentCoordinator {
     /// Publish a `PreparingStage` intent. Allocates an epoch and fence without
     /// publishing any positive association; the file write, validation, flush,
     /// atomic finalize, and directory durability all happen outside Postgres.
-    pub async fn begin_stage(&self, hash: &[u8]) -> Result<BeginOutcome, DomainError> {
-        self.begin_publication(hash, EpochAuthority::Staged, None, None, false)
-            .await
+    pub async fn begin_stage(
+        &self,
+        hash: &[u8],
+        reservation: StageReservationInput,
+    ) -> Result<BeginOutcome, DomainError> {
+        self.begin_publication(
+            hash,
+            EpochAuthority::Staged,
+            None,
+            None,
+            false,
+            Some(reservation),
+        )
+        .await
     }
 
     /// Claim the exact `Missing` epoch, state, and fence for a repair.
@@ -2529,6 +2559,7 @@ impl PostgresFragmentCoordinator {
             Some(&legacy_object_key),
             Some(&claim),
             true,
+            None,
         )
         .await
     }
@@ -3143,9 +3174,10 @@ impl PostgresFragmentCoordinator {
     /// types are unnameable in this crate.
     pub async fn begin_promotion(
         &self,
-        hash: &[u8],
+        source: &FragmentDrainCandidate,
         claim: FragmentWriteClaimInput,
     ) -> Result<BeginOutcome, DomainError> {
+        let hash = source.hash.as_slice();
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -3164,6 +3196,33 @@ impl PostgresFragmentCoordinator {
                 "promotion requires a Staged head; this one is {}",
                 head.state.label()
             )));
+        }
+        // Validation happened outside SQL. Bind that exact observation before
+        // allocating a successor or creating any provider-send authority.
+        if head.current_epoch != source.epoch
+            || head.last_fence != source.last_fence
+            || head.manifest_id.as_deref() != Some(source.manifest_id.as_slice())
+        {
+            return Ok(BeginOutcome::Fenced(
+                "staged source changed after validation".to_owned(),
+            ));
+        }
+        let exact_source = tx.query_opt(
+            "SELECT 1 FROM lore_fragment_epochs \
+             WHERE hash = $1 AND epoch = $2 AND manifest_id = $3 \
+               AND object_key = $4 AND size_payload = $5 AND size_content = $6 \
+               AND decoded_hash = $7 AND payload_flags = $8 \
+               AND authority = 1 AND disposition = 0 \
+               AND EXISTS(SELECT 1 FROM lore_fragment_stage_custody c WHERE c.hash=$1 AND c.epoch=$2 \
+                  AND c.state=1 AND c.original_flags=$9 AND c.size_payload=$5)",
+            &[&hash, &source.epoch, &source.manifest_id, &source.object_key,
+              &i64::try_from(source.size_payload).map_err(|_error| DomainError::InvalidInput("staged size overflow".to_owned()))?,
+              &source.size_content, &source.decoded_hash, &source.payload_flags, &i64::from(source.original_flags)],
+        ).await.map_err(|error| DomainError::from_pg("promotion source binding", error))?;
+        if exact_source.is_none() {
+            return Ok(BeginOutcome::Fenced(
+                "staged representation changed after validation".to_owned(),
+            ));
         }
         // The exact staged witness, read off the head this transaction holds
         // `FOR UPDATE`. It is captured rather than caller-supplied, because
@@ -4135,6 +4194,8 @@ impl PostgresFragmentCoordinator {
         if updated != 1 {
             return Ok(CommitVerdict::Fenced);
         }
+        stage_custody::release_obliterated_stages_locked(&tx, &mut sequence, &intent.purge_targets)
+            .await?;
         classify_commit(tx.commit().await, "obliterate payload commit")?;
         failpoint!("obliterate.payload.settled")?;
         Ok(CommitVerdict::Published)
@@ -4377,6 +4438,22 @@ impl PostgresFragmentCoordinator {
         // check below against the only two writers that can move it.
         let mut sequence = LockSequence::new();
         lock_lease_member_heads(&tx, &mut sequence, &member_hashes).await?;
+        sequence.enter(LockClass::StageCustody)?;
+        let custody = tx
+            .query(
+                "SELECT c.state FROM lore_fragment_stage_custody c \
+             JOIN unnest($1::bytea[],$2::bigint[]) AS m(hash,epoch) \
+               ON c.hash=m.hash AND c.epoch=m.epoch ORDER BY c.hash,c.epoch FOR SHARE OF c",
+                &[&member_hashes, &member_epochs],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("staged lease custody lock", e))?;
+        if custody.len() != members.len() || custody.iter().any(|r| r.get::<_, i16>(0) != 1) {
+            return Err(DomainError::PreconditionRejected {
+                reason: STAGED_LEASE_MEMBER_NOT_STAGED.into(),
+                reason_version: 1,
+            });
+        }
         failpoint!("lease.acquire.locked")?;
         // Scope check second, so a refusal happens before anything is written
         // and the transaction has nothing to undo.
@@ -4514,11 +4591,9 @@ impl PostgresFragmentCoordinator {
     ///
     /// * `l.state = 3` — only a `Staged` head. Every other state is either not
     ///   readable, already remote, or mid-delete.
-    /// * `l.active_operation IS NULL` — a head already owned by a promotion, an
-    ///   obliterate, or a direct write is not available. Without this term the
-    ///   same wedged head would occupy a slot on every pass, which is the
-    ///   head-of-line shape [`Self::prune_terminal_write_claims`]'s anti-join
-    ///   exists to remove.
+    /// * The active operation is absent or is the known promotion token. The
+    ///   latter permits recovery after its send barrier expires. An obliterate
+    ///   or direct write remains excluded.
     /// * The epoch join is the canonical readability join used by
     ///   [`Self::resolve`]: the epoch must be the head's current one, carry the
     ///   head's exact manifest, be `Staged` authority, and be current-eligible.
@@ -4574,6 +4649,21 @@ impl PostgresFragmentCoordinator {
         &self,
         batch: FragmentDrainCandidateBatch,
     ) -> Result<Vec<FragmentDrainCandidate>, DomainError> {
+        self.staged_drain_candidates_after(batch, &[]).await
+    }
+
+    /// Read the next bounded keyset page. An empty result lets the scheduler
+    /// wrap its cursor; failed low hashes cannot occupy every scan forever.
+    pub async fn staged_drain_candidates_after(
+        &self,
+        batch: FragmentDrainCandidateBatch,
+        after_hash: &[u8],
+    ) -> Result<Vec<FragmentDrainCandidate>, DomainError> {
+        if !after_hash.is_empty() && after_hash.len() != 32 {
+            return Err(DomainError::InvalidInput(
+                "drain cursor must be empty or a hash".to_owned(),
+            ));
+        }
         let client = self.checkout().await?;
         let rows = client
             .query(
@@ -4586,6 +4676,7 @@ impl PostgresFragmentCoordinator {
                         e.size_content AS size_content, \
                         e.decoded_hash AS decoded_hash, \
                         e.payload_flags AS payload_flags, \
+                        c.original_flags AS original_flags, \
                         e.provider_body_blake3 AS provider_body_blake3, \
                         e.provider_body_size AS provider_body_size \
                    FROM lore_fragment_lifecycle AS l \
@@ -4593,8 +4684,10 @@ impl PostgresFragmentCoordinator {
                      ON e.hash = l.hash \
                     AND e.epoch = l.current_epoch \
                     AND e.manifest_id = l.manifest_id \
+                   JOIN lore_fragment_stage_custody AS c ON c.hash=l.hash AND c.epoch=l.current_epoch AND c.state=1 \
                   WHERE l.state = 3 \
-                    AND l.active_operation IS NULL \
+                    AND (l.active_operation IS NULL OR l.active_operation = decode('77703131352d70726f6d6f74652d7631','hex')) \
+                    AND l.hash > $2 \
                     AND e.authority = 1 \
                     AND e.disposition = 0 \
                     AND NOT EXISTS ( \
@@ -4607,7 +4700,7 @@ impl PostgresFragmentCoordinator {
                                > clock_timestamp()) \
                   ORDER BY l.hash \
                   LIMIT $1",
-                &[&batch.max_candidates],
+                &[&batch.max_candidates, &after_hash],
             )
             .await
             .map_err(|error| DomainError::from_pg("fragment drain candidates", error))?;
@@ -4658,6 +4751,9 @@ impl PostgresFragmentCoordinator {
                 size_content: row.get("size_content"),
                 decoded_hash: row.get("decoded_hash"),
                 payload_flags: row.get("payload_flags"),
+                original_flags: u32::try_from(row.get::<_, i64>("original_flags")).map_err(
+                    |_error| DomainError::Internal("invalid staged original flags".into()),
+                )?,
                 provider_body_blake3,
                 provider_body_size,
             });
@@ -4676,6 +4772,7 @@ impl PostgresFragmentCoordinator {
         legacy_object_key: Option<&str>,
         claim_input: Option<&FragmentWriteClaimInput>,
         require_missing: bool,
+        stage_reservation: Option<StageReservationInput>,
     ) -> Result<BeginOutcome, DomainError> {
         // Only a lost first-head insertion followed by an acknowledged rollback
         // permits another pass. Errors, including uncertain commits, never retry here.
@@ -4687,6 +4784,7 @@ impl PostgresFragmentCoordinator {
                     legacy_object_key,
                     claim_input,
                     require_missing,
+                    stage_reservation,
                 )
                 .await?
             {
@@ -4706,6 +4804,7 @@ impl PostgresFragmentCoordinator {
         legacy_object_key: Option<&str>,
         claim_input: Option<&FragmentWriteClaimInput>,
         require_missing: bool,
+        stage_reservation: Option<StageReservationInput>,
     ) -> Result<Option<BeginOutcome>, DomainError> {
         match (authority, claim_input) {
             (EpochAuthority::Remote, None) => {
@@ -4751,6 +4850,21 @@ impl PostgresFragmentCoordinator {
             }
         }
         if let Some(head) = &existing {
+            if head.state == FragmentLifecycleState::PreparingStage {
+                let live = tx
+                    .query_opt(
+                        "SELECT 1 FROM lore_fragment_stage_custody \
+                    WHERE hash=$1 AND epoch=$2 AND state=0 AND prepare_deadline>clock_timestamp()",
+                        &[&hash, &head.current_epoch],
+                    )
+                    .await
+                    .map_err(|e| DomainError::from_pg("stage preparation owner", e))?;
+                if live.is_some() {
+                    return Ok(Some(BeginOutcome::Fenced(
+                        "stage preparation is still live".into(),
+                    )));
+                }
+            }
             if head.state.is_readable() {
                 // The dedup short-circuit. No epoch is consumed, no fence is
                 // issued, and the caller performs no I/O.
@@ -4924,6 +5038,19 @@ impl PostgresFragmentCoordinator {
         } else {
             None
         };
+        if authority == EpochAuthority::Staged {
+            let reservation = stage_reservation
+                .ok_or_else(|| DomainError::InvalidInput("stage reservation required".into()))?;
+            stage_custody::reserve_stage_locked(
+                &tx,
+                &mut sequence,
+                hash,
+                epoch,
+                fence,
+                reservation,
+            )
+            .await?;
+        }
         classify_commit(tx.commit().await, "publication begin commit")?;
         // The admission exit only. The resume commit above republishes an
         // intent this coordinator already owns and is not a new admission, so
@@ -5072,6 +5199,12 @@ impl PostgresFragmentCoordinator {
             }
             IoObservation::Valid(manifest) => manifest,
         };
+
+        if authority == EpochAuthority::Staged
+            && !stage_custody::publish_stage_locked(&tx, &mut sequence, intent, &manifest).await?
+        {
+            return Ok(CommitVerdict::Fenced);
+        }
 
         let fence = next_fence(&tx).await?;
         let provider_body_blake3 = write_claim.map(|(claim, _)| claim.body_blake3.as_slice());

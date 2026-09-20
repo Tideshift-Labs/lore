@@ -12,6 +12,7 @@ use lore_postgres::domain::fragments::FragmentProcessPoolInventory;
 const POSTGRES_PLUGIN: &str = include_str!("../src/plugins/postgres.rs");
 const SERVER: &str = include_str!("../src/server.rs");
 const FRAGMENT_SEAM: &str = include_str!("../../lore-fragment-provider/src/lib.rs");
+const DRAIN_SEAM: &str = include_str!("../../lore-fragment-provider/src/drain.rs");
 const DISPATCH_POOL: &str = include_str!("../../lore-object-dispatch/src/dispatch_pool.rs");
 const IMMUTABLE_STORE: &str = include_str!("../../lore-postgres/src/store/immutable_store.rs");
 
@@ -416,7 +417,11 @@ fn one_arc_dispatch_pool_serves_attestation_and_charge_authority() {
     // counted the drain cases' own `drain_entry` fixture as a second
     // construction site. Shipped code had exactly one throughout; the pin was
     // reading test code. See `shipped_code` for why that is the general trap.
-    let shipped_seam = shipped_code(FRAGMENT_SEAM);
+    let shipped_seam = format!(
+        "{}\n{}",
+        shipped_code(FRAGMENT_SEAM),
+        shipped_code(DRAIN_SEAM)
+    );
     assert_eq!(
         shipped_seam.matches("DispatchRuntimePool::new(").count(),
         1,
@@ -432,7 +437,7 @@ fn one_arc_dispatch_pool_serves_attestation_and_charge_authority() {
     let retention = between(
         FRAGMENT_SEAM,
         "    pub fn cell_retention(",
-        "    pub fn drain_capability(",
+        "    fn drain_capability(",
     );
     assert!(
         retention.contains("CellRetentionClient::new(self.pool.clone())"),
@@ -440,13 +445,22 @@ fn one_arc_dispatch_pool_serves_attestation_and_charge_authority() {
     );
     let drain = between(
         FRAGMENT_SEAM,
-        "    pub fn drain_capability(",
+        "    fn drain_capability(",
         "    pub async fn admit_operation(",
     );
     assert!(
         drain.contains("DispatchRuntimeClient::new(self.pool.clone())"),
         "the drain capability must be minted from the entry's own retained pool"
     );
+    assert!(!shipped_seam.contains("pub fn drain_capability("));
+    let handles = between(
+        DRAIN_SEAM,
+        "    pub async fn drain_handles(",
+        "impl FragmentDrainCapability {",
+    );
+    assert!(handles.contains("DrainClient::new(self.pool.clone())"));
+    assert!(handles.contains(".drain_capability("));
+    assert!(handles.contains("FragmentDrainMaintenanceHandle {"));
 }
 
 #[test]

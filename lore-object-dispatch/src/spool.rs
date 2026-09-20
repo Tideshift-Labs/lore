@@ -186,8 +186,7 @@ impl SpoolPaths {
         &self.boundary_binding
     }
 
-    #[cfg(target_os = "linux")]
-    pub(crate) fn observation_binding_blake3(&self) -> [u8; 32] {
+    pub fn observation_binding_blake3(&self) -> [u8; 32] {
         self.observation_binding_blake3
     }
 }

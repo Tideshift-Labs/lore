@@ -648,16 +648,35 @@ delta produced. Keep it durable, not chronological — chronological execution n
   `LinuxSpoolWriter` (drain-body placement, `lore-object-dispatch/src/spool_writer.rs`).
   `staged_drain_candidates` is pure SQL with no filesystem interaction, so unlike its
   `write_behind_staging_lifecycle.rs` sibling it is **not** Unix-gated: `tests/fragment_drain_candidates.rs`
-  (7 `#[ignore]` cases, registered in `run-fragment-lifecycle-live.ps1`) runs on Windows and Linux
+  (registered in `run-fragment-lifecycle-live.ps1`) runs on Windows and Linux
   alike; the batch bound is `fragment_drain_candidate_schema.rs`, one file per batch newtype like
   `FragmentWriteClaimPruneBatch`'s precedent. `provider_body_blake3()` is pinned `None` on a
   `commit_staged` candidate since staging creates no write claim to populate it.
-  `LinuxSpoolWriter` is a platform gate, not an infra gate, so `tests/spool_writer.rs` (10 cases)
+  `LinuxSpoolWriter` is a platform gate, not an infra gate, so `tests/spool_writer.rs`
   follows `write_behind_stage.rs`'s plain-`#[test]`-under-`cfg(linux)` convention, not
   `spool_verifier.rs`'s `#[ignore]`d one. Measured (not guessed): `open()` on an absent root and on a
   regular-file root both fold to `RootUnavailable` (same `openat2(O_DIRECTORY)` call, `ENOENT`/`ENOTDIR`,
   before the code's own `is_dir()` check ever runs); a symlinked intermediate path component fails
   `UnsafeOrNonRegular` (`mkdirat` swallows `EEXIST`, the following `openat2` with `NO_SYMLINKS` hits
   `ELOOP`). A Windows run reports 1 test (the `UnsupportedPlatform` half only), not evidence for the
-  Linux 10 -- run inside the Linux build container (testing-gotchas.md).
-
+  Linux implementation -- run inside the Linux build container (testing-gotchas.md).
+  Candidate tests also pin exact source-witness fencing, known-token recovery, keyset pagination,
+  and a forced generic query plan over mixed lifecycle states. `fragment_stage_custody.rs` covers
+  shared byte/file admission and immutable stage-policy identity against real PostgreSQL.
+  `run-write-behind-linux.ps1` runs the real stage producer, source validation, adapter PUT/GET
+  outcomes, confined cleanup, and the provider reservation/ready seam. Its default PostgreSQL
+  fixture builds the sibling local-only BLAKE3 image when absent; an explicit `-PostgresImage`
+  remains caller-owned. The Linux compiler is pinned to Rust 1.95.0; optional `-Clippy` runs
+  all four affected packages with warnings denied and gates on their exit codes before tests.
+  Windows target rustflags omit the opt-in lint list inherited by Linux, so a Windows lint pass
+  does not certify that Linux gate. The publication acknowledgement-loss case runs separately with
+  `failure_generator` and `LORE_FRAGMENT_FAILPOINTS=publication.commit.settled=unknown`; ordinary
+  unit runs cannot prove that branch. The same runner explicitly inventories subprocess crashes
+  at all four staging/association durability boundaries, active-promotion process takeover,
+  and cleanup acknowledgement loss. Runtime source tests live beside the server scheduler.
+  write_behind_policy_rotation.rs uses genuine PostgreSQL/BLAKE3 authorities to cover paired
+  stage/dispatch rollover before and after expiry, maintenance/CAS/revision refusals, exact
+  committed replay, active-work refusal, retained cleanup accounting, and rollback after the
+  stage policy changes. The Linux runner gives each of its five cases a fresh database.
+  `domain_fragment_clean_init` accepts the exact zero stage-counter seed installed by bootstrap
+  and refuses each used counter or a missing seed; its live runner derives cases from source.

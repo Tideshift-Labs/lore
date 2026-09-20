@@ -76,6 +76,7 @@ pub struct ServerState {
 /// [`serve`]: LoreHttpServer::serve
 #[derive(Default)]
 pub struct HealthFacets {
+    pub write_behind: Option<Arc<crate::fragment_write_behind::FragmentWriteBehindReadiness>>,
     /// CR-032's event-plane facets, when this cell runs a relay.
     pub event_relay: Option<Arc<crate::event_relay::readiness::EventRelayReadiness>>,
     /// WP-114 CD-6's terminal write-claim prune facet, when this cell runs the
@@ -87,6 +88,7 @@ pub struct HealthFacets {
 }
 
 pub struct ServerHealth {
+    pub write_behind: Option<Arc<crate::fragment_write_behind::FragmentWriteBehindReadiness>>,
     pub immutable_store: Weak<dyn lore_storage::ImmutableStore>,
     pub available: AtomicBool,
     pub interval_timeout: Option<(Duration, Duration)>,
@@ -127,6 +129,7 @@ impl ServerHealth {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     ) -> Self {
         ServerHealth {
+            write_behind: None,
             immutable_store: Arc::downgrade(&immutable_store),
             available: AtomicBool::new(true),
             interval_timeout: None,
@@ -360,6 +363,7 @@ impl LoreHttpServer {
         info!("Starting Lore maintenance HTTP Server: {}", &addr);
 
         let health = Arc::new(ServerHealth {
+            write_behind: None,
             immutable_store: Weak::<lore_storage::LocalImmutableStore>::new(),
             available: AtomicBool::new(true),
             interval_timeout: None,
@@ -409,6 +413,7 @@ impl LoreHttpServer {
         );
 
         let health = ServerHealth {
+            write_behind: facets.write_behind,
             immutable_store: Arc::downgrade(&immutable_store),
             available: AtomicBool::new(true),
             interval_timeout: if settings.available_interval_seconds > 0

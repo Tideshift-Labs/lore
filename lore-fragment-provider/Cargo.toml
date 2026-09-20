@@ -38,6 +38,9 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+tokio-util = { workspace = true }
 # Test-only. The seam itself spawns nothing; the admission tests do.
 lore-base = { workspace = true }
 # "test-util" for `#[tokio::test(start_paused = true)]` / `tokio::time::pause`,

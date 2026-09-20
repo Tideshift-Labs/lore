@@ -56,8 +56,12 @@ pub enum LockClass {
     Fragments = 4,
     /// Sorted associations. CR-031-owned; reserved here.
     Associations = 5,
+    /// Sorted staged-file custody rows, after all heads and associations.
+    StageCustody = 6,
+    /// One stage usage row; never acquire another head after it.
+    StageUsage = 7,
     /// The outbox append. Always last.
-    OutboxInsert = 6,
+    OutboxInsert = 8,
 }
 
 /// Enforces the shared order within one transaction.

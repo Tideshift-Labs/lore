@@ -21,6 +21,12 @@ mod domain_fragment_membership;
 #[path = "common/delete_observations.rs"]
 mod delete_observations;
 
+#[path = "common/drain_candidate.rs"]
+mod drain_candidate;
+
+#[path = "common/stage_policy.rs"]
+mod stage_policy;
+
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ops::Deref;
@@ -2802,6 +2808,7 @@ async fn store_with_pool(url: &str, pool_max: u32) -> TestDomainStore {
         .bootstrap()
         .await
         .expect("install isolated SCHEMA-118 fixture");
+    stage_policy::initialize(url, &store.fragment_coordinator()).await;
     TestDomainStore(store)
 }
 
@@ -4446,7 +4453,13 @@ async fn missing_without_epoch_evidence_reconstructs_the_exact_staged_cleanup_ta
     enable_write_claims(&url, &coordinator).await;
 
     let BeginOutcome::Admitted(stage) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin failed staging")
     else {
@@ -4556,8 +4569,16 @@ async fn a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote
     let direct = client(&url).await;
     let hash = random_hash();
 
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -4572,7 +4593,10 @@ async fn a_promotion_round_trip_allocates_a_new_epoch_and_publishes_under_remote
     );
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -5225,8 +5249,16 @@ async fn revalidate_push_witness_refuses_missing_proof_after_equivalent_promotio
     // association does not itself move the content-association scalar after
     // the witness is taken.
     let hash = random_hash();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -5290,7 +5322,10 @@ async fn revalidate_push_witness_refuses_missing_proof_after_equivalent_promotio
     // and `manifest_id`, but identical decoded_hash/size_content/size_payload/
     // payload_flags.
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -5399,8 +5434,16 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
         seed: u8,
     ) -> (Vec<u8>, i64, FragmentManifest) {
         let hash = random_hash();
-        let BeginOutcome::Admitted(stage_intent) =
-            coordinator.begin_stage(&hash).await.expect("begin stage")
+        let BeginOutcome::Admitted(stage_intent) = coordinator
+            .begin_stage(
+                &hash,
+                lore_postgres::domain::fragments::StageReservationInput {
+                    size_payload: 128,
+                    original_flags: 0,
+                },
+            )
+            .await
+            .expect("begin stage")
         else {
             panic!("a fresh hash must admit a stage begin");
         };
@@ -5481,7 +5524,10 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
 
     // A: promote with a different decoded_hash.
     let BeginOutcome::Admitted(promotion_a) = coordinator
-        .begin_promotion(&hash_a, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash_a).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion a")
     else {
@@ -5502,7 +5548,10 @@ async fn revalidate_push_witness_aborts_when_the_new_epoch_describes_different_c
 
     // B: promote with a different payload_flags.
     let BeginOutcome::Admitted(promotion_b) = coordinator
-        .begin_promotion(&hash_b, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash_b).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion b")
     else {
@@ -5599,8 +5648,16 @@ async fn acquire_staged_leases_and_release_round_trip_a_batch_with_a_monotonic_r
     let mut members = Vec::new();
     for seed in 0u8..3 {
         let hash = random_hash();
-        let BeginOutcome::Admitted(intent) =
-            coordinator.begin_stage(&hash).await.expect("begin stage")
+        let BeginOutcome::Admitted(intent) = coordinator
+            .begin_stage(
+                &hash,
+                lore_postgres::domain::fragments::StageReservationInput {
+                    size_payload: 128,
+                    original_flags: 0,
+                },
+            )
+            .await
+            .expect("begin stage")
         else {
             panic!("a fresh hash must admit a stage begin");
         };
@@ -5774,7 +5831,13 @@ async fn acquire_staged_leases_refuses_a_member_that_is_not_a_staged_epoch() {
 
     let staged_hash = random_hash();
     let BeginOutcome::Admitted(stage_intent) = coordinator
-        .begin_stage(&staged_hash)
+        .begin_stage(
+            &staged_hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin stage")
     else {
@@ -5923,8 +5986,16 @@ async fn a_duplicate_staged_lease_id_replays_the_existing_lease_and_refuses_a_di
     let mut members = Vec::new();
     for seed in 0u8..2 {
         let hash = random_hash();
-        let BeginOutcome::Admitted(intent) =
-            coordinator.begin_stage(&hash).await.expect("begin stage")
+        let BeginOutcome::Admitted(intent) = coordinator
+            .begin_stage(
+                &hash,
+                lore_postgres::domain::fragments::StageReservationInput {
+                    size_payload: 128,
+                    original_flags: 0,
+                },
+            )
+            .await
+            .expect("begin stage")
         else {
             panic!("a fresh hash must admit a stage begin");
         };
@@ -5946,7 +6017,13 @@ async fn a_duplicate_staged_lease_id_replays_the_existing_lease_and_refuses_a_di
     }
     let extra_hash = random_hash();
     let BeginOutcome::Admitted(extra_intent) = coordinator
-        .begin_stage(&extra_hash)
+        .begin_stage(
+            &extra_hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin stage extra")
     else {
@@ -6402,8 +6479,16 @@ async fn abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repo
     let context = random_context();
     let hash = random_hash();
 
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -6430,7 +6515,10 @@ async fn abandon_promotion_leaves_the_head_staged_and_readable_and_moves_no_repo
         .expect("repository must exist");
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -7274,8 +7362,16 @@ async fn acquire_staged_leases_refuses_a_staged_member_awaiting_exact_payload_pu
     // Legacy repository setup precedes enforcement; the staged lease probe does not.
     enable_write_claims(&url, &coordinator).await;
     let context = random_context();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -7389,8 +7485,16 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
     let deadline = microsecond_deadline(Duration::from_secs(60));
 
     let hash = random_hash();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -7411,7 +7515,10 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
     let staged_epoch = stage_intent.epoch;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -7454,7 +7561,52 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
         .acquire_staged_leases(&lease_id, &[(hash.clone(), staged_epoch)], deadline)
         .await
         .expect("a quarantined staged epoch behind a readable head remains leasable");
-    assert_eq!(lease.members, vec![(hash, staged_epoch)]);
+    assert_eq!(lease.members, vec![(hash.clone(), staged_epoch)]);
+    assert!(
+        coordinator
+            .begin_stage_cleanup(&hash, staged_epoch)
+            .await
+            .unwrap()
+            .is_none(),
+        "live lease must block predecessor cleanup"
+    );
+    coordinator.release_staged_lease(&lease_id).await.unwrap();
+    let cleanup = coordinator
+        .begin_stage_cleanup(&hash, staged_epoch)
+        .await
+        .unwrap()
+        .expect("last reader released: exact predecessor may be sealed");
+    assert!(
+        coordinator
+            .acquire_staged_leases(
+                &rand::random::<[u8; 16]>(),
+                &[(hash.clone(), staged_epoch)],
+                deadline
+            )
+            .await
+            .is_err(),
+        "the reclaim seal closes the new-reader gap before unlink"
+    );
+    let before = coordinator.observe_stage().await.unwrap();
+    assert_eq!(
+        (before.resident_bytes, before.resident_files),
+        (128, 1),
+        "a seal alone cannot refund physical custody"
+    );
+    // This coordinator-only test represents the caller's successful physical
+    // proof; source_tests separately executes exact unlink/fsync and replay.
+    coordinator.commit_stage_cleanup(&cleanup).await.unwrap();
+    coordinator.commit_stage_cleanup(&cleanup).await.unwrap();
+    let after = coordinator.observe_stage().await.unwrap();
+    assert_eq!(
+        (
+            after.resident_bytes,
+            after.resident_files,
+            after.metadata_bytes,
+            after.metadata_rows
+        ),
+        (0, 0, 256, 1)
+    );
 }
 
 /// P1-A: the exact independent-review sequence -- stage, promote, obliterate.
@@ -7483,8 +7635,16 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
     // Legacy repository setup precedes enforcement; the staged lease probe does not.
     enable_write_claims(&url, &coordinator).await;
     let context = random_context();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -7505,7 +7665,10 @@ async fn acquire_staged_leases_refuses_a_member_whose_fragment_was_obliterated_a
     let staged_epoch = stage_intent.epoch;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -7635,8 +7798,16 @@ async fn acquire_staged_leases_refuses_a_member_whose_head_is_mid_deletion() {
     // Legacy repository setup precedes enforcement; the staged lease probe does not.
     enable_write_claims(&url, &coordinator).await;
     let context = random_context();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -7737,8 +7908,16 @@ async fn acquire_staged_leases_waits_for_a_concurrently_locked_head() {
     let deadline = microsecond_deadline(Duration::from_secs(60));
 
     let hash = random_hash();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -8012,8 +8191,16 @@ async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_
         seed: u8,
     ) -> (Vec<u8>, i64, FragmentManifest) {
         let hash = random_hash();
-        let BeginOutcome::Admitted(stage_intent) =
-            coordinator.begin_stage(&hash).await.expect("begin stage")
+        let BeginOutcome::Admitted(stage_intent) = coordinator
+            .begin_stage(
+                &hash,
+                lore_postgres::domain::fragments::StageReservationInput {
+                    size_payload: 128,
+                    original_flags: 0,
+                },
+            )
+            .await
+            .expect("begin stage")
         else {
             panic!("a fresh hash must admit a stage begin");
         };
@@ -8107,7 +8294,10 @@ async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_
         (&hash_b, &staged_manifest_b, "mixed-batch/b-promoted"),
     ] {
         let BeginOutcome::Admitted(promotion_intent) = coordinator
-            .begin_promotion(hash, write_claim())
+            .begin_promotion(
+                &drain_candidate::candidate(&coordinator, hash).await,
+                write_claim(),
+            )
             .await
             .expect("begin promotion")
         else {
@@ -8131,7 +8321,10 @@ async fn revalidate_push_witness_refuses_missing_proof_for_equivalent_and_mixed_
 
     // C: promote with a different decoded_hash -- genuinely different content.
     let BeginOutcome::Admitted(promotion_c) = coordinator
-        .begin_promotion(&hash_c, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash_c).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion c")
     else {
@@ -8289,8 +8482,16 @@ async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_thou
     // like the existing equivalent-epoch case -- its own create_association
     // here does not move the scalar this test cares about after capture.
     let hash = random_hash();
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -8373,7 +8574,10 @@ async fn revalidate_push_witness_aborts_when_the_association_set_moved_even_thou
     // to the one preflight captured -- if the fallback were ever reached, the
     // CR-031:266 equivalence allowance would accept it.
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -9395,7 +9599,13 @@ async fn shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increas
         let transition_hash = publish_remote_fragment(&coordinator, 0x30).await;
         let promotion_hash = random_hash();
         let BeginOutcome::Admitted(stage_intent) = coordinator
-            .begin_stage(&promotion_hash)
+            .begin_stage(
+                &promotion_hash,
+                lore_postgres::domain::fragments::StageReservationInput {
+                    size_payload: 128,
+                    original_flags: 0,
+                },
+            )
             .await
             .expect("begin the promotion fixture's stage")
         else {
@@ -9488,7 +9698,10 @@ async fn shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increas
 
         // --- Staged -> Remote, which crosses nothing and writes none of them ---
         let BeginOutcome::Admitted(promotion_intent) = coordinator
-            .begin_promotion(&promotion_hash, write_claim())
+            .begin_promotion(
+                &drain_candidate::candidate(&coordinator, &promotion_hash).await,
+                write_claim(),
+            )
             .await
             .expect("begin the promotion")
         else {
@@ -10920,8 +11133,16 @@ async fn a_promotion_with_unchanged_readability_appends_no_lifecycle_summary_row
     let context = random_context();
     let hash = random_hash();
 
-    let BeginOutcome::Admitted(stage_intent) =
-        coordinator.begin_stage(&hash).await.expect("begin stage")
+    let BeginOutcome::Admitted(stage_intent) = coordinator
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .expect("begin stage")
     else {
         panic!("a fresh hash must admit a stage begin");
     };
@@ -10949,7 +11170,10 @@ async fn a_promotion_with_unchanged_readability_appends_no_lifecycle_summary_row
     let before = outbox_row_count_for_repository(&db, &repository_id).await;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {

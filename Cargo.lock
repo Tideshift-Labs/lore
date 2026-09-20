@@ -2743,8 +2743,11 @@ dependencies = [
  "hex",
  "lore-base",
  "lore-object-dispatch",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-postgres",
+ "tokio-util",
  "uuid",
 ]
 
@@ -2893,12 +2896,14 @@ dependencies = [
  "lore-aws",
  "lore-base",
  "lore-fragment-provider",
+ "lore-object-dispatch",
  "lore-revision",
  "lore-storage",
  "lore-telemetry",
  "opentelemetry",
  "rand 0.9.4",
  "ring",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -2910,6 +2915,7 @@ dependencies = [
  "tokio-postgres",
  "tokio-postgres-rustls",
  "tokio-util",
+ "toml 0.9.12+spec-1.1.0",
  "tracing",
  "uuid",
 ]
@@ -5626,6 +5632,7 @@ checksum = "ddd74a9687298c6858e9b88ec8935ec45d22e8fd5e6394fa1bd4e99a87789c76"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
  "zerocopy",
 ]

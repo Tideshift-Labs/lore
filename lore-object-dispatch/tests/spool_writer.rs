@@ -103,6 +103,51 @@ mod linux_live {
         }
     }
 
+    #[test]
+    fn bounded_physical_scan_eventually_covers_more_than_4096_historical_directories() {
+        let root = test_root("large-resumable-inventory");
+        for index in 0..5000 {
+            fs::create_dir(root.0.join(format!("historical-{index:05}"))).unwrap();
+        }
+        fs::write(root.0.join("historical-04999").join("late-body"), b"abc").unwrap();
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        assert_eq!(
+            writer.physical_usage(4096).unwrap(),
+            None,
+            "a partial first traversal cannot certify an empty spool"
+        );
+        let mut complete = None;
+        for _ in 0..16 {
+            complete = writer.physical_usage(4096).unwrap();
+            if complete.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            complete,
+            Some((3, 1)),
+            "retained cursors must eventually reach every historical directory"
+        );
+        fs::write(
+            root.0.join("historical-00001").join("new-body"),
+            b"new residue",
+        )
+        .unwrap();
+        let mut updated = None;
+        for _ in 0..16 {
+            updated = writer.physical_usage(4096).unwrap();
+            if updated == Some((14, 2)) {
+                break;
+            }
+        }
+        assert_eq!(
+            updated,
+            Some((14, 2)),
+            "completed scans must wrap and observe later residue"
+        );
+    }
+
     fn result_key(attempt_id: &str) -> SpoolObjectKey {
         SpoolObjectKey {
             provider_boundary_id: BOUNDARY.into(),

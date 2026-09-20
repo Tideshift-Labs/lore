@@ -62,7 +62,13 @@ impl MembershipStore {
         let hash = address.hash.as_ref();
         match self
             .coordinator
-            .begin_stage(hash)
+            .begin_stage(
+                hash,
+                StageReservationInput {
+                    size_payload: 1,
+                    original_flags: 0,
+                },
+            )
             .await
             .map_err(|e| StoreError::internal(e.to_string()))?
         {

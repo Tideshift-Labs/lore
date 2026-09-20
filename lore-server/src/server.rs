@@ -31,6 +31,7 @@ use lore_base::runtime::runtime_with_settings;
 use lore_base::runtime::set_task_lifecycle_callback;
 use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_postgres::domain::fragments::FragmentCellRetentionHandle;
+use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
 use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_revision::cluster::topology::Topology;
 use lore_revision::environment::EnvironmentConfig;
@@ -916,6 +917,7 @@ struct HttpSurfaceFacets {
     /// WP-114 CD-8's cell-scale retention facet, on the same route and by the
     /// same rule as the prune facet above.
     cell_retention: Option<Arc<lore_object_dispatch::cell_retention::CellRetentionReadiness>>,
+    write_behind: Option<Arc<crate::fragment_write_behind::FragmentWriteBehindReadiness>>,
 }
 
 async fn launch_http_server(
@@ -932,6 +934,7 @@ async fn launch_http_server(
         event_relay,
         fragment_prune,
         cell_retention,
+        write_behind,
     } = facets;
     LoreHttpServer::serve(
         settings,
@@ -943,6 +946,7 @@ async fn launch_http_server(
             event_relay,
             fragment_prune,
             cell_retention,
+            write_behind,
         },
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -1152,7 +1156,7 @@ async fn configure_immutable_store_via_plugin(
 ) -> Result<(
     Arc<dyn ImmutableStore>,
     Option<FragmentCellRetentionHandle>,
-    Option<Arc<WriteBehindStage>>,
+    Option<Arc<FragmentWriteBehindHandle>>,
 )> {
     let mode = &settings.immutable_store.mode;
 
@@ -1224,12 +1228,22 @@ async fn configure_immutable_store_via_plugin(
                 // input, and the drain worker is composed further out, so it is
                 // read there from this same settings reader rather than
                 // threaded through a store constructor that has no use for it.
-                let write_behind = postgres_write_behind_settings(settings)?
-                    .map(|composition| WriteBehindStage::open(composition.settings))
-                    .transpose()
-                    .map_err(|error| {
-                        anyhow!("Failed to open the write-behind staging root: {error}")
-                    })?;
+                let composition = postgres_write_behind_settings(settings)?;
+                let write_behind = if let Some(config) = composition.as_ref() {
+                    let config = config.clone();
+                    Some(lore_base::lore_spawn_blocking!("write-behind-open", move || -> Result<_> {
+                        std::fs::create_dir_all(&config.settings.root)?;
+                        std::fs::create_dir_all(&config.shared_spool_root)?;
+                        let stage_root = std::fs::canonicalize(&config.settings.root)?;
+                        let spool_root = std::fs::canonicalize(&config.shared_spool_root)?;
+                        if stage_root.starts_with(&spool_root) || spool_root.starts_with(&stage_root) {
+                            return Err(anyhow!("write-behind canonical roots must be separate, non-nested trees"));
+                        }
+                        WriteBehindStage::open(config.settings).map_err(Into::into)
+                    }).await??)
+                } else {
+                    None
+                };
                 let store = plugins::postgres::connect_immutable_store(
                     &plugin_config,
                     fragment_activation,
@@ -1243,7 +1257,24 @@ async fn configure_immutable_store_via_plugin(
                 let cell_retention = store.cell_retention().map_err(|error| {
                     anyhow!("Failed to take the cell retention client: {error}")
                 })?;
-                return Ok((Arc::new(store), cell_retention, write_behind));
+                let worker = if let Some(config) = composition {
+                    Some(
+                        store
+                            .create_write_behind_handle(
+                                config.shared_spool_root,
+                                config.cell_id,
+                                config.policy_revision,
+                                config.policy_digest,
+                            )
+                            .await
+                            .map_err(|error| {
+                                anyhow!("Failed to construct write-behind worker: {error}")
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                return Ok((Arc::new(store), cell_retention, worker));
             }
 
             registry
@@ -2340,21 +2371,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         .map(lore_postgres::domain::fragments::FragmentProcessPoolInventory::validate)
         .transpose()
         .map_err(|error| anyhow!("Invalid Postgres process pool inventory: {error}"))?;
-    // The staging handle is composed and held here and is **not yet driven**.
-    // WP-122's next step owns the three tasks that consume it: the recurring
-    // `note_pending_staged` / `note_drain_heartbeat` observer (contract C3), the
-    // drain scheduler and worker, and the staged-orphan reconciliation pass
-    // (contract C2).
-    //
-    // Composing the tier without those tasks is safe, and safe by the admission
-    // layer's own rule rather than by hope. No heartbeat is ever fed, so
-    // `drain_healthy` is false on every snapshot and a reachable root selects
-    // `DirectFallback` — the synchronous object-store path this cell already
-    // used. Nothing stages until a drain exists to promote it. An unreachable
-    // root is `Unready` instead, because `pending_staged` starts `true` and only
-    // the observer this step does not have can clear it; that is retryable
-    // `SlowDown`, which is the conservative direction of the same rule.
-    let (immutable_store, cell_retention_handle, _write_behind_stage, configured_domain) =
+    // The concrete store creates an opaque worker handle before trait erasure.
+    let (immutable_store, cell_retention_handle, write_behind_handle, configured_domain) =
         if let Some(process_pool_inventory) = fragment_process_pool_inventory
             .filter(|inventory| inventory.budget().opens_dispatch_pool())
         {
@@ -2573,8 +2591,15 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let mut cell_retention_readiness: Option<
         Arc<lore_object_dispatch::cell_retention::CellRetentionReadiness>,
     > = None;
+    let mut write_behind_readiness = None;
 
     if !is_maintenance {
+        write_behind_readiness = crate::fragment_write_behind::configure_fragment_write_behind(
+            write_behind_handle,
+            postgres_write_behind_settings(&settings)?.map(|config| config.runtime),
+            &mut endpoints,
+            _shutdown_rx.clone(),
+        )?;
         // CR-032 / WP-119 Step B, in two halves.
         //
         // The preparation runs FIRST and spawns nothing. It owns the whole
@@ -2940,6 +2965,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                         event_relay: event_relay_readiness,
                         fragment_prune: fragment_prune_readiness,
                         cell_retention: cell_retention_readiness,
+                        write_behind: write_behind_readiness,
                     },
                 )
             );

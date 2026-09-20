@@ -14,7 +14,7 @@
 //! # the dispatching session)
 //!
 //! ```text
-//! begin_promotion(&self, hash: &[u8], claim: FragmentWriteClaimInput) -> Result<BeginOutcome, DomainError>
+//! begin_promotion(&self, source: &FragmentDrainCandidate, claim: FragmentWriteClaimInput) -> Result<BeginOutcome, DomainError>
 //! commit_promotion(&self, intent: &FragmentIntent, observation: IoObservation, settlement: FragmentWriteSettlement) -> Result<CommitVerdict, DomainError>
 //! ```
 //!
@@ -44,6 +44,12 @@
 //! claim already terminal is left alone. A case asserting one settlement
 //! unconditionally on every abandon path is wrong; this file covers both
 //! reachable transitions as distinct cases.
+
+#[path = "common/drain_candidate.rs"]
+mod drain_candidate;
+
+#[path = "common/stage_policy.rs"]
+mod stage_policy;
 
 use std::time::Duration;
 use std::time::SystemTime;
@@ -242,6 +248,7 @@ async fn store(url: &str) -> PostgresDomainStore {
         .bootstrap()
         .await
         .expect("install isolated SCHEMA-118 fixture");
+    stage_policy::initialize(url, &store.fragment_coordinator()).await;
     store
 }
 
@@ -317,7 +324,13 @@ async fn stage_hash(
     seed: u8,
 ) -> (i64, FragmentManifest) {
     let BeginOutcome::Admitted(stage_intent) = coordinator
-        .begin_stage(hash)
+        .begin_stage(
+            hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin stage on a fresh hash")
     else {
@@ -535,7 +548,10 @@ async fn promotion_admission_carries_a_durable_claim_and_leaves_the_head_staged(
     let (staged_epoch, staged_manifest) = stage_hash(&coordinator, &hash, 0x10).await;
 
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion on a Staged head")
     else {
@@ -612,18 +628,18 @@ async fn promotion_admission_is_fenced_for_every_non_staged_head_shape() {
         ("Tombstoned", FragmentLifecycleState::Tombstoned),
     ] {
         let hash = random_hash();
+        stage_hash(&coordinator, &hash, 0x22).await;
+        let source = drain_candidate::candidate(&coordinator, &hash).await;
         let manifest_id = state.is_readable().then(|| vec![0x22_u8; 32]);
         direct
             .execute(
-                "INSERT INTO lore_fragment_lifecycle \
-                     (hash, current_epoch, state, manifest_id, last_fence) \
-                 VALUES ($1, 1, $2, $3, 1)",
+                "UPDATE lore_fragment_lifecycle SET state = $2, manifest_id = $3 WHERE hash = $1",
                 &[&hash, &state.bits(), &manifest_id],
             )
             .await
             .unwrap_or_else(|error| panic!("insert {label} head fixture: {error}"));
         let outcome = coordinator
-            .begin_promotion(&hash, write_claim())
+            .begin_promotion(&source, write_claim())
             .await
             .unwrap_or_else(|error| {
                 panic!("begin_promotion on {label} head must not error: {error}")
@@ -635,9 +651,16 @@ async fn promotion_admission_is_fenced_for_every_non_staged_head_shape() {
     }
 
     let absent_hash = random_hash();
-    let outcome = coordinator
-        .begin_promotion(&absent_hash, write_claim())
-        .await;
+    stage_hash(&coordinator, &absent_hash, 0x23).await;
+    let source = drain_candidate::candidate(&coordinator, &absent_hash).await;
+    direct
+        .execute(
+            "DELETE FROM lore_fragment_lifecycle WHERE hash = $1",
+            &[&absent_hash],
+        )
+        .await
+        .unwrap();
+    let outcome = coordinator.begin_promotion(&source, write_claim()).await;
     let matches_expected = matches!(
         &outcome,
         Err(DomainError::PreconditionRejected { reason, .. }) if reason == "fragment_head_absent"
@@ -665,6 +688,7 @@ async fn an_ambiguous_direct_write_claim_at_the_legacy_key_blocks_promotion_admi
     let hash = random_hash();
 
     stage_hash(&coordinator, &hash, 0x11).await;
+    let source = drain_candidate::candidate(&coordinator, &hash).await;
     // A direct-write claim (kind 0) at the legacy key, at a DIFFERENT
     // epoch/fence than anything promotion would allocate -- the whole point
     // of the object-key barrier is that the old lineage-scoped
@@ -673,7 +697,7 @@ async fn an_ambiguous_direct_write_claim_at_the_legacy_key_blocks_promotion_admi
     insert_raw_claim(&direct, &hash, 9001, 9001, &legacy_key(&hash), 0, 3).await;
 
     let outcome = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(&source, write_claim())
         .await
         .expect("begin_promotion must not error, only refuse admission");
     assert!(
@@ -696,7 +720,10 @@ async fn an_ambiguous_promotion_claim_at_the_legacy_key_blocks_direct_write_admi
 
     stage_hash(&coordinator, &hash, 0x51).await;
     let BeginOutcome::Admitted(promotion) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("admit promotion")
     else {
@@ -846,9 +873,13 @@ async fn a_second_promotion_is_blocked_until_the_first_claims_hard_not_after_the
     let hash = random_hash();
 
     stage_hash(&coordinator, &hash, 0x13).await;
+    let source = drain_candidate::candidate(&coordinator, &hash).await;
 
     let BeginOutcome::Admitted(first) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("first begin_promotion")
     else {
@@ -859,12 +890,12 @@ async fn a_second_promotion_is_blocked_until_the_first_claims_hard_not_after_the
     // two live conditional PUTs to one key would double-charge budget and
     // walk past the outcome-unknown latch.
     let blocked = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(&source, write_claim())
         .await
         .expect("second begin_promotion while the first is still live must not error");
     assert!(
-        matches!(blocked, BeginOutcome::WriteClaimBlocked { .. }),
-        "a concurrent promotion attempt on the same hash must be blocked, got {blocked:?}"
+        matches!(blocked, BeginOutcome::Fenced(_)),
+        "the old source witness must be fenced once first promotion owns it, got {blocked:?}"
     );
 
     // Move the database-clock horizons past deterministically after proving
@@ -877,7 +908,10 @@ async fn a_second_promotion_is_blocked_until_the_first_claims_hard_not_after_the
     ).await.expect("expire claim horizons");
 
     let BeginOutcome::Admitted(second) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("takeover begin_promotion after the barrier clears")
     else {
@@ -940,7 +974,10 @@ async fn authorization_refuses_when_the_staged_epoch_moved_under_the_claim() {
     let hash = random_hash();
     stage_hash(&coordinator, &hash, 0x14).await;
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -971,7 +1008,10 @@ async fn authorization_refuses_when_the_staged_manifest_was_replaced() {
     let hash = random_hash();
     stage_hash(&coordinator, &hash, 0x15).await;
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1002,7 +1042,10 @@ async fn authorization_refuses_when_the_fence_moved() {
     let hash = random_hash();
     stage_hash(&coordinator, &hash, 0x16).await;
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1033,7 +1076,10 @@ async fn authorization_refuses_when_the_promotion_token_was_cleared() {
     let hash = random_hash();
     stage_hash(&coordinator, &hash, 0x17).await;
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1068,12 +1114,16 @@ async fn reusing_an_attempt_identity_against_a_moved_staged_witness_is_rejected(
     let direct = client(&url).await;
     let hash = random_hash();
     stage_hash(&coordinator, &hash, 0x18).await;
+    let source = drain_candidate::candidate(&coordinator, &hash).await;
 
     // Leave the claim unauthorized (still Prepared, unexpired) so its
     // identity is eligible to replay.
     let claim_input = write_claim();
     let BeginOutcome::Admitted(first) = coordinator
-        .begin_promotion(&hash, claim_input.clone())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            claim_input.clone(),
+        )
         .await
         .expect("first begin_promotion")
     else {
@@ -1096,12 +1146,10 @@ async fn reusing_an_attempt_identity_against_a_moved_staged_witness_is_rejected(
         .await
         .expect("simulate the staged witness moving under the still-Prepared claim");
 
-    let replay = coordinator.begin_promotion(&hash, claim_input).await;
+    let replay = coordinator.begin_promotion(&source, claim_input).await;
     assert!(
-        matches!(replay, Err(DomainError::InvalidInput(ref message))
-            if message.contains("reused with a different binding")),
-        "reusing the attempt identity against a moved witness must be rejected by the durable \
-         equality check, got {replay:?}"
+        matches!(replay, Ok(BeginOutcome::Fenced(_))),
+        "reusing the attempt identity against a moved source must be fenced, got {replay:?}"
     );
     let row = direct
         .query_one(
@@ -1140,7 +1188,10 @@ async fn authorization_after_the_send_deadline_settles_no_send_not_ambiguous() {
     stage_hash(&coordinator, &hash, 0x19).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, short_lived_write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            short_lived_write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1195,9 +1246,13 @@ async fn an_ambiguous_settlement_leaves_the_barrier_row_visible_and_blocks_a_fre
     let direct = client(&url).await;
     let hash = random_hash();
     stage_hash(&coordinator, &hash, 0x1A).await;
+    let source = drain_candidate::candidate(&coordinator, &hash).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1239,13 +1294,22 @@ async fn an_ambiguous_settlement_leaves_the_barrier_row_visible_and_blocks_a_fre
     );
 
     let blocked = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(&source, write_claim())
         .await
         .expect("a fresh promotion attempt must not error, only be refused");
     assert!(
-        matches!(blocked, BeginOutcome::WriteClaimBlocked { .. }),
-        "an Ambiguous claim must block a fresh promotion attempt regardless of any worker \
-         lease, got {blocked:?}"
+        matches!(blocked, BeginOutcome::Fenced(_)),
+        "the pre-promotion witness must stay fenced while its claim is Ambiguous, got {blocked:?}"
+    );
+    assert!(
+        coordinator
+            .staged_drain_candidates(
+                lore_postgres::domain::fragments::FragmentDrainCandidateBatch::new(256).unwrap()
+            )
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.hash() != hash)
     );
 }
 
@@ -1277,7 +1341,10 @@ async fn a_prepared_claim_past_its_send_window_no_longer_blocks_admission_but_ca
     // hard_not_after (what the OLD lineage-only barrier, and this barrier's
     // Sending/Ambiguous arm, would gate on) is still far in the future.
     let BeginOutcome::Admitted(intent_a) = coordinator
-        .begin_promotion(&hash, short_send_long_late_effect_write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            short_send_long_late_effect_write_claim(),
+        )
         .await
         .expect("begin first promotion")
     else {
@@ -1292,7 +1359,10 @@ async fn a_prepared_claim_past_its_send_window_no_longer_blocks_admission_but_ca
     // though claim A's hard_not_after is still roughly a minute out and
     // claim A itself is still sitting Prepared, unsettled, in the database.
     let BeginOutcome::Admitted(intent_b) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin second promotion once claim A's send window has closed")
     else {
@@ -1366,7 +1436,10 @@ async fn commit_promotion_refuses_a_no_send_settlement_on_a_valid_observation() 
     stage_hash(&coordinator, &hash, 0x31).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1415,7 +1488,10 @@ async fn decisive_promotion_publishes_with_provider_evidence_and_quarantines_the
     let (staged_epoch, _staged_manifest) = stage_hash(&coordinator, &hash, 0x1B).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1520,7 +1596,10 @@ async fn a_fence_moved_between_begin_and_commit_leaves_staged_bytes_readable_and
     let (staged_epoch, staged_manifest) = stage_hash(&coordinator, &hash, 0x1D).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1610,7 +1689,10 @@ async fn abandon_promotion_settles_ambiguous_and_leaves_staged_bytes_readable_wh
     let (staged_epoch, staged_manifest) = stage_hash(&coordinator, &hash, 0x1F).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1700,7 +1782,10 @@ async fn abandon_promotion_settles_no_send_when_the_claim_was_never_authorized()
     let (staged_epoch, staged_manifest) = stage_hash(&coordinator, &hash, 0x33).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1768,7 +1853,10 @@ async fn abandon_promotion_reports_fenced_when_the_head_is_gone() {
     stage_hash(&coordinator, &hash, 0x20).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1840,7 +1928,10 @@ async fn abandon_promotion_leaves_the_head_staged_with_its_manifest_and_settles_
     let (staged_epoch, staged_manifest) = stage_hash(&coordinator, &hash, 0x21).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -1929,7 +2020,10 @@ async fn a_decisive_promotion_claim_contributes_a_cleanup_target_exactly_like_a_
 
     stage_hash(&coordinator, &hash, 0x34).await;
     let BeginOutcome::Admitted(promotion_intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -2049,7 +2143,10 @@ async fn a_sending_claim_refused_for_moved_lineage_settles_ambiguous_not_confirm
     stage_hash(&coordinator, &hash, 0x36).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(&hash, write_claim())
+        .begin_promotion(
+            &drain_candidate::candidate(&coordinator, &hash).await,
+            write_claim(),
+        )
         .await
         .expect("begin promotion")
     else {
@@ -2168,7 +2265,13 @@ async fn stage_hash_at_canonical_staged_key(
     seed: u8,
 ) -> i64 {
     let BeginOutcome::Admitted(stage_intent) = coordinator
-        .begin_stage(hash)
+        .begin_stage(
+            hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin stage on a fresh hash")
     else {
@@ -2252,7 +2355,10 @@ async fn promotion_in_flight(
     );
     enable_write_claims(url, coordinator).await;
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_promotion(hash, claim_input)
+        .begin_promotion(
+            &drain_candidate::candidate(coordinator, hash).await,
+            claim_input,
+        )
         .await
         .expect("begin promotion")
     else {

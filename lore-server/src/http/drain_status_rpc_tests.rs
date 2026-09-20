@@ -19,6 +19,7 @@ fn app(drain: Option<Arc<DrainState>>) -> TestServer {
         interval_timeout: None,
         store_health_check: false,
         drain,
+        write_behind: None,
         event_relay: None,
         fragment_prune: None,
         cell_retention: None,

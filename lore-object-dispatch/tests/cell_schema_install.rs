@@ -40,8 +40,8 @@ use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests
 // guard, and a source-dark check).
 // ---------------------------------------------------------------------------------------------
 
-const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 21] = [
-    2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+const CELL_INSTALLED_MIGRATION_NUMBERS: [u16; 23] = [
+    2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27,
 ];
 
 fn migrations_dir() -> PathBuf {

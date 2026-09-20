@@ -139,10 +139,14 @@ impl fmt::Debug for SpoolWriteReceipt {
 #[cfg(target_os = "linux")]
 mod platform {
     use std::fs::File;
+    use std::io::Read as _;
     use std::io::Write as _;
     use std::path::Component;
     use std::path::Path;
     use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use std::time::Instant;
 
     use rustix::fd::OwnedFd;
     use rustix::fs::AtFlags;
@@ -177,6 +181,14 @@ mod platform {
     const DIRECTORY_MODE: Mode = Mode::RWXU;
     const FILE_MODE: Mode = Mode::RUSR.union(Mode::WUSR);
 
+    #[derive(Default)]
+    struct PhysicalInventory {
+        stack: Vec<(OwnedFd, rustix::fs::Dir)>,
+        bytes: u64,
+        files: u64,
+        completed: Option<(Instant, u64, u64)>,
+    }
+
     pub struct LinuxSpoolWriter {
         root_path: PathBuf,
         relative_root: PathBuf,
@@ -185,9 +197,240 @@ mod platform {
         root_device: u64,
         root_inode: u64,
         maximum_body_bytes: u64,
+        physical_inventory: Mutex<PhysicalInventory>,
     }
 
     impl LinuxSpoolWriter {
+        /// Advance a bounded inventory, retaining the cursor across observations.
+        /// Only a completed, recent inventory is reported. Every descent is
+        /// relative to the pinned descriptor; this grants no cleanup authority.
+        pub fn physical_usage(
+            &self,
+            maximum_entries: u32,
+        ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
+            let mut inventory = self
+                .physical_inventory
+                .lock()
+                .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+            let result = self.advance_physical_inventory(&mut inventory, maximum_entries);
+            if result.is_err() {
+                *inventory = PhysicalInventory::default();
+            }
+            result
+        }
+
+        fn advance_physical_inventory(
+            &self,
+            inventory: &mut PhysicalInventory,
+            maximum_entries: u32,
+        ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
+            self.assert_configured_root_stable()?;
+            if inventory.stack.is_empty() {
+                let root = self
+                    .root_fd
+                    .try_clone()
+                    .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+                let entries = rustix::fs::Dir::read_from(&root)
+                    .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+                inventory.stack.push((root, entries));
+                inventory.bytes = 0;
+                inventory.files = 0;
+            }
+            let mut visited = 0_u32;
+            while visited < maximum_entries {
+                let Some((directory, entries)) = inventory.stack.last_mut() else {
+                    break;
+                };
+                let Some(entry) = entries.next() else {
+                    inventory.stack.pop();
+                    continue;
+                };
+                visited += 1;
+                let entry = entry.map_err(|_error| SpoolWriteError::RootUnavailable)?;
+                let name = entry.file_name();
+                if name.to_bytes() == b"." || name.to_bytes() == b".." {
+                    continue;
+                }
+                let stat = match rustix::fs::statat(&*directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(stat) => stat,
+                    Err(Errno::NOENT) => continue,
+                    Err(_) => return Err(SpoolWriteError::UnsafeOrNonRegular),
+                };
+                let kind = FileType::from_raw_mode(stat.st_mode);
+                if kind.is_dir() {
+                    let child = rustix::fs::openat2(
+                        &*directory,
+                        name,
+                        DIRECTORY_FLAGS,
+                        Mode::empty(),
+                        ARTIFACT_RESOLVE,
+                    )
+                    .map_err(|_error| SpoolWriteError::UnsafeOrNonRegular)?;
+                    let entries = rustix::fs::Dir::read_from(&child)
+                        .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+                    if inventory.stack.len() >= 32 {
+                        return Err(SpoolWriteError::UnsafeOrNonRegular);
+                    }
+                    inventory.stack.push((child, entries));
+                } else if kind.is_file() && stat.st_size >= 0 && stat.st_dev == self.root_device {
+                    inventory.bytes = inventory
+                        .bytes
+                        .checked_add(stat.st_size as u64)
+                        .ok_or(SpoolWriteError::InvalidBodySize)?;
+                    inventory.files = inventory
+                        .files
+                        .checked_add(1)
+                        .ok_or(SpoolWriteError::InvalidBodySize)?;
+                } else {
+                    return Err(SpoolWriteError::UnsafeOrNonRegular);
+                }
+            }
+            self.assert_configured_root_stable()?;
+            if inventory.stack.is_empty() {
+                inventory.completed = Some((Instant::now(), inventory.bytes, inventory.files));
+            }
+            Ok(inventory
+                .completed
+                .filter(|(at, _, _)| at.elapsed() <= Duration::from_secs(300))
+                .map(|(_, bytes, files)| (bytes, files)))
+        }
+
+        /// Sample the pinned root, refusing mount/root replacement since construction.
+        pub fn available_bytes(&self) -> Result<u64, SpoolWriteError> {
+            self.assert_configured_root_stable()?;
+            let stats = rustix::fs::fstatvfs(&self.root_fd)
+                .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+            stats
+                .f_bavail
+                .checked_mul(stats.f_frsize)
+                .ok_or(SpoolWriteError::RootUnavailable)
+        }
+        /// Recover a completed placement after a lost writer response. It can
+        /// only mint a receipt after re-reading, comparing and syncing exact bytes.
+        pub fn reconcile_put_body(
+            &self,
+            layout: &SpoolLayout,
+            key: &SpoolObjectKey,
+            body: &[u8],
+        ) -> Result<SpoolWriteReceipt, SpoolWriteError> {
+            if body.is_empty() || body.len() as u64 > self.maximum_body_bytes {
+                return Err(SpoolWriteError::InvalidBodySize);
+            }
+            self.assert_configured_root_stable()?;
+            let paths = layout
+                .derive_paths(key)
+                .map_err(|_error| SpoolWriteError::InvalidSpoolKey)?;
+            let relative = self.relative_artifact_path(paths.final_path())?;
+            let fd = rustix::fs::openat2(
+                &self.root_fd,
+                &relative,
+                DIRECTORY_FLAGS
+                    .difference(OFlags::DIRECTORY)
+                    .union(OFlags::NONBLOCK),
+                Mode::empty(),
+                ARTIFACT_RESOLVE,
+            )
+            .map_err(|_error| SpoolWriteError::UnsafeOrNonRegular)?;
+            let stat =
+                rustix::fs::fstat(&fd).map_err(|_error| SpoolWriteError::UnsafeOrNonRegular)?;
+            if !FileType::from_raw_mode(stat.st_mode).is_file() || stat.st_size != body.len() as i64
+            {
+                return Err(SpoolWriteError::UnsafeOrNonRegular);
+            }
+            let mut file = File::from(fd);
+            let mut found = Vec::with_capacity(body.len());
+            (&mut file)
+                .take(self.maximum_body_bytes + 1)
+                .read_to_end(&mut found)
+                .map_err(|_error| SpoolWriteError::Io {
+                    operation: "reconcile read",
+                })?;
+            if found != body {
+                return Err(SpoolWriteError::InvalidBodySize);
+            }
+            file.sync_all().map_err(|_error| SpoolWriteError::Io {
+                operation: "reconcile fsync",
+            })?;
+            let parent = relative
+                .parent()
+                .ok_or(SpoolWriteError::PathBindingMismatch)?;
+            let directory = self.ensure_directory_chain(parent)?;
+            rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
+                operation: "reconcile directory fsync",
+            })?;
+            self.assert_configured_root_stable()?;
+            Ok(SpoolWriteReceipt {
+                opaque_handle: paths.opaque_handle().to_owned(),
+                size: body.len() as u64,
+                blake3: *blake3::hash(body).as_bytes(),
+            })
+        }
+
+        /// Remove only a database-authorized PUT identity. The pinned root and
+        /// descriptor-relative parent open make missing files distinct from a lost root.
+        pub(crate) fn purge_put_body(
+            &self,
+            layout: &SpoolLayout,
+            key: &SpoolObjectKey,
+        ) -> Result<bool, SpoolWriteError> {
+            self.assert_configured_root_stable()?;
+            let paths = layout
+                .derive_paths(key)
+                .map_err(|_error| SpoolWriteError::InvalidSpoolKey)?;
+            let relative = self.relative_artifact_path(paths.final_path())?;
+            let parent = relative
+                .parent()
+                .ok_or(SpoolWriteError::PathBindingMismatch)?;
+            let mut directory = self
+                .root_fd
+                .try_clone()
+                .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+            for component in parent.components() {
+                let Component::Normal(name) = component else {
+                    return Err(SpoolWriteError::PathBindingMismatch);
+                };
+                match rustix::fs::openat2(
+                    &directory,
+                    name,
+                    DIRECTORY_FLAGS,
+                    Mode::empty(),
+                    ARTIFACT_RESOLVE,
+                ) {
+                    Ok(fd) => directory = fd,
+                    Err(Errno::NOENT) => {
+                        // Absence is durable only after the nearest surviving
+                        // parent is synced, including a peer's uncommitted unlink.
+                        rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
+                            operation: "purge missing directory fsync",
+                        })?;
+                        self.assert_configured_root_stable()?;
+                        return Ok(false);
+                    }
+                    Err(_) => return Err(SpoolWriteError::UnsafeOrNonRegular),
+                }
+            }
+            let mut removed = false;
+            for path in [paths.part_path(), paths.final_path()] {
+                let name = path
+                    .file_name()
+                    .ok_or(SpoolWriteError::PathBindingMismatch)?;
+                match rustix::fs::unlinkat(&directory, name, rustix::fs::AtFlags::empty()) {
+                    Ok(()) => removed = true,
+                    Err(Errno::NOENT) => {}
+                    Err(_) => {
+                        return Err(SpoolWriteError::Io {
+                            operation: "purge unlink",
+                        });
+                    }
+                }
+            }
+            rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
+                operation: "purge directory fsync",
+            })?;
+            self.assert_configured_root_stable()?;
+            Ok(removed)
+        }
+
         /// Open and pin the configured spool root.
         ///
         /// Mirrors `LinuxSpoolVerifier::open`: the same `openat2` resolution, the
@@ -252,6 +495,7 @@ mod platform {
                 root_device: root_stat.st_dev,
                 root_inode: root_stat.st_ino,
                 maximum_body_bytes,
+                physical_inventory: Mutex::new(PhysicalInventory::default()),
             })
         }
 
@@ -507,6 +751,31 @@ mod platform {
     pub struct LinuxSpoolWriter;
 
     impl LinuxSpoolWriter {
+        pub fn physical_usage(
+            &self,
+            _maximum_entries: u32,
+        ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
+            Err(SpoolWriteError::UnsupportedPlatform)
+        }
+        pub fn available_bytes(&self) -> Result<u64, SpoolWriteError> {
+            Err(SpoolWriteError::UnsupportedPlatform)
+        }
+        pub fn reconcile_put_body(
+            &self,
+            _layout: &SpoolLayout,
+            _key: &SpoolObjectKey,
+            _body: &[u8],
+        ) -> Result<SpoolWriteReceipt, SpoolWriteError> {
+            Err(SpoolWriteError::UnsupportedPlatform)
+        }
+        pub(crate) fn purge_put_body(
+            &self,
+            _layout: &SpoolLayout,
+            _key: &SpoolObjectKey,
+        ) -> Result<bool, SpoolWriteError> {
+            Err(SpoolWriteError::UnsupportedPlatform)
+        }
+
         pub fn open(
             _layout: &SpoolLayout,
             _maximum_body_bytes: u64,

@@ -34,22 +34,24 @@
 //! this function's output; a `pub(crate)` export from the coordinator would let
 //! the compiler hold this instead, and is worth taking if that lane offers one.
 //!
-//! # Residual this module does NOT close
+//! # Cleanup confinement and the remaining writer/read boundary
 //!
-//! `O_NOFOLLOW` covers the **final** component, and the recorded device covers a
-//! move to another filesystem. Neither catches a same-device symlink planted at
-//! an intermediate fan-out component. [`ConfinedRoot::ensure_parent`] accepts
+//! Cleanup walks from a pinned root descriptor with `openat(O_NOFOLLOW)` for
+//! every directory, then uses `unlinkat` and fsync on that same descriptor.
+//! Root inode and device identity are rechecked before each operation. Reads
+//! and finalization still use path-based intermediate components.
+//! [`ConfinedRoot::ensure_parent`] accepts
 //! `AlreadyExists` from `create_dir`, which does not prove the existing entry
 //! is a directory rather than a symlink. A party able to modify the root can
-//! plant or replace an intermediate component; this module does not prevent
-//! that substitution. Closing it needs an `openat`-from-root-dirfd walk, which needs raw
-//! fd `unsafe` FFI this crate does not otherwise have — and an attacker who can
-//! write inside the root already owns the staged bytes. The residual is
-//! documented rather than silently accepted.
+//! still substitute an intermediate component on those two paths. They must
+//! not be treated as offering cleanup's descriptor-relative confinement.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 
 use super::WriteBehindError;
 use super::admission::AdmissionSample;
@@ -96,6 +98,14 @@ struct RootInner {
     /// it, which is what stops a bind-mount or unmount from silently relocating
     /// the staged set, and also what keeps `rename` atomic.
     device: u64,
+    /// Inode identity plus a live descriptor prevents a replaced directory on
+    /// the same device, or reuse of the old inode, from passing root validation.
+    inode: u64,
+    #[cfg(unix)]
+    directory: std::fs::File,
+    /// Shared by all clones. Each blocking closure owns its permit until its
+    /// final syscall completes, even if the async caller stops waiting.
+    io_capacity: Arc<Semaphore>,
 }
 
 /// A proven staging root.
@@ -126,6 +136,24 @@ pub(crate) fn derived_staged_key(hash: &[u8], epoch: i64) -> Result<String, Writ
 }
 
 impl ConfinedRoot {
+    /// Refuse excess work before queueing it on Tokio's blocking pool.
+    ///
+    /// Move this permit into the blocking closure. Keeping it on the awaiting
+    /// future would release capacity on cancellation while I/O still runs.
+    pub(crate) fn try_io_permit(&self) -> Result<OwnedSemaphorePermit, WriteBehindError> {
+        match self.inner.io_capacity.clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(_) => Err(WriteBehindError::Io {
+                operation: "staging I/O capacity",
+                kind: std::io::ErrorKind::WouldBlock,
+            }),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn inventory_root(&self) -> &Path {
+        &self.inner.canonical
+    }
     pub(crate) fn incoming(&self) -> &Path {
         &self.inner.incoming
     }
@@ -166,6 +194,8 @@ mod platform {
     use std::fs;
     use std::io::Read as _;
     use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -205,16 +235,24 @@ mod platform {
             )]
             let canonical =
                 fs::canonicalize(configured).map_err(|_| WriteBehindError::RootUnresolvable)?;
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "the ErrorKind must not reclassify a configuration refusal as retryable Io"
-            )]
-            let metadata =
-                fs::metadata(&canonical).map_err(|_| WriteBehindError::RootUnresolvable)?;
+            match fs::symlink_metadata(&canonical) {
+                Ok(metadata) if metadata.is_dir() => {}
+                Ok(_) => return Err(WriteBehindError::RootNotADirectory),
+                Err(_) => return Err(WriteBehindError::RootUnresolvable),
+            }
+            let directory = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&canonical)
+                .map_err(|error| WriteBehindError::io("root directory open", &error))?;
+            let metadata = directory
+                .metadata()
+                .map_err(|error| WriteBehindError::io("root directory stat", &error))?;
             if !metadata.is_dir() {
                 return Err(WriteBehindError::RootNotADirectory);
             }
             let device = metadata.dev();
+            let inode = metadata.ino();
             let staged = canonical.join(STAGED_DIR);
             let incoming = canonical.join(INCOMING_DIR);
             for directory in [&staged, &incoming] {
@@ -234,9 +272,15 @@ mod platform {
                     staged,
                     incoming,
                     device,
+                    inode,
+                    directory,
+                    // Bounds unfinished reads, finalizers and exact removals,
+                    // including cancelled callers, to sixteen per root handle.
+                    io_capacity: Arc::new(tokio::sync::Semaphore::new(16)),
                 }),
             };
             root.probe()?;
+            root.verify_device()?;
             Ok(root)
         }
 
@@ -270,28 +314,36 @@ mod platform {
             })
         }
 
-        /// Confirm the root still sits on the filesystem recorded at open.
+        /// Confirm the pathname still names the directory recorded at open.
         ///
         /// This is what makes an `ENOENT` from [`Self::read_regular`] mean "this
         /// fragment is gone" rather than "the mount went away", which is the
         /// distinction that keeps a healthy fragment from being demoted to
         /// `Missing`.
         pub(crate) fn verify_device(&self) -> Result<(), WriteBehindError> {
-            // The verdict this call exists to produce is "the mount is no longer the
-            // one recorded at open", and an unreadable root proves exactly that. Any
-            // `ErrorKind` here must collapse to `RootDeviceChanged`: surfacing `Io`
-            // instead would let a caller retry, and a retry is what the doc comment
-            // above forbids -- it is how a healthy fragment gets demoted to `Missing`.
-            #[expect(
-                clippy::map_err_ignore,
-                reason = "every failure to stat the root IS the device-changed verdict, not a retryable Io"
-            )]
-            let metadata = fs::metadata(&self.inner.canonical)
-                .map_err(|_| WriteBehindError::RootDeviceChanged)?;
-            if metadata.dev() != self.inner.device {
+            self.verified_root_directory().map(|_| ())
+        }
+
+        pub(crate) fn verified_root_directory(&self) -> Result<fs::File, WriteBehindError> {
+            let current = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&self.inner.canonical)
+            {
+                Ok(current) => current,
+                Err(_) => return Err(WriteBehindError::RootDeviceChanged),
+            };
+            let metadata = match current.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => return Err(WriteBehindError::RootDeviceChanged),
+            };
+            if metadata.dev() != self.inner.device || metadata.ino() != self.inner.inode {
                 return Err(WriteBehindError::RootDeviceChanged);
             }
-            Ok(())
+            self.inner
+                .directory
+                .try_clone()
+                .map_err(|error| WriteBehindError::io("root descriptor clone", &error))
         }
 
         /// Create the fan-out directories for one staged path and make them
@@ -342,12 +394,17 @@ mod platform {
             &self,
             resolved: &ResolvedStagedPath,
         ) -> Result<Option<Bytes>, WriteBehindError> {
-            self.verify_device()?;
+            let permit = self.try_io_permit()?;
+            let root = self.clone();
             let path = resolved.path().to_path_buf();
             let device = self.inner.device;
-            join(lore_spawn_blocking!(move || read_regular_blocking(
-                &path, device
-            )))
+            join(lore_spawn_blocking!(move || {
+                let _permit = permit;
+                root.verify_device()?;
+                #[cfg(test)]
+                super::durability_tests::before_read(&path);
+                read_regular_blocking(&path, device)
+            }))
             .await
         }
 
@@ -359,18 +416,94 @@ mod platform {
             &self,
             resolved: &ResolvedStagedPath,
         ) -> Result<(), WriteBehindError> {
-            self.verify_device()?;
-            let path = resolved.path().to_path_buf();
-            let parent = resolved.parent().to_path_buf();
+            let permit = self.try_io_permit()?;
+            let root = self.clone();
+            let resolved = resolved.clone();
             join(lore_spawn_blocking!(move || {
-                match fs::remove_file(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                    Err(error) => return Err(WriteBehindError::io("staged unlink", &error)),
-                }
-                sync_directory(&parent)
+                let _permit = permit;
+                root.remove_placement_blocking(&resolved, false)
             }))
             .await
+        }
+
+        /// Unlink only the derived final or deterministic temporary placement.
+        /// The caller must already own a bounded blocking-I/O slot.
+        pub(crate) fn remove_placement_blocking(
+            &self,
+            resolved: &ResolvedStagedPath,
+            temporary: bool,
+        ) -> Result<(), WriteBehindError> {
+            let relative = if temporary {
+                let name = resolved
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or(WriteBehindError::KeyMismatch)?;
+                std::path::PathBuf::from(INCOMING_DIR).join(format!("{name}.tmp"))
+            } else {
+                match resolved.path().strip_prefix(&self.inner.canonical) {
+                    Ok(relative) => relative.to_owned(),
+                    Err(_) => return Err(WriteBehindError::KeyMismatch),
+                }
+            };
+            let mut components = relative.components().peekable();
+            let mut directory = self.verified_root_directory()?;
+            let mut directory_path = self.inner.canonical.clone();
+            while let Some(component) = components.next() {
+                let std::path::Component::Normal(name) = component else {
+                    return Err(WriteBehindError::KeyMismatch);
+                };
+                let name = match CString::new(name.as_bytes()) {
+                    Ok(name) => name,
+                    Err(_) => return Err(WriteBehindError::KeyMismatch),
+                };
+                if components.peek().is_none() {
+                    // SAFETY: directory owns a live directory fd and name is
+                    // one NUL-terminated normal component. flags=0 unlinks the
+                    // entry itself and never follows a final symlink.
+                    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+                    if result != 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            return Err(WriteBehindError::io("confined unlink", &error));
+                        }
+                    }
+                    // Even ENOENT needs this barrier: the prior unlink may
+                    // have succeeded without its caller completing fsync.
+                    return sync_directory_handle(&directory, &directory_path);
+                }
+                // SAFETY: the parent fd remains live through the call; name
+                // contains exactly one path component. NOFOLLOW rejects
+                // symlink substitution and DIRECTORY rejects non-directories.
+                let fd = unsafe {
+                    libc::openat(
+                        directory.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        // A missing shard does not block temp-only cleanup.
+                        // Persist the nearest verified existing ancestor.
+                        return sync_directory_handle(&directory, &directory_path);
+                    }
+                    return Err(WriteBehindError::io("confined directory open", &error));
+                }
+                // SAFETY: openat returned a new owned fd, transferred exactly
+                // once to File so every error path closes it.
+                let child = unsafe { fs::File::from_raw_fd(fd) };
+                let metadata = child
+                    .metadata()
+                    .map_err(|error| WriteBehindError::io("confined directory stat", &error))?;
+                if metadata.dev() != self.inner.device {
+                    return Err(WriteBehindError::RootDeviceChanged);
+                }
+                directory_path.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                directory = child;
+            }
+            Err(WriteBehindError::KeyMismatch)
         }
 
         /// Sample free space and root reachability for the admission snapshot.
@@ -427,10 +560,16 @@ mod platform {
 
     /// fsync one directory so its entries survive a crash.
     pub(crate) fn sync_directory(directory: &Path) -> Result<(), WriteBehindError> {
-        #[cfg(test)]
-        super::durability_tests::observe_sync(directory, false)?;
         let handle = fs::File::open(directory)
             .map_err(|error| WriteBehindError::io("directory open", &error))?;
+        sync_directory_handle(&handle, directory)
+    }
+
+    fn sync_directory_handle(handle: &fs::File, directory: &Path) -> Result<(), WriteBehindError> {
+        #[cfg(test)]
+        super::durability_tests::observe_sync(directory, false)?;
+        #[cfg(not(test))]
+        let _ = directory;
         handle
             .sync_all()
             .map_err(|error| WriteBehindError::io("directory fsync", &error))?;
@@ -533,6 +672,14 @@ mod platform {
         pub(crate) async fn remove_regular(
             &self,
             _resolved: &ResolvedStagedPath,
+        ) -> Result<(), WriteBehindError> {
+            Err(WriteBehindError::UnsupportedPlatform)
+        }
+
+        pub(crate) fn remove_placement_blocking(
+            &self,
+            _resolved: &ResolvedStagedPath,
+            _temporary: bool,
         ) -> Result<(), WriteBehindError> {
             Err(WriteBehindError::UnsupportedPlatform)
         }

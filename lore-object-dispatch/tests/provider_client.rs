@@ -4482,6 +4482,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
         ProviderClientError::LedgerRequestMismatch,
         ProviderClientError::LedgerAlgebraViolation,
         ProviderClientError::LedgerOverflow,
+        ProviderClientError::PreTransportGuardRefused,
     ];
     // The match below forces a new *arm*, which a `_ => {}` would satisfy without adding the
     // variant to the array these tests actually sweep. Pinning the length is what makes adding a
@@ -4492,7 +4493,7 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
     // `LedgerAlgebraViolation` were all missing from this sweep).
     assert_eq!(
         errors.len(),
-        42,
+        43,
         "a new ProviderClientError variant must be added to this array, not only to the match \
          below"
     );
@@ -4540,7 +4541,8 @@ async fn provider_client_error_display_never_contains_sensitive_values() {
             | ProviderClientError::DispatchAfterNoDispatch
             | ProviderClientError::LedgerRequestMismatch
             | ProviderClientError::LedgerAlgebraViolation
-            | ProviderClientError::LedgerOverflow => {}
+            | ProviderClientError::LedgerOverflow
+            | ProviderClientError::PreTransportGuardRefused => {}
         }
     }
 

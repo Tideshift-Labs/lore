@@ -29,6 +29,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 
+#[path = "fragment_write_behind.rs"]
+pub mod fragment_write_behind;
+
 use async_trait::async_trait;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -470,42 +473,6 @@ impl PostgresImmutableStore {
             return Ok(None);
         };
         Ok(Some(provider.cell_retention()?))
-    }
-
-    /// WP-114 CD-6's drain capability, on the dispatch pool this store's
-    /// provider entry already opened.
-    ///
-    /// `None` on the legacy route: a cell with no governed fragment path opened
-    /// no dispatch pool, and the staged route is reachable only from the
-    /// coordinated PUT path, so there is nothing for a drain to promote.
-    ///
-    /// This is a pass-through and nothing more, and the returned capability is
-    /// opaque here for the same reason [`Self::cell_retention`]'s handle is:
-    /// naming what is inside it would mean depending on `lore-object-dispatch`,
-    /// which this crate must not do. `lore-server` composes the worker.
-    ///
-    /// `shared_spool_root` is the **object-dispatch spool root**, not this
-    /// store's staging root. Owner ruling D15 made those two separate
-    /// directories with separate configuration keys, and this signature is
-    /// where the distinction is easiest to lose: passing
-    /// `WriteBehindSettings::root` here would place foreign spool files inside
-    /// the tree contract C2's reclaimer enumerates. The store does not hold the
-    /// spool root and deliberately does not learn it — it arrives from
-    /// configuration at the composition root, which is the one place that reads
-    /// both keys and can tell them apart.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PostgresFragmentProviderActivationError`] when the pool is not
-    /// the runtime pool.
-    pub fn drain_capability(
-        &self,
-        shared_spool_root: std::path::PathBuf,
-    ) -> Result<Option<FragmentDrainCapability>, PostgresFragmentProviderActivationError> {
-        let FragmentLifecycleRoute::Coordinated { provider, .. } = &self.fragment_route else {
-            return Ok(None);
-        };
-        Ok(Some(provider.drain_capability(shared_spool_root)?))
     }
 
     /// Attach the staged cleanup collaborator without changing provider or
@@ -1329,10 +1296,20 @@ impl PostgresImmutableStore {
         payload: &Bytes,
         authority: EpochAuthority,
     ) -> Result<FragmentManifest, StoreError> {
+        Self::key_manifest(&intent.object_key, address, fragment, payload, authority)
+    }
+
+    fn key_manifest(
+        object_key: &str,
+        address: Address,
+        fragment: Fragment,
+        payload: &Bytes,
+        authority: EpochAuthority,
+    ) -> Result<FragmentManifest, StoreError> {
         let mut identity = blake3::Hasher::new();
         identity.update(b"lore-fragment-manifest-v1\0");
-        identity.update(&(intent.object_key.len() as u64).to_le_bytes());
-        identity.update(intent.object_key.as_bytes());
+        identity.update(&(object_key.len() as u64).to_le_bytes());
+        identity.update(object_key.as_bytes());
         identity.update(&fragment.flags.to_le_bytes());
         identity.update(&fragment.size_payload.to_le_bytes());
         identity.update(&fragment.size_content.to_le_bytes());
@@ -1340,7 +1317,7 @@ impl PostgresImmutableStore {
         identity.update(blake3::hash(payload).as_bytes());
         Ok(FragmentManifest {
             authority,
-            object_key: intent.object_key.clone(),
+            object_key: object_key.to_owned(),
             manifest_id: identity.finalize().as_bytes().to_vec(),
             size_payload: i64::from(fragment.size_payload),
             size_content: i64::try_from(fragment.size_content).map_err(|error| {
@@ -1785,7 +1762,13 @@ impl PostgresImmutableStore {
     ) -> Result<crate::domain::fragments::EpochWitness, StoreError> {
         Self::validate_put_candidate(address, fragment, &payload, "staged")?;
         let begin = coordinator
-            .begin_stage(address.hash.data())
+            .begin_stage(
+                address.hash.data(),
+                crate::domain::fragments::coordinator::StageReservationInput {
+                    size_payload: u64::from(fragment.size_payload),
+                    original_flags: fragment.flags,
+                },
+            )
             .await
             .map_err(domain_store_err)?;
         let intent = match begin {
@@ -3240,7 +3223,23 @@ mod tests {
             .await
             .unwrap();
         let coordinator = domain.fragment_coordinator();
+        let (policy_client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        lore_base::lore_spawn!(async move {
+            connection.await.unwrap();
+        });
+        policy_client.batch_execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_maintenance') THEN CREATE ROLE object_dispatch_retention_maintenance; END IF; END $$").await.unwrap();
         coordinator.bootstrap().await.unwrap();
+        policy_client
+            .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance")
+            .await
+            .unwrap();
+        policy_client.execute("SELECT stage_policy_publish_v1('fixture-cell','fixture-policy-v1',decode(repeat('aa',32),'hex'),1073741824,100000,1073741824,100000,60000,4102444800000)",&[]).await.unwrap();
+        policy_client
+            .batch_execute("RESET SESSION AUTHORIZATION")
+            .await
+            .unwrap();
         // No provider call is available: this test drives the production
         // private staging helper; public route/association acceptance is separate.
         let s3_config = aws_sdk_s3::config::Builder::new()

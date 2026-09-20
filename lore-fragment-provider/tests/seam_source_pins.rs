@@ -95,7 +95,7 @@ const FILESYSTEM_TOKENS: [&str; 7] = [
 /// exactly what this list exists to catch; tokens the capability legitimately
 /// reuses are checked for confinement instead, by
 /// [`the_drain_capability_is_the_only_place_the_reused_durable_put_primitives_appear`].
-const PHASE5_DURABLE_PUT_TOKENS_FORBIDDEN_EVERYWHERE: [&str; 9] = [
+const PHASE5_DURABLE_PUT_TOKENS_FORBIDDEN_EVERYWHERE: [&str; 8] = [
     "FragmentReservePutQuota",
     "FragmentReservePutRequest",
     "FragmentPutSpoolReady",
@@ -103,7 +103,6 @@ const PHASE5_DURABLE_PUT_TOKENS_FORBIDDEN_EVERYWHERE: [&str; 9] = [
     "ReadyFragmentPutAttempt",
     "ReservePutRequest",
     "reserve_put(",
-    "SpoolLayout",
     "DurablePutSpoolExpectation",
 ];
 
@@ -292,6 +291,7 @@ fn crate_root() -> PathBuf {
 fn read(relative: &str) -> String {
     let path = crate_root().join(relative);
     match fs::read_to_string(&path) {
+        Ok(text) if relative == "src/lib.rs" => format!("{text}\n{}", read("src/drain.rs")),
         Ok(text) => text,
         Err(error) => panic!("{} must be readable: {error}", path.display()),
     }
@@ -631,8 +631,8 @@ fn the_seam_manifest_admits_no_provider_sdk() {
 /// **This rule deliberately does not use [`shipped_code`].** It scans the whole
 /// comment-stripped file, tests included, so the `#[cfg(test)]` walk — and the
 /// desynchronisation recorded as this file's known limit — cannot hide anything
-/// from it. That costs nothing here: the seam's own tests touch no filesystem
-/// either.
+/// from it. Filesystem-backed live fixtures reside in a separately guarded
+/// test-only module; the production files remain scanned in their entirety.
 #[test]
 fn the_seam_performs_no_filesystem_work() {
     let whole_file = strip_line_comments(&read("src/lib.rs"));
@@ -699,14 +699,13 @@ fn the_drain_capability_is_the_only_place_the_reused_durable_put_primitives_appe
     }
 }
 
-/// The filesystem rule scans one file, so the crate must be one file, and it
-/// must not splice in another.
+/// Both source files are scanned together. Refuse an unscanned module or splice.
 ///
 /// Kept when the rest of the scanner scaffolding was deleted, because it is the
 /// only thing standing between the rule above and a second module or an
 /// `include!` — neither of which the crate boundary says anything about.
 #[test]
-fn the_seam_is_the_only_source_file_and_splices_in_nothing() {
+fn every_seam_source_file_is_scanned_and_splices_in_nothing() {
     let sources = crate_root().join("src");
     let entries = match fs::read_dir(&sources) {
         Ok(entries) => entries,
@@ -719,8 +718,12 @@ fn the_seam_is_the_only_source_file_and_splices_in_nothing() {
     found.sort();
     assert_eq!(
         found,
-        vec!["lib.rs".to_string()],
-        "the seam is scanned as one file, so src/ must hold exactly lib.rs",
+        vec![
+            "drain.rs".to_string(),
+            "lib.rs".to_string(),
+            "tests.rs".to_string()
+        ],
+        "the source inventory must exactly match the files read by the scanner",
     );
 
     let spliced = hits(
@@ -730,6 +733,17 @@ fn the_seam_is_the_only_source_file_and_splices_in_nothing() {
     assert!(
         spliced.is_empty(),
         "the seam names {spliced:?}, which compiles source this guard never reads",
+    );
+    let library = fs::read_to_string(sources.join("lib.rs")).unwrap();
+    assert!(
+        library
+            .replace("\r\n", "\n")
+            .ends_with("#[cfg(test)]\nmod tests;\n")
+    );
+    let tests = strip_line_comments(&read("src/tests.rs"));
+    assert!(
+        tests.trim_start().starts_with("#![cfg(test)]"),
+        "filesystem fixtures must be excluded from production at the module boundary"
     );
 }
 
@@ -957,8 +971,8 @@ fn the_cell_retention_client_buys_only_the_retention_procedures() {
 /// set is two, not the four the ratified design named as an eventual full
 /// surface.
 #[test]
-fn the_drain_capability_exposes_exactly_mark_spool_ready_and_attempt_drain() {
-    const PERMITTED: [&str; 2] = ["mark_spool_ready", "attempt_drain"];
+fn the_drain_capability_exposes_exactly_reserve_ready_and_attempt() {
+    const PERMITTED: [&str; 3] = ["reserve_spool", "mark_spool_ready", "attempt_drain"];
 
     let shipped = shipped_code(&read("src/lib.rs"));
     let capability_blocks = all_blocks_after(&shipped, "impl FragmentDrainCapability", '{', '}');
@@ -1017,6 +1031,40 @@ fn the_drain_capability_declares_no_public_field() {
         "FragmentDrainCapability has a public field, so a caller can read it \
          directly regardless of the method-set pin, got {declaration}",
     );
+}
+
+#[test]
+fn reservation_and_maintenance_handles_expose_only_their_approved_operations() {
+    let source = shipped_code(&read("src/drain.rs"));
+    for (name, expected) in [
+        ("FragmentDrainReservationPlan", vec!["new"]),
+        ("FragmentDrainReservation", vec!["budget_pin", "write_body"]),
+        (
+            "FragmentDrainMaintenanceHandle",
+            vec!["cleanup_pass", "observe"],
+        ),
+    ] {
+        let prefix = format!("impl {name} {{");
+        let blocks = all_blocks_after(&source, &prefix, '{', '}');
+        assert!(!blocks.is_empty(), "missing {name} impl");
+        let mut methods = Vec::new();
+        for block in blocks {
+            for signature in public_fn_signatures(&block) {
+                let tail = signature
+                    .trim_start_matches("pub ")
+                    .trim_start_matches("async ")
+                    .trim_start_matches("fn ");
+                methods.push(tail.split(['(', '<']).next().unwrap().to_string());
+            }
+        }
+        methods.sort();
+        assert_eq!(methods, expected, "{name} widened its capability");
+        let declaration = block_after(&source, &format!("pub struct {name} {{"), '{', '}');
+        assert!(
+            !declaration.split_once('{').unwrap().1.contains("pub "),
+            "{name} fields must remain opaque"
+        );
+    }
 }
 
 /// `FragmentDrainAttempt` — the caller-supplied argument to `attempt_drain` —

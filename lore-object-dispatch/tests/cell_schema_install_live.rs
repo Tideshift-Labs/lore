@@ -168,13 +168,14 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     assert_eq!(report.attestation.replaced_functions_revoked, 4);
     assert_eq!(report.attestation.inert_tables_present, 4);
 
-    // The install set is 21 artifacts; nothing outside it may have been applied. WP-114 CD-4 added
+    // The install set is 23 artifacts; nothing outside it may have been applied. WP-122 adds 0026/0027.
+    // WP-114 CD-4 added
     // 0021 and 0022 for the dark shared provider-budget limiter, CD-8 added 0023 and 0024 for
     // cell-scale retention, and CR-034 added 0025 for the runtime budget-pin head read. This
     // literal is a deliberate manual tripwire (like `tests/cell_schema_install.rs`'s
     // `CELL_INSTALLED_MIGRATION_NUMBERS`): a future migration must update it, not silently pass by
     // comparing the constant to itself.
-    assert_eq!(CELL_INSTALL_SET.len(), 21);
+    assert_eq!(CELL_INSTALL_SET.len(), 23);
 
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
@@ -258,6 +259,237 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
         Err(CellSchemaError::Precondition(
             "session_user is not migrator"
         ))
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_drain_policy_publication_is_maintenance_only_and_replays_exactly() {
+    use lore_object_dispatch::drain_policy::DrainPolicy;
+    use lore_object_dispatch::drain_policy::DrainStagePolicy;
+    let cell = connect("LORE_TEST_DRAIN_POLICY_PG_URL").await;
+    install_cell_schema(&cell.client)
+        .await
+        .expect("supported full-chain install");
+    let admin = connect_as(
+        "LORE_TEST_DRAIN_POLICY_ADMIN_PG_URL",
+        "owned policy fixture",
+        None,
+    )
+    .await;
+    let policy = DrainPolicy {
+        boundary: "fixture-boundary".into(),
+        cell: "fixture-cell".into(),
+        service: "fixture-service".into(),
+        revision: "fixture-policy-v1".into(),
+        quota_revision: 1,
+        quotas: [[1048576, 16, 4, 1024, 1, 1]; 3],
+        maximum_ttl_ms: 60000,
+        expires_at_ms: 4102444800000,
+        metadata_max_rows: 32,
+        metadata_max_bytes: 1048576,
+        stage: DrainStagePolicy {
+            max_bytes: 1048576,
+            max_files: 16,
+            max_metadata_bytes: 1048576,
+            max_metadata_rows: 32,
+            prepare_ttl_ms: 60000,
+        },
+    };
+    let json = serde_json::to_string(&policy).unwrap();
+    let canonical = policy.canonical_bytes().unwrap();
+    let digest = policy.digest().unwrap();
+    // PostgreSQL 16 has no built-in BLAKE3. This exact lookup supplies only
+    // independently computed fixture preimages; unknown input fails closed.
+    let mut changed = policy.clone();
+    changed.quotas[0][0] += 1;
+    let cases = [&policy, &changed]
+        .into_iter()
+        .map(|value| {
+            let bytes = value.canonical_bytes().unwrap();
+            let encoded = bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            format!(
+                "WHEN '{encoded}' THEN decode('{}','hex')",
+                hex(&value.digest().unwrap())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    admin.client.batch_execute(&format!("CREATE FUNCTION public.blake3(payload bytea) RETURNS bytea LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE encode(payload,'hex') {cases} ELSE NULL::bytea END $$")).await.unwrap();
+    let publish = "SELECT object_store_retention.drain_policy_publish_v1($1::text::jsonb,$2,$3)";
+    admin
+        .client
+        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance")
+        .await
+        .unwrap();
+    admin
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        admin
+            .client
+            .execute(publish, &[&json, &canonical, &&digest[..]])
+            .await
+            .expect("exact policy publication and replay");
+    }
+    admin
+        .client
+        .execute(
+            "SELECT object_store_retention.drain_policy_verify_v1($1::text::jsonb,$2,$3)",
+            &[&json, &canonical, &&digest[..]],
+        )
+        .await
+        .expect("maintenance verifies published policy");
+    admin
+        .client
+        .batch_execute("COMMIT; BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    let different = admin
+        .client
+        .execute(
+            publish,
+            &[
+                &serde_json::to_string(&changed).unwrap(),
+                &changed.canonical_bytes().unwrap(),
+                &&changed.digest().unwrap()[..],
+            ],
+        )
+        .await;
+    assert!(
+        different.is_err(),
+        "a revision cannot publish different limits"
+    );
+    admin.client.batch_execute("ROLLBACK").await.unwrap();
+    admin.client.batch_execute("RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION object_dispatch_retention_runtime").await.unwrap();
+    let denied = admin
+        .client
+        .execute(publish, &[&json, &canonical, &&digest[..]])
+        .await
+        .unwrap_err();
+    assert_eq!(denied.code().map(|code| code.code()), Some("42501"));
+    assert!(
+        admin
+            .client
+            .execute(
+                "UPDATE object_store_retention.drain_policies SET revision='bypass'",
+                &[]
+            )
+            .await
+            .is_err()
+    );
+    let old_bypass_row = admin.client.query_one("SELECT count(*)::bigint, bool_or(has_function_privilege(current_user,p.oid,'EXECUTE')) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='object_store_retention' AND p.proname='object_store_dispatch_reserve_put_v1'", &[]).await.unwrap();
+    assert_eq!(
+        old_bypass_row.get::<_, i64>(0),
+        1,
+        "the retained underlying procedure must exist"
+    );
+    let old_bypass: bool = old_bypass_row.get(1);
+    assert!(
+        !old_bypass,
+        "runtime must not call the caller-ceiling reservation procedure"
+    );
+    let read_policy = "SELECT * FROM object_store_retention.drain_policy_read_v1($1,$2,$3,$4)";
+    for (boundary, cell_id, revision, pin, expected) in [
+        (
+            "missing-boundary",
+            "fixture-cell",
+            "fixture-policy-v1",
+            digest,
+            "P0002",
+        ),
+        (
+            "fixture-boundary",
+            "wrong-cell",
+            "fixture-policy-v1",
+            digest,
+            "P0002",
+        ),
+        (
+            "fixture-boundary",
+            "fixture-cell",
+            "other-revision",
+            digest,
+            "P0001",
+        ),
+        (
+            "fixture-boundary",
+            "fixture-cell",
+            "fixture-policy-v1",
+            [0x55; 32],
+            "P0001",
+        ),
+    ] {
+        let error = admin
+            .client
+            .query(read_policy, &[&boundary, &cell_id, &revision, &&pin[..]])
+            .await
+            .unwrap_err();
+        assert_eq!(error.code().map(|code| code.code()), Some(expected));
+        if expected == "P0001" {
+            assert_eq!(
+                error.as_db_error().unwrap().message(),
+                "DRAIN_POLICY_MISMATCH"
+            );
+        }
+    }
+    admin
+        .client
+        .batch_execute("RESET SESSION AUTHORIZATION")
+        .await
+        .unwrap();
+    // Planner-only fixture: most compact tombstones are deferred by their
+    // last scan, while cleanup_not_before alone would match the whole cell.
+    admin.client.batch_execute("INSERT INTO object_store_retention.drain_spool_custody(spool_id,boundary,cell,service,logical_id,attempt_id,digest,cleanup_not_before,state,last_scan_ms,metadata_bytes,descriptor)
+        SELECT md5('spool'||i)::uuid,'fixture-boundary','fixture-cell','fixture-service',md5('logical'||i)::uuid,md5('attempt'||i)::uuid,decode(repeat('aa',32),'hex'),0,3,
+        CASE WHEN i<=64 THEN 1 ELSE 4102444800000 END,1024,
+        jsonb_build_object('policy_revision',p.revision,'policy_digest',encode(p.digest,'hex'))
+        FROM generate_series(1,30000) i CROSS JOIN object_store_retention.drain_policies p
+        WHERE p.boundary='fixture-boundary' AND p.cell='fixture-cell';
+        ANALYZE object_store_retention.drain_spool_custody;
+        SET plan_cache_mode=force_generic_plan;").await.unwrap();
+    let migration = include_str!("../migrations/0026_object_store_dispatch_drain_policy.sql");
+    let selection = migration
+        .split_once(
+            "RETURN QUERY SELECT x.spool_id FROM object_store_retention.drain_spool_custody x",
+        )
+        .unwrap()
+        .1
+        .split_once(';')
+        .unwrap()
+        .0;
+    let query =
+        format!("SELECT x.spool_id FROM object_store_retention.drain_spool_custody x{selection}")
+            .replace("drain_cleanup_candidates_v1.boundary", "$1")
+            .replace("drain_cleanup_candidates_v1.cell", "$2")
+            .replace("observed_ms", "$3")
+            .replace("LIMIT batch", "LIMIT $4");
+    admin
+        .client
+        .batch_execute(&format!(
+            "PREPARE cleanup_plan(text,text,bigint,integer) AS {query}"
+        ))
+        .await
+        .unwrap();
+    let rows = admin.client.query("EXPLAIN (ANALYZE,BUFFERS,FORMAT TEXT) EXECUTE cleanup_plan('fixture-boundary','fixture-cell',2000000000000,32)", &[]).await.unwrap();
+    let plan = rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!("generic compact-tombstone cleanup plan:\n{plan}");
+    assert!(
+        plan.contains("drain_spool_cleanup"),
+        "captured-time generic query must use due-time index: {plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan") && !plan.contains("Sort"),
+        "bounded candidate page must not scan or sort accumulated tombstones: {plan}"
     );
 }
 

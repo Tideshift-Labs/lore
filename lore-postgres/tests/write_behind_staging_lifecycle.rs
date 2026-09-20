@@ -28,6 +28,13 @@
 
 #![cfg(unix)]
 
+#[cfg(feature = "failure_generator")]
+#[path = "common/stage_crash_tests.rs"]
+mod stage_crash_tests;
+
+#[path = "common/stage_policy.rs"]
+mod stage_policy;
+
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -114,6 +121,7 @@ async fn coordinator(url: &str) -> PostgresFragmentCoordinator {
         .bootstrap()
         .await
         .expect("install isolated SCHEMA-118 fixture");
+    stage_policy::initialize(url, &coordinator).await;
     coordinator
 }
 
@@ -275,7 +283,13 @@ async fn staged_commit_then_witness_capture_through_the_put_staged_sequence() {
     let payload = Bytes::from_static(b"proves-the-witness-capture-contract");
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin_stage admits a fresh hash")
     else {
@@ -338,7 +352,13 @@ async fn staged_commit_then_witness_capture_through_the_put_staged_sequence() {
 
     // Retry reuses the already published epoch.
     let BeginOutcome::AlreadyReadable(retry_witness) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("a retried begin_stage against an already-Staged head must not error")
     else {
@@ -385,7 +405,13 @@ async fn crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_get
     let payload = Bytes::from_static(b"orphaned-by-a-simulated-crash-before-commit-staged");
 
     let BeginOutcome::Admitted(first_intent) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin_stage admits a fresh hash")
     else {
@@ -427,9 +453,30 @@ async fn crash_between_finalize_and_commit_staged_orphans_the_file_and_retry_get
         "the orphaned file must still be present and byte-readable, got {orphan_read:?}"
     );
 
-    // Retry: a fresh epoch, not a resumption of the orphaned one.
+    // A live Preparing owner must remain exclusive even after its process died.
+    assert!(!matches!(
+        coordinator
+            .begin_stage(
+                &hash,
+                lore_postgres::domain::fragments::StageReservationInput {
+                    size_payload: payload.len() as u64,
+                    original_flags: 0,
+                }
+            )
+            .await
+            .unwrap(),
+        BeginOutcome::Admitted(_)
+    ));
+    direct.execute("UPDATE lore_fragment_stage_custody SET prepare_deadline=clock_timestamp()-interval '1 second' WHERE hash=$1 AND epoch=$2", &[&hash,&first_intent.epoch]).await.unwrap();
+    // Once the database deadline expires, retry gets a fresh fenced epoch.
     let BeginOutcome::Admitted(second_intent) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("retry after the simulated crash must be admitted, not blocked")
     else {
@@ -500,6 +547,7 @@ async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_f
         .await
         .expect("install isolated SCHEMA-118 fixture");
     let direct = direct_client(&url).await;
+    stage_policy::initialize(&url, &coordinator).await;
     let root = ScratchRoot::new("crash-c3");
     let stage = open_stage(&root);
     let hash = random_hash();
@@ -509,7 +557,13 @@ async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_f
     let repository_id = create_repository(&store).await;
 
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin_stage admits a fresh hash")
     else {
@@ -560,7 +614,13 @@ async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_f
     // AlreadyReadable (without repeating the capture or file publication),
     // and the caller binds the association exactly as put_coordinated would.
     let BeginOutcome::AlreadyReadable(witness) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("recovery begin_stage must not error")
     else {
@@ -621,6 +681,7 @@ async fn first_attempt_captures_staged_authority_and_binds_the_association() {
         .await
         .expect("install isolated SCHEMA-118 fixture");
     let direct = direct_client(&url).await;
+    stage_policy::initialize(&url, &coordinator).await;
     let root = ScratchRoot::new("first-association");
     let stage = open_stage(&root);
     let hash = random_hash();
@@ -630,7 +691,13 @@ async fn first_attempt_captures_staged_authority_and_binds_the_association() {
 
     // No retry occurs in this test.
     let BeginOutcome::Admitted(intent) = coordinator
-        .begin_stage(&hash)
+        .begin_stage(
+            &hash,
+            lore_postgres::domain::fragments::StageReservationInput {
+                size_payload: payload.len() as u64,
+                original_flags: 0,
+            },
+        )
         .await
         .expect("begin_stage admits a fresh hash")
     else {

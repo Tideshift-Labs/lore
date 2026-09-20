@@ -156,6 +156,10 @@ impl Admission {
         self.with_state(|state| state.last_heartbeat = Some(Instant::now()));
     }
 
+    pub(crate) fn note_worker_stopped(&self) {
+        self.with_state(|state| state.last_heartbeat = None);
+    }
+
     pub(crate) fn note_occupancy(&self, staged_bytes: u64, staged_count: u64) {
         let watermarks = self.watermarks;
         self.with_state(|state| {

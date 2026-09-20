@@ -17,6 +17,7 @@ fn a_metered_non_get_request_cannot_enter_execute_get() {
     let output = Command::new(env!("CARGO"))
         .args(["check", "--offline", "--quiet", "--manifest-path"])
         .arg(&fixture)
+        .args(["--bin", "get-only-rejects-metered"])
         .arg("--target-dir")
         .arg(&target)
         .output()
