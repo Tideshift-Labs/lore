@@ -38,6 +38,18 @@ $runPassed = $false
 $setupError = $null
 
 $expectedCases = @(
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'stale_finalize_database_clock_equality_then_one_millisecond_commits_exactly_once' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_recovery_response_digest_tracks_merged_interval_while_marker_replay_is_stable' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_retention_persists_each_later_of_arm_and_refuses_early_prune' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_recovery_rejects_range_protocol_revision_without_mutation' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_recovery_rejects_range_quota_revision_without_mutation' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_recovery_rejects_range_digest_without_mutation' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_prune_bridge_merge_preserves_distant_successor_and_counters' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_prune_reverse_merge_preserves_distant_successor_and_counters' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'materialization_replay_from_retired_epoch_cannot_resurrect_or_charge_new_epoch' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_prune_rejects_neighbor_protocol_revision_without_mutation' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_prune_rejects_neighbor_quota_revision_without_mutation' },
+    [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'completion_prune_rejects_neighbor_digest_without_mutation' },
     [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_absent_and_binding_mismatch_never_mutate' },
     [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_quiescent_and_outstanding_vectors_are_read_only' },
     [pscustomobject]@{ Target = 'domain_maintenance'; Test = 'namespace_state_missing_coverage_is_nonquiescent_and_never_repaired' },
@@ -255,6 +267,8 @@ try {
                     '-c', "DROP DATABASE $databaseName WITH (FORCE);"
                 )
             }
+            # Preserve the actual Rust summary once for machine-readable evidence.
+            Write-Host $output
             $runningMatch = [regex]::Match($output, 'running (\d+) tests?')
             $resultMatch = [regex]::Match(
                 $output,
@@ -276,11 +290,11 @@ try {
             }
             elseif ($result.Ran -eq 1) {
                 $result.Status = 'FAIL'
-                Write-Warning "  FAIL`n$output"
+                Write-Warning '  FAIL'
             }
             else {
                 $result.Status = 'NOT RUN'
-                Write-Warning "  NOT RUN`n$output"
+                Write-Warning '  NOT RUN'
             }
         }
     }

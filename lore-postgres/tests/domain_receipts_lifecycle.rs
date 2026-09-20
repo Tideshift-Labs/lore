@@ -55,6 +55,114 @@ fn pg_url() -> Option<String> {
     std::env::var("LORE_TEST_PG_URL").ok()
 }
 
+#[test]
+fn stale_clock_predicate_distinguishes_equality_from_one_millisecond_later() {
+    use lore_postgres::domain::receipts::TemporalClass;
+    use lore_postgres::domain::receipts::classify;
+
+    let clock = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let uuid_time = clock - Duration::from_secs(365 * 24 * 60 * 60);
+    assert_eq!(classify(uuid_time, clock), TemporalClass::Admissible);
+    assert_eq!(
+        classify(uuid_time, clock + Duration::from_millis(1)),
+        TemporalClass::Stale
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-receipts-live.ps1"]
+async fn receipt_retention_persists_both_later_of_arms_without_shortening_policy() {
+    let url = pg_url().expect("owned Postgres URL");
+    let store = connect_domain_store(&url).await;
+    let mut client = pg_client(&url).await;
+    let clock = capture_clock(&mut client).await;
+    for (uuid_time, uuid_arm_wins) in [
+        (clock - Duration::from_secs(2 * 24 * 60 * 60), false),
+        (clock, true),
+    ] {
+        let key = isolated_key(uuid_v7_at(uuid_time));
+        let binding = binding("lore.domain.v1.test/RetentionFormula");
+        let PrepareResult::Prepared { token, .. } = store
+            .domain_operation_prepare(&key, &binding, None, None)
+            .await
+            .unwrap()
+        else {
+            panic!("in-window retention fixture must prepare");
+        };
+        let tx = client.transaction().await.unwrap();
+        let ConsumeResult::Admitted(admission) =
+            consume(&tx, &key, &binding, &token).await.unwrap()
+        else {
+            panic!("owned prepared receipt must admit");
+        };
+        commit_terminal(
+            &tx,
+            &key,
+            &DomainOutcome::Applied,
+            None,
+            admission.admission_clock,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let row = client.query_one(
+            "SELECT full_result_expires_at=committed_at+interval '30 days', \
+             compact_expires_at=GREATEST(committed_at+interval '365 days',uuid_timestamp+interval '366 days'), \
+             compact_expires_at >= committed_at+interval '365 days', \
+             compact_expires_at >= uuid_timestamp+interval '366 days', \
+             uuid_timestamp+interval '366 days' > committed_at+interval '365 days' \
+             FROM lore_domain_operation_receipts WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+             AND tenant_scope_key=$3 AND operation_id=$4",
+            &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &key.operation_id.as_bytes().as_slice()],
+        ).await.unwrap();
+        for column in 0..4 {
+            assert!(
+                row.get::<_, bool>(column),
+                "retention formula column {column}, uuid_arm_wins={uuid_arm_wins}"
+            );
+        }
+        assert_eq!(
+            row.get::<_, bool>(4),
+            uuid_arm_wins,
+            "both distinct blockers must win in one fixture each"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-receipts-live.ps1"]
+async fn future_marker_retention_persists_uuid_arrival_plus_full_safety_horizon() {
+    let url = pg_url().expect("owned Postgres URL");
+    let store = connect_domain_store(&url).await;
+    let mut client = pg_client(&url).await;
+    let clock = capture_clock(&mut client).await;
+    let key = isolated_key(uuid_v7_at(clock + Duration::from_secs(25 * 60 * 60)));
+    let result = store
+        .domain_operation_prepare(
+            &key,
+            &binding("lore.domain.v1.test/FutureRetention"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        result,
+        PrepareResult::Committed(DomainOutcome::NotApplied { .. })
+    ));
+    let row = client.query_one(
+        "SELECT prune_after=GREATEST(rejected_at+interval '365 days',uuid_timestamp+interval '366 days'), \
+         prune_after > rejected_at+interval '365 days', prune_after=uuid_timestamp+interval '366 days' \
+         FROM lore_domain_operation_future_rejections WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+         AND tenant_scope_key=$3 AND operation_id=$4",
+        &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &key.operation_id.as_bytes().as_slice()],
+    ).await.unwrap();
+    for column in 0..3 {
+        assert!(row.get::<_, bool>(column));
+    }
+    assert_eq!(receipt_row_count(&client, &key).await, 0);
+}
+
 async fn connect_domain_store(url: &str) -> PostgresDomainStore {
     PostgresDomainStore::connect(url, 2, &TlsConfig::default())
         .await

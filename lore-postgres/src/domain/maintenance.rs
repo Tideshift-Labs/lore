@@ -607,20 +607,24 @@ fn proof_range_digest(
         .checked_sub(start)
         .and_then(|delta| delta.checked_add(1))
         .ok_or_else(|| DomainError::InvalidInput("invalid range bounds".to_owned()))?;
-    sha256_digest(
-        b"domain-marker-prune-interval-v3\0",
-        &[
-            &key.tenant_scope_key,
-            epoch,
-            &protocol.to_be_bytes(),
-            &quota.to_be_bytes(),
-            &(MARKER_INTERVAL_SCHEMA_REVISION_V3 as u64).to_be_bytes(),
-            &start.to_be_bytes(),
-            &end.to_be_bytes(),
-            &count.to_be_bytes(),
-            &end.to_be_bytes(),
-        ],
-    )
+    // CR-029 freezes this preimage as raw concatenation, unlike the framed
+    // completion-marker digest. Retained noncanonical ranges fail validation.
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    digest.update(b"domain-marker-prune-interval-v3\0");
+    digest.update(&key.tenant_scope_key);
+    digest.update(epoch);
+    for value in [
+        protocol,
+        quota,
+        MARKER_INTERVAL_SCHEMA_REVISION_V3 as u64,
+        start,
+        end,
+        count,
+        end,
+    ] {
+        digest.update(&value.to_be_bytes());
+    }
+    Ok(digest.finish().as_ref().to_vec())
 }
 
 fn proof_range_byte_charge(key: &ProofNamespaceKey) -> Result<i64, DomainError> {
@@ -637,6 +641,50 @@ fn proof_range_byte_charge(key: &ProofNamespaceKey) -> Result<i64, DomainError> 
         .ok_or_else(|| DomainError::Internal("proof range byte charge overflow".to_owned()))?;
     i64::try_from(bytes)
         .map_err(|_| DomainError::Internal("proof range byte charge exceeds i64".to_owned()))
+}
+
+/// Validate stored authority before consuming it as a merge input or release proof.
+/// A write must not repair a corrupt or cross-revision range by recomputing its digest.
+fn validated_proof_range(
+    row: &tokio_postgres::Row,
+    key: &ProofNamespaceKey,
+    epoch: &[u8],
+    protocol: i32,
+    quota: i32,
+    high_water: i64,
+) -> Result<ProofRange, DomainError> {
+    let corrupt = || DomainError::Internal("corrupt completion proof range".to_owned());
+    macro_rules! field {
+        ($name:literal, $ty:ty) => {
+            row.try_get::<_, $ty>($name).map_err(|_| corrupt())?
+        };
+    }
+    let start = field!("start_sequence", i64);
+    let end = field!("end_sequence", i64);
+    let digest = field!("interval_digest", Vec<u8>);
+    if protocol != RECEIPT_PROTOCOL_REVISION_V2
+        || quota < 1
+        || start < 1
+        || end < start
+        || end > high_water
+        || field!("sequence_count", i64) != end - start + 1
+        || field!("generation", i64) != end
+        || field!("protocol_revision", i32) != protocol
+        || field!("quota_revision", i32) != quota
+        || field!("marker_interval_schema_revision", i32) != MARKER_INTERVAL_SCHEMA_REVISION_V3
+        || field!("row_charge", i32) != 1
+        || field!("created_at_ms", i64) < 0
+        || field!("byte_charge", i64) != proof_range_byte_charge(key)?
+        || digest != proof_range_digest(key, epoch, protocol, quota, start, end)?
+    {
+        return Err(corrupt());
+    }
+    Ok(ProofRange {
+        start_sequence: start,
+        end_sequence: end,
+        digest,
+        generation: end,
+    })
 }
 
 fn completion_marker_byte_charge(
@@ -1797,15 +1845,31 @@ fn finish_terminal_ack(
         TerminalStatusAttachStatus::Invalid => 10,
         TerminalStatusAttachStatus::Phase2SequenceNotReady => 11,
     }];
-    ack.response_digest = canonical_digest(
-        b"domain-terminal-status-attachment-response-v1",
-        &[
-            &status,
-            input.key.operation_id.as_bytes(),
-            &input.request_digest,
-            &input.verification_digest,
-        ],
-    )?;
+    ack.response_digest = if let Some(range) = &ack.range {
+        // Post-prune recovery is a fresh proof, not a replay of the deleted marker ACK.
+        // Later merges may change the authoritative interval for this same request.
+        canonical_digest(
+            b"domain-terminal-status-attachment-response-v1",
+            &[
+                &status,
+                input.key.operation_id.as_bytes(),
+                &input.request_digest,
+                &input.verification_digest,
+                &range.digest,
+                &range.generation.to_be_bytes(),
+            ],
+        )?
+    } else {
+        canonical_digest(
+            b"domain-terminal-status-attachment-response-v1",
+            &[
+                &status,
+                input.key.operation_id.as_bytes(),
+                &input.request_digest,
+                &input.verification_digest,
+            ],
+        )?
+    };
     Ok(ack)
 }
 
@@ -1883,7 +1947,9 @@ async fn prune_completion_marker(
     })?;
     let neighbors = tx
         .query(
-            "SELECT start_sequence, end_sequence, created_at_ms, byte_charge \
+            "SELECT start_sequence, end_sequence, created_at_ms, byte_charge, sequence_count, \
+                    generation, interval_digest, protocol_revision, quota_revision, \
+                    marker_interval_schema_revision, row_charge \
              FROM lore_domain_tombstone_marker_prune_ranges \
              WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 \
                AND epoch=$4 AND end_sequence >= $5 AND start_sequence <= $6 \
@@ -1911,12 +1977,21 @@ async fn prune_completion_marker(
     }
     let mut start = sequence;
     let mut end = sequence;
-    let marker_created_ms = system_time_unix_millis(marker.get("created_at"))?;
-    let mut created_at_ms = marker_created_ms;
+    let mut created_at_ms = system_time_unix_millis(clock)?;
     let mut removed_range_bytes = 0_i64;
+    let protocol_revision: i32 = namespace.get("protocol_revision");
+    let quota_revision: i32 = namespace.get("quota_revision");
     for neighbor in &neighbors {
-        let neighbor_start: i64 = neighbor.get("start_sequence");
-        let neighbor_end: i64 = neighbor.get("end_sequence");
+        let checked = validated_proof_range(
+            neighbor,
+            &key,
+            &epoch,
+            protocol_revision,
+            quota_revision,
+            namespace.get("high_water"),
+        )?;
+        let neighbor_start = checked.start_sequence;
+        let neighbor_end = checked.end_sequence;
         let adjacent_left = neighbor_end.checked_add(1) == Some(sequence);
         let adjacent_right = sequence.checked_add(1) == Some(neighbor_start);
         if !adjacent_left && !adjacent_right {
@@ -1931,8 +2006,6 @@ async fn prune_completion_marker(
             .checked_add(neighbor.get("byte_charge"))
             .ok_or_else(|| DomainError::Internal("completion prune bytes overflow".to_owned()))?;
     }
-    let protocol_revision: i32 = namespace.get("protocol_revision");
-    let quota_revision: i32 = namespace.get("quota_revision");
     let digest = proof_range_digest(&key, &epoch, protocol_revision, quota_revision, start, end)?;
     let range_bytes = proof_range_byte_charge(&key)?;
     let range_count = i64::try_from(neighbors.len())
@@ -2498,11 +2571,20 @@ pub async fn terminal_status_attach(
             return finish_terminal_ack(input, ack);
         }
         if input.action == TerminalStatusAttachAction::TombstoneReleaseIntentComplete {
-            let namespace = tx.query_opt(
-                "SELECT epoch, high_water FROM lore_domain_proof_namespaces WHERE verified_issuer=$1 \
+            let namespace = tx
+                .query_opt(
+                    "SELECT epoch, high_water, org_uuid, protocol_revision, quota_revision \
+                 FROM lore_domain_proof_namespaces WHERE verified_issuer=$1 \
                  AND authenticated_subject=$2 AND tenant_scope_key=$3 AND state <> $4 FOR UPDATE",
-                &[key[0],key[1],key[2],&schema_mediated::NAMESPACE_STATE_RETIRED],
-            ).await.map_err(|e| DomainError::from_pg("post-prune namespace lock", e))?;
+                    &[
+                        key[0],
+                        key[1],
+                        key[2],
+                        &schema_mediated::NAMESPACE_STATE_RETIRED,
+                    ],
+                )
+                .await
+                .map_err(|e| DomainError::from_pg("post-prune namespace lock", e))?;
             if let Some(namespace) = namespace {
                 let epoch: Vec<u8> = namespace.get("epoch");
                 let tombstone_digest = input
@@ -2518,7 +2600,9 @@ pub async fn terminal_status_attach(
                 }
                 let range = tx
                     .query_opt(
-                        "SELECT start_sequence, end_sequence, interval_digest, generation \
+                        "SELECT start_sequence, end_sequence, interval_digest, generation, \
+                                sequence_count, protocol_revision, quota_revision, \
+                                marker_interval_schema_revision, row_charge, byte_charge, created_at_ms \
                      FROM lore_domain_tombstone_marker_prune_ranges \
                      WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 \
                        AND epoch=$4 AND start_sequence <= $5 AND end_sequence >= $5 FOR UPDATE",
@@ -2533,12 +2617,20 @@ pub async fn terminal_status_attach(
                     .await
                     .map_err(|e| DomainError::from_pg("post-prune containing range", e))?;
                 if let Some(range) = range {
-                    let proof = ProofRange {
-                        start_sequence: range.get("start_sequence"),
-                        end_sequence: range.get("end_sequence"),
-                        digest: range.get("interval_digest"),
-                        generation: range.get("generation"),
+                    let namespace_key = ProofNamespaceKey {
+                        verified_issuer: input.key.verified_issuer.clone(),
+                        authenticated_subject: input.key.authenticated_subject.clone(),
+                        tenant_scope_key: input.key.tenant_scope_key.clone(),
+                        org_uuid: namespace.get("org_uuid"),
                     };
+                    let proof = validated_proof_range(
+                        &range,
+                        &namespace_key,
+                        &epoch,
+                        namespace.get("protocol_revision"),
+                        namespace.get("quota_revision"),
+                        namespace.get("high_water"),
+                    )?;
                     let mut ack =
                         empty_terminal_ack(TerminalStatusAttachStatus::Phase2PostPruneRecovery);
                     ack.fields[8] = Some(expected);

@@ -38,6 +38,8 @@ $inventory = @(
         Exact = $true
         ExactPrefixes = @()
         Cases = @(
+            'receipt_retention_persists_both_later_of_arms_without_shortening_policy',
+            'future_marker_retention_persists_uuid_arrival_plus_full_safety_horizon',
             'deterministic_same_attempt_admission_waits_for_the_original_token',
             'deterministic_changed_intent_admission_cannot_obtain_the_original_token',
             'deterministic_serializable_admission_loser_returns_contention_without_token',
@@ -129,7 +131,7 @@ function Get-TestCatalog {
         # warnings are evidence output, not runner setup failures; the native exit code remains the
         # authority for success.
         $ErrorActionPreference = 'Continue'
-        $listArgs = @('test', '-p', $Package)
+        $listArgs = @('test', '-p', $Package, '-j', '4')
         if ($Target -eq 'lib') {
             $listArgs += '--lib'
         }
@@ -289,7 +291,7 @@ try {
             $priorErrorAction = $ErrorActionPreference
             try {
                 $ErrorActionPreference = 'Continue'
-                $cargoArgs = @('test', '-p', $result.Package)
+                $cargoArgs = @('test', '-p', $result.Package, '-j', '4')
                 if ($result.Target -eq 'lib') {
                     $cargoArgs += '--lib'
                 }
@@ -310,6 +312,8 @@ try {
                 )
             }
 
+            # Preserve the actual Rust summary once for machine-readable evidence.
+            Write-Host $output
             $runningMatch = [regex]::Match($output, 'running (\d+) tests?')
             $resultMatch = [regex]::Match(
                 $output,
@@ -330,11 +334,11 @@ try {
             }
             elseif ($result.Ran -eq 1) {
                 $result.Status = 'FAIL'
-                Write-Warning "  FAIL`n$output"
+                Write-Warning '  FAIL'
             }
             else {
                 $result.Status = 'NOT RUN'
-                Write-Warning "  NOT RUN`n$output"
+                Write-Warning '  NOT RUN'
             }
         }
     }

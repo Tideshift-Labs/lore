@@ -257,7 +257,6 @@ async fn namespace_state_reads_one_snapshot_across_concurrent_retirement() {
         &1_u64.to_be_bytes(),
         &1_u64.to_be_bytes(),
     ] {
-        hasher.update(&(part.len() as u32).to_be_bytes());
         hasher.update(part);
     }
     let range_digest = hasher.finish().as_ref().to_vec();
@@ -2904,4 +2903,685 @@ async fn retire_rejects_nonquiescent_namespace_and_changed_epoch_claim_without_m
         .expect("count surviving namespace")
         .get(0);
     assert_eq!(remaining, 1, "neither rejection may delete the namespace");
+}
+
+/// Build real committed markers in one namespace. Deadline ageing is fixture-only;
+/// the production 365-day retention policy remains in force.
+async fn completed_marker_fixture(
+    store: &PostgresDomainStore,
+    direct: &mut Client,
+    count: usize,
+) -> (
+    ProofNamespaceMaterializeInput,
+    Vec<TerminalStatusAttachInput>,
+) {
+    let clock = store.domain_operation_clock_get().await.unwrap();
+    let first = prepare_operation_ready_for_completion(store, direct, clock, None).await;
+    let namespace = ProofNamespaceKey {
+        verified_issuer: first.stale.key.verified_issuer.clone(),
+        authenticated_subject: first.stale.key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: first.stale.key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_materialize(&materialize)
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+    let mut requests = vec![completion_request(&first, &materialize.namespace_epoch, 1)];
+    for ordinal in 1..count {
+        let operation = prepare_operation_ready_for_completion(
+            store,
+            direct,
+            clock + Duration::from_secs(ordinal as u64),
+            Some(&first.stale.key),
+        )
+        .await;
+        requests.push(completion_request(
+            &operation,
+            &materialize.namespace_epoch,
+            ordinal as i64 + 1,
+        ));
+    }
+    for request in &requests {
+        assert_eq!(
+            store
+                .domain_operation_terminal_status_attach(request)
+                .await
+                .unwrap()
+                .status,
+            TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+        );
+        let key = &request.key;
+        direct.execute(
+            "UPDATE lore_domain_operation_tombstone_release_completion_markers \
+             SET created_at=to_timestamp(1000 + sequence), retain_until=to_timestamp(2000) \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+            &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &key.operation_id.as_bytes().as_slice()],
+        ).await.unwrap();
+    }
+    (materialize, requests)
+}
+
+async fn assert_corrupt_neighbor_refused(column: &str, replay_pruned: bool) {
+    let url =
+        pg_url().expect("owned Postgres URL is required for an explicitly selected live test");
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let (_, requests) = completed_marker_fixture(&store, &mut direct, 2).await;
+    let first = store
+        .domain_operation_terminal_status_attach(&requests[0])
+        .await
+        .unwrap();
+    assert_eq!(
+        first.status,
+        TerminalStatusAttachStatus::Phase2PostPruneRecovery
+    );
+    let replacement = match column {
+        "protocol_revision" => "protocol_revision + 1",
+        "quota_revision" => "quota_revision + 1",
+        "interval_digest" => "decode(repeat('ff', 32), 'hex')",
+        _ => panic!("unknown fixture corruption"),
+    };
+    let key = &requests[0].key;
+    let sql = format!(
+        "UPDATE lore_domain_tombstone_marker_prune_ranges SET {column}={replacement} \
+         WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND start_sequence=1"
+    );
+    assert_eq!(
+        direct
+            .execute(
+                &sql,
+                &[
+                    &key.verified_issuer,
+                    &key.authenticated_subject,
+                    &key.tenant_scope_key
+                ]
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let before = domain_rows(&direct).await;
+    let request = &requests[usize::from(!replay_pruned)];
+    let result = store.domain_operation_terminal_status_attach(request).await;
+    assert!(
+        matches!(result, Err(DomainError::Internal(_))),
+        "corrupt adjacent {column} must fail closed instead of being normalized by a merge: {result:?}"
+    );
+    assert_eq!(
+        domain_rows(&direct).await,
+        before,
+        "refused merge must leave every domain row and counter unchanged"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_prune_rejects_neighbor_protocol_revision_without_mutation() {
+    assert_corrupt_neighbor_refused("protocol_revision", false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_prune_rejects_neighbor_quota_revision_without_mutation() {
+    assert_corrupt_neighbor_refused("quota_revision", false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_prune_rejects_neighbor_digest_without_mutation() {
+    assert_corrupt_neighbor_refused("interval_digest", false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_recovery_rejects_range_protocol_revision_without_mutation() {
+    assert_corrupt_neighbor_refused("protocol_revision", true).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_recovery_rejects_range_quota_revision_without_mutation() {
+    assert_corrupt_neighbor_refused("quota_revision", true).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_recovery_rejects_range_digest_without_mutation() {
+    assert_corrupt_neighbor_refused("interval_digest", true).await;
+}
+
+fn expected_range_digest(
+    materialize: &ProofNamespaceMaterializeInput,
+    start: u64,
+    end: u64,
+) -> Vec<u8> {
+    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    for part in [
+        b"domain-marker-prune-interval-v3\0".as_slice(),
+        materialize.key.tenant_scope_key.as_slice(),
+        materialize.namespace_epoch.as_slice(),
+        &2_u64.to_be_bytes(),
+        &(materialize.platform_capacity_revision as u64).to_be_bytes(),
+        &3_u64.to_be_bytes(),
+        &start.to_be_bytes(),
+        &end.to_be_bytes(),
+        &(end - start + 1).to_be_bytes(),
+        &end.to_be_bytes(),
+    ] {
+        hasher.update(part);
+    }
+    hasher.finish().as_ref().to_vec()
+}
+
+#[test]
+fn interval_digest_matches_independent_raw_concat_golden_vector() {
+    let mut materialize = materialize_input(namespace_key(), 0, 1);
+    materialize.key.tenant_scope_key = (0_u8..16).collect();
+    materialize.namespace_epoch = (16_u8..32).collect();
+    // Independently computed with .NET SHA256 over a literal 120-byte CR-029
+    // preimage, not produced by either the Lore helper or this test encoder.
+    assert_eq!(
+        expected_range_digest(&materialize, 5, 9),
+        [
+            0x74, 0xd5, 0xb1, 0x5a, 0x4b, 0xe9, 0xb0, 0x5f, 0x29, 0xd9, 0x0a, 0xdb, 0xe4, 0xcd,
+            0x31, 0xa3, 0xb8, 0xaf, 0xe6, 0x26, 0x55, 0x23, 0xdf, 0x19, 0xe6, 0xea, 0x4a, 0x56,
+            0xd5, 0xa8, 0x2e, 0x38
+        ]
+    );
+}
+
+async fn assert_completion_merge_order(order: [usize; 3]) {
+    let url = pg_url().expect("owned Postgres URL");
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    {
+        let (materialize, requests) = completed_marker_fixture(&store, &mut direct, 5).await;
+        let key = &materialize.key;
+        let successor = store
+            .domain_operation_terminal_status_attach(&requests[4])
+            .await
+            .unwrap();
+        assert_eq!(
+            successor.status,
+            TerminalStatusAttachStatus::Phase2PostPruneRecovery
+        );
+        let successor_sql = "SELECT row_to_json(r)::text || ':' || xmin::text FROM lore_domain_tombstone_marker_prune_ranges r \
+            WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND start_sequence=5";
+        let successor_before: String = direct
+            .query_one(
+                successor_sql,
+                &[
+                    &key.verified_issuer,
+                    &key.authenticated_subject,
+                    &key.tenant_scope_key,
+                ],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let mut singleton_times = Vec::new();
+        for index in order {
+            let lower: i64 = direct
+                .query_one(
+                    "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let pruned = store
+                .domain_operation_terminal_status_attach(&requests[index])
+                .await
+                .unwrap();
+            assert_eq!(
+                pruned.status,
+                TerminalStatusAttachStatus::Phase2PostPruneRecovery
+            );
+            let upper: i64 = direct
+                .query_one(
+                    "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            let range = pruned.range.unwrap();
+            let created: i64 = direct.query_one(
+                "SELECT created_at_ms FROM lore_domain_tombstone_marker_prune_ranges WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND start_sequence=$4",
+                &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &range.start_sequence],
+            ).await.unwrap().get(0);
+            if range.start_sequence == range.end_sequence {
+                assert!(
+                    (lower..=upper).contains(&created),
+                    "singleton stores prune DB clock, not the aged marker clock: {created} outside {lower}..={upper}"
+                );
+                singleton_times.push(created);
+            }
+        }
+        let successor_after: String = direct
+            .query_one(
+                successor_sql,
+                &[
+                    &key.verified_issuer,
+                    &key.authenticated_subject,
+                    &key.tenant_scope_key,
+                ],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(
+            successor_after, successor_before,
+            "a merge must not rewrite a non-adjacent successor"
+        );
+        let ranges = direct.query(
+            "SELECT start_sequence,end_sequence,sequence_count,generation,created_at_ms,row_charge,byte_charge,interval_digest \
+             FROM lore_domain_tombstone_marker_prune_ranges WHERE verified_issuer=$1 AND authenticated_subject=$2 \
+             AND tenant_scope_key=$3 ORDER BY start_sequence",
+            &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key],
+        ).await.unwrap();
+        assert_eq!(ranges.len(), 2);
+        let merged = &ranges[0];
+        let values: Vec<i64> = (0..5).map(|column| merged.get(column)).collect();
+        assert_eq!(
+            values,
+            vec![1, 3, 3, 3, *singleton_times.iter().min().unwrap()]
+        );
+        assert_eq!(merged.get::<_, i32>(5), 1);
+        let expected_bytes = (key.verified_issuer.len()
+            + key.authenticated_subject.len()
+            + key.tenant_scope_key.len()
+            + 16
+            + 6 * 8
+            + 32) as i64;
+        assert_eq!(merged.get::<_, i64>(6), expected_bytes);
+        assert_eq!(
+            merged.get::<_, Vec<u8>>(7),
+            expected_range_digest(&materialize, 1, 3)
+        );
+        let counters = direct.query_one(
+            "SELECT (SELECT retained_marker_count FROM lore_domain_proof_namespaces WHERE epoch=$1), \
+             (SELECT fragment_count FROM lore_domain_proof_namespaces WHERE epoch=$1), \
+             g.retained_marker_count,g.fragment_count,g.fragment_bytes,g.marker_bytes, \
+             o.retained_marker_count,o.fragment_count,o.fragment_bytes,o.marker_bytes, \
+             (SELECT byte_charge FROM lore_domain_operation_tombstone_release_completion_markers WHERE namespace_epoch=$1 AND sequence=4) \
+             FROM lore_domain_proof_global_counters g CROSS JOIN lore_domain_proof_org_counters o WHERE g.id=1 AND o.org_uuid=$2",
+            &[&materialize.namespace_epoch, &key.org_uuid],
+        ).await.unwrap();
+        let marker_bytes: i64 = counters.get(10);
+        let actual: Vec<i64> = (0..10).map(|column| counters.get(column)).collect();
+        assert_eq!(
+            actual,
+            vec![
+                1,
+                2,
+                1,
+                2,
+                expected_bytes * 2,
+                marker_bytes,
+                1,
+                2,
+                expected_bytes * 2,
+                marker_bytes
+            ]
+        );
+        let replay = store
+            .domain_operation_terminal_status_attach(&requests[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            replay.range.unwrap().digest,
+            expected_range_digest(&materialize, 1, 3)
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_prune_bridge_merge_preserves_distant_successor_and_counters() {
+    assert_completion_merge_order([0, 2, 1]).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_prune_reverse_merge_preserves_distant_successor_and_counters() {
+    assert_completion_merge_order([2, 1, 0]).await;
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_recovery_response_digest_tracks_merged_interval_while_marker_replay_is_stable()
+{
+    let url = pg_url().expect("owned Postgres URL");
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let (_, requests) = completed_marker_fixture(&store, &mut direct, 2).await;
+    let key = &requests[0].key;
+    direct.execute("UPDATE lore_domain_operation_tombstone_release_completion_markers SET retain_until=clock_timestamp()+interval '5 minutes' WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND sequence=1",
+        &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key]).await.unwrap();
+    let retained = store
+        .domain_operation_terminal_status_attach(&requests[0])
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.status,
+        TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+    );
+    assert_eq!(
+        store
+            .domain_operation_terminal_status_attach(&requests[0])
+            .await
+            .unwrap(),
+        retained
+    );
+    direct.execute("UPDATE lore_domain_operation_tombstone_release_completion_markers SET retain_until=clock_timestamp()-interval '1 second' WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND sequence=1",
+        &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key]).await.unwrap();
+    let singleton = store
+        .domain_operation_terminal_status_attach(&requests[0])
+        .await
+        .unwrap();
+    assert_eq!(
+        singleton.status,
+        TerminalStatusAttachStatus::Phase2PostPruneRecovery
+    );
+    assert_eq!(
+        store
+            .domain_operation_terminal_status_attach(&requests[0])
+            .await
+            .unwrap(),
+        singleton
+    );
+    let merged = store
+        .domain_operation_terminal_status_attach(&requests[1])
+        .await
+        .unwrap();
+    assert_eq!(
+        merged.status,
+        TerminalStatusAttachStatus::Phase2PostPruneRecovery
+    );
+    let after_merge = store
+        .domain_operation_terminal_status_attach(&requests[0])
+        .await
+        .unwrap();
+    assert_eq!(
+        after_merge.status,
+        TerminalStatusAttachStatus::Phase2PostPruneRecovery
+    );
+    assert_ne!(
+        after_merge.range, singleton.range,
+        "the same exact request now observes the merged interval"
+    );
+    assert_ne!(
+        after_merge.response_digest, singleton.response_digest,
+        "post-prune response digest must bind the current interval digest/generation"
+    );
+    assert_eq!(
+        store
+            .domain_operation_terminal_status_attach(&requests[0])
+            .await
+            .unwrap(),
+        after_merge
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn materialization_replay_from_retired_epoch_cannot_resurrect_or_charge_new_epoch() {
+    let url = pg_url().expect("owned Postgres URL");
+    let store = store(&url).await;
+    let direct = client(&url).await;
+    let namespace = namespace_key();
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let old = materialize_input(namespace.clone(), counter, quota);
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_materialize(&old)
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_retire(&retire_input(&old))
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceRetireStatus::Retired
+    );
+    let (counter, quota) = capacity_pair(&direct).await;
+    let new = materialize_input(namespace, counter, quota);
+    assert_ne!(new.namespace_epoch, old.namespace_epoch);
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_materialize(&new)
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+    let before = domain_rows(&direct).await;
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_materialize(&old)
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceMaterializeStatus::Mismatch
+    );
+    assert_eq!(domain_rows(&direct).await, before);
+}
+
+/// The real writer chooses each retention arm once. Only after checking those
+/// persisted deadlines do we shorten this fixture's deadline to exercise the
+/// reader on either side. This is bounded transition proof, not a live-year wait.
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn completion_retention_persists_each_later_of_arm_and_refuses_early_prune() {
+    let url = pg_url().expect("owned Postgres URL");
+    let store = store(&url).await;
+    let mut direct = client(&url).await;
+    let clock = store.domain_operation_clock_get().await.unwrap();
+    let old = prepare_operation_ready_for_completion(&store, &mut direct, clock, None).await;
+    let current = prepare_operation_ready_for_completion(
+        &store,
+        &mut direct,
+        clock + Duration::from_secs(366 * 24 * 60 * 60),
+        Some(&old.stale.key),
+    )
+    .await;
+    let namespace = ProofNamespaceKey {
+        verified_issuer: old.stale.key.verified_issuer.clone(),
+        authenticated_subject: old.stale.key.authenticated_subject.clone(),
+        org_uuid: rand::random::<[u8; 16]>().to_vec(),
+        tenant_scope_key: old.stale.key.tenant_scope_key.clone(),
+    };
+    let (counter, quota) = provision_capacity(&direct, &namespace.org_uuid).await;
+    let materialize = materialize_input(namespace, counter, quota);
+    assert_eq!(
+        store
+            .domain_operation_proof_namespace_materialize(&materialize)
+            .await
+            .unwrap()
+            .status,
+        ProofNamespaceMaterializeStatus::Materialized
+    );
+    for (ordinal, operation) in [old, current].iter().enumerate() {
+        let request =
+            completion_request(operation, &materialize.namespace_epoch, ordinal as i64 + 1);
+        assert_eq!(
+            store
+                .domain_operation_terminal_status_attach(&request)
+                .await
+                .unwrap()
+                .status,
+            TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+        );
+        let key = &request.key;
+        let uuid_time =
+            lore_postgres::domain::receipts::uuid_v7_timestamp(&key.operation_id).unwrap();
+        let row = direct.query_one(
+            "SELECT retain_until=GREATEST(created_at+interval '365 days',$5::timestamptz+interval '366 days'), \
+             $5::timestamptz+interval '366 days' > created_at+interval '365 days' \
+             FROM lore_domain_operation_tombstone_release_completion_markers \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+            &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &key.operation_id.as_bytes().as_slice(), &uuid_time],
+        ).await.unwrap();
+        assert!(
+            row.get::<_, bool>(0),
+            "persisted deadline must preserve both 365d and UUID+366d blockers"
+        );
+        assert_eq!(
+            row.get::<_, bool>(1),
+            ordinal == 1,
+            "each later-of arm must win once"
+        );
+        direct.execute(
+            "UPDATE lore_domain_operation_tombstone_release_completion_markers SET retain_until=clock_timestamp()+interval '5 minutes' \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+            &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &key.operation_id.as_bytes().as_slice()],
+        ).await.unwrap();
+        let before = domain_rows(&direct).await;
+        assert_eq!(
+            store
+                .domain_operation_terminal_status_attach(&request)
+                .await
+                .unwrap()
+                .status,
+            TerminalStatusAttachStatus::Phase2ReleaseCompletionReady
+        );
+        assert_eq!(
+            domain_rows(&direct).await,
+            before,
+            "future deadline must preserve the marker and every charge"
+        );
+        direct.execute(
+            "UPDATE lore_domain_operation_tombstone_release_completion_markers \
+             SET created_at=clock_timestamp()-interval '2 seconds',retain_until=clock_timestamp()-interval '1 second' \
+             WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND operation_id=$4",
+            &[&key.verified_issuer, &key.authenticated_subject, &key.tenant_scope_key, &key.operation_id.as_bytes().as_slice()],
+        ).await.unwrap();
+        assert_eq!(
+            store
+                .domain_operation_terminal_status_attach(&request)
+                .await
+                .unwrap()
+                .status,
+            TerminalStatusAttachStatus::Phase2PostPruneRecovery
+        );
+    }
+}
+
+/// Only this owned test transaction resolves clock_timestamp through a database
+/// fixture. The shipped coordinator and database defaults keep their real clock.
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn stale_finalize_database_clock_equality_then_one_millisecond_commits_exactly_once() {
+    let url = pg_url().expect("owned Postgres URL");
+    let _store = store(&url).await;
+    let mut direct = client(&url).await;
+    direct.batch_execute(
+        "CREATE SCHEMA wp115_clock; \
+         CREATE TABLE wp115_clock.instant (singleton boolean PRIMARY KEY CHECK(singleton), now timestamptz NOT NULL); \
+         CREATE FUNCTION wp115_clock.clock_timestamp() RETURNS timestamptz LANGUAGE SQL VOLATILE \
+         AS 'SELECT now FROM wp115_clock.instant WHERE singleton';"
+    ).await.unwrap();
+    let clock = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    direct
+        .execute(
+            "INSERT INTO wp115_clock.instant VALUES (true,$1)",
+            &[&clock],
+        )
+        .await
+        .unwrap();
+    let input = stale_input(clock + Duration::from_secs(24 * 60 * 60));
+    assert_eq!(
+        lore_postgres::domain::receipts::uuid_v7_timestamp(&input.key.operation_id).unwrap(),
+        clock - Duration::from_secs(365 * 24 * 60 * 60)
+    );
+    let before = domain_rows(&direct).await;
+    let tx = direct.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL search_path=wp115_clock,pg_catalog,public")
+        .await
+        .unwrap();
+    assert_eq!(
+        admission_clock(&tx).await.unwrap(),
+        clock,
+        "the unchanged production SQL must resolve the held database clock"
+    );
+    let equality = lore_postgres::domain::maintenance::verified_stale_finalize(&tx, &input)
+        .await
+        .unwrap();
+    assert_eq!(
+        equality.status,
+        VerifiedStaleFinalizeStatus::NotEligibleNotStale
+    );
+    assert_eq!(equality.stale_finalize_clock, Some(clock));
+    tx.commit().await.unwrap();
+    assert_eq!(
+        domain_rows(&direct).await,
+        before,
+        "equality cannot manufacture any receipt, fence, or charge"
+    );
+
+    // Treat the equality reply as lost: retain the exact request and permit,
+    // advance only the database fixture clock, and invoke the production body.
+    direct
+        .execute(
+            "UPDATE wp115_clock.instant SET now=now+interval '1 millisecond'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let later = clock + Duration::from_millis(1);
+    let tx = direct.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL search_path=wp115_clock,pg_catalog,public")
+        .await
+        .unwrap();
+    assert_eq!(admission_clock(&tx).await.unwrap(), later);
+    let committed = lore_postgres::domain::maintenance::verified_stale_finalize(&tx, &input)
+        .await
+        .unwrap();
+    assert_eq!(committed.status, VerifiedStaleFinalizeStatus::Committed);
+    assert_eq!(committed.stale_finalize_clock, Some(later));
+    tx.commit().await.unwrap();
+    let after_commit = domain_rows(&direct).await;
+    let tx = direct.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL search_path=wp115_clock,pg_catalog,public")
+        .await
+        .unwrap();
+    let replay = lore_postgres::domain::maintenance::verified_stale_finalize(&tx, &input)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        replay, committed,
+        "same permit and request must replay the original committed bytes"
+    );
+    assert_eq!(domain_rows(&direct).await, after_commit);
+    let count: i64 = direct
+        .query_one("SELECT count(*) FROM lore_domain_operation_receipts", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(count, 1);
+    let tx = direct.transaction().await.unwrap();
+    let real_clock = admission_clock(&tx).await.unwrap();
+    tx.rollback().await.unwrap();
+    let actual: SystemTime = direct
+        .query_one("SELECT pg_catalog.clock_timestamp()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        actual.duration_since(real_clock).unwrap() < Duration::from_secs(5),
+        "SET LOCAL must not leak the fixture clock into later transactions"
+    );
 }
