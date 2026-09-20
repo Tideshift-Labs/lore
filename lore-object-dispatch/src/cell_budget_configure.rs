@@ -19,7 +19,12 @@ use crate::dispatch_pool::DispatchPoolRole;
 use crate::dispatch_pool::DispatchRuntimePool;
 use crate::dispatch_pool::DispatchTlsMode;
 
-pub const LOCAL_BUDGET_REVISION: &str = "local-cell-budget-policy-v1";
+pub const LEGACY_LOCAL_BUDGET_REVISION: &str = "local-cell-budget-policy-v1";
+pub const LOCAL_BUDGET_REVISION: &str = "local-cell-budget-policy-v2";
+
+#[cfg(test)]
+#[path = "cell_budget_configure_tests.rs"]
+mod tests;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -128,7 +133,8 @@ impl LocalBudgetConfiguration {
                             })
                     })
             });
-        if self.schema_revision != LOCAL_BUDGET_REVISION
+        if ![LEGACY_LOCAL_BUDGET_REVISION, LOCAL_BUDGET_REVISION]
+            .contains(&self.schema_revision.as_str())
             || self.provenance != "operator-selected-local-development-limit-v1"
             || ![
                 &self.cell_id,
@@ -144,6 +150,8 @@ impl LocalBudgetConfiguration {
             || self.evidence_reference.is_empty()
             || self.evidence_reference.len() > 512
             || self.issued_at_unix_ms < 0
+            || (self.schema_revision == LOCAL_BUDGET_REVISION
+                && self.issued_at_unix_ms > 0xffff_ffff_ffff)
             || !horizon.is_some_and(|h| (60_000..=86_400_000).contains(&h))
             || self.allocation_fence == 0
             || self.allocation_fence > i64::MAX as u64
@@ -283,9 +291,7 @@ async fn configure_budget_inner(
         "Commit0 local development budget envelope v1",
         disposition.as_bytes(),
     );
-    let mut uuid_bytes = [0; 16];
-    uuid_bytes.copy_from_slice(&disposition.as_bytes()[..16]);
-    let disposition_id = Uuid::from_bytes(uuid_bytes);
+    let disposition_id = local_disposition_id(config, &disposition);
     let dimensions = serde_json::json!([{
         "dimensionId":"local-policy-requests", "effectiveBound":config.shared_units,
         "measuredLoad":0, "targetDemand":0, "failureReserve":0,
@@ -389,6 +395,20 @@ async fn configure_budget_inner(
         disposition_digest: disposition.to_hex().to_string(),
         envelope_digest: envelope.to_hex().to_string(),
     })
+}
+
+// Keep v1 byte-identical for retained configuration replay. A v2 successor can name that
+// exact opaque predecessor through the local projection API, then serve as a UUIDv7
+// predecessor for the canonical capacity publisher. Neither path rewrites prior records.
+fn local_disposition_id(config: &LocalBudgetConfiguration, disposition: &blake3::Hash) -> Uuid {
+    let mut bytes = [0; 16];
+    bytes.copy_from_slice(&disposition.as_bytes()[..16]);
+    if config.schema_revision == LOCAL_BUDGET_REVISION {
+        bytes[..6].copy_from_slice(&config.issued_at_unix_ms.to_be_bytes()[2..]);
+        bytes[6] = (bytes[6] & 0x0f) | 0x70;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    }
+    Uuid::from_bytes(bytes)
 }
 
 const PUBLISH_SQL: &str = "SELECT r.result_code FROM

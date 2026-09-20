@@ -209,20 +209,20 @@ grant CAS with its own UUIDv7 identity. Migration 0021 is exactly 8,543 bytes wi
 `3387f71079d81552e97226144e3f8526706f197d6eedb23af9af5a41ac43fb31`; migration 0022 is exactly
 57,061 bytes with BLAKE3-256
 `7d471d4524dec97f0108b57d586f99676e48721860bb78b1710b6d6a7e979c34`.
-Publication is maintenance-only, parameterized, and callable only by the authenticated maintenance
-database role. It stores distinct core, disposition, and envelope target projections and enforces
-the frozen revision grammar and exact fence sequence, the cell-scoped schema and target agreement,
-the headroom identity, cache completeness, supplied digest links, and the persisted predecessor/head
-revision chain. Resolution rechecks those projections and their predecessor row before any charge.
-This cell-local surface does not recreate the deleted cross-cell validator or claim to decode the
-platform's canonical records; a future publication adapter must authenticate and project those
-records before using this maintenance-only function. Charging is runtime-only and serializable. One database clock evaluates the
-deadline, hard expiry, and rolling refill. The grant CAS and all applicable bucket debits commit in
-one transaction. The physical bucket, traffic-class bucket, and listing bucket cannot split or
-partially debit. Rotation refills the prior bucket to the rotation clock, converts its remaining
-depletion into the new bucket scale without rounding capacity upward, and carries that depletion
-into the new fence. An unchanged physical ceiling therefore never reseeds at full capacity. No
-configuration row is installed by either migration.
+Parameterized publication requires the authenticated maintenance role. It stores core, disposition
+and envelope projections; checks revision grammar, fence sequence, cell/schema/target agreement,
+headroom, cache completeness, digest links and the predecessor chain. Resolution rechecks the
+projections and predecessor before charging. This local surface neither decodes canonical platform
+records nor replaces cross-cell validation; the publication adapter must authenticate and project
+them. Runtime-only serializable charging uses one database clock for deadlines, expiry and refill.
+The grant CAS and all physical, traffic-class and listing debits are atomic. Rotation refills to
+that clock, then rescales and carries depletion without rounding capacity upward. An unchanged
+physical ceiling never reseeds at full capacity. Neither migration installs a configuration row.
+
+Local budget policy V2 produces deterministic UUIDv7 disposition identities; V1 keeps its original
+serialization, digests and opaque UUIDs for exact replay. Existing V1 state needs an explicit local
+V2 successor before canonical publication. Follow the
+[local transition procedure](../../lorehub/docs/runbooks/local-capacity-acceptance.md#restart-after-capacity-publication).
 
 The Stage-3 digest chain has a specific proof limit. `core_record_digest`,
 `disposition_record_digest`, and `final_budget_vector_digest` are caller-supplied opaque bytes. The

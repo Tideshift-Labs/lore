@@ -99,6 +99,16 @@ topic — chronological execution notes belong in `docs/worklogs/`.
 
 ### Fixtures and white-box seams
 
+- **Versioned derivation must preserve retained identity.** A new default revision can move every
+  fixture to the new derivation while silently breaking replay of old rows. Pin old serialized
+  bytes, digest chains, and UUID literals independently of the default revision constant. Local
+  budget V1's raw digest UUID is not necessarily UUIDv7; normalizing it would change its identity.
+  Test the explicit V2 successor against that exact opaque predecessor, with old rows unchanged
+  and prior depletion retained. Source and pins: `lore-object-dispatch/src/cell_budget_configure.rs`
+  (`local_disposition_id`) and `src/cell_budget_configure_tests.rs` in that crate. Exercise expired
+  V1 reconciliation and succession with `pwsh -File lore-object-dispatch/tests/run-budget-configure-live.ps1`;
+  it owns a container and a fresh database per test. Never point it at a retained cell. This local
+  publication proof does not establish the subsequent canonical publisher or application bridge.
 - A same-file `#[cfg(test)] mod tests` can inspect private state; a sibling module cannot.
 - Handler tests can use real in-memory stores and call handlers directly without a live gRPC server.
 - Pick the immutable-store fixture by behavior: canned response, unconditional failure, or a wrapper
@@ -591,4 +601,3 @@ already available — no WSL Rust toolchain install needed. Recipe, proven 2026-
   with both sockets held at once. Guard: `scripts/test/test_allocate_free_port.py` asserts the
   candidates are not sequential (revert-checked RED against the old `bind(0)` source: `span 11
   across 12 calls`).
-
