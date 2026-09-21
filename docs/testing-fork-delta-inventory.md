@@ -644,6 +644,17 @@ delta produced. Keep it durable, not chronological — chronological execution n
     writing -- check `domain/fragments/creation.rs` before trusting any future claim that Stage mode
     works live.
 
+- **CR-035 write-behind backpressure is not unreadiness [SERVER,
+  `lore-server/src/fragment_write_behind.rs`]**: `classify_pass`/`record_pass_outcome`/
+  `readiness_reason` are pure and fixture-free — this loop body had zero assertions anywhere in
+  the fork before this change. A `SlowDown` pass advances the loop clock but never the progress
+  clock, records a backpressure run's *start* (not its latest stall) in `*_backpressure_since`,
+  and clears it on the next `Advanced` pass; any other `Err` still freezes both clocks, so a
+  genuine wedge ages out to `worker_stale`/`cleanup_stale` unchanged. The two new
+  sustained-backpressure reasons sit below the stale-clock checks in `readiness_reason`'s
+  first-match order, so a real wedge still outranks them, and the two loops (drain/cleanup) track
+  independently. Gate: `cargo test -p lore-server --lib fragment_write_behind`.
+
 - **WP-122 L5 [SERVER]**: `staged_drain_candidates` (bounded plan query, `lore-postgres`) and
   `LinuxSpoolWriter` (drain-body placement, `lore-object-dispatch/src/spool_writer.rs`).
   `staged_drain_candidates` is pure SQL with no filesystem interaction, so unlike its
