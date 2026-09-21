@@ -109,111 +109,18 @@ delta produced. Keep it durable, not chronological — chronological execution n
   the drain matrix rejects any head evolution unless its revision delta exactly equals the open-lease
   decrement and its commit time is not older than the reservation. This remains pure `[SERVER]`
   source with no loreserver composition, provider traffic, credentials, or deployment authority.
-  The eleven `local_authority_*` live tests (the retained cell-authority half) have a
-  checked-in provisioning harness:
-  `lore-object-dispatch/tests/run-local-authority-live.ps1`. Unlike the retention-client live tier,
-  these tests use `NoTls` against a `POSTGRES_HOST_AUTH_METHOD=trust` container and plain
-  `postgresql://postgres@...` URLs -- no certificates, no `pg_hba.conf`. Ten of the eleven
-  self-provision (roles plus their own `include_str!`'d migration subset), so the harness need only
-  hand each an empty fresh database. The exception is `local_authority_canonical_codec.rs`'s live
-  test: it installs nothing and states its requirement in its own `#[ignore = "..."]` message, so
-  the harness must pre-install precisely that pair, not the full chain -- match what a test's calls
-  actually touch. The harness also installs the full chain
-  once into its own dedicated database as executed proof it installs cleanly, and asserts the
-  documented inert state (0002's tables present, 0004-0006's uninstalled procedures absent). Run:
-  `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` (add `-KeepOnFailure` to
-  leave the labelled container up for debugging). All eleven tests stay `#[ignore]`; the harness
-  opts them in explicitly with `--ignored --exact <name>`, it does not un-ignore them, so the
-  crate's baseline `cargo test -p lore-object-dispatch` ignored count is unchanged by this run
-  (don't hardcode a count here — it drifts; list it fresh with `-- --list --ignored`).
-  CD-1's out-of-band installer/attester itself (`lore-object-dispatch/src/cell_schema_install.rs`
-  plus `src/bin/cell-schema-install.rs`, a one-shot operator CLI, not a service) has its own
-  offline-only suite, `tests/cell_schema_install.rs` — no Postgres, no `#[ignore]`. It re-reads
-  `migrations/*.sql` from disk independently of the module's own `include_str!` copies (so a
-  frozen-bytes claim is checked against ground truth, not against itself), and pins: the exact
-  install set against the on-disk directory, so a future migration must be classified
-  installed-or-deferred or the test fails (read its current size from `CELL_INSTALL_SET`, never
-  from a number written here — it grows every CD wave); the interleaved install plan; each schema
-  layer's install/read_state function names, revisions, and digest against the migration that
-  creates them; the `CREATE OR REPLACE FUNCTION` replacement inventory (scanned by text, not
-  hand-enumerated, so an unpinned replace and one dropped from the pinned list both fail); and a `local_authority_put_reservation_provisioning.rs`-style "runtime source never
-  calls the install entrypoints" guard extended to the new bin target. Gate:
-  `cargo test -p lore-object-dispatch --test cell_schema_install`. One test
-  (`cell_schema_error_is_a_standard_redacted_error_type`) is a type-level stub pending the real
-  `CellSchemaError` variant list, which the module's pinned contract deliberately left open —
-  fill in the per-variant `format!("{e}")`/`{e:?}` redaction assertions once the enum lands.
-  WP-114 CD-5's provider client (`provider_client.rs`): `AuthorizedProviderAttempt` is
-  crate-private-constructed, and a transport reporting `provider_requests_issued != 1` poisons the
-  ledger. That bounds what a transport may issue *and admit to*; it does not prove SDK auto-retry is
-  off, because an SDK retry happens below the one call and reports one honestly. Disabling it is
-  CD-6's construction obligation, and `ProviderRetryPolicy` is only the declaration.
-  `record_no_dispatch` refuses after any issued attempt regardless of outcome: generate such state
-  matrices by driving the real API, and give a sequencing rule an axis on both sides of the sequence
-  (two successive hand-listed versions both missed the ambiguous case). Keep
-  `ProviderAttemptLedger::audit`'s call into `compaction`'s `provider_attempt_audit_is_valid` rather
-  than restating the algebra. The matrix's pinned state set is a change-detector, not an oracle — it
-  is invariant under swapping the decisive/ambiguous arms, so the two tests pinning that mapping
-  directly are load-bearing.
-  `validate_endpoint_host` accepts a single-label host (`minio`, `localhost`).
-  Double pattern: one closure-scripted double per trait, `new` returning `(Self, Rc<Cell<u32>>)`
-  (the counter handle must outlive the double once moved into the client); close over an
-  `Rc<RefCell<Option<T>>>` in the same closure to capture what it *receives*, not just call counts.
-  When the received type is deliberately non-`Clone` (`ProviderChargeRequest`, so nothing can retain
-  a chargeable value past the call), copy the asserted fields into your own plain struct instead.
-  `ProviderAttemptLedger::new` takes `(provider_boundary_id, logical_request_id) -> Result<Self, _>`
-  (no `Default`); `execute` refuses a request naming a different boundary/logical-request with
-  `LedgerRequestMismatch`, and `audit_for(logical_request_id)` replaced `audit()` for the same
-  reason — one ledger cannot accumulate two requests' attempts. `authorize` is crate-private; its
-  public replacement is `validate_attempt`, so a test asserting the `ProviderChargeRequest` an
-  authority receives needs the capture-closure pattern above during a real `execute()`, not a direct
-  call. Adding an identity field to a type whose `Debug` is `#[derive]`d is how this module's
-  redaction regressed once — check for a hand-written impl whenever a type gains an identity string.
-  Gate: `cargo test -p lore-object-dispatch --test provider_client -j 4` (no `#[ignore]`).
-  WP-114 CD-4's shared limiter (`provider_charge.rs`, migrations 0021/0022) splits its evidence
-  across two tiers. `tests/run-provider-charge-live.ps1` (six `#[ignore]`d tests, disposable
-  PostgreSQL 16) owns the effect claims: fusing the debit into the check loop, so a class-cap
-  refusal leaves the shared bucket debited, fails
-  `..._last_unit_charges_are_atomic_and_fail_closed` at "shared debit must roll back"
-  (revert-checked). It does NOT own the locking claims — deleting both the per-boundary
-  `pg_advisory_xact_lock` and the check loop's `FOR UPDATE OF state` leaves all six green, since
-  SERIALIZABLE plus the harness's own `40001` retry still delivers the outcome. Only
-  `provider_charge_schema.rs`'s `charge_locks_and_checks_every_cap_before_inserting_or_debiting`
-  (source order lock < grant insert < debit) catches that, so it is load-bearing, not a redundant
-  change-detector. `concurrent_charges` is `tokio::join!` over two connections with no barrier, so
-  every assertion also holds sequentially: it proves the rollback, not the race. Open gap: nothing
-  exercises the function's refusal of a non-serializable caller.
-  Comparing a crate's counts across two commits needs `--no-fail-fast`; the default stops at the
-  first failing target and tallies only what it reached (19 of 47 here), a plausible-looking count.
-  **CR-034 runtime budget pin re-read [SERVER]**, layered on the CD-4/CD-5 pair above: on
-  `BudgetPinRejected`, `execute` calls the new `refresh_budget_pin` trait method (default:
-  `Err(ConfigurationUnresolved)`, every pre-existing implementor unaffected) at most once, retries
-  the same attempt at most once, and accepts the refresh only when its fence is the exact successor
-  AND its revision token differs — a real publish always mints a fresh revision, so a fixture that
-  only bumps the fence and keeps the old revision string is refused for the wrong reason; pin that
-  case explicitly (`refresh_to_the_exact_successor_fence_but_an_unchanged_revision_is_still_refused`),
-  don't rely on catching it by accident. `PostgresProviderChargeAuthority::refresh_budget_pin`
-  (`provider_charge.rs`) reads migration 0025's `SECURITY DEFINER` head-read function through the
-  same dispatch pool the charge uses, `ReadCommitted` not `Serializable`, no boundary advisory lock.
-  Unit coverage (mocked authority, no database — 9 cases): `cargo test -p lore-object-dispatch
-  --test provider_client -- refresh_ non_budget_pin_rejected`, `tests/provider_client.rs` section
-  "7a" (`RefreshScriptedChargeAuthority` scripts `charge`/`refresh_budget_pin` independently and
-  records every pin observed; `PanicOnRefreshChargeAuthority` turns an unwanted refresh call into a
-  hard failure). Live coverage, `tests/run-budget-pin-refresh-live.ps1` (own throwaway Postgres 16
-  container per test, pattern of `provider_charge_live.rs`): 0025 least-privilege (runtime role
-  only, `42501` for maintenance/migrator, head table itself still unreachable), a real
-  renewal-and-retry (double-spend proof: old fence's bucket untouched, only the new fence's is
-  debited), N+2 drift refusing with zero debit anywhere, and expiry staying
-  `CONFIGURATION_UNRESOLVED` with zero refresh calls (`CountingRefreshAuthority` wraps the real
-  authority to count real `refresh_budget_pin` invocations, not a fake's). All 4 live tests and all
-  9 unit cases passed 2026-09-16. One fixture gotcha this file's `set_available` hit that
-  `provider_charge_live.rs`'s twin never needed: its bare-literal `{units} * {INTERVAL_MS}` SQL
-  multiplies as `int4` and overflows past ~2.1e9 (`int4mul`, SQLSTATE `22003`) the moment `units`
-  exceeds ~2 — cast both operands to `numeric(20,0)` (the `uint64` domain's own base type) before
-  multiplying. Not yet run as of 2026-09-16, owned by the implementation lane not this test lane:
-  the live catalog re-measure (`run-cell-schema-install-live.ps1 -Measure`) that pins 0025's two
-  moved sections (`functions`, `function_acls`) into `CELL_CATALOG_SECTION_BLAKE3_V1`/
-  `CELL_CATALOG_MANIFEST_BLAKE3_V1` — untouched by the install-set bump to 21 entries as of this
-  writing, invisible to the default (non-live) suite, caught only by the live installer tier.
+  WP-114's CD-1 through CD-6 test methodology for this crate -- the installer/attester
+  (`cell_schema_install.rs`, `src/bin/cell-schema-install.rs`), the eleven `local_authority_*`
+  live tests, CD-5's provider-client ledger and double-testing pattern (`provider_client.rs`),
+  CD-4's shared charge limiter (`provider_charge.rs`), and **CR-034**'s runtime `refresh_budget_pin`
+  re-read layered on that CD-4/CD-5 pair -- is detailed in
+  [`testing-fork-delta-inventory-object-dispatch.md`](testing-fork-delta-inventory-object-dispatch.md),
+  split out to keep this file under budget. Gates:
+  `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1`,
+  `cargo test -p lore-object-dispatch --test cell_schema_install`,
+  `cargo test -p lore-object-dispatch --test provider_client -j 4`,
+  `lore-object-dispatch/tests/run-provider-charge-live.ps1`, and
+  `lore-object-dispatch/tests/run-budget-pin-refresh-live.ps1`.
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: `admit_operation`
   (`lore-fragment-provider/src/lib.rs`, the gateway method, not `FragmentProviderEntry`'s
   forwarder) shifts a queued attempt's `deadline_unix_ms` forward by the time actually spent
@@ -306,16 +213,15 @@ delta produced. Keep it durable, not chronological — chronological execution n
   constructor that can serve a real `get()`) is `pub(crate)` to `lore-transport`, unreachable
   without standing up a real server. So a full remote-fetch-then-cache regression for `State::tree`
   is not cheaply testable at this layer — don't invent a live-server fixture here.
-  **Checked whether `lore-integration-tests` changes that answer: it doesn't, today.** That crate's
-  real-server harness (`storage_remote_test.rs`'s `start_test_server`) wires only
-  `immutable_store`/`mutable_store` into `GrpcServerBuilder` — no revision service, no
-  resolve-by-name — and only ever drives the raw `lore::storage` C-ABI (`lore::storage::open`/`get`/
-  `put`), never a `RepositoryContext`. Getting a `RemoteState::Connected` `RepositoryContext` at all
-  means going through `lore_revision::repository::clone::clone`, which does a real
-  `protocol::connect` handshake plus `repository::resolve_by_name` against the server and needs an
-  actual committed revision already present there to clone — a full clone/repository fixture that
-  does not exist in either crate's harness today. Building it is a real feature addition to the
-  test infrastructure, not a cheap extension of `start_test_server`; deferred rather than built here.
+  **`lore-integration-tests` doesn't answer this either.** Its real-server harness
+  (`storage_remote_test.rs`'s `start_test_server`) wires only `immutable_store`/`mutable_store`
+  into `GrpcServerBuilder` — no revision service, no resolve-by-name — and only ever drives the raw
+  `lore::storage` C-ABI (`lore::storage::open`/`get`/`put`), never a `RepositoryContext`. A real
+  `RemoteState::Connected` `RepositoryContext` needs `lore_revision::repository::clone::clone`'s
+  actual `protocol::connect` handshake plus `repository::resolve_by_name`, and an already-committed
+  revision to clone against — a full clone/repository fixture neither crate's harness has today.
+  Building one is a real feature addition to the test infrastructure, not a cheap extension of
+  `start_test_server`; deferred.
   What's pinned instead, in `lore-revision/tests/state.rs`
   (`tree_read_options_request_cache_and_priority_despite_disable_cache_default`): the literal
   `read_options_from_repository(&repository).with_cache().with_priority()` expression `tree()`
@@ -328,9 +234,9 @@ delta produced. Keep it durable, not chronological — chronological execution n
   `webdriver_fullstack_history.rs` in `lorehub-desktop`'s full-stack WebDriver tier (a different
   repo, a slower tier), which asserts the History view renders the full chain plus expanded
   ancestor deltas on a real sparse clone and fails if the tree block is not retained, because the
-  delta read is swallowed and the file list comes back empty otherwise. Ran green (1 passed / 0
-  failed) against this fix. Fork-side coverage of the tree-retention half is deliberately deferred
-  to that tier, not absent by oversight — a future reader of this guide should draw that conclusion,
+  delta read is swallowed and the file list comes back empty otherwise. Fork-side coverage of the
+  tree-retention half is deliberately deferred to that tier, not absent by oversight — a future
+  reader of this guide should draw that conclusion,
   not "unguarded."
 
 - **`revision info --delta`'s delta-read-failure surfacing [CLIENT]**: a failed
@@ -580,7 +486,7 @@ delta produced. Keep it durable, not chronological — chronological execution n
   forever. Gate: `pwsh -File lore-postgres/tests/run-fragment-lifecycle-live.ps1` (its
   `Assert-ExpectedCatalog` fails the run before Docker starts if the compiled catalog and its
   `$inventory` disagree).
-  **A found contract disagreement, unresolved as of this note:** the ratified plan's barrier
+  **A found contract disagreement, still unresolved:** the ratified plan's barrier
   section recommends restricting the new hash-wide barrier to `kind = 1` (Promotion) rows only,
   "so a concurrent direct write does not block promotion, and vice versa" -- but the case a fresh
   review round required is the opposite: an object-key barrier blocking *every* claim kind at the
@@ -640,9 +546,8 @@ delta produced. Keep it durable, not chronological — chronological execution n
     `capture_current_readable_epoch` returns `None`).
     `staged_commit_then_witness_capture_through_the_put_staged_sequence` pins this and documents in
     its own failure message how to flip it once fixed. Not owned by this seam's test lane to fix
-    (`domain/fragments/creation.rs` is coordinator territory) and not yet resolved as of this
-    writing -- check `domain/fragments/creation.rs` before trusting any future claim that Stage mode
-    works live.
+    (`domain/fragments/creation.rs` is coordinator territory) -- check `domain/fragments/creation.rs`
+    before trusting any future claim that Stage mode works live.
 
 - **CR-035 write-behind backpressure is not unreadiness [SERVER,
   `lore-server/src/fragment_write_behind.rs`]**: `classify_pass`/`record_pass_outcome`/
