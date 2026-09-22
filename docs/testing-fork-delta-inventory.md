@@ -98,6 +98,24 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   grpc::repository::v1::repository_metadata_set grpc::handlers::repository_query
   grpc::handlers::branch_list grpc::repository::v1::repository_get`
 - **CR-032 superseded-epoch outbox pruning [SERVER, WP-119 Step C/Phase 8]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-032-superseded-epoch-outbox-pruning-server-wp-119-step-c-phase-8). Gates: `cargo test -p lore-postgres --test domain_outbox_prune -- --ignored --test-threads=1` `cargo test -p lore-postgres --lib domain::outbox::prune::tests`
+- **CR-032 receiver-side fault-injection seam and live gap/refetch [SERVER, WP-119 Task 3]**:
+  `lore-server/src/plugins/remote_notification/faults.rs`, a `DurableStreamSource` decorator behind
+  `#[cfg(feature = "failure_generator")]` wrapping the real `GrpcDurableStream`
+  (`event_relay/wiring.rs`). Five one-shot anchors read from `LORE_RECEIVER_FAULTS`
+  (`receiver.stream.drop`, `receiver.stream.duplicate`, `receiver.stream.poison`,
+  `receiver.stream.transient`, `receiver.ack.transient`), triggered by a 1-based ordinal or the
+  literal `next`, armed at runtime through `<anchor>.arm` files under `LORE_RECEIVER_FAULT_DIR` and
+  answered with `<anchor>.fired`; `LORE_RECEIVER_FAULT_TRACE=1` swaps in a tracing invalidation
+  target so an apply/refetch is an artifact rather than an inference. Identity function in a
+  default build. This is the receiver-side failpoint the two-process runner's case l (2026-09-15)
+  said the crate exposed none of. Exercised by five new live cases (m..q, catalog now a..q) in
+  `lore-integration-tests/tests/active_active_two_process_test.rs` via
+  `run-active-active-two-process-live.ps1`, against two real `loreserver` processes sharing one
+  cell Postgres/MinIO over the real gateway/mTLS/JetStream. Gates:
+  `cargo clippy -p lore-server --lib --features failure_generator --no-deps -- -D warnings` (and
+  the same without the feature); live: `pwsh -File
+  lore-integration-tests/tests/run-active-active-two-process-live.ps1` with `LORE_RECEIVER_FAULTS`
+  armed for cases n/o/p/q, `PASS=5 FAIL=0 NOT RUN=0 EXPECTED=5` at last run.
 - **WP-114/WP-115 durable promotion send claim [SERVER, `lore-postgres/src/domain/fragments/`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-114-wp-115-durable-promotion-send-claim-server-lore-postgres-src-domain-fragments). Gates: `pwsh -File lore-postgres/tests/run-fragment-lifecycle-live.ps1`
 - **WP-114 CD-6/CD-7 write-behind store adapter [SERVER, `lore-postgres/src/store/write_behind/`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-114-cd-6-cd-7-write-behind-store-adapter-server-lore-postgres-src-store-write-behind). Gates: `cargo test -p lore-postgres --test write_behind_stage --test
     write_behind_source_pins`
