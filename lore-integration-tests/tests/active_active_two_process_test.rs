@@ -27,6 +27,8 @@ mod active_active_two_process_tests {
     use lore_postgres::domain::outbox::CheckpointOutcome;
     use lore_proto::lore::domain::v1::DomainOperationOutcome;
     use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
+    use lore_server::plugins::remote_notification::apply::POISON_CLASS_UNSUPPORTED_SCHEMA;
+    use lore_server::plugins::remote_notification::receiver::REASON_POISON_PARKED;
     use tonic::Code;
 
     use crate::active_active_two_process_support::Arming;
@@ -2589,6 +2591,7 @@ mod active_active_two_process_tests {
     const FAULT_DUPLICATE: &str = "receiver.stream.duplicate";
     const FAULT_STREAM_TRANSIENT: &str = "receiver.stream.transient";
     const FAULT_ACK_TRANSIENT: &str = "receiver.ack.transient";
+    const FAULT_POISON: &str = "receiver.stream.poison";
 
     /// Ceiling on a wait that depends on the broker redelivering an unacked
     /// message.
@@ -3407,6 +3410,229 @@ mod active_active_two_process_tests {
             1,
             "the ack anchor is one-shot; a second firing would have blocked the redelivery's \
              own acknowledgement and made the recovery half vacuous"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case R — a poisoned delivery is parked, never acknowledged, and stalls
+    // -----------------------------------------------------------------------
+
+    /// WP-119 Phase 10's poison row, closed live: a live durable receiver, on a
+    /// live broker, is handed a delivery it cannot decode, parks it under the
+    /// contract's bounded poison class, acknowledges NOTHING, stalls its
+    /// contiguous frontier below that sequence, and reports itself unready for
+    /// that reason.
+    ///
+    /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
+    /// "DURABLE_INVALIDATION" ("invalid scope, malformed identity, or
+    /// unsupported version follows the poison path"), and the receiver's own
+    /// outcome matrix (`plugins/remote_notification/receiver.rs`): "poison |
+    /// park, fail readiness | no".
+    ///
+    /// # What is real
+    ///
+    /// Everything but one field. The push is a real governed mutation on
+    /// process A, relayed by the real relay through the real gateway and real
+    /// JetStream to process B's real receiver. The single injected fact is that
+    /// B's durable stream raises that one envelope's `payload_version` out of
+    /// range before handing it over, which is what an event published by a
+    /// newer cell than this build looks like from inside a consumer. The
+    /// receiver, the decode, the park, the projection and the readiness facet
+    /// are all the shipped ones.
+    ///
+    /// # Why the class is asserted by constant
+    ///
+    /// `POISON_CLASS_UNSUPPORTED_SCHEMA` is the contract's own name for this
+    /// disposition. A literal `"UNSUPPORTED_SCHEMA"` here would keep passing
+    /// after a rename on the production side and would silently stop being an
+    /// assertion about the contract; the fault injector chooses the
+    /// out-of-range `payload_version` for the same reason — it is the one
+    /// corruption whose class does not depend on the decoder's check order.
+    ///
+    /// # The window this case asserts inside, and why that is not a weakness
+    ///
+    /// A park is not a permanent wedge and must not be asserted as one. The
+    /// parked message is never acknowledged, so the broker's own `ack_wait`
+    /// eventually redelivers it; the anchor is one-shot and already spent, so
+    /// that redelivery decodes, applies, and closes the frontier. The stalled
+    /// state therefore holds for the `ack_wait` window and no longer, and every
+    /// assertion below is made inside it — the same window case N's gap blocker
+    /// is read in, for the same reason. What is proven is that a poisoned
+    /// delivery is parked rather than applied or acknowledged, not that a
+    /// receiver stays parked forever.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_r_a_poisoned_delivery_is_parked_unacknowledged_and_stalls_the_frontier() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture
+            .start(
+                "b",
+                BootOptions::receiver_faults("receiver.stream.poison=next"),
+            )
+            .await;
+        let token = fixture.minter.mint("case-r-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-r-writer", "r").await;
+        wait_for_receiver(&b).await;
+        // Same reason as cases O and Q: a poison armed while the create's own
+        // events are still in flight lands on one of THEM, and this case
+        // silently stops being about the push it names.
+        wait_for_quiescence(&fixture, &b, "case R setup").await;
+        let generation = b
+            .event_readiness()
+            .await
+            .receiver_generation
+            .expect("a ready receiver reports its generation");
+        let (settled_frontier, _) = fixture
+            .backend
+            .checkpoint_row(&b.receiver_identity(), generation)
+            .await
+            .expect("a quiesced receiver has reported a checkpoint for its own generation");
+
+        b.arm_receiver_fault(FAULT_POISON);
+        governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-r-writer",
+            &repository,
+            &branch,
+            Hash::default(),
+            1,
+            0xb1,
+        )
+        .await;
+        let poisoned_sequence = wait_for_accepted_pushes(&fixture, 1, "case R push").await;
+        wait_until!(
+            format!(
+                "process B's durable stream to poison one delivery; log tail: {}",
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.fault_fired(FAULT_POISON)
+        );
+
+        // Read before any later wait can be overtaken by the broker's
+        // redelivery: at this instant the poisoned delivery has been handed
+        // over and refused, and an apply for it would already have been traced.
+        let applied_at_park =
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED));
+
+        // Readiness fails FIRST and for the stated reason. Asserted before the
+        // projection because the facet is set from the session as the park is
+        // recorded, while the checkpoint is reported on the loop's own cadence.
+        // Captured inside the predicate for the same reason as the checkpoint
+        // snapshot below: readiness returns to true once the redelivery clears
+        // the park, so a re-read after the wait can answer from after recovery.
+        let mut observed = None;
+        wait_until!(
+            format!(
+                "process B's receiver to report itself unready; last seen {:?}",
+                b.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            {
+                let snapshot = b.event_readiness().await;
+                let unready = snapshot.receiver_ready == Some(false);
+                if unready {
+                    observed = Some(snapshot);
+                }
+                unready
+            }
+        );
+        let readiness = observed.expect("the predicate only passed on a snapshot it had just read");
+        assert_eq!(
+            readiness.receiver_reason.as_deref(),
+            Some(REASON_POISON_PARKED),
+            "an unready receiver here must be unready BECAUSE of the park; any other reason \
+             (bootstrapping, lag) would mean this case never observed the poison path"
+        );
+        assert_eq!(
+            readiness.receiver_generation,
+            Some(generation),
+            "a park is resolved in place; it must not retire the generation that observed it"
+        );
+
+        // The persisted park, from the live receiver's own projection, named by
+        // the contract's constant.
+        //
+        // Read as ONE row at ONE moment, and every later assertion is made
+        // against that captured snapshot rather than a fresh query. A park is
+        // resolved by the broker's redelivery and `AckFrontier::poison` filters
+        // its entries to sequences above the frontier, so a second query after
+        // this wait could answer from after the recovery — pairing a frontier
+        // that has moved past the park with a park observed before it, and
+        // failing a receiver that did exactly the right thing.
+        let mut parked: Option<(i64, Vec<(i64, i64)>, Vec<(i64, String)>)> = None;
+        wait_until!(
+            format!(
+                "process B's checkpoint to carry a park at {poisoned_sequence}; last seen {:?}",
+                fixture
+                    .backend
+                    .checkpoint_snapshot(&b.receiver_identity(), generation)
+                    .await
+            ),
+            RECEIVER_DEADLINE,
+            {
+                parked = fixture
+                    .backend
+                    .checkpoint_snapshot(&b.receiver_identity(), generation)
+                    .await;
+                parked.as_ref().is_some_and(|(_, _, poison)| {
+                    poison.iter().any(|(sequence, class)| {
+                        *sequence == poisoned_sequence && class == POISON_CLASS_UNSUPPORTED_SCHEMA
+                    })
+                })
+            }
+        );
+
+        let (blocked_frontier, gaps, poison) =
+            parked.expect("the predicate only passed on a row it had just read");
+        assert!(
+            blocked_frontier < poisoned_sequence,
+            "a parked delivery is never acknowledged, so the contiguous frontier must stay below \
+             it; got {blocked_frontier} against a park at {poisoned_sequence} with poison \
+             {poison:?}"
+        );
+        assert!(
+            blocked_frontier >= settled_frontier,
+            "the frontier must not go backwards; it was {settled_frontier} before the push and \
+             {blocked_frontier} after the park"
+        );
+        // A gap and a park CAN coexist in general, and this pins that they do
+        // not here. It is a weaker claim than it looks — `gap_sequences` is
+        // also empty for a receiver that never saw the delivery at all — which
+        // is why it is not carrying the case on its own: the `.fired` wait and
+        // the poison entry above are what prove the delivery arrived and was
+        // refused, and this only adds that the refusal was classified as a park
+        // rather than projected twice.
+        assert!(
+            gaps.is_empty(),
+            "a park must be projected as poison and not ALSO as a gap; reporting one sequence as \
+             both would double-count the blocker. Got gaps {gaps:?}"
+        );
+
+        assert_eq!(
+            applied_at_park,
+            0,
+            "a poisoned delivery must be parked, never applied. Log tail: {}",
+            b.log_tail()
+        );
+        assert_eq!(
+            b.log_lines_containing(&refetch_line(&repository)),
+            0,
+            "a poison is not an ordering problem: the receiver must park it, not resolve it by \
+             authoritative refetch"
+        );
+        assert_eq!(
+            b.log_lines_containing(&fired_line(FAULT_POISON)),
+            1,
+            "the poison anchor is one-shot; a second firing would have corrupted the broker's \
+             redelivery too and made the park indistinguishable from a permanent wedge. Log \
+             tail: {}",
+            b.log_tail()
         );
     }
 

@@ -377,6 +377,35 @@ impl ReceiverSession {
         }
     }
 
+    /// Park one sequence AND make that park reportable.
+    ///
+    /// [`AckFrontier::record_poison`] alone updates only this process's own
+    /// frontier, which is enough for the readiness facet and not enough for the
+    /// durable projection. A park acknowledges nothing, so the contiguous
+    /// frontier does not move, and `events_since_checkpoint` is incremented
+    /// only on the acknowledgement path — so both terms of
+    /// [`Self::needs_checkpoint`]'s short circuit hold and it answers false for
+    /// as long as nothing else arrives. The blocker would then reach readiness
+    /// and NEVER the checkpoint row: not late, never, because
+    /// [`ReceiverLoop::final_checkpoint`] carries the same guard and skips it on
+    /// the way out too.
+    ///
+    /// Counting the park as an event is what makes "this generation is parked"
+    /// a durable fact another process, an operator query, or a replacement
+    /// generation's resume decision can read. The cadence still bounds the
+    /// write: this only makes a checkpoint DUE, it does not send one.
+    ///
+    /// Deduplication stays in [`AckFrontier::record_poison`] and deliberately
+    /// not here, so a broker redelivering the same parked message re-arms the
+    /// checkpoint without adding a second blocker. The cost is one idempotent
+    /// re-write of an unchanged row per redelivery — roughly one per the
+    /// broker's `ack_wait` — which is the price of the park staying true in the
+    /// projection rather than only in this process.
+    fn park(&mut self, broker_sequence: i64, class: &'static str) {
+        self.frontier.record_poison(broker_sequence, class);
+        self.events_since_checkpoint = self.events_since_checkpoint.saturating_add(1);
+    }
+
     fn needs_checkpoint(&self, config: &ReceiverConfig) -> bool {
         if self.reported_frontier == Some(self.frontier.contiguous_frontier())
             && self.events_since_checkpoint == 0
@@ -1169,7 +1198,7 @@ impl DurableReceiver {
                     class,
                     "parking a durable invalidation the receiver cannot apply"
                 );
-                session.frontier.record_poison(sequence, class);
+                session.park(sequence, class);
                 metrics::record_receiver_outcome("parked");
                 return StepOutcome::Parked(class);
             }
@@ -1180,7 +1209,7 @@ impl DurableReceiver {
             Ok(version) => version,
             Err(error) => {
                 let class = error.poison_class();
-                session.frontier.record_poison(sequence, class);
+                session.park(sequence, class);
                 metrics::record_receiver_outcome("parked");
                 return StepOutcome::Parked(class);
             }
@@ -1350,6 +1379,7 @@ mod tests {
     use bytes::Bytes;
     use lore_base::types::RepositoryId;
 
+    use super::super::apply::POISON_CLASS_UNSUPPORTED_SCHEMA;
     use super::super::apply::RecordingInvalidationTarget;
     use super::super::apply::TargetCall;
     use super::super::config::RemoteNotificationConfig;
@@ -1433,6 +1463,47 @@ mod tests {
         }
         .encode(1..=1)
         .expect("the test envelope is inside every contract bound")
+    }
+
+    /// One durable envelope whose `payload_version` is inside the producer's
+    /// own encode bound (so it encodes cleanly) but outside this receiver's
+    /// contract-pinned decode range (`[1, 1]` under [`TEST_CONFIG`]). The
+    /// decoder must refuse it with `DeliveryViolation::UnsupportedPayloadVersion`,
+    /// which is exactly the case the two decode paths in
+    /// [`DurableReceiver::dispose`] must classify under
+    /// [`POISON_CLASS_UNSUPPORTED_SCHEMA`] and park.
+    fn durable_with_unsupported_payload_version(
+        repository_byte: u8,
+        ordinal: u64,
+    ) -> super::super::wire::PrivateEnvelopeV1 {
+        let payload_version = 2;
+        DurableEnvelopeV1 {
+            common: EnvelopeCommon {
+                cell_id: CELL.to_string(),
+                placement_epoch: 12,
+                event_id: EventId::from_bytes([ordinal as u8; 16]),
+                repository: repository(repository_byte),
+                producer_instance_id: IDENTITY.to_string(),
+                produced_at: UNIX_EPOCH,
+            },
+            body: DurableInvalidationBody {
+                payload_version,
+                idempotency_key: [7; 32],
+                event_kind: "branch.pushed".to_string(),
+                repository_generation: 1,
+                aggregate_kind: "branch".to_string(),
+                aggregate_identity: "0123456789abcdef".to_string(),
+                aggregate_version: AggregateVersion {
+                    ordinal,
+                    identity: None,
+                },
+                payload: Bytes::new(),
+                committed_at: UNIX_EPOCH,
+                actor: None,
+            },
+        }
+        .encode(payload_version..=payload_version)
+        .expect("the producer's own contract permits the version it sent")
     }
 
     struct Harness {
@@ -1610,6 +1681,127 @@ mod tests {
 
         // Caught up.
         assert_eq!(harness.receiver.step(&mut session).await, StepOutcome::Idle);
+    }
+
+    /// A single park must be enough to make the *next steady-state cadence
+    /// tick* report a checkpoint, not only the best-effort one at shutdown.
+    ///
+    /// Regression pin for [`ReceiverSession::park`]: recording the poison in
+    /// the in-process frontier alone left `events_since_checkpoint` at zero,
+    /// so [`ReceiverSession::needs_checkpoint`]'s short circuit
+    /// (`reported_frontier == contiguous_frontier && events_since_checkpoint
+    /// == 0`) held forever — a parked generation would never trip the cadence,
+    /// however much wall-clock time passed.
+    #[tokio::test]
+    async fn a_single_park_makes_the_next_cadence_checkpoint_due() {
+        let mut harness = harness(900);
+        // One event is enough to cross the threshold, so this pins the count
+        // itself rather than a coincidence of the default's `2`.
+        harness.receiver.receiver.checkpoint_every_events = 1;
+        let mut session = harness.receiver.bootstrap().await.expect("bootstraps");
+        assert_eq!(session.contiguous_frontier(), 899);
+
+        harness
+            .stream
+            .push_envelope(900, durable_with_unsupported_payload_version(0x9f, 1));
+        assert_eq!(
+            harness.receiver.step(&mut session).await,
+            StepOutcome::Parked(POISON_CLASS_UNSUPPORTED_SCHEMA)
+        );
+        assert!(harness.stream.acked().is_empty());
+        assert_eq!(
+            session.contiguous_frontier(),
+            899,
+            "a park never advances the frontier"
+        );
+
+        assert!(
+            session.needs_checkpoint(&harness.receiver.receiver),
+            "a park that acknowledges nothing must still count toward the checkpoint cadence, or \
+             the durable projection never learns the generation is blocked"
+        );
+    }
+
+    /// The finding an executed live two-process run caught: a parked delivery
+    /// acknowledges nothing, so nothing else makes a checkpoint due, and
+    /// without [`ReceiverSession::park`] counting the park itself neither the
+    /// steady-state cadence nor [`DurableReceiver::final_checkpoint`] at
+    /// shutdown ever reports one — the durable `lore_outbox_checkpoints`
+    /// projection shows an unblocked row forever while this process's own
+    /// readiness correctly reports `poison_parked`.
+    ///
+    /// This drives the real, unmodified shutdown path (mirroring
+    /// `shutdown_checkpoints_an_applied_event_before_returning`) rather than
+    /// calling the checkpoint machinery directly, so it fails exactly when the
+    /// automatic trigger is broken, not only when the report's own content is
+    /// wrong.
+    #[tokio::test]
+    async fn shutdown_checkpoints_a_parked_deliverys_poison_class_before_returning() {
+        let mut harness = harness(900);
+        harness.receiver.receiver.checkpoint_interval = Duration::from_secs(60);
+        let readiness = harness.receiver.readiness();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let run = harness.receiver.run_with_shutdown(shutdown_rx);
+        tokio::pin!(run);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut run => panic!("receiver stopped before shutdown: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+                if readiness.is_ready() {
+                    break;
+                }
+            }
+            harness
+                .stream
+                .push_envelope(900, durable_with_unsupported_payload_version(0x9f, 1));
+            loop {
+                tokio::select! {
+                    result = &mut run => panic!("receiver stopped before parking: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+                if readiness.snapshot().reason == Some(REASON_POISON_PARKED) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("receiver must park the unsupported-schema delivery");
+
+        assert!(
+            harness.stream.acked().is_empty(),
+            "a parked delivery must never be acknowledged"
+        );
+        let before_shutdown = harness.store.calls().len();
+        shutdown_tx.send(true).expect("receiver observes shutdown");
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("receiver must finish promptly")
+            .expect("shutdown succeeds");
+
+        let checkpoints: Vec<CheckpointReport> = harness.store.calls()[before_shutdown..]
+            .iter()
+            .filter_map(|call| match call {
+                StoreCall::Checkpoint(report) => Some((**report).clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            checkpoints.len(),
+            1,
+            "shutdown must report exactly one checkpoint once a park is outstanding"
+        );
+        assert_eq!(
+            checkpoints[0].poison,
+            vec![lore_postgres::domain::outbox::PoisonEntry {
+                broker_sequence: 900,
+                class: POISON_CLASS_UNSUPPORTED_SCHEMA.to_string(),
+            }],
+            "the parked sequence and its bounded poison class must reach the durable checkpoint \
+             projection, keyed by the same constant apply.rs classifies it under"
+        );
+        assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
     }
 
     /// A message served from an epoch this generation did not capture retires

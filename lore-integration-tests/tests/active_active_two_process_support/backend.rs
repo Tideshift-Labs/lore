@@ -618,6 +618,50 @@ impl SharedBackend {
         })
     }
 
+    /// One generation's frontier, gaps AND poison blockers, read in ONE query.
+    ///
+    /// The three facts move together and a case that reads them through
+    /// separate calls can observe a mixture of two moments. That is not
+    /// theoretical here: a park is resolved by the broker's own redelivery, and
+    /// `AckFrontier::poison` filters its entries to sequences strictly above
+    /// the frontier — so a case that waits for the park in one call and then
+    /// re-reads the frontier in another can see the frontier AFTER recovery
+    /// beside a park it observed BEFORE, and report a correct receiver as a
+    /// failure. One row, one moment.
+    pub async fn checkpoint_snapshot(
+        &self,
+        receiver_identity: &str,
+        membership_generation: i64,
+    ) -> Option<(i64, Vec<(i64, i64)>, Vec<(i64, String)>)> {
+        let row = self
+            .authority
+            .query_opt(
+                "SELECT contiguous_frontier, gap_starts, gap_ends, poison_sequences, \
+                        poison_classes \
+                   FROM lore_outbox_checkpoints \
+                  WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3",
+                &[&self.cell_id, &receiver_identity, &membership_generation],
+            )
+            .await
+            .expect("read one generation's whole checkpoint row");
+        row.map(|row| {
+            let starts: Vec<i64> = row.get("gap_starts");
+            let ends: Vec<i64> = row.get("gap_ends");
+            let sequences: Vec<i64> = row.get("poison_sequences");
+            let classes: Vec<String> = row.get("poison_classes");
+            assert_eq!(
+                sequences.len(),
+                classes.len(),
+                "the checkpoint projection's poison arrays must stay parallel"
+            );
+            (
+                row.get("contiguous_frontier"),
+                starts.into_iter().zip(ends).collect(),
+                sequences.into_iter().zip(classes).collect(),
+            )
+        })
+    }
+
     /// Submit one checkpoint report through the REAL production write path
     /// (`lore_postgres::domain::outbox::report_checkpoint`), under a
     /// receiver's own identity and generation, exactly as that receiver's own

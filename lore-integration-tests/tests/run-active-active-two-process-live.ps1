@@ -145,6 +145,11 @@ $caseCatalog = @(
     [pscustomobject]@{ Key = 'o'; Test = "$testPrefix::case_o_a_duplicated_delivery_is_applied_once_and_acknowledged_twice" }
     [pscustomobject]@{ Key = 'p'; Test = "$testPrefix::case_p_a_transient_read_failure_reconnects_without_costing_a_generation" }
     [pscustomobject]@{ Key = 'q'; Test = "$testPrefix::case_q_a_failed_acknowledgement_does_not_undo_the_apply" }
+    # R closes the last of the five receiver-side fault anchors. It asserts
+    # inside the broker's own `ack_wait` window by construction: a park is not
+    # permanent, because the unacknowledged message is redelivered and the
+    # one-shot anchor is spent by then. See the case's own doc comment.
+    [pscustomobject]@{ Key = 'r'; Test = "$testPrefix::case_r_a_poisoned_delivery_is_parked_unacknowledged_and_stalls_the_frontier" }
 )
 
 $selected = if ($Case) {
