@@ -112,6 +112,15 @@ struct State {
     /// once a pass completes, so a self-clearing stall leaves no trace.
     drain_backpressure_since: Option<Instant>,
     cleanup_backpressure_since: Option<Instant>,
+    /// When the stage last started reporting no room, and still is.
+    ///
+    /// `capacity_available` is not a free-space measurement. It is a
+    /// reconciliation predicate over the stage and spool ledgers, and it goes
+    /// false transiently whenever the physical inventory and the charged ledger
+    /// disagree — which they do by construction while fragments are arriving.
+    /// Recording when the run began is what lets a transient disagreement clear
+    /// without ever reaching the readiness verdict.
+    capacity_unavailable_since: Option<Instant>,
     stopped: bool,
 }
 
@@ -141,6 +150,10 @@ pub struct Snapshot {
     /// 503 can be told apart from a wedge without reading the server log.
     pub drain_backpressure_millis: Option<u64>,
     pub cleanup_backpressure_millis: Option<u64>,
+    /// How long the stage has been reporting no room without a break. Present so
+    /// a 503 can be told from a transient ledger disagreement without reading the
+    /// server log, the same way the backpressure ages are.
+    pub capacity_unavailable_millis: Option<u64>,
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -231,6 +244,49 @@ fn record_pass_outcome(
     }
 }
 
+/// Fold one observation into readiness state.
+///
+/// **A stage with no room is not the same claim as a ledger that disagrees with
+/// itself.** `capacity_available` is computed by comparing the last completed
+/// physical inventory against a freshly read charged ledger, so it goes false
+/// whenever the two are momentarily out of step — which is the normal condition
+/// while fragments are being staged. Treating that instant as unreadiness is what
+/// ejects every replica of a cell at once, because they all read the same ledger.
+///
+/// So the run is remembered and `readiness_reason` reports it only once it has
+/// outlived the same budget every other transient condition is given. A stage
+/// that is genuinely full never recovers, so it still reaches 503 one budget
+/// later.
+///
+/// An observation that could not be taken CLEARS the run. Not knowing is not
+/// evidence that room returned, but it is equally not evidence that the stage is
+/// full, and the two mistakes are not symmetric. Keeping the run across a gap
+/// means the first sample after recovery arrives with the budget already spent,
+/// so a cell-wide `observe()` blip — one database stall reaches every replica
+/// identically — is followed by an instant all-replica ejection on the very next
+/// ordinary transient disagreement. That is the failure this change exists to
+/// remove. Clearing costs one extra budget before a genuinely full stage ages
+/// out, and `observation_unknown` answers 503 throughout the gap regardless.
+///
+/// Pure and synchronous, so the rule is testable without a store, a runtime or a
+/// Postgres fixture — the same reason `record_pass_outcome` is.
+fn record_observation(state: &mut State, observation: Option<WriteBehindObservation>, at: Instant) {
+    match observation {
+        Some(value) => {
+            if value.capacity_available {
+                state.capacity_unavailable_since = None;
+            } else {
+                state.capacity_unavailable_since.get_or_insert(at);
+            }
+            state.observation = Some((at, value));
+        }
+        None => {
+            state.capacity_unavailable_since = None;
+            state.observation = None;
+        }
+    }
+}
+
 fn readiness_reason(
     state: &State,
     stale_after: Duration,
@@ -245,7 +301,10 @@ fn readiness_reason(
         Some("observation_unknown")
     } else if observation.is_none_or(|value| !value.roots_usable) {
         Some("root_unavailable")
-    } else if observation.is_none_or(|value| !value.capacity_available) {
+    } else if state
+        .capacity_unavailable_since
+        .is_some_and(|at| at.elapsed() >= stale_after)
+    {
         Some("capacity_unavailable")
     } else if worker_age.is_none_or(|age| age >= stale_after) {
         Some("worker_stale")
@@ -324,6 +383,9 @@ impl FragmentWriteBehindReadiness {
                 .map(|at| millis(at.elapsed())),
             cleanup_backpressure_millis: state
                 .cleanup_backpressure_since
+                .map(|at| millis(at.elapsed())),
+            capacity_unavailable_millis: state
+                .capacity_unavailable_since
                 .map(|at| millis(at.elapsed())),
         }
     }
@@ -473,22 +535,29 @@ pub(crate) fn configure_fragment_write_behind(
                 instruments()
                     .usage
                     .record(observation.spool_bytes, &[KeyValue::new("root", "spool")]);
-                observer_readiness
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .observation = Some((Instant::now(), observation));
+                // Explicit block, matching the worker loops: the guard is released at the
+                // brace rather than at a statement temporary, so `snapshot()` below cannot
+                // be folded into the same expression and self-deadlock this std `Mutex`.
+                {
+                    let mut state = observer_readiness
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    record_observation(&mut state, Some(observation), Instant::now());
+                }
                 if observer_readiness.snapshot().ready {
                     handle.note_drain_heartbeat();
                 } else {
                     handle.note_worker_stopped();
                 }
             } else {
-                observer_readiness
-                    .state
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .observation = None;
+                {
+                    let mut state = observer_readiness
+                        .state
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    record_observation(&mut state, None, Instant::now());
+                }
                 handle.note_observation_unknown();
                 handle.note_worker_stopped();
             }
@@ -689,9 +758,17 @@ mod tests {
         state.observation.as_mut().unwrap().1.roots_usable = false;
         assert_eq!(reason(&state), Some("root_unavailable"));
         state.observation.as_mut().unwrap().1.roots_usable = true;
-        state.observation.as_mut().unwrap().1.capacity_available = false;
+
+        // `capacity_unavailable` needs its run to outlive `stale_after`
+        // before it reports -- route through `record_observation` (one old
+        // sample to start the run, one fresh one so the observation itself
+        // stays current) so this pins the same run-tracking the observer
+        // loop relies on, not just a raw flag flip.
+        record_observation(&mut state, Some(capacity_observation(false)), old);
+        record_observation(&mut state, Some(capacity_observation(false)), now);
         assert_eq!(reason(&state), Some("capacity_unavailable"));
-        state.observation.as_mut().unwrap().1.capacity_available = true;
+
+        record_observation(&mut state, Some(capacity_observation(true)), now);
         state.observation.as_mut().unwrap().1.cleanup_backlog = 1;
         assert_eq!(reason(&state), Some("cleanup_not_progressing"));
         state.cleanup_progress = Some(now);
@@ -1102,11 +1179,32 @@ mod tests {
         state.drain_backpressure_since = Some(sustained_backpressure);
         assert_eq!(reason(&state), Some("root_unavailable"));
 
-        // `capacity_unavailable` outranks it.
+        // `capacity_unavailable` outranks it, once its run has outlived the
+        // budget -- a single false sample is not enough (see the CR-037
+        // tests below), so route through `record_observation` rather than
+        // poking the flag directly: one old sample to start the run, then a
+        // fresh one so the observation itself stays current.
         let mut state = healthy_state(now);
-        state.observation.as_mut().unwrap().1.capacity_available = false;
+        record_observation(&mut state, Some(capacity_observation(false)), stale);
+        record_observation(&mut state, Some(capacity_observation(false)), now);
         state.drain_backpressure_since = Some(sustained_backpressure);
         assert_eq!(reason(&state), Some("capacity_unavailable"));
+
+        // It still outranks `worker_stale` once its own budget has elapsed.
+        let mut state = healthy_state(now);
+        record_observation(&mut state, Some(capacity_observation(false)), stale);
+        record_observation(&mut state, Some(capacity_observation(false)), now);
+        state.worker = Some(stale);
+        assert_eq!(reason(&state), Some("capacity_unavailable"));
+
+        // `root_unavailable` still outranks `capacity_unavailable`, even
+        // once the latter's run has outlived its own budget.
+        let mut state = healthy_state(now);
+        record_observation(&mut state, Some(capacity_observation(false)), stale);
+        let mut roots_down = capacity_observation(false);
+        roots_down.roots_usable = false;
+        record_observation(&mut state, Some(roots_down), now);
+        assert_eq!(reason(&state), Some("root_unavailable"));
 
         // `drain_backpressure_sustained` itself outranks `drain_not_progressing`:
         // construct a state where both conditions independently hold (a fresh
@@ -1165,6 +1263,221 @@ mod tests {
             state.drain_backpressure_since,
             Some(sustained),
             "a cleanup pass must not affect drain's backpressure state"
+        );
+    }
+
+    // --- CR-037: capacity_unavailable needs a sustained run, not one sample --
+
+    fn capacity_observation(available: bool) -> WriteBehindObservation {
+        WriteBehindObservation {
+            capacity_available: available,
+            ..healthy_observation()
+        }
+    }
+
+    #[test]
+    fn capacity_unavailable_since_records_the_start_of_the_run_not_the_latest_false_sample() {
+        let now = Instant::now();
+        let start_of_run = now - Duration::from_secs(20);
+        let a_later_sample_in_the_same_run = now - Duration::from_secs(3);
+
+        let mut state = healthy_state(now);
+        record_observation(&mut state, Some(capacity_observation(false)), start_of_run);
+        assert_eq!(state.capacity_unavailable_since, Some(start_of_run));
+
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            a_later_sample_in_the_same_run,
+        );
+        assert_eq!(
+            state.capacity_unavailable_since,
+            Some(start_of_run),
+            "a later false sample in the same run must not reset the recorded \
+             start, or the age would never grow"
+        );
+
+        // The start stayed anchored well past the 5s budget `reason()` uses,
+        // so the recorded age has grown enough to be reported even though
+        // the latest sample was only 3s ago.
+        assert_eq!(reason(&state), Some("capacity_unavailable"));
+    }
+
+    #[test]
+    fn an_available_sample_clears_capacity_unavailable_since() {
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        state.capacity_unavailable_since = Some(now - Duration::from_secs(20));
+
+        record_observation(&mut state, Some(capacity_observation(true)), now);
+        assert_eq!(state.capacity_unavailable_since, None);
+    }
+
+    #[test]
+    fn flapping_capacity_availability_never_reaches_a_sustained_verdict_however_long_it_flaps() {
+        // The core of the fix: a predicate that disagrees with itself and
+        // recovers, over and over, must never accumulate into
+        // `capacity_unavailable`. Each `true` sample clears the run before
+        // it can age past the budget, exactly like backpressure's
+        // idle-`Ok(0)` case above.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+
+        for step in 0..50u32 {
+            record_observation(&mut state, Some(capacity_observation(false)), now);
+            record_observation(&mut state, Some(capacity_observation(true)), now);
+            assert_eq!(
+                state.capacity_unavailable_since, None,
+                "the intervening true sample at step {step} must have cleared the run"
+            );
+            assert_eq!(
+                reason(&state),
+                None,
+                "a flapping predicate must never age into unreadiness (step {step})"
+            );
+        }
+    }
+
+    #[test]
+    fn capacity_unavailable_reason_fires_once_the_run_outlives_the_budget_and_not_before() {
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        state.capacity_unavailable_since = Some(now - Duration::from_secs(4));
+        assert_eq!(
+            reason(&state),
+            None,
+            "under the 5s budget is not unavailable yet"
+        );
+        state.capacity_unavailable_since = Some(now - Duration::from_secs(6));
+        assert_eq!(reason(&state), Some("capacity_unavailable"));
+    }
+
+    #[test]
+    fn a_none_sample_clears_the_run_so_a_fresh_budget_must_elapse_before_capacity_unavailable_reappears()
+     {
+        // Revised rule (independent review, post-dating the test this
+        // replaces): a missing observation CLEARS `capacity_unavailable_since`
+        // rather than leaving it anchored. Keeping the run across a gap meant
+        // the first sample after recovery arrived with its budget already
+        // spent -- a cell-wide `observe()` blip hits every replica
+        // identically, so the very next ordinary transient disagreement
+        // produced an instant all-replica ejection. `observation_unknown`
+        // still answers 503 throughout the gap, so nothing is unguarded.
+        let now = Instant::now();
+        // Already well past the 5s budget by the time the gap closes below --
+        // if this age survived the gap, `capacity_unavailable` would reappear
+        // the instant the gap closes instead of needing a fresh budget.
+        let start_of_run = now - Duration::from_secs(20);
+        let mut state = healthy_state(now);
+
+        record_observation(&mut state, Some(capacity_observation(false)), start_of_run);
+        // Refresh the observation itself (without disturbing the anchored
+        // run) so the sanity check below is not masked by
+        // `observation_unknown` -- same two-call pattern as
+        // `capacity_unavailable_since_records_the_start_of_the_run_not_the_latest_false_sample`.
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            now - Duration::from_secs(1),
+        );
+        assert_eq!(state.capacity_unavailable_since, Some(start_of_run));
+        assert_eq!(
+            reason(&state),
+            Some("capacity_unavailable"),
+            "sanity: this run is already old enough to report, before the gap"
+        );
+
+        // A gap: the observer could not take an observation this tick.
+        record_observation(&mut state, None, now);
+        assert!(
+            state.observation.is_none(),
+            "a missing observation clears the last observation"
+        );
+        assert_eq!(
+            state.capacity_unavailable_since, None,
+            "a missing observation clears the run, it does not just mask it"
+        );
+        assert_eq!(
+            reason(&state),
+            Some("observation_unknown"),
+            "observation_unknown still covers the gap itself, ahead of \
+             capacity_unavailable in priority order"
+        );
+
+        // The gap closes with a fresh false sample. This starts a NEW run;
+        // it must not resume the pre-gap one.
+        record_observation(&mut state, Some(capacity_observation(false)), now);
+        assert_eq!(
+            state.capacity_unavailable_since,
+            Some(now),
+            "the run restarts from this sample, not from the pre-gap start_of_run"
+        );
+        assert_eq!(
+            reason(&state),
+            None,
+            "a fresh budget must elapse before capacity_unavailable reappears -- \
+             the pre-gap age must not carry over the gap and fire immediately"
+        );
+    }
+
+    #[test]
+    fn a_single_fresh_false_observation_must_not_report_capacity_unavailable() {
+        // The regression this exists to pin: a single observation with
+        // `capacity_available == false` must leave `readiness_reason`
+        // returning `None`. `capacity_available` is a reconciliation
+        // predicate over the stage and spool ledgers, not a free-space
+        // measurement, and it goes false transiently as a matter of course
+        // while fragments are being staged -- reporting `capacity_unavailable`
+        // off a single sample would eject a replica for a condition that
+        // clears on its own within the next observation or two.
+        //
+        // This test fails if the budget gating in `readiness_reason` /
+        // `record_observation` is removed and a fresh `false` sample reports
+        // immediately instead of waiting for `capacity_unavailable_since` to
+        // age past `stale_after`. Confirmed by temporarily reverting the
+        // gate locally and observing this test go red, then restoring it and
+        // observing it go green again (see the run report).
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+
+        record_observation(&mut state, Some(capacity_observation(false)), now);
+
+        assert_eq!(
+            reason(&state),
+            None,
+            "one fresh false sample alone must not report capacity_unavailable"
+        );
+    }
+
+    #[test]
+    fn capacity_unavailable_millis_is_none_with_no_run_and_grows_with_one() {
+        // `Snapshot.capacity_unavailable_millis` is
+        // `state.capacity_unavailable_since.map(|at| millis(at.elapsed()))`
+        // (see `FragmentWriteBehindReadiness::snapshot`). Building a full
+        // `Snapshot` needs a live store handle, which this module cannot
+        // construct, so pin the same computation directly against `State`.
+        let state = State::default();
+        assert_eq!(
+            state
+                .capacity_unavailable_since
+                .map(|at| millis(at.elapsed())),
+            None,
+            "no run means no reported age"
+        );
+
+        let mut state = State::default();
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            Instant::now() - Duration::from_millis(50),
+        );
+        let reported = state
+            .capacity_unavailable_since
+            .map(|at| millis(at.elapsed()))
+            .expect("a run is in progress");
+        assert!(
+            reported >= 50,
+            "the reported age should reflect the recorded start of the run, got {reported}ms"
         );
     }
 }
