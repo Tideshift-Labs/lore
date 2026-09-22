@@ -52,7 +52,9 @@ async fn ordinary_put_after_committed_upload_loses_readable_epoch_and_returns_sl
         domain.identity().clone(),
     );
     let immutable = Arc::new(
-        connect_immutable_store(&config, Some(activation))
+        // No staging tier: this fixture exercises normal provider construction, and a cell
+        // without write-behind is the synchronous configuration.
+        connect_immutable_store(&config, Some(activation), None)
             .await
             .expect("normal provider construction must fully succeed"),
     );
