@@ -1601,7 +1601,7 @@ pub(crate) fn connect_relay_pool(
     let plugin_name = PLUGIN_NAME;
     let cfg = parse_config(plugin_name, config)?;
     let tls = build_tls(plugin_name, &cfg)?;
-    lore_postgres::pool::build_pool(&cfg.url, pool_max, &tls).map_err(|e| {
+    lore_postgres::pool::build_pool_named(&cfg.url, pool_max, &tls, "relay").map_err(|e| {
         PluginError::from(PluginInitError {
             plugin_name: plugin_name.to_string(),
             message: format!("Failed to build the outbox relay pool: {e}"),
@@ -1631,12 +1631,16 @@ pub(crate) async fn assert_domain_store_colocated(
 
     // A tiny pool: this connection exists only to read the database identity
     // once at startup and is dropped immediately afterwards.
-    let pool = lore_postgres::pool::build_pool(&cfg.url, 1, &tls).map_err(|e| {
-        PluginError::from(PluginInitError {
-            plugin_name: plugin_name.to_string(),
-            message: format!("Failed to build {label} identity-check pool: {e}"),
-        })
-    })?;
+    // Labelled apart from the steady-state pools: it opens one connection at
+    // startup and is dropped, so folding its waits into another pool's p95
+    // would put a cold connect in a steady-state figure.
+    let pool = lore_postgres::pool::build_pool_named(&cfg.url, 1, &tls, "colocation_check")
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to build {label} identity-check pool: {e}"),
+            })
+        })?;
 
     domain
         .assert_same_database(&pool, label)

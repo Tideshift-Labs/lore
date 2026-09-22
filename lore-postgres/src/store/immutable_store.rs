@@ -40,7 +40,6 @@ use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use aws_smithy_types::retry::RetryConfig;
 use bytes::Bytes;
 use bytes::BytesMut;
-use deadpool_postgres::Pool;
 use deadpool_postgres::PoolError;
 use lore_aws::aws_error::AwsError;
 use lore_aws::aws_error::is_retryable_sdk_error;
@@ -118,6 +117,7 @@ use crate::domain::fragments::ProviderTrafficClass;
 use crate::domain::fragments::coordinator::DirectWriteKind;
 use crate::domain::fragments::decodable_encoding;
 use crate::domain::fragments::read_fragment_write_capability;
+use crate::pool::Pool;
 use crate::store::write_behind::AdmissionSnapshot;
 use crate::store::write_behind::StagedRead;
 use crate::store::write_behind::StagingMode;
@@ -406,7 +406,7 @@ impl PostgresImmutableStore {
         tls: &crate::pool::TlsConfig,
         object: ObjectStoreSettings,
     ) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(pg_url, pool_max, tls)?;
+        let pool = crate::pool::build_pool_named(pg_url, pool_max, tls, "immutable")?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
 
         // Build the legacy S3-compatible byte client with its existing retry

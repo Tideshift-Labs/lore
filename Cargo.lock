@@ -3127,6 +3127,7 @@ version = "0.9.1-nightly"
 dependencies = [
  "axum",
  "http 1.4.0",
+ "lore-base",
  "lore-error-set",
  "opentelemetry",
  "opentelemetry-semantic-conventions",

@@ -8947,7 +8947,7 @@ async fn run_sustained_uploader(
 /// attempt.
 async fn run_final_push_transaction(
     coordinator: &TestFragmentCoordinator,
-    pool: &deadpool_postgres::Pool,
+    pool: &lore_postgres::pool::Pool,
     repository_id: &[u8],
     required: &[RequiredFragment],
 ) -> PushSample {
@@ -9003,7 +9003,7 @@ async fn run_final_push_transaction(
 /// cost. Returns `None` if `budget` expires first, which is itself the answer.
 async fn wait_for_a_first_attempt_commit(
     coordinator: &TestFragmentCoordinator,
-    pool: &deadpool_postgres::Pool,
+    pool: &lore_postgres::pool::Pool,
     repository_id: &[u8],
     required: &[RequiredFragment],
     budget: Duration,

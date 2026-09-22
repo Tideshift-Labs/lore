@@ -48,9 +48,12 @@ use std::sync::Arc;
 pub use deadpool_postgres::Client;
 use deadpool_postgres::Manager;
 use deadpool_postgres::ManagerConfig;
-pub use deadpool_postgres::Pool;
-use deadpool_postgres::PoolError;
+pub use deadpool_postgres::PoolError;
 use deadpool_postgres::RecyclingMethod;
+pub use deadpool_postgres::Status;
+use lore_telemetry::InstrumentProvider;
+use lore_telemetry::PoolAcquireMetrics;
+use lore_telemetry::PoolAcquireSnapshot;
 use rustls::ClientConfig;
 use rustls::DigitallySignedStruct;
 use rustls::RootCertStore;
@@ -402,10 +405,107 @@ fn schema_fragments(
     Ok(statements)
 }
 
+struct PostgresPoolInstrumentProvider;
+
+impl InstrumentProvider for PostgresPoolInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "urc.store.postgres"
+    }
+}
+
+/// A `deadpool_postgres::Pool` that measures every checkout's **wait**.
+///
+/// This type deliberately replaces the plain re-export of
+/// `deadpool_postgres::Pool` that used to live here, because the measurement
+/// has to be complete to be worth quoting. A p95 taken over "the checkouts
+/// someone remembered to instrument" is not a p95 of anything; and this crate
+/// plus `lore-server` hold roughly thirty checkout sites spread across stores,
+/// coordinators, backfills, the relay worker, and operator commands. Wrapping
+/// the type instead of the call sites makes a bare unmeasured checkout
+/// **unconstructible** from either crate — `lore-server` has no
+/// `deadpool-postgres` dependency of its own and names the pool only through
+/// this module — so coverage is held by the compiler rather than by review.
+///
+/// The surface is deliberately only what callers already use ([`Pool::get`],
+/// [`Pool::status`], `Clone`). [`Pool::raw`] exists for the deadpool API this
+/// does not forward; reaching for it bypasses the measurement, which is why it
+/// says so. Its only caller is the contention case's warm-up, which wants
+/// exactly that: cold connects kept out of the measured tally.
+#[derive(Clone)]
+pub struct Pool {
+    inner: deadpool_postgres::Pool,
+    acquire: Arc<PoolAcquireMetrics>,
+}
+
+impl std::fmt::Debug for Pool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Pool")
+            .field("status", &self.inner.status())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Pool {
+    /// Check out a connection, recording how long the checkout waited.
+    ///
+    /// The recorded duration is the queue wait plus, for a pool that has not
+    /// yet opened `max_size` connections, the connect — which is what the
+    /// caller actually waits for. It is **not** the operation duration
+    /// `operation_duration` records, and **not** the instantaneous queue depth
+    /// `pool_waiting` records; a gate stated as a p95 on the wait can be
+    /// answered from this and from neither of those.
+    pub async fn get(&self) -> Result<Client, PoolError> {
+        self.acquire.measure(self.inner.get()).await
+    }
+
+    /// Current pool saturation, forwarded unchanged.
+    pub fn status(&self) -> Status {
+        self.inner.status()
+    }
+
+    /// Read this pool's acquisition tally in-process, without an OTLP
+    /// collector. The same measurements also leave over OTLP.
+    pub fn acquire_snapshot(&self) -> PoolAcquireSnapshot {
+        self.acquire.snapshot()
+    }
+
+    /// The underlying deadpool pool, for API this wrapper does not forward.
+    ///
+    /// A checkout taken through here is **not measured**. Forward the method
+    /// on [`Pool`] instead unless you mean to leave it out of the tally.
+    pub fn raw(&self) -> &deadpool_postgres::Pool {
+        &self.inner
+    }
+}
+
 /// Build a pooled Postgres connector with a rustls TLS provider. TLS
 /// negotiation follows the URL's `sslmode`; verification follows `tls` (see
 /// [`TlsConfig`] and the module docs).
+///
+/// The pool's acquisition measurements are labelled `unlabelled`. Every pool a
+/// cell actually runs is built through [`build_pool_named`] instead; this form
+/// stays for the test and fixture pools, where one shared label costs nothing
+/// because they are not a cell.
+///
+/// The label is the only thing that defaults. Whether a checkout is *measured*
+/// is a property of the [`Pool`] type, not of this argument, so a pool built
+/// here is still fully accounted for — it simply shares a bucket.
 pub fn build_pool(url: &str, pool_max: u32, tls: &TlsConfig) -> Result<Pool, String> {
+    build_pool_named(url, pool_max, tls, "unlabelled")
+}
+
+/// [`build_pool`], with this pool's acquisition measurements labelled.
+///
+/// `name` is the `pool` label (`immutable`, `mutable`, `lock`, `domain`,
+/// `relay`, ...). It is a `&'static str` so a repository, branch, or tenant
+/// identifier cannot reach a metric label.
+pub fn build_pool_named(
+    url: &str,
+    pool_max: u32,
+    tls: &TlsConfig,
+    name: &'static str,
+) -> Result<Pool, String> {
     let pg_config = url
         .parse::<tokio_postgres::Config>()
         .map_err(|e| format!("invalid postgres url: {e}"))?;
@@ -417,10 +517,17 @@ pub fn build_pool(url: &str, pool_max: u32, tls: &TlsConfig) -> Result<Pool, Str
             recycling_method: RecyclingMethod::Fast,
         },
     );
-    Pool::builder(manager)
+    let inner = deadpool_postgres::Pool::builder(manager)
         .max_size(pool_max as usize)
         .build()
-        .map_err(|e| format!("failed to build postgres pool: {e}"))
+        .map_err(|e| format!("failed to build postgres pool: {e}"))?;
+    Ok(Pool {
+        inner,
+        acquire: Arc::new(PoolAcquireMetrics::new(
+            &PostgresPoolInstrumentProvider,
+            name,
+        )),
+    })
 }
 
 fn make_tls(tls: &TlsConfig) -> Result<MakeRustlsConnect, String> {

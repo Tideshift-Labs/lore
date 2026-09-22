@@ -31,10 +31,10 @@
 //! projection check pass — see [`super::store::PostgresDomainStore::enable_enforcement`].
 
 use async_trait::async_trait;
-use deadpool_postgres::Pool;
 
 use crate::domain::errors::DomainError;
 use crate::domain::schema;
+use crate::pool::Pool;
 
 /// Facts about one repository, read from Lore's own structures by the caller.
 ///

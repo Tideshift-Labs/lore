@@ -24,4 +24,5 @@ tower = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+lore-base = { workspace = true }
 tokio = { workspace = true }

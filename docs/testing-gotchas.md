@@ -9,6 +9,12 @@ Durable, recurring testing lessons grouped by topic.
 - **Timing-sensitive tests**: Rerun failures in isolation; they might be scheduling flakes under load.
 - **Protobufs**: Regenerate instead of hand-splicing. Box large `prost` oneofs to avoid large enum variants and pin the boxed shapes.
 - **Clippy**: Check crate-local `clippy.toml` which shadows workspace configs.
+- **A restored file can still test red**: after a mutation-probe restore (or any rapid overwrite of a
+  source file) under heavy concurrent `cargo` activity in a shared `target/` dir, a rerun can reuse a
+  stale compiled test binary and silently reproduce the reverted mutation — no `Compiling <crate>`
+  line appears in the output, only `Finished`. Confirm the on-disk source first (`Read` it back), and
+  if a rerun after a confirmed-correct restore still fails, bump the file's mtime
+  (`(Get-Item $f).LastWriteTime = Get-Date`) to force a real recompile before trusting the result.
 
 ## Deterministic async tests
 
@@ -18,6 +24,12 @@ Durable, recurring testing lessons grouped by topic.
 - **Rejections**: Follow rejected exact-selection attempts with sequential-retry cases to ensure no stale metadata is left in memory.
 - **UTF-8 limits**: Test exact byte boundaries and one byte over. Include sparse binary sources to test open-once read caps.
 - **Timeouts**: Wrap stream assertions in `tokio::time::timeout`. Bind ephemeral ports once to avoid readiness races.
+- **Timing assertions on a real clock**: when pinning "at least the sleep duration" (e.g. a
+  timer/`measure`-style wrapper), assert a lower bound only, with margin (e.g. sleep 100ms, assert
+  `>= 90.0`) — never an upper bound tight enough to flake under scheduler load. `start_paused = true`
+  makes `tokio::time::sleep` resolve without any wall-clock wait, which would make the assertion
+  trivially true regardless of whether the wrapper timed anything; use a real, unpaused clock instead.
+  See `lore-telemetry/src/pool_acquire.rs`'s `measure_records_the_actual_wait_not_a_zero_duration`.
 
 ## Fixtures and white-box seams
 
@@ -37,6 +49,17 @@ Durable, recurring testing lessons grouped by topic.
   - `42P08` inconsistent types: Do not reuse placeholders (`$1`) for different column types even if the Rust value is the same. Use unique placeholders (`$1`, `$2`).
 - **Retry classification**: Retries should not be triggered by broad transience classifiers for `40001`/`40P01`.
 - **Locking order**: Fanout helpers using `LockSequence` must lock earlier classes *before* the caller's lock, not after.
+
+## Histogram/quantile fixtures
+
+- **Testing a quantile-from-bucket-counts function without re-deriving its formula**: build a fixture
+  where sample *rank* maps monotonically and known-in-advance to a bucket index (e.g. rank `i+1` in
+  bucket `min(i, last_bucket)`), then hand-compute the expected bucket per `(n, q)` pair from the
+  fixture's construction, not from a copy of the function's own rank formula — otherwise the test
+  only checks the implementation against itself. Use sample counts spanning `n*q` fractional
+  (discriminates `ceil` vs `floor`) and exact-integer cases, and place values mid-bucket (not on a
+  boundary) unless the test's specific point is boundary inclusivity. See
+  `lore-telemetry/src/pool_acquire.rs::tests::record_ranked_samples` /`wait_in_bucket`.
 
 ## General Pitfalls
 

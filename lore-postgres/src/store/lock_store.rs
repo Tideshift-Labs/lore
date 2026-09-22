@@ -10,7 +10,6 @@
 //! TTL/lease — locks persist until explicitly released.
 
 use async_trait::async_trait;
-use deadpool_postgres::Pool;
 use deadpool_postgres::PoolError;
 use lore_base::error::InvalidArguments;
 use lore_base::error::LockNotFound;
@@ -26,6 +25,8 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::util;
 use tokio_postgres::Row;
+
+use crate::pool::Pool;
 
 /// Self-bootstrapping schema. The `PRIMARY KEY` is the exclusivity constraint;
 /// the three indexes back the supported `LockQuery` filters (the DynamoDB "3
@@ -64,7 +65,7 @@ impl PostgresLockStore {
         pool_max: u32,
         tls: &crate::pool::TlsConfig,
     ) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(url, pool_max, tls)?;
+        let pool = crate::pool::build_pool_named(url, pool_max, tls, "lock")?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
         Ok(Self {
             pool,

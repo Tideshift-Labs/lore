@@ -68,7 +68,6 @@ use std::time::SystemTime;
 
 pub(crate) use creation::bind_branch_creation_metadata;
 pub(crate) use creation::bind_creation_metadata;
-use deadpool_postgres::Pool;
 use deadpool_postgres::Transaction;
 pub use stage_custody::StageCleanupIntent;
 pub use stage_custody::StageObservation;
@@ -94,6 +93,7 @@ use crate::domain::outbox;
 use crate::domain::outbox::builders;
 use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::schema::STATE_LIVE;
+use crate::pool::Pool;
 
 /// Reserved limit for a future certified complete membership proof under
 /// CR-031's F-031 amendment. Selective fallback is disabled; the scalar-only

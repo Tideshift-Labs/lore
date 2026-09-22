@@ -103,3 +103,16 @@ For detailed historical context, gotchas, and design invariants, see the [Append
     write_behind_source_pins`
 - **CR-035 write-behind backpressure is not unreadiness [SERVER,   `lore-server/src/fragment_write_behind.rs`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-035-write-behind-backpressure-is-not-unreadiness-server-lore-server-src-fragment-write-behind-rs). Gates: `cargo test -p lore-server --lib fragment_write_behind`
 - **WP-122 L5 [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-122-l5-server). Gates: See Appendix.
+- **Pool-acquisition latency instrument [SERVER, `lore-telemetry/src/pool_acquire.rs`]**: checkout-wait
+  histogram/tally, distinct from `operation_duration` and the `pool_waiting`/`pool_available` gauges;
+  `100.0` and `250.0` are placement-gate thresholds and must stay boundary-inclusive. A cancelled
+  `measure()` (deadline elapsed, losing `select!` branch) must still record — via an RAII
+  `AcquireGuard` defaulting to `AcquireOutcome::Abandoned` until `settle()`d, recording on `Drop` so a
+  `?`-early-return or a dropped future is still measured — because those are the longest waits and
+  dropping them silently biases the quantile low exactly when the pool is under pressure. `Abandoned`
+  is excluded from the bucket tally/quantile like `Failed`, with its own `abandoned()`/
+  `abandoned_max_ms()` on the snapshot. Gate: `cargo test -p lore-telemetry --lib pool_acquire`.
+  `lore-telemetry` has no runtime dependency on `lore-base`; the crate's `[dev-dependencies]` carries
+  it solely so tests can use `lore_base::lore_spawn!` (the workspace `clippy.toml`, resolved from the
+  nearest ancestor since the crate has no `clippy.toml` of its own, forbids raw
+  `tokio::spawn`/`JoinSet::spawn` even in tests).

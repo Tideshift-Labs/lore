@@ -16,13 +16,12 @@
 //! The two CHECK constraints on `lore_domain_schema_state` make the unsafe
 //! combinations unrepresentable rather than merely unlikely.
 
-use deadpool_postgres::Pool;
-
 use crate::domain::errors::DomainError;
 use crate::domain::outbox::schema::OUTBOX_BASE_API_VERSION;
 use crate::domain::outbox::schema::OUTBOX_SCHEMA;
 use crate::domain::schema;
 use crate::domain::schema_mediated::MEDIATED_SCHEMA;
+use crate::pool::Pool;
 
 /// Postgres-backed CR-029 domain coordinator.
 pub struct PostgresDomainStore {
@@ -103,7 +102,7 @@ impl PostgresDomainStore {
         pool_max: u32,
         tls: &crate::pool::TlsConfig,
     ) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(url, pool_max, tls)?;
+        let pool = crate::pool::build_pool_named(url, pool_max, tls, "domain")?;
         // Skip completed DDL and commit each missing statement before the next
         // one. Replica joins must not retain schema locks across live writes.
         crate::pool::ensure_schema_online(&pool, schema::SCHEMA).await?;

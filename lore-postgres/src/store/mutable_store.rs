@@ -13,7 +13,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use deadpool_postgres::Pool;
 use deadpool_postgres::PoolError;
 use lore_base::types::Address;
 use lore_base::types::KeyType;
@@ -25,6 +24,8 @@ use lore_storage::errors::SlowDown;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::store_types::KeyValueStream;
 use tokio_postgres::Transaction;
+
+use crate::pool::Pool;
 
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS lore_mutable (
@@ -56,7 +57,7 @@ impl PostgresMutableStore {
         pool_max: u32,
         tls: &crate::pool::TlsConfig,
     ) -> Result<Self, String> {
-        let pool = crate::pool::build_pool(url, pool_max, tls)?;
+        let pool = crate::pool::build_pool_named(url, pool_max, tls, "mutable")?;
         crate::pool::ensure_schema(&pool, SCHEMA).await?;
         Ok(Self {
             pool,

@@ -410,7 +410,7 @@ impl LockFencingReadiness {
 /// Postgres-only CR-030 coordinator, sharing CR-029's pool.
 #[derive(Clone)]
 pub struct PostgresLockCoordinator {
-    pool: deadpool_postgres::Pool,
+    pool: crate::pool::Pool,
     database_identity: String,
 }
 

@@ -22,6 +22,11 @@ use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lore_telemetry::AcquireGuard;
+use lore_telemetry::AcquireOutcome;
+use lore_telemetry::InstrumentProvider;
+use lore_telemetry::PoolAcquireMetrics;
+use lore_telemetry::PoolAcquireSnapshot;
 use rustls::ClientConfig;
 use rustls::RootCertStore;
 use tokio::sync::Mutex;
@@ -36,6 +41,17 @@ use crate::dispatch_client::DATABASE_IDENTITY_SQL;
 use crate::dispatch_client::DispatchDatabaseIdentity;
 use crate::dispatch_client::DispatchDatabaseIdentityError;
 use crate::dispatch_client::decode_database_identity;
+
+/// Shares `lore-postgres`'s metric namespace on purpose: an operator reading a
+/// cell's acquisition p95 wants all six pools under one metric name, separated
+/// by the `pool` label, not this one under a name of its own.
+struct DispatchPoolInstrumentProvider;
+
+impl InstrumentProvider for DispatchPoolInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "urc.store.postgres"
+    }
+}
 
 /// The PostgreSQL role every 0013/0015/0017 mutation and 0020 registration asserts.
 pub const DISPATCH_RUNTIME_ROLE: &str = "object_dispatch_retention_runtime";
@@ -328,6 +344,7 @@ pub struct DispatchRuntimePool {
     lock_timeout_ms: u64,
     operation_timeout: Duration,
     connections_per_replica: u32,
+    acquire_metrics: PoolAcquireMetrics,
 }
 
 impl fmt::Debug for DispatchRuntimePool {
@@ -387,6 +404,7 @@ impl DispatchRuntimePool {
             lock_timeout_ms,
             operation_timeout,
             connections_per_replica,
+            acquire_metrics: PoolAcquireMetrics::new(&DispatchPoolInstrumentProvider, "dispatch"),
         })
     }
 
@@ -415,7 +433,38 @@ impl DispatchRuntimePool {
     }
 
     /// Take one connection out of the pool, opening a new one if the pool is below `pool_max`.
+    ///
+    /// The wait is measured and recorded under the same `pool_acquire_duration`
+    /// instrument `lore-postgres`'s pools use. This pool is hand-rolled rather
+    /// than deadpool-backed, so it does not inherit that crate's measured
+    /// wrapper and has to time itself; the measurement has to exist here
+    /// anyway, because this is the one pool of the six whose exhaustion is a
+    /// permit wait rather than a connection wait, and a process-wide
+    /// acquisition p95 that silently omitted it would be quoting five pools
+    /// while naming six.
     pub(crate) async fn acquire(&self) -> Result<DispatchLease<'_>, DispatchPoolError> {
+        // An `AcquireGuard` rather than an `Instant` pair: this future is
+        // cancellable at both awaits below (the permit wait and the connect),
+        // and a caller dropped at either one has still waited. Recording only
+        // on return would lose exactly the longest waits — see
+        // `AcquireOutcome::Abandoned`.
+        let mut guard = AcquireGuard::new(&self.acquire_metrics);
+        let lease = self.acquire_inner().await;
+        guard.settle(if lease.is_ok() {
+            AcquireOutcome::Acquired
+        } else {
+            AcquireOutcome::Failed
+        });
+        lease
+    }
+
+    /// Read this pool's acquisition tally in-process, without an OTLP
+    /// collector.
+    pub fn acquire_snapshot(&self) -> PoolAcquireSnapshot {
+        self.acquire_metrics.snapshot()
+    }
+
+    async fn acquire_inner(&self) -> Result<DispatchLease<'_>, DispatchPoolError> {
         let permit = tokio::time::timeout(self.config.acquire_timeout, self.permits.acquire())
             .await
             .map_err(|_| DispatchPoolError::PoolExhausted)?
