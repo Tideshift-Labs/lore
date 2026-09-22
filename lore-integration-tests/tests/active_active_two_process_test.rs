@@ -33,6 +33,7 @@ mod active_active_two_process_tests {
 
     use crate::active_active_two_process_support::Arming;
     use crate::active_active_two_process_support::Env;
+    use crate::active_active_two_process_support::backend::CheckpointSnapshot;
     use crate::active_active_two_process_support::backend::OutboxRow;
     use crate::active_active_two_process_support::backend::SharedBackend;
     use crate::active_active_two_process_support::carriage;
@@ -2601,7 +2602,30 @@ mod active_active_two_process_tests {
     /// and a bound under that would report a correct receiver as a failure.
     const REDELIVERY_DEADLINE: Duration = Duration::from_secs(150);
 
-    /// Push one revision through `through` and return the branch tip it left.
+    /// Everything about a chained push that does NOT change between the links.
+    ///
+    /// The process, the writer and the aggregate are fixed for a case; only the
+    /// parent revision, the revision number and the nonce move. Separating them
+    /// is what keeps [`governed_push`] inside the argument bound, and it also
+    /// removes the failure mode the long form invited — five positional
+    /// arguments of which two are `&[u8; 16]`, so swapping the repository and
+    /// the branch at one call site among several compiled cleanly and would
+    /// have pushed to an aggregate the case was not asserting about.
+    struct PushTarget<'a> {
+        /// The process the push is committed on.
+        through: &'a Cell,
+        /// The bearer token the request carries.
+        token: &'a str,
+        /// The subject the governed carriage is prepared for. It must be the
+        /// token's own subject; they are separate fields because the carriage
+        /// and the request are prepared by different helpers.
+        subject: &'a str,
+        repository: &'a [u8; 16],
+        branch: &'a [u8; 16],
+    }
+
+    /// Push one revision through `target.through` and return the branch tip it
+    /// left.
     ///
     /// `previous` is the parent revision and `number` its revision number, so a
     /// case can chain pushes and give ONE aggregate key a rising ordinal
@@ -2611,11 +2635,7 @@ mod active_active_two_process_tests {
     /// aggregates and no gap at all.
     async fn governed_push(
         fixture: &Fixture,
-        through: &Cell,
-        token: &str,
-        subject: &str,
-        repository: &[u8; 16],
-        branch: &[u8; 16],
+        target: &PushTarget<'_>,
         previous: Hash,
         number: u64,
         nonce: u8,
@@ -2623,7 +2643,7 @@ mod active_active_two_process_tests {
         let revision = fixture
             .backend
             .serialize_revision(
-                repository_id(*repository),
+                repository_id(*target.repository),
                 previous,
                 number,
                 Some(&format!("push-{number}.txt")),
@@ -2632,9 +2652,9 @@ mod active_active_two_process_tests {
         let prepared = carriage::prepare_push(
             &fixture.backend,
             fixture.minter.issuer(),
-            subject,
-            repository,
-            branch,
+            target.subject,
+            target.repository,
+            target.branch,
             revision.as_ref(),
             false,
             false,
@@ -2642,15 +2662,15 @@ mod active_active_two_process_tests {
         )
         .await;
         let request = carriage::push_request(
-            token,
-            repository,
-            branch,
+            target.token,
+            target.repository,
+            target.branch,
             revision.as_ref(),
             false,
             false,
             Some(&prepared),
         );
-        carriage::branch_push(through.grpc_endpoint(), request)
+        carriage::branch_push(target.through.grpc_endpoint(), request)
             .await
             .unwrap_or_else(|status| {
                 panic!("the governed push at revision {number} must succeed: {status:?}")
@@ -2747,6 +2767,43 @@ mod active_active_two_process_tests {
         );
     }
 
+    /// Poll `cell`'s checkpoint row for one generation until `accept` takes it,
+    /// and return THE ROW THAT WAS ACCEPTED.
+    ///
+    /// Returning the accepted row is the whole point, and it is why this is not
+    /// a `wait_until!`. A wait that only answers "the condition held once" makes
+    /// the caller read the row again to assert on it, and the second read is a
+    /// different moment: a park is resolved by the broker's own `ack_wait`
+    /// redelivery, so between the two reads the frontier can pass the park and
+    /// the blocker can vanish. The caller would then assert a frontier from
+    /// after recovery against a park observed before it, and fail a receiver
+    /// that did exactly the right thing.
+    async fn wait_for_checkpoint(
+        fixture: &Fixture,
+        cell: &Cell,
+        generation: i64,
+        label: &str,
+        accept: impl Fn(&CheckpointSnapshot) -> bool,
+    ) -> CheckpointSnapshot {
+        let identity = cell.receiver_identity();
+        let start = Instant::now();
+        loop {
+            let snapshot = fixture
+                .backend
+                .checkpoint_snapshot(&identity, generation)
+                .await;
+            match snapshot {
+                Some(snapshot) if accept(&snapshot) => return snapshot,
+                other => assert!(
+                    start.elapsed() < RECEIVER_DEADLINE,
+                    "timed out after {:?} waiting for {label}; last seen {other:?}",
+                    start.elapsed()
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
     /// Wait until `cell` reports its durable receiver ready.
     async fn wait_for_receiver(cell: &Cell) {
         wait_until!(
@@ -2799,18 +2856,14 @@ mod active_active_two_process_tests {
         wait_for_receiver(&b).await;
 
         // The mutation. Committed on A, and A is the only process it touches.
-        let revision = governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-m-writer",
-            &repository,
-            &branch,
-            Hash::default(),
-            1,
-            0x61,
-        )
-        .await;
+        let target = PushTarget {
+            through: &a,
+            token: &token,
+            subject: "case-m-writer",
+            repository: &repository,
+            branch: &branch,
+        };
+        let revision = governed_push(&fixture, &target, Hash::default(), 1, 0x61).await;
 
         // One durable outbox intent, of the expected kind, accepted by the
         // real broker. Asserted before the receiver half so a failure
@@ -2922,18 +2975,14 @@ mod active_active_two_process_tests {
 
         // Push 1: establishes the applied ordinal for this aggregate. Nothing
         // is armed yet, so this delivery is ordinary.
-        let first = governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-n-writer",
-            &repository,
-            &branch,
-            Hash::default(),
-            1,
-            0x71,
-        )
-        .await;
+        let target = PushTarget {
+            through: &a,
+            token: &token,
+            subject: "case-n-writer",
+            repository: &repository,
+            branch: &branch,
+        };
+        let first = governed_push(&fixture, &target, Hash::default(), 1, 0x71).await;
         let first_sequence = wait_for_accepted_pushes(&fixture, 1, "case N push 1").await;
         let generation = wait_for_frontier(&fixture, &b, first_sequence, "case N push 1").await;
         assert!(
@@ -2946,18 +2995,7 @@ mod active_active_two_process_tests {
         // Arm, then push 2. The arm is deliberately after push 1's frontier is
         // proven, so the fault cannot land on a bootstrap drain delivery.
         b.arm_receiver_fault(FAULT_DROP);
-        let second = governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-n-writer",
-            &repository,
-            &branch,
-            first,
-            2,
-            0x72,
-        )
-        .await;
+        let second = governed_push(&fixture, &target, first, 2, 0x72).await;
         let dropped_sequence = wait_for_accepted_pushes(&fixture, 2, "case N push 2").await;
         wait_until!(
             format!(
@@ -2970,18 +3008,7 @@ mod active_active_two_process_tests {
 
         // Push 3: the skip. B has applied ordinal 1, never saw ordinal 2, and
         // now sees ordinal 3 for the same aggregate key.
-        governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-n-writer",
-            &repository,
-            &branch,
-            second,
-            3,
-            0x73,
-        )
-        .await;
+        governed_push(&fixture, &target, second, 3, 0x73).await;
         let third_sequence = wait_for_accepted_pushes(&fixture, 3, "case N push 3").await;
 
         wait_until!(
@@ -3103,18 +3130,14 @@ mod active_active_two_process_tests {
             .expect("a ready receiver reports its generation");
 
         b.arm_receiver_fault(FAULT_DUPLICATE);
-        governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-o-writer",
-            &repository,
-            &branch,
-            Hash::default(),
-            1,
-            0x81,
-        )
-        .await;
+        let target = PushTarget {
+            through: &a,
+            token: &token,
+            subject: "case-o-writer",
+            repository: &repository,
+            branch: &branch,
+        };
+        governed_push(&fixture, &target, Hash::default(), 1, 0x81).await;
         let accepted = wait_for_accepted_pushes(&fixture, 1, "case O push").await;
         wait_until!(
             format!(
@@ -3221,18 +3244,14 @@ mod active_active_two_process_tests {
         // which is how this case first failed — a sixty-second timeout that
         // reads like a broken decorator and is really a long-poll.
         b.arm_receiver_fault(FAULT_STREAM_TRANSIENT);
-        let first = governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-p-writer",
-            &repository,
-            &branch,
-            Hash::default(),
-            1,
-            0x91,
-        )
-        .await;
+        let target = PushTarget {
+            through: &a,
+            token: &token,
+            subject: "case-p-writer",
+            repository: &repository,
+            branch: &branch,
+        };
+        let first = governed_push(&fixture, &target, Hash::default(), 1, 0x91).await;
         let first_sequence = wait_for_accepted_pushes(&fixture, 1, "case P push 1").await;
         wait_until!(
             format!(
@@ -3248,18 +3267,7 @@ mod active_active_two_process_tests {
         // receiver is still consuming rather than merely still alive: the
         // failure left everything unacknowledged, the receiver backed off, and
         // it is now draining new work on the SAME generation.
-        governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-p-writer",
-            &repository,
-            &branch,
-            first,
-            2,
-            0x92,
-        )
-        .await;
+        governed_push(&fixture, &target, first, 2, 0x92).await;
         let accepted = wait_for_accepted_pushes(&fixture, 2, "case P push 2").await;
         let after = wait_for_frontier(&fixture, &b, accepted, "case P push 2").await;
 
@@ -3340,18 +3348,14 @@ mod active_active_two_process_tests {
             .expect("a ready receiver reports its generation");
 
         b.arm_receiver_fault(FAULT_ACK_TRANSIENT);
-        governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-q-writer",
-            &repository,
-            &branch,
-            Hash::default(),
-            1,
-            0xa1,
-        )
-        .await;
+        let target = PushTarget {
+            through: &a,
+            token: &token,
+            subject: "case-q-writer",
+            repository: &repository,
+            branch: &branch,
+        };
+        governed_push(&fixture, &target, Hash::default(), 1, 0xa1).await;
         let accepted = wait_for_accepted_pushes(&fixture, 1, "case Q push").await;
         wait_until!(
             format!(
@@ -3492,18 +3496,14 @@ mod active_active_two_process_tests {
             .expect("a quiesced receiver has reported a checkpoint for its own generation");
 
         b.arm_receiver_fault(FAULT_POISON);
-        governed_push(
-            &fixture,
-            &a,
-            &token,
-            "case-r-writer",
-            &repository,
-            &branch,
-            Hash::default(),
-            1,
-            0xb1,
-        )
-        .await;
+        let target = PushTarget {
+            through: &a,
+            token: &token,
+            subject: "case-r-writer",
+            repository: &repository,
+            branch: &branch,
+        };
+        governed_push(&fixture, &target, Hash::default(), 1, 0xb1).await;
         let poisoned_sequence = wait_for_accepted_pushes(&fixture, 1, "case R push").await;
         wait_until!(
             format!(
@@ -3565,31 +3565,24 @@ mod active_active_two_process_tests {
         // this wait could answer from after the recovery — pairing a frontier
         // that has moved past the park with a park observed before it, and
         // failing a receiver that did exactly the right thing.
-        let mut parked: Option<(i64, Vec<(i64, i64)>, Vec<(i64, String)>)> = None;
-        wait_until!(
-            format!(
-                "process B's checkpoint to carry a park at {poisoned_sequence}; last seen {:?}",
-                fixture
-                    .backend
-                    .checkpoint_snapshot(&b.receiver_identity(), generation)
-                    .await
-            ),
-            RECEIVER_DEADLINE,
-            {
-                parked = fixture
-                    .backend
-                    .checkpoint_snapshot(&b.receiver_identity(), generation)
-                    .await;
-                parked.as_ref().is_some_and(|(_, _, poison)| {
-                    poison.iter().any(|(sequence, class)| {
-                        *sequence == poisoned_sequence && class == POISON_CLASS_UNSUPPORTED_SCHEMA
-                    })
+        let parked = wait_for_checkpoint(
+            &fixture,
+            &b,
+            generation,
+            &format!("case R: a park at {poisoned_sequence}"),
+            |snapshot| {
+                snapshot.poison.iter().any(|(sequence, class)| {
+                    *sequence == poisoned_sequence && class == POISON_CLASS_UNSUPPORTED_SCHEMA
                 })
-            }
-        );
+            },
+        )
+        .await;
 
-        let (blocked_frontier, gaps, poison) =
-            parked.expect("the predicate only passed on a row it had just read");
+        let CheckpointSnapshot {
+            frontier: blocked_frontier,
+            gaps,
+            poison,
+        } = parked;
         assert!(
             blocked_frontier < poisoned_sequence,
             "a parked delivery is never acknowledged, so the contiguous frontier must stay below \

@@ -100,6 +100,21 @@ impl DomainBackfillSource for EmptyBackfillSource {
     }
 }
 
+/// One receiver generation's whole checkpoint row, read at ONE moment.
+///
+/// A named type rather than a tuple because the three fields move together and
+/// a caller that mixes up the two blocker lists — both `Vec` of pairs starting
+/// with an `i64` sequence — gets a compile error instead of a wrong assertion.
+#[derive(Debug, Clone)]
+pub struct CheckpointSnapshot {
+    /// The highest sequence this generation has proved complete.
+    pub frontier: i64,
+    /// Unresolved gaps, as inclusive `(from, to)` ranges.
+    pub gaps: Vec<(i64, i64)>,
+    /// Unresolved parks, as `(broker_sequence, poison class)`.
+    pub poison: Vec<(i64, String)>,
+}
+
 /// One outbox row, as the authority reports it.
 #[derive(Debug, Clone)]
 pub struct OutboxRow {
@@ -632,7 +647,7 @@ impl SharedBackend {
         &self,
         receiver_identity: &str,
         membership_generation: i64,
-    ) -> Option<(i64, Vec<(i64, i64)>, Vec<(i64, String)>)> {
+    ) -> Option<CheckpointSnapshot> {
         let row = self
             .authority
             .query_opt(
@@ -654,11 +669,11 @@ impl SharedBackend {
                 classes.len(),
                 "the checkpoint projection's poison arrays must stay parallel"
             );
-            (
-                row.get("contiguous_frontier"),
-                starts.into_iter().zip(ends).collect(),
-                sequences.into_iter().zip(classes).collect(),
-            )
+            CheckpointSnapshot {
+                frontier: row.get("contiguous_frontier"),
+                gaps: starts.into_iter().zip(ends).collect(),
+                poison: sequences.into_iter().zip(classes).collect(),
+            }
         })
     }
 

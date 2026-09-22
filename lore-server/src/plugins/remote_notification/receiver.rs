@@ -1378,6 +1378,7 @@ mod tests {
 
     use bytes::Bytes;
     use lore_base::types::RepositoryId;
+    use lore_postgres::domain::outbox::schema::MAX_CHECKPOINT_BLOCKERS;
 
     use super::super::apply::POISON_CLASS_UNSUPPORTED_SCHEMA;
     use super::super::apply::RecordingInvalidationTarget;
@@ -1719,6 +1720,129 @@ mod tests {
             session.needs_checkpoint(&harness.receiver.receiver),
             "a park that acknowledges nothing must still count toward the checkpoint cadence, or \
              the durable projection never learns the generation is blocked"
+        );
+    }
+
+    /// A broker redelivers an unacknowledged parked sequence.
+    /// [`AckFrontier::record_poison`] deliberately deduplicates the poison
+    /// entry itself, and deliberately NOT [`ReceiverSession::park`] — each
+    /// protects something different. This pins both halves: the poison list
+    /// must not grow on the redelivery, and the checkpoint must still be
+    /// re-armed by it, because `park` increments
+    /// `events_since_checkpoint` unconditionally. A `park` that skipped the
+    /// increment for an already-known sequence would pass the first half and
+    /// silently restore the original defect for every redelivery.
+    #[tokio::test]
+    async fn a_redelivered_park_does_not_duplicate_the_poison_entry_but_still_rearms_the_checkpoint()
+     {
+        let mut harness = harness(900);
+        harness.receiver.receiver.checkpoint_every_events = 1;
+        let mut session = harness.receiver.bootstrap().await.expect("bootstraps");
+        assert_eq!(session.contiguous_frontier(), 899);
+
+        // First delivery: parked.
+        harness
+            .stream
+            .push_envelope(900, durable_with_unsupported_payload_version(0x9f, 1));
+        assert_eq!(
+            harness.receiver.step(&mut session).await,
+            StepOutcome::Parked(POISON_CLASS_UNSUPPORTED_SCHEMA)
+        );
+        assert_eq!(
+            session.checkpoint_report(IDENTITY).poison.len(),
+            1,
+            "the first park records one blocker"
+        );
+        assert!(session.needs_checkpoint(&harness.receiver.receiver));
+
+        // Model a checkpoint having already been sent for the first park, so
+        // the second delivery's own effect on the cadence can be isolated
+        // from the first's.
+        session.reported_frontier = Some(session.contiguous_frontier());
+        session.events_since_checkpoint = 0;
+        assert!(
+            !session.needs_checkpoint(&harness.receiver.receiver),
+            "sanity: nothing pending immediately after the modeled checkpoint"
+        );
+
+        // The broker redelivers the same unacknowledged sequence.
+        harness
+            .stream
+            .push_envelope(900, durable_with_unsupported_payload_version(0x9f, 1));
+        assert_eq!(
+            harness.receiver.step(&mut session).await,
+            StepOutcome::Parked(POISON_CLASS_UNSUPPORTED_SCHEMA)
+        );
+
+        assert_eq!(
+            session.checkpoint_report(IDENTITY).poison.len(),
+            1,
+            "a redelivered park must not duplicate the poison entry"
+        );
+        assert!(
+            session.needs_checkpoint(&harness.receiver.receiver),
+            "a redelivered park must still re-arm the checkpoint even though \
+             AckFrontier::record_poison deduplicated it, or a redelivery leaves the durable \
+             projection unaware the generation is still blocked"
+        );
+    }
+
+    /// Once the poison tracker saturates, [`AckFrontier::record_poison`]
+    /// early-returns without pushing a new entry — the caller cannot tell a
+    /// saturated park from a no-op by watching the poison list. The
+    /// checkpoint must still be armed regardless, because the synthetic
+    /// `POISON_CLASS_TRACKER_SATURATED` entry [`AckFrontier::poison`] appends
+    /// only reaches the durable projection if a checkpoint is actually sent.
+    /// Drives saturation directly on the frontier rather than pushing
+    /// [`MAX_CHECKPOINT_BLOCKERS`] real deliveries through the stream: the
+    /// tests module has direct field access to [`ReceiverSession::frontier`]
+    /// and [`AckFrontier::record_poison`] is public, so this is the cheapest
+    /// way to reach the state under test.
+    #[tokio::test]
+    async fn a_park_while_the_poison_tracker_is_saturated_still_arms_the_checkpoint() {
+        let mut harness = harness(900);
+        harness.receiver.receiver.checkpoint_every_events = 1;
+        let mut session = harness.receiver.bootstrap().await.expect("bootstraps");
+
+        // Fill the tracker to exactly its cap with distinct sequences.
+        for offset in 1..=(MAX_CHECKPOINT_BLOCKERS as i64) {
+            session
+                .frontier
+                .record_poison(1_000 + offset, "SATURATION_FILL");
+        }
+        assert!(
+            !session.frontier.is_saturated(),
+            "filling exactly to the cap must not itself saturate the tracker"
+        );
+
+        // One more distinct sequence pushes it over.
+        session.frontier.record_poison(
+            1_000 + MAX_CHECKPOINT_BLOCKERS as i64 + 1,
+            "SATURATION_TRIGGER",
+        );
+        assert!(
+            session.frontier.is_saturated(),
+            "one more distinct park past the cap must saturate the tracker"
+        );
+
+        // Establish a clean checkpoint baseline so the assertion below
+        // isolates park's own contribution.
+        session.reported_frontier = Some(session.frontier.contiguous_frontier());
+        session.events_since_checkpoint = 0;
+        assert!(
+            !session.needs_checkpoint(&harness.receiver.receiver),
+            "sanity: nothing pending before the park under test"
+        );
+
+        // A further park while saturated: record_poison itself pushes
+        // nothing new (it early-returns once saturated).
+        session.park(1_000 + MAX_CHECKPOINT_BLOCKERS as i64 + 2, "NEW_POISON");
+
+        assert!(
+            session.needs_checkpoint(&harness.receiver.receiver),
+            "a park must arm the checkpoint even when the tracker is saturated and \
+             record_poison itself pushed nothing new, or the synthetic \
+             FRONTIER_TRACKER_SATURATED entry never reaches the durable projection"
         );
     }
 
