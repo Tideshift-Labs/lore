@@ -77,7 +77,8 @@ pub const DISPATCH_PROCESS_CONNECTION_LIMIT: u32 = 20;
 ///
 /// # Two pools outside this sum, 2026-09-21
 ///
-/// Verified at their construction sites, and they are not the same kind of exclusion.
+/// Verified at their construction sites, and they are not the same kind of exclusion. **The
+/// omission is conditional, not flat, and it bites in the one profile we deploy.**
 ///
 /// `colocation_check` (`lore-server/src/plugins/postgres.rs:1637`, `pool_max` 1) is **in-process**
 /// and opens at startup: `assert_domain_store_colocated` builds it to read
