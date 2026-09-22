@@ -47,10 +47,19 @@
 //! # The grammar
 //!
 //! `LORE_RECEIVER_FAULTS` is a comma-separated list of `anchor=trigger`. Every
-//! anchor fires **exactly once** and is spent afterwards. One-shot rather than
+//! anchor fires **at most once** and is spent afterwards. One-shot rather than
 //! sticky is deliberate: a fault that keeps firing proves the receiver notices
 //! it, and a fault that stops proves the receiver *recovers* from it, which is
 //! the half WP-119 Phase 10 actually needs.
+//!
+//! *At most* once, not exactly once, and the difference is reachable:
+//! `receiver.stream.poison` declines a delivery that is not a
+//! `DURABLE_INVALIDATION`, because corrupting one would perturb nothing. A
+//! declined anchor is NOT spent, so an `Armed` trigger simply fires on the next
+//! eligible delivery — but an `Ordinal` trigger has only that one delivery to
+//! fire at, so an ordinal aimed at an ineligible one never fires at all. That
+//! is deliberate: firing anyway would spend the shot and write a `.fired`
+//! marker for a fault that changed nothing.
 //!
 //! A trigger is one of two things:
 //!
@@ -631,20 +640,34 @@ mod injected {
             }
         }
 
-        /// Spend `anchor`'s one shot and leave the `.fired` marker.
+        /// Spend `anchor`'s one shot, WITHOUT leaving the `.fired` marker.
         ///
         /// Returns false when it was already spent, so the check and the spend
-        /// are one atomic decision under the lock rather than two.
+        /// are one atomic decision under the lock rather than two. This is the
+        /// only place `spent` grows, and every effect must be guarded by a
+        /// `true` from here — a fault that lands outside a successful spend can
+        /// land more than once, and a fault that lands after a `false` lands
+        /// without the marker that is supposed to witness it.
+        ///
+        /// Split from the marker for `receiver.stream.duplicate`, whose effect
+        /// happens one call LATER than its decision: see the replay branch of
+        /// [`DurableStreamSource::next`].
+        fn spend(&self, anchor: Anchor) -> bool {
+            let mut spent = match self.spent.lock() {
+                Ok(spent) => spent,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if spent.contains(&anchor) {
+                return false;
+            }
+            spent.push(anchor);
+            true
+        }
+
+        /// Spend `anchor`'s one shot and leave the `.fired` marker.
         fn commit(&self, anchor: Anchor) -> bool {
-            {
-                let mut spent = match self.spent.lock() {
-                    Ok(spent) => spent,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                if spent.contains(&anchor) {
-                    return false;
-                }
-                spent.push(anchor);
+            if !self.spend(anchor) {
+                return false;
             }
             self.mark_fired(anchor);
             true
@@ -748,23 +771,31 @@ mod injected {
     /// harness having to know this module's validation order. A corruption
     /// whose poison class depended on which check happened to fire first would
     /// make the assertion fragile against an unrelated reordering.
-    /// Returns whether the envelope was actually corrupted.
+    /// Whether corrupting this envelope would actually perturb anything.
     ///
-    /// The bool is load-bearing, not a convenience. An envelope that is not a
-    /// `DURABLE_INVALIDATION` has no `payload_version` to push out of range,
-    /// and the receiver already parks it as an unexpected delivery class on its
-    /// own — so this would perturb nothing. Reporting that lets the caller
-    /// decline to spend the anchor, because a firing that is logged, spends its
-    /// one shot, and writes a `.fired` marker while changing nothing is exactly
-    /// the "it held / it never ran" confusion the marker exists to prevent.
-    fn poison(envelope: &mut wire::PrivateEnvelopeV1) -> bool {
+    /// A PURE predicate, deliberately separate from [`poison`], so eligibility
+    /// can be decided BEFORE the anchor is spent and the mutation can then
+    /// happen only on a successful spend. The first shape of this fix mutated
+    /// first and spent second, which let a concurrent reader corrupt several
+    /// deliveries while only one of them got the `.fired` marker — the same
+    /// "a fault landed with nothing witnessing it" defect in mirror image.
+    ///
+    /// An envelope that is not a `DURABLE_INVALIDATION` has no
+    /// `payload_version` to push out of range, and the receiver already parks
+    /// it as an unexpected delivery class on its own.
+    fn poison_would_take(envelope: &wire::PrivateEnvelopeV1) -> bool {
         use wire::private_envelope_v1::Body;
-        match envelope.body.as_mut() {
-            Some(Body::DurableInvalidation(body)) => {
-                body.payload_version = u32::MAX;
-                true
-            }
-            _ => false,
+        matches!(envelope.body, Some(Body::DurableInvalidation(_)))
+    }
+
+    /// Corrupt one envelope so `decode_durable_delivery` must park it.
+    ///
+    /// Infallible, and only ever called after [`poison_would_take`] said yes
+    /// and the anchor's shot was spent.
+    fn poison(envelope: &mut wire::PrivateEnvelopeV1) {
+        use wire::private_envelope_v1::Body;
+        if let Some(Body::DurableInvalidation(body)) = envelope.body.as_mut() {
+            body.payload_version = u32::MAX;
         }
     }
 
@@ -804,6 +835,11 @@ mod injected {
             // number of reads later. It deliberately does NOT advance the
             // delivery counter: it is the same delivery, seen twice.
             if let Some(delivered) = self.take_pending() {
+                // The marker goes here, where the effect actually lands, not at
+                // the stash. A case waits on `.fired` before asserting, so it
+                // must not be able to see the marker for a duplicate that was
+                // stashed and then discarded.
+                self.mark_fired(Anchor::StreamDuplicate);
                 warn!(
                     "{EVIDENCE_PREFIX} replay anchor={} broker_sequence={}",
                     Anchor::StreamDuplicate.name(),
@@ -828,27 +864,39 @@ mod injected {
                 return Ok(StreamDelivery::CaughtUp);
             }
 
-            // Two-phase, unlike every other anchor: corrupt FIRST and spend the
-            // shot only if the corruption took. See `poison`'s own doc comment.
+            // Eligibility, then the spend, then the effect — in that order, so
+            // the corruption happens if and only if this call is the one that
+            // spent the anchor's single shot. See `poison_would_take`.
             if self.is_due(Anchor::StreamPoison, self.config.stream_poison, ordinal) {
-                if poison(&mut delivered.envelope) {
-                    if self.commit(Anchor::StreamPoison) {
-                        Self::log_firing(Anchor::StreamPoison, ordinal, Some(sequence));
-                    }
-                } else {
+                if !poison_would_take(&delivered.envelope) {
+                    // Declined, not fired: the anchor stays armed and no
+                    // `.fired` marker appears, so a case waiting on the marker
+                    // keeps waiting rather than asserting against an envelope
+                    // nothing touched.
                     warn!(
                         "{EVIDENCE_PREFIX} skipped anchor={} ordinal={ordinal} \
                          broker_sequence={sequence} reason=not_a_durable_invalidation",
                         Anchor::StreamPoison.name()
                     );
+                } else if self.commit(Anchor::StreamPoison) {
+                    poison(&mut delivered.envelope);
+                    Self::log_firing(Anchor::StreamPoison, ordinal, Some(sequence));
                 }
             }
 
-            if self.fires(
+            // `spend`, not `commit`: the duplicate's EFFECT is the replay on the
+            // next call, so the `.fired` marker is written there and not here.
+            // Marking at stash time let a case wait on `.fired`, assert "applied
+            // exactly once", and pass having never been delivered a duplicate at
+            // all — for instance when `capture` discarded the stashed copy in
+            // between. The spend still happens here, so the anchor cannot arm
+            // twice while a copy is pending.
+            if self.is_due(
                 Anchor::StreamDuplicate,
                 self.config.stream_duplicate,
                 ordinal,
-            ) {
+            ) && self.spend(Anchor::StreamDuplicate)
+            {
                 Self::log_firing(Anchor::StreamDuplicate, ordinal, Some(sequence));
                 self.stash_pending(delivered.clone());
             }

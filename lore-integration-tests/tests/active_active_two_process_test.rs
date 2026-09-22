@@ -3151,6 +3151,17 @@ mod active_active_two_process_tests {
             "the duplicate anchor is one-shot; a second firing would mean the count above is \
              about a different delivery than the case thinks"
         );
+        // Without this the case is satisfiable with no duplicate ever
+        // delivered: "applied exactly once" is trivially true of a stream that
+        // carried the event once. The replay line is the only proof the
+        // receiver was actually handed the same event twice.
+        assert_eq!(
+            b.log_lines_containing(&format!("RECEIVER_FAULT replay anchor={FAULT_DUPLICATE}")),
+            1,
+            "the stashed copy must actually have been REPLAYED to the receiver, not merely \
+             stashed. Log tail: {}",
+            b.log_tail()
+        );
         assert_eq!(
             b.log_lines_containing(&refetch_line(&repository)),
             0,
