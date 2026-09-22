@@ -1715,12 +1715,29 @@ fn the_connection_budget_statement_is_present_and_arithmetically_true() {
         "six independently configured maxima",
         "sum above 20 PostgreSQL connections",
         "do-managed-pg-connection-budget.md",
+        // The two pools outside the sum, verified at their construction sites 2026-09-21. An
+        // "exact" inventory that silently omits a connection is read as authoritative by whoever
+        // sizes the managed instance, so the exclusions are named rather than assumed.
+        "colocation identity check",
+        "sum plus one on a cell with no fragment provider",
+        "domain initialize-events",
     ] {
         assert!(
             DISPATCH_CONNECTION_BUDGET_STATEMENT.contains(fragment),
             "the budget statement omits {fragment}"
         );
     }
+    // The condition under which the omitted colocation connection actually matters. A cell with a
+    // fragment provider reclaims its headroom, because the check is released before the dispatch
+    // pool opens and `dispatch_pool_max` is then at least 1; a cell without one does not.
+    let no_provider = DispatchConnectionBudget::new(2, 3, 4, 5, 0, 6).expect("no-provider cell");
+    assert_eq!(no_provider.connections_per_replica(), 20);
+    assert_eq!(
+        no_provider.dispatch_pool_max(),
+        0,
+        "the no-provider profile is the one whose momentary peak is the sum plus the colocation \
+         connection, because no dispatch pool later occupies that headroom"
+    );
 }
 
 #[test]

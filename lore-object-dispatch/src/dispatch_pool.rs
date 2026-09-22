@@ -74,15 +74,49 @@ pub const DISPATCH_PROCESS_CONNECTION_LIMIT: u32 = 20;
 /// instance sized for the app pools alone rather than the full consumer set was exhausted at
 /// `max_connections = 25`, and the exhaustion surfaced as SQLSTATE `53300` in three
 /// unrelated-looking failures rather than as an obvious pool error.
+///
+/// # Two pools outside this sum, 2026-09-21
+///
+/// Verified at their construction sites, and they are not the same kind of exclusion.
+///
+/// `colocation_check` (`lore-server/src/plugins/postgres.rs:1637`, `pool_max` 1) is **in-process**
+/// and opens at startup: `assert_domain_store_colocated` builds it to read
+/// `(system_identifier, database OID)` once, then drops it. It is therefore concurrent with the
+/// domain pool it is checking against. It does **not** raise the process peak on a cell that
+/// configures a fragment provider, because it is released before the dispatch pool opens and
+/// `dispatch_pool_max` is then at least 1. It **does** raise the peak to `sum + 1` on a cell with
+/// no fragment provider, where `dispatch_pool_max` is zero and nothing later reclaims the
+/// headroom — which is exactly the staging profile. A configuration summing to precisely 20 on
+/// such a cell momentarily wants 21. That load-bearing ordering claim (colocation released before
+/// dispatch construction) is read from source and has not been confirmed by a runtime connection
+/// count.
+///
+/// The event-operator relay pool (`lore-server/src/domain/event_operator.rs:95`, `pool_max` 2)
+/// is an out-of-band operator command, `loreserver domain initialize-events`. It belongs to the
+/// same class as 0020's enrollment and the schema installer, already carved out below, and is
+/// named here only because an unnamed carve-out is indistinguishable from an oversight.
+///
+/// `PostgresReceiverStore` is **not** a third pool. It holds a `deadpool` `Pool` handle cloned
+/// from the relay pool (`lore-server/src/event_relay/wiring.rs:326`), and a clone shares one
+/// underlying pool, so it borrows per call and adds nothing. Reserving for it would reserve
+/// connections that are never opened. It is, however, a borrower that `RELAY_POOL_MAX`'s own
+/// sizing comment (`wiring.rs:108-111`, "one each and one spare" for four borrowers) does not
+/// count — a relay sizing question, not a budget question, and not measured here.
 pub const DISPATCH_CONNECTION_BUDGET_STATEMENT: &str = "\
 Per loreserver process in a cell: lore-postgres immutable, mutable, lock, and domain pools, one \
 lore-object-dispatch dispatch-runtime pool, and CR-032's event-relay pool when [outbox_relay] is \
 enabled, all against the same cell database and none coordinating on connections. Composition \
 must add the six independently configured maxima and refuse a sum above 20 PostgreSQL \
 connections before constructing the dispatch pool. The relay's maximum is zero exactly when the \
-relay is disabled, so a cell that has not enabled it reserves nothing for it. The managed \
-instance must be sized for that sum across every replica plus every other consumer of the same \
-instance, per lorehub/docs/learnings/do-managed-pg-connection-budget.md.";
+relay is disabled, so a cell that has not enabled it reserves nothing for it. One further \
+in-process connection is NOT in this sum: the startup colocation identity check opens a \
+single-connection pool beside the domain pool and releases it before the dispatch pool is built, \
+so it is covered by dispatch headroom on a provider-configured cell but raises the momentary peak \
+to the sum plus one on a cell with no fragment provider. Size for that one extra connection on \
+such a cell. Out-of-band operator commands, including schema install, 0020 enrollment, and \
+domain initialize-events, account for their own connections separately and are outside this sum. \
+The managed instance must be sized for that total across every replica plus every other consumer \
+of the same instance, per lorehub/docs/learnings/do-managed-pg-connection-budget.md.";
 
 /// The per-replica pool arithmetic behind [`DISPATCH_CONNECTION_BUDGET_STATEMENT`].
 ///
