@@ -85,6 +85,22 @@ pub struct BootOptions<'a> {
     pub relay_enabled: bool,
     /// `LORE_FRAGMENT_FAILPOINTS` for this boot, if any.
     pub failpoints: Option<&'a str>,
+    /// `LORE_RECEIVER_FAULTS` for this boot, if any.
+    ///
+    /// Separate from `failpoints` because the two reach different crates and
+    /// different halves of the event plane: `LORE_FRAGMENT_FAILPOINTS` arms
+    /// `lore-postgres`'s producer-side anchors, and this arms `lore-server`'s
+    /// receiver-side stream decorator. A single field would let a case meaning
+    /// to inject on one side silently disarm the other on a restart, which is
+    /// the class of mistake this struct's own doc comment already warns about.
+    pub receiver_faults: Option<&'a str>,
+    /// Trace every invalidation-target call in this process's log.
+    ///
+    /// Off by default. A case that asserts "replica B applied replica A's
+    /// mutation" turns it on, because a frontier advancing does not name the
+    /// repository, the event kind, or the ordinal — and the whole point of the
+    /// A-to-B claim is that it names them.
+    pub trace_target: bool,
 }
 
 impl BootOptions<'_> {
@@ -93,6 +109,8 @@ impl BootOptions<'_> {
         Self {
             relay_enabled: true,
             failpoints: None,
+            receiver_faults: None,
+            trace_target: false,
         }
     }
 
@@ -105,6 +123,49 @@ impl BootOptions<'_> {
         Self {
             relay_enabled: false,
             failpoints: None,
+            receiver_faults: None,
+            trace_target: false,
+        }
+    }
+}
+
+impl<'a> BootOptions<'a> {
+    /// Relay on, the invalidation target traced, and `spec` armed on the
+    /// receiver's durable stream.
+    ///
+    /// The trace comes with the faults rather than being a third call, because
+    /// every case that injects a receiver-side fault asserts on what the
+    /// receiver then did with it, and that assertion reads the traced lines.
+    pub fn receiver_faults(spec: &'a str) -> Self {
+        Self {
+            relay_enabled: true,
+            failpoints: None,
+            receiver_faults: Some(spec),
+            trace_target: true,
+        }
+    }
+
+    /// Relay on, with `spec` armed as `LORE_FRAGMENT_FAILPOINTS`.
+    ///
+    /// A constructor rather than a struct literal at the call site, so adding a
+    /// field here cannot break a case that has nothing to do with it — which is
+    /// exactly what the receiver-fault fields did the first time.
+    pub fn with_failpoints(spec: &'a str) -> Self {
+        Self {
+            relay_enabled: true,
+            failpoints: Some(spec),
+            receiver_faults: None,
+            trace_target: false,
+        }
+    }
+
+    /// Relay on, no injected fault, but the invalidation target traced.
+    pub fn traced() -> Self {
+        Self {
+            relay_enabled: true,
+            failpoints: None,
+            receiver_faults: None,
+            trace_target: true,
         }
     }
 }
@@ -120,8 +181,15 @@ pub struct Cell {
     /// Everything the template needs except the relay switch, which changes per
     /// boot and is therefore applied at render time rather than stored.
     render_pairs: Vec<(&'static str, String)>,
-    /// Process environment except `LORE_FRAGMENT_FAILPOINTS`, same reason.
+    /// Process environment except the per-boot fault variables, same reason.
     base_env: Vec<(String, String)>,
+    /// This process's own receiver-fault rendezvous directory.
+    ///
+    /// Per process rather than per case: both processes run a receiver, and an
+    /// arm file in a shared directory would fire on whichever one read it
+    /// first, making the case's own claim about WHICH replica saw the fault
+    /// unfalsifiable.
+    fault_dir: PathBuf,
     child: Option<Child>,
 }
 
@@ -140,6 +208,8 @@ impl Cell {
         std::fs::create_dir_all(&config_dir).expect("create the process config directory");
         let state_dir = env.work_dir.join(format!("state-{name}"));
         std::fs::create_dir_all(&state_dir).expect("create the process state directory");
+        let fault_dir = env.work_dir.join(format!("faults-{name}"));
+        std::fs::create_dir_all(&fault_dir).expect("create the process fault rendezvous directory");
 
         let render_pairs = vec![
             ("GRPC_PORT", grpc_port.to_string()),
@@ -227,11 +297,50 @@ impl Cell {
             server_bin: env.server_bin.clone(),
             render_pairs,
             base_env,
+            fault_dir,
             child: None,
         };
         cell.spawn(options);
         cell.wait_ready().await;
         cell
+    }
+
+    /// Arm a `next`-triggered receiver fault on this process.
+    ///
+    /// The anchor name is the spec spelling, e.g. `receiver.stream.drop`. The
+    /// process fires it on its next opportunity and replaces the arm file with
+    /// a `.fired` marker, which [`Cell::fault_fired`] reads.
+    pub fn arm_receiver_fault(&self, anchor: &str) {
+        let fired = self.fault_dir.join(format!("{anchor}.fired"));
+        // Clear any previous marker first, so `fault_fired` cannot answer true
+        // from an earlier firing and turn this arming into a no-op nobody
+        // notices.
+        let _ = std::fs::remove_file(&fired);
+        std::fs::write(self.fault_dir.join(format!("{anchor}.arm")), anchor)
+            .unwrap_or_else(|error| panic!("arm the receiver fault {anchor}: {error}"));
+    }
+
+    /// Whether the process has fired that armed fault yet.
+    ///
+    /// A case waits on this before asserting anything about the receiver's
+    /// response. Without it a green assertion cannot distinguish "the receiver
+    /// handled the fault" from "the fault never fired", which is the whole
+    /// difference between this tier and the stand-in it replaces.
+    pub fn fault_fired(&self, anchor: &str) -> bool {
+        self.fault_dir.join(format!("{anchor}.fired")).exists()
+    }
+
+    /// How many lines of this process's log contain `needle`.
+    ///
+    /// Counting rather than merely finding, because the duplicate and
+    /// ack-failure cases turn on a call happening EXACTLY once: "at least one
+    /// apply" is satisfied by the double apply those cases exist to refuse.
+    pub fn log_lines_containing(&self, needle: &str) -> usize {
+        std::fs::read_to_string(&self.log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
     }
 
     /// The relay owner this process claims outbox rows under.
@@ -334,6 +443,25 @@ impl Cell {
             None => {
                 command.env_remove("LORE_FRAGMENT_FAILPOINTS");
             }
+        }
+        // Both are removed rather than merely left unset when absent, for the
+        // same reason `LORE_FRAGMENT_FAILPOINTS` is: a restart that means to
+        // drop an injected fault must actually drop it, and this process
+        // inherits the harness's own environment.
+        match options.receiver_faults {
+            Some(spec) => {
+                command.env("LORE_RECEIVER_FAULTS", spec);
+                command.env("LORE_RECEIVER_FAULT_DIR", &self.fault_dir);
+            }
+            None => {
+                command.env_remove("LORE_RECEIVER_FAULTS");
+                command.env_remove("LORE_RECEIVER_FAULT_DIR");
+            }
+        }
+        if options.trace_target {
+            command.env("LORE_RECEIVER_FAULT_TRACE", "1");
+        } else {
+            command.env_remove("LORE_RECEIVER_FAULT_TRACE");
         }
         let child = command.spawn().unwrap_or_else(|error| {
             panic!(

@@ -694,10 +694,9 @@ mod active_active_two_process_tests {
             fixture.backend.pending_count().await == 0
         );
 
-        a.restart_with(BootOptions {
-            relay_enabled: true,
-            failpoints: Some("outbox.claim.before_commit=abort"),
-        })
+        a.restart_with(BootOptions::with_failpoints(
+            "outbox.claim.before_commit=abort",
+        ))
         .await;
 
         let revision = fixture
@@ -1011,10 +1010,9 @@ mod active_active_two_process_tests {
             fixture.backend.pending_count().await == 0
         );
 
-        a.restart_with(BootOptions {
-            relay_enabled: true,
-            failpoints: Some("outbox.accept.before_update=abort"),
-        })
+        a.restart_with(BootOptions::with_failpoints(
+            "outbox.accept.before_update=abort",
+        ))
         .await;
 
         let revision = fixture
@@ -2556,6 +2554,881 @@ mod active_active_two_process_tests {
              session, so its facet is unaffected; asserted so a reader does not mistake this for \
              a live-receiver gap"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Cases M..Q — the receiver-side fault tier (WP-119 Phase 10, WP-111 P5)
+    // -----------------------------------------------------------------------
+    //
+    // Everything below runs against the REAL plane end to end: a governed
+    // mutation committed on one loreserver, its CR-032 outbox row, a real
+    // relay claim, a real mTLS Publish into the real notification gateway, real
+    // JetStream, the other process's real `Consume` stream, its real receiver,
+    // and its real Postgres checkpoint projection. Nothing is stood in for.
+    //
+    // What makes that possible is `lore-server`'s receiver-side fault seam
+    // (`plugins::remote_notification::faults`), which cases K and L could not
+    // use because it did not exist: their doc comments record that
+    // `LORE_FRAGMENT_FAILPOINTS` reaches only the producer half, so a genuine
+    // broker-sequence gap was out of reach and case L wrote the projection
+    // directly instead. Case N below is the live version of what case L could
+    // only assert about the projection, and the two are kept apart on purpose —
+    // L still proves the projection refuses a bad report from ANY reporter,
+    // which is a claim about the store, not about a receiver.
+    //
+    // The fault is armed at RUNTIME through a rendezvous file rather than by an
+    // ordinal chosen up front, and every case waits for the process's own
+    // `.fired` marker before asserting. An assertion made without that wait
+    // cannot distinguish "the receiver handled the injected fault" from "the
+    // fault never fired", which is the difference these cases exist to make.
+
+    /// Anchor spellings, so a case names a fault the same way the server parses
+    /// it. A typo here would arm nothing and the `.fired` wait would time out,
+    /// which is the failure mode to prefer over a silent pass.
+    const FAULT_DROP: &str = "receiver.stream.drop";
+    const FAULT_DUPLICATE: &str = "receiver.stream.duplicate";
+    const FAULT_STREAM_TRANSIENT: &str = "receiver.stream.transient";
+    const FAULT_ACK_TRANSIENT: &str = "receiver.ack.transient";
+
+    /// Ceiling on a wait that depends on the broker redelivering an unacked
+    /// message.
+    ///
+    /// Deliberately far above [`RECEIVER_DEADLINE`]: redelivery is gated on
+    /// JetStream's own `ack_wait`, which the gateway provisions at 30 seconds,
+    /// and a bound under that would report a correct receiver as a failure.
+    const REDELIVERY_DEADLINE: Duration = Duration::from_secs(150);
+
+    /// Push one revision through `through` and return the branch tip it left.
+    ///
+    /// `previous` is the parent revision and `number` its revision number, so a
+    /// case can chain pushes and give ONE aggregate key a rising ordinal
+    /// sequence — which is what a gap has to be a gap in. A gap needs a skip
+    /// within a sequence this generation was already following, so a case that
+    /// pushed to three different branches would produce three unrelated
+    /// aggregates and no gap at all.
+    async fn governed_push(
+        fixture: &Fixture,
+        through: &Cell,
+        token: &str,
+        subject: &str,
+        repository: &[u8; 16],
+        branch: &[u8; 16],
+        previous: Hash,
+        number: u64,
+        nonce: u8,
+    ) -> Hash {
+        let revision = fixture
+            .backend
+            .serialize_revision(
+                repository_id(*repository),
+                previous,
+                number,
+                Some(&format!("push-{number}.txt")),
+            )
+            .await;
+        let prepared = carriage::prepare_push(
+            &fixture.backend,
+            fixture.minter.issuer(),
+            subject,
+            repository,
+            branch,
+            revision.as_ref(),
+            false,
+            false,
+            nonce,
+        )
+        .await;
+        let request = carriage::push_request(
+            token,
+            repository,
+            branch,
+            revision.as_ref(),
+            false,
+            false,
+            Some(&prepared),
+        );
+        carriage::branch_push(through.grpc_endpoint(), request)
+            .await
+            .unwrap_or_else(|status| {
+                panic!("the governed push at revision {number} must succeed: {status:?}")
+            });
+        revision
+    }
+
+    /// The evidence line one FIRING of `anchor` writes.
+    ///
+    /// Matches `anchor=`, not the bare anchor name: the server logs an
+    /// `armed=<...>` banner at startup naming every armed anchor, and counting
+    /// the bare name would score that banner as a firing.
+    fn fired_line(anchor: &str) -> String {
+        format!("RECEIVER_FAULT anchor={anchor}")
+    }
+
+    /// The traced-apply evidence line for ONE event kind of one repository.
+    ///
+    /// Necessary rather than decorative: a governed repository create appends
+    /// `repository.published` and `branch.created` before any push appends
+    /// `branch.pushed`, so a count matched on the repository alone answers
+    /// three for a repository whose push was applied exactly once. An
+    /// exactly-once assertion has to name the aggregate it is counting.
+    fn applied_event_line(repository: &[u8; 16], event_kind: &str) -> String {
+        format!(
+            "RECEIVER_FAULT target=apply repository={} event_kind={event_kind}",
+            hex(repository)
+        )
+    }
+
+    /// The traced-refetch evidence line.
+    fn refetch_line(repository: &[u8; 16]) -> String {
+        format!(
+            "RECEIVER_FAULT target=refetch repository={}",
+            hex(repository)
+        )
+    }
+
+    /// Wait until process `cell`'s current receiver generation has a checkpoint
+    /// covering `sequence`, and return that generation.
+    async fn wait_for_frontier(fixture: &Fixture, cell: &Cell, sequence: i64, label: &str) -> i64 {
+        let identity = cell.receiver_identity();
+        wait_until!(
+            format!(
+                "{label}: {}'s receiver frontier to cover sequence {sequence}; last seen {:?}",
+                cell.name,
+                fixture.backend.checkpoint_frontier_of(&identity).await
+            ),
+            RECEIVER_DEADLINE,
+            fixture
+                .backend
+                .checkpoint_frontier_of(&identity)
+                .await
+                .is_some_and(|(_, frontier)| frontier >= sequence)
+        );
+        fixture
+            .backend
+            .checkpoint_frontier_of(&identity)
+            .await
+            .expect("the frontier just observed must still be readable")
+            .0
+    }
+
+    /// Wait until every relayed event has reached `cell`'s receiver and its
+    /// frontier covers all of them.
+    ///
+    /// Arming a delivery fault needs this, and skipping it is how case O first
+    /// failed: a governed repository create appends its own events, and a fault
+    /// armed while those are still in flight lands on one of THEM rather than
+    /// on the push the case is about. The fault still fires and the assertion
+    /// still reads a real log, so the failure looks like a receiver defect
+    /// rather than a setup race.
+    async fn wait_for_quiescence(fixture: &Fixture, cell: &Cell, label: &str) {
+        let identity = cell.receiver_identity();
+        wait_until!(
+            format!(
+                "{label}: {}'s receiver to drain the setup events; pending={:?} max_seq={:?} \
+                 frontier={:?}",
+                cell.name,
+                fixture.backend.pending_count().await,
+                fixture.backend.max_broker_sequence().await,
+                fixture.backend.checkpoint_frontier_of(&identity).await
+            ),
+            RECEIVER_DEADLINE,
+            fixture.backend.pending_count().await == 0
+                && match fixture.backend.max_broker_sequence().await {
+                    None => false,
+                    Some(max) => fixture
+                        .backend
+                        .checkpoint_frontier_of(&identity)
+                        .await
+                        .is_some_and(|(_, frontier)| frontier >= max),
+                }
+        );
+    }
+
+    /// Wait until `cell` reports its durable receiver ready.
+    async fn wait_for_receiver(cell: &Cell) {
+        wait_until!(
+            format!(
+                "process {}'s durable receiver to report itself ready; last seen {:?}",
+                cell.name,
+                cell.event_readiness().await
+            ),
+            RECEIVER_DEADLINE,
+            cell.event_readiness().await.receiver_ready == Some(true)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case M — a mutation committed on A is applied by B's durable receiver
+    // -----------------------------------------------------------------------
+
+    /// The completion criterion of the local event plane, end to end, with no
+    /// component stood in for: a governed push committed through process A
+    /// becomes an invalidation process B's receiver **applies**, named by
+    /// repository and aggregate ordinal.
+    ///
+    /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
+    /// "DURABLE_INVALIDATION".
+    ///
+    /// # Why the traced target, and not just the frontier
+    ///
+    /// Every earlier case in this file proves B's receiver *advanced* — that
+    /// its contiguous frontier covered a broker sequence. That is a real fact
+    /// and an insufficient one for this claim: a frontier advances for a
+    /// duplicate, a stale no-op, and a refetch exactly as it does for an apply,
+    /// so "the frontier moved past A's push" is consistent with B never having
+    /// applied anything. `LORE_RECEIVER_FAULT_TRACE` makes the apply itself an
+    /// artifact carrying the repository, the event kind, and the ordinal, so
+    /// the assertion is about the event rather than about a number.
+    ///
+    /// The target it traces is still `NoopInvalidationTarget`'s behaviour — a
+    /// `remote`-mode cell has no repository-scoped derived state to evict — so
+    /// this changes what is *visible*, not what the receiver *does*.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_m_a_mutation_committed_on_a_is_applied_by_bs_durable_receiver() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture.start("b", BootOptions::traced()).await;
+        let token = fixture.minter.mint("case-m-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-m-writer", "m").await;
+        wait_for_receiver(&b).await;
+
+        // The mutation. Committed on A, and A is the only process it touches.
+        let revision = governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-m-writer",
+            &repository,
+            &branch,
+            Hash::default(),
+            1,
+            0x61,
+        )
+        .await;
+
+        // One durable outbox intent, of the expected kind, accepted by the
+        // real broker. Asserted before the receiver half so a failure
+        // downstream cannot be misread as a producer fault.
+        wait_until!(
+            format!(
+                "A's governed push to reach the broker; rows: {}",
+                describe(&fixture.backend.outbox_rows().await)
+            ),
+            RELAY_DEADLINE,
+            fixture
+                .backend
+                .outbox_rows_of_kind(BRANCH_PUSHED)
+                .await
+                .iter()
+                .any(broker_accepted)
+        );
+        let accepted = fixture
+            .backend
+            .max_broker_sequence()
+            .await
+            .expect("an accepted row carries the sequence the broker assigned it");
+
+        // The receiver half, on the OTHER process.
+        wait_for_frontier(&fixture, &b, accepted, "case M").await;
+        wait_until!(
+            format!(
+                "process B to apply repository {}'s invalidation; log tail: {}",
+                hex(&repository),
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED)) >= 1
+        );
+
+        // The branch tip A wrote is the one B's own reads answer with, which is
+        // the data-plane half of the same visibility claim. Case A proves this
+        // for a repository create; asserted here too so this case stands alone
+        // as "the mutation is visible through B", not only "an event was".
+        assert_eq!(
+            fixture
+                .backend
+                .branch_latest_hash(&repository, &branch)
+                .await,
+            Some(revision.as_ref().to_vec()),
+            "the committed branch tip must be the revision A pushed"
+        );
+        assert_eq!(
+            b.log_lines_containing(&refetch_line(&repository)),
+            0,
+            "an ordinary delivery must be applied, never refetched; a refetch here would mean \
+             the receiver could not order the event"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case N — a live receiver observes a REAL gap, refetches, and recovers
+    // -----------------------------------------------------------------------
+
+    /// WP-119 Phase 10's gap/refetch row, closed: a live durable receiver, on a
+    /// live broker, never receives one delivery, observes the resulting
+    /// version gap, issues an authoritative refetch **before** acknowledging,
+    /// persists a real gap blocker that stalls its contiguous frontier, and
+    /// then recovers when the broker redelivers the missing message.
+    ///
+    /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
+    /// "DURABLE_INVALIDATION" ("Each receiver frontier is contiguous: an
+    /// unresolved gap ... blocks advancement even when a later event was
+    /// acknowledged"), and the receiver's own rule
+    /// (`plugins/remote_notification/receiver.rs`): "a gap or an incomparable
+    /// version is resolved by authoritative refetch BEFORE the acknowledgement,
+    /// never by picking an order."
+    ///
+    /// # What is real
+    ///
+    /// All of it, which is the point. The three pushes are real governed
+    /// mutations on process A; the events reach process B through the real
+    /// relay, the real gateway, and real JetStream; B's receiver is the shipped
+    /// one, unmodified. The single injected fact is that B's durable stream
+    /// never hands ONE delivery to the receiver — the shape a lost delivery
+    /// has from inside a consumer — and because that message is therefore never
+    /// acknowledged, the BROKER's own `ack_wait` redelivers it, which is what
+    /// the recovery half then rides.
+    ///
+    /// # Why three pushes to one branch
+    ///
+    /// A gap is a skip within a sequence this generation was already
+    /// following. `AppliedVersions::verdict` answers `NextOrdinal` for an
+    /// aggregate with nothing applied yet, deliberately, so dropping the FIRST
+    /// event a receiver ever sees for a branch produces no gap at all. Push one
+    /// establishes the applied ordinal, push two is dropped, push three is the
+    /// skip.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_n_a_dropped_delivery_makes_a_live_receiver_refetch_and_then_recover() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture
+            .start(
+                "b",
+                BootOptions::receiver_faults("receiver.stream.drop=next"),
+            )
+            .await;
+        let token = fixture.minter.mint("case-n-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-n-writer", "n").await;
+        wait_for_receiver(&b).await;
+
+        // Push 1: establishes the applied ordinal for this aggregate. Nothing
+        // is armed yet, so this delivery is ordinary.
+        let first = governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-n-writer",
+            &repository,
+            &branch,
+            Hash::default(),
+            1,
+            0x71,
+        )
+        .await;
+        let first_sequence = wait_for_accepted_pushes(&fixture, 1, "case N push 1").await;
+        let generation = wait_for_frontier(&fixture, &b, first_sequence, "case N push 1").await;
+        assert!(
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED)) >= 1,
+            "push 1 must be APPLIED, not merely acknowledged; without an applied ordinal for \
+             this aggregate a later skip is not a gap. Log tail: {}",
+            b.log_tail()
+        );
+
+        // Arm, then push 2. The arm is deliberately after push 1's frontier is
+        // proven, so the fault cannot land on a bootstrap drain delivery.
+        b.arm_receiver_fault(FAULT_DROP);
+        let second = governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-n-writer",
+            &repository,
+            &branch,
+            first,
+            2,
+            0x72,
+        )
+        .await;
+        let dropped_sequence = wait_for_accepted_pushes(&fixture, 2, "case N push 2").await;
+        wait_until!(
+            format!(
+                "process B's durable stream to drop one delivery; log tail: {}",
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.fault_fired(FAULT_DROP)
+        );
+
+        // Push 3: the skip. B has applied ordinal 1, never saw ordinal 2, and
+        // now sees ordinal 3 for the same aggregate key.
+        governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-n-writer",
+            &repository,
+            &branch,
+            second,
+            3,
+            0x73,
+        )
+        .await;
+        let third_sequence = wait_for_accepted_pushes(&fixture, 3, "case N push 3").await;
+
+        wait_until!(
+            format!(
+                "process B's receiver to refetch repository {} after the gap; log tail: {}",
+                hex(&repository),
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.log_lines_containing(&refetch_line(&repository)) >= 1
+        );
+
+        // The persisted blocker, from a live receiver's own projection. This is
+        // exactly the fact case L had to write by hand.
+        wait_until!(
+            format!(
+                "process B's checkpoint to carry the gap at {dropped_sequence}; last seen {:?}",
+                fixture
+                    .backend
+                    .checkpoint_row(&b.receiver_identity(), generation)
+                    .await
+            ),
+            RECEIVER_DEADLINE,
+            fixture
+                .backend
+                .checkpoint_row(&b.receiver_identity(), generation)
+                .await
+                .is_some_and(|(_, gaps)| gaps
+                    .iter()
+                    .any(|(from, to)| *from <= dropped_sequence && dropped_sequence <= *to))
+        );
+        let (blocked_frontier, gaps) = fixture
+            .backend
+            .checkpoint_row(&b.receiver_identity(), generation)
+            .await
+            .expect("the generation that just reported a gap must have a row");
+        assert!(
+            blocked_frontier < third_sequence,
+            "an unresolved gap at {dropped_sequence} must block the frontier below the later \
+             acknowledged sequence {third_sequence}; got {blocked_frontier} with gaps {gaps:?}"
+        );
+
+        // Recovery. The dropped message was never acknowledged, so the broker's
+        // own ack_wait redelivers it; the fault is one-shot and spent, so this
+        // time the receiver sees it. The refetch already forgot this
+        // repository's applied versions, so the redelivery is applied rather
+        // than refused, and the frontier closes over the whole run.
+        wait_until!(
+            format!(
+                "the broker to redeliver sequence {dropped_sequence} and process B to close its \
+                 frontier past {third_sequence}; last seen {:?}",
+                fixture
+                    .backend
+                    .checkpoint_row(&b.receiver_identity(), generation)
+                    .await
+            ),
+            REDELIVERY_DEADLINE,
+            fixture
+                .backend
+                .checkpoint_row(&b.receiver_identity(), generation)
+                .await
+                .is_some_and(|(frontier, gaps)| frontier >= third_sequence && gaps.is_empty())
+        );
+
+        // Recovery must not have cost a generation: a gap is resolved in place,
+        // not by retiring and rebootstrapping.
+        assert_eq!(
+            b.event_readiness().await.receiver_generation,
+            Some(generation),
+            "a resolved gap must not retire the generation that observed it"
+        );
+        assert_eq!(
+            b.log_lines_containing(&fired_line(FAULT_DROP)),
+            1,
+            "the drop anchor is one-shot; a second firing would have swallowed the redelivery \
+             too and made the recovery half vacuous. Log tail: {}",
+            b.log_tail()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case O — a duplicated delivery is an acknowledged no-op, applied once
+    // -----------------------------------------------------------------------
+
+    /// At-least-once delivery, absorbed: the same durable invalidation arrives
+    /// twice at a live receiver and is applied exactly once, acknowledged both
+    /// times, and advances the frontier without a blocker.
+    ///
+    /// Contract: the outcome matrix's "duplicate" row, and
+    /// `AppliedVersions::verdict` answering `VersionOrder::Equal`.
+    ///
+    /// The exactly-once assertion is a COUNT, not a presence check. "At least
+    /// one apply" is satisfied by the double apply this case exists to refuse,
+    /// which is why the traced line is counted rather than searched for.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_o_a_duplicated_delivery_is_applied_once_and_acknowledged_twice() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture
+            .start(
+                "b",
+                BootOptions::receiver_faults("receiver.stream.duplicate=next"),
+            )
+            .await;
+        let token = fixture.minter.mint("case-o-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-o-writer", "o").await;
+        wait_for_receiver(&b).await;
+        // The create's own events must land BEFORE the fault is armed, or the
+        // duplicate fires on one of them and this case silently stops being
+        // about the push.
+        wait_for_quiescence(&fixture, &b, "case O setup").await;
+        let generation = b
+            .event_readiness()
+            .await
+            .receiver_generation
+            .expect("a ready receiver reports its generation");
+
+        b.arm_receiver_fault(FAULT_DUPLICATE);
+        governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-o-writer",
+            &repository,
+            &branch,
+            Hash::default(),
+            1,
+            0x81,
+        )
+        .await;
+        let accepted = wait_for_accepted_pushes(&fixture, 1, "case O push").await;
+        wait_until!(
+            format!(
+                "process B's durable stream to replay one delivery; log tail: {}",
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.fault_fired(FAULT_DUPLICATE)
+        );
+        wait_for_frontier(&fixture, &b, accepted, "case O").await;
+
+        // The duplicate is acknowledged, so nothing blocks; and the whole point
+        // is that the SECOND copy changed no derived state.
+        let (frontier, gaps) = fixture
+            .backend
+            .checkpoint_row(&b.receiver_identity(), generation)
+            .await
+            .expect("the ready generation must have a checkpoint row");
+        assert!(
+            gaps.is_empty(),
+            "a duplicate is an acknowledged no-op and must leave no blocker; got {gaps:?}"
+        );
+        assert!(
+            frontier >= accepted,
+            "the duplicate was acknowledged twice, so the frontier must still cover \
+             {accepted}; got {frontier}"
+        );
+        assert_eq!(
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED)),
+            1,
+            "the repeated stable event must be ONE invalidation, applied once. Log tail: {}",
+            b.log_tail()
+        );
+        assert_eq!(
+            b.log_lines_containing(&fired_line(FAULT_DUPLICATE)),
+            1,
+            "the duplicate anchor is one-shot; a second firing would mean the count above is \
+             about a different delivery than the case thinks"
+        );
+        assert_eq!(
+            b.log_lines_containing(&refetch_line(&repository)),
+            0,
+            "a duplicate is orderable and must never trigger an authoritative refetch"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case P — a transient read failure reconnects without costing a generation
+    // -----------------------------------------------------------------------
+
+    /// A durable-stream read fails transiently under a live receiver. The
+    /// receiver acknowledges nothing, backs off, resumes on the SAME
+    /// generation, and goes on to drain the event it was reaching for.
+    ///
+    /// Contract: `StreamError::Transient`'s own rule — "the receiver backs off,
+    /// leaves everything unacknowledged, and fails its lag readiness facet. It
+    /// never acknowledges to clear a transient failure" — and the asymmetry
+    /// amendment A-26 records, under which only a `FAILED_PRECONDITION` class
+    /// retires a generation.
+    ///
+    /// The sharp assertion is the generation. A receiver that treated a
+    /// transient read as fatal would still end up ready, still end up with a
+    /// covering frontier, and still look entirely healthy in every check except
+    /// this one — it would simply have paid a full rebootstrap for a blip.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_p_a_transient_read_failure_reconnects_without_costing_a_generation() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture
+            .start(
+                "b",
+                BootOptions::receiver_faults("receiver.stream.transient=next"),
+            )
+            .await;
+        let token = fixture.minter.mint("case-p-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-p-writer", "p").await;
+        wait_for_receiver(&b).await;
+        wait_for_quiescence(&fixture, &b, "case P setup").await;
+        let generation = b
+            .event_readiness()
+            .await
+            .receiver_generation
+            .expect("a ready receiver reports its generation");
+
+        // Arm FIRST, then push. The order is not cosmetic and the reverse does
+        // not work: a `receiver.stream.transient` trigger is evaluated at the
+        // start of a `next` call, and an idle receiver is BLOCKED inside a
+        // `next` that the gateway's `Consume` stream has not answered. Arming a
+        // quiet receiver therefore fires nothing until traffic wakes that call,
+        // which is how this case first failed — a sixty-second timeout that
+        // reads like a broken decorator and is really a long-poll.
+        b.arm_receiver_fault(FAULT_STREAM_TRANSIENT);
+        let first = governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-p-writer",
+            &repository,
+            &branch,
+            Hash::default(),
+            1,
+            0x91,
+        )
+        .await;
+        let first_sequence = wait_for_accepted_pushes(&fixture, 1, "case P push 1").await;
+        wait_until!(
+            format!(
+                "process B's durable stream to fail one read transiently; log tail: {}",
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.fault_fired(FAULT_STREAM_TRANSIENT)
+        );
+        wait_for_frontier(&fixture, &b, first_sequence, "case P push 1").await;
+
+        // The recovery half. A second push AFTER the transient read proves the
+        // receiver is still consuming rather than merely still alive: the
+        // failure left everything unacknowledged, the receiver backed off, and
+        // it is now draining new work on the SAME generation.
+        governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-p-writer",
+            &repository,
+            &branch,
+            first,
+            2,
+            0x92,
+        )
+        .await;
+        let accepted = wait_for_accepted_pushes(&fixture, 2, "case P push 2").await;
+        let after = wait_for_frontier(&fixture, &b, accepted, "case P push 2").await;
+
+        assert_eq!(
+            after, generation,
+            "a transient read is not a placement move; generation {generation} must survive it \
+             rather than being retired and replaced by {after}"
+        );
+        assert_eq!(
+            b.log_lines_containing(&fired_line(FAULT_STREAM_TRANSIENT)),
+            1,
+            "the transient anchor is one-shot; a second firing would mean the recovery above \
+             was never actually tested"
+        );
+        wait_until!(
+            format!(
+                "process B to apply both of repository {}'s pushes after reconnecting; log \
+                 tail: {}",
+                hex(&repository),
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED)) >= 2
+        );
+        let (_, gaps) = fixture
+            .backend
+            .checkpoint_row(&b.receiver_identity(), generation)
+            .await
+            .expect("the surviving generation must still have its own row");
+        assert!(
+            gaps.is_empty(),
+            "a transient read acknowledges nothing and therefore skips nothing; a gap here \
+             would mean the receiver advanced past a delivery it never saw. Got {gaps:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Case Q — a failed acknowledgement does not undo the apply
+    // -----------------------------------------------------------------------
+
+    /// The acknowledgement is last and its failure is not a rollback: the
+    /// invalidation has already been applied, the broker redelivers the
+    /// unacknowledged message, and the redelivery is absorbed as a duplicate
+    /// rather than applied a second time.
+    ///
+    /// Contract: the receiver's own rule — "the acknowledgement is last, and
+    /// its failure does not undo the application: applying is idempotent, so a
+    /// redelivery of an applied event is a duplicate, which is an acknowledged
+    /// no-op."
+    ///
+    /// This is the one case where the injected fault and the real broker do
+    /// half the work each: the ack failure is injected, and the redelivery that
+    /// follows is JetStream's own, on its own `ack_wait`. Nothing in the
+    /// harness replays the message.
+    #[tokio::test]
+    #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
+    async fn case_q_a_failed_acknowledgement_does_not_undo_the_apply() {
+        let fixture = Fixture::open(Arming::GovernedOutbox).await;
+        let a = fixture.start("a", BootOptions::relaying()).await;
+        let b = fixture
+            .start(
+                "b",
+                BootOptions::receiver_faults("receiver.ack.transient=next"),
+            )
+            .await;
+        let token = fixture.minter.mint("case-q-writer");
+
+        let (repository, branch, _) =
+            governed_repository(&fixture, &a, &token, "case-q-writer", "q").await;
+        wait_for_receiver(&b).await;
+        // Same reason as case O: an ack fault armed while the create's events
+        // are in flight fails the acknowledgement of one of THOSE.
+        wait_for_quiescence(&fixture, &b, "case Q setup").await;
+        let generation = b
+            .event_readiness()
+            .await
+            .receiver_generation
+            .expect("a ready receiver reports its generation");
+
+        b.arm_receiver_fault(FAULT_ACK_TRANSIENT);
+        governed_push(
+            &fixture,
+            &a,
+            &token,
+            "case-q-writer",
+            &repository,
+            &branch,
+            Hash::default(),
+            1,
+            0xa1,
+        )
+        .await;
+        let accepted = wait_for_accepted_pushes(&fixture, 1, "case Q push").await;
+        wait_until!(
+            format!(
+                "process B's acknowledgement to fail once; log tail: {}",
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.fault_fired(FAULT_ACK_TRANSIENT)
+        );
+
+        // The apply happened before the failed acknowledgement, so it is
+        // already visible even though the frontier cannot be.
+        wait_until!(
+            format!(
+                "process B to have applied repository {}'s push before its acknowledgement \
+                 failed; log tail: {}",
+                hex(&repository),
+                b.log_tail()
+            ),
+            RECEIVER_DEADLINE,
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED)) >= 1
+        );
+
+        // The broker's own redelivery closes the frontier, on the same
+        // generation: a failed ack is transient, not a placement move.
+        wait_until!(
+            format!(
+                "the broker to redeliver sequence {accepted} and process B to acknowledge it; \
+                 last seen {:?}",
+                fixture
+                    .backend
+                    .checkpoint_row(&b.receiver_identity(), generation)
+                    .await
+            ),
+            REDELIVERY_DEADLINE,
+            fixture
+                .backend
+                .checkpoint_row(&b.receiver_identity(), generation)
+                .await
+                .is_some_and(|(frontier, gaps)| frontier >= accepted && gaps.is_empty())
+        );
+        assert_eq!(
+            b.event_readiness().await.receiver_generation,
+            Some(generation),
+            "a failed acknowledgement must not retire the generation"
+        );
+        assert_eq!(
+            b.log_lines_containing(&applied_event_line(&repository, BRANCH_PUSHED)),
+            1,
+            "the redelivery must be absorbed as a duplicate, not applied a second time. Log \
+             tail: {}",
+            b.log_tail()
+        );
+        assert_eq!(
+            b.log_lines_containing(&fired_line(FAULT_ACK_TRANSIENT)),
+            1,
+            "the ack anchor is one-shot; a second firing would have blocked the redelivery's \
+             own acknowledgement and made the recovery half vacuous"
+        );
+    }
+
+    /// Wait until `expected` `branch.pushed` rows have reached the broker, and
+    /// answer with the highest sequence the broker has assigned.
+    ///
+    /// The COUNT is load-bearing and an `any(broker_accepted)` here would be a
+    /// vacuous wait in any case that pushes more than once: the previous
+    /// push's row already satisfies it, so the wait returns immediately and
+    /// `max_broker_sequence` answers with the PREVIOUS push's sequence. Every
+    /// later assertion would then be about the wrong event while looking
+    /// exactly as healthy.
+    async fn wait_for_accepted_pushes(fixture: &Fixture, expected: usize, label: &str) -> i64 {
+        wait_until!(
+            format!(
+                "{label}: {expected} governed push(es) to be accepted by the broker; rows: {}",
+                describe(&fixture.backend.outbox_rows().await)
+            ),
+            RELAY_DEADLINE,
+            fixture
+                .backend
+                .outbox_rows_of_kind(BRANCH_PUSHED)
+                .await
+                .iter()
+                .filter(|row| broker_accepted(row))
+                .count()
+                >= expected
+        );
+        fixture
+            .backend
+            .max_broker_sequence()
+            .await
+            .expect("an accepted row carries the sequence the broker assigned it")
     }
 
     /// Poll a set of futures to completion together.

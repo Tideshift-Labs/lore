@@ -47,7 +47,7 @@ use lore_postgres::domain::outbox::membership::set_current_placement;
 use lore_postgres::domain::outbox::report_checkpoint;
 use lore_postgres::domain::outbox::stamp_cutover;
 use lore_postgres::pool::TlsConfig;
-use lore_postgres::pool::build_pool;
+use lore_postgres::pool::build_pool_named;
 use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
@@ -648,9 +648,13 @@ impl SharedBackend {
         gaps: Vec<(i64, i64)>,
         poison: Vec<(i64, &str)>,
     ) -> Result<CheckpointOutcome, DomainError> {
-        let pool = build_pool(&env.pg_url, 2, &TlsConfig::default()).unwrap_or_else(|error| {
-            panic!("open a short-lived pool for a synthetic checkpoint report: {error}")
-        });
+        // The label is this harness's own, deliberately not one of the cell's
+        // (`domain`, `relay`, ...): a short-lived harness pool must not land in
+        // the same acquisition tally a capacity case then reads back.
+        let pool = build_pool_named(&env.pg_url, 2, &TlsConfig::default(), "wp109-harness")
+            .unwrap_or_else(|error| {
+                panic!("open a short-lived pool for a synthetic checkpoint report: {error}")
+            });
         let gaps: Vec<SequenceGap> = gaps
             .into_iter()
             .map(|(from, to)| SequenceGap { from, to })

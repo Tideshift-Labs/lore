@@ -129,6 +129,22 @@ $caseCatalog = @(
     # is injected.
     [pscustomobject]@{ Key = 'k'; Test = "$testPrefix::case_k_a_replacement_receiver_generation_inherits_nothing_from_its_dead_predecessor" }
     [pscustomobject]@{ Key = 'l'; Test = "$testPrefix::case_l_the_checkpoint_projection_refuses_a_frontier_that_skips_an_unresolved_gap" }
+    # WP-119 Phase 10 / WP-111 Phase 5, the receiver-side fault tier. Unlike K
+    # and L, these inject NOTHING into Postgres: the whole path is real, and the
+    # one injected fact is what process B's durable STREAM hands its receiver,
+    # through `lore-server`'s `plugins::remote_notification::faults` decorator.
+    # That seam is why the gap/refetch row K and L had to work around is now
+    # reachable live. The decorator is `#[cfg(feature = "failure_generator")]`,
+    # so the build step's feature flag is load-bearing for these exactly as it
+    # already is for D and E.
+    #
+    # N and Q additionally wait on the BROKER's own `ack_wait` redelivery and so
+    # take well over a minute each by construction, not by slowness.
+    [pscustomobject]@{ Key = 'm'; Test = "$testPrefix::case_m_a_mutation_committed_on_a_is_applied_by_bs_durable_receiver" }
+    [pscustomobject]@{ Key = 'n'; Test = "$testPrefix::case_n_a_dropped_delivery_makes_a_live_receiver_refetch_and_then_recover" }
+    [pscustomobject]@{ Key = 'o'; Test = "$testPrefix::case_o_a_duplicated_delivery_is_applied_once_and_acknowledged_twice" }
+    [pscustomobject]@{ Key = 'p'; Test = "$testPrefix::case_p_a_transient_read_failure_reconnects_without_costing_a_generation" }
+    [pscustomobject]@{ Key = 'q'; Test = "$testPrefix::case_q_a_failed_acknowledgement_does_not_undo_the_apply" }
 )
 
 $selected = if ($Case) {

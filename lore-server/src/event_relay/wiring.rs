@@ -64,6 +64,7 @@ use lore_postgres::pool::Pool;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::info;
+use tracing::warn;
 
 use crate::domain::DomainContext;
 use crate::event_relay::admission::OutboxAdmission;
@@ -77,7 +78,6 @@ use crate::event_relay::reset_service::StreamResetHandler;
 use crate::event_relay::startup;
 use crate::event_relay::startup::StartupRefusal;
 use crate::event_relay::worker::EventRelayWorker;
-use crate::plugins::remote_notification::NoopInvalidationTarget;
 use crate::plugins::remote_notification::PrivateGatewayClient;
 use crate::plugins::remote_notification::PublishTransport;
 use crate::plugins::remote_notification::ReceiverReadiness;
@@ -85,6 +85,7 @@ use crate::plugins::remote_notification::ReceiverRuntime;
 use crate::plugins::remote_notification::RemoteNotificationConfig;
 use crate::plugins::remote_notification::client::GrpcPublishTransport;
 use crate::plugins::remote_notification::client::connect_gateway_channel;
+use crate::plugins::remote_notification::faults;
 use crate::plugins::remote_notification::receiver_store::PostgresReceiverStore;
 use crate::plugins::remote_notification::stream::GrpcDurableStream;
 use crate::settings::Settings;
@@ -290,11 +291,13 @@ pub async fn prepare_event_relay(
     // receives a `toml::Value` and cannot reach a Postgres pool, which is the
     // seam `receiver_store`'s module documentation describes.
     //
-    // The target is `NoopInvalidationTarget`, and that is the correct target
-    // rather than a placeholder: a `remote`-mode loreserver mounts no local
-    // public notification service and keeps no repository-scoped cache this
-    // plane feeds, so there is no process-local derived state to evict. When a
-    // cell gains some, this one line is where its target is handed in.
+    // The target `faults::invalidation_target()` returns is
+    // `NoopInvalidationTarget` on every production path, and that is the
+    // correct target rather than a placeholder: a `remote`-mode loreserver
+    // mounts no local public notification service and keeps no
+    // repository-scoped cache this plane feeds, so there is no process-local
+    // derived state to evict. When a cell gains some, that function is where
+    // its target is handed in.
     //
     // The receiver's channel is its OWN, under the `receiver`-role credential.
     // It is not the publisher's: the gateway maps one mTLS identity to one cell
@@ -314,6 +317,9 @@ pub async fn prepare_event_relay(
                     })?
                 }
             };
+            if faults::faults_compiled() {
+                warn!("{}", faults::RECEIVER_FAULTS_COMPILED_BANNER);
+            }
             Some(DurableReceiverWiring {
                 transport: Arc::clone(&transport),
                 runtime: ReceiverRuntime {
@@ -321,11 +327,22 @@ pub async fn prepare_event_relay(
                         pool.clone(),
                         remote.cell_id.clone(),
                     )),
-                    stream: Arc::new(GrpcDurableStream::new(
+                    // The gRPC stream is the real one in every build. The wrap
+                    // is the identity function unless this binary carries
+                    // `failure_generator` AND `LORE_RECEIVER_FAULTS` arms an
+                    // anchor, so the production path is one unconditional call
+                    // rather than a `cfg` here. See `faults`'s module docs for
+                    // why the injection point is this seam and not the
+                    // receiver's own control flow.
+                    stream: faults::wrap_stream(Arc::new(GrpcDurableStream::new(
                         receiver_channel,
                         remote.cell_id.clone(),
-                    )),
-                    target: Arc::new(NoopInvalidationTarget),
+                    ))),
+                    // `NoopInvalidationTarget` ordinarily — a `remote`-mode
+                    // cell keeps no repository-scoped derived state this plane
+                    // feeds — or a tracing variant that discards nothing and
+                    // only makes each call an artifact a harness can assert on.
+                    target: faults::invalidation_target(),
                 },
             })
         }
