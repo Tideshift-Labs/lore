@@ -45,15 +45,23 @@ impl TryFrom<u32> for NoDispatchReason {
 
 /// The fields a no-dispatch proof commits to.
 ///
-/// **Open, handed to CD-6 (INV-EJ B1, 2026-08-30): there is no request identity here.** A proof
-/// therefore attests that *some* request resolved without dispatch, not which one, so
-/// [`crate::provider_client::ProviderAttemptLedger::record_no_dispatch`] cannot check the proof it
-/// is handed against the request its ledger is bound to. Adding a logical request identity is a
-/// change to this record's canonical preimage and its paired vectors, so it belongs with the
-/// producer CD-6 builds, not with a consumer-side check.
+/// **Closed by CD-6 (INV-EJ B1's last unbound edge).** The proof commits to the logical request it
+/// describes, so it attests that *this* request resolved without dispatch rather than that some
+/// request did, and
+/// [`crate::provider_client::ProviderAttemptLedger::record_no_dispatch`] can refuse a proof minted
+/// for a different request than its ledger is bound to. The identity is inside the canonical
+/// preimage rather than beside it: a caller-supplied identity checked against a proof that does not
+/// commit to one restates the caller's claim instead of binding the record.
+///
+/// `logical_request_id` is validated for canonicality only. It deliberately carries no ordering
+/// constraint against `committed_at_unix_ms`: a request necessarily predates the proof that closes
+/// it, but the two clocks are not the same authority's, so an ordering check here would reject
+/// valid records rather than catch invalid ones. `proof_id`'s timestamp equality below is a
+/// different claim — that one is self-consistency within a single minted value.
 #[derive(Clone, PartialEq, Eq)]
 pub struct NoDispatchProofFields {
     pub reason: NoDispatchReason,
+    pub logical_request_id: String,
     pub proof_id: String,
     pub proof_fence: u64,
     pub committed_at_unix_ms: i64,
@@ -65,6 +73,7 @@ impl fmt::Debug for NoDispatchProofFields {
         formatter
             .debug_struct("NoDispatchProofFields")
             .field("reason", &self.reason)
+            .field("logical_request_id", &"[REDACTED]")
             .field("proof_id", &"[REDACTED]")
             .field("proof_fence", &self.proof_fence)
             .field("committed_at_unix_ms", &self.committed_at_unix_ms)
@@ -162,11 +171,19 @@ fn canonical_preimage(
     if proof_timestamp != committed_at {
         return Err(NoDispatchProofError::ProofTimestampMismatch);
     }
+    // Canonicality is the whole bound here. A canonical UUIDv7 is fixed-width at 36 bytes, so
+    // the separate identity byte-length check that `request_state_wire::no_dispatch_child`
+    // applies to its own inputs cannot fire under any validated limit (`max_identity_bytes` is
+    // never below 36), and the two writers still agree byte for byte. That is a statement about
+    // the validated limits, not an absolute one.
+    canonical_uuid_v7_timestamp(&fields.logical_request_id)
+        .map_err(|_| NoDispatchProofError::InvalidLogicalRequestId)?;
     let mut writer = BoundedCanonicalWriter::new(max_preimage_bytes)
         .map_err(|_| NoDispatchProofError::InvalidMaximum)?;
     writer
         .raw(NO_DISPATCH_PROOF_DOMAIN)
         .and_then(|()| writer.u32(fields.reason as u32))
+        .and_then(|()| writer.text(&fields.logical_request_id))
         .and_then(|()| writer.text(&fields.proof_id))
         .and_then(|()| writer.u64(fields.proof_fence))
         .and_then(|()| writer.u64(committed_at))
@@ -181,6 +198,8 @@ pub enum NoDispatchProofError {
     InvalidReason,
     #[error("no-dispatch proof ID is not canonical UUIDv7")]
     InvalidProofId,
+    #[error("no-dispatch logical request ID is not canonical UUIDv7")]
+    InvalidLogicalRequestId,
     #[error("no-dispatch proof fence must be positive")]
     InvalidProofFence,
     #[error("no-dispatch proof commit time is outside nonnegative i64")]

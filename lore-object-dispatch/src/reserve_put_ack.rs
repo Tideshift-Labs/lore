@@ -97,6 +97,11 @@ pub enum ReservePutAckError {
     InvalidNestedEvidence,
     #[error("ReservePut ACK nested identity does not select the parent authority")]
     InvalidIdentityProjection,
+    /// Distinct from [`Self::InvalidIdentityProjection`] on purpose: a proof naming another
+    /// request is the one fault CD-6 exists to name, and folding it into the general projection
+    /// error would make it indistinguishable from an unrelated structural mismatch.
+    #[error("ReservePut ACK no-dispatch proof names a different logical request")]
+    NoDispatchRequestMismatch,
     #[error("ReservePut ACK quota is empty or inconsistent with its release")]
     InvalidQuota,
     #[error("ReservePut ACK time projection is invalid")]
@@ -525,6 +530,23 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
         .map(|closure| closure_child(closure, value.admission_clock_unix_ms, limits))
         .transpose()?;
     let wire_limits = wire_limits(limits);
+    // CD-6: the nested proof commits to a logical request, and the ACK checks that it is this
+    // ACK's. Without it an ACK for request A could carry a valid, correctly digested proof
+    // minted for request B -- the durable-side twin of the ledger binding in
+    // `ProviderAttemptLedger::record_no_dispatch`.
+    //
+    // Identity runs before `no_dispatch_child` and before the time projection below, matching
+    // `record_no_dispatch` and `audit_for`: whether the proof describes this request at all
+    // precedes any question about its structure or its clock. Ordering it after the encode
+    // would flatten the one fault this variant exists to name into
+    // `InvalidNestedEvidence` for a proof whose identity is also malformed.
+    if value
+        .no_dispatch_proof
+        .as_ref()
+        .is_some_and(|proof| proof.logical_request_id != value.logical_request_id)
+    {
+        return Err(ReservePutAckError::NoDispatchRequestMismatch);
+    }
     let proof = value
         .no_dispatch_proof
         .as_ref()

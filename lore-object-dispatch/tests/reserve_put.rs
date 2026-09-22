@@ -39,6 +39,7 @@ fn no_dispatch_proof(reason: NoDispatchReason) -> NoDispatchProof {
     build_no_dispatch_proof(
         NoDispatchProofFields {
             reason,
+            logical_request_id: "00000000-0000-7abc-8def-0123456789ab".to_string(),
             proof_id: "00000000-03e8-7000-8000-000000000000".to_string(),
             proof_fence: 1,
             committed_at_unix_ms: 1_000,

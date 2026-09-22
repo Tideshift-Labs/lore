@@ -322,10 +322,20 @@ fn compact_receipt_limits() -> ObjectStoreCompactReceiptLimits {
     }
 }
 
+/// A no-dispatch proof bound (WP-114 CD-6) to `logical_request_id()` -- the same identity every
+/// fixture in this file's `new_ledger()` binds its ledger to. Tests exercising the CD-6 mismatch
+/// use [`no_dispatch_proof_for`] directly instead.
 fn no_dispatch_proof() -> CanonicalNoDispatchProof {
+    no_dispatch_proof_for(&logical_request_id())
+}
+
+/// A no-dispatch proof bound to an arbitrary `logical_request_id`, for exercising WP-114 CD-6's
+/// `ProviderAttemptLedger::record_no_dispatch` request binding.
+fn no_dispatch_proof_for(logical_request_id: &str) -> CanonicalNoDispatchProof {
     build_no_dispatch_proof(
         NoDispatchProofFields {
             reason: NoDispatchReason::PreparedTtlExpired,
+            logical_request_id: logical_request_id.to_string(),
             proof_id: uuid_v7(1_000, "0000000000cc"),
             proof_fence: 1,
             committed_at_unix_ms: 1_000,
@@ -3603,12 +3613,129 @@ async fn record_no_dispatch_returns_the_poison_on_a_poisoned_ledger() {
         Some(ProviderClientError::TransportReportInconsistent)
     );
 
-    // `record_no_dispatch` takes no request id, so there is no identity to check against poison
-    // here -- it always reports the poison. This is unaffected by `audit_for`'s
-    // identity-before-poison ordering below; the two guards have nothing in common to reorder.
+    // The ledger's own bound request still reports the poison (proven directly by
+    // `record_no_dispatch_request_mismatch_wins_over_poison` below, which also proves a
+    // *mismatched* request is refused before this poison is ever consulted).
     assert_eq!(
         ledger.record_no_dispatch(&no_dispatch_proof()),
         Err(ProviderClientError::TransportReportInconsistent)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// 9a. ProviderAttemptLedger::record_no_dispatch request binding (WP-114 CD-6, INV-EJ B1's last
+// unbound edge)
+// ---------------------------------------------------------------------------------------------
+//
+// Before CD-6, `NoDispatchProofFields` carried no request identity, so a validated proof minted
+// for request B could finalize request A's ledger. CD-6 binds the proof to its request and checks
+// that identity FIRST -- before the poison check and before the `no_dispatch_count != 0 ||
+// attempt_count != 0` precondition -- matching `audit_for`'s documented identity-before-poison
+// ordering (see the comment block introducing section 9b below).
+
+#[tokio::test]
+async fn record_no_dispatch_accepts_a_proof_minted_for_the_ledgers_own_request() {
+    let mut ledger = new_ledger();
+
+    assert!(
+        ledger
+            .record_no_dispatch(&no_dispatch_proof_for(&logical_request_id()))
+            .is_ok()
+    );
+    assert_eq!(ledger.no_dispatch_count(), 1);
+}
+
+#[tokio::test]
+async fn record_no_dispatch_refuses_a_proof_minted_for_a_different_request() {
+    let mut ledger = new_ledger();
+
+    assert_eq!(
+        ledger.record_no_dispatch(&no_dispatch_proof_for(&other_logical_request_id())),
+        Err(ProviderClientError::LedgerRequestMismatch)
+    );
+    assert_eq!(
+        ledger.no_dispatch_count(),
+        0,
+        "a refused mismatched proof must not be recorded"
+    );
+    assert_eq!(ledger.poisoned(), None);
+}
+
+/// The exact ordering `record_no_dispatch` must implement: identity is checked before poison. A
+/// mismatched proof on a poisoned ledger must report `LedgerRequestMismatch`, not the error that
+/// poisoned the ledger -- otherwise a caller asking about someone else's request would learn this
+/// ledger's internal poison state.
+#[tokio::test]
+async fn record_no_dispatch_request_mismatch_wins_over_poison() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 0,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+    let _ = client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await;
+    assert_eq!(
+        ledger.poisoned(),
+        Some(ProviderClientError::TransportReportInconsistent)
+    );
+
+    assert_eq!(
+        ledger.record_no_dispatch(&no_dispatch_proof_for(&other_logical_request_id())),
+        Err(ProviderClientError::LedgerRequestMismatch),
+        "a mismatched request must be refused before the ledger's own poison is ever consulted"
+    );
+
+    // The ledger's own bound request still gets the poison, proving the mismatched call above did
+    // not otherwise disturb the ledger.
+    assert_eq!(
+        ledger.record_no_dispatch(&no_dispatch_proof_for(&logical_request_id())),
+        Err(ProviderClientError::TransportReportInconsistent)
+    );
+}
+
+/// The same ordering against the OTHER precondition `record_no_dispatch` checks: on a ledger that
+/// is not poisoned at all but already has an issued attempt (so the "already has an attempt"
+/// precondition would ALSO fire for the ledger's own request), a mismatched request must still be
+/// refused for the identity reason first -- not `NoDispatchNotPermitted`.
+#[tokio::test]
+async fn record_no_dispatch_request_mismatch_wins_over_no_dispatch_not_permitted() {
+    let (charge_authority, _charge_calls) =
+        ScriptedChargeAuthority::new(|request| Ok(binding_grant(request)));
+    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+    client
+        .execute(&mut ledger, &base_request(ProviderAttemptClass::Readiness))
+        .await
+        .expect("decisive attempt must succeed");
+    assert_eq!(ledger.attempt_count(), 1);
+    assert_eq!(ledger.poisoned(), None);
+
+    // On the ledger's own request, an issued attempt already forbids a no-dispatch record.
+    assert_eq!(
+        ledger.record_no_dispatch(&no_dispatch_proof_for(&logical_request_id())),
+        Err(ProviderClientError::NoDispatchNotPermitted)
+    );
+
+    // A mismatched request must be refused for the identity reason first: a wrong implementation
+    // that checked the precondition before identity would report `NoDispatchNotPermitted` here
+    // too, since this ledger genuinely has an issued attempt.
+    assert_eq!(
+        ledger.record_no_dispatch(&no_dispatch_proof_for(&other_logical_request_id())),
+        Err(ProviderClientError::LedgerRequestMismatch)
     );
 }
 

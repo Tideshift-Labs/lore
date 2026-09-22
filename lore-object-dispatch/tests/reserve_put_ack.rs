@@ -169,9 +169,28 @@ fn closure(disposition: i32) -> PutReservationClosureV1 {
     value
 }
 
+// Bound (WP-114 CD-6) to the same `logical_request_id` every caller in this file's `reserved()`
+// fixture uses, since every no-dispatch proof this file constructs is attached to a value derived
+// from `reserved()`.
 fn no_dispatch(reason: i32, committed_at_unix_ms: i64) -> ObjectStoreNoDispatchProofV1 {
+    no_dispatch_for(
+        &uuid_v7(1_000, "0123456789ab"),
+        reason,
+        committed_at_unix_ms,
+    )
+}
+
+/// Like [`no_dispatch`], but for an arbitrary `logical_request_id` -- used to build a correctly
+/// digested proof minted for a DIFFERENT request than the one it gets attached to, exercising
+/// WP-114 CD-6's ACK-side identity check (`ReservePutAckError::NoDispatchRequestMismatch`).
+fn no_dispatch_for(
+    logical_request_id: &str,
+    reason: i32,
+    committed_at_unix_ms: i64,
+) -> ObjectStoreNoDispatchProofV1 {
     let mut value = ObjectStoreNoDispatchProofV1 {
         reason,
+        logical_request_id: logical_request_id.to_string(),
         proof_id: uuid_v7(committed_at_unix_ms as u64, "1123456789ab"),
         proof_fence: 9,
         committed_at_unix_ms,
@@ -180,6 +199,7 @@ fn no_dispatch(reason: i32, committed_at_unix_ms: i64) -> ObjectStoreNoDispatchP
     };
     let mut output = b"object-store-no-dispatch-proof-v1\0".to_vec();
     output.extend_from_slice(&(reason as u32).to_be_bytes());
+    push_text(&mut output, logical_request_id);
     push_text(&mut output, &value.proof_id);
     output.extend_from_slice(&value.proof_fence.to_be_bytes());
     output.extend_from_slice(&(committed_at_unix_ms as u64).to_be_bytes());
@@ -321,6 +341,7 @@ fn closure_child_bytes(value: &PutReservationClosureV1) -> Vec<u8> {
 fn no_dispatch_child_bytes(value: &ObjectStoreNoDispatchProofV1) -> Vec<u8> {
     let mut output = b"object-store-no-dispatch-proof-v1\0".to_vec();
     output.extend_from_slice(&(value.reason as u32).to_be_bytes());
+    push_text(&mut output, &value.logical_request_id);
     push_text(&mut output, &value.proof_id);
     output.extend_from_slice(&value.proof_fence.to_be_bytes());
     output.extend_from_slice(&(value.committed_at_unix_ms as u64).to_be_bytes());
@@ -792,6 +813,42 @@ fn no_dispatch_proof_requires_semantic_reason_uuid_time_fence_epoch_and_digest()
     );
     value.no_dispatch_proof = Some(no_dispatch(6, ADMISSION));
     assert!(encode(&value).is_ok());
+}
+
+/// WP-114 CD-6, ACK side: the durable-side twin of `ProviderAttemptLedger::record_no_dispatch`'s
+/// ledger/request binding. An ACK for request A must refuse a nested no-dispatch proof that is
+/// otherwise perfectly valid -- correct reason, canonical UUIDv7 proof ID, positive fence/epoch,
+/// a digest that matches its own (mutated) fields, and timing that would satisfy
+/// `InvalidTimeProjection`'s check -- but was minted for a different request B.
+#[test]
+fn no_dispatch_proof_for_a_foreign_request_is_refused_on_identity_not_time() {
+    let mut value = reserved();
+    value.state = PutReservationStateV1::PutReservationStatePreparedExpired as i32;
+    value.payload_release_receipt = Some(release(
+        ObjectStoreResultDispositionV1::ObjectStoreResultDispositionNotApplicable as i32,
+        ObjectStorePayloadReleaseReasonV1::ObjectStorePayloadReleaseReasonNoPayloadCreated as i32,
+        None,
+        3_400,
+    ));
+
+    // Sanity: this exact proof, minted for the ACK's OWN request, is valid -- isolating the
+    // refusal below to the identity swap alone, not some other field this fixture also changed.
+    let own_request_id = value.logical_request_id.clone();
+    value.no_dispatch_proof = Some(no_dispatch_for(&own_request_id, 4, EXPIRES));
+    assert!(
+        encode(&value).is_ok(),
+        "same-request proof with identical timing must validate"
+    );
+
+    let foreign_request_id = uuid_v7(1_000, "ffffffffffff");
+    assert_ne!(foreign_request_id, own_request_id);
+    value.no_dispatch_proof = Some(no_dispatch_for(&foreign_request_id, 4, EXPIRES));
+    assert_eq!(
+        encode(&value),
+        Err(ReservePutAckError::NoDispatchRequestMismatch),
+        "a correctly digested, correctly timed proof minted for a different request must still \
+         be refused"
+    );
 }
 
 #[test]

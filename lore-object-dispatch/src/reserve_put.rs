@@ -173,6 +173,19 @@ pub fn validate_reserve_put_state_snapshot(
         return Err(ReservePutError::InvalidNoDispatchMaximum);
     }
     if let Some(proof) = &snapshot.no_dispatch_proof {
+        // CD-6 bound the proof to a logical request. This site cannot check that binding:
+        // `ReservePutStateSnapshot` carries no request identity, so the proof is structurally
+        // unbindable here. Deliberate silence, not an omission -- `reserve_put_ack.rs`,
+        // `request_state_wire.rs::validate_state_algebra` and
+        // `provider_client.rs::record_no_dispatch` each do know their request and each enforce
+        // it. Giving the snapshot a request identity is the fix if this ever stands alone.
+        //
+        // The proto declares two further nesting sites that no code reads today, so neither is
+        // a live hole and neither is checked: `PutReservationUnavailableV1`'s
+        // `reservation_no_dispatch_proof` (field 10, and its parent's identity would make it
+        // bindable) and `PutUploadClosedV1`'s `no_dispatch_proof` (field 14, likewise bindable
+        // against that message's `logical_request_id`). Whoever writes the first encoder for
+        // either owes the same check rather than inheriting this exemption.
         validate_no_dispatch_proof(proof, max_no_dispatch_proof_preimage_bytes)
             .map_err(|_| ReservePutError::InvalidNoDispatchProof)?;
     }

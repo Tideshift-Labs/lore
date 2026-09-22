@@ -258,6 +258,7 @@ message ObjectStoreNoDispatchProofV1 {
   ObjectStoreNoDispatchReasonV1 reason = 1; string proof_id = 2;
   uint64 proof_fence = 3; int64 committed_at_unix_ms = 4;
   uint64 authority_epoch = 5; bytes proof_blake3 = 6;
+  string logical_request_id = 7;
 }
 message PutReservationUnavailableV1 {
   string protocol_revision = 1; string provider_boundary_id = 2;

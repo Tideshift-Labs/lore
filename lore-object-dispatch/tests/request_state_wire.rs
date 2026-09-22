@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+use lore_object_dispatch::RequestStateWireError;
 use lore_object_dispatch::RequestStateWireLimits;
 use lore_object_dispatch::TerminalResultLimits;
 use lore_object_dispatch::validate_and_encode_object_store_request_outcome;
@@ -448,8 +449,12 @@ fn uuid_v7(timestamp: i64) -> String {
     )
 }
 
+// WP-114 CD-6: bound to this file's `REQUEST_ID`, the same `logical_request_id` every
+// `prepared()`-derived fixture (and therefore every `phase_fixtures()` case that embeds a
+// no-dispatch proof) uses.
 fn no_dispatch(reason: ObjectStoreNoDispatchReasonV1) -> ObjectStoreNoDispatchProofV1 {
     let mut fields = (reason as u32).to_be_bytes().to_vec();
+    append_text(&mut fields, REQUEST_ID);
     let id = uuid_v7(NOW);
     append_text(&mut fields, &id);
     fields.extend_from_slice(&4_u64.to_be_bytes());
@@ -458,6 +463,7 @@ fn no_dispatch(reason: ObjectStoreNoDispatchReasonV1) -> ObjectStoreNoDispatchPr
     let complete = complete_record("object-store-no-dispatch-proof-v1", &fields);
     ObjectStoreNoDispatchProofV1 {
         reason: reason as i32,
+        logical_request_id: REQUEST_ID.to_string(),
         proof_id: id,
         proof_fence: 4,
         committed_at_unix_ms: NOW,
@@ -468,6 +474,7 @@ fn no_dispatch(reason: ObjectStoreNoDispatchReasonV1) -> ObjectStoreNoDispatchPr
 
 fn no_dispatch_record(value: &ObjectStoreNoDispatchProofV1) -> Vec<u8> {
     let mut fields = (value.reason as u32).to_be_bytes().to_vec();
+    append_text(&mut fields, &value.logical_request_id);
     append_text(&mut fields, &value.proof_id);
     fields.extend_from_slice(&value.proof_fence.to_be_bytes());
     fields.extend_from_slice(&(value.committed_at_unix_ms as u64).to_be_bytes());
@@ -778,12 +785,16 @@ fn all_seven_request_phases_match_independently_assembled_canonical_records() {
             "4cced26c2dd71b48286980a265a5b5da0f6a921b6349e81a35842124708356a4",
         ),
         (
-            1_015,
-            "de81bf7f003e5097b284ea1bec6168829eb8a9dc88182d5aca75711d77ef18a2",
+            // WP-114 CD-6: +40 bytes (a framed `logical_request_id` UUIDv7 text field) over the
+            // pre-CD-6 length/digest. Recomputed independently (Python + the `blake3` package)
+            // from the byte-spliced pre-CD-6 preimage, not copied from any Rust run.
+            1_055,
+            "fb52a23659aa4aeae52060f7bfb0aab9d6ba46077e804b796cc015449da59182",
         ),
         (
-            1_202,
-            "75405a5ce19b806f5f73ebfe9c41a48186c5eaa54834694001a46862a049c94f",
+            // Same +40-byte WP-114 CD-6 adjustment as above.
+            1_242,
+            "fd9d6e58b30242be2752f6a7d1d1b255cea2b4ea53bd306dcd1a6a20287ff991",
         ),
     ];
     for (input, (expected_length, expected_digest)) in phase_fixtures().into_iter().zip(vectors) {
@@ -1170,6 +1181,41 @@ fn state_rejects_terminal_no_dispatch_payload_binding_and_reservation_inconsiste
         .into_iter()
         .all(|input| validate_and_encode_object_store_request_state(&input, &limits()).is_err())
     );
+}
+
+/// WP-114 CD-6, request-state side: `validate_state_algebra`'s phase 6|7 branch refuses a nested
+/// no-dispatch proof that is otherwise fully valid -- correct reason, canonical UUIDv7 proof ID, a
+/// digest that matches its own (mutated) fields, correct timing -- but was minted for a different
+/// request than the state row's own `logical_request_id`. Covers both NoDispatch (phase 6, index
+/// 5) and PreparedExpired (phase 7, index 6).
+#[test]
+fn state_rejects_no_dispatch_proof_minted_for_a_foreign_request() {
+    for index in [5usize, 6usize] {
+        let mut foreign = phase_fixtures()[index].clone();
+        let own_request_id = foreign.logical_request_id.clone();
+        let proof = foreign
+            .no_dispatch_proof
+            .as_mut()
+            .expect("fixture no-dispatch proof");
+        assert_eq!(
+            proof.logical_request_id, own_request_id,
+            "fixture precondition: the unmutated proof already commits to this state's own \
+             request"
+        );
+
+        let foreign_request_id = uuid_v7(NOW + 999);
+        assert_ne!(foreign_request_id, own_request_id);
+        proof.logical_request_id = foreign_request_id;
+        let recomputed = no_dispatch_record(proof);
+        proof.proof_blake3 = recomputed[recomputed.len() - 32..].to_vec().into();
+
+        assert_eq!(
+            validate_and_encode_object_store_request_state(&foreign, &limits()),
+            Err(RequestStateWireError::InvalidStateAlgebra),
+            "phase index {index}: a correctly digested proof minted for a different request \
+             must still be refused"
+        );
+    }
 }
 
 #[test]

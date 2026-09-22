@@ -11,9 +11,9 @@ const GENERATED: &str = include_str!("../src/grpc/lore.object_dispatch.v1.rs");
 // schema. Comments and formatting are deliberately excluded, while every package, type, field name,
 // field number, reserved field number, optional/repeated qualifier, oneof branch, enum name, and
 // enum number remains covered. Re-freeze all three together, in the same commit as the proto edit.
-const CONTRACT_TOKEN_BYTES: usize = 20_612;
-const CONTRACT_FNV1A64: u64 = 0x4d34_14d5_b5a6_438d;
-const CONTRACT_DJB2_XOR64: u64 = 0xb3d4_8c7d_3014_e8bb;
+const CONTRACT_TOKEN_BYTES: usize = 20_639;
+const CONTRACT_FNV1A64: u64 = 0x1ed2_ae4b_daec_3e94;
+const CONTRACT_DJB2_XOR64: u64 = 0x311d_4338_9925_2f80;
 
 fn without_line_comments(source: &str) -> String {
     source

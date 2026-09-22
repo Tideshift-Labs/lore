@@ -516,6 +516,8 @@ pub(crate) fn no_dispatch_child(
     if proof_timestamp != nonnegative(value.committed_at_unix_ms)? {
         return Err(RequestStateWireError::InvalidTimeOrder);
     }
+    canonical_uuid_v7_timestamp(&value.logical_request_id)
+        .map_err(|_| RequestStateWireError::InvalidUuidV7)?;
     digest(&value.proof_blake3)?;
     let mut output = writer(limits)?;
     output
@@ -523,6 +525,13 @@ pub(crate) fn no_dispatch_child(
         .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.reason as u32)
+        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+    // CD-6: the proof commits to the request it describes. This writer and
+    // `no_dispatch::canonical_preimage` are two independent implementations of one
+    // preimage; the in-crate agreement test is what keeps them from drifting.
+    text(&value.logical_request_id, limits)?;
+    output
+        .text(&value.logical_request_id)
         .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.proof_id, limits)?;
     output
@@ -965,6 +974,9 @@ fn validate_state_algebra(input: &ObjectStoreRequestStateV1) -> Result<(), Reque
             || input.ack_receipt.is_some()
             || input.discard_receipt.is_some()
             || ((input.phase == 7) != (proof.reason == 4))
+            // CD-6: the nested proof commits to a logical request, so a state row for request A
+            // cannot carry a correctly digested proof minted for request B.
+            || proof.logical_request_id != input.logical_request_id
         {
             return Err(RequestStateWireError::InvalidStateAlgebra);
         }
@@ -1391,4 +1403,101 @@ pub enum RequestStateWireError {
     DigestMismatch,
     #[error("canonical request-state wire record exceeds its byte bound")]
     CanonicalTooLarge,
+}
+
+// WP-114 CD-6 (INV-EJ B1): `no_dispatch::canonical_preimage` (the pure proof contract) and
+// `no_dispatch_child` above are two INDEPENDENT writers of the same domain-tagged
+// `object-store-no-dispatch-proof-v1` preimage -- one on the pure-contract path, one on the
+// durable authority-record path. Nothing at compile time pins them together, so they can silently
+// diverge. `no_dispatch_child` is `pub(crate)`, so this lives here as an internal unit test rather
+// than in `tests/`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::no_dispatch::NoDispatchProofFields;
+    use crate::no_dispatch::NoDispatchReason;
+    use crate::no_dispatch::build_no_dispatch_proof;
+
+    fn uuid_v7(timestamp_unix_ms: u64, tail: &str) -> String {
+        let timestamp = format!("{timestamp_unix_ms:012x}");
+        format!("{}-{}-7abc-8def-{tail}", &timestamp[..8], &timestamp[8..])
+    }
+
+    fn limits() -> RequestStateWireLimits {
+        RequestStateWireLimits {
+            max_identity_bytes: 256,
+            max_canonical_row_bytes: 16_384,
+        }
+    }
+
+    /// Every `NoDispatchReason` variant appears exactly once (the `raw_reason` loop), plus four
+    /// dedicated cases walking `proof_fence`/`authority_epoch`/`committed_at_unix_ms` to their
+    /// documented boundaries (`1`/`u64::MAX`, `0`/`(1 << 48) - 1`) against one fixed reason, so
+    /// reason coverage and numeric-boundary coverage stay orthogonal rather than hand-picking one
+    /// case that happens to exercise both.
+    fn cases() -> Vec<NoDispatchProofFields> {
+        let mut cases = Vec::new();
+        for raw_reason in 1..=8u32 {
+            let reason = NoDispatchReason::try_from(raw_reason)
+                .expect("every code 1..=8 is a valid NoDispatchReason");
+            let committed_at = i64::from(raw_reason) * 1000;
+            cases.push(NoDispatchProofFields {
+                reason,
+                logical_request_id: uuid_v7(u64::from(raw_reason) * 7, "0000000000aa"),
+                proof_id: uuid_v7(committed_at as u64, "0123456789ab"),
+                proof_fence: u64::from(raw_reason) + 1,
+                committed_at_unix_ms: committed_at,
+                authority_epoch: u64::from(raw_reason) + 1,
+            });
+        }
+        for (proof_fence, authority_epoch, committed_at) in [
+            (1u64, 1u64, 0i64),
+            (u64::MAX, u64::MAX, (1_i64 << 48) - 1),
+            (1u64, u64::MAX, 0i64),
+            (u64::MAX, 1u64, (1_i64 << 48) - 1),
+        ] {
+            cases.push(NoDispatchProofFields {
+                reason: NoDispatchReason::PreparedTtlExpired,
+                logical_request_id: uuid_v7(0, "1111111111aa"),
+                proof_id: uuid_v7(committed_at as u64, "0123456789ab"),
+                proof_fence,
+                committed_at_unix_ms: committed_at,
+                authority_epoch,
+            });
+        }
+        cases
+    }
+
+    #[test]
+    fn no_dispatch_child_matches_no_dispatch_rs_canonical_bytes_for_every_reason_and_boundary() {
+        for fields in cases() {
+            let built = build_no_dispatch_proof(fields.clone(), limits().max_canonical_row_bytes)
+                .unwrap_or_else(|error| panic!("fields {fields:?} must build: {error}"));
+            let wire_value = ObjectStoreNoDispatchProofV1 {
+                reason: fields.reason as i32,
+                proof_id: fields.proof_id.clone(),
+                proof_fence: fields.proof_fence,
+                committed_at_unix_ms: fields.committed_at_unix_ms,
+                authority_epoch: fields.authority_epoch,
+                proof_blake3: built.proof().proof_blake3.to_vec().into(),
+                logical_request_id: fields.logical_request_id.clone(),
+            };
+            let complete = no_dispatch_child(&wire_value, &limits())
+                .unwrap_or_else(|error| panic!("fields {fields:?} must encode: {error}"));
+            let (preimage, digest) = complete.split_at(complete.len() - 32);
+
+            assert_eq!(
+                preimage,
+                built.canonical_preimage(),
+                "no_dispatch_child's preimage diverged from no_dispatch::canonical_preimage for \
+                 {fields:?}"
+            );
+            assert_eq!(
+                digest,
+                built.proof().proof_blake3,
+                "no_dispatch_child's digest diverged from no_dispatch::build_no_dispatch_proof \
+                 for {fields:?}"
+            );
+        }
+    }
 }

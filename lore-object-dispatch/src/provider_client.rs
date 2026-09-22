@@ -1719,8 +1719,16 @@ impl ProviderAttemptLedger {
     /// record, and CD-6 owns that producer.
     pub fn record_no_dispatch(
         &mut self,
-        _proof: &CanonicalNoDispatchProof,
+        proof: &CanonicalNoDispatchProof,
     ) -> Result<(), ProviderClientError> {
+        // Identity is checked before poison and before the precondition below, matching
+        // `audit_for`: whether this proof describes this ledger's request at all precedes any
+        // question about the state the ledger is in. Closes INV-EJ B1's last unbound edge --
+        // before CD-6 the proof was discarded, so a proof minted for request B could finalize
+        // request A's ledger.
+        if proof.proof().fields.logical_request_id != self.logical_request_id {
+            return Err(ProviderClientError::LedgerRequestMismatch);
+        }
         if let Some(error) = self.poisoned {
             return Err(error);
         }

@@ -17,3 +17,11 @@ lore-postgres/migrations/*.sql text eol=lf
 # CRLF copies that `git status` still reports clean, and the next edit to such a
 # file commits the whole file as CRLF (rustfmt then reformats every line).
 *.rs text eol=lf
+
+# Scoped to the fork-private object-dispatch protos, NOT to `*.proto`. Most of
+# the workspace's proto blobs are CRLF in history because they are upstream
+# Epic's, so a blanket `*.proto text eol=lf` would renormalise them on next
+# touch and manufacture divergence against upstream. These files are ours, are
+# LF in history, and a one-line edit to one of them already came back as a
+# whole-file CRLF rewrite once.
+lore-proto/proto/lore/object_dispatch/v1/*.proto text eol=lf

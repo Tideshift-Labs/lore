@@ -695,6 +695,8 @@ pub struct ObjectStoreNoDispatchProofV1 {
     pub authority_epoch: u64,
     #[prost(bytes = "bytes", tag = "6")]
     pub proof_blake3: ::prost::bytes::Bytes,
+    #[prost(string, tag = "7")]
+    pub logical_request_id: ::prost::alloc::string::String,
 }
 impl ::prost::Name for ObjectStoreNoDispatchProofV1 {
     const NAME: &'static str = "ObjectStoreNoDispatchProofV1";

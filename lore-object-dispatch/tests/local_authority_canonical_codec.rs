@@ -537,7 +537,7 @@ fn reserve_put_ack_encodes_exact_reserved_and_spool_ready_shapes() {
 }
 
 #[test]
-fn sql_shape_matches_rust_codec_domains_and_keeps_687_byte_terminal_vector_out_of_scope() {
+fn sql_shape_matches_rust_codec_domains_and_keeps_727_byte_terminal_vector_out_of_scope() {
     let sql = migration();
     let rust_codec = include_str!("../src/reserve_put_ack.rs");
     for domain in [
@@ -570,13 +570,17 @@ fn sql_shape_matches_rust_codec_domains_and_keeps_687_byte_terminal_vector_out_o
         );
     }
     let compact_fixture = include_str!("compaction.rs");
-    assert!(compact_fixture.contains("assert_eq!(source_ack.canonical_bytes().len(), 687);"));
+    // WP-114 CD-6: `reserve_put_ack()`'s embedded no-dispatch proof now carries a
+    // `logical_request_id` field, so this Rust-side vector grew from 687 to 727 bytes (+40, one
+    // framed UUIDv7 text field) and its digest changed. Re-pinned against `compaction.rs`'s own
+    // recomputed literals (see that file's `disposed_put_compact_pins_reserve_ack_and_replay_projection`).
+    assert!(compact_fixture.contains("assert_eq!(source_ack.canonical_bytes().len(), 727);"));
     assert!(
         compact_fixture
-            .contains("9be99cf8cf771dae54f540a31ff5074839c4a3a71e928da7ba2885bdb2b623c5")
+            .contains("3defa62864274d0c3f17b76359fd95d38a6ed13bfef40c0a86332d566f508d99")
     );
     assert!(sql.contains("ack_state NOT IN (1, 2)"));
-    assert!(!sql.contains("LOCAL_RESERVE_PUT_ACK_687"));
+    assert!(!sql.contains("LOCAL_RESERVE_PUT_ACK_727"));
 }
 
 #[test]

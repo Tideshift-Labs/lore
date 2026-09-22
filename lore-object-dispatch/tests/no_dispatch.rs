@@ -9,9 +9,24 @@ use lore_object_dispatch::build_no_dispatch_proof;
 use lore_object_dispatch::validate_no_dispatch_proof;
 
 const COMMITTED_AT: i64 = 0x018f_3e12_a456;
+// Deliberately NOT derived from COMMITTED_AT: WP-114 CD-6 requires `logical_request_id` to be
+// canonical UUIDv7, but explicitly does not constrain its embedded timestamp against
+// `committed_at_unix_ms` the way `proof_id` is constrained. Using a different embedded timestamp
+// here is itself part of the proof that no such ordering is enforced.
+const LOGICAL_REQUEST_ID: &str = "00000000-0000-7abc-8def-1111111111aa";
+const OTHER_LOGICAL_REQUEST_ID: &str = "00000000-0000-7abc-8def-2222222222bb";
+// Recomputed for the WP-114 CD-6 field addition: independently derived (Python + the `blake3`
+// package) from `independent_preimage()` below, not copied from any Rust run.
+//
+// CROSS-LANGUAGE: this exact vector and digest are also pinned by the TypeScript twin, at
+// `lorehub/packages/control-plane/test/capacity/object-store-no-dispatch-proof.test.ts`
+// ("agrees byte-for-byte with the Rust twin on one shared cross-language vector"). Both
+// implementations encode `object-store-no-dispatch-proof-v1`; before CD-6 they pinned DIFFERENT
+// inputs and stayed green while disagreeing byte for byte. Move this vector and you must move
+// that one in the same commit.
 const GOLDEN_DIGEST: [u8; 32] = [
-    0xa9, 0x0a, 0x54, 0x47, 0x76, 0x41, 0x6d, 0x8e, 0x40, 0xc6, 0xdc, 0xdf, 0x43, 0x0c, 0xc0, 0xb2,
-    0x14, 0x50, 0x35, 0xd3, 0xab, 0xbb, 0xc2, 0x7b, 0x73, 0xa1, 0x4c, 0xf2, 0x0a, 0xfd, 0x5a, 0x01,
+    0xe0, 0x67, 0xc2, 0x6c, 0x7e, 0x42, 0x2e, 0x2e, 0x5b, 0xb3, 0xe1, 0xd0, 0xe7, 0x43, 0xdd, 0x42,
+    0xa5, 0x78, 0x55, 0x10, 0x10, 0xf3, 0x5e, 0x4f, 0xd0, 0x3c, 0xb5, 0x42, 0xeb, 0x5e, 0x79, 0xfe,
 ];
 
 fn uuid_v7(timestamp_unix_ms: u64, tail: &str) -> String {
@@ -22,6 +37,7 @@ fn uuid_v7(timestamp_unix_ms: u64, tail: &str) -> String {
 fn fields() -> NoDispatchProofFields {
     NoDispatchProofFields {
         reason: NoDispatchReason::PreparedTtlExpired,
+        logical_request_id: LOGICAL_REQUEST_ID.to_string(),
         proof_id: uuid_v7(COMMITTED_AT as u64, "0123456789ab"),
         proof_fence: 5,
         committed_at_unix_ms: COMMITTED_AT,
@@ -33,6 +49,12 @@ fn independent_preimage() -> Vec<u8> {
     let proof_id = uuid_v7(COMMITTED_AT as u64, "0123456789ab");
     let mut output = b"object-store-no-dispatch-proof-v1\0".to_vec();
     output.extend_from_slice(&4_u32.to_be_bytes());
+    output.extend_from_slice(
+        &u32::try_from(LOGICAL_REQUEST_ID.len())
+            .expect("literal logical request ID length must fit u32")
+            .to_be_bytes(),
+    );
+    output.extend_from_slice(LOGICAL_REQUEST_ID.as_bytes());
     output.extend_from_slice(
         &u32::try_from(proof_id.len())
             .expect("literal proof ID length must fit u32")
@@ -50,11 +72,11 @@ fn built() -> CanonicalNoDispatchProof {
 }
 
 #[test]
-fn no_dispatch_proof_pins_independent_102_byte_preimage_and_digest() {
+fn no_dispatch_proof_pins_independent_142_byte_preimage_and_digest() {
     let expected = independent_preimage();
     let actual = built();
 
-    assert_eq!(expected.len(), 102);
+    assert_eq!(expected.len(), 142);
     assert_eq!(actual.canonical_preimage(), expected);
     assert_eq!(blake3::hash(&expected).as_bytes(), &GOLDEN_DIGEST);
     assert_eq!(actual.proof().proof_blake3, GOLDEN_DIGEST);
@@ -109,6 +131,83 @@ fn no_dispatch_proof_requires_canonical_uuid_timestamp_equal_to_database_commit(
     );
 }
 
+/// WP-114 CD-6: `logical_request_id` is checked for canonicality only. Unlike `proof_id`, its
+/// embedded UUIDv7 timestamp is never compared against `committed_at_unix_ms` -- `fields()` above
+/// already uses a deliberately different embedded timestamp, and every other passing test in this
+/// file relies on that not being rejected. This test pins it explicitly so a future change adding
+/// a timestamp-ordering constraint here is caught.
+#[test]
+fn no_dispatch_proof_logical_request_id_has_no_timestamp_ordering_constraint() {
+    let mut far_future = fields();
+    far_future.logical_request_id = uuid_v7((1_u64 << 48) - 1, "1111111111aa");
+    assert!(build_no_dispatch_proof(far_future, 1024).is_ok());
+
+    let mut zero_timestamp = fields();
+    zero_timestamp.logical_request_id = uuid_v7(0, "1111111111aa");
+    assert!(build_no_dispatch_proof(zero_timestamp, 1024).is_ok());
+}
+
+/// `logical_request_id` must still be a canonical UUIDv7: empty, non-UUID-shaped, and
+/// non-canonical (wrong case, wrong version/variant nibble) values are all rejected the same way
+/// as an invalid `proof_id` is, just against the new field's own error variant.
+#[test]
+fn no_dispatch_proof_rejects_every_non_canonical_logical_request_id_shape() {
+    let cases: [(&str, &str); 5] = [
+        ("", "empty"),
+        ("not-a-uuid", "not UUID-shaped"),
+        ("00000000-0000-7abc-8def-1111111111ag", "non-hex tail"),
+        (
+            "00000000-0000-4abc-8def-1111111111aa",
+            "version nibble is 4, not 7",
+        ),
+        (
+            "00000000-0000-7abc-1def-1111111111aa",
+            "variant nibble is 1, not 8/9/a/b",
+        ),
+    ];
+
+    for (candidate, label) in cases {
+        let mut broken = fields();
+        broken.logical_request_id = candidate.to_string();
+        assert_eq!(
+            build_no_dispatch_proof(broken, 1024),
+            Err(NoDispatchProofError::InvalidLogicalRequestId),
+            "case: {label}"
+        );
+    }
+
+    let mut uppercase = fields();
+    uppercase.logical_request_id.make_ascii_uppercase();
+    assert_eq!(
+        build_no_dispatch_proof(uppercase, 1024),
+        Err(NoDispatchProofError::InvalidLogicalRequestId),
+        "case: uppercase is not canonical lowercase hex"
+    );
+}
+
+/// Two proofs differing ONLY in `logical_request_id` must diverge in `proof_blake3`, so a proof
+/// minted for request A can never be replayed as if it were minted for request B: mint proof
+/// bytes for one, mutate the field, and prove neither the preimage nor the digest can still match.
+#[test]
+fn no_dispatch_proofs_for_different_logical_requests_have_different_digests() {
+    let for_a = build_no_dispatch_proof(fields(), 1024).expect("proof for request A must build");
+    let mut fields_b = fields();
+    fields_b.logical_request_id = OTHER_LOGICAL_REQUEST_ID.to_string();
+    let for_b = build_no_dispatch_proof(fields_b, 1024).expect("proof for request B must build");
+
+    assert_ne!(for_a.canonical_preimage(), for_b.canonical_preimage());
+    assert_ne!(for_a.proof().proof_blake3, for_b.proof().proof_blake3);
+
+    // A's digest, replayed against B's fields (the exact substitution attack CD-6 closes), must
+    // fail validation rather than silently pass.
+    let mut swapped = for_b.proof().clone();
+    swapped.proof_blake3 = for_a.proof().proof_blake3;
+    assert_eq!(
+        validate_no_dispatch_proof(&swapped, 1024),
+        Err(NoDispatchProofError::DigestMismatch)
+    );
+}
+
 #[test]
 fn no_dispatch_proof_accepts_inclusive_numeric_and_preimage_boundaries() {
     let mut maximum = fields();
@@ -160,6 +259,9 @@ fn no_dispatch_validation_rejects_every_stale_field_or_digest_mutation() {
     let mut reason = proof.clone();
     reason.fields.reason = NoDispatchReason::SdkConstructionFailed;
     mutations.push(reason);
+    let mut logical_request_id = proof.clone();
+    logical_request_id.fields.logical_request_id = OTHER_LOGICAL_REQUEST_ID.to_string();
+    mutations.push(logical_request_id);
     let mut proof_id = proof.clone();
     proof_id.fields.proof_id = uuid_v7(COMMITTED_AT as u64, "1123456789ab");
     mutations.push(proof_id);
@@ -187,6 +289,7 @@ fn no_dispatch_diagnostics_redact_proof_identity_digest_and_preimage() {
     let diagnostic = format!("{canonical:?}");
 
     assert!(!diagnostic.contains(&canonical.proof().fields.proof_id));
+    assert!(!diagnostic.contains(&canonical.proof().fields.logical_request_id));
     assert!(!diagnostic.contains("169, 10, 84, 71"));
     assert!(!diagnostic.contains("object-store-no-dispatch-proof-v1"));
     assert!(diagnostic.contains("[REDACTED]"));

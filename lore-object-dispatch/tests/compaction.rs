@@ -489,6 +489,9 @@ fn expired_state() -> lore_object_dispatch::CanonicalObjectStoreRequestState {
     let proof = build_no_dispatch_proof(
         NoDispatchProofFields {
             reason: NoDispatchReason::PreparedTtlExpired,
+            // Bound to THIS state's own logical_request_id (WP-114 CD-6): the proof embedded
+            // below asserts that this specific request resolved without dispatch.
+            logical_request_id: REQUEST_ID.to_string(),
             proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
             proof_fence: 4,
             committed_at_unix_ms: NOW,
@@ -525,6 +528,7 @@ fn expired_state() -> lore_object_dispatch::CanonicalObjectStoreRequestState {
             no_dispatch_proof: Some(ObjectStoreNoDispatchProofV1 {
                 reason: ObjectStoreNoDispatchReasonV1::ObjectStoreNoDispatchReasonPreparedTtlExpired
                     as i32,
+                logical_request_id: REQUEST_ID.to_string(),
                 proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
                 proof_fence: 4,
                 committed_at_unix_ms: NOW,
@@ -585,6 +589,9 @@ fn bound_no_dispatch_audit() -> BoundProviderAttemptAudit {
     let proof = build_no_dispatch_proof(
         NoDispatchProofFields {
             reason: NoDispatchReason::PreparedTtlExpired,
+            // Must match the `REQUEST_ID` passed to `no_dispatch_bound_audit` below: WP-114 CD-6
+            // refuses `record_no_dispatch` when the proof's request does not match the ledger's.
+            logical_request_id: REQUEST_ID.to_string(),
             proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
             proof_fence: 1,
             committed_at_unix_ms: NOW,
@@ -608,6 +615,8 @@ fn reserve_put_ack() -> lore_object_dispatch::CanonicalObjectStoreReservePutAck 
     let no_dispatch = build_no_dispatch_proof(
         NoDispatchProofFields {
             reason: NoDispatchReason::PreparedTtlExpired,
+            // Matches this fixture's own `logical_request_id: REQUEST_ID` below.
+            logical_request_id: REQUEST_ID.to_string(),
             proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
             proof_fence: 1,
             committed_at_unix_ms: NOW,
@@ -652,6 +661,7 @@ fn reserve_put_ack() -> lore_object_dispatch::CanonicalObjectStoreReservePutAck 
             closure: None,
             no_dispatch_proof: Some(ObjectStoreNoDispatchProofV1 {
                 reason: 4,
+                logical_request_id: REQUEST_ID.to_string(),
                 proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
                 proof_fence: 1,
                 committed_at_unix_ms: NOW,
@@ -825,15 +835,19 @@ fn disposed_put_compact_pins_reserve_ack_and_replay_projection() {
         compact_ack.canonical_bytes().as_ptr(),
         source_ack.canonical_bytes().as_ptr()
     );
-    assert_eq!(source_ack.canonical_bytes().len(), 687);
+    // WP-114 CD-6: `reserve_put_ack()`'s embedded no-dispatch proof (this file) now carries a
+    // `logical_request_id` field, so these two literals are +40 bytes (one framed UUIDv7 text
+    // field) over the pre-CD-6 length/digest. Recomputed against the landed implementation itself
+    // (dumped via a temporary `println!` of the real canonical bytes/digest, not hand-spliced).
+    assert_eq!(source_ack.canonical_bytes().len(), 727);
     assert_eq!(
         source_ack.ack_blake3(),
-        decode_hex("9be99cf8cf771dae54f540a31ff5074839c4a3a71e928da7ba2885bdb2b623c5").as_slice()
+        decode_hex("3defa62864274d0c3f17b76359fd95d38a6ed13bfef40c0a86332d566f508d99").as_slice()
     );
-    assert_eq!(compact.canonical_bytes().len(), 7_749);
+    assert_eq!(compact.canonical_bytes().len(), 7_789);
     assert_eq!(
         compact.compact_blake3(),
-        decode_hex("06c714e55984f67f117f84b77e1e78b202dbd40d02258e1c3ae5680e1d73cd76").as_slice()
+        decode_hex("513e761cf04c78018236f10ed3a10be7bce19dbb4976bac9c6eb6b2b8d6fc1ac").as_slice()
     );
 
     let mut replay = planner(&fixture);
@@ -1201,6 +1215,9 @@ fn historical_terminal_ambiguity_and_no_dispatch_grant_are_audited_exactly() {
     let no_dispatch = build_no_dispatch_proof(
         NoDispatchProofFields {
             reason: NoDispatchReason::DispatcherProvedNotSent,
+            // Matches `expired_state()`'s own `logical_request_id: REQUEST_ID` (this state is
+            // `expired_state()` with its phase/no_dispatch_proof overridden below).
+            logical_request_id: REQUEST_ID.to_string(),
             proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
             proof_fence: 4,
             committed_at_unix_ms: NOW,
@@ -1212,6 +1229,7 @@ fn historical_terminal_ambiguity_and_no_dispatch_grant_are_audited_exactly() {
     expired_value.no_dispatch_proof = Some(ObjectStoreNoDispatchProofV1 {
         reason: ObjectStoreNoDispatchReasonV1::ObjectStoreNoDispatchReasonDispatcherProvedNotSent
             as i32,
+        logical_request_id: REQUEST_ID.to_string(),
         proof_id: "018f3e12-a456-7abc-8def-0123456789ab".to_string(),
         proof_fence: 4,
         committed_at_unix_ms: NOW,

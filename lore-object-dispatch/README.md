@@ -25,6 +25,7 @@ For a detailed catalogue of embedded migrations (including BLAKE3 hashes and det
 `provider_client.rs` manages provider attempts and the charge-before-send kernel.
 - **Provider Ledger:** A ledger is bound exclusively to one boundary and one request (`ProviderAttemptLedger::new`).
 - **Authorization:** Replaces global execution flows with bounded ledger auditing. Charging outside a ledger is unreachable.
+- **No-Dispatch Proof Binding:** The `object-store-no-dispatch-proof-v1` canonical preimage carries the logical request's identity. `record_no_dispatch` refuses a correctly digested proof minted for a different request (`LedgerRequestMismatch`), so a no-dispatch proof cannot finalize the wrong ledger.
 
 ### Typed Cell-Authority Client (WP-114 CD-3)
 `dispatch_client.rs` manages the typed pathway to the retained PostgreSQL procedures for admission, progress, spool readiness, and schema readiness.
