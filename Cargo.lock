@@ -2859,6 +2859,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "lore-base",
+ "lore-object-dispatch",
  "lore-proto",
  "lore-telemetry",
  "opentelemetry",

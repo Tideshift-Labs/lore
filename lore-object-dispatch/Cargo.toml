@@ -27,10 +27,20 @@ tracing = { workspace = true }
 unicode-normalization = "0.1.25"
 uuid = { workspace = true, features = ["serde"] }
 
+[features]
+# CR-038: the two install entry points that can build a cell without the operator path's guards.
+# `apply_cell_install_plan` commits a forward step without attesting it (the pin-measurement seam),
+# and `install_cell_schema_at` builds an older known state as a fixture. Neither may be reachable
+# from a production build, and a `#[cfg(test)]` item is invisible to this crate's own integration
+# tests, which is where they are used. Enabled for those tests by the self dev-dependency below,
+# the same shape as `lore-transport`'s and `lore-revision`'s `test_seams`.
+test_seams = []
+
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
+lore-object-dispatch = { path = ".", features = ["test_seams"] }
 rcgen = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 x509-parser = { workspace = true }

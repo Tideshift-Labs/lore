@@ -18,8 +18,9 @@
 //! cell-schema-install measure    # print the live catalog manifest digests
 //! ```
 //!
-//! `upgrade` requires every replica stopped. It refuses while any other session is connected to the
-//! cell database, and it commits a forward step only after the new state attests inside the same
+//! `upgrade` requires every replica stopped. It checks once, before its transaction, that no other
+//! session is connected to the cell database; a later connection is refused only if it holds a cell
+//! table when the step's `LOCK TABLE ... NOWAIT` runs. It commits a forward step only after the new state attests inside the same
 //! transaction. After any interruption, run it again: it classifies the cell before it acts.
 //!
 //! `install`, `upgrade` and `attest` each take the cell schema session lock and refuse at once if

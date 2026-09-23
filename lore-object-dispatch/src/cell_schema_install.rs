@@ -1552,9 +1552,13 @@ pub async fn release_cell_schema_lock(client: &Client) -> Result<(), CellSchemaE
 
 /// Move an attested [`CellSchemaRevision::R27`] cell to [`CELL_SCHEMA_CURRENT`] (CR-038).
 ///
-/// Offline only: every replica must be stopped. The run refuses if any other session is connected
-/// to the cell database, and the step's own `LOCK TABLE ... NOWAIT` refuses a transaction that
-/// still holds a cell table. Recovery after any interruption is to run it again: it classifies the
+/// Offline only: every replica must be stopped. The session guard checks ONCE, before the step's
+/// `BEGIN`: it refuses if any other session is connected to the cell database. A session that
+/// connects after that check is not seen by it. The step's `LOCK TABLE ... NOWAIT` refuses such a
+/// session only if it already holds one of the four cell tables. Otherwise it is benign: a binary
+/// that ships this step refuses to start write-behind until the marker exists, and an older
+/// binary's release call that began before `COMMIT` runs the old body, leaving that row at its full
+/// charge (conservative, never a double release). Recovery after any interruption is to run it again: it classifies the
 /// live catalog first, so a step that committed is never run twice, and a step that did not commit
 /// left nothing behind because the step and its attestation are one transaction.
 ///
@@ -1686,7 +1690,10 @@ fn forward_step_error(error: tokio_postgres::Error) -> CellSchemaError {
 /// step is refused by the database.
 ///
 /// Forward steps run here without their in-transaction attestation, because this seam is what
-/// measures a new state's pins before they exist. [`install_cell_schema`] never skips it.
+/// measures a new state's pins before they exist. [`install_cell_schema`] never skips it. That is
+/// also why it takes no lock and exists only under the `test_seams` feature: a production build
+/// has no way to commit a forward step that did not attest.
+#[cfg(feature = "test_seams")]
 pub async fn apply_cell_install_plan(
     client: &Client,
 ) -> Result<
@@ -1702,13 +1709,15 @@ pub async fn apply_cell_install_plan(
 /// Install a FRESH cell at an older known state, then attest it as exactly that state.
 ///
 /// For fixtures only, such as an upgrade test that needs a real [`CellSchemaRevision::R27`] cell.
-/// The operator binary does not expose it. On an existing schema it refuses unless the cell already
+/// It exists only under the `test_seams` feature, so neither the operator binary nor any production
+/// build can reach it. On an existing schema it refuses unless the cell already
 /// attests as `target`, and it never moves a cell forward: that is [`upgrade_cell_schema`]'s job.
 ///
 /// # Errors
 ///
 /// As [`install_cell_schema`], and [`CellSchemaError::RefusedUnattestedSchema`] when the existing
 /// cell is at a different state.
+#[cfg(feature = "test_seams")]
 pub async fn install_cell_schema_at(
     client: &Client,
     target: CellSchemaRevision,
@@ -1739,7 +1748,9 @@ pub async fn install_cell_schema_at(
 enum StepAttestation {
     /// Every operator path.
     Attest,
-    /// Only the measurement seam, which runs before the target's pins exist.
+    /// Only the measurement seam, which runs before the target's pins exist. Absent from a
+    /// production build.
+    #[cfg(feature = "test_seams")]
     Skip,
 }
 

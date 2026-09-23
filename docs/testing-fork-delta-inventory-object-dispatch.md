@@ -107,6 +107,7 @@ bare-literal `{units} * {INTERVAL_MS}` SQL multiplies as `int4` and overflows pa
 `numeric(20,0)` (the `uint64` domain's own base type) before multiplying. Owned by the
 implementation lane, not this test lane: the live catalog re-measure
 (`run-cell-schema-install-live.ps1 -Measure`) pins 0025's two moved sections (`functions`,
-`function_acls`) into `CELL_CATALOG_SECTION_BLAKE3_V1`/`CELL_CATALOG_MANIFEST_BLAKE3_V1` --
+`function_acls`) into `CELL_CATALOG_SECTION_BLAKE3_R27`/`CELL_CATALOG_MANIFEST_BLAKE3_R27` (named
+`*_V1` before CR-038; the current state's pins are the `*_R28` pair) --
 invisible to the default (non-live) suite and caught only by the live installer tier, so run it
 whenever 0025 changes.
