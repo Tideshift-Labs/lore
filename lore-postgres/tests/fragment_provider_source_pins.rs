@@ -151,7 +151,7 @@ fn dispatch_dependency_guard_rejects_regular_build_target_and_workspace_aliases(
 /// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 12] = [
+const SCANNED_FILES: [&str; 13] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -164,11 +164,12 @@ const SCANNED_FILES: [&str; 12] = [
     "stage_rotation_schema.rs",
     "stage_schema.rs",
     "states.rs",
+    "upgrade.rs",
 ];
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
-const PACKAGE_FILES: [&str; 13] = [
+const PACKAGE_FILES: [&str; 14] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -182,6 +183,7 @@ const PACKAGE_FILES: [&str; 13] = [
     "stage_rotation_schema.rs",
     "stage_schema.rs",
     "states.rs",
+    "upgrade.rs",
 ];
 
 /// A provider SDK or bucket client.
