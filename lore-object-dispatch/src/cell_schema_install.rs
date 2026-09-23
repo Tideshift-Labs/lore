@@ -330,23 +330,29 @@ LOCK TABLE object_store_retention.object_dispatch_spool_objects,
  object_store_retention.drain_spool_custody,object_store_retention.object_dispatch_quota_usage,
  object_store_retention.drain_policies IN ACCESS EXCLUSIVE MODE NOWAIT;";
 
-/// Message the R25 -> R26 prelude raises for a cell that still has spool state.
-const IN_FLIGHT_SPOOL_REFUSAL: &str = "CR038_UPGRADE_IN_FLIGHT_SPOOL";
+/// Message the R25 -> R26 prelude raises for a cell that still holds spool objects.
+const R25_SPOOL_OBJECTS_REFUSAL: &str = "CR038_UPGRADE_R25_SPOOL_OBJECTS";
+
+/// Message the R25 -> R26 prelude raises for a cell with charged quota.
+const R25_CHARGED_QUOTA_REFUSAL: &str = "CR038_UPGRADE_R25_CHARGED_QUOTA";
 
 /// 0026 replaces `put_spool_ready` (it then requires a drain custody row) and revokes the runtime's
 /// direct `reserve_put`/`upload_progress` grants. A spool object reserved before 0026 could never
 /// become ready afterwards, and its quota charge could never be returned by the drain path. So the
-/// step refuses a cell that holds any spool object or any nonzero quota usage. The drain tables do
-/// not exist yet; the two that do are locked.
+/// step refuses a cell that holds any spool object or any nonzero quota usage, with a distinct
+/// reason for each because they drain differently (see [`forward_step_error`]). The drain tables
+/// do not exist yet; the two that do are locked.
 const R25_TO_R26_PRELUDE_SQL: &str = "SET LOCAL ROLE object_dispatch_retention_owner;
 LOCK TABLE object_store_retention.object_dispatch_spool_objects,
  object_store_retention.object_dispatch_quota_usage IN ACCESS EXCLUSIVE MODE NOWAIT;
 DO $prelude$
 BEGIN
- IF EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_spool_objects)
- OR EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_quota_usage
+ IF EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_spool_objects) THEN
+  RAISE EXCEPTION 'CR038_UPGRADE_R25_SPOOL_OBJECTS' USING ERRCODE='55000';
+ END IF;
+ IF EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_quota_usage
             WHERE used_bytes<>0 OR used_rows<>0 OR used_concurrency<>0) THEN
-  RAISE EXCEPTION 'CR038_UPGRADE_IN_FLIGHT_SPOOL' USING ERRCODE='55000';
+  RAISE EXCEPTION 'CR038_UPGRADE_R25_CHARGED_QUOTA' USING ERRCODE='55000';
  END IF;
 END $prelude$;";
 
@@ -1880,9 +1886,23 @@ fn forward_step_error(error: tokio_postgres::Error) -> CellSchemaError {
     // 55P03 is `lock_not_available`: the step's `LOCK TABLE ... NOWAIT` met a live transaction.
     if database_error.code().code() == "55P03" {
         CellSchemaError::ReplicasActive
-    } else if database_error.message() == IN_FLIGHT_SPOOL_REFUSAL {
+    } else if database_error.message() == R25_SPOOL_OBJECTS_REFUSAL {
+        // Why: after 0026 a pre-0026 spool object can never become ready. What drains it: R25's
+        // cell retention (0024) deletes a closed request's spool object once its retention window
+        // and hard expiry pass, so the cell must run on its current binary until none remain.
         CellSchemaError::Precondition(
-            "the cell holds spool objects or quota charges that the R25 upgrade cannot carry forward",
+            "R25 upgrade refused: the cell still holds spool objects, which cannot become ready \
+             after 0026; restart the replicas on the current binary, let cell retention remove \
+             them once their requests close and expire, then stop every replica and retry",
+        )
+    } else if database_error.message() == R25_CHARGED_QUOTA_REFUSAL {
+        // Why: the drain path can only return a charge it can bind to a spool row. What drains it:
+        // nothing. No procedure installed at R25 ever decrements `object_dispatch_quota_usage`
+        // (0013 only adds to it), so this state does not clear on its own.
+        CellSchemaError::Precondition(
+            "R25 upgrade refused: the cell has charged spool quota, and no R25 procedure ever \
+             returns it; this cell cannot take the upgrade as it is: reinstall it (install on a \
+             fresh database) or get an owner decision on resetting the charge",
         )
     } else {
         CellSchemaError::Postgres
