@@ -391,7 +391,8 @@ pub const CELL_FORWARD_STEPS: [CellForwardStep; 3] = [
 ///
 /// For a frozen artifact, the exact bytes minus its one `BEGIN;` line and its final `COMMIT;`
 /// line. The strip is validated rather than trusted: exactly one line reads `BEGIN;`, exactly one
-/// reads `COMMIT;`, the `BEGIN;` comes first, and nothing but blank lines follows `COMMIT;`.
+/// reads `COMMIT;`, the `BEGIN;` comes first, only blank lines and `--` comment lines precede
+/// `BEGIN;`, and only blank lines follow `COMMIT;`. So the removed text holds no statement.
 /// Anything else fails closed, so an edited artifact cannot silently lose or keep a statement.
 ///
 /// # Errors
@@ -420,6 +421,12 @@ pub fn forward_step_body(step: &CellForwardStep) -> Result<&'static str, CellSch
             commit_start = Some(offset);
         } else if commit_start.is_some() && !text.trim().is_empty() {
             return Err(shape);
+        } else if begin_end.is_none() {
+            // Before `BEGIN;`: the stripped prefix. It may hold only the header comment.
+            let trimmed = text.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with("--") {
+                return Err(shape);
+            }
         }
         offset += line.len();
     }
@@ -1887,22 +1894,23 @@ fn forward_step_error(error: tokio_postgres::Error) -> CellSchemaError {
     if database_error.code().code() == "55P03" {
         CellSchemaError::ReplicasActive
     } else if database_error.message() == R25_SPOOL_OBJECTS_REFUSAL {
-        // Why: after 0026 a pre-0026 spool object can never become ready. What drains it: R25's
-        // cell retention (0024) deletes a closed request's spool object once its retention window
-        // and hard expiry pass, so the cell must run on its current binary until none remain.
+        // Why: after 0026 a pre-0026 spool object can never become ready. What drains it: nothing.
+        // At R25 no installed procedure closes a request, moves a spool object to a terminal
+        // lifecycle, or returns its quota, so 0024's retention never selects it (review probe of a
+        // real 0013 reserve_put, 2026-09-23: lifecycle 1, no request row, no releasing function).
         CellSchemaError::Precondition(
-            "R25 upgrade refused: the cell still holds spool objects, which cannot become ready \
-             after 0026; restart the replicas on the current binary, let cell retention remove \
-             them once their requests close and expire, then stop every replica and retry",
+            "R25 upgrade refused: the cell holds spool objects that cannot be carried forward (no \
+             R25 procedure ever closes or releases them, and after 0026 they could never become \
+             ready); reinstall the cell (install on a fresh database) or get an owner decision",
         )
     } else if database_error.message() == R25_CHARGED_QUOTA_REFUSAL {
         // Why: the drain path can only return a charge it can bind to a spool row. What drains it:
         // nothing. No procedure installed at R25 ever decrements `object_dispatch_quota_usage`
         // (0013 only adds to it), so this state does not clear on its own.
         CellSchemaError::Precondition(
-            "R25 upgrade refused: the cell has charged spool quota, and no R25 procedure ever \
-             returns it; this cell cannot take the upgrade as it is: reinstall it (install on a \
-             fresh database) or get an owner decision on resetting the charge",
+            "R25 upgrade refused: the cell has charged spool quota that cannot be carried forward \
+             (no R25 procedure ever returns it); reinstall the cell (install on a fresh database) \
+             or get an owner decision",
         )
     } else {
         CellSchemaError::Postgres
