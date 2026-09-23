@@ -435,6 +435,73 @@ async fn assert_refused(coordinator: &PostgresFragmentCoordinator, needle: &str)
     }
 }
 
+/// `upgrade_clean_schema` (bb117070) refuses while ANY backend outside the
+/// coordinator's own pool is connected, checked before it even classifies
+/// the catalog -- so this file's own `direct` assertion connection, kept
+/// open across most of a test for pre/post snapshots, now trips the SAME
+/// guard the case means to exercise (a wrong-reason refusal). Drop `direct`
+/// immediately before every call, run it, then hand back a fresh
+/// reconnection for post-call assertions. The production guard's own
+/// bounded settle wait (`BACKEND_SETTLE_ATTEMPTS`/`BACKEND_SETTLE_INTERVAL`
+/// in `upgrade.rs`) absorbs the short delay before the dropped socket is
+/// actually gone -- mirrors `wait_until_exclusive` in
+/// `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs`.
+async fn call_upgrade(
+    coordinator: &PostgresFragmentCoordinator,
+    direct: Client,
+    url: &str,
+) -> (Result<FragmentSchemaUpgradeOutcome, DomainError>, Client) {
+    drop(direct);
+    let outcome = coordinator.upgrade_clean_schema().await;
+    (outcome, client(url).await)
+}
+
+async fn expect_upgraded(
+    coordinator: &PostgresFragmentCoordinator,
+    direct: Client,
+    url: &str,
+    from_version: i64,
+) -> Client {
+    let (outcome, direct) = call_upgrade(coordinator, direct, url).await;
+    assert_eq!(
+        outcome.unwrap(),
+        FragmentSchemaUpgradeOutcome::Upgraded { from_version }
+    );
+    direct
+}
+
+async fn expect_already_current(
+    coordinator: &PostgresFragmentCoordinator,
+    direct: Client,
+    url: &str,
+) -> Client {
+    let (outcome, direct) = call_upgrade(coordinator, direct, url).await;
+    assert_eq!(
+        outcome.unwrap(),
+        FragmentSchemaUpgradeOutcome::AlreadyCurrent
+    );
+    direct
+}
+
+/// [`assert_refused`], but for a case that holds `direct` open: drop it (see
+/// [`call_upgrade`]) before the call and hand back a fresh reconnection.
+async fn assert_refused_dropping(
+    coordinator: &PostgresFragmentCoordinator,
+    direct: Client,
+    url: &str,
+    needle: &str,
+) -> Client {
+    let (outcome, direct) = call_upgrade(coordinator, direct, url).await;
+    match outcome {
+        Err(DomainError::NotReady(message)) => assert!(
+            message.contains(needle),
+            "expected a refusal mentioning {needle:?}, got {message:?}"
+        ),
+        other => panic!("expected Err(NotReady(..) containing {needle:?}), got {other:?}"),
+    }
+    direct
+}
+
 fn swap_database(url: &str, database: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((base, query)) => (base, Some(query)),
@@ -617,10 +684,7 @@ async fn happy_path_upgrades_a_seeded_clean_cell_then_runs_a_real_stage_drain_an
     let state_before = schema_state_snapshot(&direct).await;
     let triggers_before = fragment_trigger_snapshot(&direct).await;
 
-    assert_eq!(
-        coordinator.upgrade_clean_schema().await.unwrap(),
-        FragmentSchemaUpgradeOutcome::Upgraded { from_version: 4 }
-    );
+    let direct = expect_upgraded(&coordinator, direct, &url, 4).await;
 
     // Discriminating re-derivation: catches a regression that widens what the
     // upgrade may touch, or that forgets to re-enable the permanent fence.
@@ -744,15 +808,9 @@ async fn rerun_after_success_reports_already_current_and_writes_nothing_further(
     let url = pg_url();
     let (store, direct) = revision4_clean_cell(&url).await;
     let coordinator = store.fragment_coordinator();
-    assert_eq!(
-        coordinator.upgrade_clean_schema().await.unwrap(),
-        FragmentSchemaUpgradeOutcome::Upgraded { from_version: 4 }
-    );
+    let direct = expect_upgraded(&coordinator, direct, &url, 4).await;
     let before = schema_state_snapshot(&direct).await;
-    assert_eq!(
-        coordinator.upgrade_clean_schema().await.unwrap(),
-        FragmentSchemaUpgradeOutcome::AlreadyCurrent
-    );
+    let direct = expect_already_current(&coordinator, direct, &url).await;
     let after = schema_state_snapshot(&direct).await;
     assert_eq!(before, after);
 }
@@ -801,10 +859,10 @@ async fn an_aborted_upgrade_transaction_leaves_the_cell_at_exact_revision_4_and_
         "a rolled-back transaction must not leave stage objects behind"
     );
 
-    assert_eq!(
-        coordinator.upgrade_clean_schema().await.unwrap(),
-        FragmentSchemaUpgradeOutcome::Upgraded { from_version: 4 }
-    );
+    // `aborting` never disconnected (its rolled-back `tx` was dropped, not
+    // the client); the real rerun below needs no other backend connected.
+    drop(aborting);
+    let _direct = expect_upgraded(&coordinator, direct, &url, 4).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -837,7 +895,7 @@ async fn a_schema_state_column_mutated_during_the_step_rolls_back_the_whole_upgr
         .await
         .unwrap();
     let before = schema_state_snapshot(&direct).await;
-    let outcome = coordinator.upgrade_clean_schema().await;
+    let (outcome, direct) = call_upgrade(&coordinator, direct, &url).await;
     assert!(
         matches!(&outcome, Err(DomainError::Internal(message))
             if message.contains("a schema-state column other than schema_version changed")),
@@ -869,7 +927,7 @@ async fn a_revision_5_catalog_is_refused_as_an_unknown_state() {
         ))
         .await
         .unwrap();
-    assert_refused(&coordinator, "unknown catalog state").await;
+    let direct = assert_refused_dropping(&coordinator, direct, &url, "unknown catalog state").await;
     let (version, _) = schema_state_snapshot(&direct).await;
     assert_eq!(
         version, 5,
@@ -891,7 +949,7 @@ async fn a_partial_stage_table_is_refused_as_an_unknown_state() {
         )
         .await
         .unwrap();
-    assert_refused(&coordinator, "unknown catalog state").await;
+    assert_refused_dropping(&coordinator, direct, &url, "unknown catalog state").await;
 }
 
 #[tokio::test]
@@ -923,7 +981,13 @@ async fn a_staged_lifecycle_head_is_refused_by_name() {
         )
         .await
         .unwrap();
-    assert_refused(&coordinator, "PreparingStage/Staged lifecycle head").await;
+    assert_refused_dropping(
+        &coordinator,
+        direct,
+        &url,
+        "PreparingStage/Staged lifecycle head",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -941,7 +1005,13 @@ async fn a_preparingstage_lifecycle_head_is_refused_by_name() {
         )
         .await
         .unwrap();
-    assert_refused(&coordinator, "PreparingStage/Staged lifecycle head").await;
+    assert_refused_dropping(
+        &coordinator,
+        direct,
+        &url,
+        "PreparingStage/Staged lifecycle head",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -959,7 +1029,13 @@ async fn a_non_terminal_staged_reader_lease_is_refused_by_name() {
         )
         .await
         .unwrap();
-    assert_refused(&coordinator, "non-terminal staged-reader lease").await;
+    assert_refused_dropping(
+        &coordinator,
+        direct,
+        &url,
+        "non-terminal staged-reader lease",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -975,7 +1051,13 @@ async fn a_disabled_fence_is_refused_by_name() {
         )
         .await
         .unwrap();
-    assert_refused(&coordinator, "permanent fence missing or disabled").await;
+    assert_refused_dropping(
+        &coordinator,
+        direct,
+        &url,
+        "permanent fence missing or disabled",
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1001,24 +1083,37 @@ async fn a_database_identity_mismatch_is_refused_by_name() {
         )
         .await
         .unwrap();
-    assert_refused(&coordinator, "database identity mismatch").await;
+    assert_refused_dropping(&coordinator, direct, &url, "database identity mismatch").await;
 }
 
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
-async fn a_live_lock_holder_refuses_with_contention_not_a_wait() {
+async fn a_live_lock_holder_refuses_while_another_session_is_connected() {
     let url = pg_url();
-    let (store, _direct) = revision4_clean_cell(&url).await;
+    let (store, direct) = revision4_clean_cell(&url).await;
     let coordinator = store.fragment_coordinator();
+    // Drop the fixture's own assertion connection first: bb117070's
+    // backend-count guard (checked before the NOWAIT lock, on every call)
+    // would otherwise refuse on ITS presence rather than `holder`'s.
+    // `holder` itself is then the ONE other session, and IS still counted
+    // the same way -- the count check refuses on it before the NOWAIT lock
+    // attempt is ever reached, so this proves "refused while another
+    // session is connected", not the NOWAIT statement in isolation. See
+    // testing-gotchas: the NOWAIT backstop has no live-second-connection
+    // test that reaches it anymore.
+    drop(direct);
     let mut holder = client(&url).await;
     let tx = holder.transaction().await.unwrap();
     tx.batch_execute("LOCK TABLE lore_fragment_lifecycle IN ACCESS EXCLUSIVE MODE")
         .await
         .unwrap();
     let outcome = coordinator.upgrade_clean_schema().await;
+    let Err(DomainError::Contention(message)) = outcome else {
+        panic!("expected Err(Contention(..)), got {outcome:?}");
+    };
     assert!(
-        matches!(outcome, Err(DomainError::Contention(_))),
-        "expected Contention while a live session holds a fragment table, got {outcome:?}"
+        message.contains("other backend(s) are connected"),
+        "expected the named backend-count refusal, got {message:?}"
     );
     tx.rollback().await.unwrap();
 }
@@ -1073,10 +1168,7 @@ async fn a_fresh_cell_and_an_upgraded_cell_have_an_identical_fragment_catalog() 
     let url = pg_url();
     let (store, direct) = revision4_clean_cell(&url).await;
     let coordinator = store.fragment_coordinator();
-    assert_eq!(
-        coordinator.upgrade_clean_schema().await.unwrap(),
-        FragmentSchemaUpgradeOutcome::Upgraded { from_version: 4 }
-    );
+    let direct = expect_upgraded(&coordinator, direct, &url, 4).await;
     let upgraded_fingerprint = fragment_catalog_fingerprint(&direct).await;
 
     let fresh_db = create_sibling_database(&url).await;
@@ -1120,4 +1212,260 @@ async fn a_fresh_cell_and_an_upgraded_cell_have_an_identical_fragment_catalog() 
             &fresh_fingerprint[f_start..f_end]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// bb117070: harden review-gap coverage.
+// ---------------------------------------------------------------------------
+
+/// A second, merely-connected session -- no lock, no open transaction,
+/// nothing but a live connection -- must refuse the upgrade by name and
+/// leave the cell at exact revision 4. Before bb117070, `refuse_other_backends`
+/// did not exist: `NOWAIT` alone cannot see an idle session (it holds no
+/// lock), so the upgrade reported `Upgraded` while the idle session could
+/// then write a `PreparingStage` head into what was, until that moment,
+/// still a revision-4 cell -- the defect the reviewer's probe on 1a819000
+/// found.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn an_idle_connected_session_refuses_the_upgrade_and_leaves_the_cell_at_revision_4() {
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let before = schema_state_snapshot(&direct).await;
+
+    // `direct` itself is the idle second session here: deliberately NOT
+    // dropped before this call, unlike every other case in this file (see
+    // `call_upgrade`).
+    let outcome = coordinator.upgrade_clean_schema().await;
+    assert!(
+        matches!(&outcome, Err(DomainError::Contention(message))
+            if message.contains("other backend(s) are connected")),
+        "expected a named backend-count refusal, got {outcome:?}"
+    );
+
+    let after = schema_state_snapshot(&direct).await;
+    assert_eq!(
+        before, after,
+        "a refused upgrade must leave the cell at exact revision 4"
+    );
+    let stage_present: bool = direct
+        .query_one(
+            "SELECT to_regclass('lore_fragment_stage_policy') IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        !stage_present,
+        "a refused upgrade must not install any stage-5/6 object"
+    );
+}
+
+/// A revision-4 catalog missing two known non-relation classes (partial
+/// indexes, not tables) is still an unknown state, and the classifier's
+/// `describe()` must name both by exact identifier, not just report a count.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn a_v4_catalog_missing_two_known_indexes_is_refused_naming_both() {
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+    direct
+        .batch_execute(
+            "ALTER TABLE lore_fragment_schema_state DISABLE TRIGGER lore_clean_state_permanent; \
+             DROP INDEX lore_fragment_write_claims_barrier, lore_fragment_associations_live_fanout; \
+             ALTER TABLE lore_fragment_schema_state ENABLE ALWAYS TRIGGER lore_clean_state_permanent;",
+        )
+        .await
+        .unwrap();
+    let (outcome, _direct) = call_upgrade(&coordinator, direct, &url).await;
+    let Err(DomainError::NotReady(message)) = outcome else {
+        panic!("expected Err(NotReady(..)), got {outcome:?}");
+    };
+    assert!(message.contains("unknown catalog state"), "{message:?}");
+    assert!(
+        message.contains("lore_fragment_write_claims_barrier"),
+        "expected the missing-object list to name the dropped write-claims barrier index, got \
+         {message:?}"
+    );
+    assert!(
+        message.contains("lore_fragment_associations_live_fanout"),
+        "expected the missing-object list to name the dropped associations fanout index, got \
+         {message:?}"
+    );
+}
+
+/// An event trigger raising mid-way through the rotation DDL (after the
+/// fence's own `DISABLE TRIGGER` and after the custody DDL's `CREATE
+/// TABLE`s have already run in the same transaction) must roll the whole
+/// upgrade back: the fence returns to enabled `ALWAYS`, `schema_version`
+/// stays 4, and the reported error carries the failing statement's own
+/// SQLSTATE and message (bb117070's `pg()` helper).
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn a_mid_ddl_failure_after_the_trigger_disable_rolls_back_and_reports_sqlstate() {
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+
+    // Positive control: confirm a raw `RAISE ... USING ERRCODE` really
+    // surfaces as SQLSTATE 55000 on this server, so the assertion below is
+    // proving the coordinator's own error text, not an assumption about
+    // Postgres's own error-code plumbing.
+    let probe = direct
+        .batch_execute("DO $$ BEGIN RAISE EXCEPTION 'probe' USING ERRCODE = '55000'; END $$;")
+        .await
+        .unwrap_err();
+    assert_eq!(
+        probe.as_db_error().unwrap().code().code(),
+        "55000",
+        "positive control: a raw ERRCODE 55000 raise must report SQLSTATE 55000"
+    );
+
+    // Fires only on the rotation DDL's own `ALTER TABLE ... previous_revision`
+    // statement: the custody DDL that runs first has no `ALTER TABLE`
+    // (verified by `stage_schema.rs` having none), and the fence's own
+    // `DISABLE`/`ENABLE ALWAYS TRIGGER` statements don't match the query
+    // text filter below.
+    direct
+        .batch_execute(
+            "CREATE FUNCTION cr039_fail_rotation_ddl() RETURNS event_trigger \
+             LANGUAGE plpgsql AS $$ BEGIN \
+               IF current_query() LIKE '%previous_revision%' THEN \
+                 RAISE EXCEPTION 'cr039 injected rotation DDL failure' USING ERRCODE = '55000'; \
+               END IF; \
+             END $$; \
+             CREATE EVENT TRIGGER cr039_fail_rotation_ddl ON ddl_command_start \
+               WHEN TAG IN ('ALTER TABLE') EXECUTE FUNCTION cr039_fail_rotation_ddl();",
+        )
+        .await
+        .unwrap();
+
+    let before = schema_state_snapshot(&direct).await;
+    let (outcome, direct) = call_upgrade(&coordinator, direct, &url).await;
+    let Err(DomainError::Internal(message)) = outcome else {
+        panic!("expected Err(Internal(..)), got {outcome:?}");
+    };
+    assert!(
+        message.contains("SQLSTATE 55000"),
+        "expected the error text to carry the SQLSTATE, got {message:?}"
+    );
+    assert!(
+        message.contains("cr039 injected rotation DDL failure"),
+        "expected the error text to carry the server's own message, got {message:?}"
+    );
+
+    let after = schema_state_snapshot(&direct).await;
+    assert_eq!(
+        before, after,
+        "an aborted mid-DDL failure must leave schema_version and every other column untouched"
+    );
+    let fence_enabled: String = direct
+        .query_one(
+            "SELECT tgenabled::text FROM pg_trigger WHERE tgname = 'lore_clean_state_permanent'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        fence_enabled, "A",
+        "the permanent fence's own DISABLE inside the aborted transaction must roll back to ALWAYS"
+    );
+
+    direct
+        .batch_execute(
+            "DROP EVENT TRIGGER cr039_fail_rotation_ddl; DROP FUNCTION cr039_fail_rotation_ddl();",
+        )
+        .await
+        .unwrap();
+}
+
+/// An ordinary writer -- an open transaction doing a real `INSERT`, taking
+/// Postgres's implicit ROW EXCLUSIVE lock -- must refuse the upgrade, not
+/// just a hand-crafted `LOCK TABLE ... ACCESS EXCLUSIVE` session. In
+/// practice this resolves through the same backend-count guard as
+/// `a_live_lock_holder_refuses_while_another_session_is_connected` (it runs
+/// before the NOWAIT lock attempt), so this proves the guarantee against
+/// realistic DML rather than the NOWAIT statement specifically -- see
+/// testing-gotchas.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn a_realistic_row_exclusive_writer_refuses_while_another_session_is_connected() {
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let before = schema_state_snapshot(&direct).await;
+    drop(direct);
+
+    let mut writer = client(&url).await;
+    let tx = writer.transaction().await.unwrap();
+    let hash = random_hash();
+    tx.execute(
+        "INSERT INTO lore_fragment_lifecycle (hash, current_epoch, state, last_fence) \
+         VALUES ($1, 1, 1, 1)",
+        &[&hash],
+    )
+    .await
+    .unwrap();
+
+    let outcome = coordinator.upgrade_clean_schema().await;
+    let Err(DomainError::Contention(message)) = outcome else {
+        panic!("expected Err(Contention(..)), got {outcome:?}");
+    };
+    assert!(
+        message.contains("other backend(s) are connected"),
+        "expected the named backend-count refusal, got {message:?}"
+    );
+
+    tx.rollback().await.unwrap();
+    let direct = client(&url).await;
+    let after = schema_state_snapshot(&direct).await;
+    assert_eq!(
+        before, after,
+        "a refused upgrade must leave the cell at exact revision 4"
+    );
+}
+
+/// A clean cell caught at an unsupported revision (5, here) must get its
+/// real remedy from `bootstrap()` -- restore the pre-upgrade backup, or
+/// escalate to the cell owner -- not the revision-4-only upgrade verb
+/// (bb117070's `bootstrap` change).
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn bootstrap_on_a_clean_v5_cell_names_restore_or_escalate() {
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    direct
+        .batch_execute(&format!(
+            "ALTER TABLE lore_fragment_schema_state DISABLE TRIGGER lore_clean_state_permanent; \
+             {STAGE_CUSTODY_SCHEMA} \
+             UPDATE lore_fragment_schema_state SET schema_version = 5 WHERE id = 1; \
+             ALTER TABLE lore_fragment_schema_state ENABLE ALWAYS TRIGGER lore_clean_state_permanent;"
+        ))
+        .await
+        .unwrap();
+    let before = schema_state_snapshot(&direct).await;
+
+    let error = store.fragment_coordinator().bootstrap().await.unwrap_err();
+    let DomainError::NotReady(message) = error else {
+        panic!("expected NotReady, got {error:?}")
+    };
+    assert!(
+        message.contains("restore"),
+        "expected the remedy to name restoring the pre-upgrade backup, got {message:?}"
+    );
+    assert!(
+        message.contains("escalate"),
+        "expected the remedy to name escalating to the cell owner, got {message:?}"
+    );
+    assert!(
+        !message.contains("upgrade-fragments"),
+        "a revision-5 cell must not be offered the revision-4-only upgrade command, got {message:?}"
+    );
+
+    let after = schema_state_snapshot(&direct).await;
+    assert_eq!(before, after, "a refused bootstrap must write nothing");
 }

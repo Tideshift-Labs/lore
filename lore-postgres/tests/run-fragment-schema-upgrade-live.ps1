@@ -61,9 +61,14 @@ $inventory = @(
             'a_disabled_fence_is_refused_by_name',
             'a_non_clean_cell_is_refused_by_name',
             'a_database_identity_mismatch_is_refused_by_name',
-            'a_live_lock_holder_refuses_with_contention_not_a_wait',
+            'a_live_lock_holder_refuses_while_another_session_is_connected',
             'bootstrap_on_a_revision_4_clean_cell_returns_the_remedy_and_writes_nothing',
-            'a_fresh_cell_and_an_upgraded_cell_have_an_identical_fragment_catalog'
+            'a_fresh_cell_and_an_upgraded_cell_have_an_identical_fragment_catalog',
+            'an_idle_connected_session_refuses_the_upgrade_and_leaves_the_cell_at_revision_4',
+            'a_v4_catalog_missing_two_known_indexes_is_refused_naming_both',
+            'a_mid_ddl_failure_after_the_trigger_disable_rolls_back_and_reports_sqlstate',
+            'a_realistic_row_exclusive_writer_refuses_while_another_session_is_connected',
+            'bootstrap_on_a_clean_v5_cell_names_restore_or_escalate'
         )
     }
     [pscustomobject]@{

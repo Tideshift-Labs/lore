@@ -257,17 +257,55 @@ async fn real_loreserver_binary_upgrades_a_revision_4_clean_cell_and_emits_parse
     assert_eq!(report["schema_version"], schema::FRAGMENT_SCHEMA_VERSION);
     assert_eq!(report["restart_required"], true);
 
-    let store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
-        .await
-        .unwrap();
-    assert!(
-        store
-            .fragment_coordinator()
-            .readiness()
+    {
+        // Scoped and dropped before the rerun below: `upgrade_clean_schema`
+        // (bb117070) refuses while any backend outside the CLI subprocess's
+        // own pool is connected, even for a no-op already_current call, and
+        // this readiness check's own pool is a separate physical connection
+        // set from the subprocess's -- see the same trap fixed in
+        // `lore-postgres/tests/domain_fragment_schema_upgrade.rs`.
+        let store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
             .await
-            .unwrap()
-            .ready_for_lifecycle()
-    );
+            .unwrap();
+        assert!(
+            store
+                .fragment_coordinator()
+                .readiness()
+                .await
+                .unwrap()
+                .ready_for_lifecycle()
+        );
+    }
+    // The coordinator's own settle wait (`BACKEND_SETTLE_ATTEMPTS`, 2s) is
+    // sized for a just-closed backend within the SAME process; a pool with
+    // up to 4 physical connections dropped here can take longer than that
+    // from a freshly launched subprocess's point of view. Poll to exclusive
+    // from a throwaway connection first (mirrors `wait_until_exclusive` in
+    // `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs`).
+    {
+        let waiter = client(&url).await;
+        for attempt in 0..50 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let others: i64 = waiter
+                .query_one(
+                    "SELECT (numbackends - 1)::bigint FROM pg_catalog.pg_stat_database \
+                     WHERE datname = pg_catalog.current_database()",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            if others <= 0 {
+                break;
+            }
+            assert!(
+                attempt < 49,
+                "the readiness check's pool never fully disconnected before the rerun"
+            );
+        }
+    }
 
     // A rerun of the real binary reports already_current and stays green.
     let mut rerun = tokio::process::Command::new(env!("CARGO_BIN_EXE_loreserver"));
@@ -284,7 +322,12 @@ async fn real_loreserver_binary_upgrades_a_revision_4_clean_cell_and_emits_parse
         .await
         .expect("rerun must not hang")
         .unwrap();
-    assert!(rerun_output.status.success());
+    assert!(
+        rerun_output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&rerun_output.stdout),
+        String::from_utf8_lossy(&rerun_output.stderr)
+    );
     let rerun_stdout = String::from_utf8(rerun_output.stdout).unwrap();
     let rerun_report: serde_json::Value = rerun_stdout
         .lines()

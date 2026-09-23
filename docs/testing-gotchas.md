@@ -234,6 +234,40 @@ See `lore-postgres/tests/domain_fragment_schema_upgrade.rs` for the resulting fi
 `run-fragment-schema-upgrade-live.ps1` for the Postgres-only container (no MinIO/S3: the upgrade
 never touches a provider).
 
+**bb117070's backend-count guard refuses on this fixture file's own assertion connection.**
+`upgrade_clean_schema` now calls `refuse_other_backends` (count `pg_stat_database.numbackends`
+minus the coordinator's own pool size) before it even classifies the catalog -- so it fires on
+*every* call, including a no-op `AlreadyCurrent` rerun. Every case in
+`domain_fragment_schema_upgrade.rs` keeps its own `direct: Client` open across the whole test for
+pre/post snapshots; left connected, that is itself "another backend" and the call refuses for the
+wrong reason (backend-count, not the state the case means to exercise). Fix: drop `direct`
+immediately before every `upgrade_clean_schema`/`assert_refused` call and reconnect fresh
+afterward for post-call assertions -- see `call_upgrade`/`expect_upgraded`/
+`assert_refused_dropping` in that file, mirroring `wait_until_exclusive` in
+`lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs`. The guard's own bounded settle
+loop (`BACKEND_SETTLE_ATTEMPTS`/`BACKEND_SETTLE_INTERVAL`, ~2s) absorbs an in-process drop's
+async socket teardown, so a plain `drop` before the call is normally enough -- **except across a
+separate OS process**: `lore-server/tests/fragment_schema_upgrade_operator.rs`'s real-binary rerun
+needed an explicit poll-to-zero on `numbackends` (not just a `drop`) before launching the second
+`loreserver` subprocess, because a 4-connection pool's teardown from the FIRST process's
+perspective could outlast the coordinator's 2s budget as seen from the second process. Once ANY
+second connection (lock or not) is enough for the count check to refuse first, the `NOWAIT`
+table-lock backstop has **no remaining test that reaches it through an ordinary second
+connection** -- `a_live_lock_holder_refuses_while_another_session_is_connected` (renamed from
+`..._refuses_with_contention_not_a_wait`, which asserted only `matches!(.., Contention(_))` and so
+silently stopped discriminating the two refusal paths) and
+`a_realistic_row_exclusive_writer_refuses_while_another_session_is_connected` both now assert the
+exact count-check message (`"other backend(s) are connected"`), naming what they actually prove.
+The NOWAIT statement is still real and still matters as the documented race backstop (a
+connection that lands between the count check passing and the `LOCK TABLE ... NOWAIT` call), but
+that race is not exercised by any test in this file; reaching it would need a hook inside the
+coordinator (a failpoint) that does not exist here, not a second plain connection.
+An event-trigger fault injection (`CREATE EVENT TRIGGER ... ON ddl_command_start WHEN TAG IN
+('ALTER TABLE')`, gated on `current_query() LIKE '%<a string unique to the target DDL>%'`) is a
+reliable way to fail a specific statement mid-multi-statement-`batch_execute` without touching
+production code; pair it with a positive control (`RAISE ... USING ERRCODE` on a throwaway
+connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expected to surface.
+
 ## General Pitfalls
 
 - **Hashing output for whitespace**: Hashing ignores `\r\n` vs `\n` normalization in pipelines. Use `SELECT position(chr(13) in prosrc)` or `.gitattributes` `eol=lf` limits instead.
