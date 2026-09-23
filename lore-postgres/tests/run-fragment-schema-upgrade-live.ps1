@@ -52,6 +52,7 @@ $inventory = @(
             'happy_path_upgrades_a_seeded_clean_cell_then_runs_a_real_stage_drain_and_promotion',
             'rerun_after_success_reports_already_current_and_writes_nothing_further',
             'an_aborted_upgrade_transaction_leaves_the_cell_at_exact_revision_4_and_a_rerun_upgrades',
+            'a_schema_state_column_mutated_during_the_step_rolls_back_the_whole_upgrade',
             'a_revision_5_catalog_is_refused_as_an_unknown_state',
             'a_partial_stage_table_is_refused_as_an_unknown_state',
             'a_staged_lifecycle_head_is_refused_by_name',

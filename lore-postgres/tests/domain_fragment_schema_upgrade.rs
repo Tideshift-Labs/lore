@@ -808,6 +808,49 @@ async fn an_aborted_upgrade_transaction_leaves_the_cell_at_exact_revision_4_and_
 }
 
 // ---------------------------------------------------------------------------
+// Verification is discriminating.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn a_schema_state_column_mutated_during_the_step_rolls_back_the_whole_upgrade() {
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+    // Test-only trigger simulating an unintended DDL side effect touching a
+    // schema-state column other than schema_version -- exactly the shape
+    // `verify_upgraded`'s only-schema_version-changed check exists to catch.
+    // It fires on the same raise UPDATE the real upgrade issues, inside its
+    // own transaction, with no production code changed to install it.
+    // `updated_at` is the target: every other mutable column is pinned to an
+    // exact value by `lore_fragment_clean_initialization_shape`'s CHECK for a
+    // clean-initialized row (verified_fragments = 0 included), so mutating
+    // one of those trips a CHECK violation before Rust-level verification
+    // ever runs -- a different failure than the one this case means to prove.
+    direct
+        .batch_execute(
+            "CREATE FUNCTION cr039_test_side_effect() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN NEW.updated_at := NEW.updated_at + interval '1 second'; RETURN NEW; END $$; \
+             CREATE TRIGGER cr039_test_side_effect BEFORE UPDATE ON lore_fragment_schema_state \
+             FOR EACH ROW EXECUTE FUNCTION cr039_test_side_effect();",
+        )
+        .await
+        .unwrap();
+    let before = schema_state_snapshot(&direct).await;
+    let outcome = coordinator.upgrade_clean_schema().await;
+    assert!(
+        matches!(&outcome, Err(DomainError::Internal(message))
+            if message.contains("a schema-state column other than schema_version changed")),
+        "expected the only-schema_version-changed check to refuse, got {outcome:?}"
+    );
+    let after = schema_state_snapshot(&direct).await;
+    assert_eq!(
+        before, after,
+        "a failed verification must roll back the whole transaction, not just the flagged column"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Refusals, each by its own named reason.
 // ---------------------------------------------------------------------------
 
