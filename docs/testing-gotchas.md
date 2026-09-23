@@ -192,6 +192,48 @@ See `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs` for the res
 `admit_one_reserved_spool_object`) and `run-cell-schema-forward-upgrade-live.ps1` for the dedicated
 BLAKE3-capable container.
 
+## CR-039 fragment-schema-upgrade fixture gotchas
+
+Building a revision-4 clean-cell fixture by clean-initializing (reaching revision 6) then
+downgrading in place, rather than replaying `dae71dfc` DDL, hits three independent traps —
+each one made `upgrade_clean_schema` return a *different* refusal than the one the case meant
+to exercise, not a compile or connection error, so each needed its own repro to place:
+
+- **A bare stage-table `DROP TABLE ... CASCADE` does not remove every stage-5 object.**
+  `lore_fragment_stage_drain_recovery` is a partial index on `lore_fragment_lifecycle` (the
+  *base* revision-4 table), not on any dropped stage table — CR-039's own doc says so
+  ("partial, on `lore_fragment_lifecycle`") but it's easy to read past. Leaving it behind reports
+  `stage_indexes: 1` in the unknown-catalog-state refusal, on a fixture that otherwise looks
+  exactly revision-4. Drop both `lore_fragment_stage_custody_cleanup` and
+  `lore_fragment_stage_drain_recovery` explicitly, by name, after the table drops.
+- **`clean_readiness_holds`'s sequence-headroom check is a strict `>`, and a fresh clean cell
+  sits exactly on that boundary.** `lore_fragment_fence_seq` starts at `last_value = 1,
+  is_called = false`, so `last_value + (is_called?1:0) = 1`. Any raw test row (a lifecycle head,
+  a staged lease) carries `last_fence`/`fence`/`reader_fence >= 1` by CHECK, and the schema's own
+  minimum legal value, `1`, ties the boundary rather than clearing it — `1 > 1` is false. The
+  refusal reads as "enforcement, fencing, sequence headroom or readable heads do not hold", which
+  has nothing to do with the head or lease the case meant to plant. Call
+  `SELECT nextval('lore_fragment_fence_seq')` (twice, to be safely clear) before any such raw
+  insert.
+- **`repository_create` requires an exact `EpochWitness` per metadata hash once lifecycle is
+  enabled — true of every clean-initialized cell, including at revision 4.** A repository fixture
+  built with random `metadata_hash`/`default_branch_metadata_hash` bytes and no
+  `metadata_witnesses` refuses `repository_create_metadata_witnesses_required`. Publish the two
+  hashes as real Remote fragments first (`begin_direct_write`/`commit_remote`), capture each
+  witness via `capture_current_readable_epoch_for_authority`, and pass both — `bind_creation_metadata`
+  associates them to the new repository at the zero context internally, not a context the caller
+  picks.
+- **A fresh-vs-upgraded catalog diff must compare two *clean* cells, not a clean cell against a
+  plain `bootstrap()`.** The six `lore_clean_*`/`lore_membership_*` trigger installs live in
+  `initialize_empty`, not in `bootstrap()` — a plain-bootstrapped comparison cell has zero of them,
+  which any trigger-inclusive fingerprint reports as a huge, misleading divergence with nothing to
+  do with the upgrade path itself.
+
+See `lore-postgres/tests/domain_fragment_schema_upgrade.rs` for the resulting fixture
+(`revision6_clean_cell`, `revision4_clean_cell`, `advance_fence_sequence`) and
+`run-fragment-schema-upgrade-live.ps1` for the Postgres-only container (no MinIO/S3: the upgrade
+never touches a provider).
+
 ## General Pitfalls
 
 - **Hashing output for whitespace**: Hashing ignores `\r\n` vs `\n` normalization in pipelines. Use `SELECT position(chr(13) in prosrc)` or `.gitattributes` `eol=lf` limits instead.

@@ -100,6 +100,22 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   needs `lore-object-dispatch = { workspace = true, features = ["test_seams"] }` in
   `[dev-dependencies]` — it's `#[cfg(feature = "test_seams")]`-gated upstream in that crate, the
   same shape `lore-transport`/`lore-revision` use their own `test_seams` for.
+- **CR-039 clean-cell fragment schema forward upgrade [SERVER, `lore-postgres/src/domain/fragments/upgrade.rs`]**:
+  `PostgresFragmentCoordinator::upgrade_clean_schema` moves an exact revision-4 clean cell to
+  revision 6 (WP-122's stage custody schema) in one transaction; `AlreadyCurrent` on an exact
+  revision-6 cell; every other catalog state refused by name; `bootstrap()` refuses a behind clean
+  cell before any DDL, naming the `loreserver domain upgrade-fragments --confirm-replicas-stopped`
+  remedy. Postgres-only, no MinIO/S3 (the upgrade is offline and database-only). Offline: unit tests
+  in `upgrade.rs` itself pin the relation-list partition and that the stage DDL creates every object
+  the classifier checks. Live: `pwsh -File lore-postgres/tests/run-fragment-schema-upgrade-live.ps1`
+  — 15 cases in `lore-postgres --test domain_fragment_schema_upgrade` (seam catalog match, happy
+  path with pre-existing revision-4 data surviving plus a real post-upgrade stage/drain/promotion,
+  `AlreadyCurrent` rerun, an aborted-transaction rerun, each named refusal, a fresh-vs-upgraded
+  catalog diff covering columns/constraints/indexes/`prosrc`/triggers/grants) plus 1 case in
+  `lore-server --test fragment_schema_upgrade_operator` that drives the actual `loreserver domain
+  upgrade-fragments` binary end to end, refusal without `--confirm-replicas-stopped` included. See
+  [testing-gotchas.md](testing-gotchas.md#cr-039-fragment-schema-upgrade-fixture-gotchas) for the
+  fixture traps this tier's revision-4 downgrade and readiness fixtures needed.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.
