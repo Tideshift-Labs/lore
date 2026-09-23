@@ -59,6 +59,23 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   --test no_dispatch --test reserve_put --test upload -j 4` `cargo test -p lore-object-dispatch --test terminal_result -j 4` `cargo test -p lore-object-dispatch --test result_ack -j 4` `cargo test -p lore-object-dispatch --test result_discard -j 4` `cargo test -p lore-object-dispatch --test result_disposition -j 4` `cargo test -p lore-object-dispatch --test fetch_lease --test result_disposition --test
   payload_purge -j 4` `cargo test -p lore-object-dispatch --test cell_schema_install` `cargo test -p lore-object-dispatch --test provider_client -j 4` `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` `lore-object-dispatch/tests/run-provider-charge-live.ps1` `lore-object-dispatch/tests/run-budget-pin-refresh-live.ps1`
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-charge-admission-deadline-horizon-guard-server). Gates: `cargo test -p lore-server --lib -- charge_bound`
+- **CR-038 cell schema forward upgrade and spool metadata true-up [SERVER]**: migration 0028 trues
+  up a released spool row's metadata charge to its actual retained size (was a flat 16,384-byte
+  charge, never given back — the slot-31 wedge); `upgrade_cell_schema` moves an attested R27 cell to
+  R28 offline, under the session advisory lock, refusing if any other session is connected (D4) or
+  the live catalog is at an unknown/future state. `CellSchemaError::UpgradeRequired`/`FutureSchema`/
+  `SchemaOperationBusy`/`ReplicasActive` are new; `DrainClient::verify_schema_revision` is D5's
+  write-behind refusal on an unmarked cell. Offline: `cargo test -p lore-object-dispatch --test
+  cell_schema_install` (the `forward_steps_carry_no_transaction_control_or_concurrent_index_build`
+  case is test-plan item 8: no forward step may contain `BEGIN;`/`COMMIT;`/`CONCURRENTLY`, since the
+  installer supplies the one wrapping transaction). Live: `pwsh -File
+  lore-object-dispatch/tests/run-cell-schema-forward-upgrade-live.ps1` — its own container (not
+  `run-cell-schema-install-live.ps1`'s), because two of its seven cases drive real reservation
+  traffic through `drain_reserve_v1`/`drain_cleanup_release_v1`, which need a genuine BLAKE3
+  provider at `public.blake3(bytea)` (`local_blake3_v1` refuses without one); the runner builds
+  `lorehub/docker/dev-cell/Dockerfile.postgres-blake3` (plpython3u + the `blake3` PyPI package) on
+  first use. See [testing-gotchas.md](testing-gotchas.md#cr-038-forward-upgrade-fixture-gotchas)
+  for the fixture traps this tier's synthetic reservation/seeding needed.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

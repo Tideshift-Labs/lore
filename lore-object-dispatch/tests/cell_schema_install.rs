@@ -1064,3 +1064,55 @@ fn top_level_constants_match_the_frozen_role_and_schema_names() {
         ]
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// CR-038: forward steps. Test plan item 8 -- a step must carry no transaction control and no
+// non-transactional DDL, because the installer wraps the whole body in one SERIALIZABLE
+// transaction and attests the target state before it commits.
+// ---------------------------------------------------------------------------------------------
+
+/// Strip `--` line comments before scanning, so a comment that merely discusses `BEGIN`/`COMMIT`
+/// (0028's own header does, at length) cannot be mistaken for the statement it warns against.
+fn strip_sql_line_comments(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| line.split_once("--").map_or(line, |(code, _comment)| code))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
+    assert_eq!(
+        CELL_FORWARD_STEPS.len(),
+        1,
+        "a new forward step must extend this sweep, not bypass it"
+    );
+    for step in CELL_FORWARD_STEPS {
+        let code = strip_sql_line_comments(step.migration.sql).to_ascii_uppercase();
+        // Transaction-control statements, not the bare word: a PL/pgSQL function body legitimately
+        // contains `BEGIN ... END $$;` block delimiters, which are not `BEGIN;`/`BEGIN ISOLATION
+        // ...` transaction control and must not trip this guard. `COMMIT` never appears in a step
+        // body outside prose (stripped above) or a transaction-control statement.
+        for forbidden in ["BEGIN;", "BEGIN ISOLATION", "COMMIT;", "CONCURRENTLY"] {
+            assert!(
+                !code.contains(forbidden),
+                "forward step {} ({}) contains {forbidden}: the installer supplies the \
+                 transaction, and a non-transactional statement cannot share it",
+                step.migration.number,
+                step.migration.file_name
+            );
+        }
+    }
+}
+
+#[test]
+fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
+    // Test plan item 8's structural sibling: CR-038 D2 supports only N-1 to N, so the chain must
+    // be exactly one hop from R27 to CELL_SCHEMA_CURRENT with no gap and no branch.
+    assert_eq!(CELL_FORWARD_STEPS[0].from, CellSchemaRevision::R27);
+    assert_eq!(
+        CELL_FORWARD_STEPS[0].to,
+        lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT
+    );
+}

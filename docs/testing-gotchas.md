@@ -61,6 +61,77 @@ Durable, recurring testing lessons grouped by topic.
   boundary) unless the test's specific point is boundary inclusivity. See
   `lore-telemetry/src/pool_acquire.rs::tests::record_ranked_samples` /`wait_in_bucket`.
 
+## CR-038 forward-upgrade fixture gotchas
+
+Seeding `drain_spool_custody`/`object_dispatch_spool_objects` rows directly (bypassing the full
+reserve/claim/release algebra) and driving real reservation traffic through `DrainClient` both hit
+the same class of trap: a CHECK/FK constraint that looks satisfied by inspection but isn't, because
+it's derived from another column rather than a fixed literal.
+
+- **`*_uuid_unix_ms` CHECK columns are derived, not free-form.** `object_dispatch_requests` (and
+  siblings) pin `logical_request_uuid_unix_ms`/`attempt_uuid_unix_ms` to the exact 48-bit big-endian
+  millisecond timestamp the matching UUIDv7 embeds in its own first six bytes. A hand-picked literal
+  (e.g. `1000`) only passes when the fixture also hand-picks a UUID whose embedded timestamp equals
+  it; a real `Uuid::now_v7()` needs the value computed from `id.as_bytes()[0..6]`, not asserted.
+- **A BEFORE INSERT trigger can require a JSONB field to *name* an unrelated row.**
+  `drain_custody_policy_expiry_v1` (0027) does `SELECT ... INTO STRICT NEW.policy_expiry_ms FROM
+  drain_policies WHERE revision = NEW.descriptor->>'policy_revision' AND
+  encode(digest,'hex') = NEW.descriptor->>'policy_digest'` — an empty or placeholder `descriptor`
+  JSONB on a directly-seeded `drain_spool_custody` row fails this lookup with a bare "query returned
+  no rows", not a named constraint. The descriptor must carry the seeded policy's own revision and
+  hex digest even when nothing else in the descriptor is realistic.
+- **A composite FK can reference a column that "looks" free-form.**
+  `object_dispatch_spool_objects.bound_request_*` FK-references `object_dispatch_requests` on
+  `(logical_request_id, attempt_id, terminal_result_id)` — the three values must match a seeded
+  request row *exactly*, including `terminal_result_id`, which is easy to drift into a
+  differently-spelled placeholder string across two independently-written INSERTs.
+- **`drain_cleanup_release_v1` needs a real BLAKE3 provider even when the test's point is the
+  metadata true-up, not the release receipt.** It calls `local_blake3_v1` unconditionally to sign
+  the release receipt; without `public.blake3(bytea)` installed, every path through this function —
+  including the underflow case — fails with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE` before reaching the
+  logic under test.
+- **`drain_cleanup_claim_v1` refuses `DRAIN_CLEANUP_TOO_EARLY` until the reservation's own expiry
+  passes.** A fixture driving reserve→claim→release back-to-back (to simulate load quickly, not a
+  realistic multi-minute TTL) must give the policy/descriptor a short `maximum_ttl_ms` and then sleep
+  past it before claiming — and that window must absorb a *cold* runtime pool's first
+  connect-and-physical-attest round trip (seconds, not milliseconds) if the very first reservation in
+  a test uses an unwarmed `DispatchRuntimePool`. Warm the pool once (any cheap call) before the timed
+  loop starts, then the per-iteration window only needs to cover normal round-trip time.
+- **Whitespace inside a plpgsql `$$...$$` body is part of `prosrc`, verbatim.** A test that restores
+  a function to its "original" definition (to undo a planted catalog drift, or to restore a
+  temporarily mutated function for a discrimination proof) must reproduce the exact source text,
+  comments included — `pg_get_functiondef` reconstructs a plpgsql body from the stored `prosrc`
+  unchanged, so any difference in indentation or a dropped comment line still reads as `CatalogDrift`
+  on the `functions` manifest section, even though the logic is identical. Prefer `include_str!` on
+  the real migration file plus a plain substring extraction over hand-retyping the body, and diff the
+  extracted text against what you intend to keep unmutated before relying on it.
+- **A shared fixture row (one `drain_policies` row per boundary/cell reused across several test
+  cases) needs `ON CONFLICT DO NOTHING` on re-seed, and a matching top-up on any row a prior case's
+  release decremented** (`object_dispatch_quota_usage`, keyed by `(provider_boundary_id, scope_kind,
+  scope_id, quota_class)`) — otherwise the second case either fails re-inserting the policy row, or
+  the wrong exception fires (`DRAIN_COUNTER_UNDERFLOW` instead of the one actually under test)
+  because a prior case already spent that scope's counted usage.
+- **A raise inside a function called through a plain `batch_execute` string leaves the connection's
+  session state dirty.** `SET SESSION AUTHORIZATION x; BEGIN ...; SELECT <raises>; COMMIT; RESET
+  SESSION AUTHORIZATION;` never reaches the `COMMIT`/`RESET` when the `SELECT` raises — the whole
+  batch aborts at the first failing statement. A test asserting an expected raise on such a
+  connection must `ROLLBACK; RESET SESSION AUTHORIZATION;` explicitly before reusing that client.
+
+- **A "no other session connected" precondition counts YOUR test's own fixture connections.**
+  `upgrade_cell_schema`'s D4 check (refuse the real state-transition step, not a no-op
+  already-current call, if any other backend is connected to the cell database) counts the test's
+  own admin/superuser connection and any `DispatchRuntimePool` connection just as much as a
+  deliberately-opened "replica" session. Before the ONE call in a test that performs the real N-1→N
+  transition, explicitly drop every other handle this test opened (admin client, pool/`DrainClient`,
+  a second migrator connection) and poll `(numbackends - 1) FROM pg_stat_database WHERE datname =
+  current_database()` down to zero from the surviving connection before calling — an `AbortOnDropHandle`
+  aborting a background connection task doesn't guarantee the server has noticed the closed socket
+  yet. A call already at the current state needs none of this (D4 only gates the one transition).
+
+See `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs` for the resulting fixture
+(`seed_metadata_true_up_fixture`, `synthetic_descriptor`, `wait_until_exclusive`) and
+`run-cell-schema-forward-upgrade-live.ps1` for the dedicated BLAKE3-capable container.
+
 ## General Pitfalls
 
 - **Hashing output for whitespace**: Hashing ignores `\r\n` vs `\n` normalization in pipelines. Use `SELECT position(chr(13) in prosrc)` or `.gitattributes` `eol=lf` limits instead.
