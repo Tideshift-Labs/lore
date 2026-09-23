@@ -12,19 +12,26 @@
 //! This is the one supported path across that gap. It recognises a closed list
 //! of states, refuses every other one by name, and runs in one transaction:
 //!
-//! 1. take the schema advisory lock and `ACCESS EXCLUSIVE NOWAIT` on every
-//!    fragment table, so a live replica makes it refuse instead of queueing;
-//! 2. snapshot the schema-state row and every fragment trigger's enablement;
+//! 1. take the schema advisory lock and refuse while any other client backend
+//!    is connected to the cell database. An idle replica holds no table lock,
+//!    so a lock probe alone cannot see it; `pg_stat_database.numbackends` can,
+//!    whatever the other session's role. `ACCESS EXCLUSIVE NOWAIT` on every
+//!    fragment table stays as the backstop for a session that races the count;
+//! 2. snapshot the schema-state row and every fragment trigger's full
+//!    definition, enablement and function body;
 //! 3. disable only `lore_clean_state_permanent`, apply the same stage DDL a
 //!    fresh cell runs, and re-enable the trigger `ALWAYS`;
 //! 4. prove that only `schema_version` moved (4 -> 6), that every trigger is
 //!    exactly as before, that the stage objects exist with a fresh cell's
-//!    seed, and that clean readiness still holds; then commit.
+//!    seed, that clean readiness still holds, and that no other backend
+//!    connected meanwhile; then commit.
 //!
 //! The trigger disable is transactional and never visible to another session.
 //! It needs table ownership, which can already drop the trigger, so the fence
 //! is not weakened. The fence's purpose, that no writer changes the clean
 //! record, is what step 4 re-proves before the commit.
+
+use std::time::Duration;
 
 use tokio_postgres::Transaction;
 use tokio_postgres::error::SqlState;
@@ -60,6 +67,55 @@ pub const STAGE_RELATIONS: [&str; 3] = [
     "lore_fragment_stage_custody",
 ];
 
+/// Every `lore_fragment_*` relation, index and sequence of a clean-initialized
+/// revision-4 cell: SCHEMA-118 revision 4, the legacy immutable-store tables the
+/// clean fences guard, and the membership protocol table. Read from a real cell
+/// initialized by `lore` `dae71dfc` (2026-09-23). The classifier requires set
+/// equality, so a missing index or an unknown extra object is refused.
+pub const PRE_STAGE_CLASSES: [&str; 29] = [
+    "lore_fragment_associations",
+    "lore_fragment_associations_live_fanout",
+    "lore_fragment_associations_pkey",
+    "lore_fragment_associations_repository",
+    "lore_fragment_epochs",
+    "lore_fragment_epochs_pkey",
+    "lore_fragment_fence_seq",
+    "lore_fragment_lifecycle",
+    "lore_fragment_lifecycle_metering",
+    "lore_fragment_lifecycle_metering_pkey",
+    "lore_fragment_lifecycle_pkey",
+    "lore_fragment_membership_protocol",
+    "lore_fragment_membership_protocol_pkey",
+    "lore_fragment_metering",
+    "lore_fragment_metering_pkey",
+    "lore_fragment_schema_state",
+    "lore_fragment_schema_state_pkey",
+    "lore_fragment_staged_lease_members",
+    "lore_fragment_staged_lease_members_epoch",
+    "lore_fragment_staged_lease_members_pkey",
+    "lore_fragment_staged_leases",
+    "lore_fragment_staged_leases_deadline",
+    "lore_fragment_staged_leases_pkey",
+    "lore_fragment_state",
+    "lore_fragment_state_pkey",
+    "lore_fragment_write_claims",
+    "lore_fragment_write_claims_barrier",
+    "lore_fragment_write_claims_pkey",
+    "lore_fragment_write_claims_terminal_prune",
+];
+
+/// The `lore_fragment_*` classes revisions 5 and 6 add.
+pub const STAGE_CLASSES: [&str; 8] = [
+    "lore_fragment_stage_custody",
+    "lore_fragment_stage_custody_cleanup",
+    "lore_fragment_stage_custody_pkey",
+    "lore_fragment_stage_drain_recovery",
+    "lore_fragment_stage_policy",
+    "lore_fragment_stage_policy_pkey",
+    "lore_fragment_stage_usage",
+    "lore_fragment_stage_usage_pkey",
+];
+
 const STAGE_FUNCTIONS: [&str; 3] = [
     "stage_policy_publish_v1",
     "stage_policy_verify_v1",
@@ -70,6 +126,11 @@ const STAGE_INDEXES: [&str; 2] = [
     "lore_fragment_stage_custody_cleanup",
     "lore_fragment_stage_drain_recovery",
 ];
+
+/// Bounded wait for a just-closed backend (for example this process's own
+/// co-location check pool) to leave `numbackends` before refusing.
+const BACKEND_SETTLE_ATTEMPTS: u32 = 10;
+const BACKEND_SETTLE_INTERVAL: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentSchemaUpgradeOutcome {
@@ -82,40 +143,97 @@ pub enum FragmentSchemaUpgradeOutcome {
 /// Catalog facts that place a cell on the closed list.
 #[derive(Debug, PartialEq, Eq)]
 struct StageCatalog {
-    pre_stage_relations: i64,
-    stage_relations: i64,
+    /// Sorted `lore_fragment_*` class names in the current schema.
+    classes: Vec<String>,
     stage_functions: i64,
-    stage_indexes: i64,
     rotation_columns: i64,
     promotion_claim_columns: i64,
+    promotion_shape: bool,
 }
 
 impl StageCatalog {
+    fn expected(current: bool) -> Vec<String> {
+        let mut names: Vec<String> = PRE_STAGE_CLASSES.iter().map(|s| (*s).to_owned()).collect();
+        if current {
+            names.extend(STAGE_CLASSES.iter().map(|s| (*s).to_owned()));
+        }
+        names.sort();
+        names
+    }
+
     fn is_pre_stage(&self) -> bool {
-        self.pre_stage_relations == PRE_STAGE_RELATIONS.len() as i64
+        self.classes == Self::expected(false)
             && self.promotion_claim_columns == 3
-            && self.stage_relations == 0
+            && self.promotion_shape
             && self.stage_functions == 0
-            && self.stage_indexes == 0
             && self.rotation_columns == 0
     }
 
     fn is_current(&self) -> bool {
-        self.pre_stage_relations == PRE_STAGE_RELATIONS.len() as i64
+        self.classes == Self::expected(true)
             && self.promotion_claim_columns == 3
-            && self.stage_relations == STAGE_RELATIONS.len() as i64
+            && self.promotion_shape
             && self.stage_functions == STAGE_FUNCTIONS.len() as i64
-            && self.stage_indexes == STAGE_INDEXES.len() as i64
             && self.rotation_columns == 2
+    }
+
+    /// Name what separates this catalog from the nearer supported revision.
+    fn describe(&self) -> String {
+        let has_stage = self
+            .classes
+            .iter()
+            .any(|name| STAGE_CLASSES.contains(&name.as_str()));
+        let expected = Self::expected(has_stage);
+        let missing: Vec<&String> = expected
+            .iter()
+            .filter(|name| !self.classes.contains(name))
+            .collect();
+        let unexpected: Vec<&String> = self
+            .classes
+            .iter()
+            .filter(|name| !expected.contains(name))
+            .collect();
+        format!(
+            "compared with revision {}: missing {missing:?}, unexpected {unexpected:?}, \
+             stage functions {}/3, rotation columns {}/2, promotion claim columns {}/3, \
+             promotion shape constraint {}",
+            if has_stage {
+                schema::FRAGMENT_SCHEMA_VERSION
+            } else {
+                PRE_STAGE_SCHEMA_VERSION
+            },
+            self.stage_functions,
+            self.rotation_columns,
+            self.promotion_claim_columns,
+            self.promotion_shape
+        )
+    }
+}
+
+/// Keep the SQLSTATE and the server's own message. `tokio_postgres::Error`'s
+/// `Display` renders a server error as a bare `db error`.
+fn pg(context: &'static str) -> impl FnOnce(tokio_postgres::Error) -> DomainError {
+    move |error| match error.as_db_error() {
+        Some(db) => DomainError::Internal(format!(
+            "{context}: SQLSTATE {} {}{}",
+            db.code().code(),
+            db.message(),
+            db.detail()
+                .map(|detail| format!(" ({detail})"))
+                .unwrap_or_default()
+        )),
+        None => DomainError::from_pg(context, error),
     }
 }
 
 impl PostgresFragmentCoordinator {
     /// Upgrade a clean-initialized revision-4 cell to the compiled revision.
     ///
-    /// The caller must stop every replica first; `NOWAIT` turns a missed one
-    /// into a prompt refusal, not proof of absence. Rerunning after a crash or
-    /// a lost commit reply is safe: an upgraded cell reports `AlreadyCurrent`.
+    /// The caller must stop every replica first. The upgrade refuses while any
+    /// backend outside this coordinator's own pool is connected to the cell
+    /// database, whether idle or not, and `NOWAIT` refuses a lock holder that
+    /// races that count. Rerunning after a crash or a lost commit reply is
+    /// safe: an upgraded cell reports `AlreadyCurrent`.
     pub async fn upgrade_clean_schema(&self) -> Result<FragmentSchemaUpgradeOutcome, DomainError> {
         let mut client =
             self.pool.get().await.map_err(|e| {
@@ -124,23 +242,25 @@ impl PostgresFragmentCoordinator {
         let tx = client
             .transaction()
             .await
-            .map_err(|e| DomainError::from_pg("fragment schema upgrade begin", e))?;
+            .map_err(pg("fragment schema upgrade begin"))?;
         tx.batch_execute("SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '120s'")
             .await
-            .map_err(|e| DomainError::from_pg("fragment schema upgrade bounds", e))?;
+            .map_err(pg("fragment schema upgrade bounds"))?;
         tx.execute(
             "SELECT pg_advisory_xact_lock($1)",
             &[&crate::pool::SCHEMA_LOCK_KEY],
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade schema lock", e))?;
+        .map_err(pg("fragment schema upgrade schema lock"))?;
+        self.refuse_other_backends(&tx).await?;
 
         let before = stage_catalog(&tx).await?;
         let current = before.is_current();
         if !current && !before.is_pre_stage() {
             return Err(DomainError::NotReady(format!(
-                "fragment schema upgrade refuses an unknown catalog state {before:?}; \
-                 only an exact revision-{PRE_STAGE_SCHEMA_VERSION} or revision-{} cell is supported",
+                "fragment schema upgrade refuses an unknown catalog state ({}); only an exact \
+                 revision-{PRE_STAGE_SCHEMA_VERSION} or revision-{} clean cell is supported",
+                before.describe(),
                 schema::FRAGMENT_SCHEMA_VERSION
             )));
         }
@@ -161,7 +281,7 @@ impl PostgresFragmentCoordinator {
                         .into(),
                 ));
             }
-            return Err(DomainError::from_pg("fragment schema upgrade drain", error));
+            return Err(pg("fragment schema upgrade drain")(error));
         }
 
         let state_before = state_snapshot(&tx).await?;
@@ -171,7 +291,7 @@ impl PostgresFragmentCoordinator {
                 &[],
             )
             .await
-            .map_err(|e| DomainError::from_pg("fragment schema upgrade version", e))?
+            .map_err(pg("fragment schema upgrade version"))?
             .get(0);
         self.refuse_unclean(&tx).await?;
         if current {
@@ -198,21 +318,24 @@ impl PostgresFragmentCoordinator {
             "ALTER TABLE lore_fragment_schema_state DISABLE TRIGGER lore_clean_state_permanent",
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade fence lift", e))?;
+        .map_err(pg("fragment schema upgrade fence lift"))?;
         tx.batch_execute(STAGE_CUSTODY_SCHEMA)
             .await
-            .map_err(|e| DomainError::from_pg("fragment schema upgrade stage custody DDL", e))?;
+            .map_err(pg("fragment schema upgrade stage custody DDL"))?;
         tx.batch_execute(STAGE_POLICY_ROTATION_SCHEMA)
             .await
-            .map_err(|e| DomainError::from_pg("fragment schema upgrade stage rotation DDL", e))?;
+            .map_err(pg("fragment schema upgrade stage rotation DDL"))?;
         tx.batch_execute(
             "ALTER TABLE lore_fragment_schema_state ENABLE ALWAYS TRIGGER lore_clean_state_permanent",
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade fence restore", e))?;
+        .map_err(pg("fragment schema upgrade fence restore"))?;
 
         verify_upgraded(&tx, &state_before, &triggers_before).await?;
         self.refuse_unclean(&tx).await?;
+        // A replica that connected during the step is blocked on our locks now
+        // and would write revision-6 tables with an old binary after commit.
+        self.refuse_other_backends(&tx).await?;
         tx.commit().await.map_err(|e| {
             DomainError::OutcomeUnknown(format!(
                 "fragment schema upgrade commit: {e}; rerun to reconcile"
@@ -221,6 +344,45 @@ impl PostgresFragmentCoordinator {
         Ok(FragmentSchemaUpgradeOutcome::Upgraded {
             from_version: PRE_STAGE_SCHEMA_VERSION,
         })
+    }
+
+    /// Refuse while any backend outside this coordinator's pool is connected
+    /// to the cell database.
+    ///
+    /// `numbackends` counts every backend on the database whatever its role,
+    /// where `pg_stat_activity` hides other roles' sessions from an
+    /// unprivileged caller (CR-038 measured this on PostgreSQL 16). Every
+    /// connection this pool holds is this process's, so the pool's size is
+    /// subtracted. A backend that is still exiting gets a short bounded wait.
+    async fn refuse_other_backends(&self, tx: &Transaction<'_>) -> Result<(), DomainError> {
+        let mut others = 0;
+        for attempt in 0..BACKEND_SETTLE_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(BACKEND_SETTLE_INTERVAL).await;
+            }
+            // Statistics are snapshotted per transaction; take a fresh one.
+            tx.batch_execute("SELECT pg_catalog.pg_stat_clear_snapshot()")
+                .await
+                .map_err(pg("fragment schema upgrade statistics snapshot"))?;
+            let connected: i64 = tx
+                .query_one(
+                    "SELECT numbackends::bigint FROM pg_catalog.pg_stat_database \
+                      WHERE datname = pg_catalog.current_database()",
+                    &[],
+                )
+                .await
+                .map_err(pg("fragment schema upgrade backend count"))?
+                .get(0);
+            let own = i64::try_from(self.pool.status().size).unwrap_or(i64::MAX);
+            others = connected.saturating_sub(own);
+            if others <= 0 {
+                return Ok(());
+            }
+        }
+        Err(DomainError::Contention(format!(
+            "fragment schema upgrade refused: {others} other backend(s) are connected to the \
+             cell database; stop every loreserver replica and other client, then rerun"
+        )))
     }
 
     /// The clean record, its fences and standing readiness must hold on both
@@ -234,7 +396,7 @@ impl PostgresFragmentCoordinator {
                 &[],
             )
             .await
-            .map_err(|e| DomainError::from_pg("fragment schema upgrade state", e))?;
+            .map_err(pg("fragment schema upgrade state"))?;
         if !row.get::<_, bool>("clean")
             || row.get::<_, i16>("backfill_state") != schema::BACKFILL_NOT_STARTED
             || !row.get::<_, bool>("lifecycle_enabled")
@@ -263,7 +425,7 @@ impl PostgresFragmentCoordinator {
     }
 }
 
-/// Whether a clean-initialized cell is behind the compiled revision.
+/// The stored revision of a clean-initialized cell behind the compiled one.
 ///
 /// `bootstrap` consults this before any DDL, so an old cell gets a named
 /// remedy instead of the fence's raw refusal, and nothing is written.
@@ -282,7 +444,7 @@ pub(super) async fn clean_cell_needs_upgrade(
         Ok(row) => row,
         // No schema-state relation yet: a fresh cell, nothing to upgrade.
         Err(error) if error.code() == Some(&SqlState::UNDEFINED_TABLE) => return Ok(None),
-        Err(error) => return Err(DomainError::from_pg("fragment schema upgrade probe", error)),
+        Err(error) => return Err(pg("fragment schema upgrade probe")(error)),
     };
     Ok(row
         .map(|row| row.get::<_, i64>(0))
@@ -293,33 +455,33 @@ async fn stage_catalog(tx: &Transaction<'_>) -> Result<StageCatalog, DomainError
     let row = tx
         .query_one(
             "SELECT \
-               (SELECT count(*) FROM unnest($1::text[]) r WHERE to_regclass(r) IS NOT NULL)::bigint, \
-               (SELECT count(*) FROM unnest($2::text[]) r WHERE to_regclass(r) IS NOT NULL)::bigint, \
+               (SELECT COALESCE(array_agg(c.relname::text), '{}') FROM pg_class c \
+                  JOIN pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = current_schema() \
+                   AND starts_with(c.relname, 'lore_fragment_')) AS classes, \
                (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
-                 WHERE n.nspname = current_schema() AND p.proname = ANY($3))::bigint, \
-               (SELECT count(*) FROM unnest($4::text[]) r WHERE to_regclass(r) IS NOT NULL)::bigint, \
+                 WHERE n.nspname = current_schema() AND p.proname = ANY($1))::bigint, \
                (SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('lore_fragment_stage_policy') \
                  AND attname IN ('previous_revision', 'previous_digest') AND attnum > 0 \
                  AND NOT attisdropped)::bigint, \
                (SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('lore_fragment_write_claims') \
                  AND attname IN ('kind', 'source_epoch', 'source_manifest_id') AND attnum > 0 \
-                 AND NOT attisdropped)::bigint",
-            &[
-                &PRE_STAGE_RELATIONS.as_slice(),
-                &STAGE_RELATIONS.as_slice(),
-                &STAGE_FUNCTIONS.as_slice(),
-                &STAGE_INDEXES.as_slice(),
-            ],
+                 AND NOT attisdropped)::bigint, \
+               EXISTS (SELECT 1 FROM pg_constraint \
+                 WHERE conrelid = to_regclass('lore_fragment_write_claims') \
+                   AND conname = 'lore_fragment_write_claim_promotion_shape' AND convalidated)",
+            &[&STAGE_FUNCTIONS.as_slice()],
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade catalog", e))?;
+        .map_err(pg("fragment schema upgrade catalog"))?;
+    let mut classes: Vec<String> = row.get(0);
+    classes.sort();
     Ok(StageCatalog {
-        pre_stage_relations: row.get(0),
-        stage_relations: row.get(1),
-        stage_functions: row.get(2),
-        stage_indexes: row.get(3),
-        rotation_columns: row.get(4),
-        promotion_claim_columns: row.get(5),
+        classes,
+        stage_functions: row.get(1),
+        rotation_columns: row.get(2),
+        promotion_claim_columns: row.get(3),
+        promotion_shape: row.get(4),
     })
 }
 
@@ -333,22 +495,25 @@ async fn state_snapshot(tx: &Transaction<'_>) -> Result<String, DomainError> {
     )
     .await
     .map(|row| row.get(0))
-    .map_err(|e| DomainError::from_pg("fragment schema upgrade state snapshot", e))
+    .map_err(pg("fragment schema upgrade state snapshot"))
 }
 
-/// Every non-internal trigger on a fragment relation, with its enablement.
+/// Every non-internal trigger on a fragment relation: its full definition
+/// (`pg_get_triggerdef` carries timing, events, columns, `WHEN` qualifier and
+/// arguments), its enablement, and an md5 of its function's body.
 async fn trigger_snapshot(tx: &Transaction<'_>) -> Result<String, DomainError> {
     tx.query_one(
-        "SELECT COALESCE(string_agg(format('%s/%s/%s/%s/%s', t.tgrelid::regclass, t.tgname, \
-                    t.tgenabled, t.tgtype, t.tgfoid::regprocedure), ',' \
+        "SELECT COALESCE(string_agg(format('%s|%s|%s|%s', pg_get_triggerdef(t.oid), t.tgenabled, \
+                    t.tgfoid::regprocedure, md5(p.prosrc)), E'\\n' \
                     ORDER BY t.tgrelid::regclass::text, t.tgname), '') \
            FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid \
+           JOIN pg_proc p ON p.oid = t.tgfoid \
           WHERE NOT t.tgisinternal AND starts_with(c.relname, 'lore_fragment')",
         &[],
     )
     .await
     .map(|row| row.get(0))
-    .map_err(|e| DomainError::from_pg("fragment schema upgrade trigger snapshot", e))
+    .map_err(pg("fragment schema upgrade trigger snapshot"))
 }
 
 /// Refuse state the stage custody accounting cannot represent after the fact.
@@ -369,7 +534,7 @@ async fn refuse_staged_work(tx: &Transaction<'_>) -> Result<(), DomainError> {
             .as_slice()],
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade staged work", e))?;
+        .map_err(pg("fragment schema upgrade staged work"))?;
     let (heads, leases): (i64, i64) = (row.get(0), row.get(1));
     if heads != 0 {
         return Err(DomainError::NotReady(format!(
@@ -404,16 +569,21 @@ async fn verify_upgraded(
             &[],
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade verify version", e))?
+        .map_err(pg("fragment schema upgrade verify version"))?
         .get(0);
     if version != schema::FRAGMENT_SCHEMA_VERSION {
         return fail("schema_version did not reach the compiled revision");
     }
     if trigger_snapshot(tx).await? != triggers_before {
-        return fail("a fragment trigger's definition or enablement changed");
+        return fail("a fragment trigger's definition, enablement or function body changed");
     }
-    if !stage_catalog(tx).await?.is_current() {
-        return fail("the stage catalog is incomplete");
+    let after = stage_catalog(tx).await?;
+    if !after.is_current() {
+        return fail(&format!(
+            "the catalog is not an exact revision-{} catalog ({})",
+            schema::FRAGMENT_SCHEMA_VERSION,
+            after.describe()
+        ));
     }
     let seeded: bool = tx
         .query_one(
@@ -422,14 +592,14 @@ async fn verify_upgraded(
                        FROM lore_fragment_stage_usage) \
                 AND NOT EXISTS (SELECT 1 FROM lore_fragment_stage_policy) \
                 AND NOT EXISTS (SELECT 1 FROM lore_fragment_stage_custody) \
-                AND (SELECT count(*) = 2 AND bool_and(i.indisvalid AND i.indisready) \
-                       FROM pg_index i WHERE i.indexrelid = ANY(ARRAY[ \
-                         to_regclass('lore_fragment_stage_custody_cleanup'), \
-                         to_regclass('lore_fragment_stage_drain_recovery')]::oid[]))",
-            &[],
+                AND (SELECT count(*) = cardinality($1::text[]) \
+                            AND bool_and(i.indisvalid AND i.indisready) \
+                       FROM pg_index i WHERE i.indexrelid = ANY(ARRAY( \
+                         SELECT to_regclass(name)::oid FROM unnest($1::text[]) AS name)))",
+            &[&STAGE_INDEXES.as_slice()],
         )
         .await
-        .map_err(|e| DomainError::from_pg("fragment schema upgrade verify seed", e))?
+        .map_err(pg("fragment schema upgrade verify seed"))?
         .get(0);
     if !seeded {
         return fail("the stage tables do not hold a fresh cell's seed");
@@ -446,6 +616,23 @@ mod tests {
         let mut composed: Vec<&str> = PRE_STAGE_RELATIONS.to_vec();
         composed.extend(STAGE_RELATIONS);
         assert_eq!(composed, schema::FRAGMENT_SCHEMA_RELATIONS.to_vec());
+    }
+
+    #[test]
+    fn class_sets_cover_the_relations_and_do_not_overlap() {
+        for relation in PRE_STAGE_RELATIONS {
+            assert!(PRE_STAGE_CLASSES.contains(&relation), "{relation}");
+        }
+        for relation in STAGE_RELATIONS.iter().chain(&STAGE_INDEXES) {
+            assert!(STAGE_CLASSES.contains(relation), "{relation}");
+        }
+        for name in STAGE_CLASSES {
+            assert!(!PRE_STAGE_CLASSES.contains(&name), "{name}");
+        }
+        let mut sorted = PRE_STAGE_CLASSES.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), PRE_STAGE_CLASSES.len());
     }
 
     #[test]

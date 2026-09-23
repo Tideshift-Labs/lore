@@ -1487,6 +1487,19 @@ impl PostgresFragmentCoordinator {
         let probe = self.checkout().await?;
         let needs_upgrade = super::upgrade::clean_cell_needs_upgrade(&probe).await?;
         drop(probe);
+        if let Some(version) = needs_upgrade
+            && version != super::upgrade::PRE_STAGE_SCHEMA_VERSION
+        {
+            // CR-039's upgrade accepts only revision 4. Any other lower
+            // revision on a clean cell is a state no supported path produced.
+            return Err(DomainError::NotReady(format!(
+                "this clean-initialized cell's fragment schema is revision {version}, which no \
+                 supported upgrade starts from (this binary needs {}). Do not reset or hand-edit \
+                 it: restore the backup taken before the last upgrade attempt, or escalate to \
+                 the cell owner (CR-039)",
+                schema::FRAGMENT_SCHEMA_VERSION
+            )));
+        }
         if let Some(version) = needs_upgrade {
             return Err(DomainError::NotReady(format!(
                 "this clean-initialized cell's fragment schema is revision {version}; this \
