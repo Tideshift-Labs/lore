@@ -169,6 +169,17 @@ it's derived from another column rather than a fixed literal.
   trigger; prefer it whenever the probe's only job is to change the manifest, not to test
   relation-specific behavior.
 
+- **Proving a migration leaves an unrelated row set untouched needs counts captured on both sides
+  of the mutation, not just a post-hoc "still not full" read.** For the R25 budget-limiter tables
+  (`object_dispatch_budget_configurations`/`_current_budget_configuration`/`_budget_bucket_state`,
+  scoped by `provider_boundary_id`), capture `(configurations, current, bucket_state)` before the
+  upgrade and assert the exact tuple again after — `(1, 1, 7)` for one published budget (7 = the
+  fixed `1..=7` cap-class loop in `publish_budget`). A refusal message asserting a remedy ("reinstall
+  the cell" / "get an owner decision") should also assert the negative — that it does NOT suggest an
+  unrelated fix (e.g. "wait for retention") — because an unfixable precondition and a merely-slow one
+  read identically if only the positive claim is checked. See
+  `budget_row_counts`/`live_install_at_r25_upgrades_to_current_and_drain_client_writes` and the two
+  R25 refusal tests in `cell_schema_forward_upgrade_live.rs`.
 - **A real `reserve_put` admission always charges quota alongside the spool row it creates**, so a
   fixture cannot isolate "spool object present, quota untouched" through `reserve_put` alone —
   proven by mutation: with the R25 prelude's spool-objects `IF EXISTS` disabled, the SAME
