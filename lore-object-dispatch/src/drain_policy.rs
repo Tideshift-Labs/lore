@@ -81,6 +81,10 @@ impl std::fmt::Debug for DrainDescriptor {
     }
 }
 
+/// The cell schema revision this build ships (CR-038). Migration 0028's
+/// `cell_schema_revision_v1()` returns it; write-behind refuses to start on any other value.
+pub const CELL_SCHEMA_REVISION: i32 = 28;
+
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DrainError {
     #[error("drain descriptor or policy is invalid")]
@@ -89,6 +93,12 @@ pub enum DrainError {
     Refused,
     #[error("drain authority is unavailable; the operation may have committed")]
     Unavailable,
+    #[error(
+        "the cell schema predates the spool metadata true-up: stop every replica and run `cell-schema-install upgrade`"
+    )]
+    SchemaUpgradeRequired,
+    #[error("the cell schema revision is not one this build knows; refusing write-behind")]
+    SchemaUnknown,
 }
 
 fn framed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), DrainError> {
@@ -435,6 +445,44 @@ impl DrainClient {
         let (policy, revision, fence, expiry, _) =
             self.read_clocked(boundary, cell, revision, digest).await?;
         Ok((policy, revision, fence, expiry))
+    }
+
+    /// Refuse write-behind on a cell that lacks the spool metadata true-up (CR-038 D5).
+    ///
+    /// The runtime readback 0019 carries cannot see migrations after 0024, so without this a binary
+    /// would run the spool on an un-upgraded cell with no prevention, which is how a cell wedges. An
+    /// absent marker names the fix; a marker naming any other revision fails closed.
+    pub async fn verify_schema_revision(&self) -> Result<(), DrainError> {
+        let rows = self
+            .query(
+                "SELECT pg_catalog.to_regprocedure('object_store_retention.cell_schema_revision_v1()') IS NOT NULL",
+                &[],
+            )
+            .await?;
+        let present: bool = rows
+            .first()
+            .ok_or(DrainError::Invalid)?
+            .try_get(0)
+            .map_err(|_error| DrainError::Invalid)?;
+        if !present {
+            return Err(DrainError::SchemaUpgradeRequired);
+        }
+        let rows = self
+            .query(
+                "SELECT object_store_retention.cell_schema_revision_v1()",
+                &[],
+            )
+            .await?;
+        let revision: i32 = rows
+            .first()
+            .ok_or(DrainError::Invalid)?
+            .try_get(0)
+            .map_err(|_error| DrainError::Invalid)?;
+        if revision == CELL_SCHEMA_REVISION {
+            Ok(())
+        } else {
+            Err(DrainError::SchemaUnknown)
+        }
     }
 
     /// Check configured work bounds against trusted lifetimes before activation.

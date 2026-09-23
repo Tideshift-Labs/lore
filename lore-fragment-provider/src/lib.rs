@@ -723,6 +723,12 @@ impl FragmentProviderError {
                     FragmentProviderDisposition::Internal
                 }
             },
+            // CR-038 D5: a cell at the wrong schema revision is a deployment fault, not back
+            // pressure. Retrying cannot fix it; the error must reach the operator with its text.
+            Self::DrainAuthority(
+                lore_object_dispatch::drain_policy::DrainError::SchemaUpgradeRequired
+                | lore_object_dispatch::drain_policy::DrainError::SchemaUnknown,
+            ) => FragmentProviderDisposition::Internal,
             Self::DrainSpoolIo
             | Self::DrainAuthority(_)
             | Self::PutAdmissionTimedOut

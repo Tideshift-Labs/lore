@@ -240,6 +240,11 @@ impl FragmentProviderEntry {
     ) -> Result<(FragmentDrainCapability, FragmentDrainMaintenanceHandle), FragmentProviderError>
     {
         let client = DrainClient::new(self.pool.clone());
+        // CR-038 D5: before any spool state exists, refuse a cell without the metadata true-up.
+        client
+            .verify_schema_revision()
+            .await
+            .map_err(FragmentProviderError::DrainAuthority)?;
         client
             .verify_activation_window(
                 self.boundary().provider_boundary_id(),

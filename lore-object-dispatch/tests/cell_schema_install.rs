@@ -19,6 +19,7 @@ use lore_object_dispatch::cell_schema_install::CELL_CATALOG_MANIFEST_SECTIONS;
 use lore_object_dispatch::cell_schema_install::CELL_CATALOG_MANIFEST_SQL;
 use lore_object_dispatch::cell_schema_install::CELL_DEFERRED_MIGRATIONS;
 use lore_object_dispatch::cell_schema_install::CELL_DEFERRED_PROCEDURES;
+use lore_object_dispatch::cell_schema_install::CELL_FORWARD_STEPS;
 use lore_object_dispatch::cell_schema_install::CELL_INERT_RETENTION_TABLES;
 use lore_object_dispatch::cell_schema_install::CELL_INSTALL_SET;
 use lore_object_dispatch::cell_schema_install::CELL_MIGRATOR_ROLE;
@@ -30,6 +31,7 @@ use lore_object_dispatch::cell_schema_install::CELL_SERVICE_ROLES;
 use lore_object_dispatch::cell_schema_install::CellInstallStep;
 use lore_object_dispatch::cell_schema_install::CellSchemaError;
 use lore_object_dispatch::cell_schema_install::CellSchemaLayerId;
+use lore_object_dispatch::cell_schema_install::CellSchemaRevision;
 use lore_object_dispatch::cell_schema_install::cell_install_plan;
 use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests;
 
@@ -151,14 +153,15 @@ fn install_set_is_exactly_cr_033_d5s() {
     let module_source = include_str!("../src/cell_schema_install.rs");
     assert!(!module_source.contains("0001_"));
 
-    // Every migration file on disk is classified as installed or deferred. A future 0018 must
-    // fail this assertion rather than being silently excluded from either list.
+    // Every migration file on disk is classified as installed, deferred, or a CR-038 forward step.
+    // A new file must fail this assertion rather than being silently excluded from every list.
     let on_disk = all_migration_numbers_on_disk();
     let mut classified: BTreeSet<u16> = CELL_INSTALLED_MIGRATION_NUMBERS.into_iter().collect();
     classified.extend(CELL_DEFERRED_MIGRATIONS);
+    classified.extend(CELL_FORWARD_STEPS.iter().map(|step| step.migration.number));
     assert_eq!(
         on_disk, classified,
-        "every migrations/*.sql file must be classified as installed or deferred"
+        "every migrations/*.sql file must be classified as installed, deferred or a forward step"
     );
 }
 
@@ -861,13 +864,17 @@ fn every_error_variant() -> Vec<CellSchemaError> {
         CellSchemaError::RetiredEntrypointUnexpectedFailure("put_reservation"),
         CellSchemaError::RefusedUnattestedSchema("catalog drift"),
         CellSchemaError::UnexpectedInstallResult,
+        CellSchemaError::UpgradeRequired(CellSchemaRevision::R27),
+        CellSchemaError::FutureSchema,
+        CellSchemaError::SchemaOperationBusy,
+        CellSchemaError::ReplicasActive,
     ];
     // The match below forces a new *arm*, which a `=> {}` satisfies without adding the variant to
     // the vec these tests actually sweep. Pinning the length is what makes adding a variant fail
     // here rather than pass unswept.
     assert_eq!(
         variants.len(),
-        12,
+        16,
         "a new CellSchemaError variant must be added to this vec, not only to the match below"
     );
     for variant in &variants {
@@ -884,7 +891,11 @@ fn every_error_variant() -> Vec<CellSchemaError> {
             | CellSchemaError::RetiredEntrypointReachable(_)
             | CellSchemaError::RetiredEntrypointUnexpectedFailure(_)
             | CellSchemaError::RefusedUnattestedSchema(_)
-            | CellSchemaError::UnexpectedInstallResult => {}
+            | CellSchemaError::UnexpectedInstallResult
+            | CellSchemaError::UpgradeRequired(_)
+            | CellSchemaError::FutureSchema
+            | CellSchemaError::SchemaOperationBusy
+            | CellSchemaError::ReplicasActive => {}
         }
     }
     variants

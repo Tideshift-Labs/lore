@@ -14,8 +14,16 @@
 //! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../cell"
 //! cell-schema-install install    # install the CR-033 D5 set, then attest
 //! cell-schema-install attest     # attest only; never writes schema
+//! cell-schema-install upgrade    # CR-038: move an attested R27 cell to the current state, offline
 //! cell-schema-install measure    # print the live catalog manifest digests
 //! ```
+//!
+//! `upgrade` requires every replica stopped. It refuses while any other session is connected to the
+//! cell database, and it commits a forward step only after the new state attests inside the same
+//! transaction. After any interruption, run it again: it classifies the cell before it acts.
+//!
+//! `install`, `upgrade` and `attest` each take the cell schema session lock and refuse at once if
+//! another session holds it.
 //!
 //! The connection **must** authenticate as `object_dispatch_retention_migrator`; every action
 //! refuses otherwise, `attest` and `measure` included, and so does the revoke pass inside `install`.
@@ -35,21 +43,25 @@ use std::process::ExitCode;
 use lore_object_dispatch::cell_schema_install::CELL_CATALOG_MANIFEST_SECTIONS;
 use lore_object_dispatch::cell_schema_install::CellAttestation;
 use lore_object_dispatch::cell_schema_install::LayerIdentity;
+use lore_object_dispatch::cell_schema_install::acquire_cell_schema_lock;
 use lore_object_dispatch::cell_schema_install::attest_cell_schema;
 use lore_object_dispatch::cell_schema_install::install_cell_schema;
 use lore_object_dispatch::cell_schema_install::measure_catalog_manifest;
+use lore_object_dispatch::cell_schema_install::release_cell_schema_lock;
+use lore_object_dispatch::cell_schema_install::upgrade_cell_schema;
 use tokio_util::task::AbortOnDropHandle;
 
 /// Environment variable naming the cell database, under the crate's bytewise config prefix.
 const MIGRATOR_URL_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL";
 
-const USAGE: &str = "usage: cell-schema-install <install|attest|measure>\n\
+const USAGE: &str = "usage: cell-schema-install <install|attest|upgrade|measure>\n\
      the cell database URL is read from LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
     Install,
     Attest,
+    Upgrade,
     Measure,
 }
 
@@ -66,6 +78,7 @@ fn main() -> ExitCode {
     let action = match action.as_str() {
         "install" => Action::Install,
         "attest" => Action::Attest,
+        "upgrade" => Action::Upgrade,
         "measure" => Action::Measure,
         _ => {
             eprintln!("{USAGE}");
@@ -129,13 +142,32 @@ async fn run(action: Action, url: &str) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Action::Attest => match attest_cell_schema(&client).await {
-            Ok(attestation) => {
-                print_attestation(&attestation);
+        Action::Attest => {
+            if let Err(error) = acquire_cell_schema_lock(&client).await {
+                eprintln!("attestation failed: {error}");
+                return ExitCode::from(1);
+            }
+            let attested = attest_cell_schema(&client).await;
+            let released = release_cell_schema_lock(&client).await;
+            match (attested, released) {
+                (Ok(attestation), Ok(())) => {
+                    print_attestation(&attestation);
+                    ExitCode::SUCCESS
+                }
+                (Err(error), _) | (Ok(_), Err(error)) => {
+                    eprintln!("attestation failed: {error}");
+                    ExitCode::from(1)
+                }
+            }
+        }
+        Action::Upgrade => match upgrade_cell_schema(&client).await {
+            Ok(report) => {
+                println!("upgrade: {:?}", report.disposition);
+                print_attestation(&report.attestation);
                 ExitCode::SUCCESS
             }
             Err(error) => {
-                eprintln!("attestation failed: {error}");
+                eprintln!("upgrade refused: {error}");
                 ExitCode::from(1)
             }
         },
@@ -156,6 +188,7 @@ async fn run(action: Action, url: &str) -> ExitCode {
 }
 
 fn print_attestation(attestation: &CellAttestation) {
+    println!("  schema state: {}", attestation.schema_revision.label());
     for (id, identity) in &attestation.layers {
         match identity {
             LayerIdentity::Absent => println!("  identity {}: ABSENT", id.label()),

@@ -9,6 +9,12 @@
 //! D8's per-participant dispatcher identity, provisioning/readback, and database-owned monotonic
 //! registration). Migrations 0021 and 0022 add CD-4's dark shared-limiter layer.
 //!
+//! CR-038 adds the forward path. [`CELL_INSTALL_SET`] stays frozen as state
+//! [`CellSchemaRevision::R27`]; later changes are [`CELL_FORWARD_STEPS`], each a single
+//! transaction that must attest its target state before it commits. Attestation classifies the
+//! live catalog against the closed [`CELL_SCHEMA_STATES`] list, and [`upgrade_cell_schema`] moves an
+//! attested N-1 cell to N offline. Nothing here repairs an unknown state.
+//!
 //! Six properties this module owns, and nothing else in the crate does:
 //!
 //! 1. **Migrator-role install, out of band.** Every public entry point here refuses unless the
@@ -249,6 +255,61 @@ pub const CELL_INSTALL_SET: [CellMigration; 23] = [
 /// the argument for it is in [`crate::cell_retention`].
 pub const CELL_DEFERRED_MIGRATIONS: [u16; 3] = [4, 5, 6];
 
+/// One known, attestable cell schema state (CR-038).
+///
+/// A state is one exact live catalog manifest. The layer identity tuples cannot tell these apart,
+/// because 0025 onward added no layer, so the manifest is the only record of which one a cell is
+/// in. The list is closed: a manifest that matches no state here is drift, never a guess.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellSchemaRevision {
+    /// The frozen install set, 0002-0027. Upgradable to [`CellSchemaRevision::R28`], nothing else.
+    R27,
+    /// `R27` plus forward step 0028, the spool metadata true-up. The current state.
+    R28,
+}
+
+impl CellSchemaRevision {
+    /// Stable, non-sensitive label for reports and diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::R27 => "R27",
+            Self::R28 => "R28",
+        }
+    }
+}
+
+/// The state a fully installed or fully upgraded cell must attest as.
+pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R28;
+
+/// One forward step between two adjacent known states.
+///
+/// Unlike a frozen install artifact, a forward step's SQL carries no `BEGIN`/`COMMIT`. The
+/// installer owns the transaction, runs the body, attests the target state inside that same
+/// transaction, and commits only if it attests. That is what leaves no committed-but-unattested
+/// state for a crash to expose, and it is why a step must be transactional as a whole.
+#[derive(Clone, Copy, Debug)]
+pub struct CellForwardStep {
+    /// The state the cell must attest as before the step.
+    pub from: CellSchemaRevision,
+    /// The state the cell must attest as after the step, before `COMMIT`.
+    pub to: CellSchemaRevision,
+    /// The step's embedded body and its pinned digest.
+    pub migration: CellMigration,
+}
+
+/// The forward steps, in order. Only N-1 to N is supported (CR-038 D2): a cell further behind is
+/// unknown to this installer and is reinstalled, never walked forward.
+pub const CELL_FORWARD_STEPS: [CellForwardStep; 1] = [CellForwardStep {
+    from: CellSchemaRevision::R27,
+    to: CellSchemaRevision::R28,
+    migration: cell_migration!(
+        28,
+        "0028_object_store_dispatch_drain_metadata_true_up.sql",
+        "8c7fa36216f887c046bfe6102e13fe3384e1af492754aeb6f9aee8e93b9c8be2"
+    ),
+}];
+
 /// Fail closed if packaging or merge changed any embedded artifact's bytes.
 ///
 /// Checks two things that can drift apart independently: every install-set artifact against its own
@@ -257,6 +318,11 @@ pub const CELL_DEFERRED_MIGRATIONS: [u16; 3] = [4, 5, 6];
 pub fn validate_cell_install_set_digests() -> bool {
     for migration in CELL_INSTALL_SET {
         if blake3::hash(migration.sql.as_bytes()).as_bytes() != &migration.blake3 {
+            return false;
+        }
+    }
+    for step in CELL_FORWARD_STEPS {
+        if blake3::hash(step.migration.sql.as_bytes()).as_bytes() != &step.migration.blake3 {
             return false;
         }
     }
@@ -943,7 +1009,10 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
 /// indexes, types, functions and their ACLs, plus relation ACLs. The remaining sections hold.
 /// Migration 0027 changes columns, constraints, functions, function ACLs and triggers
 /// for offline rotation and immutable per-reservation replay horizons.
-pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
+///
+/// CR-038 renamed this from `CELL_CATALOG_SECTION_BLAKE3_V1` without changing a byte: it is now the
+/// pin of state [`CellSchemaRevision::R27`], the state an existing cell may be upgraded from.
+pub const CELL_CATALOG_SECTION_BLAKE3_R27: [[u8; 32]; 12] = [
     hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
     hex32("1d67f06a797f9b45c588b83014b9bd451136f7fc7e84d6c2ae8276dcf66bd7dd"),
     hex32("a88e3821de78ba6a7e20de17fe0ecf559c4e776f772d1cbf3a053ec4c7bfe905"),
@@ -958,13 +1027,70 @@ pub const CELL_CATALOG_SECTION_BLAKE3_V1: [[u8; 32]; 12] = [
     hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
 ];
 
-/// Pinned BLAKE3-256 of the complete manifest of a fully installed cell, PostgreSQL 16.
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R27`] cell, `PostgreSQL` 16.
 ///
 /// Pinned to PostgreSQL 16: the manifest carries `pg_get_functiondef` and `pg_get_indexdef` output,
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
-pub const CELL_CATALOG_MANIFEST_BLAKE3_V1: [u8; 32] =
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R27: [u8; 32] =
     hex32("5297269d1975f58e610821e87c8e4c344249084cbd42d7704fc2f2b9993e4f87");
+
+/// Pinned per-section digests of state [`CellSchemaRevision::R28`], `PostgreSQL` 16.
+///
+/// Forward step 0028 creates two functions and replaces one, and grants one to the runtime role.
+/// It adds no relation, column, constraint, index, type or trigger. So exactly `functions` and
+/// `function_acls` may move against the R27 pin; a move anywhere else means the step did something
+/// it does not claim to do. Measured on a fresh install and on an upgraded R27 cell; both must
+/// match, which is the fresh-install parity check.
+///
+/// Measured 2026-09-22 on `postgres:16`: exactly those two sections moved, as predicted. The other
+/// ten are byte-identical to the R27 pin.
+pub const CELL_CATALOG_SECTION_BLAKE3_R28: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R27[0],
+    CELL_CATALOG_SECTION_BLAKE3_R27[1],
+    CELL_CATALOG_SECTION_BLAKE3_R27[2],
+    CELL_CATALOG_SECTION_BLAKE3_R27[3],
+    CELL_CATALOG_SECTION_BLAKE3_R27[4],
+    CELL_CATALOG_SECTION_BLAKE3_R27[5],
+    hex32("c7faaac26bd25a3def78a550e2df56f0c71a26b735ecca311c21bd8d8db2715b"),
+    hex32("ecd277894e230afee68ec745205af1317f639bbfa9081412b6caad55142ec454"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[8],
+    CELL_CATALOG_SECTION_BLAKE3_R27[9],
+    CELL_CATALOG_SECTION_BLAKE3_R27[10],
+    CELL_CATALOG_SECTION_BLAKE3_R27[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R28`] cell, `PostgreSQL` 16.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R28: [u8; 32] =
+    hex32("5b5785d20aa33ae0bce288a1317d9a2985be92c36bf159f0ae3172587da12b25");
+
+/// Every known state with its pins, oldest first. Attestation classifies against this closed list.
+pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 2] = [
+    (
+        CellSchemaRevision::R27,
+        CELL_CATALOG_SECTION_BLAKE3_R27,
+        CELL_CATALOG_MANIFEST_BLAKE3_R27,
+    ),
+    (
+        CellSchemaRevision::R28,
+        CELL_CATALOG_SECTION_BLAKE3_R28,
+        CELL_CATALOG_MANIFEST_BLAKE3_R28,
+    ),
+];
+
+/// Return the known state whose whole manifest matches, if any.
+#[must_use]
+pub fn classify_cell_catalog(
+    sections: &[[u8; 32]; 12],
+    manifest: &[u8; 32],
+) -> Option<CellSchemaRevision> {
+    CELL_SCHEMA_STATES
+        .iter()
+        .find(|(_, pinned_sections, pinned_manifest)| {
+            pinned_sections == sections && pinned_manifest == manifest
+        })
+        .map(|(revision, _, _)| *revision)
+}
 
 /// Const hex decoder for the pinned digests above.
 const fn hex32(text: &str) -> [u8; 32] {
@@ -1058,6 +1184,24 @@ pub enum CellSchemaError {
     /// An install procedure returned a result code outside `CREATED`/`REPLAY`.
     #[error("a cell schema install procedure returned an unexpected result code")]
     UnexpectedInstallResult,
+    /// The cell attests as a known older state. Run `cell-schema-install upgrade`.
+    #[error(
+        "cell schema is at known state {} and must be upgraded: run `cell-schema-install upgrade` with every replica stopped",
+        .0.label()
+    )]
+    UpgradeRequired(CellSchemaRevision),
+    /// The cell's revision marker names a state newer than this installer knows.
+    #[error("cell schema is newer than this installer knows; use the installer that created it")]
+    FutureSchema,
+    /// Another session holds the cell schema operation lock.
+    #[error("another cell schema operation holds the lock; nothing was changed")]
+    SchemaOperationBusy,
+    /// Another session is connected to the cell database, or a transaction still holds a cell
+    /// authority table.
+    #[error(
+        "other sessions are connected to the cell database: stop and exclude every replica and operator session, then retry"
+    )]
+    ReplicasActive,
 }
 
 impl CellSchemaError {
@@ -1077,6 +1221,10 @@ impl CellSchemaError {
             Self::RetiredEntrypointUnexpectedFailure(_) => "retired entrypoint sqlstate",
             Self::RefusedUnattestedSchema(_) => "unattested schema",
             Self::UnexpectedInstallResult => "install result",
+            Self::UpgradeRequired(_) => "upgrade required",
+            Self::FutureSchema => "future schema",
+            Self::SchemaOperationBusy => "schema operation busy",
+            Self::ReplicasActive => "replicas active",
         }
     }
 
@@ -1122,6 +1270,9 @@ pub enum LayerInstallOutcome {
 /// What one attestation observed. Every field is non-sensitive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellAttestation {
+    /// The known state the live catalog matched. A public attestation always reports
+    /// [`CELL_SCHEMA_CURRENT`]; an older match is refused as [`CellSchemaError::UpgradeRequired`].
+    pub schema_revision: CellSchemaRevision,
     /// Each layer's identity tuple, in [`CELL_SCHEMA_LAYERS`] order.
     pub layers: [(CellSchemaLayerId, LayerIdentity); 6],
     /// Per-section live catalog digests, in [`CELL_CATALOG_MANIFEST_SECTIONS`] order.
@@ -1157,6 +1308,46 @@ pub struct CellInstallReport {
     /// The attestation taken after the run.
     pub attestation: CellAttestation,
 }
+
+/// What one `upgrade` run did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CellUpgradeDisposition {
+    /// The cell already attested as [`CELL_SCHEMA_CURRENT`]; no step ran.
+    AlreadyCurrent,
+    /// One forward step committed, from this state to [`CELL_SCHEMA_CURRENT`].
+    Upgraded(CellSchemaRevision),
+}
+
+/// What one upgrade run did, with the attestation taken after it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellUpgradeReport {
+    /// Whether a step ran.
+    pub disposition: CellUpgradeDisposition,
+    /// The attestation taken after the run, always at [`CELL_SCHEMA_CURRENT`].
+    pub attestation: CellAttestation,
+}
+
+/// Session advisory-lock key for every cell schema operation: install, upgrade, and the operator's
+/// attest. A session lock, not a transaction lock, so it holds across each artifact's `COMMIT` and
+/// ends with the connection if the operator process dies.
+pub const CELL_SCHEMA_LOCK_KEY: i64 = 0x0c38_ce11_5c4e_0001;
+
+const SCHEMA_LOCK_TRY_SQL: &str = "SELECT pg_catalog.pg_try_advisory_lock($1)";
+
+const SCHEMA_LOCK_RELEASE_SQL: &str = "SELECT pg_catalog.pg_advisory_unlock($1)";
+
+// Every other backend connected to the cell database, whatever its role. Not `pg_stat_activity`:
+// measured on PostgreSQL 16, a role without `pg_read_all_stats` does not see other roles' rows there
+// at all, so a role filter over it counts zero with a replica connected. `numbackends` is visible to
+// every role. It is deliberately broader than the dispatch roles: a replica's store pools connect to
+// this same database, and "every replica stopped" means none of them is connected.
+const ACTIVE_SERVICE_SESSIONS_SQL: &str = "SELECT (numbackends - 1)::bigint
+     FROM pg_catalog.pg_stat_database WHERE datname = pg_catalog.current_database()";
+
+const REVISION_MARKER_PRESENT_SQL: &str = "SELECT pg_catalog.to_regprocedure(
+       'object_store_retention.cell_schema_revision_v1()') IS NOT NULL";
+
+const REVISION_MARKER_READ_SQL: &str = "SELECT object_store_retention.cell_schema_revision_v1()";
 
 const SCHEMA_PRESENT_SQL: &str = "SELECT count(*)::bigint FROM pg_catalog.pg_namespace \
      WHERE nspname = 'object_store_retention'";
@@ -1306,13 +1497,181 @@ const RESIDUAL_PRIVILEGE_SQL: &str = "SELECT
 /// Returns [`CellSchemaError`] when a precondition fails, the database refuses a step, or the
 /// post-install attestation does not hold. Nothing is repaired on failure.
 pub async fn install_cell_schema(client: &Client) -> Result<CellInstallReport, CellSchemaError> {
-    let (disposition, layer_outcomes) = apply_cell_install_plan(client).await?;
+    acquire_cell_schema_lock(client).await?;
+    let result = async {
+        let (disposition, layer_outcomes) =
+            apply_install_plan_to(client, CELL_SCHEMA_CURRENT, StepAttestation::Attest).await?;
+        let attestation = attest_cell_schema(client).await?;
+        Ok(CellInstallReport {
+            disposition,
+            layer_outcomes,
+            attestation,
+        })
+    }
+    .await;
+    let released = release_cell_schema_lock(client).await;
+    let report = result?;
+    released?;
+    Ok(report)
+}
+
+/// Take the cell schema operation lock, or refuse at once if another session holds it.
+///
+/// Never waits: two operators racing an install or an upgrade is a mistake to report, not a queue
+/// to join. The lock is a session lock, so a crashed operator releases it by disconnecting.
+///
+/// # Errors
+///
+/// [`CellSchemaError::SchemaOperationBusy`] when another session holds it, or the migrator-session
+/// precondition when the caller is not the migrator.
+pub async fn acquire_cell_schema_lock(client: &Client) -> Result<(), CellSchemaError> {
+    assert_migrator_session(client).await?;
+    let acquired: bool =
+        query_one_value_with(client, SCHEMA_LOCK_TRY_SQL, &[&CELL_SCHEMA_LOCK_KEY]).await?;
+    if acquired {
+        Ok(())
+    } else {
+        Err(CellSchemaError::SchemaOperationBusy)
+    }
+}
+
+/// Release the lock [`acquire_cell_schema_lock`] took.
+///
+/// # Errors
+///
+/// [`CellSchemaError::InvalidResponse`] when this session did not hold it.
+pub async fn release_cell_schema_lock(client: &Client) -> Result<(), CellSchemaError> {
+    let released: bool =
+        query_one_value_with(client, SCHEMA_LOCK_RELEASE_SQL, &[&CELL_SCHEMA_LOCK_KEY]).await?;
+    if released {
+        Ok(())
+    } else {
+        Err(CellSchemaError::InvalidResponse("schema lock not held"))
+    }
+}
+
+/// Move an attested [`CellSchemaRevision::R27`] cell to [`CELL_SCHEMA_CURRENT`] (CR-038).
+///
+/// Offline only: every replica must be stopped. The run refuses if any other session is connected
+/// to the cell database, and the step's own `LOCK TABLE ... NOWAIT` refuses a transaction that
+/// still holds a cell table. Recovery after any interruption is to run it again: it classifies the
+/// live catalog first, so a step that committed is never run twice, and a step that did not commit
+/// left nothing behind because the step and its attestation are one transaction.
+///
+/// # Errors
+///
+/// Returns [`CellSchemaError`] when a precondition fails, the lock is held, replicas are active,
+/// the cell is at no known state, or the step does not attest before `COMMIT`. A step that fails
+/// before `COMMIT` is rolled back; the cell stays at its prior state.
+pub async fn upgrade_cell_schema(client: &Client) -> Result<CellUpgradeReport, CellSchemaError> {
+    if !validate_cell_install_set_digests() {
+        return Err(CellSchemaError::Precondition("embedded migration digests"));
+    }
+    assert_install_preconditions(client).await?;
+    acquire_cell_schema_lock(client).await?;
+    let result = upgrade_locked(client).await;
+    let released = release_cell_schema_lock(client).await;
+    let report = result?;
+    released?;
+    Ok(report)
+}
+
+async fn upgrade_locked(client: &Client) -> Result<CellUpgradeReport, CellSchemaError> {
+    if !schema_is_present(client).await? {
+        return Err(CellSchemaError::Precondition(
+            "no cell schema to upgrade; run install",
+        ));
+    }
+    let (revision, _) = attest_known_state(client).await?;
+    let disposition = if revision == CELL_SCHEMA_CURRENT {
+        CellUpgradeDisposition::AlreadyCurrent
+    } else {
+        let Some(step) = CELL_FORWARD_STEPS
+            .iter()
+            .find(|step| step.from == revision && step.to == CELL_SCHEMA_CURRENT)
+        else {
+            return Err(CellSchemaError::Precondition(
+                "no forward step from this state",
+            ));
+        };
+        assert_no_active_service_sessions(client).await?;
+        apply_forward_step(client, step, StepAttestation::Attest).await?;
+        CellUpgradeDisposition::Upgraded(revision)
+    };
+    revoke_replaced_function_privileges(client).await?;
     let attestation = attest_cell_schema(client).await?;
-    Ok(CellInstallReport {
+    Ok(CellUpgradeReport {
         disposition,
-        layer_outcomes,
         attestation,
     })
+}
+
+async fn assert_no_active_service_sessions(client: &Client) -> Result<(), CellSchemaError> {
+    let active: i64 = query_one_value(client, ACTIVE_SERVICE_SESSIONS_SQL).await?;
+    if active == 0 {
+        Ok(())
+    } else {
+        Err(CellSchemaError::ReplicasActive)
+    }
+}
+
+/// Run one forward step and attest its target state inside one `SERIALIZABLE` transaction.
+///
+/// `COMMIT` is issued only after the target state attests, so no crash point can leave a committed
+/// state that does not. A lost `COMMIT` reply leaves the outcome unknown to this call; the next run
+/// resolves it by classification, not by replay.
+async fn apply_forward_step(
+    client: &Client,
+    step: &CellForwardStep,
+    step_attestation: StepAttestation,
+) -> Result<(), CellSchemaError> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;")
+        .await
+        .map_err(CellSchemaError::postgres)?;
+    let body = async {
+        client
+            .batch_execute(step.migration.sql)
+            .await
+            .map_err(forward_step_error)?;
+        // The step body ends as the owner (`SET LOCAL ROLE`). Attestation must run as the migrator,
+        // or the retired-readback probes would pass for the wrong reason.
+        client
+            .batch_execute("RESET ROLE;")
+            .await
+            .map_err(CellSchemaError::postgres)?;
+        if step_attestation == StepAttestation::Attest {
+            let (revision, _) = attest_known_state(client).await?;
+            if revision != step.to {
+                return Err(CellSchemaError::CatalogDrift("forward step target"));
+            }
+        }
+        Ok(())
+    }
+    .await;
+    match body {
+        Ok(()) => client
+            .batch_execute("COMMIT;")
+            .await
+            .map_err(CellSchemaError::postgres),
+        Err(error) => {
+            // Best effort: a broken connection rolls back on its own.
+            let _ = client.batch_execute("ROLLBACK;").await;
+            Err(error)
+        }
+    }
+}
+
+fn forward_step_error(error: tokio_postgres::Error) -> CellSchemaError {
+    // 55P03 is `lock_not_available`: the step's `LOCK TABLE ... NOWAIT` met a live transaction.
+    if error
+        .as_db_error()
+        .is_some_and(|database_error| database_error.code().code() == "55P03")
+    {
+        CellSchemaError::ReplicasActive
+    } else {
+        CellSchemaError::Postgres
+    }
 }
 
 /// Run the install plan without the closing attestation.
@@ -1325,8 +1684,69 @@ pub async fn install_cell_schema(client: &Client) -> Result<CellInstallReport, C
 ///
 /// Returns [`CellSchemaError`] when a precondition fails, an existing schema does not attest, or a
 /// step is refused by the database.
+///
+/// Forward steps run here without their in-transaction attestation, because this seam is what
+/// measures a new state's pins before they exist. [`install_cell_schema`] never skips it.
 pub async fn apply_cell_install_plan(
     client: &Client,
+) -> Result<
+    (
+        CellInstallDisposition,
+        [(CellSchemaLayerId, LayerInstallOutcome); 6],
+    ),
+    CellSchemaError,
+> {
+    apply_install_plan_to(client, CELL_SCHEMA_CURRENT, StepAttestation::Skip).await
+}
+
+/// Install a FRESH cell at an older known state, then attest it as exactly that state.
+///
+/// For fixtures only, such as an upgrade test that needs a real [`CellSchemaRevision::R27`] cell.
+/// The operator binary does not expose it. On an existing schema it refuses unless the cell already
+/// attests as `target`, and it never moves a cell forward: that is [`upgrade_cell_schema`]'s job.
+///
+/// # Errors
+///
+/// As [`install_cell_schema`], and [`CellSchemaError::RefusedUnattestedSchema`] when the existing
+/// cell is at a different state.
+pub async fn install_cell_schema_at(
+    client: &Client,
+    target: CellSchemaRevision,
+) -> Result<CellInstallReport, CellSchemaError> {
+    acquire_cell_schema_lock(client).await?;
+    let result = async {
+        let (disposition, layer_outcomes) =
+            apply_install_plan_to(client, target, StepAttestation::Attest).await?;
+        let (revision, attestation) = attest_known_state(client).await?;
+        if revision != target {
+            return Err(CellSchemaError::CatalogDrift("install target state"));
+        }
+        Ok(CellInstallReport {
+            disposition,
+            layer_outcomes,
+            attestation,
+        })
+    }
+    .await;
+    let released = release_cell_schema_lock(client).await;
+    let report = result?;
+    released?;
+    Ok(report)
+}
+
+/// Whether a forward step attests its target state before `COMMIT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StepAttestation {
+    /// Every operator path.
+    Attest,
+    /// Only the measurement seam, which runs before the target's pins exist.
+    Skip,
+}
+
+async fn apply_install_plan_to(
+    client: &Client,
+    target: CellSchemaRevision,
+    step_attestation: StepAttestation,
 ) -> Result<
     (
         CellInstallDisposition,
@@ -1362,10 +1782,16 @@ pub async fn apply_cell_install_plan(
 
     let disposition = if schema_is_present(client).await? {
         // Forward migrations are one-shot, not idempotent, so an existing schema is never
-        // re-migrated. It must already attest, or this run refuses and changes nothing.
-        attest_cell_schema(client)
+        // re-migrated. It must already attest at the target state, or this run refuses and changes
+        // nothing. An older known state is refused too: moving it forward is `upgrade`'s job.
+        let (revision, _) = attest_known_state(client)
             .await
             .map_err(|error| CellSchemaError::RefusedUnattestedSchema(error.reason()))?;
+        if revision != target {
+            return Err(CellSchemaError::RefusedUnattestedSchema(
+                CellSchemaError::UpgradeRequired(revision).reason(),
+            ));
+        }
         for (index, layer) in CELL_SCHEMA_LAYERS.iter().enumerate() {
             layer_outcomes[index].1 = if layer.install_retired_after.is_some() {
                 LayerInstallOutcome::AttestedOnly
@@ -1389,6 +1815,23 @@ pub async fn apply_cell_install_plan(
                         call_layer_install(client, &CELL_SCHEMA_LAYERS[index]).await?;
                 }
             }
+        }
+        // Fresh install walks the same forward steps an upgrade does, through the same wrapper, so
+        // a fresh cell and an upgraded cell run identical statements in identical order. Only the
+        // data the backfill sees differs.
+        let mut reached = CellSchemaRevision::R27;
+        for step in &CELL_FORWARD_STEPS {
+            if reached == target {
+                break;
+            }
+            if step.from != reached {
+                return Err(CellSchemaError::Precondition("forward steps out of order"));
+            }
+            apply_forward_step(client, step, step_attestation).await?;
+            reached = step.to;
+        }
+        if reached != target {
+            return Err(CellSchemaError::Precondition("install target unreachable"));
         }
         CellInstallDisposition::Created
     };
@@ -1443,9 +1886,26 @@ pub async fn revoke_replaced_function_privileges(
 ///
 /// Returns [`CellSchemaError`] on any partial identity tuple, identity drift, catalog drift,
 /// residual service-role privilege on a replaced function, missing inert state, or a retired
-/// readback entrypoint that is still reachable.
+/// readback entrypoint that is still reachable. A cell that fully attests as a known older state
+/// is refused with [`CellSchemaError::UpgradeRequired`], and one whose revision marker is newer
+/// than this build knows with [`CellSchemaError::FutureSchema`].
 pub async fn attest_cell_schema(client: &Client) -> Result<CellAttestation, CellSchemaError> {
+    let (revision, attestation) = attest_known_state(client).await?;
+    if revision != CELL_SCHEMA_CURRENT {
+        return Err(CellSchemaError::UpgradeRequired(revision));
+    }
+    Ok(attestation)
+}
+
+/// Fully attest the live catalog against whichever known state it matches.
+///
+/// Every check other than the manifest comparison is the same for every known state. An older
+/// state is therefore attested exactly as strictly as the current one before anything may move it.
+async fn attest_known_state(
+    client: &Client,
+) -> Result<(CellSchemaRevision, CellAttestation), CellSchemaError> {
     assert_migrator_session(client).await?;
+    assert_revision_marker_known(client).await?;
     let layers = read_layer_identities(client).await?;
     for (index, (id, identity)) in layers.iter().enumerate() {
         if *identity == LayerIdentity::Absent {
@@ -1455,31 +1915,73 @@ pub async fn attest_cell_schema(client: &Client) -> Result<CellAttestation, Cell
     }
 
     let (catalog_sections, catalog_blake3) = read_catalog_manifest(client).await?;
-    for (index, section) in catalog_sections.iter().enumerate() {
-        if *section != CELL_CATALOG_SECTION_BLAKE3_V1[index] {
-            return Err(CellSchemaError::CatalogDrift(
-                CELL_CATALOG_MANIFEST_SECTIONS[index],
-            ));
+    let Some(schema_revision) = classify_cell_catalog(&catalog_sections, &catalog_blake3) else {
+        // Name the first section that disagrees with the CURRENT pin, as before CR-038: the
+        // operator's next question is what differs from what this build expects.
+        let current = CELL_SCHEMA_STATES
+            .iter()
+            .find(|(revision, _, _)| *revision == CELL_SCHEMA_CURRENT)
+            .ok_or(CellSchemaError::InvalidResponse("current schema pin"))?;
+        for (index, section) in catalog_sections.iter().enumerate() {
+            if *section != current.1[index] {
+                return Err(CellSchemaError::CatalogDrift(
+                    CELL_CATALOG_MANIFEST_SECTIONS[index],
+                ));
+            }
         }
-    }
-    if catalog_blake3 != CELL_CATALOG_MANIFEST_BLAKE3_V1 {
         return Err(CellSchemaError::CatalogDrift("manifest"));
-    }
+    };
 
     let replaced_functions_revoked = assert_no_residual_service_privilege(client).await?;
     let inert_tables_present = assert_inert_state(client).await?;
     let retention_read_state_result = read_retention_state(client).await?;
     let retired_readbacks = assert_retired_readbacks(client).await?;
 
-    Ok(CellAttestation {
-        layers,
-        catalog_sections,
-        catalog_blake3,
-        retention_read_state_result,
-        retired_readbacks,
-        replaced_functions_revoked,
-        inert_tables_present,
-    })
+    Ok((
+        schema_revision,
+        CellAttestation {
+            schema_revision,
+            layers,
+            catalog_sections,
+            catalog_blake3,
+            retention_read_state_result,
+            retired_readbacks,
+            replaced_functions_revoked,
+            inert_tables_present,
+        },
+    ))
+}
+
+/// Refuse a cell whose runtime revision marker names a state this build does not know.
+///
+/// Absence is not an error here: an [`CellSchemaRevision::R27`] cell predates the marker, and the
+/// manifest classification decides what it is. A present marker must name exactly the revision
+/// this build ships; a higher value is a newer installer's cell, a lower one cannot exist.
+async fn assert_revision_marker_known(client: &Client) -> Result<(), CellSchemaError> {
+    let present: bool = query_one_value(client, REVISION_MARKER_PRESENT_SQL).await?;
+    if !present {
+        return Ok(());
+    }
+    // EXECUTE is granted to the runtime role only. Read it as the owner, the same way the layer
+    // tuples are read, and never leave the session as the owner.
+    client
+        .batch_execute(&format!("SET ROLE {CELL_OWNER_ROLE};"))
+        .await
+        .map_err(CellSchemaError::postgres)?;
+    let read = client.query_one(REVISION_MARKER_READ_SQL, &[]).await;
+    client
+        .batch_execute("RESET ROLE;")
+        .await
+        .map_err(CellSchemaError::postgres)?;
+    let marker: i32 = read
+        .map_err(CellSchemaError::postgres)?
+        .try_get(0)
+        .map_err(|_error| CellSchemaError::InvalidResponse("revision marker"))?;
+    match marker.cmp(&crate::drain_policy::CELL_SCHEMA_REVISION) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(CellSchemaError::FutureSchema),
+        std::cmp::Ordering::Less => Err(CellSchemaError::CatalogDrift("revision marker")),
+    }
 }
 
 /// Read the live catalog manifest without comparing it, for measuring the pinned digests.
