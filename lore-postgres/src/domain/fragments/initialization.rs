@@ -325,7 +325,18 @@ async fn completed(
         ));
     }
     attest_clean_fences(tx).await?;
-    let ready: bool = tx
+    if !clean_readiness_holds(tx).await? {
+        return Err(DomainError::NotReady(
+            "clean initialization enforcement or sequence headroom lost".into(),
+        ));
+    }
+    Ok(true)
+}
+
+/// Enforcement, fencing, fence-sequence headroom and readable-head
+/// resolvability: the database half of a clean cell's standing readiness.
+pub(super) async fn clean_readiness_holds(tx: &Transaction<'_>) -> Result<bool, DomainError> {
+    Ok(tx
         .query_one(
             "SELECT EXISTS (SELECT 1 FROM lore_domain_schema_state WHERE enforcement_enabled) \
          AND EXISTS (SELECT 1 FROM lore_domain_lock_schema_state WHERE fencing_enabled) \
@@ -342,13 +353,7 @@ async fn completed(
         )
         .await
         .map_err(|e| DomainError::from_pg("clean initialization current readiness", e))?
-        .get(0);
-    if !ready {
-        return Err(DomainError::NotReady(
-            "clean initialization enforcement or sequence headroom lost".into(),
-        ));
-    }
-    Ok(true)
+        .get(0))
 }
 
 pub(super) async fn attest_clean_fences(tx: &Transaction<'_>) -> Result<(), DomainError> {

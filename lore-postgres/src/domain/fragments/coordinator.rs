@@ -1479,7 +1479,23 @@ impl PostgresFragmentCoordinator {
     /// instead of failing. Auto-applying it here would make every unmigrated
     /// cell silently cut over on a binary roll — and applying it at boot is
     /// what aborted startup on unmigrated cells in INV-EE P0-1's sibling case.
+    ///
+    /// A clean-initialized cell behind the compiled revision is refused before
+    /// any DDL: its permanent fence forbids the stage DDL's version raise, and
+    /// the supported path is the explicit offline upgrade (CR-039).
     pub async fn bootstrap(&self) -> Result<(), DomainError> {
+        let probe = self.checkout().await?;
+        let needs_upgrade = super::upgrade::clean_cell_needs_upgrade(&probe).await?;
+        drop(probe);
+        if let Some(version) = needs_upgrade {
+            return Err(DomainError::NotReady(format!(
+                "this clean-initialized cell's fragment schema is revision {version}; this \
+                 binary needs {}. Do not reset the cell: stop every replica, back up the cell \
+                 database, then run `loreserver domain upgrade-fragments \
+                 --confirm-replicas-stopped`",
+                schema::FRAGMENT_SCHEMA_VERSION
+            )));
+        }
         crate::pool::ensure_schema(&self.pool, schema::FRAGMENT_SCHEMA)
             .await
             .map_err(|error| {

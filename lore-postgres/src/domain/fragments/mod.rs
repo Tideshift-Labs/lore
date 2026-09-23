@@ -91,6 +91,7 @@ pub mod schema;
 pub mod stage_rotation_schema;
 pub mod stage_schema;
 pub mod states;
+pub mod upgrade;
 
 /// Whether this build carries WP-118 Phase 9's fragment failpoints.
 ///

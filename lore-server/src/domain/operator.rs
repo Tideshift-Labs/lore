@@ -176,6 +176,16 @@ pub enum DomainCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Upgrade a clean-initialized cell's fragment schema to this binary's
+    /// revision (CR-039). Offline: every replica must be stopped first.
+    UpgradeFragments {
+        /// Attest that every loreserver replica of this cell is stopped.
+        #[arg(long)]
+        confirm_replicas_stopped: bool,
+        /// Print one JSON object.
+        #[arg(long)]
+        json: bool,
+    },
     /// Report this cell's domain and SCHEMA-117 lock cutover state.
     Status {
         /// Print one JSON object instead of the human-readable report.
@@ -256,6 +266,13 @@ pub async fn run(command: &DomainCommand, settings: &Settings) -> Result<()> {
                 *json,
             )
             .await
+        }
+        DomainCommand::UpgradeFragments {
+            confirm_replicas_stopped,
+            json,
+        } => {
+            crate::domain::fragment_operator::upgrade(settings, *confirm_replicas_stopped, *json)
+                .await
         }
         DomainCommand::Status { json } => {
             let context = DomainOperatorContext::open(settings).await?;
