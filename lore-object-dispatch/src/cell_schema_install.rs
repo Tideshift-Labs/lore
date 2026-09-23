@@ -262,7 +262,12 @@ pub const CELL_DEFERRED_MIGRATIONS: [u16; 3] = [4, 5, 6];
 /// in. The list is closed: a manifest that matches no state here is drift, never a guess.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CellSchemaRevision {
-    /// The frozen install set, 0002-0027. Upgradable to [`CellSchemaRevision::R28`], nothing else.
+    /// 0002, 0003, 0007-0025: a cell installed before WP-122's drain policy (CR-038 addendum,
+    /// 2026-09-23). Slot 0's local cell is in this state.
+    R25,
+    /// `R25` plus 0026, the drain policy and spool custody.
+    R26,
+    /// The frozen install set, 0002-0027.
     R27,
     /// `R27` plus forward step 0028, the spool metadata true-up. The current state.
     R28,
@@ -273,8 +278,21 @@ impl CellSchemaRevision {
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
+            Self::R25 => "R25",
+            Self::R26 => "R26",
             Self::R27 => "R27",
             Self::R28 => "R28",
+        }
+    }
+
+    /// The highest migration number this state contains.
+    #[must_use]
+    pub const fn last_migration(self) -> u16 {
+        match self {
+            Self::R25 => 25,
+            Self::R26 => 26,
+            Self::R27 => 27,
+            Self::R28 => 28,
         }
     }
 }
@@ -294,21 +312,118 @@ pub struct CellForwardStep {
     pub from: CellSchemaRevision,
     /// The state the cell must attest as after the step, before `COMMIT`.
     pub to: CellSchemaRevision,
-    /// The step's embedded body and its pinned digest.
+    /// The step's embedded artifact and its pinned digest.
     pub migration: CellMigration,
+    /// `true` when [`CellForwardStep::migration`] is a FROZEN install artifact that carries its own
+    /// `BEGIN;`/`COMMIT;` lines. Its forward body is then those exact bytes with the two lines
+    /// removed by [`forward_step_body`], so a fresh install and an upgrade run the same statements
+    /// and no second copy of the artifact exists to drift.
+    pub unwrap_frozen_transaction: bool,
+    /// Runs first inside the step's transaction: take the owner role, lock every existing cell
+    /// table the step touches `NOWAIT`, and refuse any state the step cannot carry forward safely.
+    pub prelude_sql: &'static str,
 }
 
-/// The forward steps, in order. Only N-1 to N is supported (CR-038 D2): a cell further behind is
-/// unknown to this installer and is reinstalled, never walked forward.
-pub const CELL_FORWARD_STEPS: [CellForwardStep; 1] = [CellForwardStep {
-    from: CellSchemaRevision::R27,
-    to: CellSchemaRevision::R28,
-    migration: cell_migration!(
-        28,
-        "0028_object_store_dispatch_drain_metadata_true_up.sql",
-        "8c7fa36216f887c046bfe6102e13fe3384e1af492754aeb6f9aee8e93b9c8be2"
-    ),
-}];
+/// The four tables every drain step touches, locked `NOWAIT` as in 0027's offline rotation.
+const DRAIN_TABLES_LOCK_SQL: &str = "SET LOCAL ROLE object_dispatch_retention_owner;
+LOCK TABLE object_store_retention.object_dispatch_spool_objects,
+ object_store_retention.drain_spool_custody,object_store_retention.object_dispatch_quota_usage,
+ object_store_retention.drain_policies IN ACCESS EXCLUSIVE MODE NOWAIT;";
+
+/// Message the R25 -> R26 prelude raises for a cell that still has spool state.
+const IN_FLIGHT_SPOOL_REFUSAL: &str = "CR038_UPGRADE_IN_FLIGHT_SPOOL";
+
+/// 0026 replaces `put_spool_ready` (it then requires a drain custody row) and revokes the runtime's
+/// direct `reserve_put`/`upload_progress` grants. A spool object reserved before 0026 could never
+/// become ready afterwards, and its quota charge could never be returned by the drain path. So the
+/// step refuses a cell that holds any spool object or any nonzero quota usage. The drain tables do
+/// not exist yet; the two that do are locked.
+const R25_TO_R26_PRELUDE_SQL: &str = "SET LOCAL ROLE object_dispatch_retention_owner;
+LOCK TABLE object_store_retention.object_dispatch_spool_objects,
+ object_store_retention.object_dispatch_quota_usage IN ACCESS EXCLUSIVE MODE NOWAIT;
+DO $prelude$
+BEGIN
+ IF EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_spool_objects)
+ OR EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_quota_usage
+            WHERE used_bytes<>0 OR used_rows<>0 OR used_concurrency<>0) THEN
+  RAISE EXCEPTION 'CR038_UPGRADE_IN_FLIGHT_SPOOL' USING ERRCODE='55000';
+ END IF;
+END $prelude$;";
+
+/// The forward steps, in order, each from one known state to the next (CR-038 D2 as amended by
+/// the 2026-09-23 addendum). `upgrade` chains them until the cell reaches [`CELL_SCHEMA_CURRENT`].
+/// A cell at a state outside [`CELL_SCHEMA_STATES`] is still refused, never walked forward.
+pub const CELL_FORWARD_STEPS: [CellForwardStep; 3] = [
+    CellForwardStep {
+        from: CellSchemaRevision::R25,
+        to: CellSchemaRevision::R26,
+        migration: CELL_INSTALL_SET[21],
+        unwrap_frozen_transaction: true,
+        prelude_sql: R25_TO_R26_PRELUDE_SQL,
+    },
+    CellForwardStep {
+        from: CellSchemaRevision::R26,
+        to: CellSchemaRevision::R27,
+        migration: CELL_INSTALL_SET[22],
+        unwrap_frozen_transaction: true,
+        prelude_sql: DRAIN_TABLES_LOCK_SQL,
+    },
+    CellForwardStep {
+        from: CellSchemaRevision::R27,
+        to: CellSchemaRevision::R28,
+        migration: cell_migration!(
+            28,
+            "0028_object_store_dispatch_drain_metadata_true_up.sql",
+            "8c7fa36216f887c046bfe6102e13fe3384e1af492754aeb6f9aee8e93b9c8be2"
+        ),
+        unwrap_frozen_transaction: false,
+        prelude_sql: DRAIN_TABLES_LOCK_SQL,
+    },
+];
+
+/// The SQL a forward step actually runs inside the installer's transaction.
+///
+/// For a frozen artifact, the exact bytes minus its one `BEGIN;` line and its final `COMMIT;`
+/// line. The strip is validated rather than trusted: exactly one line reads `BEGIN;`, exactly one
+/// reads `COMMIT;`, the `BEGIN;` comes first, and nothing but blank lines follows `COMMIT;`.
+/// Anything else fails closed, so an edited artifact cannot silently lose or keep a statement.
+///
+/// # Errors
+///
+/// [`CellSchemaError::Precondition`] when the artifact does not have exactly that shape.
+pub fn forward_step_body(step: &CellForwardStep) -> Result<&'static str, CellSchemaError> {
+    let sql = step.migration.sql;
+    if !step.unwrap_frozen_transaction {
+        return Ok(sql);
+    }
+    let shape = CellSchemaError::Precondition("frozen forward artifact shape");
+    let mut begin_end = None;
+    let mut commit_start = None;
+    let mut offset = 0;
+    for line in sql.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        if text == "BEGIN;" {
+            if begin_end.is_some() {
+                return Err(shape);
+            }
+            begin_end = Some(offset + line.len());
+        } else if text == "COMMIT;" {
+            if commit_start.is_some() {
+                return Err(shape);
+            }
+            commit_start = Some(offset);
+        } else if commit_start.is_some() && !text.trim().is_empty() {
+            return Err(shape);
+        }
+        offset += line.len();
+    }
+    match (begin_end, commit_start) {
+        (Some(begin_end), Some(commit_start)) if begin_end <= commit_start => {
+            sql.get(begin_end..commit_start).ok_or(shape)
+        }
+        _ => Err(shape),
+    }
+}
 
 /// Fail closed if packaging or merge changed any embedded artifact's bytes.
 ///
@@ -321,10 +436,28 @@ pub fn validate_cell_install_set_digests() -> bool {
             return false;
         }
     }
+    // Each step carries exactly the migration that turns `from` into `to`, the steps form one
+    // unbroken chain ending at the current state, and every body has the shape it claims.
+    let mut previous: Option<CellSchemaRevision> = None;
     for step in CELL_FORWARD_STEPS {
-        if blake3::hash(step.migration.sql.as_bytes()).as_bytes() != &step.migration.blake3 {
+        if blake3::hash(step.migration.sql.as_bytes()).as_bytes() != &step.migration.blake3
+            || step.migration.number != step.to.last_migration()
+            || step.from.last_migration() + 1 != step.to.last_migration()
+            || previous.is_some_and(|previous| previous != step.from)
+            || forward_step_body(&step).is_err()
+        {
             return false;
         }
+        if step.unwrap_frozen_transaction
+            && cell_migration_for(step.migration.number)
+                .is_none_or(|frozen| frozen.blake3 != step.migration.blake3)
+        {
+            return false;
+        }
+        previous = Some(step.to);
+    }
+    if previous != Some(CELL_SCHEMA_CURRENT) {
+        return false;
     }
     for layer in CELL_SCHEMA_LAYERS {
         let Some(migration) = cell_migration_for(layer.contract_migration) else {
@@ -1064,8 +1197,68 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R28: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R28: [u8; 32] =
     hex32("5b5785d20aa33ae0bce288a1317d9a2985be92c36bf159f0ae3172587da12b25");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 16 (CR-038 addendum).
+///
+/// Measured 2026-09-23 on `postgres:16` from a fresh 0002-0025 install. The same twelve digests
+/// were read, read-only, from slot 0's live cell database, which was installed on 2026-09-19 from
+/// `lore` `dae71dfc`. A `pg_dump`/`pg_restore` copy of that cell does NOT match: the restore
+/// re-parses two `CHECK` expressions and flattens nested `AND` parentheses, so `constraints`
+/// differs. A restored copy is a different catalog, not an R25 cell.
+pub const CELL_CATALOG_SECTION_BLAKE3_R25: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R27[0],
+    hex32("316036b2379716cfa8f437588afff7b0e51f5158c04146525589e9bfc00e07a4"),
+    hex32("a034c938af4fe80ed2e47aae05b84de1d2164c71a1f4ba7c17598f834fa4a496"),
+    hex32("5c0279033f49f711b0ef2a70144a314a670b789fe27afd57129a4122f6ca294c"),
+    hex32("e73d69307f2270734c4acb7b0e35e6fae8348abdbf88bec1b78d15ba7cfaec72"),
+    hex32("f7f3af85ac11837251f1814f7e721f9f2df634bfcacb49782cd34f51c5879687"),
+    hex32("99ba715475d61c65393cb42a54aafd2341ba23f32bddddce3b4fa0c1c07b415a"),
+    hex32("b5063dc0c02feafa2decaedcd73057af6682a52baa02aaca5530319bce328218"),
+    hex32("ceb77a757063fe3514a25f80be242a241943cab76539cf201550a1fc976443d4"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[9],
+    hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R25`] cell, `PostgreSQL` 16.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R25: [u8; 32] =
+    hex32("ed7c07f323cd32412f77bc614741fa870da3a969c9668ff939ab80fcd2a94426");
+
+/// Pinned per-section digests of state [`CellSchemaRevision::R26`], `PostgreSQL` 16 (CR-038 addendum).
+///
+/// Measured 2026-09-23 on `postgres:16` from a fresh 0002-0026 install. 0027 then moves `columns`,
+/// `constraints`, `functions`, `function_acls` and `triggers`, exactly the sections its own
+/// description in [`CELL_CATALOG_SECTION_BLAKE3_R27`] names.
+pub const CELL_CATALOG_SECTION_BLAKE3_R26: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R27[0],
+    CELL_CATALOG_SECTION_BLAKE3_R27[1],
+    hex32("f8656b9d79eb144a94396c15f79de29b1da73af1c4446365c6e01016a127b1b6"),
+    hex32("d1eb1d30d773f43263eebc32f7fda6c0d76ead4db61ff9c3368e1fabdd96d659"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[4],
+    CELL_CATALOG_SECTION_BLAKE3_R27[5],
+    hex32("cc086af82332d5da9a02d677e0d4cb5d61faab154b94515a8216e56946906fd8"),
+    hex32("20f0e57fceca9fb24b6f95db94bbc960ec39ac7df3a93cc1610bfe2185196ae8"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[8],
+    CELL_CATALOG_SECTION_BLAKE3_R27[9],
+    hex32("b5f633ebe7a54a9d43e75d043387b67cc659395fa8f0880a5c0d869a2b90fe81"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R26`] cell, `PostgreSQL` 16.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R26: [u8; 32] =
+    hex32("b944ad69c2cd0efc047f54096f4ac17f815a2944efdfe3818b10bcfe7d6bcbdc");
+
 /// Every known state with its pins, oldest first. Attestation classifies against this closed list.
-pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 2] = [
+pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4] = [
+    (
+        CellSchemaRevision::R25,
+        CELL_CATALOG_SECTION_BLAKE3_R25,
+        CELL_CATALOG_MANIFEST_BLAKE3_R25,
+    ),
+    (
+        CellSchemaRevision::R26,
+        CELL_CATALOG_SECTION_BLAKE3_R26,
+        CELL_CATALOG_MANIFEST_BLAKE3_R26,
+    ),
     (
         CellSchemaRevision::R27,
         CELL_CATALOG_SECTION_BLAKE3_R27,
@@ -1550,9 +1743,10 @@ pub async fn release_cell_schema_lock(client: &Client) -> Result<(), CellSchemaE
     }
 }
 
-/// Move an attested [`CellSchemaRevision::R27`] cell to [`CELL_SCHEMA_CURRENT`] (CR-038).
+/// Move a cell at any known older state to [`CELL_SCHEMA_CURRENT`] (CR-038 and its 2026-09-23
+/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28.
 ///
-/// Offline only: every replica must be stopped. The session guard checks ONCE, before the step's
+/// Offline only: every replica must be stopped. The session guard checks ONCE before each step's
 /// `BEGIN`: it refuses if any other session is connected to the cell database. A session that
 /// connects after that check is not seen by it. The step's `LOCK TABLE ... NOWAIT` refuses such a
 /// session only if it already holds one of the four cell tables. Otherwise it is benign: a binary
@@ -1586,21 +1780,29 @@ async fn upgrade_locked(client: &Client) -> Result<CellUpgradeReport, CellSchema
             "no cell schema to upgrade; run install",
         ));
     }
-    let (revision, _) = attest_known_state(client).await?;
-    let disposition = if revision == CELL_SCHEMA_CURRENT {
+    let (start, _) = attest_known_state(client).await?;
+    let disposition = if start == CELL_SCHEMA_CURRENT {
         CellUpgradeDisposition::AlreadyCurrent
     } else {
-        let Some(step) = CELL_FORWARD_STEPS
-            .iter()
-            .find(|step| step.from == revision && step.to == CELL_SCHEMA_CURRENT)
-        else {
-            return Err(CellSchemaError::Precondition(
-                "no forward step from this state",
-            ));
-        };
-        assert_no_active_service_sessions(client).await?;
-        apply_forward_step(client, step, StepAttestation::Attest).await?;
-        CellUpgradeDisposition::Upgraded(revision)
+        // One committed, attested step at a time. A crash between two steps leaves the cell at a
+        // known intermediate state, and the next run starts from there: each step classifies
+        // afresh rather than trusting what this loop believed it had reached.
+        let mut reached = start;
+        while reached != CELL_SCHEMA_CURRENT {
+            let Some(step) = CELL_FORWARD_STEPS.iter().find(|step| step.from == reached) else {
+                return Err(CellSchemaError::Precondition(
+                    "no forward step from this state",
+                ));
+            };
+            assert_no_active_service_sessions(client).await?;
+            apply_forward_step(client, step, StepAttestation::Attest).await?;
+            let (observed, _) = attest_known_state(client).await?;
+            if observed != step.to {
+                return Err(CellSchemaError::CatalogDrift("forward step target"));
+            }
+            reached = observed;
+        }
+        CellUpgradeDisposition::Upgraded(start)
     };
     revoke_replaced_function_privileges(client).await?;
     let attestation = attest_cell_schema(client).await?;
@@ -1634,8 +1836,13 @@ async fn apply_forward_step(
         .await
         .map_err(CellSchemaError::postgres)?;
     let body = async {
+        let sql = forward_step_body(step)?;
         client
-            .batch_execute(step.migration.sql)
+            .batch_execute(step.prelude_sql)
+            .await
+            .map_err(forward_step_error)?;
+        client
+            .batch_execute(sql)
             .await
             .map_err(forward_step_error)?;
         // The step body ends as the owner (`SET LOCAL ROLE`). Attestation must run as the migrator,
@@ -1667,12 +1874,16 @@ async fn apply_forward_step(
 }
 
 fn forward_step_error(error: tokio_postgres::Error) -> CellSchemaError {
+    let Some(database_error) = error.as_db_error() else {
+        return CellSchemaError::Postgres;
+    };
     // 55P03 is `lock_not_available`: the step's `LOCK TABLE ... NOWAIT` met a live transaction.
-    if error
-        .as_db_error()
-        .is_some_and(|database_error| database_error.code().code() == "55P03")
-    {
+    if database_error.code().code() == "55P03" {
         CellSchemaError::ReplicasActive
+    } else if database_error.message() == IN_FLIGHT_SPOOL_REFUSAL {
+        CellSchemaError::Precondition(
+            "the cell holds spool objects or quota charges that the R25 upgrade cannot carry forward",
+        )
     } else {
         CellSchemaError::Postgres
     }
@@ -1812,26 +2023,43 @@ async fn apply_install_plan_to(
         }
         CellInstallDisposition::Replayed
     } else {
+        // The frozen install set, as frozen artifacts with their own transactions, up to the
+        // target or to its end (R27), whichever comes first. A target older than R27 is only ever a
+        // fixture: it stops the frozen chain at that state's last migration.
+        let frozen_state = if target.last_migration() < CellSchemaRevision::R27.last_migration() {
+            target
+        } else {
+            CellSchemaRevision::R27
+        };
         for step in cell_install_plan() {
             match step {
                 CellInstallStep::Migration(index) => {
                     let migration = CELL_INSTALL_SET[index];
+                    if migration.number > frozen_state.last_migration() {
+                        continue;
+                    }
                     client
                         .batch_execute(migration.sql)
                         .await
                         .map_err(CellSchemaError::postgres)?;
                 }
                 CellInstallStep::InstallLayer(index) => {
-                    layer_outcomes[index].1 =
-                        call_layer_install(client, &CELL_SCHEMA_LAYERS[index]).await?;
+                    let layer = &CELL_SCHEMA_LAYERS[index];
+                    if layer.installed_after_migration > frozen_state.last_migration() {
+                        continue;
+                    }
+                    layer_outcomes[index].1 = call_layer_install(client, layer).await?;
                 }
             }
         }
-        // Fresh install walks the same forward steps an upgrade does, through the same wrapper, so
-        // a fresh cell and an upgraded cell run identical statements in identical order. Only the
-        // data the backfill sees differs.
-        let mut reached = CellSchemaRevision::R27;
-        for step in &CELL_FORWARD_STEPS {
+        // Past R27, fresh install walks the same forward steps an upgrade does, through the same
+        // wrapper, so a fresh cell and an upgraded cell run identical statements in identical
+        // order. Only the data the backfill sees differs.
+        let mut reached = frozen_state;
+        for step in CELL_FORWARD_STEPS
+            .iter()
+            .filter(|step| step.from.last_migration() >= frozen_state.last_migration())
+        {
             if reached == target {
                 break;
             }

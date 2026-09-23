@@ -14,7 +14,7 @@
 //! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../cell"
 //! cell-schema-install install    # install the CR-033 D5 set, then attest
 //! cell-schema-install attest     # attest only; never writes schema
-//! cell-schema-install upgrade    # CR-038: move an attested R27 cell to the current state, offline
+//! cell-schema-install upgrade    # CR-038: move an attested R25/R26/R27 cell to current, offline
 //! cell-schema-install measure    # print the live catalog manifest digests
 //! ```
 //!

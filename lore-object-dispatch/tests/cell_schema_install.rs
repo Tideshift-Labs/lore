@@ -1085,11 +1085,15 @@ fn strip_sql_line_comments(source: &str) -> String {
 fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
     assert_eq!(
         CELL_FORWARD_STEPS.len(),
-        1,
+        3,
         "a new forward step must extend this sweep, not bypass it"
     );
     for step in CELL_FORWARD_STEPS {
-        let code = strip_sql_line_comments(step.migration.sql).to_ascii_uppercase();
+        // The body the installer actually runs: for 0026 and 0027, the frozen artifact minus its
+        // own `BEGIN;`/`COMMIT;` lines (CR-038 addendum).
+        let body = lore_object_dispatch::cell_schema_install::forward_step_body(&step)
+            .expect("every forward step has a valid body");
+        let code = strip_sql_line_comments(body).to_ascii_uppercase();
         // Transaction-control statements, not the bare word: a PL/pgSQL function body legitimately
         // contains `BEGIN ... END $$;` block delimiters, which are not `BEGIN;`/`BEGIN ISOLATION
         // ...` transaction control and must not trip this guard. `COMMIT` never appears in a step
@@ -1108,11 +1112,22 @@ fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
 
 #[test]
 fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
-    // Test plan item 8's structural sibling: CR-038 D2 supports only N-1 to N, so the chain must
-    // be exactly one hop from R27 to CELL_SCHEMA_CURRENT with no gap and no branch.
-    assert_eq!(CELL_FORWARD_STEPS[0].from, CellSchemaRevision::R27);
+    // CR-038 D2 as amended 2026-09-23: every step is one state to the next, and the steps form one
+    // unbroken chain R25 -> R26 -> R27 -> CELL_SCHEMA_CURRENT with no gap and no branch.
+    let hops: Vec<_> = CELL_FORWARD_STEPS
+        .iter()
+        .map(|step| (step.from, step.to))
+        .collect();
     assert_eq!(
-        CELL_FORWARD_STEPS[0].to,
+        hops,
+        vec![
+            (CellSchemaRevision::R25, CellSchemaRevision::R26),
+            (CellSchemaRevision::R26, CellSchemaRevision::R27),
+            (CellSchemaRevision::R27, CellSchemaRevision::R28),
+        ]
+    );
+    assert_eq!(
+        CELL_FORWARD_STEPS[2].to,
         lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT
     );
 }
