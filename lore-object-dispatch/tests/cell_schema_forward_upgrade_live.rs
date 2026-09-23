@@ -30,8 +30,13 @@ use lore_object_dispatch::DispatchConnectionBudget;
 use lore_object_dispatch::DispatchDatabaseIdentity;
 use lore_object_dispatch::DispatchPoolConfig;
 use lore_object_dispatch::DispatchPoolRole;
+use lore_object_dispatch::DispatchRecordLimits;
+use lore_object_dispatch::DispatchRuntimeClient;
 use lore_object_dispatch::DispatchRuntimePool;
 use lore_object_dispatch::DispatchTlsMode;
+use lore_object_dispatch::PutStreamIdentity;
+use lore_object_dispatch::ReservePutQuotaScope;
+use lore_object_dispatch::ReservePutRequest;
 use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT;
 use lore_object_dispatch::cell_schema_install::CellSchemaError;
 use lore_object_dispatch::cell_schema_install::CellSchemaRevision;
@@ -527,6 +532,70 @@ async fn reserve_and_release(
     let intent = client.claim_cleanup(descriptor.spool_object_id).await?;
     client.release_cleanup(&intent).await?;
     Ok(())
+}
+
+// -------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23) fixture: admit one genuine `object_dispatch_spool_objects` row
+// (state 1, RESERVED) through the real 0013 `ReservePut` procedure, via the typed runtime client
+// -- not a hand-crafted INSERT. `payload_kind = 1` (chunked upload, the identity's `upload_id` and
+// `upload_fence` both set) needs no pre-existing `object_dispatch_requests` row:
+// `bound_request_logical_request_id` stays NULL, and a composite foreign key with a NULL column is
+// not enforced. The blake3-shaped fields below are opaque 32-byte tokens the procedure stores and
+// later re-derives its own ACK digest from; they are not required to be a real hash of anything,
+// exactly as `tests/dispatch_client_live.rs`'s own fixture uses fixed byte patterns for the same
+// fields.
+// -------------------------------------------------------------------------------------------
+
+async fn admit_one_reserved_spool_object(pool: Arc<DispatchRuntimePool>, boundary: &str) {
+    let runtime = DispatchRuntimeClient::new(pool).expect("runtime client");
+    let identity = PutStreamIdentity {
+        provider_boundary_id: boundary.into(),
+        authenticated_cell_id: "r25-refusal-cell".into(),
+        authenticated_tenant_id: "r25-refusal-tenant".into(),
+        logical_request_id: Uuid::now_v7(),
+        attempt_id: Uuid::now_v7(),
+        upload_id: Uuid::now_v7(),
+        upload_fence: 1,
+    };
+    let quota = ReservePutQuotaScope {
+        max_bytes: 100,
+        max_rows: 10,
+        max_concurrency: 10,
+        low_water_bytes: 0,
+        low_water_rows: 0,
+        low_water_concurrency: 0,
+    };
+    let request = ReservePutRequest {
+        protocol_revision: "protocol-1".into(),
+        policy_revision: "policy-1".into(),
+        identity,
+        spool_object_id: Uuid::now_v7(),
+        boundary_blake3: [0x41; 32],
+        boundary_token: "boundary-token".into(),
+        observation_binding_blake3: [0x51; 32],
+        expected_size: 10,
+        expected_blake3: [0x31; 32],
+        put_reservation_fingerprint: [0x61; 32],
+        allocation_revision: "allocation-1".into(),
+        allocation_fence: 1,
+        reservation_deadline_unix_ms: 4_000_000_000_000,
+        allocation_hard_expiry_unix_ms: 4_000_000_000_000,
+        prepared_ttl_ms: 60_000,
+        max_chunk_bytes: 1_048_576,
+        quota_revision: 1,
+        global_quota: quota,
+        cell_quota: quota,
+        tenant_quota: quota,
+        limits: DispatchRecordLimits {
+            maximum_identity_bytes: 256,
+            maximum_boundary_token_bytes: 256,
+            maximum_record_bytes: 16_777_216,
+        },
+    };
+    runtime
+        .reserve_put(&request)
+        .await
+        .expect("admit one real reservation through 0013, leaving a spool_objects row behind");
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2575,4 +2644,435 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
     attest_cell_schema(&migrator)
         .await
         .expect("attestation holds again once the real function is restored");
+}
+
+// -------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23), test plan item 1: a cell installed at R25 -- slot 0's actual
+// state -- upgrades through R26 and R27 to the current state, attests R28, and then accepts real
+// write-behind traffic: a genuine DrainClient reserve/claim/release cycle, and write-behind
+// startup's own schema-revision check.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database with a real BLAKE3 provider"]
+async fn live_install_at_r25_upgrades_to_current_and_drain_client_writes() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_CHAIN_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R25)
+        .await
+        .expect("install a real R25 cell (slot 0's actual state)");
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R25)),
+        "a fresh R25 install must attest as R25, not as current"
+    );
+
+    let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
+    let now = now_ms(&fixture.client).await;
+    let boundary = "r25-chain-boundary";
+    let cell = "r25-chain-cell";
+    let service = "r25-chain-service";
+
+    let base_url = fixture.base_url.clone();
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    let report = upgrade_cell_schema(&migrator)
+        .await
+        .expect("upgrade an R25 cell all the way to current: R25 -> R26 -> R27 -> R28");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R25)
+    );
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+
+    let fixture = admin_at(base_url).await;
+    install_blake3_provider(&fixture.client).await;
+    let allocation = publish_budget(
+        &fixture.client,
+        boundary,
+        cell,
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    let policy = drain_policy(
+        boundary,
+        cell,
+        service,
+        "r25-chain-policy-v1",
+        u64::try_from(now + 3_600_000).unwrap(),
+        16_384 * 8,
+        1_000_000,
+    );
+    publish_drain_policy(&fixture.client, &policy).await;
+    let policy_digest = policy.digest().unwrap();
+
+    let pool = Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    );
+    let client = DrainClient::new(pool);
+    // Write-behind startup's own gate: an upgraded cell's marker must now be readable.
+    client
+        .verify_schema_revision()
+        .await
+        .expect("write-behind startup must accept a cell upgraded from R25 to current");
+
+    let descriptor_now = now_ms(&fixture.client).await;
+    let descriptor = synthetic_descriptor(0, &policy, &policy_digest, &allocation, descriptor_now);
+    let claimable_after = Duration::from_millis(policy.maximum_ttl_ms + 500);
+    reserve_and_release(&client, &descriptor, claimable_after)
+        .await
+        .expect("a real reserve/claim/release cycle must succeed on the upgraded cell");
+    assert!(
+        !client
+            .observe(boundary, cell)
+            .await
+            .expect("observe after a real write")
+            .metadata_full,
+        "one reservation on a fresh policy must not read as metadata_full"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23), test plan item 5: the R25 -> R26 step refuses a cell that still
+// holds ANY spool object, or ANY nonzero quota usage -- proved as two independent triggers, each
+// on its own fresh R25 cell -- and the refused cell is left exactly at R25, never partially
+// advanced. The refusal message names the reason. `live_install_at_r25_upgrades_to_current_and_
+// drain_client_writes` above is the positive control: the same upgrade call, on a cell with
+// neither trigger present, succeeds -- so a refusal here is provably the guard firing on the
+// condition it names, not some unrelated failure of the step itself.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database with a real BLAKE3 provider"]
+async fn live_r25_upgrade_refuses_a_spool_object_or_charged_quota_and_leaves_the_cell_at_r25() {
+    // -- Trigger 1: any row in object_dispatch_spool_objects, admitted through the real 0013
+    // ReservePut procedure (not a hand-crafted INSERT). --
+    let spool_fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_SPOOL_REFUSAL_PG_URL").await;
+    let (spool_migrator, _spool_task) = connect_as(
+        &spool_fixture.base_url,
+        "object_dispatch_retention_migrator",
+    )
+    .await;
+    install_cell_schema_at(&spool_migrator, CellSchemaRevision::R25)
+        .await
+        .expect("install a real R25 cell");
+    // The shared canonical-record codec (0009) verifies the client-supplied digest against a real
+    // BLAKE3 provider even for a plain reserve_put admission.
+    install_blake3_provider(&spool_fixture.client).await;
+    let (spool_identity, ..) = database_identity(&spool_fixture.client).await;
+    let spool_pool = Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&spool_fixture.base_url, spool_identity))
+            .expect("runtime pool"),
+    );
+    admit_one_reserved_spool_object(spool_pool, "r25-spool-refusal-boundary").await;
+
+    drop(spool_fixture);
+    wait_until_exclusive(&spool_migrator).await;
+    let spool_reason = match upgrade_cell_schema(&spool_migrator).await {
+        Err(CellSchemaError::Precondition(reason)) => {
+            assert!(
+                reason.contains("still holds spool objects") && reason.contains("0026"),
+                "the spool-object refusal must name spool objects specifically, not a generic \
+                 blocker: {reason}"
+            );
+            reason
+        }
+        other => {
+            panic!("expected a named Precondition refusal for a live spool object, got {other:?}")
+        }
+    };
+    assert_eq!(
+        attest_cell_schema(&spool_migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R25)),
+        "a refused R25 -> R26 step must leave the cell exactly at R25, not partially advanced"
+    );
+
+    // -- Trigger 2: nonzero object_dispatch_quota_usage, with no spool object at all. Inserted
+    // directly: unlike object_dispatch_spool_objects, this table has no foreign key into
+    // object_dispatch_requests, so a minimal valid row needs no upstream admission call. --
+    let quota_fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_QUOTA_REFUSAL_PG_URL").await;
+    let (quota_migrator, _quota_task) = connect_as(
+        &quota_fixture.base_url,
+        "object_dispatch_retention_migrator",
+    )
+    .await;
+    install_cell_schema_at(&quota_migrator, CellSchemaRevision::R25)
+        .await
+        .expect("install a second real R25 cell");
+    let now = now_ms(&quota_fixture.client).await;
+    quota_fixture
+        .client
+        .execute(
+            "INSERT INTO object_store_retention.object_dispatch_quota_usage
+               (schema_revision, provider_boundary_id, scope_kind, scope_id, quota_class,
+                used_bytes, used_rows, used_concurrency, counter_revision, updated_at_unix_ms)
+             VALUES ('object-store-dispatch-authority-schema-v1', 'r25-quota-refusal-boundary', 1,
+                     'r25-quota-refusal-boundary', 1, 0, 1, 1, 1, $1)",
+            &[&now],
+        )
+        .await
+        .expect("seed a nonzero quota-usage row (no FK dependency, unlike a spool row)");
+
+    drop(quota_fixture);
+    wait_until_exclusive(&quota_migrator).await;
+    let quota_reason = match upgrade_cell_schema(&quota_migrator).await {
+        Err(CellSchemaError::Precondition(reason)) => {
+            assert!(
+                reason.contains("charged spool quota"),
+                "the quota refusal must name the quota charge specifically, not a generic \
+                 blocker: {reason}"
+            );
+            reason
+        }
+        other => panic!(
+            "expected a named Precondition refusal for a nonzero quota charge, got {other:?}"
+        ),
+    };
+    assert_eq!(
+        attest_cell_schema(&quota_migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R25)),
+        "a refused R25 -> R26 step must leave the cell exactly at R25, not partially advanced"
+    );
+
+    assert_ne!(
+        spool_reason, quota_reason,
+        "the two triggers must be distinguishable by their refusal reason, not collapsed into \
+         one generic message"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23), test plan item 7: an R25 cell with one extra relation is a state
+// outside the closed CELL_SCHEMA_STATES list. It must be refused as drift, never guessed at or
+// silently walked forward as if it were a known state.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_r25_upgrade_refuses_a_state_outside_the_known_list() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_DRIFT_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R25)
+        .await
+        .expect("install a real R25 cell");
+
+    // One extra function: a state outside the closed CELL_SCHEMA_STATES list, neither R25 nor any
+    // other known state. A function rather than a table: `DROP TABLE` triggers catalog activity
+    // that can attract a stray autovacuum backend shortly afterward, which would flakily trip the
+    // final upgrade's D4 exclusivity check below for a reason unrelated to what this test proves.
+    fixture
+        .client
+        .batch_execute(
+            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+             CREATE FUNCTION object_store_retention.cr038_r25_drift_probe_v1() RETURNS integer
+             LANGUAGE sql IMMUTABLE SET search_path = pg_catalog AS $$ SELECT 1 $$;
+             COMMIT;",
+        )
+        .await
+        .expect("plant one extra function");
+
+    assert!(
+        matches!(
+            attest_cell_schema(&migrator).await,
+            Err(CellSchemaError::CatalogDrift(_))
+        ),
+        "an R25 cell with an extra function must not classify as any known state"
+    );
+    // Classification runs before the D4 exclusivity check, so this refuses even with the admin
+    // connection above still open.
+    assert!(
+        matches!(
+            upgrade_cell_schema(&migrator).await,
+            Err(CellSchemaError::CatalogDrift(_))
+        ),
+        "upgrade must refuse a state outside the known list, never walk it forward as a guess"
+    );
+
+    // Undo the plant and confirm the cell is provably back to exactly R25.
+    fixture
+        .client
+        .batch_execute(
+            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+             DROP FUNCTION object_store_retention.cr038_r25_drift_probe_v1();
+             COMMIT;",
+        )
+        .await
+        .expect("undo the plant");
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R25)),
+        "once the plant is undone the cell must fully attest as R25 again, proving the plant was \
+         fully reversed rather than merely no longer triggering some unrelated check"
+    );
+
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    upgrade_cell_schema(&migrator)
+        .await
+        .expect("a genuinely R25 cell upgrades cleanly once the drift is gone");
+}
+
+// -------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23), test plan item 3: kill the session right after the R25 -> R26
+// step's own COMMIT is acknowledged by the server but never reaches the client, inside a CHAINED
+// upgrade that must still walk R26 -> R27 -> R28 afterward. The chaining/reclassify loop that
+// makes this possible is new code the R27-only crash tests above never exercise (they upgrade in
+// exactly one hop): a fresh run must resume from R26, not replay the R25 -> R26 step.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_upgrade_recovers_from_a_lost_commit_after_the_r25_to_r26_step() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_LOST_COMMIT_PG_URL").await;
+    let base_url = fixture.base_url.clone();
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R25)
+        .await
+        .expect("install a real R25 cell");
+
+    drop(migrator);
+    drop(_migrator_task);
+    drop(fixture);
+    {
+        let probe = admin_at(base_url.clone()).await;
+        wait_until_exclusive(&probe.client).await;
+    }
+
+    let (host_port, path) = host_port_and_path(&base_url);
+    let proxy = LostCommitProxy::start(host_port).await;
+    let proxied_url = format!(
+        "postgresql://object_dispatch_retention_migrator@127.0.0.1:{}/{path}?sslmode=disable",
+        proxy.port
+    );
+    let (proxied_migrator, _proxied_task) = {
+        let (client, connection) = tokio_postgres::connect(&proxied_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect through the lost-commit proxy");
+        (
+            client,
+            AbortOnDropHandle::new(lore_base::lore_spawn!(
+                "cell-schema-forward-upgrade-r25-proxied",
+                async move {
+                    let _ = connection.await;
+                }
+            )),
+        )
+    };
+
+    // The R25 -> R26 step is the first `COMMIT` a chained upgrade from R25 issues, so the proxy's
+    // single-shot arm targets it without needing to skip any earlier COMMIT.
+    proxy.drop_next_commit_response();
+    let outcome = upgrade_cell_schema(&proxied_migrator).await;
+    assert!(
+        outcome.is_err(),
+        "the client must see an error when the R25 -> R26 step's own COMMIT reply never arrives, \
+         even though the server committed it"
+    );
+    assert!(
+        proxy.fault_fired(),
+        "the fault must actually have fired, or this proves nothing"
+    );
+    drop(proxied_migrator);
+    drop(_proxied_task);
+
+    // The server-side R25 -> R26 COMMIT the client never saw already landed: a fresh connection
+    // must classify the cell as R26, not R25, proving the chained loop's persisted step survives
+    // the connection that ran it.
+    let (migrator, _migrator_task) =
+        connect_as(&base_url, "object_dispatch_retention_migrator").await;
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R26)),
+        "the cell must attest as R26 after the lost-commit crash, not R25 (the step silently \
+         re-ran) and not current (the loop kept going past a dead connection)"
+    );
+
+    wait_until_exclusive(&migrator).await;
+    let report = upgrade_cell_schema(&migrator)
+        .await
+        .expect("recovery must resume from R26 and reach current");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R26),
+        "recovery must resume from R26 (the state actually reached), never redo the R25 -> R26 \
+         step"
+    );
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+}
+
+// -------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23), test plan item 4: three-way fresh-install parity. A fresh R28
+// install, a cell upgraded all the way from R25, and a cell upgraded starting from R26 (the
+// resume case) must all attest byte-identical manifests: every one of the twelve sections, plus
+// the whole-manifest digest.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_fresh_r25_upgrade_and_r26_resume_attest_identical_manifests() {
+    let fresh = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FRESH_PG_URL").await;
+    let (fresh_migrator, _fresh_task) =
+        connect_as(&fresh.base_url, "object_dispatch_retention_migrator").await;
+    let fresh_report = install_cell_schema(&fresh_migrator)
+        .await
+        .expect("fresh install runs the forward steps through the same wrapper as upgrade");
+    assert_eq!(
+        fresh_report.attestation.schema_revision,
+        CELL_SCHEMA_CURRENT
+    );
+
+    let from_r25 = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FROM_R25_PG_URL").await;
+    let (from_r25_migrator, _from_r25_task) =
+        connect_as(&from_r25.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&from_r25_migrator, CellSchemaRevision::R25)
+        .await
+        .expect("install a real R25 cell");
+    drop(from_r25);
+    wait_until_exclusive(&from_r25_migrator).await;
+    let from_r25_report = upgrade_cell_schema(&from_r25_migrator)
+        .await
+        .expect("upgrade all the way from R25");
+    assert_eq!(
+        from_r25_report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R25)
+    );
+
+    let from_r26 = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FROM_R26_PG_URL").await;
+    let (from_r26_migrator, _from_r26_task) =
+        connect_as(&from_r26.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&from_r26_migrator, CellSchemaRevision::R26)
+        .await
+        .expect("install a real R26 cell");
+    drop(from_r26);
+    wait_until_exclusive(&from_r26_migrator).await;
+    let from_r26_report = upgrade_cell_schema(&from_r26_migrator)
+        .await
+        .expect("upgrade starting from R26 (the resume case)");
+    assert_eq!(
+        from_r26_report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R26)
+    );
+
+    assert_eq!(
+        fresh_report.attestation.catalog_sections, from_r25_report.attestation.catalog_sections,
+        "a fresh install and a cell upgraded from R25 must match on every manifest section"
+    );
+    assert_eq!(
+        fresh_report.attestation.catalog_sections, from_r26_report.attestation.catalog_sections,
+        "a fresh install and a cell resumed from R26 must match on every manifest section"
+    );
+    assert_eq!(
+        fresh_report.attestation.catalog_blake3, from_r25_report.attestation.catalog_blake3,
+        "a fresh install and a cell upgraded from R25 must attest byte-identical manifests"
+    );
+    assert_eq!(
+        fresh_report.attestation.catalog_blake3, from_r26_report.attestation.catalog_blake3,
+        "a fresh install and a cell resumed from R26 must attest byte-identical manifests"
+    );
 }

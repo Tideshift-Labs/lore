@@ -1110,6 +1110,82 @@ fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// CR-038 addendum (2026-09-23): the strip that turns a frozen install artifact into a forward
+// step's body is a validated exact-shape rule, not a trust. Every malformed shape it claims to
+// reject must actually be rejected, and the rejection must be discriminating: a body that is
+// well-formed except for exactly the mutation under test must still fail.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn forward_step_body_fails_closed_on_a_malformed_frozen_artifact_shape() {
+    use lore_object_dispatch::cell_schema_install::CellForwardStep;
+    use lore_object_dispatch::cell_schema_install::CellMigration;
+    use lore_object_dispatch::cell_schema_install::forward_step_body;
+
+    fn step(sql: &'static str) -> CellForwardStep {
+        CellForwardStep {
+            from: CellSchemaRevision::R25,
+            to: CellSchemaRevision::R26,
+            migration: CellMigration {
+                number: 26,
+                file_name: "0026_test_fixture.sql",
+                sql,
+                blake3: [0u8; 32],
+            },
+            unwrap_frozen_transaction: true,
+            prelude_sql: "",
+        }
+    }
+
+    // A well-formed shape parses and returns exactly the body between BEGIN; and COMMIT;.
+    assert_eq!(
+        forward_step_body(&step("BEGIN;\nSELECT 1;\nCOMMIT;\n")),
+        Ok("SELECT 1;\n")
+    );
+
+    for (label, malformed) in [
+        ("missing BEGIN;", "SELECT 1;\nCOMMIT;\n"),
+        ("missing COMMIT;", "BEGIN;\nSELECT 1;\n"),
+        ("two COMMIT; lines", "BEGIN;\nSELECT 1;\nCOMMIT;\nCOMMIT;\n"),
+        ("two BEGIN; lines", "BEGIN;\nBEGIN;\nSELECT 1;\nCOMMIT;\n"),
+        (
+            "trailing statement after COMMIT;",
+            "BEGIN;\nSELECT 1;\nCOMMIT;\nSELECT 2;\n",
+        ),
+        ("COMMIT; before BEGIN;", "COMMIT;\nBEGIN;\n"),
+        ("neither BEGIN; nor COMMIT; present", "SELECT 1;\n"),
+    ] {
+        assert!(
+            forward_step_body(&step(malformed)).is_err(),
+            "{label} must be refused, not silently stripped: {malformed:?}"
+        );
+    }
+
+    // Discriminating: start from a well-formed artifact that passes, then apply only the ONE
+    // mutation under test (drop the BEGIN; line) and confirm the same artifact now refuses. This
+    // proves the guard reacts to the mutation itself, not to some other property of the fixture.
+    let well_formed =
+        "BEGIN;\nCREATE TABLE object_store_retention.cr038_shape_probe(x int);\nCOMMIT;\n";
+    assert!(forward_step_body(&step(well_formed)).is_ok());
+    let missing_begin: String = well_formed
+        .lines()
+        .filter(|line| *line != "BEGIN;")
+        .collect::<Vec<_>>()
+        .join("\n");
+    let leaked_missing_begin: &'static str = Box::leak(missing_begin.into_boxed_str());
+    assert!(
+        forward_step_body(&step(leaked_missing_begin)).is_err(),
+        "removing only the BEGIN; line from an otherwise well-formed artifact must still refuse"
+    );
+
+    // A step with `unwrap_frozen_transaction: false` (0028's shape) never runs the shape check at
+    // all -- its body is used verbatim, malformed-looking or not.
+    let mut non_frozen = step("SELECT 1;\n");
+    non_frozen.unwrap_frozen_transaction = false;
+    assert_eq!(forward_step_body(&non_frozen), Ok("SELECT 1;\n"));
+}
+
 #[test]
 fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
     // CR-038 D2 as amended 2026-09-23: every step is one state to the next, and the steps form one

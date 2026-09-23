@@ -149,9 +149,37 @@ it's derived from another column rather than a fixed literal.
   aborting a background connection task doesn't guarantee the server has noticed the closed socket
   yet. A call already at the current state needs none of this (D4 only gates the one transition).
 
+- **`ReservePutRequest`'s `*_blake3` fields are opaque 32-byte tokens, not hashes the client must
+  derive.** 0013's `reserve_put` stores whatever bytes are supplied for `boundary_blake3`,
+  `observation_binding_blake3`, `expected_blake3` and `put_reservation_fingerprint`; there is no
+  server-side check that they are a real digest of anything. But the shared canonical-record codec
+  (0009) it calls into DOES need a real `public.blake3(bytea)` provider to verify its own generated
+  ACK digest — a fresh disposable database with no BLAKE3 provider installed fails every
+  `reserve_put` call with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`, even though nothing in the request
+  itself "needed" hashing. Install the provider (the genuine `plpython3u` one from
+  `run-cell-schema-forward-upgrade-live.ps1`'s image, not a golden-vector stand-in) before any real
+  `reserve_put`/`put_upload_progress`/`put_spool_ready` call, not just before a release/compaction
+  call.
+- **A `CREATE TABLE`/`DROP TABLE` drift probe can flake a following D4 exclusivity check.** Planting
+  catalog drift with a table (then dropping it to undo the plant) can attract a stray autovacuum
+  backend shortly afterward; `upgrade_cell_schema`'s "no other session connected" poll
+  (`wait_until_exclusive`) can read zero and still lose the race to that worker before the next
+  call's own check runs. A `CREATE OR REPLACE FUNCTION`/`DROP FUNCTION` probe (no relation
+  created or dropped) proves the same catalog-drift refusal without the relation-level autovacuum
+  trigger; prefer it whenever the probe's only job is to change the manifest, not to test
+  relation-specific behavior.
+
+- **A real `reserve_put` admission always charges quota alongside the spool row it creates**, so a
+  fixture cannot isolate "spool object present, quota untouched" through `reserve_put` alone —
+  proven by mutation: with the R25 prelude's spool-objects `IF EXISTS` disabled, the SAME
+  reserve_put-seeded database still refused, but with the quota-charge message, because admission
+  reserves quota units as part of the same call. Confirms the two R25 guards are independently
+  reachable in practice, not merely in the SQL text.
+
 See `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs` for the resulting fixture
-(`seed_metadata_true_up_fixture`, `synthetic_descriptor`, `wait_until_exclusive`) and
-`run-cell-schema-forward-upgrade-live.ps1` for the dedicated BLAKE3-capable container.
+(`seed_metadata_true_up_fixture`, `synthetic_descriptor`, `wait_until_exclusive`,
+`admit_one_reserved_spool_object`) and `run-cell-schema-forward-upgrade-live.ps1` for the dedicated
+BLAKE3-capable container.
 
 ## General Pitfalls
 

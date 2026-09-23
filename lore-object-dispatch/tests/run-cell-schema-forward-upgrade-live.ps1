@@ -81,7 +81,26 @@ $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_KILL_BEFORE_COMMIT_PG_URL'; Name = 'live_upgrade_recovers_from_a_kill_before_commit'; Database = 'kill_before_commit' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_BACKFILL_STATES_PG_URL'; Name = 'live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_double_give_back'; Database = 'backfill_states' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_REAL_CAP_PG_URL'; Name = 'live_upgraded_cell_at_real_dev_cap_stays_writable'; Database = 'real_cap' },
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_TRUE_UP_PG_URL'; Name = 'live_release_true_up_matches_actual_size_and_underflow_raises'; Database = 'true_up' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_TRUE_UP_PG_URL'; Name = 'live_release_true_up_matches_actual_size_and_underflow_raises'; Database = 'true_up' },
+    # CR-038 addendum (2026-09-23): R25/R26 join the closed attested list.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_CHAIN_PG_URL'; Name = 'live_install_at_r25_upgrades_to_current_and_drain_client_writes'; Database = 'r25_chain' },
+    @{
+        EnvVar   = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_SPOOL_REFUSAL_PG_URL'
+        Name     = 'live_r25_upgrade_refuses_a_spool_object_or_charged_quota_and_leaves_the_cell_at_r25'
+        Database = 'r25_spool_refusal'
+        ExtraEnv = @{ 'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_QUOTA_REFUSAL_PG_URL' = 'r25_quota_refusal' }
+    },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_DRIFT_PG_URL'; Name = 'live_r25_upgrade_refuses_a_state_outside_the_known_list'; Database = 'r25_drift' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_LOST_COMMIT_PG_URL'; Name = 'live_upgrade_recovers_from_a_lost_commit_after_the_r25_to_r26_step'; Database = 'r25_lost_commit' },
+    @{
+        EnvVar   = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FRESH_PG_URL'
+        Name     = 'live_fresh_r25_upgrade_and_r26_resume_attest_identical_manifests'
+        Database = 'r25_parity_fresh'
+        ExtraEnv = @{
+            'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FROM_R25_PG_URL' = 'r25_parity_from_r25'
+            'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FROM_R26_PG_URL' = 'r25_parity_from_r26'
+        }
+    }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })
