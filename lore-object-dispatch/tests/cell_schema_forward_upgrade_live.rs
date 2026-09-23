@@ -2646,11 +2646,48 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
         .expect("attestation holds again once the real function is restored");
 }
 
+/// The three budget-row counts that make up slot 0's real published shape: one row in
+/// `object_dispatch_budget_configurations`, one in `object_dispatch_current_budget_configuration`,
+/// and one `object_dispatch_budget_bucket_state` row per published cap class (`publish_budget`
+/// above always publishes caps 1..=7, so 7 here whenever a boundary has ever published).
+async fn budget_row_counts(admin: &tokio_postgres::Client, boundary: &str) -> (i64, i64, i64) {
+    let configurations: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM object_store_retention.object_dispatch_budget_configurations \
+             WHERE provider_boundary_id = $1",
+            &[&boundary],
+        )
+        .await
+        .expect("count budget configurations")
+        .get(0);
+    let current: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM object_store_retention.object_dispatch_current_budget_configuration \
+             WHERE provider_boundary_id = $1",
+            &[&boundary],
+        )
+        .await
+        .expect("count current budget configuration")
+        .get(0);
+    let bucket_state: i64 = admin
+        .query_one(
+            "SELECT count(*) FROM object_store_retention.object_dispatch_budget_bucket_state \
+             WHERE provider_boundary_id = $1",
+            &[&boundary],
+        )
+        .await
+        .expect("count budget bucket state")
+        .get(0);
+    (configurations, current, bucket_state)
+}
+
 // -------------------------------------------------------------------------------------------
 // CR-038 addendum (2026-09-23), test plan item 1: a cell installed at R25 -- slot 0's actual
-// state -- upgrades through R26 and R27 to the current state, attests R28, and then accepts real
-// write-behind traffic: a genuine DrainClient reserve/claim/release cycle, and write-behind
-// startup's own schema-revision check.
+// state -- with its drain budget PUBLISHED AT R25, matching slot 0's real shape (one
+// configurations row, one current row, one bucket_state row per published cap class), upgrades
+// through R26 and R27 to the current state, attests R28, leaves those budget rows completely
+// unchanged by the upgrade, and then accepts real write-behind traffic: a genuine DrainClient
+// reserve/claim/release cycle, and write-behind startup's own schema-revision check.
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2674,6 +2711,27 @@ async fn live_install_at_r25_upgrades_to_current_and_drain_client_writes() {
     let cell = "r25-chain-cell";
     let service = "r25-chain-service";
 
+    // Publish the drain budget BEFORE the upgrade: R25 already carries migrations 0021/0022 (the
+    // budget limiter schema), matching slot 0's actual pre-upgrade shape.
+    install_blake3_provider(&fixture.client).await;
+    let allocation = publish_budget(
+        &fixture.client,
+        boundary,
+        cell,
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    let before_upgrade_counts = budget_row_counts(&fixture.client, boundary).await;
+    assert_eq!(
+        before_upgrade_counts,
+        (1, 1, 7),
+        "a single published budget at R25 must read as exactly one configuration row, one \
+         current-configuration row, and one bucket_state row per published cap class (1..=7) -- \
+         slot 0's real pre-upgrade shape"
+    );
+
     let base_url = fixture.base_url.clone();
     drop(fixture);
     wait_until_exclusive(&migrator).await;
@@ -2687,16 +2745,12 @@ async fn live_install_at_r25_upgrades_to_current_and_drain_client_writes() {
     assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
 
     let fixture = admin_at(base_url).await;
-    install_blake3_provider(&fixture.client).await;
-    let allocation = publish_budget(
-        &fixture.client,
-        boundary,
-        cell,
-        &system_identifier,
-        database_oid,
-        now,
-    )
-    .await;
+    let after_upgrade_counts = budget_row_counts(&fixture.client, boundary).await;
+    assert_eq!(
+        after_upgrade_counts, before_upgrade_counts,
+        "the R25 -> R28 upgrade must leave the pre-existing published budget rows completely \
+         unchanged: no forward step here touches budget configuration/current/bucket_state"
+    );
     let policy = drain_policy(
         boundary,
         cell,
@@ -2775,9 +2829,20 @@ async fn live_r25_upgrade_refuses_a_spool_object_or_charged_quota_and_leaves_the
     let spool_reason = match upgrade_cell_schema(&spool_migrator).await {
         Err(CellSchemaError::Precondition(reason)) => {
             assert!(
-                reason.contains("still holds spool objects") && reason.contains("0026"),
+                reason.contains("holds spool objects")
+                    && reason.contains("cannot be carried forward"),
                 "the spool-object refusal must name spool objects specifically, not a generic \
                  blocker: {reason}"
+            );
+            assert!(
+                reason.contains("reinstall the cell") && reason.contains("owner decision"),
+                "the refusal must name the remedy -- reinstall the cell or get an owner decision \
+                 -- not just describe the blocker: {reason}"
+            );
+            assert!(
+                !reason.to_lowercase().contains("retention"),
+                "the cell cannot be carried forward at all here; the message must not suggest \
+                 waiting for retention to clear it: {reason}"
             );
             reason
         }
@@ -2822,9 +2887,20 @@ async fn live_r25_upgrade_refuses_a_spool_object_or_charged_quota_and_leaves_the
     let quota_reason = match upgrade_cell_schema(&quota_migrator).await {
         Err(CellSchemaError::Precondition(reason)) => {
             assert!(
-                reason.contains("charged spool quota"),
+                reason.contains("charged spool quota")
+                    && reason.contains("cannot be carried forward"),
                 "the quota refusal must name the quota charge specifically, not a generic \
                  blocker: {reason}"
+            );
+            assert!(
+                reason.contains("reinstall the cell") && reason.contains("owner decision"),
+                "the refusal must name the remedy -- reinstall the cell or get an owner decision \
+                 -- not just describe the blocker: {reason}"
+            );
+            assert!(
+                !reason.to_lowercase().contains("retention"),
+                "the cell cannot be carried forward at all here; the message must not suggest \
+                 waiting for retention to clear it: {reason}"
             );
             reason
         }

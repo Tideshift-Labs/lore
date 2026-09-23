@@ -1155,12 +1155,26 @@ fn forward_step_body_fails_closed_on_a_malformed_frozen_artifact_shape() {
         ),
         ("COMMIT; before BEGIN;", "COMMIT;\nBEGIN;\n"),
         ("neither BEGIN; nor COMMIT; present", "SELECT 1;\n"),
+        (
+            "a non-comment statement before BEGIN;",
+            "SELECT 0;\nBEGIN;\nSELECT 1;\nCOMMIT;\n",
+        ),
     ] {
         assert!(
             forward_step_body(&step(malformed)).is_err(),
             "{label} must be refused, not silently stripped: {malformed:?}"
         );
     }
+
+    // Blank lines and `--` line comments before BEGIN; are the one allowed prefix shape (a real
+    // frozen artifact's own header comment) -- accepted, and stripped along with BEGIN; itself.
+    assert_eq!(
+        forward_step_body(&step(
+            "\n-- 0026: a header comment\n--\n\nBEGIN;\nSELECT 1;\nCOMMIT;\n"
+        )),
+        Ok("SELECT 1;\n"),
+        "blank lines and -- comment lines before BEGIN; must be accepted as the stripped prefix"
+    );
 
     // Discriminating: start from a well-formed artifact that passes, then apply only the ONE
     // mutation under test (drop the BEGIN; line) and confirm the same artifact now refuses. This
