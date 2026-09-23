@@ -77,6 +77,10 @@ $tests = @(
         ExtraEnv = @{ 'LORE_TEST_CELL_SCHEMA_UPGRADE_PARITY_UPGRADED_PG_URL' = 'parity_upgraded' }
     },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_LOST_COMMIT_PG_URL'; Name = 'live_upgrade_recovers_from_a_lost_commit_reply'; Database = 'lost_commit' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_KILL_MID_ATTEST_PG_URL'; Name = 'live_upgrade_recovers_from_a_kill_mid_attest'; Database = 'kill_mid_attest' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_KILL_BEFORE_COMMIT_PG_URL'; Name = 'live_upgrade_recovers_from_a_kill_before_commit'; Database = 'kill_before_commit' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_BACKFILL_STATES_PG_URL'; Name = 'live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_double_give_back'; Database = 'backfill_states' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_REAL_CAP_PG_URL'; Name = 'live_upgraded_cell_at_real_dev_cap_stays_writable'; Database = 'real_cap' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_TRUE_UP_PG_URL'; Name = 'live_release_true_up_matches_actual_size_and_underflow_raises'; Database = 'true_up' }
 )
 

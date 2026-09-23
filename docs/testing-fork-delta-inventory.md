@@ -74,8 +74,17 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   traffic through `drain_reserve_v1`/`drain_cleanup_release_v1`, which need a genuine BLAKE3
   provider at `public.blake3(bytea)` (`local_blake3_v1` refuses without one); the runner builds
   `lorehub/docker/dev-cell/Dockerfile.postgres-blake3` (plpython3u + the `blake3` PyPI package) on
-  first use. See [testing-gotchas.md](testing-gotchas.md#cr-038-forward-upgrade-fixture-gotchas)
-  for the fixture traps this tier's synthetic reservation/seeding needed.
+  first use. Eleven live cases: the wedge/upgrade flagship (with its colocated negative control),
+  D5's write-behind refusal, catalog-drift/future-marker/replica-active refusals, the advisory
+  lock, fresh-install/upgrade manifest parity, three crash points (mid-attest and before-COMMIT via
+  a generalized needle-kill proxy that forwards the untagged startup packet before switching to
+  tagged-frame parsing; lost-COMMIT via the existing plaintext proxy shape), a backfill/compaction
+  race discrimination proof (states 1/2/4 byte-for-byte untouched; a deterministic
+  compact-then-reapply-a-stale-snapshot replay of the APPLY step's own guard, real vs the pre-fix
+  spool_id-only shape), the release true-up formula plus its underflow-guard discrimination proof,
+  and one real-scale case bulk-seeded (SQL) to the exact 8,192-row/134,217,728-byte dev cap. See
+  [testing-gotchas.md](testing-gotchas.md#cr-038-forward-upgrade-fixture-gotchas) for the fixture
+  traps this tier's synthetic reservation/seeding needed.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

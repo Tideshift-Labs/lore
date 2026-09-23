@@ -695,6 +695,171 @@ async fn live_upgraded_cell_survives_the_load_that_wedges_an_unupgraded_cell() {
 }
 
 // -------------------------------------------------------------------------------------------
+// Real scale: the flagship test above proves the mechanism at a scaled-down cap (network
+// round-trips through real reserve/claim/release dominate its runtime). This test proves the
+// absolute numbers instead: a cell bulk-seeded (SQL, like the implementer's own scratch proof) to
+// the exact slot-31 shape -- 8,192 released rows, 134,217,728 bytes, the real dev policy's cap --
+// wedges, and the same cell upgraded in place both clears `metadata_full` and accepts real new
+// reservations through `DrainClient`.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database with a real BLAKE3 provider"]
+async fn live_upgraded_cell_at_real_dev_cap_stays_writable() {
+    const REAL_ROWS: i64 = 8192;
+    const REAL_MAX_BYTES: u64 = 134_217_728; // 8192 * 16384, the real dev policy cap.
+    const REAL_MAX_ROWS: u64 = 32_768; // the real dev policy's metadata_max_rows.
+
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_REAL_CAP_PG_URL").await;
+    let base_url = fixture.base_url.clone();
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R27)
+        .await
+        .expect("install a real R27 cell");
+    install_blake3_provider(&fixture.client).await;
+
+    let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
+    let now = now_ms(&fixture.client).await;
+    let boundary = "real-cap-boundary";
+    let cell = "real-cap-cell";
+    let service = "real-cap-service";
+    let allocation = publish_budget(
+        &fixture.client,
+        boundary,
+        cell,
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+
+    // A real, fully-valid published policy (not the minimal synthetic JSON the other seeded-row
+    // tests use), because the writability check at the end drives REAL reservations against it.
+    let policy = drain_policy(
+        boundary,
+        cell,
+        service,
+        "real-cap-policy-v1",
+        u64::try_from(now + 3_600_000).unwrap(),
+        REAL_MAX_BYTES,
+        REAL_MAX_ROWS,
+    );
+    publish_drain_policy(&fixture.client, &policy).await;
+    let policy_digest = policy.digest().unwrap();
+    let policy_digest_hex = lore_object_dispatch::drain_policy::hex(&policy_digest);
+
+    // Bulk-seed the exact slot-31 shape in one round trip: 8,192 released (state 3) rows, each
+    // still holding the flat 16,384-byte pre-true-up charge, zero spooled files (nothing here
+    // creates an `object_dispatch_spool_objects` row, matching the observed dump). `drain_spool_custody`
+    // has no UUID-version CHECK of its own (unlike `object_dispatch_spool_objects`), so
+    // `md5(...)::uuid` identities are sufficient here.
+    fixture
+        .client
+        .execute(
+            &format!(
+                "INSERT INTO object_store_retention.drain_spool_custody
+                   (spool_id, boundary, cell, service, logical_id, attempt_id, descriptor, canonical,
+                    digest, cleanup_not_before, state, cleanup_fence, metadata_bytes, release_receipt,
+                    release_digest)
+                 SELECT md5('real-cap-spool'||i)::uuid, '{boundary}', '{cell}', '{service}',
+                   md5('real-cap-logical'||i)::uuid, md5('real-cap-attempt'||i)::uuid,
+                   jsonb_build_object('policy_revision', 'real-cap-policy-v1', 'policy_digest', '{policy_digest_hex}'),
+                   decode('aa','hex'), decode(repeat('11',32),'hex'), 0, 3, 1, 16384,
+                   decode(repeat('11',32),'hex'), decode(repeat('11',32),'hex')
+                 FROM generate_series(1, {REAL_ROWS}) i"
+            ),
+            &[],
+        )
+        .await
+        .expect("bulk-seed the real slot-31 shape (SQL, matching the implementer's own scratch proof)");
+    fixture
+        .client
+        .execute(
+            "UPDATE object_store_retention.drain_policies \
+             SET metadata_rows = $1::text::object_store_retention.uint64, \
+                 metadata_bytes = $2::text::object_store_retention.uint64 \
+             WHERE boundary = $3 AND cell = $4",
+            &[
+                &REAL_ROWS.to_string(),
+                &REAL_MAX_BYTES.to_string(),
+                &boundary,
+                &cell,
+            ],
+        )
+        .await
+        .expect("set the aggregate to the exact real cap");
+
+    let pool = Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    );
+    let client = DrainClient::new(pool);
+    client
+        .verify_schema_revision()
+        .await
+        .expect_err("R27 cell, no marker yet; this call only warms the pool");
+
+    let wedged = client
+        .observe(boundary, cell)
+        .await
+        .expect("observe the bulk-seeded cell");
+    assert!(
+        wedged.metadata_full,
+        "8,192 rows at the flat charge on the real {REAL_MAX_BYTES}-byte cap must read as wedged, \
+         exactly the slot-31 condition"
+    );
+
+    drop(client);
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    let report = upgrade_cell_schema(&migrator)
+        .await
+        .expect("upgrade the real-scale cell to current");
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+
+    let fixture = admin_at(base_url).await;
+    let pool = Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    );
+    let client = DrainClient::new(pool);
+    let after_upgrade = client
+        .observe(boundary, cell)
+        .await
+        .expect("observe the upgraded real-scale cell");
+    assert!(
+        !after_upgrade.metadata_full,
+        "trueing up all 8,192 rows must clear metadata_full at the real cap"
+    );
+
+    // Writable: drive a handful of real reservations through `DrainClient` against the SAME
+    // published policy the bulk-seeded rows reference, proving the cell accepts new writes, not
+    // merely that the counter reads as not-full.
+    client
+        .verify_schema_revision()
+        .await
+        .expect("the upgraded cell's marker must now be readable");
+    let claimable_after = Duration::from_millis(policy.maximum_ttl_ms + 500);
+    for i in 0..3u32 {
+        let iteration_now = now_ms(&fixture.client).await;
+        let descriptor =
+            synthetic_descriptor(i, &policy, &policy_digest, &allocation, iteration_now);
+        reserve_and_release(&client, &descriptor, claimable_after)
+            .await
+            .unwrap_or_else(|error| panic!("post-upgrade real reservation {i}: {error}"));
+    }
+    assert!(
+        !client
+            .observe(boundary, cell)
+            .await
+            .expect("observe after real writes")
+            .metadata_full,
+        "the cell must remain writable (not wedged) after real post-upgrade reservations"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
 // CR-038 D5: write-behind refuses to start on a cell that predates the true-up, and accepts one
 // that has it. No reservation traffic needed -- this is a pure marker readback.
 // -------------------------------------------------------------------------------------------
@@ -1080,6 +1245,412 @@ async fn relay(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// A second, generalized fault proxy: kill the connection outright (both directions) the moment a
+// client->server frame's payload contains a fixed needle, WITHOUT forwarding that frame. This
+// simulates the connection dying before the server ever receives a given statement -- the other
+// two rows of the CR-038 crash table ("during attest" and "before COMMIT"), as distinct from the
+// `LostCommitProxy` above (whose fault fires only after the server has already processed and
+// replied to `COMMIT`). Matching on raw frame bytes works for both the simple query protocol
+// (tag `Q`) and the extended protocol's `Parse` (tag `P`, used for every parameterless
+// `Client::query`/`query_one` call this module makes), since in both cases the SQL text itself is
+// carried inline in that one frame's payload.
+// ---------------------------------------------------------------------------------------------
+
+struct NeedleKillProxy {
+    port: u16,
+    fired: Arc<AtomicBool>,
+    _task: AbortOnDropHandle<()>,
+}
+
+impl NeedleKillProxy {
+    async fn start(upstream: String, needle: &'static str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind needle-kill proxy");
+        let port = listener.local_addr().expect("proxy address").port();
+        let fired = Arc::new(AtomicBool::new(false));
+        let task_fired = Arc::clone(&fired);
+        let task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+            "cell-schema-forward-upgrade-needle-kill-proxy",
+            async move {
+                let mut connections = Vec::new();
+                while let Ok((downstream, _)) = listener.accept().await {
+                    let upstream = upstream.clone();
+                    let fired = Arc::clone(&task_fired);
+                    connections.push(AbortOnDropHandle::new(lore_base::lore_spawn!(
+                        "cell-schema-forward-upgrade-needle-kill-connection",
+                        async move {
+                            if let Ok(server) = TcpStream::connect(&upstream).await {
+                                relay_kill_before_forward(downstream, server, needle, fired).await;
+                            }
+                        }
+                    )));
+                }
+            }
+        ));
+        Self {
+            port,
+            fired,
+            _task: task,
+        }
+    }
+
+    fn fault_fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+async fn relay_kill_before_forward(
+    downstream: TcpStream,
+    upstream: TcpStream,
+    needle: &str,
+    fired: Arc<AtomicBool>,
+) {
+    let (mut downstream_read, mut downstream_write) = downstream.into_split();
+    let (mut upstream_read, mut upstream_write) = upstream.into_split();
+    let needle = needle.as_bytes();
+    let forward = async move {
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        // The client's very first message (the startup packet, and this proxy is only ever used
+        // with `sslmode=disable` so no preceding `SSLRequest`) has NO leading tag byte -- unlike
+        // every later message in the session, it is just a 4-byte big-endian length followed by
+        // that many bytes of payload. Relay it byte-for-byte before switching to tagged-frame
+        // parsing, or the tag-based loop below misreads its first payload byte as a tag and a
+        // length that never resolves, hanging the connection.
+        loop {
+            let read = match downstream_read.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.len() < 4 {
+                continue;
+            }
+            let Ok(length) = <[u8; 4]>::try_from(&buffer[0..4]) else {
+                return;
+            };
+            let length = u32::from_be_bytes(length) as usize;
+            if length < 4 || buffer.len() < length {
+                continue;
+            }
+            if upstream_write.write_all(&buffer[..length]).await.is_err() {
+                return;
+            }
+            if upstream_write.flush().await.is_err() {
+                return;
+            }
+            buffer.drain(..length);
+            break;
+        }
+        loop {
+            let read = match downstream_read.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            buffer.extend_from_slice(&chunk[..read]);
+            let mut offset = 0usize;
+            while buffer.len() - offset >= 5 {
+                let tag = buffer[offset];
+                let Ok(length) = <[u8; 4]>::try_from(&buffer[offset + 1..offset + 5]) else {
+                    return;
+                };
+                let length = u32::from_be_bytes(length) as usize;
+                if length < 4 {
+                    return;
+                }
+                let total = 1 + length;
+                if buffer.len() - offset < total {
+                    break;
+                }
+                let frame = &buffer[offset..offset + total];
+                let matches_needle = (tag == b'Q' || tag == b'P')
+                    && frame.windows(needle.len()).any(|w| w == needle);
+                if matches_needle {
+                    // The server never receives this frame at all: close both directions now.
+                    fired.store(true, Ordering::Release);
+                    return;
+                }
+                if upstream_write.write_all(frame).await.is_err() {
+                    return;
+                }
+                offset += total;
+            }
+            buffer.drain(..offset);
+            if upstream_write.flush().await.is_err() {
+                return;
+            }
+        }
+    };
+    let backward = async move {
+        let _ = tokio::io::copy(&mut upstream_read, &mut downstream_write).await;
+    };
+    tokio::select! {
+        () = forward => {}
+        () = backward => {}
+    }
+}
+
+/// Parse `<user>@<host:port>/<db>` out of a migrator URL for the proxy fixtures below.
+fn host_port_and_path(base_url: &str) -> (String, String) {
+    let upstream = url_as(base_url, "object_dispatch_retention_migrator");
+    let without_scheme = upstream
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .expect("scheme separator in the migrator URL");
+    let after_userinfo = without_scheme
+        .split_once('@')
+        .map(|(_, rest)| rest)
+        .expect("userinfo separator in the migrator URL");
+    let (host_port, path) = after_userinfo
+        .split_once('/')
+        .expect("host:port/database in the migrator URL");
+    (host_port.to_string(), path.to_string())
+}
+
+/// A single state-3 custody row, seeded directly (no reservation algebra needed): enough to prove
+/// a forward-step crash/retry trues it exactly once, without the full reserve/release apparatus
+/// the flagship wedge test needs. Unlike `seed_metadata_true_up_fixture` (test plan item 9), this
+/// needs no matching `object_dispatch_spool_objects`/`object_dispatch_requests` rows: nothing here
+/// calls `drain_cleanup_release_v1` (which is what reads `object_dispatch_spool_objects`) -- the
+/// row starts life already in state 3, exactly as a previously-released, not-yet-trued row would.
+async fn seed_one_untrued_row(
+    admin: &tokio_postgres::Client,
+    boundary: &str,
+    cell: &str,
+    spool: Uuid,
+) {
+    admin
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+             INSERT INTO object_store_retention.drain_policies
+               (boundary, cell, revision, digest, policy, canonical, metadata_rows, metadata_bytes)
+             VALUES ('{boundary}', '{cell}', 'seed-policy-v1', decode(repeat('11',32),'hex'),
+               '{{\"expires_at_ms\": 4102444800000}}'::jsonb, decode('aa','hex'), 1, 16384)
+             ON CONFLICT (boundary, cell) DO NOTHING;
+             INSERT INTO object_store_retention.drain_spool_custody
+               (spool_id, boundary, cell, service, logical_id, attempt_id, descriptor, canonical,
+                digest, cleanup_not_before, state, cleanup_fence, metadata_bytes, release_receipt,
+                release_digest)
+             VALUES ('{spool}', '{boundary}', '{cell}', 'seed-service', md5('logical'||'{spool}')::uuid,
+               md5('attempt'||'{spool}')::uuid,
+               jsonb_build_object('policy_revision', 'seed-policy-v1', 'policy_digest', repeat('11', 32)),
+               decode('aa','hex'), decode(repeat('11',32),'hex'), 0, 3, 1, 16384,
+               decode(repeat('11',32),'hex'), decode(repeat('11',32),'hex'));
+             COMMIT;"
+        ))
+        .await
+        .expect("seed one untrued state-3 custody row");
+}
+
+/// The exact true-up formula (mirrors `drain_retained_metadata_bytes_v1`), recomputed
+/// independently so a test can assert the stored `metadata_bytes` was applied exactly once rather
+/// than merely "less than the flat charge".
+async fn read_retained_and_expected(admin: &tokio_postgres::Client, spool: Uuid) -> (i64, i64) {
+    let row = admin
+        .query_one(
+            "SELECT metadata_bytes, octet_length(descriptor::text), octet_length(canonical), \
+             octet_length(release_receipt), octet_length(release_digest) \
+             FROM object_store_retention.drain_spool_custody WHERE spool_id = $1",
+            &[&spool],
+        )
+        .await
+        .expect("read custody row after recovery");
+    let retained: i64 = row.get(0);
+    let descriptor_len: i32 = row.get(1);
+    let canonical_len: i32 = row.get(2);
+    let receipt_len: i32 = row.get(3);
+    let release_digest_len: i32 = row.get(4);
+    let expected = (1024
+        + i64::from(descriptor_len)
+        + i64::from(canonical_len)
+        + i64::from(receipt_len)
+        + i64::from(release_digest_len))
+    .max(1024);
+    (retained, expected)
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_upgrade_recovers_from_a_kill_mid_attest() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_KILL_MID_ATTEST_PG_URL").await;
+    let base_url = fixture.base_url.clone();
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R27)
+        .await
+        .expect("install a real R27 cell");
+    let spool = Uuid::now_v7();
+    seed_one_untrued_row(
+        &fixture.client,
+        "kill-mid-attest-boundary",
+        "kill-mid-attest-cell",
+        spool,
+    )
+    .await;
+
+    drop(migrator);
+    drop(_migrator_task);
+    drop(fixture);
+    {
+        let probe = admin_at(base_url.clone()).await;
+        wait_until_exclusive(&probe.client).await;
+    }
+
+    let (host_port, path) = host_port_and_path(&base_url);
+    // `rules_and_policies` names the last column of the catalog manifest query
+    // (`CELL_CATALOG_MANIFEST_SQL`), read as part of the IN-TRANSACTION attest that follows the
+    // forward step's body -- killing on it lands the fault mid-attest, before `COMMIT` is ever
+    // sent, inside the step's own `SERIALIZABLE` transaction. Postgres rolls the whole thing back:
+    // the row seeded above must still read as untrued (16384) after this attempt.
+    let proxy = NeedleKillProxy::start(host_port, "rules_and_policies").await;
+    let proxied_url = format!(
+        "postgresql://object_dispatch_retention_migrator@127.0.0.1:{}/{path}?sslmode=disable",
+        proxy.port
+    );
+    let (proxied_migrator, _proxied_task) = {
+        let (client, connection) = tokio_postgres::connect(&proxied_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect through the needle-kill proxy");
+        (
+            client,
+            AbortOnDropHandle::new(lore_base::lore_spawn!(
+                "cell-schema-forward-upgrade-mid-attest-proxied",
+                async move {
+                    let _ = connection.await;
+                }
+            )),
+        )
+    };
+    let outcome = upgrade_cell_schema(&proxied_migrator).await;
+    assert!(
+        outcome.is_err(),
+        "a connection killed mid-attest must surface as an error to this call"
+    );
+    assert!(
+        proxy.fault_fired(),
+        "the fault must actually have fired, or this proves nothing"
+    );
+    drop(proxied_migrator);
+    drop(_proxied_task);
+
+    // The whole in-progress transaction rolled back: the cell is still R27 (nothing committed),
+    // and this fixture's own connections above are the only sessions, so a rerun performs the
+    // real state transition again and needs the same D4 exclusivity as any first attempt.
+    let (recovery_migrator, _recovery_task) =
+        connect_as(&base_url, "object_dispatch_retention_migrator").await;
+    wait_until_exclusive(&recovery_migrator).await;
+    let report = upgrade_cell_schema(&recovery_migrator)
+        .await
+        .expect("recovery run reaches R28");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R27),
+        "nothing committed on the killed attempt, so recovery must perform the real transition, \
+         not find it already current"
+    );
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+
+    // `drain_spool_custody` is not migrator-readable (only owner/runtime hold grants on it); read
+    // the row back as the superuser fixture connection.
+    let admin_conn = admin_at(base_url).await;
+    let (retained, expected) = read_retained_and_expected(&admin_conn.client, spool).await;
+    assert_eq!(
+        retained, expected,
+        "the seeded row must be trued to exactly the formula's output once, not left untrued or \
+         double-processed"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_upgrade_recovers_from_a_kill_before_commit() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_KILL_BEFORE_COMMIT_PG_URL").await;
+    let base_url = fixture.base_url.clone();
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R27)
+        .await
+        .expect("install a real R27 cell");
+    let spool = Uuid::now_v7();
+    seed_one_untrued_row(
+        &fixture.client,
+        "kill-before-commit-boundary",
+        "kill-before-commit-cell",
+        spool,
+    )
+    .await;
+
+    drop(migrator);
+    drop(_migrator_task);
+    drop(fixture);
+    {
+        let probe = admin_at(base_url.clone()).await;
+        wait_until_exclusive(&probe.client).await;
+    }
+
+    let (host_port, path) = host_port_and_path(&base_url);
+    // The only client->server frame containing this exact text on this code path is
+    // `apply_forward_step`'s own final `client.batch_execute("COMMIT;")`, issued only after the
+    // step body and its in-transaction attest have both already succeeded. Killing on it means the
+    // server never receives `COMMIT` at all -- a strictly later crash point than the mid-attest
+    // case above, and the one the CR's own crash table calls "inside step 5, before COMMIT".
+    let proxy = NeedleKillProxy::start(host_port, "COMMIT").await;
+    let proxied_url = format!(
+        "postgresql://object_dispatch_retention_migrator@127.0.0.1:{}/{path}?sslmode=disable",
+        proxy.port
+    );
+    let (proxied_migrator, _proxied_task) = {
+        let (client, connection) = tokio_postgres::connect(&proxied_url, tokio_postgres::NoTls)
+            .await
+            .expect("connect through the needle-kill proxy");
+        (
+            client,
+            AbortOnDropHandle::new(lore_base::lore_spawn!(
+                "cell-schema-forward-upgrade-before-commit-proxied",
+                async move {
+                    let _ = connection.await;
+                }
+            )),
+        )
+    };
+    let outcome = upgrade_cell_schema(&proxied_migrator).await;
+    assert!(
+        outcome.is_err(),
+        "a connection killed before COMMIT must surface as an error to this call"
+    );
+    assert!(
+        proxy.fault_fired(),
+        "the fault must actually have fired, or this proves nothing"
+    );
+    drop(proxied_migrator);
+    drop(_proxied_task);
+
+    // The server never received COMMIT, so nothing committed: same recovery shape as the
+    // mid-attest case above, a real (not no-op) state transition.
+    let (recovery_migrator, _recovery_task) =
+        connect_as(&base_url, "object_dispatch_retention_migrator").await;
+    wait_until_exclusive(&recovery_migrator).await;
+    let report = upgrade_cell_schema(&recovery_migrator)
+        .await
+        .expect("recovery run reaches R28");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R27),
+        "nothing committed on the killed attempt, so recovery must perform the real transition"
+    );
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+
+    let admin_conn = admin_at(base_url).await;
+    let (retained, expected) = read_retained_and_expected(&admin_conn.client, spool).await;
+    assert_eq!(
+        retained, expected,
+        "the seeded row must be trued to exactly the formula's output once, not left untrued or \
+         double-processed"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires a fresh disposable PostgreSQL 16 database"]
 async fn live_upgrade_recovers_from_a_lost_commit_reply() {
@@ -1090,6 +1661,14 @@ async fn live_upgrade_recovers_from_a_lost_commit_reply() {
     install_cell_schema_at(&migrator, CellSchemaRevision::R27)
         .await
         .expect("install a real R27 cell");
+    let spool = Uuid::now_v7();
+    seed_one_untrued_row(
+        &fixture.client,
+        "lost-commit-boundary",
+        "lost-commit-cell",
+        spool,
+    )
+    .await;
 
     // D4 needs an exclusive session at the moment the upgrade actually runs. Drop every handle
     // this test has opened so far and wait for the server to see them gone before the proxied
@@ -1102,19 +1681,8 @@ async fn live_upgrade_recovers_from_a_lost_commit_reply() {
         wait_until_exclusive(&probe.client).await;
     }
 
-    let upstream = url_as(&base_url, "object_dispatch_retention_migrator");
-    let without_scheme = upstream
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .expect("scheme separator in the migrator URL");
-    let after_userinfo = without_scheme
-        .split_once('@')
-        .map(|(_, rest)| rest)
-        .expect("userinfo separator in the migrator URL");
-    let (host_port, path) = after_userinfo
-        .split_once('/')
-        .expect("host:port/database in the migrator URL");
-    let proxy = LostCommitProxy::start(host_port.to_string()).await;
+    let (host_port, path) = host_port_and_path(&base_url);
+    let proxy = LostCommitProxy::start(host_port).await;
     let proxied_url = format!(
         "postgresql://object_dispatch_retention_migrator@127.0.0.1:{}/{path}?sslmode=disable",
         proxy.port
@@ -1156,6 +1724,365 @@ async fn live_upgrade_recovers_from_a_lost_commit_reply() {
     let report = upgrade_cell_schema(&migrator).await.expect("recovery run");
     assert_eq!(report.disposition, CellUpgradeDisposition::AlreadyCurrent);
     assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+
+    // The server-side COMMIT that the client never saw a reply for already trued the seeded row
+    // exactly once; recovery classifying as AlreadyCurrent (rather than re-running the step) is
+    // what keeps it that way -- assert the stored value directly rather than only inferring it
+    // from the disposition. `drain_spool_custody` is not migrator-readable; use the admin
+    // (superuser) fixture connection instead.
+    let admin_conn = admin_at(base_url).await;
+    let (retained, expected) = read_retained_and_expected(&admin_conn.client, spool).await;
+    assert_eq!(
+        retained, expected,
+        "the row the lost-commit attempt actually trued server-side must read as trued exactly \
+         once, not doubled by any retry logic"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// Test plan item 3 (fully): the backfill touches only state-3 rows. States 1, 2 and 4 must be
+// byte-for-byte untouched.
+//
+// Test plan item 4: the backfill's own guard (`AND x.state=3 AND x.metadata_bytes=t.charged` on
+// the APPLY step, added specifically because "the backfill UPDATE matches on spool_id only" was
+// the original, unfixed shape of this defect) prevents a double give-back when a row a backfill
+// snapshot already read gets compacted before the APPLY step's own re-check runs. The real 0028
+// backfill runs as one atomic statement inside the upgrade's own LOCK TABLE-guarded transaction,
+// which excludes genuine wall-clock concurrency with compaction by construction -- so the
+// discrimination proof here is a deterministic, parameter-driven replay of exactly the APPLY
+// step's WHERE clause (real vs the pre-fix shape), fed the SAME stale snapshot values a real race
+// would produce, rather than a timing-dependent two-connection race.
+// -------------------------------------------------------------------------------------------
+
+/// Re-run just the backfill APPLY step's own guard, standalone, against caller-supplied
+/// `charged`/`retained` values standing in for a snapshot read before some other change to the
+/// row. `guarded = true` is 0028's real WHERE clause; `false` drops `AND x.state=3 AND
+/// x.metadata_bytes=t.charged`, the exact pre-fix shape CR-038 names as the defect this guards
+/// against. Returns the number of custody rows the UPDATE matched.
+/// `Ok(rows_affected)` on success. The mutated (pre-fix) shape can also legitimately fail the
+/// `object_store_retention.uint64` domain's own `>= 0` CHECK when the double give-back this test
+/// forces would take the policy counter negative -- that failure is itself discriminating evidence
+/// (the real guard's WHERE clause makes the statement that provokes it unreachable), so the caller
+/// decides what a `Err` means rather than this helper treating it as a fixture bug.
+async fn apply_parametrized_backfill_step(
+    admin: &tokio_postgres::Client,
+    guarded: bool,
+    spool: Uuid,
+    charged: i64,
+    retained: i64,
+) -> Result<i64, tokio_postgres::Error> {
+    let guard_clause = if guarded {
+        "AND x.state=3 AND x.metadata_bytes=$2"
+    } else {
+        ""
+    };
+    let update_sql = format!(
+        "UPDATE object_store_retention.drain_spool_custody x SET metadata_bytes=$3
+         WHERE x.spool_id=$1 {guard_clause} AND $3::bigint<$2::bigint"
+    );
+    admin
+        .batch_execute("BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;")
+        .await
+        .expect("open owner transaction");
+    let affected = admin
+        .execute(&update_sql, &[&spool, &charged, &retained])
+        .await;
+    let result = match affected {
+        Ok(affected) if affected > 0 => admin
+            .execute(
+                "UPDATE object_store_retention.drain_policies p
+                 SET metadata_bytes=(p.metadata_bytes::numeric-($1::bigint::numeric-$2::bigint::numeric))::object_store_retention.uint64
+                 FROM object_store_retention.drain_spool_custody x
+                 WHERE x.spool_id=$3 AND p.boundary=x.boundary AND p.cell=x.cell",
+                &[&charged, &retained, &spool],
+            )
+            .await
+            .map(|_| affected),
+        other => other,
+    };
+    admin
+        .batch_execute(if result.is_ok() {
+            "COMMIT;"
+        } else {
+            "ROLLBACK;"
+        })
+        .await
+        .expect("close the owner transaction");
+    result.map(|affected| i64::try_from(affected).unwrap())
+}
+
+async fn read_policy_metadata_bytes(
+    admin: &tokio_postgres::Client,
+    boundary: &str,
+    cell: &str,
+) -> i64 {
+    admin
+        .query_one(
+            "SELECT metadata_bytes::bigint FROM object_store_retention.drain_policies WHERE boundary = $1 AND cell = $2",
+            &[&boundary, &cell],
+        )
+        .await
+        .expect("read policy counter")
+        .get(0)
+}
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_double_give_back() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_BACKFILL_STATES_PG_URL").await;
+    let base_url = fixture.base_url.clone();
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R27)
+        .await
+        .expect("install a real R27 cell");
+
+    // -- Part 1 (item 3): seed one row per state 1, 2, 3, 4 and prove backfill only touches 3. --
+    let boundary = "backfill-states-boundary";
+    let cell = "backfill-states-cell";
+    fixture
+        .client
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+             INSERT INTO object_store_retention.drain_policies
+               (boundary, cell, revision, digest, policy, canonical, metadata_rows, metadata_bytes)
+             VALUES ('{boundary}', '{cell}', 'seed-policy-v1', decode(repeat('11',32),'hex'),
+               '{{\"expires_at_ms\": 4102444800000}}'::jsonb, decode('aa','hex'), 4, 65536);
+             COMMIT;"
+        ))
+        .await
+        .expect("seed policy");
+
+    let spool_state1 = Uuid::now_v7();
+    let spool_state2 = Uuid::now_v7();
+    let spool_state4 = Uuid::now_v7();
+    let spool_state3 = Uuid::now_v7();
+    for (spool, state) in [(spool_state1, 1), (spool_state2, 2)] {
+        fixture
+            .client
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+                 INSERT INTO object_store_retention.drain_spool_custody
+                   (spool_id, boundary, cell, service, logical_id, attempt_id, descriptor, canonical,
+                    digest, cleanup_not_before, state, cleanup_fence, metadata_bytes)
+                 VALUES ('{spool}', '{boundary}', '{cell}', 'seed-service',
+                   md5('logical'||'{spool}')::uuid, md5('attempt'||'{spool}')::uuid,
+                   jsonb_build_object('policy_revision','seed-policy-v1','policy_digest', repeat('11', 32)),
+                   decode('aa','hex'), decode(repeat('11',32),'hex'), 0, {state}, 1, 16384);
+                 COMMIT;"
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("seed state-{state} row: {error}"));
+    }
+    // State 4: already compacted (the shape `drain_cleanup_compact_v1` leaves: descriptor/canonical
+    // NULL, metadata_bytes at the 1024 marker). Seeded as a state-3 row first, then moved with a
+    // plain UPDATE: the `drain_custody_policy_expiry_v1` trigger is BEFORE INSERT only, and an
+    // INSERT with a NULL descriptor straight away would trip its `SELECT ... INTO STRICT` lookup
+    // (NULL matches no policy row).
+    seed_one_untrued_row(&fixture.client, boundary, cell, spool_state4).await;
+    fixture
+        .client
+        .batch_execute(&format!(
+            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+             UPDATE object_store_retention.drain_spool_custody
+             SET state = 4, descriptor = NULL, canonical = NULL, metadata_bytes = 1024
+             WHERE spool_id = '{spool_state4}';
+             COMMIT;"
+        ))
+        .await
+        .expect("move the state-4 row to the already-compacted shape");
+    // State 3: seed_one_untrued_row's own policy insert is `ON CONFLICT DO NOTHING`, so it will
+    // not disturb the 65536 seeded above.
+    seed_one_untrued_row(&fixture.client, boundary, cell, spool_state3).await;
+
+    async fn snapshot(admin: &tokio_postgres::Client, spool: Uuid) -> Vec<Option<String>> {
+        // Every column cast to text in SQL itself: a simple, order-preserving byte-for-byte
+        // comparison with no client-side type dispatch to get wrong (`jsonb`'s `::text` cast is
+        // its canonical serialization; `bytea`'s is `\x`-prefixed hex, which is exact).
+        let row = admin
+            .query_one(
+                "SELECT state::text, metadata_bytes::text, descriptor::text, canonical::text, \
+                 release_receipt::text, release_digest::text, cleanup_fence::text, \
+                 cleanup_not_before::text FROM object_store_retention.drain_spool_custody \
+                 WHERE spool_id = $1",
+                &[&spool],
+            )
+            .await
+            .expect("snapshot row");
+        (0..8).map(|index| row.get(index)).collect()
+    }
+    let before_state1 = snapshot(&fixture.client, spool_state1).await;
+    let before_state2 = snapshot(&fixture.client, spool_state2).await;
+    let before_state4 = snapshot(&fixture.client, spool_state4).await;
+
+    drop(migrator);
+    drop(_migrator_task);
+    drop(fixture);
+    {
+        let probe = admin_at(base_url.clone()).await;
+        wait_until_exclusive(&probe.client).await;
+    }
+    let (recovery_migrator, _recovery_task) =
+        connect_as(&base_url, "object_dispatch_retention_migrator").await;
+    upgrade_cell_schema(&recovery_migrator)
+        .await
+        .expect("upgrade to current");
+
+    let admin_conn = admin_at(base_url.clone()).await;
+    let after_state1 = snapshot(&admin_conn.client, spool_state1).await;
+    let after_state2 = snapshot(&admin_conn.client, spool_state2).await;
+    let after_state4 = snapshot(&admin_conn.client, spool_state4).await;
+    assert_eq!(
+        before_state1, after_state1,
+        "a state-1 row must be byte-for-byte untouched"
+    );
+    assert_eq!(
+        before_state2, after_state2,
+        "a state-2 row must be byte-for-byte untouched"
+    );
+    assert_eq!(
+        before_state4, after_state4,
+        "an already-compacted state-4 row must be byte-for-byte untouched -- never given back twice"
+    );
+    let (retained3, expected3) = read_retained_and_expected(&admin_conn.client, spool_state3).await;
+    assert_eq!(
+        retained3, expected3,
+        "the state-3 row must still be trued normally alongside the untouched states"
+    );
+
+    // -- Part 2 (item 4): the guard itself, deterministically. --
+    // Two isolated boundary/cell pairs, each with its own row compacted the moment BEFORE the
+    // (simulated) backfill APPLY step runs against a stale pre-compaction snapshot.
+    async fn compact_and_snapshot(
+        admin: &tokio_postgres::Client,
+        boundary: &str,
+        cell: &str,
+        spool: Uuid,
+    ) -> (i64, i64) {
+        // Unlike every other seeded policy in this file, `expires_at_ms` here is in the PAST: this
+        // helper needs `drain_cleanup_compact_v1` to actually run (its early-return condition is
+        // `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`; with no matching
+        // `object_dispatch_spool_objects` row, `s.expires_at_unix_ms` is NULL and `greatest` falls
+        // through to the policy's own value alone).
+        admin
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+                 INSERT INTO object_store_retention.drain_policies
+                   (boundary, cell, revision, digest, policy, canonical, metadata_rows, metadata_bytes)
+                 VALUES ('{boundary}', '{cell}', 'seed-policy-v1', decode(repeat('11',32),'hex'),
+                   '{{\"expires_at_ms\": 1000}}'::jsonb, decode('aa','hex'), 1, 16384);
+                 COMMIT;"
+            ))
+            .await
+            .expect("seed isolated policy");
+        seed_one_untrued_row(admin, boundary, cell, spool).await;
+        let charged: i64 = 16384;
+        let retained: i64 = admin
+            .query_one(
+                "SELECT object_store_retention.drain_retained_metadata_bytes_v1(c) \
+                 FROM object_store_retention.drain_spool_custody c WHERE c.spool_id = $1",
+                &[&spool],
+            )
+            .await
+            .expect("compute the retained size a snapshot would have captured")
+            .get(0);
+        // Compaction "races ahead": give the row's own custody charge back now, exactly like the
+        // real 0027 `drain_cleanup_compact_v1`, before any backfill APPLY step re-checks it.
+        admin
+            .batch_execute(&format!(
+                "SET SESSION AUTHORIZATION object_dispatch_retention_runtime;
+                 BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;
+                 SELECT object_store_retention.drain_cleanup_compact_v1('{spool}');
+                 COMMIT;
+                 RESET SESSION AUTHORIZATION;"
+            ))
+            .await
+            .expect("real compaction on the row");
+        (charged, retained)
+    }
+
+    let real_boundary = "backfill-race-real-boundary";
+    let real_cell = "backfill-race-real-cell";
+    let real_spool = Uuid::now_v7();
+    let (real_charged, real_retained) =
+        compact_and_snapshot(&admin_conn.client, real_boundary, real_cell, real_spool).await;
+    let policy_after_compaction_only =
+        read_policy_metadata_bytes(&admin_conn.client, real_boundary, real_cell).await;
+    assert_eq!(
+        policy_after_compaction_only, 1024,
+        "compaction alone must already have given the row's charge back to 1024"
+    );
+    let real_affected = apply_parametrized_backfill_step(
+        &admin_conn.client,
+        true,
+        real_spool,
+        real_charged,
+        real_retained,
+    )
+    .await
+    .expect("the real guard's statement must succeed (as a correct no-op)");
+    assert_eq!(
+        real_affected, 0,
+        "the real guard must refuse to touch a row compaction already moved to state 4"
+    );
+    assert_eq!(
+        read_policy_metadata_bytes(&admin_conn.client, real_boundary, real_cell).await,
+        1024,
+        "the real guard must leave the policy exactly where compaction alone left it -- no double give-back"
+    );
+
+    let mutated_boundary = "backfill-race-mutated-boundary";
+    let mutated_cell = "backfill-race-mutated-cell";
+    let mutated_spool = Uuid::now_v7();
+    let (mutated_charged, mutated_retained) = compact_and_snapshot(
+        &admin_conn.client,
+        mutated_boundary,
+        mutated_cell,
+        mutated_spool,
+    )
+    .await;
+    let mutated_result = apply_parametrized_backfill_step(
+        &admin_conn.client,
+        false,
+        mutated_spool,
+        mutated_charged,
+        mutated_retained,
+    )
+    .await;
+    // The discrimination proof itself: dropping `AND x.state=3 AND x.metadata_bytes=t.charged`
+    // (the exact pre-fix shape CR-038 names) makes the custody UPDATE incorrectly re-match a row
+    // compaction already moved to state 4, attempting a second give-back for the same charge. That
+    // attempt either succeeds and drives the policy counter below the 1024 compaction alone left
+    // (a silent double give-back) or is caught by the `uint64` domain's own `>= 0` CHECK when the
+    // second subtraction goes negative -- both outcomes are the guard's absence actually mattering;
+    // a clean `Ok` leaving the counter at 1024 (indistinguishable from the real guard's own
+    // behavior) would mean the mutation changed nothing and the proof failed.
+    match mutated_result {
+        Ok(affected) => {
+            assert_eq!(
+                affected, 1,
+                "the pre-fix (spool_id-only) shape must incorrectly re-match an already-compacted \
+                 row, or this proves nothing"
+            );
+            let mutated_policy_bytes =
+                read_policy_metadata_bytes(&admin_conn.client, mutated_boundary, mutated_cell)
+                    .await;
+            assert!(
+                mutated_policy_bytes < 1024,
+                "the pre-fix shape must double-give-back: the policy counter must be reduced a \
+                 SECOND time below what compaction alone left it (1024), landing at \
+                 {mutated_policy_bytes}"
+            );
+        }
+        Err(error) => {
+            assert_eq!(
+                error.as_db_error().and_then(|db| db.constraint()),
+                Some("uint64_check"),
+                "an error here must be the double give-back going negative through the uint64 \
+                 domain's own CHECK, not some other failure: {error}"
+            );
+        }
+    }
 }
 
 // -------------------------------------------------------------------------------------------

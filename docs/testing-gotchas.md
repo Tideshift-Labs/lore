@@ -117,6 +117,27 @@ it's derived from another column rather than a fixed literal.
   batch aborts at the first failing statement. A test asserting an expected raise on such a
   connection must `ROLLBACK; RESET SESSION AUTHORIZATION;` explicitly before reusing that client.
 
+- **A raw TCP fault proxy that scans the client->server direction must forward the pgwire startup
+  packet specially first.** Every message after it carries a leading tag byte before its 4-byte
+  length; the startup packet (and a preceding `SSLRequest`, absent when connecting with
+  `sslmode=disable`) does not -- it is just the length followed by that many bytes. A proxy written
+  to scan for a needle (or any other tagged-frame parsing) must relay this first message verbatim,
+  by its own untagged framing, before switching to tag-based parsing, or it misreads the startup
+  payload's first byte as a tag and hangs waiting for a length that never resolves.
+- **A `uint64` domain column needs its bound parameter cast to its own underlying type first, not
+  straight to the domain.** `$1::object_store_retention.uint64` or `$1::numeric` from an `i64`
+  binding fails as a `WrongType` on the driver side; `$1::bigint::numeric` (cast to what the Rust
+  type actually binds as, then to what the SQL expression needs) works. The existing
+  `$3::text::object_store_retention.uint64` idiom used elsewhere in this crate sidesteps the same
+  issue by going through text instead.
+- **`drain_cleanup_compact_v1` silently no-ops when there is no matching
+  `object_dispatch_spool_objects` row, unless the seeded policy's own `expires_at_ms` is already in
+  the past.** Its early-return guard is `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`;
+  a `SELECT INTO` (not `STRICT`) that matches zero rows leaves `s.expires_at_unix_ms` NULL, and
+  `greatest(NULL, far_future)` still evaluates to `far_future` -- every other fixture in this tier
+  deliberately seeds a far-future policy expiry specifically to keep compaction a no-op, so a test
+  that needs compaction to actually run must seed a PAST `expires_at_ms` instead, not merely omit
+  the spool_objects row.
 - **A "no other session connected" precondition counts YOUR test's own fixture connections.**
   `upgrade_cell_schema`'s D4 check (refuse the real state-transition step, not a no-op
   already-current call, if any other backend is connected to the cell database) counts the test's
