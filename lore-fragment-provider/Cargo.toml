@@ -41,6 +41,9 @@ uuid = { workspace = true }
 serde_json = { workspace = true }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 tokio-util = { workspace = true }
+# CR-038 D5's `install_cell_schema_at` (a real R27 cell fixture) is `test_seams`-gated in
+# `lore-object-dispatch`, the same shape that crate's own `tests/` dev-dependency uses.
+lore-object-dispatch = { workspace = true, features = ["test_seams"] }
 # Test-only. The seam itself spawns nothing; the admission tests do.
 lore-base = { workspace = true }
 # "test-util" for `#[tokio::test(start_paused = true)]` / `tokio::time::pause`,

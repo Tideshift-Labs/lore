@@ -1826,6 +1826,13 @@ async fn read_policy_metadata_bytes(
         .get(0)
 }
 
+// This test (via `apply_parametrized_backfill_step`) proves a hand-copied reproduction of the
+// backfill APPLY step's WHERE-clause predicate, not the shipped 0028 statement itself. Under the
+// real, shipped 0028 migration the backfill runs inside the same transaction that takes
+// `drain_policies` in `ACCESS EXCLUSIVE MODE NOWAIT` (see `migrations/0028_...sql`), which makes
+// the race this test simulates unreachable in production: no concurrent compaction can interleave
+// with a live backfill. The parametrized replay exists because that exclusivity makes the real
+// race untestable by timing, so this discriminates the guard clause deterministically instead.
 #[tokio::test]
 #[ignore = "requires a fresh disposable PostgreSQL 16 database"]
 async fn live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_double_give_back() {

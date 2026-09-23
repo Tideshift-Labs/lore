@@ -85,6 +85,21 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   and one real-scale case bulk-seeded (SQL) to the exact 8,192-row/134,217,728-byte dev cap. See
   [testing-gotchas.md](testing-gotchas.md#cr-038-forward-upgrade-fixture-gotchas) for the fixture
   traps this tier's synthetic reservation/seeding needed.
+  D5's own call path — `FragmentProviderEntry::drain_handles` (`lore-fragment-provider/src/drain.rs`)
+  — is pinned separately from `DrainClient::verify_schema_revision` above: two live (`#[ignore]`)
+  cases in `lore-fragment-provider/src/tests.rs`
+  (`drain_handles_refuses_a_cell_that_predates_the_spool_metadata_true_up`,
+  `drain_handles_refuses_a_cell_schema_revision_this_build_does_not_know`) drive `drain_handles`
+  itself against a real R27 cell and a planted future marker; a call-site-direct test on
+  `verify_schema_revision` does not catch its own call being deleted from `drain_handles`, since
+  every offline fixture in that crate already installs the current schema. The disposition arm that
+  maps the two schema `DrainError`s to `Internal` (not the generic `DrainAuthority(_) => Transient`)
+  is pinned offline in the same file:
+  `drain_authority_schema_refusals_classify_as_internal_and_keep_their_operator_message`. A crate
+  that needs `cell_schema_install::install_cell_schema_at` (a real R27 fixture) for its own tests
+  needs `lore-object-dispatch = { workspace = true, features = ["test_seams"] }` in
+  `[dev-dependencies]` — it's `#[cfg(feature = "test_seams")]`-gated upstream in that crate, the
+  same shape `lore-transport`/`lore-revision` use their own `test_seams` for.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

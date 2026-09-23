@@ -1874,6 +1874,51 @@ fn every_local_refusal_carries_a_named_disposition() {
     }
 }
 
+/// CR-038 D5: a cell schema revision this build cannot serve is a deployment fault, not back
+/// pressure -- pins the arm at `lib.rs`'s `disposition()` that classifies the two schema-refusal
+/// `DrainError` variants as `Internal` rather than falling through to the generic
+/// `DrainAuthority(_) => Transient` catch-all below it, and pins that the operator-facing message
+/// text (what an operator actually reads) survives being wrapped in `FragmentProviderError`'s own
+/// `Display`. Losing the dedicated arm would degrade both refusals to `Transient`, which tells an
+/// operator to retry a call that will fail identically forever.
+#[test]
+fn drain_authority_schema_refusals_classify_as_internal_and_keep_their_operator_message() {
+    use lore_object_dispatch::drain_policy::DrainError;
+
+    for (refusal, expected_text_fragment) in [
+        (
+            DrainError::SchemaUpgradeRequired,
+            "stop every replica and run `cell-schema-install upgrade`",
+        ),
+        (
+            DrainError::SchemaUnknown,
+            "the cell schema revision is not one this build knows",
+        ),
+    ] {
+        let error = FragmentProviderError::DrainAuthority(refusal);
+        assert_eq!(
+            error.disposition(),
+            FragmentProviderDisposition::Internal,
+            "{refusal} must classify as Internal, not the generic DrainAuthority(_) => Transient \
+             catch-all"
+        );
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains(expected_text_fragment),
+            "the operator message must survive FragmentProviderError's own Display wrapping; got \
+             {rendered:?}"
+        );
+    }
+
+    // The generic catch-all still holds for every other `DrainError` variant, so the two schema
+    // arms above are proved to be a carve-out and not a change to the default.
+    assert_eq!(
+        FragmentProviderError::DrainAuthority(DrainError::Invalid).disposition(),
+        FragmentProviderDisposition::Transient,
+        "a non-schema DrainError must still fall through to the generic catch-all"
+    );
+}
+
 // -----------------------------------------------------------------------
 // WP-114 CD-6: FragmentDrainCapability
 // -----------------------------------------------------------------------
@@ -2957,6 +3002,266 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
     crate::drain::assert_cleanup_recovers_after_worker_panic(&maintenance).await;
     std::fs::remove_dir_all(&root).unwrap();
 }
+
+/// CR-038 D5: `drain_handles` itself -- not `verify_schema_revision` called in isolation -- must
+/// refuse a cell that predates the spool metadata true-up. Deleting the `verify_schema_revision()`
+/// call from `drain_handles` (`src/drain.rs`) does not fail any offline test in this crate, since
+/// every offline fixture installs the current schema; only a real R27 cell, driven through
+/// `drain_handles`'s own call path, discriminates it.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn drain_handles_refuses_a_cell_that_predates_the_spool_metadata_true_up() {
+    use lore_object_dispatch::cell_schema_install::CellSchemaRevision;
+    use lore_object_dispatch::cell_schema_install::install_cell_schema_at;
+    use lore_object_dispatch::drain_policy::DrainError;
+    use tokio_util::task::AbortOnDropHandle;
+
+    let url = std::env::var("LORE_TEST_DRAIN_HANDLES_SCHEMA_GATE_UPGRADE_REQUIRED_PG_URL")
+        .expect("owned disposable PostgreSQL URL is required");
+    assert!(
+        url.starts_with("postgresql://postgres@"),
+        "runner must supply its fresh superuser fixture"
+    );
+    let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let _connection = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "drain-handles-schema-gate-upgrade-required-live",
+        async move {
+            let _ = connection.await;
+        }
+    ));
+    admin.batch_execute("DO $$ BEGIN
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_owner') THEN CREATE ROLE object_dispatch_retention_owner NOLOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_runtime') THEN CREATE ROLE object_dispatch_retention_runtime LOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_maintenance') THEN CREATE ROLE object_dispatch_retention_maintenance LOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_migrator') THEN CREATE ROLE object_dispatch_retention_migrator LOGIN; END IF;
+          END $$;
+          ALTER ROLE object_dispatch_retention_runtime LOGIN;
+          ALTER ROLE object_dispatch_retention_maintenance LOGIN;
+          GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator WITH INHERIT FALSE, SET TRUE;").await.unwrap();
+    let database: String = admin
+        .query_one("SELECT current_database()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    admin
+        .batch_execute(&format!(
+            "GRANT CREATE ON DATABASE \"{}\" TO object_dispatch_retention_owner; SET SESSION AUTHORIZATION object_dispatch_retention_migrator;",
+            database.replace('"', "\"\"")
+        ))
+        .await
+        .unwrap();
+    install_cell_schema_at(&admin, CellSchemaRevision::R27)
+        .await
+        .expect("install a real R27 cell, which predates the true-up marker");
+    admin
+        .batch_execute("RESET SESSION AUTHORIZATION;")
+        .await
+        .unwrap();
+
+    let row = admin
+        .query_one(
+            "SELECT s.system_identifier::text,d.oid::bigint FROM pg_control_system() s,pg_database d WHERE d.datname=current_database()",
+            &[],
+        )
+        .await
+        .unwrap();
+    let system: String = row.get(0);
+    let oid = row.get::<_, i64>(1) as u32;
+    let identity = DispatchDatabaseIdentity::new(system.parse().unwrap(), oid).unwrap();
+    let runtime_url = format!(
+        "{}{}sslmode=disable",
+        url.replacen("://postgres@", "://object_dispatch_retention_runtime@", 1),
+        if url.contains('?') { "&" } else { "?" }
+    );
+    let pool = Arc::new(
+        DispatchRuntimePool::new(DispatchPoolConfig {
+            postgres_url: runtime_url,
+            role: DispatchPoolRole::Runtime,
+            expected_database_identity: identity,
+            pool_max: 1,
+            connect_timeout: Duration::from_secs(5),
+            acquire_timeout: Duration::from_secs(5),
+            statement_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(2),
+            tls: DispatchTlsMode::Disabled,
+            budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0).unwrap(),
+        })
+        .unwrap(),
+    );
+
+    let (offline, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+    let Ok(mut entry) = Arc::try_unwrap(offline) else {
+        panic!("fixture entry uniquely owned")
+    };
+    entry.pool = pool.clone();
+    entry._dispatch = DispatchRuntimeClient::new(pool).unwrap();
+    let entry = Arc::new(entry);
+
+    let root = std::env::temp_dir().join(format!("lore-drain-schema-gate-{}", Uuid::now_v7()));
+    std::fs::create_dir(&root).unwrap();
+    let pin = FragmentDrainPolicyPin {
+        cell_id: "schema-gate-cell".into(),
+        revision: "schema-gate-policy".into(),
+        digest: [0x11; 32],
+    };
+    let outcome = entry
+        .drain_handles(
+            root.clone(),
+            pin,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+    match outcome {
+        Err(FragmentProviderError::DrainAuthority(DrainError::SchemaUpgradeRequired)) => {}
+        Err(other) => panic!("expected DrainAuthority(SchemaUpgradeRequired), got {other:?}"),
+        Ok(_) => panic!(
+            "drain_handles must refuse an R27 cell through its own call path, not merely when \
+             verify_schema_revision is called directly"
+        ),
+    }
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "a schema-refused activation must perform no spool setup work"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// CR-038 D5: `drain_handles` must also refuse, through its own call path, a cell schema revision
+/// this build does not recognize -- not only the "predates the true-up" case above.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn drain_handles_refuses_a_cell_schema_revision_this_build_does_not_know() {
+    use lore_object_dispatch::drain_policy::DrainError;
+    use tokio_util::task::AbortOnDropHandle;
+
+    let url = std::env::var("LORE_TEST_DRAIN_HANDLES_SCHEMA_GATE_UNKNOWN_PG_URL")
+        .expect("owned disposable PostgreSQL URL is required");
+    assert!(
+        url.starts_with("postgresql://postgres@"),
+        "runner must supply its fresh superuser fixture"
+    );
+    let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let _connection = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "drain-handles-schema-gate-unknown-live",
+        async move {
+            let _ = connection.await;
+        }
+    ));
+    admin.batch_execute("DO $$ BEGIN
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_owner') THEN CREATE ROLE object_dispatch_retention_owner NOLOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_runtime') THEN CREATE ROLE object_dispatch_retention_runtime LOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_maintenance') THEN CREATE ROLE object_dispatch_retention_maintenance LOGIN; END IF;
+          IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='object_dispatch_retention_migrator') THEN CREATE ROLE object_dispatch_retention_migrator LOGIN; END IF;
+          END $$;
+          ALTER ROLE object_dispatch_retention_runtime LOGIN;
+          ALTER ROLE object_dispatch_retention_maintenance LOGIN;
+          GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator WITH INHERIT FALSE, SET TRUE;").await.unwrap();
+    let database: String = admin
+        .query_one("SELECT current_database()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    admin
+        .batch_execute(&format!(
+            "GRANT CREATE ON DATABASE \"{}\" TO object_dispatch_retention_owner; SET SESSION AUTHORIZATION object_dispatch_retention_migrator;",
+            database.replace('"', "\"\"")
+        ))
+        .await
+        .unwrap();
+    lore_object_dispatch::cell_schema_install::install_cell_schema(&admin)
+        .await
+        .expect("install a real, current cell");
+    admin
+        .batch_execute(
+            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+             CREATE OR REPLACE FUNCTION object_store_retention.cell_schema_revision_v1() RETURNS integer
+             LANGUAGE sql IMMUTABLE SET search_path=pg_catalog AS $$ SELECT 999 $$;
+             COMMIT;",
+        )
+        .await
+        .expect("plant a future marker this build does not recognize");
+    admin
+        .batch_execute("RESET SESSION AUTHORIZATION;")
+        .await
+        .unwrap();
+
+    let row = admin
+        .query_one(
+            "SELECT s.system_identifier::text,d.oid::bigint FROM pg_control_system() s,pg_database d WHERE d.datname=current_database()",
+            &[],
+        )
+        .await
+        .unwrap();
+    let system: String = row.get(0);
+    let oid = row.get::<_, i64>(1) as u32;
+    let identity = DispatchDatabaseIdentity::new(system.parse().unwrap(), oid).unwrap();
+    let runtime_url = format!(
+        "{}{}sslmode=disable",
+        url.replacen("://postgres@", "://object_dispatch_retention_runtime@", 1),
+        if url.contains('?') { "&" } else { "?" }
+    );
+    let pool = Arc::new(
+        DispatchRuntimePool::new(DispatchPoolConfig {
+            postgres_url: runtime_url,
+            role: DispatchPoolRole::Runtime,
+            expected_database_identity: identity,
+            pool_max: 1,
+            connect_timeout: Duration::from_secs(5),
+            acquire_timeout: Duration::from_secs(5),
+            statement_timeout: Duration::from_secs(5),
+            lock_timeout: Duration::from_secs(2),
+            tls: DispatchTlsMode::Disabled,
+            budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0).unwrap(),
+        })
+        .unwrap(),
+    );
+
+    let (offline, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());
+    let Ok(mut entry) = Arc::try_unwrap(offline) else {
+        panic!("fixture entry uniquely owned")
+    };
+    entry.pool = pool.clone();
+    entry._dispatch = DispatchRuntimeClient::new(pool).unwrap();
+    let entry = Arc::new(entry);
+
+    let root =
+        std::env::temp_dir().join(format!("lore-drain-schema-gate-unknown-{}", Uuid::now_v7()));
+    std::fs::create_dir(&root).unwrap();
+    let pin = FragmentDrainPolicyPin {
+        cell_id: "schema-gate-unknown-cell".into(),
+        revision: "schema-gate-unknown-policy".into(),
+        digest: [0x22; 32],
+    };
+    let outcome = entry
+        .drain_handles(
+            root.clone(),
+            pin,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .await;
+    match outcome {
+        Err(FragmentProviderError::DrainAuthority(DrainError::SchemaUnknown)) => {}
+        Err(other) => panic!("expected DrainAuthority(SchemaUnknown), got {other:?}"),
+        Ok(_) => panic!(
+            "drain_handles must refuse an unrecognized schema revision through its own call \
+             path, not merely when verify_schema_revision is called directly"
+        ),
+    }
+    assert_eq!(
+        std::fs::read_dir(&root).unwrap().count(),
+        0,
+        "a schema-refused activation must perform no spool setup work"
+    );
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
 /// Dynamic proof, not just a source reading, that the drain shares the
 /// one in-flight put semaphore with the direct fallback: holding the
 /// cell's only put permit through the direct path leaves a otherwise-valid
