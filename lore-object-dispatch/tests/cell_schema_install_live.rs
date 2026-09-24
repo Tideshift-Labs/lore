@@ -20,12 +20,14 @@ use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_LAYERS;
 use lore_object_dispatch::cell_schema_install::CellInstallDisposition;
 use lore_object_dispatch::cell_schema_install::CellSchemaError;
 use lore_object_dispatch::cell_schema_install::CellSchemaLayerId;
+use lore_object_dispatch::cell_schema_install::CellSchemaRevision;
 use lore_object_dispatch::cell_schema_install::LayerIdentity;
 use lore_object_dispatch::cell_schema_install::LayerInstallOutcome;
-use lore_object_dispatch::cell_schema_install::apply_cell_install_plan;
+use lore_object_dispatch::cell_schema_install::apply_cell_install_plan_at;
 use lore_object_dispatch::cell_schema_install::attest_cell_schema;
 use lore_object_dispatch::cell_schema_install::install_cell_schema;
 use lore_object_dispatch::cell_schema_install::measure_catalog_manifest;
+use lore_object_dispatch::cell_schema_install::read_server_major;
 use lore_object_dispatch::cell_schema_install::revoke_replaced_function_privileges;
 use tokio_util::task::AbortOnDropHandle;
 
@@ -884,9 +886,21 @@ async fn live_postgres_cell_schema_revokes_service_privileges_after_replacement(
 #[ignore = "measurement helper; requires a fresh disposable PostgreSQL 16 database"]
 async fn live_postgres_cell_schema_measure_catalog_manifest() {
     let cell = connect("LORE_TEST_CELL_SCHEMA_MEASURE_PG_URL").await;
-    apply_cell_install_plan(&cell.client)
+    // Optional: measure an older known state, e.g. on a newly supported server major.
+    let target = match std::env::var("LORE_TEST_CELL_SCHEMA_MEASURE_TARGET").as_deref() {
+        Err(_) | Ok("R28") => CellSchemaRevision::R28,
+        Ok("R25") => CellSchemaRevision::R25,
+        Ok("R26") => CellSchemaRevision::R26,
+        Ok("R27") => CellSchemaRevision::R27,
+        Ok(other) => panic!("unknown LORE_TEST_CELL_SCHEMA_MEASURE_TARGET {other}"),
+    };
+    let major = read_server_major(&cell.client)
+        .await
+        .expect("a supported server major");
+    apply_cell_install_plan_at(&cell.client, target)
         .await
         .expect("install the chain without attesting it");
+    println!("MEASURED target {} on {}", target.label(), major.label());
     let (sections, whole) = measure_catalog_manifest(&cell.client)
         .await
         .expect("measure the live catalog manifest");

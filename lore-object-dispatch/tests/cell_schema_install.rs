@@ -24,15 +24,22 @@ use lore_object_dispatch::cell_schema_install::CELL_INERT_RETENTION_TABLES;
 use lore_object_dispatch::cell_schema_install::CELL_INSTALL_SET;
 use lore_object_dispatch::cell_schema_install::CELL_MIGRATOR_ROLE;
 use lore_object_dispatch::cell_schema_install::CELL_OWNER_ROLE;
+use lore_object_dispatch::cell_schema_install::CELL_PG18_RENDERINGS;
 use lore_object_dispatch::cell_schema_install::CELL_REPLACED_FUNCTIONS;
 use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_INSTALL_API_REVISION_V1;
 use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_LAYERS;
+use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_STATES;
+use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_STATES_PG18;
 use lore_object_dispatch::cell_schema_install::CELL_SERVICE_ROLES;
 use lore_object_dispatch::cell_schema_install::CellInstallStep;
+use lore_object_dispatch::cell_schema_install::CellMigration;
 use lore_object_dispatch::cell_schema_install::CellSchemaError;
 use lore_object_dispatch::cell_schema_install::CellSchemaLayerId;
 use lore_object_dispatch::cell_schema_install::CellSchemaRevision;
+use lore_object_dispatch::cell_schema_install::PostgresMajor;
 use lore_object_dispatch::cell_schema_install::cell_install_plan;
+use lore_object_dispatch::cell_schema_install::cell_migration_sql;
+use lore_object_dispatch::cell_schema_install::classify_cell_catalog;
 use lore_object_dispatch::cell_schema_install::validate_cell_install_set_digests;
 
 // ---------------------------------------------------------------------------------------------
@@ -868,13 +875,14 @@ fn every_error_variant() -> Vec<CellSchemaError> {
         CellSchemaError::FutureSchema,
         CellSchemaError::SchemaOperationBusy,
         CellSchemaError::ReplicasActive,
+        CellSchemaError::UnsupportedServerMajor(170_004),
     ];
     // The match below forces a new *arm*, which a `=> {}` satisfies without adding the variant to
     // the vec these tests actually sweep. Pinning the length is what makes adding a variant fail
     // here rather than pass unswept.
     assert_eq!(
         variants.len(),
-        16,
+        17,
         "a new CellSchemaError variant must be added to this vec, not only to the match below"
     );
     for variant in &variants {
@@ -895,7 +903,8 @@ fn every_error_variant() -> Vec<CellSchemaError> {
             | CellSchemaError::UpgradeRequired(_)
             | CellSchemaError::FutureSchema
             | CellSchemaError::SchemaOperationBusy
-            | CellSchemaError::ReplicasActive => {}
+            | CellSchemaError::ReplicasActive
+            | CellSchemaError::UnsupportedServerMajor(_) => {}
         }
     }
     variants
@@ -1219,5 +1228,170 @@ fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
     assert_eq!(
         CELL_FORWARD_STEPS[2].to,
         lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// PostgreSQL major selection (WP-115 row 58).
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn only_postgres_16_and_18_map_to_a_major_and_every_other_value_is_refused() {
+    for (server_version_num, expected) in [
+        (160_000, Some(PostgresMajor::Pg16)),
+        (160_014, Some(PostgresMajor::Pg16)),
+        (169_999, Some(PostgresMajor::Pg16)),
+        (180_000, Some(PostgresMajor::Pg18)),
+        (180_006, Some(PostgresMajor::Pg18)),
+        (189_999, Some(PostgresMajor::Pg18)),
+        // No nearest-major fallback in either direction.
+        (150_010, None),
+        (159_999, None),
+        (170_000, None),
+        (170_006, None),
+        (179_999, None),
+        (190_000, None),
+        (0, None),
+        (-1, None),
+    ] {
+        assert_eq!(
+            PostgresMajor::from_server_version_num(server_version_num),
+            expected,
+            "server_version_num {server_version_num}"
+        );
+    }
+    // The refusal names the version it saw and is its own reason, never a catalog drift.
+    let refusal = CellSchemaError::UnsupportedServerMajor(170_006);
+    assert!(format!("{refusal}").contains("170006"));
+    assert_eq!(refusal.reason(), "unsupported server major");
+}
+
+#[test]
+fn each_major_selects_its_own_pin_list_and_no_state_pin_is_shared_across_majors() {
+    assert_eq!(PostgresMajor::Pg16.schema_states(), &CELL_SCHEMA_STATES);
+    assert_eq!(
+        PostgresMajor::Pg18.schema_states(),
+        &CELL_SCHEMA_STATES_PG18
+    );
+    assert_ne!(CELL_SCHEMA_STATES, CELL_SCHEMA_STATES_PG18);
+    let mut manifests = BTreeSet::new();
+    for (revision, sections, manifest) in CELL_SCHEMA_STATES.iter().chain(&CELL_SCHEMA_STATES_PG18)
+    {
+        assert_ne!(
+            *manifest,
+            [0u8; 32],
+            "{} manifest pin is a placeholder",
+            revision.label()
+        );
+        assert!(
+            sections.iter().all(|section| *section != [0u8; 32]),
+            "{} has a placeholder section pin",
+            revision.label()
+        );
+        assert!(
+            manifests.insert(*manifest),
+            "{} manifest pin repeats",
+            revision.label()
+        );
+    }
+    // A PostgreSQL 16 catalog never classifies under PostgreSQL 18's pins, and the reverse.
+    for (revision, sections, manifest) in CELL_SCHEMA_STATES {
+        assert_eq!(
+            classify_cell_catalog(PostgresMajor::Pg16, &sections, &manifest),
+            Some(revision)
+        );
+        assert_eq!(
+            classify_cell_catalog(PostgresMajor::Pg18, &sections, &manifest),
+            None
+        );
+    }
+    for (revision, sections, manifest) in CELL_SCHEMA_STATES_PG18 {
+        assert_eq!(
+            classify_cell_catalog(PostgresMajor::Pg18, &sections, &manifest),
+            Some(revision)
+        );
+        assert_eq!(
+            classify_cell_catalog(PostgresMajor::Pg16, &sections, &manifest),
+            None
+        );
+    }
+}
+
+#[test]
+fn postgres_18_renders_exactly_0008_and_0011_and_only_their_digest_literal() {
+    let rendered: Vec<u16> = CELL_PG18_RENDERINGS.iter().map(|r| r.number).collect();
+    assert_eq!(rendered, vec![8, 11]);
+    for migration in CELL_INSTALL_SET {
+        // PostgreSQL 16 always installs the exact frozen bytes.
+        let pg16 = cell_migration_sql(PostgresMajor::Pg16, &migration).expect("pg16 sql");
+        assert_eq!(pg16.as_ref(), migration.sql, "{:04}", migration.number);
+        let pg18 = cell_migration_sql(PostgresMajor::Pg18, &migration).expect("pg18 sql");
+        let Some(rendering) = CELL_PG18_RENDERINGS
+            .iter()
+            .find(|rendering| rendering.number == migration.number)
+        else {
+            assert_eq!(pg18.as_ref(), migration.sql, "{:04}", migration.number);
+            continue;
+        };
+        // Same length, and the bytes differ only inside the one literal.
+        assert_eq!(pg18.len(), migration.sql.len());
+        let start = migration
+            .sql
+            .find(rendering.frozen_literal)
+            .expect("frozen literal present");
+        let end = start + rendering.frozen_literal.len();
+        assert_eq!(&pg18[..start], &migration.sql[..start]);
+        assert_eq!(&pg18[end..], &migration.sql[end..]);
+        assert_eq!(&pg18[start..end], rendering.rendered_literal);
+        assert_ne!(rendering.frozen_literal, rendering.rendered_literal);
+        // The frozen artifact keeps its own pin; the rendering has a different one.
+        assert_eq!(
+            blake3::hash(migration.sql.as_bytes()).as_bytes(),
+            &migration.blake3
+        );
+        assert_eq!(
+            blake3::hash(pg18.as_bytes()).as_bytes(),
+            &rendering.rendered_blake3
+        );
+        assert_ne!(rendering.rendered_blake3, migration.blake3);
+    }
+    assert!(validate_cell_install_set_digests());
+}
+
+#[test]
+fn a_rendering_refuses_an_artifact_whose_literal_is_absent_or_repeated() {
+    let frozen = CELL_INSTALL_SET
+        .iter()
+        .find(|migration| migration.number == 8)
+        .copied()
+        .expect("0008 in the install set");
+    let literal = CELL_PG18_RENDERINGS[0].frozen_literal;
+    let absent: &'static str = Box::leak(
+        frozen
+            .sql
+            .replace(literal, &"0".repeat(64))
+            .into_boxed_str(),
+    );
+    let repeated: &'static str =
+        Box::leak(format!("{}\n-- {literal}\n", frozen.sql).into_boxed_str());
+    for (case, sql) in [("absent", absent), ("repeated", repeated)] {
+        let doctored = CellMigration { sql, ..frozen };
+        assert_eq!(
+            cell_migration_sql(PostgresMajor::Pg18, &doctored).map(|_| ()),
+            Err(CellSchemaError::Precondition("rendered migration literal")),
+            "{case}"
+        );
+        // PostgreSQL 16 never renders, so it is not affected by the literal at all.
+        assert!(cell_migration_sql(PostgresMajor::Pg16, &doctored).is_ok());
+    }
+    // One extra byte elsewhere: the literal still occurs once, so only the digest can catch it.
+    let edited: &'static str = Box::leak(format!("{} ", frozen.sql).into_boxed_str());
+    let doctored = CellMigration {
+        sql: edited,
+        ..frozen
+    };
+    assert_eq!(
+        cell_migration_sql(PostgresMajor::Pg18, &doctored).map(|_| ()),
+        Err(CellSchemaError::Precondition("rendered migration digest"))
     );
 }

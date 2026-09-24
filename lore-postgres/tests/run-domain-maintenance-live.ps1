@@ -20,10 +20,16 @@ only this runner's container and anonymous volume.
 [CmdletBinding()]
 param(
     [switch]$KeepOnFailure,
-    [ValidateRange(1, 86400)][int]$CommandTimeoutSeconds = 600
+    [ValidateRange(1, 86400)][int]$CommandTimeoutSeconds = 600,
+    [string]$PostgresImage = 'postgres:16'
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The image tag names the PostgreSQL major this run expects; the live server must report it.
+$expectedPgMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name PostgreSQL 16 or 18 in its tag"
+}
 $ProgressPreference = 'SilentlyContinue'
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
@@ -187,7 +193,7 @@ try {
         '--label', "com.tideshift.lore.domain-maintenance-live.started=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
         '--publish', '127.0.0.1::5432',
         '--env', 'POSTGRES_HOST_AUTH_METHOD=trust',
-        'postgres:16'
+        $PostgresImage
     )
 
     $portResult = Invoke-ForegroundProcess docker @('port', $containerName, '5432/tcp') $loreRoot $CommandTimeoutSeconds
@@ -225,8 +231,8 @@ try {
         throw 'failed to query the disposable PostgreSQL server version'
     }
     $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
-    if ($serverVersion -lt 160000 -or $serverVersion -ge 170000) {
-        throw "expected PostgreSQL 16, found server_version_num=$serverVersion"
+    if ($serverVersion -lt ($expectedPgMajor * 10000) -or $serverVersion -ge (($expectedPgMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedPgMajor, found server_version_num=$serverVersion"
     }
 
     Push-Location $loreRoot

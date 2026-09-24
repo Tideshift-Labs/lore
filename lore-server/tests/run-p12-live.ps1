@@ -27,10 +27,15 @@ param(
     [int]$PgPort = 11832,
     [string]$PgUser = 'lorehub',
     [string]$PgPassword = 'lorehub',
-    [string]$ComposeFile = 'D:\github\lorehub-all\lorehub\docker\compose.yaml'
+    [string]$ComposeFile = 'D:\github\lorehub-all\lorehub\docker\compose.yaml',
+    [ValidateSet(16, 18)]
+    [int]$PostgresMajor = 16
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The shared server must report exactly this major.
+$expectedPgMajor = $PostgresMajor
 $ProgressPreference = 'SilentlyContinue'
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
@@ -131,8 +136,8 @@ function Assert-Postgres {
         throw "failed to query the test PostgreSQL server version:`n$($versionRaw | Out-String)"
     }
     $version = [int](($versionRaw | Out-String).Trim())
-    if ($version -lt 160000 -or $version -ge 170000) {
-        throw "expected PostgreSQL 16, found server_version_num=$version"
+    if ($version -lt ($expectedPgMajor * 10000) -or $version -ge (($expectedPgMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedPgMajor, found server_version_num=$version"
     }
 }
 

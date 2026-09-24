@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 (with a real BLAKE3 provider) and runs CR-038's forward
+Provisions a disposable PostgreSQL 16 or 18 (with a real BLAKE3 provider) and runs CR-038's forward
 schema-upgrade live tier by exact name, reporting PASS / FAIL / NOT RUN as three distinct states.
 
 .DESCRIPTION
@@ -34,12 +34,18 @@ Steps:
      zero tests is NOT RUN, never a pass.
   8. Removes only its own labelled container.
 
+.PARAMETER PostgresImage
+A prebuilt postgres-blake3 image to run instead of the default PostgreSQL 16 one, e.g.
+`commit0-postgres-blake3:pg18-local`. This runner never builds or retags it; it must already exist.
+Its tag must name major 16 or 18, and the server's `server_version_num` must match that major.
+
 .PARAMETER KeepOnFailure
 Keeps the container for debugging when the run did not fully pass.
 #>
 
 [CmdletBinding()]
 param(
+    [string]$PostgresImage = '',
     [switch]$KeepOnFailure
 )
 
@@ -55,7 +61,11 @@ $containerStarted = $false
 $runPassed = $false
 
 $target = 'cell_schema_forward_upgrade_live'
-$imageTag = 'lore-cell-schema-forward-upgrade:postgres16-blake3-v1'
+$defaultImageTag = 'lore-cell-schema-forward-upgrade:postgres16-blake3-v1'
+$imageTag = if ($PostgresImage) { $PostgresImage } else { $defaultImageTag }
+$expectedMajor = if ($imageTag -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "image $imageTag does not name a supported major (16 or 18) in its tag"
+}
 
 $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_WEDGE_PG_URL'; Name = 'live_upgraded_cell_survives_the_load_that_wedges_an_unupgraded_cell'; Database = 'wedge' },
@@ -201,6 +211,9 @@ function Build-PostgresBlake3Image {
     if ($existing -and $LASTEXITCODE -eq 0) {
         return
     }
+    if ($imageTag -ne $defaultImageTag) {
+        throw "image $imageTag is not present; this runner builds only its own default image"
+    }
     $context = [IO.Path]::GetFullPath((Join-Path $loreRoot '../lorehub/docker/dev-cell'))
     $dockerfile = Join-Path $context 'Dockerfile.postgres-blake3'
     if (-not (Test-Path -LiteralPath $dockerfile)) {
@@ -248,6 +261,16 @@ try {
         & docker logs $containerName
         throw 'disposable PostgreSQL did not become ready within 60 seconds'
     }
+
+    $serverVersionRaw = & docker exec $containerName psql -tA -v ON_ERROR_STOP=1 -U postgres -d postgres -c 'SHOW server_version_num;'
+    if ($LASTEXITCODE -ne 0) {
+        throw 'failed to read server_version_num'
+    }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($imageTag)"
 
     $roleSql = @'
 DO $$

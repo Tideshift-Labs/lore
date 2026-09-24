@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 and runs the WP-114 CD-1 cell-schema installer/attester live
+Provisions a disposable PostgreSQL 16 (or 18, with -PostgresImage) and runs the WP-114 CD-1 cell-schema installer/attester live
 tier by exact name, reporting PASS / FAIL / NOT RUN as three distinct states.
 
 .DESCRIPTION
@@ -42,6 +42,13 @@ Runs only the measurement helper, which installs a fresh chain and prints the li
 digests. Use it to (re)measure the pinned constants in `cell_schema_install.rs` after a frozen
 migration or the manifest query changes. It is not a gate and reports no PASS.
 
+.PARAMETER MeasureTarget
+With -Measure, the known state to install and measure: R25, R26, R27 or R28 (default R28).
+
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:16`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
+
 .PARAMETER KeepOnFailure
 Keeps the container for debugging when the run did not fully pass.
 #>
@@ -49,6 +56,9 @@ Keeps the container for debugging when the run did not fully pass.
 [CmdletBinding()]
 param(
     [switch]$Measure,
+    [ValidateSet('R25', 'R26', 'R27', 'R28')]
+    [string]$MeasureTarget = 'R28',
+    [string]$PostgresImage = 'postgres:16',
     [switch]$KeepOnFailure
 )
 
@@ -64,6 +74,11 @@ $containerStarted = $false
 $runPassed = $false
 
 $target = 'cell_schema_install_live'
+
+# The image tag names the major the pins are for; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 
 $gateTests = @(
     @{
@@ -130,6 +145,10 @@ $priorEnvironment = @{}
 foreach ($name in $environmentNames) {
     $priorEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
 }
+$environmentNames += 'LORE_TEST_CELL_SCHEMA_MEASURE_TARGET'
+$priorEnvironment['LORE_TEST_CELL_SCHEMA_MEASURE_TARGET'] =
+    [Environment]::GetEnvironmentVariable('LORE_TEST_CELL_SCHEMA_MEASURE_TARGET', 'Process')
+[Environment]::SetEnvironmentVariable('LORE_TEST_CELL_SCHEMA_MEASURE_TARGET', $MeasureTarget, 'Process')
 
 function Invoke-Checked {
     param(
@@ -244,7 +263,7 @@ try {
         '--label', "com.tideshift.lore.cell-schema-install-live.started=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
         '--publish', '127.0.0.1::5432',
         '--env', 'POSTGRES_HOST_AUTH_METHOD=trust',
-        'postgres:16'
+        $PostgresImage
     )
 
     $portOutputRaw = & docker port $containerName '5432/tcp'
@@ -269,6 +288,16 @@ try {
         & docker logs $containerName
         throw 'disposable PostgreSQL did not become ready within 60 seconds'
     }
+
+    $serverVersionRaw = & docker exec $containerName psql -tA -v ON_ERROR_STOP=1 -U postgres -d postgres -c 'SHOW server_version_num;'
+    if ($LASTEXITCODE -ne 0) {
+        throw 'failed to read server_version_num'
+    }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
     # The migrator is a LOGIN role and a NON-INHERITING member of the owner role. All three parts
     # are load-bearing. The installer requires session_user = migrator; every frozen migration opens

@@ -108,6 +108,10 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# The image tag names the PostgreSQL major this run expects; the live server must report it.
+# An unmarked tag, such as the default, is this runner's PostgreSQL 16 fixture.
+$expectedPgMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else { 16 }
 $ProgressPreference = 'SilentlyContinue'
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
@@ -782,8 +786,8 @@ try {
             throw "expected server_version_num to be a bare integer; psql returned:`n$versionText"
         }
         $serverVersion = [int]$versionText
-        if ($serverVersion -lt 160000 -or $serverVersion -ge 170000) {
-            throw "expected PostgreSQL 16, found server_version_num=$serverVersion"
+        if ($serverVersion -lt ($expectedPgMajor * 10000) -or $serverVersion -ge (($expectedPgMajor + 1) * 10000)) {
+            throw "expected PostgreSQL $expectedPgMajor, found server_version_num=$serverVersion"
         }
 
         $liveCases = @(

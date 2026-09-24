@@ -15,6 +15,19 @@
 //! live catalog against the closed [`CELL_SCHEMA_STATES`] list, and [`upgrade_cell_schema`] moves an
 //! attested N-1 cell to N offline. Nothing here repairs an unknown state.
 //!
+//! ## PostgreSQL major versions
+//!
+//! The manifest carries server-rendered catalog text, so every pin is a property of one server
+//! major. Each entry point reads `server_version_num` and selects that major's closed pin list:
+//! [`CELL_SCHEMA_STATES`] for PostgreSQL 16, [`CELL_SCHEMA_STATES_PG18`] for PostgreSQL 18. Any
+//! other major is refused as [`CellSchemaError::UnsupportedServerMajor`]; it never falls back to
+//! another major's pins. Frozen migrations 0008 and 0011 embed a PostgreSQL 16 manifest digest in
+//! their own in-database catalog asserts, so on PostgreSQL 18 they are installed as the
+//! [`CELL_PG18_RENDERINGS`]: the frozen bytes with exactly that one literal replaced, checked
+//! against their own pinned BLAKE3. The frozen files and their pins do not change.
+//! A PostgreSQL 16 cell moved to 18 by `pg_upgrade` re-renders catalog text such as `CHECK`
+//! expressions, matches no fresh-install PostgreSQL 18 pin, and is refused as catalog drift.
+//!
 //! Six properties this module owns, and nothing else in the crate does:
 //!
 //! 1. **Migrator-role install, out of band.** Every public entry point here refuses unless the
@@ -458,6 +471,10 @@ pub fn validate_cell_install_set_digests() -> bool {
             || step.from.last_migration() + 1 != step.to.last_migration()
             || previous.is_some_and(|previous| previous != step.from)
             || forward_step_body(&step).is_err()
+            // A forward step runs its frozen bytes on every major, so it must have no rendering.
+            || CELL_PG18_RENDERINGS
+                .iter()
+                .any(|rendering| rendering.number == step.migration.number)
         {
             return false;
         }
@@ -471,6 +488,15 @@ pub fn validate_cell_install_set_digests() -> bool {
     }
     if previous != Some(CELL_SCHEMA_CURRENT) {
         return false;
+    }
+    // Every PostgreSQL 18 rendering names a frozen artifact and renders to its own pinned digest.
+    for rendering in CELL_PG18_RENDERINGS {
+        let Some(migration) = cell_migration_for(rendering.number) else {
+            return false;
+        };
+        if cell_migration_sql(PostgresMajor::Pg18, &migration).is_err() {
+            return false;
+        }
     }
     for layer in CELL_SCHEMA_LAYERS {
         let Some(migration) = cell_migration_for(layer.contract_migration) else {
@@ -1284,13 +1310,259 @@ pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4
     ),
 ];
 
-/// Return the known state whose whole manifest matches, if any.
+/// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 18.
+///
+/// Every PostgreSQL 18 pin is measured on `postgres:18` (180006) from a fresh install at that
+/// state, with 0008 and 0011 as their [`CELL_PG18_RENDERINGS`], never derived from a PostgreSQL 16
+/// pin. Against the PostgreSQL 16 pin of the same state, three sections move in every state:
+/// `constraints` (PostgreSQL 18 records `NOT NULL` as `pg_constraint` rows), `relation_acls`
+/// (PostgreSQL 17 added `MAINTAIN` to the default relation ACL), and `functions` (0008's and 0011's
+/// rendered digest literals). The other nine match the PostgreSQL 16 pin, which is the check.
+pub const CELL_CATALOG_SECTION_BLAKE3_R25_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R25[0],
+    CELL_CATALOG_SECTION_BLAKE3_R25[1],
+    CELL_CATALOG_SECTION_BLAKE3_R25[2],
+    hex32("6a4e8fa9f8f9b94ea725f8b4730e7a173e22b6be5b61c8e869b4f9d9efe824ef"),
+    CELL_CATALOG_SECTION_BLAKE3_R25[4],
+    CELL_CATALOG_SECTION_BLAKE3_R25[5],
+    hex32("9a21ed9728651b4a33435bcd9903eeea647ba6f8d65d8a0ee0c82e2332ebc500"),
+    CELL_CATALOG_SECTION_BLAKE3_R25[7],
+    hex32("5acd9d78f1c3d32940421c3179abeef738633fc8acfaacbe2d0ad23b4fb260e8"),
+    CELL_CATALOG_SECTION_BLAKE3_R25[9],
+    CELL_CATALOG_SECTION_BLAKE3_R25[10],
+    CELL_CATALOG_SECTION_BLAKE3_R25[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R25`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R25_PG18: [u8; 32] =
+    hex32("fe1081c3c3fa470fca2baf7361548e251799cd79e8303230480769008c41a94e");
+
+/// Pinned per-section digests of state [`CellSchemaRevision::R26`], `PostgreSQL` 18.
+pub const CELL_CATALOG_SECTION_BLAKE3_R26_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R26[0],
+    CELL_CATALOG_SECTION_BLAKE3_R26[1],
+    CELL_CATALOG_SECTION_BLAKE3_R26[2],
+    hex32("7cdc255112fc603376da7e2c4b52d654604b4c965d2d61f4a0b61d3a6b40d85c"),
+    CELL_CATALOG_SECTION_BLAKE3_R26[4],
+    CELL_CATALOG_SECTION_BLAKE3_R26[5],
+    hex32("f3ebb667cda32a6e43769010a36e6959a823bfd0c8e0b3a2148a8de4f59cd476"),
+    CELL_CATALOG_SECTION_BLAKE3_R26[7],
+    hex32("8ca2be5452c73301c237cffcc12746732897ace4d635cd0fae232f95c87cc750"),
+    CELL_CATALOG_SECTION_BLAKE3_R26[9],
+    CELL_CATALOG_SECTION_BLAKE3_R26[10],
+    CELL_CATALOG_SECTION_BLAKE3_R26[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R26`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R26_PG18: [u8; 32] =
+    hex32("4591bd39f88de7734eba29ffe5781ba1bbb54e790fa7e49cc6a37ff21dd3af04");
+
+/// Pinned per-section digests of state [`CellSchemaRevision::R27`], `PostgreSQL` 18.
+pub const CELL_CATALOG_SECTION_BLAKE3_R27_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R27[0],
+    CELL_CATALOG_SECTION_BLAKE3_R27[1],
+    CELL_CATALOG_SECTION_BLAKE3_R27[2],
+    hex32("990b6c05be2868f57a485721afe69d60e6f9f81cc50620aeb51336724d7fb68d"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[4],
+    CELL_CATALOG_SECTION_BLAKE3_R27[5],
+    hex32("24dfe8d9987ce45e7f372c3cd04ad9a5c092a3859de1565117950394ee7b76d5"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[7],
+    hex32("8ca2be5452c73301c237cffcc12746732897ace4d635cd0fae232f95c87cc750"),
+    CELL_CATALOG_SECTION_BLAKE3_R27[9],
+    CELL_CATALOG_SECTION_BLAKE3_R27[10],
+    CELL_CATALOG_SECTION_BLAKE3_R27[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R27`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R27_PG18: [u8; 32] =
+    hex32("8fcccaab1c43828f75194eb3e64e66285144ccd36b7fb78490b0d06ccf5d4b1e");
+
+/// Pinned per-section digests of state [`CellSchemaRevision::R28`], `PostgreSQL` 18.
+///
+/// As on PostgreSQL 16, forward step 0028 moves exactly `functions` and `function_acls` against
+/// the R27 pin of the same major.
+pub const CELL_CATALOG_SECTION_BLAKE3_R28_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[0],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[1],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[2],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[3],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[4],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[5],
+    hex32("9ce55f8d99e6b40cb5d76b6e37b86aab6a719164dd592b59388b85b2ef4981d2"),
+    CELL_CATALOG_SECTION_BLAKE3_R28[7],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[8],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[9],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[10],
+    CELL_CATALOG_SECTION_BLAKE3_R27_PG18[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R28`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R28_PG18: [u8; 32] =
+    hex32("1832abe46949ed0c85cebc5a2ec21d4b44fd23f1625c2f70665456f8cd285b13");
+
+/// One major's closed list of known states: each state with its section pins and manifest pin.
+pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4];
+
+/// Every known PostgreSQL 18 state with its pins, oldest first.
+pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
+    (
+        CellSchemaRevision::R25,
+        CELL_CATALOG_SECTION_BLAKE3_R25_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R25_PG18,
+    ),
+    (
+        CellSchemaRevision::R26,
+        CELL_CATALOG_SECTION_BLAKE3_R26_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R26_PG18,
+    ),
+    (
+        CellSchemaRevision::R27,
+        CELL_CATALOG_SECTION_BLAKE3_R27_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R27_PG18,
+    ),
+    (
+        CellSchemaRevision::R28,
+        CELL_CATALOG_SECTION_BLAKE3_R28_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R28_PG18,
+    ),
+];
+
+/// A PostgreSQL server major this module has measured pins for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostgresMajor {
+    /// `server_version_num` in `[160000, 170000)`.
+    Pg16,
+    /// `server_version_num` in `[180000, 190000)`.
+    Pg18,
+}
+
+impl PostgresMajor {
+    /// Map `server_version_num` to a supported major. Every other value is `None`: there is no
+    /// nearest-major fallback, because a different major renders the manifest differently.
+    #[must_use]
+    pub const fn from_server_version_num(server_version_num: i32) -> Option<Self> {
+        match server_version_num {
+            160_000..=169_999 => Some(Self::Pg16),
+            180_000..=189_999 => Some(Self::Pg18),
+            _ => None,
+        }
+    }
+
+    /// Stable, non-sensitive label for reports and diagnostics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pg16 => "PostgreSQL 16",
+            Self::Pg18 => "PostgreSQL 18",
+        }
+    }
+
+    /// This major's closed list of known states and their pins.
+    #[must_use]
+    pub const fn schema_states(self) -> &'static CellSchemaStatePins {
+        match self {
+            Self::Pg16 => &CELL_SCHEMA_STATES,
+            Self::Pg18 => &CELL_SCHEMA_STATES_PG18,
+        }
+    }
+}
+
+/// One frozen artifact as it must be installed on PostgreSQL 18.
+///
+/// 0008 and 0011 each embed the SHA-256 of their own in-database catalog manifest, measured on
+/// PostgreSQL 16. The rendering replaces exactly that one literal and nothing else. The result is
+/// checked against [`CellMigrationRendering::rendered_blake3`] before it runs.
+#[derive(Clone, Copy, Debug)]
+pub struct CellMigrationRendering {
+    /// The frozen artifact this renders.
+    pub number: u16,
+    /// The PostgreSQL 16 manifest digest literal in the frozen bytes. It must occur exactly once.
+    pub frozen_literal: &'static str,
+    /// The PostgreSQL 18 manifest digest that replaces it, measured.
+    pub rendered_literal: &'static str,
+    /// BLAKE3-256 of the rendered artifact.
+    pub rendered_blake3: [u8; 32],
+}
+
+/// The PostgreSQL 18 renderings of 0008 and 0011.
+///
+/// Measured on `postgres:18` (180006): 0008's manifest with the frozen 0002-0008 chain applied,
+/// then 0011's from its own `DETAIL` with rendered 0008 applied. 0011's manifest covers every
+/// function in the schema, including 0008's assert with its digest literal, so its PostgreSQL 18
+/// value is only valid after rendered 0008.
+pub const CELL_PG18_RENDERINGS: [CellMigrationRendering; 2] = [
+    CellMigrationRendering {
+        number: 8,
+        frozen_literal: "317145373c7f1929f9d85077d05660a6373e7407da3dd1ce88b64936ce7972c8",
+        rendered_literal: "2cf59bddf42ae2772ac7f4c6cec255ca50e80b88d13dbb06d494d0268923a0b2",
+        rendered_blake3: hex32("11452a3511046c575e45e6c49df5ae69a150a17e5fe2ca4bb2b614026666aeed"),
+    },
+    CellMigrationRendering {
+        number: 11,
+        frozen_literal: "837aa8d2654cea2204e88fcc56d4cd291199c73829aa77c0e55b69544864e32c",
+        rendered_literal: "e4b7ed44e63b6bf6741f68f06296ac08bc59f93b1fbdfff059f31ac988891e4d",
+        rendered_blake3: hex32("f14a8d21e33071d4e848d96531445393c62f536b2b7c22c118a8e2132c450a97"),
+    },
+];
+
+/// The exact SQL to run for `migration` on `major`.
+///
+/// PostgreSQL 16 gets the frozen bytes. PostgreSQL 18 gets the frozen bytes unless the artifact has
+/// a [`CELL_PG18_RENDERINGS`] entry, in which case the one literal is replaced and the result must
+/// match its pinned digest.
+///
+/// # Errors
+///
+/// [`CellSchemaError::Precondition`] when the frozen literal does not occur exactly once, or the
+/// rendered bytes do not match their pinned digest.
+pub fn cell_migration_sql(
+    major: PostgresMajor,
+    migration: &CellMigration,
+) -> Result<std::borrow::Cow<'static, str>, CellSchemaError> {
+    let rendering = match major {
+        PostgresMajor::Pg16 => None,
+        PostgresMajor::Pg18 => CELL_PG18_RENDERINGS
+            .iter()
+            .find(|rendering| rendering.number == migration.number),
+    };
+    let Some(rendering) = rendering else {
+        return Ok(std::borrow::Cow::Borrowed(migration.sql));
+    };
+    if migration.sql.matches(rendering.frozen_literal).count() != 1 {
+        return Err(CellSchemaError::Precondition("rendered migration literal"));
+    }
+    let rendered = migration
+        .sql
+        .replacen(rendering.frozen_literal, rendering.rendered_literal, 1);
+    if blake3::hash(rendered.as_bytes()).as_bytes() != &rendering.rendered_blake3 {
+        return Err(CellSchemaError::Precondition("rendered migration digest"));
+    }
+    Ok(std::borrow::Cow::Owned(rendered))
+}
+
+const SERVER_VERSION_NUM_SQL: &str =
+    "SELECT pg_catalog.current_setting('server_version_num')::integer";
+
+/// Read the connected server's major and refuse one this module has no pins for.
+///
+/// # Errors
+///
+/// [`CellSchemaError::UnsupportedServerMajor`] for any major other than 16 or 18.
+pub async fn read_server_major(client: &Client) -> Result<PostgresMajor, CellSchemaError> {
+    let server_version_num: i32 = query_one_value(client, SERVER_VERSION_NUM_SQL).await?;
+    PostgresMajor::from_server_version_num(server_version_num)
+        .ok_or(CellSchemaError::UnsupportedServerMajor(server_version_num))
+}
+
+/// Return the known state of `major` whose whole manifest matches, if any.
 #[must_use]
 pub fn classify_cell_catalog(
+    major: PostgresMajor,
     sections: &[[u8; 32]; 12],
     manifest: &[u8; 32],
 ) -> Option<CellSchemaRevision> {
-    CELL_SCHEMA_STATES
+    major
+        .schema_states()
         .iter()
         .find(|(_, pinned_sections, pinned_manifest)| {
             pinned_sections == sections && pinned_manifest == manifest
@@ -1408,6 +1680,11 @@ pub enum CellSchemaError {
         "other sessions are connected to the cell database: stop and exclude every replica and operator session, then retry"
     )]
     ReplicasActive,
+    /// The server's major version has no measured pins here. Carries `server_version_num`.
+    ///
+    /// Never a fallback to another major's pins: the manifest is server-rendered text.
+    #[error("unsupported PostgreSQL server major (server_version_num {0}); supported: 16, 18")]
+    UnsupportedServerMajor(i32),
 }
 
 impl CellSchemaError {
@@ -1431,6 +1708,7 @@ impl CellSchemaError {
             Self::FutureSchema => "future schema",
             Self::SchemaOperationBusy => "schema operation busy",
             Self::ReplicasActive => "replicas active",
+            Self::UnsupportedServerMajor(_) => "unsupported server major",
         }
     }
 
@@ -1945,6 +2223,26 @@ pub async fn apply_cell_install_plan(
     apply_install_plan_to(client, CELL_SCHEMA_CURRENT, StepAttestation::Skip).await
 }
 
+/// [`apply_cell_install_plan`] stopped at an older known state, for measuring that state's pins on
+/// a new server major before they exist. Same `test_seams` limits.
+///
+/// # Errors
+///
+/// As [`apply_cell_install_plan`].
+#[cfg(feature = "test_seams")]
+pub async fn apply_cell_install_plan_at(
+    client: &Client,
+    target: CellSchemaRevision,
+) -> Result<
+    (
+        CellInstallDisposition,
+        [(CellSchemaLayerId, LayerInstallOutcome); 6],
+    ),
+    CellSchemaError,
+> {
+    apply_install_plan_to(client, target, StepAttestation::Skip).await
+}
+
 /// Install a FRESH cell at an older known state, then attest it as exactly that state.
 ///
 /// For fixtures only, such as an upgrade test that needs a real [`CellSchemaRevision::R27`] cell.
@@ -2008,6 +2306,7 @@ async fn apply_install_plan_to(
         return Err(CellSchemaError::Precondition("embedded migration digests"));
     }
     assert_install_preconditions(client).await?;
+    let major = read_server_major(client).await?;
 
     let mut layer_outcomes = [
         (CellSchemaLayerId::Retention, LayerInstallOutcome::Created),
@@ -2067,7 +2366,7 @@ async fn apply_install_plan_to(
                         continue;
                     }
                     client
-                        .batch_execute(migration.sql)
+                        .batch_execute(&cell_migration_sql(major, &migration)?)
                         .await
                         .map_err(CellSchemaError::postgres)?;
                 }
@@ -2172,6 +2471,7 @@ async fn attest_known_state(
     client: &Client,
 ) -> Result<(CellSchemaRevision, CellAttestation), CellSchemaError> {
     assert_migrator_session(client).await?;
+    let major = read_server_major(client).await?;
     assert_revision_marker_known(client).await?;
     let layers = read_layer_identities(client).await?;
     for (index, (id, identity)) in layers.iter().enumerate() {
@@ -2182,10 +2482,12 @@ async fn attest_known_state(
     }
 
     let (catalog_sections, catalog_blake3) = read_catalog_manifest(client).await?;
-    let Some(schema_revision) = classify_cell_catalog(&catalog_sections, &catalog_blake3) else {
+    let Some(schema_revision) = classify_cell_catalog(major, &catalog_sections, &catalog_blake3)
+    else {
         // Name the first section that disagrees with the CURRENT pin, as before CR-038: the
         // operator's next question is what differs from what this build expects.
-        let current = CELL_SCHEMA_STATES
+        let current = major
+            .schema_states()
             .iter()
             .find(|(revision, _, _)| *revision == CELL_SCHEMA_CURRENT)
             .ok_or(CellSchemaError::InvalidResponse("current schema pin"))?;
