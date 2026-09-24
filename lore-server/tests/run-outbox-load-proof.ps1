@@ -323,6 +323,8 @@ try {
     $gatewayEnv = @{
         LH_GATEWAY_ENV          = 'development'
         LH_GATEWAY_REGION       = 'sfo3'
+        # Contract A-32: required, and this tier measures the durable plane.
+        LH_GATEWAY_EVENT_PLANE  = 'durable'
         LH_GATEWAY_PLACEMENT    = $placement
         LH_GATEWAY_SHARDS       = $shards
         LH_GATEWAY_PRIVATE_HOST = '127.0.0.1'
