@@ -24,7 +24,11 @@
 //! another major's pins. Frozen migrations 0008 and 0011 embed a PostgreSQL 16 manifest digest in
 //! their own in-database catalog asserts, so on PostgreSQL 18 they are installed as the
 //! [`CELL_PG18_RENDERINGS`]: the frozen bytes with exactly that one literal replaced, checked
-//! against their own pinned BLAKE3. The frozen files and their pins do not change.
+//! against their own pinned BLAKE3. The frozen files and their pins do not change. A new
+//! migration cannot fix this: the assert runs inside the install plan, between 0008 and the next
+//! artifact, so the frozen PostgreSQL 16 literal would refuse the install before any later
+//! migration could replace it. No layer identity tuple names 0008 or 0011, so the schema-state
+//! row records the same artifact digests on both majors.
 //! A PostgreSQL 16 cell moved to 18 by `pg_upgrade` re-renders catalog text such as `CHECK`
 //! expressions, matches no fresh-install PostgreSQL 18 pin, and is refused as catalog drift.
 //!
@@ -495,6 +499,14 @@ pub fn validate_cell_install_set_digests() -> bool {
             return false;
         };
         if cell_migration_sql(PostgresMajor::Pg18, &migration).is_err() {
+            return false;
+        }
+        // The schema-state row records each layer's contract-artifact digest. A rendered artifact
+        // must never be one, or that row would hold a major-dependent value.
+        if CELL_SCHEMA_LAYERS
+            .iter()
+            .any(|layer| layer.contract_migration == rendering.number)
+        {
             return false;
         }
     }

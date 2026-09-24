@@ -1359,6 +1359,37 @@ fn postgres_18_renders_exactly_0008_and_0011_and_only_their_digest_literal() {
 }
 
 #[test]
+fn no_layer_identity_tuple_records_a_rendered_artifact_so_the_schema_state_row_is_major_independent()
+ {
+    // The only table that records an artifact BLAKE3 is the schema-state row, one tuple per layer,
+    // holding the digest of that layer's contract migration. None of those is rendered, so PG16
+    // and PG18 write and attest the same frozen digests there.
+    for layer in CELL_SCHEMA_LAYERS {
+        assert!(
+            CELL_PG18_RENDERINGS
+                .iter()
+                .all(|rendering| rendering.number != layer.contract_migration),
+            "{} names a rendered artifact",
+            layer.id.label()
+        );
+        let frozen = CELL_INSTALL_SET
+            .iter()
+            .find(|migration| migration.number == layer.contract_migration)
+            .expect("contract migration in the install set");
+        for major in [PostgresMajor::Pg16, PostgresMajor::Pg18] {
+            let sql = cell_migration_sql(major, frozen).expect("contract sql");
+            assert_eq!(
+                blake3::hash(sql.as_bytes()).to_hex().as_str(),
+                layer.migration_blake3_hex,
+                "{} on {}",
+                layer.id.label(),
+                major.label()
+            );
+        }
+    }
+}
+
+#[test]
 fn a_rendering_refuses_an_artifact_whose_literal_is_absent_or_repeated() {
     let frozen = CELL_INSTALL_SET
         .iter()
