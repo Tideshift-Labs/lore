@@ -266,7 +266,7 @@ try {
     # default and the streams this run publishes to would never be created.
     Push-Location $gatewayRoot
     try {
-        $provisionOutput = Invoke-Checked bun @('scripts/provision-streams.ts', '--cell', $CellId, '--url', $NatsUrl)
+        $provisionOutput = Invoke-Checked bun @('scripts/provision-streams.ts', '--cell', $CellId, '--event-plane', 'durable', '--url', $NatsUrl)
     }
     finally { Pop-Location }
     $streamIdentity = "DURABLE-$CellId"
