@@ -801,10 +801,14 @@ impl OperatorContext {
                 to,
                 transition_seq,
                 retired_rows,
+                retired_generations,
+                carried_pending_rows,
             } => {
                 println!(
                     "cell {} switched from {from} to {to} (transition {transition_seq}); \
-                     {retired_rows} outbox row(s) moved to lore_outbox_retired_events",
+                     {retired_rows} outbox row(s) moved to lore_outbox_retired_events, \
+                     {retired_generations} receiver generation(s) retired, \
+                     {carried_pending_rows} pending row(s) carried for the relay to publish",
                     self.cell_id
                 );
                 println!(

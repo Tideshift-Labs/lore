@@ -99,3 +99,10 @@ CREATE TABLE IF NOT EXISTS lore_outbox_retired_events (
 
 CREATE INDEX IF NOT EXISTS lore_outbox_retired_events_transition_rows
     ON lore_outbox_retired_events (cell_id, transition_seq);
+
+-- Re-entry to durable retires every live receiver generation; the count is part
+-- of that transition's audit record. An ALTER, not an edit to the CREATE TABLE
+-- body above, so a cell that already has the table gains the column too.
+ALTER TABLE lore_outbox_event_plane_transitions
+    ADD COLUMN IF NOT EXISTS retired_generations bigint NOT NULL DEFAULT 0
+        CHECK (retired_generations >= 0);

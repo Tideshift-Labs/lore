@@ -30,19 +30,39 @@
 //!
 //! 1. refuses while any `pending` row exists, because a pending row is work
 //!    that was never published. The operator drains it in `durable` mode first;
-//! 2. moves every `broker_accepted` and `consumer_safe` row into
+//! 2. refuses while any PARKED dead letter exists. A parked dead letter is an
+//!    undecided correctness incident, and its only recoveries (`requeue` and
+//!    `obsolete`) belong to the durable plane — a requeue writes a pending row;
+//! 3. moves every `broker_accepted` and `consumer_safe` row into
 //!    `lore_outbox_retired_events`, verbatim, with disposition
 //!    `retired_live_only`;
-//! 3. writes the transition row that names who ordered it, why, and how many
+//! 4. writes the transition row that names who ordered it, why, and how many
 //!    rows it retired.
 //!
-//! All three happen in one transaction. Nothing is deleted without its evidence
-//! copy and its audit row.
+//! All of it happens in one transaction. Nothing is deleted without its
+//! evidence copy and its audit row.
 //!
-//! Switching back to `durable` writes only the transition row. A `live_only`
-//! cell has no outbox rows (boot refuses one that does), and the retired
-//! evidence stays where it is. Receivers join under new membership generations
-//! by the ordinary CR-032 rules.
+//! # Re-entry to `durable`
+//!
+//! Switching back to `durable`, in one transaction:
+//!
+//! 1. refuses while a stream-reset fence is in progress;
+//! 2. retires every receiver generation that is not yet retired. They stopped
+//!    consuming when the cell left the durable plane, and a stale `ready`
+//!    generation would otherwise stay in the required set. Receivers rejoin
+//!    under NEW generations by the ordinary CR-032 rules; the count is on the
+//!    transition row;
+//! 3. carries a stray `pending` row across rather than refusing, because the
+//!    durable plane is exactly what publishes it. This is the exit for a
+//!    `live_only` cell that somehow gained one: `live_only` boot refuses any
+//!    row, and this switch is how the operator clears that refusal. A published
+//!    (`broker_accepted`/`consumer_safe`) row cannot arise on `live_only` and
+//!    is refused.
+//!
+//! Re-entry assumes the cell's DURABLE stream is the one it left. A stream
+//! recreated while the cell was `live_only` (broker volume loss) is a broker
+//! reset, and the gateway's durable journal reports it through the reset
+//! protocol, as for any durable cell.
 
 use std::time::Duration;
 use std::time::SystemTime;
@@ -149,8 +169,13 @@ pub enum SetEventPlaneOutcome {
         to: EventPlane,
         /// The transition row's sequence.
         transition_seq: i64,
-        /// How many outbox rows moved to the evidence table.
+        /// How many outbox rows moved to the evidence table (`live_only` only).
         retired_rows: i64,
+        /// How many receiver generations re-entry retired (`durable` only).
+        retired_generations: i64,
+        /// Stray `pending` rows carried into `durable`, where the relay
+        /// publishes them (`durable` only).
+        carried_pending_rows: i64,
     },
     /// The cell was already in the requested plane. Nothing was written.
     AlreadyCurrent {
@@ -196,6 +221,32 @@ pub async fn read_event_plane(
     })
 }
 
+/// Refuse an operator recovery that would put a row back into
+/// `lore_outbox_events` on a `live_only` cell.
+///
+/// `requeue-dead-letter` and `replay` both return work to `pending`. On a
+/// `live_only` cell nothing publishes it, and the row alone would make the next
+/// boot refuse. Their supported order is: `set-plane durable`, recover, drain,
+/// then `set-plane live-only` again.
+///
+/// # Errors
+/// `NotReady` on a `live_only` cell; the marker read's own errors otherwise.
+pub async fn refuse_recovery_on_live_only(
+    client: &impl GenericClient,
+    cell_id: &str,
+    operation: &str,
+) -> Result<(), DomainError> {
+    if read_event_plane(client, cell_id).await?.plane == EventPlane::LiveOnly {
+        return Err(DomainError::NotReady(format!(
+            "outbox {operation} refused: cell {cell_id} runs the live_only event plane, where \
+             nothing would publish the row it returns to pending. Stop every replica, run \
+             `loreserver outbox set-plane durable`, recover and drain in durable mode, then switch \
+             back with `set-plane live-only`"
+        )));
+    }
+    Ok(())
+}
+
 /// Read the marker and whether the cell has any outbox row, for the boot gate.
 ///
 /// # Errors
@@ -232,8 +283,9 @@ pub async fn read_boot_facts(
 /// * `InvalidInput` — malformed `cell_id`, or an empty or over-wide actor or
 ///   reason.
 /// * `Contention` — another backend is connected, or holds the outbox table.
-/// * `NotReady` — a switch to `live_only` while `pending` rows exist, or a
-///   switch to `durable` while outbox rows exist.
+/// * `NotReady` — a switch to `live_only` while `pending` rows or parked dead
+///   letters exist; a switch to `durable` while published rows exist or a
+///   stream-reset fence is in progress.
 /// * `OutcomeUnknown` — the commit reply was lost; rerun to reconcile.
 pub async fn set_event_plane(
     client: &mut deadpool_postgres::Client,
@@ -265,7 +317,9 @@ pub async fn set_event_plane(
     if let Err(error) = tx
         .batch_execute(
             "LOCK TABLE lore_outbox_events, lore_outbox_event_plane_transitions, \
-             lore_outbox_retired_events IN ACCESS EXCLUSIVE MODE NOWAIT",
+             lore_outbox_retired_events, lore_outbox_dead_letters, \
+             lore_outbox_membership_state, lore_outbox_receiver_membership, \
+             lore_outbox_reset_generations IN ACCESS EXCLUSIVE MODE NOWAIT",
         )
         .await
     {
@@ -301,9 +355,8 @@ pub async fn set_event_plane(
         .map_err(|e| DomainError::from_pg("event plane switch backlog count", e))?;
     let pending: i64 = counts.get("pending");
     let published: i64 = counts.get("published");
-    let total: i64 = counts.get("total");
 
-    let retired_rows = match target {
+    let (retired_rows, retired_generations) = match target {
         EventPlane::LiveOnly => {
             if pending > 0 {
                 return Err(DomainError::NotReady(format!(
@@ -312,16 +365,46 @@ pub async fn set_event_plane(
                      first, then rerun"
                 )));
             }
-            published
-        }
-        EventPlane::Durable => {
-            if total > 0 {
+            let parked = parked_dead_letters(&tx, cell_id).await?;
+            if parked > 0 {
                 return Err(DomainError::NotReady(format!(
-                    "event plane switch to durable refused: cell {cell_id} is live_only but holds \
-                     {total} outbox row(s); a live_only cell must hold none"
+                    "event plane switch to live_only refused: cell {cell_id} has {parked} parked \
+                     dead letter(s) awaiting a disposition, and both dispositions belong to the \
+                     durable plane. Decide each first, in durable mode: `loreserver outbox \
+                     requeue-dead-letter` and drain, or `loreserver outbox obsolete` with proof; \
+                     then rerun"
                 )));
             }
-            0
+            (published, 0)
+        }
+        EventPlane::Durable => {
+            // Only a pending row can arise on a live_only cell (a direct write or a
+            // defect); it is carried across because this plane publishes it. A
+            // published row there has no supported origin at all.
+            if published > 0 {
+                return Err(DomainError::NotReady(format!(
+                    "event plane switch to durable refused: cell {cell_id} is live_only but holds \
+                     {published} published outbox row(s), which no supported path writes on that \
+                     plane; inspect them with `loreserver outbox inspect` before switching"
+                )));
+            }
+            if reset_in_progress(&tx, cell_id).await? {
+                return Err(DomainError::NotReady(format!(
+                    "event plane switch to durable refused: cell {cell_id} has a stream-reset \
+                     fence in progress; it clears only through the reset protocol"
+                )));
+            }
+            // A carried row enters its publication cycle now. Its original age
+            // would otherwise read as backlog and close write admission the
+            // moment the relay starts (the same rule every recovery follows).
+            tx.execute(
+                "UPDATE lore_outbox_events SET unpublished_since = clock_timestamp() \
+                  WHERE cell_id = $1 AND state = 'pending'",
+                &[&cell_id],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("event plane re-entry age reset", e))?;
+            (0, retire_receiver_generations(&tx, cell_id).await?)
         }
     };
 
@@ -329,8 +412,8 @@ pub async fn set_event_plane(
     tx.execute(
         "INSERT INTO lore_outbox_event_plane_transitions \
              (cell_id, transition_seq, from_plane, to_plane, actor, reason, retired_rows, \
-              transitioned_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, clock_timestamp())",
+              retired_generations, transitioned_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())",
         &[
             &cell_id,
             &transition_seq,
@@ -339,6 +422,7 @@ pub async fn set_event_plane(
             &actor,
             &reason,
             &retired_rows,
+            &retired_generations,
         ],
     )
     .await
@@ -422,7 +506,94 @@ pub async fn set_event_plane(
         to: target,
         transition_seq,
         retired_rows,
+        retired_generations,
+        carried_pending_rows: if target == EventPlane::Durable {
+            pending
+        } else {
+            0
+        },
     })
+}
+
+/// Parked dead letters for the cell: undecided incidents a `live_only` switch
+/// refuses to leave behind.
+async fn parked_dead_letters(tx: &Transaction<'_>, cell_id: &str) -> Result<i64, DomainError> {
+    Ok(tx
+        .query_one(
+            "SELECT count(*) FROM lore_outbox_dead_letters \
+              WHERE cell_id = $1 AND disposition = 'parked'",
+            &[&cell_id],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("event plane switch dead letter probe", e))?
+        .get(0))
+}
+
+/// Whether a stream-reset fence is open for the cell.
+async fn reset_in_progress(tx: &Transaction<'_>, cell_id: &str) -> Result<bool, DomainError> {
+    Ok(tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM lore_outbox_reset_generations \
+              WHERE cell_id = $1 AND state = 'reset_in_progress')",
+            &[&cell_id],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("event plane switch reset fence probe", e))?
+        .get(0))
+}
+
+/// Retire every receiver generation that is not yet retired, under one
+/// membership-version bump, for re-entry to `durable`.
+///
+/// This is not `membership::retire_generation`, whose per-generation proof
+/// (a checkpoint, or a ready successor) exists so retention cannot delete ahead
+/// of a consumer. Re-entry runs on a cell that holds no published row at all —
+/// the `live_only` switch moved them to evidence — so there is nothing left for
+/// that proof to protect, and the generations being retired stopped consuming
+/// when the cell left the durable plane. Returns how many were retired.
+async fn retire_receiver_generations(
+    tx: &Transaction<'_>,
+    cell_id: &str,
+) -> Result<i64, DomainError> {
+    let live: i64 = tx
+        .query_one(
+            "SELECT count(*) FROM lore_outbox_receiver_membership \
+              WHERE cell_id = $1 AND state <> 'retired'",
+            &[&cell_id],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("event plane re-entry membership probe", e))?
+        .get(0);
+    if live == 0 {
+        return Ok(0);
+    }
+    let retired = tx
+        .execute(
+            "WITH bumped AS ( \
+                 UPDATE lore_outbox_membership_state \
+                    SET membership_version = membership_version + 1, \
+                        updated_at = clock_timestamp() \
+                  WHERE cell_id = $1 \
+                 RETURNING membership_version \
+             ) \
+             UPDATE lore_outbox_receiver_membership AS member \
+                SET state = 'retired', \
+                    membership_version = bumped.membership_version, \
+                    updated_at = clock_timestamp() \
+               FROM bumped \
+              WHERE member.cell_id = $1 AND member.state <> 'retired'",
+            &[&cell_id],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("event plane re-entry membership retire", e))?;
+    let retired = i64::try_from(retired).unwrap_or(i64::MAX);
+    if retired != live {
+        return Err(DomainError::Internal(format!(
+            "event plane re-entry counted {live} live receiver generation(s) but retired \
+             {retired}; nothing was committed"
+        )));
+    }
+    Ok(retired)
 }
 
 /// Refuse while any backend outside the caller's pool is connected to the cell

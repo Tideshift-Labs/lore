@@ -57,9 +57,13 @@ $cases = @(
     'a_second_connected_backend_refuses_the_switch_until_it_disconnects',
     'read_boot_facts_reports_the_marker_and_whether_the_cell_holds_any_outbox_row',
     'rerunning_an_applied_switch_reports_already_current',
-    'switching_back_to_durable_refuses_while_the_cell_holds_a_row',
+    'switching_back_to_durable_carries_a_stray_pending_row_and_restarts_its_age',
     'switching_to_live_only_moves_broker_accepted_and_consumer_safe_rows_verbatim_with_audit',
-    'switching_to_live_only_refuses_while_a_pending_row_exists'
+    'switching_to_live_only_refuses_while_a_pending_row_exists',
+    'switching_to_live_only_refuses_while_a_parked_dead_letter_exists',
+    'requeue_and_replay_refuse_on_a_live_only_cell',
+    'durable_re_entry_retires_every_live_receiver_generation_with_audit',
+    'durable_re_entry_refuses_while_a_reset_fence_is_in_progress'
 )
 
 $results = @(

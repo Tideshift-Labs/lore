@@ -52,6 +52,7 @@ use crate::domain::outbox::evaluator::EvaluationBlock;
 use crate::domain::outbox::evaluator::SafeVector;
 use crate::domain::outbox::evaluator::lock_membership_for_read;
 use crate::domain::outbox::evaluator::prove_safe_vector;
+use crate::domain::outbox::event_plane::refuse_recovery_on_live_only;
 use crate::domain::outbox::membership::MembershipSnapshot;
 use crate::domain::outbox::membership::read_membership_snapshot;
 use crate::domain::outbox::membership::validate_cell_id;
@@ -609,6 +610,9 @@ pub async fn replay(
     }
     let limit = validate_limit("replay", limit, MAX_REPLAY_ROWS)?;
     let window_seconds = validate_window(window)?;
+    // Contract A-32: a live_only cell holds no row for a replay to act on, and
+    // must never gain a pending one.
+    refuse_recovery_on_live_only(pooled(client), cell_id, "replay").await?;
 
     let tx = client
         .transaction()
@@ -757,6 +761,10 @@ pub async fn requeue_dead_letter(
     if !dead_letter_is_in_cell(scoped, cell_id, event_id).await? {
         return Ok(DeadLetterOutcome::NotFound);
     }
+    // Contract A-32: a requeue writes a pending row, which a live_only cell
+    // must never hold. Checked after the scope check, so another cell's event
+    // IDs still answer only NotFound.
+    refuse_recovery_on_live_only(scoped, cell_id, "requeue-dead-letter").await?;
     relay::requeue_dead_letter(client, event_id, reason, actor).await
 }
 

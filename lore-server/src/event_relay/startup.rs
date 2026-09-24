@@ -152,13 +152,17 @@ pub enum StartupRefusal {
     },
     /// A `live_only` cell still holds outbox rows.
     ///
-    /// Unreachable through supported paths: `set-plane live-only` leaves no row
-    /// and a `live_only` process appends none. So it names an investigation,
-    /// not a command that would hide the cause.
+    /// `set-plane live-only` leaves no row, a `live_only` process appends none,
+    /// and `requeue-dead-letter` and `replay` refuse on a `live_only` cell. A
+    /// row can still arrive by a direct write or a defect, so the refusal names
+    /// the supported exit: `set-plane durable` carries a stray pending row into
+    /// the plane that publishes it.
     #[error(
         "event_plane = \"live_only\" and the cell's marker agrees, but the cell holds outbox rows; \
-         a live_only cell must hold none and no supported path writes one. Inspect them with \
-         `loreserver outbox status` and `loreserver outbox inspect` before starting any replica"
+         a live_only cell must hold none. Inspect them with `loreserver outbox inspect`, then, \
+         with every replica stopped, run `loreserver outbox set-plane durable --actor <who> \
+         --reason <why>` and start the cell with event_plane = \"durable\" so the relay publishes \
+         them; drain, and switch back with `set-plane live-only`"
     )]
     LiveOnlyWithOutboxRows,
     /// The marker could not be read.

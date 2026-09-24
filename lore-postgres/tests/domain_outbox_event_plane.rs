@@ -371,6 +371,7 @@ async fn switching_to_live_only_moves_broker_accepted_and_consumer_safe_rows_ver
         to,
         transition_seq,
         retired_rows,
+        ..
     } = outcome
     else {
         panic!("expected Applied, got {outcome:?}");
@@ -503,7 +504,7 @@ async fn rerunning_an_applied_switch_reports_already_current() {
 
 #[tokio::test]
 #[ignore = "requires LORE_TEST_PG_URL"]
-async fn switching_back_to_durable_refuses_while_the_cell_holds_a_row() {
+async fn switching_back_to_durable_carries_a_stray_pending_row_and_restarts_its_age() {
     let Some(url) = pg_url() else {
         eprintln!("LORE_TEST_PG_URL unset; skipping");
         return;
@@ -534,33 +535,316 @@ async fn switching_back_to_durable_refuses_while_the_cell_holds_a_row() {
 
     // A live_only cell should never gain a row through ordinary production
     // (that predicate lives in `lore-server`), so this simulates the one way
-    // one could appear anyway: a direct write, standing in for a defect this
-    // switch must still refuse to build on.
+    // one could appear anyway: a direct write, standing in for a defect. A
+    // live_only boot refuses it, and `set-plane durable` is the supported exit.
     let stray = append_pending(&mut raw, &cell_id, &repository_id).await;
+    raw.execute(
+        "UPDATE lore_outbox_events SET unpublished_since = clock_timestamp() - interval '1 hour' \
+          WHERE event_id = $1",
+        &[&stray],
+    )
+    .await
+    .expect("age the stray row");
+
+    let outcome = event_plane::set_event_plane(
+        &mut client,
+        &cell_id,
+        EventPlane::Durable,
+        "operator-b",
+        "resume durable mode to publish a stray row",
+        own_backends,
+    )
+    .await
+    .expect("durable re-entry carries a stray pending row");
+    let SetEventPlaneOutcome::Applied {
+        carried_pending_rows,
+        retired_rows,
+        ..
+    } = outcome
+    else {
+        panic!("expected Applied, got {outcome:?}");
+    };
+    assert_eq!(carried_pending_rows, 1);
+    assert_eq!(retired_rows, 0);
+    assert_eq!(
+        event_state(&raw, stray).await.as_deref(),
+        Some("pending"),
+        "the carried row stays pending for the relay to publish"
+    );
+    let age: f64 = raw
+        .query_one(
+            "SELECT extract(epoch FROM clock_timestamp() - unpublished_since)::float8 \
+               FROM lore_outbox_events WHERE event_id = $1",
+            &[&stray],
+        )
+        .await
+        .expect("carried row age")
+        .get(0);
+    assert!(
+        age < 60.0,
+        "re-entry must restart the carried row's publication clock, or admission reads an \
+         hour-old backlog; age was {age}s"
+    );
+    assert_eq!(transition_count(&raw, &cell_id).await, 2);
+}
+
+/// Insert one parked dead letter for `cell_id` directly: the relay's own
+/// dead-letter path needs a claim and a terminal publish result, and what the
+/// switch and the requeue guard read is the parked row alone.
+async fn park_dead_letter(raw: &Client, cell_id: &str) -> Uuid {
+    let event_id = Uuid::new_v4();
+    let key: [u8; 32] = rand::random();
+    let repository_id = rand_repository_id();
+    let aggregate_id: [u8; 16] = rand::random();
+    let version = AggregateVersion::ordinal_only(1).encode();
+    raw.execute(
+        "INSERT INTO lore_outbox_dead_letters \
+             (event_id, cell_id, idempotency_key, repository_id, repository_generation, \
+              event_kind, aggregate_kind, aggregate_id, aggregate_version, \
+              payload_schema_version, payload, created_at, attempt_count, terminal_class, \
+              first_failed_at, last_failed_at, disposition) \
+         VALUES ($1, $2, $3, $4, 1, 'branch.pushed', 'branch', $5, $6, 1, '\\x7b7d', \
+                 clock_timestamp(), 1, 'UNSUPPORTED_SCHEMA', clock_timestamp(), \
+                 clock_timestamp(), 'parked')",
+        &[
+            &event_id,
+            &cell_id,
+            &key.as_slice(),
+            &repository_id.as_slice(),
+            &aggregate_id.as_slice(),
+            &version.as_slice(),
+        ],
+    )
+    .await
+    .expect("park a dead letter");
+    event_id
+}
+
+#[tokio::test]
+#[ignore = "requires LORE_TEST_PG_URL"]
+async fn switching_to_live_only_refuses_while_a_parked_dead_letter_exists() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let _store = store(&url).await;
+    let cell_id = rand_cell_id();
+    let raw = raw_client(&url).await;
+    park_dead_letter(&raw, &cell_id).await;
+
+    let baseline = total_backends(&raw).await;
+    let mut client = deadpool_client(&url).await;
+    let result = event_plane::set_event_plane(
+        &mut client,
+        &cell_id,
+        EventPlane::LiveOnly,
+        "operator-a",
+        "go live_only",
+        baseline + 1,
+    )
+    .await;
+    let Err(DomainError::NotReady(message)) = result else {
+        panic!("expected NotReady, got {result:?}");
+    };
+    assert!(message.contains("parked dead letter"), "{message}");
+    assert!(message.contains("requeue-dead-letter"), "{message}");
+    assert!(message.contains("obsolete"), "{message}");
+    assert_eq!(transition_count(&raw, &cell_id).await, 0);
+}
+
+#[tokio::test]
+#[ignore = "requires LORE_TEST_PG_URL"]
+async fn requeue_and_replay_refuse_on_a_live_only_cell() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let _store = store(&url).await;
+    let cell_id = rand_cell_id();
+    let raw = raw_client(&url).await;
+    let baseline = total_backends(&raw).await;
+    let mut client = deadpool_client(&url).await;
+    event_plane::set_event_plane(
+        &mut client,
+        &cell_id,
+        EventPlane::LiveOnly,
+        "operator-a",
+        "go live_only",
+        baseline + 1,
+    )
+    .await
+    .expect("switch an empty cell to live_only");
+    // A dead letter that predates nothing: inserted after the switch, standing
+    // in for any path that leaves one on a live_only cell.
+    let dead = park_dead_letter(&raw, &cell_id).await;
+
+    let requeue = lore_postgres::domain::outbox::operator::requeue_dead_letter(
+        &mut client,
+        &cell_id,
+        dead,
+        "operator-b",
+        "retry",
+    )
+    .await;
+    let Err(DomainError::NotReady(message)) = requeue else {
+        panic!("expected NotReady from requeue, got {requeue:?}");
+    };
+    assert!(message.contains("set-plane durable"), "{message}");
+    assert_eq!(
+        event_state(&raw, dead).await,
+        None,
+        "no pending row was written"
+    );
+
+    let replay = lore_postgres::domain::outbox::operator::replay(
+        &mut client,
+        &cell_id,
+        None,
+        Duration::from_secs(3600),
+        10,
+        "operator-b",
+        "replay",
+    )
+    .await;
+    assert!(
+        matches!(replay, Err(DomainError::NotReady(_))),
+        "expected NotReady from replay, got {replay:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires LORE_TEST_PG_URL"]
+async fn durable_re_entry_retires_every_live_receiver_generation_with_audit() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let _store = store(&url).await;
+    let cell_id = rand_cell_id();
+    let raw = raw_client(&url).await;
+    raw.batch_execute(&format!(
+        "INSERT INTO lore_outbox_membership_state \
+             (cell_id, membership_version, next_membership_generation, reset_generation, \
+              current_placement_revision, updated_at) \
+         VALUES ('{cell_id}', 3, 3, 0, 0, clock_timestamp()); \
+         INSERT INTO lore_outbox_receiver_membership \
+             (cell_id, receiver_identity, membership_generation, membership_version, state, \
+              created_at, updated_at) \
+         VALUES ('{cell_id}', 'replica-1', 1, 2, 'joining', clock_timestamp(), clock_timestamp()), \
+                ('{cell_id}', 'replica-2', 2, 3, 'joining', clock_timestamp(), clock_timestamp());"
+    ))
+    .await
+    .expect("seed receiver membership");
+
+    let baseline = total_backends(&raw).await;
+    let mut client = deadpool_client(&url).await;
+    for (target, reason) in [
+        (EventPlane::LiveOnly, "leave durable"),
+        (EventPlane::Durable, "re-enter durable"),
+    ] {
+        event_plane::set_event_plane(
+            &mut client,
+            &cell_id,
+            target,
+            "operator",
+            reason,
+            baseline + 1,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("switch to {target} failed: {e:?}"));
+    }
+
+    let live: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM lore_outbox_receiver_membership \
+              WHERE cell_id = $1 AND state <> 'retired'",
+            &[&cell_id],
+        )
+        .await
+        .expect("live members")
+        .get(0);
+    assert_eq!(
+        live, 0,
+        "re-entry must leave no stale generation in the required set"
+    );
+    let (version, audited): (i64, i64) = {
+        let state = raw
+            .query_one(
+                "SELECT membership_version FROM lore_outbox_membership_state WHERE cell_id = $1",
+                &[&cell_id],
+            )
+            .await
+            .expect("membership state");
+        let audit = raw
+            .query_one(
+                "SELECT retired_generations FROM lore_outbox_event_plane_transitions \
+                  WHERE cell_id = $1 AND to_plane = 'durable'",
+                &[&cell_id],
+            )
+            .await
+            .expect("re-entry transition");
+        (state.get(0), audit.get(0))
+    };
+    assert_eq!(
+        version, 4,
+        "one membership-version bump anchors the retirement"
+    );
+    assert_eq!(
+        audited, 2,
+        "the transition row records how many generations it retired"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires LORE_TEST_PG_URL"]
+async fn durable_re_entry_refuses_while_a_reset_fence_is_in_progress() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let _store = store(&url).await;
+    let cell_id = rand_cell_id();
+    let raw = raw_client(&url).await;
+    let baseline = total_backends(&raw).await;
+    let mut client = deadpool_client(&url).await;
+    event_plane::set_event_plane(
+        &mut client,
+        &cell_id,
+        EventPlane::LiveOnly,
+        "operator",
+        "leave durable",
+        baseline + 1,
+    )
+    .await
+    .expect("switch to live_only");
+    let fingerprint: [u8; 32] = rand::random();
+    raw.execute(
+        "INSERT INTO lore_outbox_reset_generations \
+             (cell_id, reset_generation, detection_id, reset_fingerprint, broker_reset_identity, \
+              old_stream_identity, old_stream_epoch, new_stream_identity, new_stream_epoch, \
+              reason_code, placement_revision, detected_at_unix_ms, emitter_identity, \
+              evidence_id, ack_bytes, state, persisted_at) \
+         VALUES ($1, 1, 'detection-1', $2, 'broker-1', 'stream-a', 1, 'stream-b', 2, 1, 0, 0, \
+                 'emitter', 'evidence-1', '\\x01', 'reset_in_progress', clock_timestamp())",
+        &[&cell_id, &fingerprint.as_slice()],
+    )
+    .await
+    .expect("open a reset fence");
 
     let result = event_plane::set_event_plane(
         &mut client,
         &cell_id,
         EventPlane::Durable,
-        "operator-b",
-        "attempt to resume durable mode",
-        own_backends,
+        "operator",
+        "re-enter durable",
+        baseline + 1,
     )
     .await;
-    assert!(
-        matches!(result, Err(DomainError::NotReady(_))),
-        "expected NotReady, got {result:?}"
-    );
-    assert_eq!(
-        event_state(&raw, stray).await.as_deref(),
-        Some("pending"),
-        "the refused switch must not touch the stray row"
-    );
-    assert_eq!(
-        transition_count(&raw, &cell_id).await,
-        1,
-        "still only the original live_only transition"
-    );
+    let Err(DomainError::NotReady(message)) = result else {
+        panic!("expected NotReady, got {result:?}");
+    };
+    assert!(message.contains("stream-reset fence"), "{message}");
+    assert_eq!(transition_count(&raw, &cell_id).await, 1);
 }
 
 #[tokio::test]
