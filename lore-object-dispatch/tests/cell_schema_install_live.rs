@@ -883,7 +883,7 @@ async fn live_postgres_cell_schema_revokes_service_privileges_after_replacement(
 /// Not a gate: installs a fresh chain and prints the live manifest digests so the pinned constants
 /// can be measured rather than guessed. Run through `run-cell-schema-install-live.ps1 -Measure`.
 #[tokio::test]
-#[ignore = "measurement helper; requires a fresh disposable PostgreSQL 16 database"]
+#[ignore = "measurement helper; requires a fresh disposable PostgreSQL 16 or 18 database"]
 async fn live_postgres_cell_schema_measure_catalog_manifest() {
     let cell = connect("LORE_TEST_CELL_SCHEMA_MEASURE_PG_URL").await;
     // Optional: measure an older known state, e.g. on a newly supported server major.

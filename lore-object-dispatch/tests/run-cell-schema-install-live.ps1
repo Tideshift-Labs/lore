@@ -76,7 +76,7 @@ $runPassed = $false
 $target = 'cell_schema_install_live'
 
 # The image tag names the major the pins are for; the live server must then report that major.
-$expectedMajor = if ($PostgresImage -match ':(?:pg)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
     throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
 }
 

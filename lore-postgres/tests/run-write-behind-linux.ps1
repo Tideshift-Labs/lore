@@ -110,8 +110,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # The image tag names the PostgreSQL major this run expects; the live server must report it.
-# An unmarked tag, such as the default, is this runner's PostgreSQL 16 fixture.
-$expectedPgMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else { 16 }
+# An unmarked tag, such as the default, is this runner's PostgreSQL 16 fixture -- ASSUMED, not
+# asserted by the tag itself, which the mismatch error below says explicitly.
+$tagMajorMatch = [regex]::Match($PostgresImage, ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)')
+$expectedPgMajor = if ($tagMajorMatch.Success) { [int]$tagMajorMatch.Groups['major'].Value } else { 16 }
+$expectedPgMajorAssumed = -not $tagMajorMatch.Success
 $ProgressPreference = 'SilentlyContinue'
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
@@ -787,7 +790,14 @@ try {
         }
         $serverVersion = [int]$versionText
         if ($serverVersion -lt ($expectedPgMajor * 10000) -or $serverVersion -ge (($expectedPgMajor + 1) * 10000)) {
-            throw "expected PostgreSQL $expectedPgMajor, found server_version_num=$serverVersion"
+            $reportedMajor = [int]($serverVersion / 10000)
+            $assumedNote = if ($expectedPgMajorAssumed) {
+                " (assumed as $expectedPgMajor because tag '$PostgresImage' does not mark a major)"
+            }
+            else {
+                " (from tag '$PostgresImage')"
+            }
+            throw "expected PostgreSQL $expectedPgMajor$assumedNote, but the server reported major $reportedMajor (server_version_num=$serverVersion)"
         }
 
         $liveCases = @(
