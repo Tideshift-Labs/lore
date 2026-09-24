@@ -49,6 +49,20 @@ Durable, recurring testing lessons grouped by topic.
   - `42P08` inconsistent types: Do not reuse placeholders (`$1`) for different column types even if the Rust value is the same. Use unique placeholders (`$1`, `$2`).
 - **Retry classification**: Retries should not be triggered by broad transience classifiers for `40001`/`40P01`.
 - **Locking order**: Fanout helpers using `LockSequence` must lock earlier classes *before* the caller's lock, not after.
+- **Measuring `numbackends` on a connection you then drop races itself.** Symptom: a test
+  proving a Postgres-connection-count contention gate (e.g. `set_event_plane`'s "refuse while
+  another backend is connected") passes or fails inconsistently, or silently proves nothing
+  (the gate opens when it should refuse). Cause: `pg_stat_database.numbackends` is a live count —
+  if you open a throwaway connection to read it and then drop it before opening the connection
+  under test (or the "other session" you're proving refuses the switch), the drop and the new
+  connect race, and the count you captured no longer matches the count at call time. Fix: measure
+  through a connection the test keeps open for the rest of the case (an `observer`), never a
+  fresh one you open-query-drop; and always measure `own_backends` *at* the moment you know what
+  should count as "mine" (immediately before opening the connection under test, or immediately
+  after the deliberately-uncounted "other" session connects) rather than passing a literal
+  constant. See `lore-postgres/tests/domain_outbox_event_plane.rs`'s `total_backends` helper for
+  the worked pattern (six of seven cases needed it before this lesson, all six failed the same
+  way: "N other backends" where N included the test's own leftover setup connections).
 
 ## Histogram/quantile fixtures
 
