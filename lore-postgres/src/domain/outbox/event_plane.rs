@@ -408,12 +408,18 @@ pub async fn set_event_plane(
         }
     };
 
+    // Only re-entry carries rows; a live_only switch refused any pending row above.
+    let carried_pending_rows = if target == EventPlane::Durable {
+        pending
+    } else {
+        0
+    };
     let transition_seq = current.transition_seq + 1;
     tx.execute(
         "INSERT INTO lore_outbox_event_plane_transitions \
              (cell_id, transition_seq, from_plane, to_plane, actor, reason, retired_rows, \
-              retired_generations, transitioned_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())",
+              retired_generations, carried_pending_rows, transitioned_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp())",
         &[
             &cell_id,
             &transition_seq,
@@ -423,6 +429,7 @@ pub async fn set_event_plane(
             &reason,
             &retired_rows,
             &retired_generations,
+            &carried_pending_rows,
         ],
     )
     .await
@@ -507,11 +514,7 @@ pub async fn set_event_plane(
         transition_seq,
         retired_rows,
         retired_generations,
-        carried_pending_rows: if target == EventPlane::Durable {
-            pending
-        } else {
-            0
-        },
+        carried_pending_rows,
     })
 }
 

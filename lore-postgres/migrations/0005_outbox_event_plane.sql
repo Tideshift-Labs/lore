@@ -106,3 +106,9 @@ CREATE INDEX IF NOT EXISTS lore_outbox_retired_events_transition_rows
 ALTER TABLE lore_outbox_event_plane_transitions
     ADD COLUMN IF NOT EXISTS retired_generations bigint NOT NULL DEFAULT 0
         CHECK (retired_generations >= 0);
+
+-- Re-entry to durable carries a stray pending row across for the relay to
+-- publish; the count is part of the same audit record.
+ALTER TABLE lore_outbox_event_plane_transitions
+    ADD COLUMN IF NOT EXISTS carried_pending_rows bigint NOT NULL DEFAULT 0
+        CHECK (carried_pending_rows >= 0);

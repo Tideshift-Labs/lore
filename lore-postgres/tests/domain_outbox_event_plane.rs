@@ -565,6 +565,16 @@ async fn switching_back_to_durable_carries_a_stray_pending_row_and_restarts_its_
         panic!("expected Applied, got {outcome:?}");
     };
     assert_eq!(carried_pending_rows, 1);
+    let audited: i64 = raw
+        .query_one(
+            "SELECT carried_pending_rows FROM lore_outbox_event_plane_transitions \
+              WHERE cell_id = $1 AND to_plane = 'durable'",
+            &[&cell_id],
+        )
+        .await
+        .expect("re-entry transition")
+        .get(0);
+    assert_eq!(audited, 1, "the transition row records the carried row");
     assert_eq!(retired_rows, 0);
     assert_eq!(
         event_state(&raw, stray).await.as_deref(),
