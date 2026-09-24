@@ -6,7 +6,7 @@
 [CmdletBinding()]
 param(
     [switch]$KeepOnFailure,
-    [string]$PostgresImage = 'postgres:16'
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'

@@ -22,7 +22,7 @@ run label and the owning PowerShell process before removing the container and an
 [CmdletBinding()]
 param(
     [switch]$KeepOnFailure,
-    [string]$PostgresImage = 'postgres:16'
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'

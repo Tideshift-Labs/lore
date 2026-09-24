@@ -29,7 +29,7 @@ param(
     [string]$PgPassword = 'lorehub',
     [string]$ComposeFile = 'D:\github\lorehub-all\lorehub\docker\compose.yaml',
     [ValidateSet(16, 18)]
-    [int]$PostgresMajor = 16
+    [int]$PostgresMajor = 18
 )
 
 $ErrorActionPreference = 'Stop'

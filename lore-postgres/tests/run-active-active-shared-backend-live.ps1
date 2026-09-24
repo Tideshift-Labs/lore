@@ -57,7 +57,7 @@ param(
     [string]$ComposeFile = 'D:\github\lorehub-all\lorehub\docker\compose.yaml',
     [string]$Seed,
     [ValidateSet(16, 18)]
-    [int]$PostgresMajor = 16
+    [int]$PostgresMajor = 18
 )
 
 $ErrorActionPreference = 'Stop'

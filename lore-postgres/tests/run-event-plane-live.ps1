@@ -3,8 +3,9 @@
 
 <#
 .SYNOPSIS
-Provisions an owned PostgreSQL 16 instance and runs contract amendment A-32's live event-plane
-inventory (`lore-postgres/tests/domain_outbox_event_plane.rs`), one fresh database per case.
+Provisions an owned PostgreSQL 18 (or 16, with -PostgresImage) instance and runs contract
+amendment A-32's live event-plane inventory
+(`lore-postgres/tests/domain_outbox_event_plane.rs`), one fresh database per case.
 
 .DESCRIPTION
 The Rust cases remain `#[ignore]`. This runner opts in to each case by exact name and reports
@@ -27,11 +28,16 @@ a live, end-to-end proof that every CR-032 producer site appends zero rows under
 the real `DomainContext`/`Governed*` wrapper types -- see the test file's own module docs for what
 stands in for that (a static call-site sweep plus the `outbox_cell_id()` unit predicate) and the
 follow-up this leaves open.
+
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -49,6 +55,11 @@ $setupError = $null
 
 $package = 'lore-postgres'
 $target = 'domain_outbox_event_plane'
+
+# The image tag names the major the pins are for; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 
 # Exact: this target must hold no ignored case beyond this list, so a case added
 # without updating this runner is a setup failure rather than a silent NOT RUN.
@@ -168,7 +179,7 @@ try {
         '--label', "com.tideshift.lore.event-plane-live.started=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
         '--publish', '127.0.0.1::5432',
         '--env', 'POSTGRES_HOST_AUTH_METHOD=trust',
-        'postgres:16'
+        $PostgresImage
     )
 
     $portOutputRaw = & docker port $containerName '5432/tcp'
@@ -210,9 +221,10 @@ try {
         throw 'failed to query the disposable PostgreSQL server version'
     }
     $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
-    if ($serverVersion -lt 160000 -or $serverVersion -ge 170000) {
-        throw "expected PostgreSQL 16, found server_version_num=$serverVersion"
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
     }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
     Push-Location $loreRoot
     try {

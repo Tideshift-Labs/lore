@@ -104,7 +104,7 @@ param(
     [switch]$SkipLive,
     [switch]$IncludeCompileFail,
     [switch]$Clippy,
-    [string]$PostgresImage = 'commit0-postgres-blake3:local-tests'
+    [string]$PostgresImage = 'commit0-postgres-blake3:pg18-local-tests'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -748,7 +748,10 @@ try {
                 if (-not (Test-Path -LiteralPath $postgresDockerfile)) {
                     throw "local PostgreSQL fixture Dockerfile missing: $postgresDockerfile; supply -PostgresImage explicitly"
                 }
-                Invoke-Checked docker @('build', '--file', $postgresDockerfile, '--tag', $PostgresImage, $postgresContext)
+                # $expectedPgMajor is parsed from this same $PostgresImage tag above; pass it through
+                # so the built image's actual major matches what its own tag claims, rather than
+                # silently taking the Dockerfile's ARG PG_MAJOR default of 16 regardless of tag.
+                Invoke-Checked docker @('build', '--file', $postgresDockerfile, '--tag', $PostgresImage, '--build-arg', "PG_MAJOR=$expectedPgMajor", $postgresContext)
             }
             $global:LASTEXITCODE = 0
         }

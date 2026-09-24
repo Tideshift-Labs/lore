@@ -35,9 +35,10 @@ Steps:
   8. Removes only its own labelled container.
 
 .PARAMETER PostgresImage
-A prebuilt postgres-blake3 image to run instead of the default PostgreSQL 16 one, e.g.
-`commit0-postgres-blake3:pg18-local`. This runner never builds or retags it; it must already exist.
-Its tag must name major 16 or 18, and the server's `server_version_num` must match that major.
+A prebuilt postgres-blake3 image to run instead of the default PostgreSQL 18 one, e.g.
+`commit0-postgres-blake3:local` for 16. This runner never builds or retags a caller-supplied image;
+it must already exist. Its tag must name major 16 or 18, and the server's `server_version_num` must
+match that major.
 
 .PARAMETER KeepOnFailure
 Keeps the container for debugging when the run did not fully pass.
@@ -61,7 +62,7 @@ $containerStarted = $false
 $runPassed = $false
 
 $target = 'cell_schema_forward_upgrade_live'
-$defaultImageTag = 'lore-cell-schema-forward-upgrade:postgres16-blake3-v1'
+$defaultImageTag = 'lore-cell-schema-forward-upgrade:postgres18-blake3-v1'
 $imageTag = if ($PostgresImage) { $PostgresImage } else { $defaultImageTag }
 $expectedMajor = if ($imageTag -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
     throw "image $imageTag does not name a supported major (16 or 18) in its tag"
@@ -220,7 +221,11 @@ function Build-PostgresBlake3Image {
         throw "postgres-blake3 Dockerfile missing: $dockerfile"
     }
     Write-Host "Building $imageTag (plpython3u + blake3, one-time)..."
-    Invoke-Checked docker @('build', '--file', $dockerfile, '--tag', $imageTag, $context)
+    # This runner builds only its own $defaultImageTag (checked above), so $expectedMajor -- parsed
+    # from that same tag -- is always the major this build must produce. Passing it as a build-arg
+    # is what keeps the built image's actual major in step with what its own tag claims; the
+    # Dockerfile's ARG PG_MAJOR otherwise silently defaults to 16 regardless of the tag name.
+    Invoke-Checked docker @('build', '--file', $dockerfile, '--tag', $imageTag, '--build-arg', "PG_MAJOR=$expectedMajor", $context)
 }
 
 try {

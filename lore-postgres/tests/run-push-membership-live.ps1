@@ -13,7 +13,7 @@ The shared lifecycle runner owns its wider regression inventory.
 param(
     [switch]$KeepOnFailure,
     [string[]]$OnlyCase = @(),
-    [string]$PostgresImage = 'postgres:16'
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'

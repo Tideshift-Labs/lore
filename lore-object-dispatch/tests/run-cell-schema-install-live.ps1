@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 (or 18, with -PostgresImage) and runs the WP-114 CD-1 cell-schema installer/attester live
+Provisions a disposable PostgreSQL 18 (or 16, with -PostgresImage) and runs the WP-114 CD-1 cell-schema installer/attester live
 tier by exact name, reporting PASS / FAIL / NOT RUN as three distinct states.
 
 .DESCRIPTION
@@ -46,7 +46,7 @@ migration or the manifest query changes. It is not a gate and reports no PASS.
 With -Measure, the known state to install and measure: R25, R26, R27 or R28 (default R28).
 
 .PARAMETER PostgresImage
-The PostgreSQL image to run. Default `postgres:16`. Its major must be 16 or 18, and the server's
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
 `server_version_num` must match that major, or the run stops before any test.
 
 .PARAMETER KeepOnFailure
@@ -58,7 +58,7 @@ param(
     [switch]$Measure,
     [ValidateSet('R25', 'R26', 'R27', 'R28')]
     [string]$MeasureTarget = 'R28',
-    [string]$PostgresImage = 'postgres:16',
+    [string]$PostgresImage = 'postgres:18',
     [switch]$KeepOnFailure
 )
 

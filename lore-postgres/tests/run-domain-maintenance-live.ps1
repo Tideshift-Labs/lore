@@ -21,7 +21,7 @@ only this runner's container and anonymous volume.
 param(
     [switch]$KeepOnFailure,
     [ValidateRange(1, 86400)][int]$CommandTimeoutSeconds = 600,
-    [string]$PostgresImage = 'postgres:16'
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'

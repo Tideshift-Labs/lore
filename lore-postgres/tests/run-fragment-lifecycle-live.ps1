@@ -36,7 +36,7 @@ that silent drop is the false green this contract exists to prevent.
 param(
     [switch]$KeepOnFailure,
     [string[]]$OnlyCase = @(),
-    [string]$PostgresImage = 'postgres:16'
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'
