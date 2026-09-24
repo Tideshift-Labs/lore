@@ -131,21 +131,34 @@ pub enum StartupRefusal {
     )]
     LiveOnlyForbidsReceiver,
     /// The configured plane differs from the cell's marker in Postgres.
+    ///
+    /// Boot never writes the marker. A fresh `live_only` cell refuses here
+    /// until an operator runs the named command.
     #[error(
         "this loreserver is configured for event_plane = \"{configured}\" but the cell's marker \
-         is \"{marker}\"; stop every replica and run `loreserver outbox set-plane`, or fix the \
-         configuration"
+         is \"{marker}\"{absent}; stop every replica of this cell, run `{remedy}`, then start \
+         the replicas again (or fix the configuration)",
+        absent = if *marker_absent { " (no transition recorded, which means durable)" } else { "" }
     )]
     EventPlaneMismatch {
         /// The configured plane.
         configured: &'static str,
         /// The marker's plane.
         marker: &'static str,
+        /// Whether the cell has no transition row at all.
+        marker_absent: bool,
+        /// The exact command that moves the marker to the configured plane.
+        remedy: &'static str,
     },
     /// A `live_only` cell still holds outbox rows.
+    ///
+    /// Unreachable through supported paths: `set-plane live-only` leaves no row
+    /// and a `live_only` process appends none. So it names an investigation,
+    /// not a command that would hide the cause.
     #[error(
-        "event_plane = \"live_only\" but the cell still holds outbox rows; a live_only cell must \
-         hold none. Run `loreserver outbox set-plane live-only` with every replica stopped"
+        "event_plane = \"live_only\" and the cell's marker agrees, but the cell holds outbox rows; \
+         a live_only cell must hold none and no supported path writes one. Inspect them with \
+         `loreserver outbox status` and `loreserver outbox inspect` before starting any replica"
     )]
     LiveOnlyWithOutboxRows,
     /// The marker could not be read.

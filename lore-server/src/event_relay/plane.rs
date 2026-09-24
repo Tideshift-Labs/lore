@@ -80,6 +80,19 @@ pub fn outbox_production_enabled(plane: Option<EventPlane>) -> bool {
     plane != Some(EventPlane::LiveOnly)
 }
 
+/// The exact operator command that moves a cell's marker to `plane`.
+///
+/// Boot never writes the marker itself: a refusal names this command instead,
+/// so the switch is always an explicit, audited, offline operator action.
+pub const fn set_plane_command(plane: EventPlane) -> &'static str {
+    match plane {
+        EventPlane::LiveOnly => {
+            "loreserver outbox set-plane live-only --actor <who> --reason <why>"
+        }
+        EventPlane::Durable => "loreserver outbox set-plane durable --actor <who> --reason <why>",
+    }
+}
+
 /// Decide whether the configured plane may run against the cell's marker.
 ///
 /// # Errors
@@ -93,6 +106,8 @@ pub fn check_marker(
         return Err(StartupRefusal::EventPlaneMismatch {
             configured: configured.as_str(),
             marker: facts.marker.plane.as_str(),
+            marker_absent: facts.marker.transition_seq == 0,
+            remedy: set_plane_command(configured),
         });
     }
     if configured == EventPlane::LiveOnly && facts.has_outbox_rows {
@@ -107,15 +122,25 @@ mod tests {
 
     use super::*;
 
-    fn facts(plane: EventPlane, has_outbox_rows: bool) -> EventPlaneBootFacts {
+    /// A marker at `transition_seq`. Sequence 0 is a cell with no transition
+    /// row, which only ever reads as `durable`.
+    fn facts_at(
+        plane: EventPlane,
+        transition_seq: i64,
+        has_outbox_rows: bool,
+    ) -> EventPlaneBootFacts {
         EventPlaneBootFacts {
             marker: EventPlaneMarker {
                 plane,
-                transition_seq: 0,
-                transitioned_at: None,
+                transition_seq,
+                transitioned_at: (transition_seq > 0).then_some(std::time::SystemTime::UNIX_EPOCH),
             },
             has_outbox_rows,
         }
+    }
+
+    fn facts(plane: EventPlane, has_outbox_rows: bool) -> EventPlaneBootFacts {
+        facts_at(plane, 1, has_outbox_rows)
     }
 
     fn resolve(
@@ -181,6 +206,8 @@ mod tests {
             Err(StartupRefusal::EventPlaneMismatch {
                 configured: "live_only",
                 marker: "durable",
+                marker_absent: false,
+                remedy: "loreserver outbox set-plane live-only --actor <who> --reason <why>",
             })
         );
         assert_eq!(
@@ -188,7 +215,40 @@ mod tests {
             Err(StartupRefusal::EventPlaneMismatch {
                 configured: "durable",
                 marker: "live_only",
+                marker_absent: false,
+                remedy: "loreserver outbox set-plane durable --actor <who> --reason <why>",
             })
+        );
+    }
+
+    /// Boot never writes the marker: a fresh `live_only` cell refuses and
+    /// names the exact command, and an existing cell with no marker boots
+    /// `durable` unchanged.
+    #[test]
+    fn an_absent_marker_is_durable_and_a_live_only_boot_names_the_command() {
+        assert_eq!(
+            check_marker(EventPlane::Durable, &facts_at(EventPlane::Durable, 0, true)),
+            Ok(())
+        );
+        let refusal = check_marker(
+            EventPlane::LiveOnly,
+            &facts_at(EventPlane::Durable, 0, false),
+        )
+        .expect_err("a live_only boot on an absent marker must refuse");
+        assert_eq!(
+            refusal,
+            StartupRefusal::EventPlaneMismatch {
+                configured: "live_only",
+                marker: "durable",
+                marker_absent: true,
+                remedy: "loreserver outbox set-plane live-only --actor <who> --reason <why>",
+            }
+        );
+        let message = refusal.to_string();
+        assert!(message.contains("no transition recorded"), "{message}");
+        assert!(
+            message.contains("loreserver outbox set-plane live-only --actor"),
+            "{message}"
         );
     }
 
