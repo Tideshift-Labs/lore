@@ -17,6 +17,8 @@
 //! combinations unrepresentable rather than merely unlikely.
 
 use crate::domain::errors::DomainError;
+use crate::domain::outbox::event_plane::EVENT_PLANE_SCHEMA;
+use crate::domain::outbox::event_plane::EventPlaneBootFacts;
 use crate::domain::outbox::schema::OUTBOX_BASE_API_VERSION;
 use crate::domain::outbox::schema::OUTBOX_SCHEMA;
 use crate::domain::schema;
@@ -108,6 +110,9 @@ impl PostgresDomainStore {
         crate::pool::ensure_schema_online(&pool, schema::SCHEMA).await?;
         crate::pool::ensure_schema_online(&pool, MEDIATED_SCHEMA).await?;
         crate::pool::ensure_schema_online(&pool, OUTBOX_SCHEMA).await?;
+        // Contract amendment A-32: the event plane marker and the retired-row
+        // evidence. Two new tables, empty on every cell that never switched.
+        crate::pool::ensure_schema_online(&pool, EVENT_PLANE_SCHEMA).await?;
 
         let identity = read_database_identity(&pool)
             .await
@@ -128,6 +133,20 @@ impl PostgresDomainStore {
     /// The database this store is bound to.
     pub fn identity(&self) -> &DatabaseIdentity {
         &self.identity
+    }
+
+    /// The event plane marker and whether the cell holds outbox rows, for the
+    /// boot gate (contract amendment A-32).
+    pub async fn event_plane_boot_facts(
+        &self,
+        cell_id: &str,
+    ) -> Result<EventPlaneBootFacts, DomainError> {
+        let client =
+            self.pool.get().await.map_err(|e| {
+                DomainError::Internal(format!("event plane boot facts checkout: {e}"))
+            })?;
+        let client: &tokio_postgres::Client = &client;
+        crate::domain::outbox::event_plane::read_boot_facts(client, cell_id).await
     }
 
     /// R-SHOULD-1: prove positively that another CR-007 pool addresses the same

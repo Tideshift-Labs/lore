@@ -480,7 +480,7 @@ impl LoreLockService {
             // would drop a lock its holder still believes it has.
             // `resolve_lock_fencing` refuses to arm a cell that enabled them.
             lease_duration: None,
-            outbox_cell_id: call.domain.cell_id().map(str::to_owned),
+            outbox_cell_id: call.domain.outbox_cell_id().map(str::to_owned),
         };
         let binding = acquire_or_renew_binding(&input)
             .map_err(|error| super::map_domain_error_to_status(&error))?;
@@ -532,7 +532,7 @@ impl LoreLockService {
             branch_id: batch.branch_id.to_vec(),
             owner: call.caller.clone(),
             resources: batch.resources,
-            outbox_cell_id: call.domain.cell_id().map(str::to_owned),
+            outbox_cell_id: call.domain.outbox_cell_id().map(str::to_owned),
         };
         let binding =
             release_binding(&input).map_err(|error| super::map_domain_error_to_status(&error))?;
@@ -591,7 +591,7 @@ impl LoreLockService {
             },
             acting_owner: call.caller.clone(),
             resources: batch.resources,
-            outbox_cell_id: call.domain.cell_id().map(str::to_owned),
+            outbox_cell_id: call.domain.outbox_cell_id().map(str::to_owned),
         };
         let binding = force_release_binding(&input)
             .map_err(|error| super::map_domain_error_to_status(&error))?;

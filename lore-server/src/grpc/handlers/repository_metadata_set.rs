@@ -223,7 +223,7 @@ pub async fn handler(
             // carrying the pointer that was there.
             let previous = match &governed {
                 Some(governed) => {
-                    let event = match governed.cell_id() {
+                    let event = match governed.outbox_cell_id() {
                         Some(cell_id) => Some(
                             outbox_builders::repository_metadata_changed(
                                 cell_id,

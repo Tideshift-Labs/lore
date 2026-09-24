@@ -385,6 +385,7 @@ const DISABLED_RELAY_REMOTE_MODE: &str = r#"
 
     [notification]
     mode = "remote"
+    event_plane = "durable"
 
     [plugins.remote]
     gateway_uri = "http://127.0.0.1:1"
@@ -432,6 +433,7 @@ const DISABLED_RELAY_REMOTE_MODE_WITH_RECEIVER: &str = r#"
 
     [notification]
     mode = "remote"
+    event_plane = "durable"
 
     [plugins.remote]
     gateway_uri = "http://127.0.0.1:1"

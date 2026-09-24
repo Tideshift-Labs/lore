@@ -37,6 +37,9 @@
 //!   status, inspection, replay, and the two dead-letter dispositions. It
 //!   decides no policy and holds no thresholds; `lore-server`'s
 //!   `event_relay::operator` is the command surface over it.
+//! * [`event_plane`] — contract amendment A-32's cell marker (`live_only` or
+//!   `durable`), the boot facts that gate it, and the offline switch that
+//!   moves retained rows to evidence.
 //!
 //! **The relay worker loop is not here.** It is WP-119 Step B, in `lore-server`.
 //! Nothing in this module publishes, waits, or decides a backoff. Neither is the
@@ -51,6 +54,7 @@ pub mod builders;
 pub mod checkpoint;
 pub mod cutover;
 pub mod evaluator;
+pub mod event_plane;
 pub mod initialization;
 pub mod membership;
 pub mod operator;
@@ -76,6 +80,10 @@ pub use evaluator::EvaluationBlock;
 pub use evaluator::EvaluationOutcome;
 pub use evaluator::SafeVector;
 pub use evaluator::evaluate_consumer_safe;
+pub use event_plane::EventPlane;
+pub use event_plane::EventPlaneBootFacts;
+pub use event_plane::EventPlaneMarker;
+pub use event_plane::SetEventPlaneOutcome;
 pub use membership::CapturedPosition;
 pub use membership::MembershipCas;
 pub use membership::MembershipMember;

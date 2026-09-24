@@ -670,7 +670,7 @@ impl GovernedPushCommit {
         //
         // `None` also when this cell has no configured identity; see
         // `DomainContext::cell_id`.
-        let event = match (self.domain.cell_id(), current_head == new_head) {
+        let event = match (self.domain.outbox_cell_id(), current_head == new_head) {
             (Some(cell_id), false) => Some(
                 outbox_builders::branch_pushed(
                     cell_id,

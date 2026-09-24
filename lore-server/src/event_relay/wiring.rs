@@ -9,6 +9,9 @@
 //!
 //! The sequence, in order and for a reason:
 //!
+//! 0. **Event plane** (contract amendment A-32) — a `remote` cell must name
+//!    one. `live_only` refuses `[outbox_relay] enabled` and a declared
+//!    receiver, then returns `None`. `durable` continues below unchanged.
 //! 1. **Not configured, or `enabled = false`** — return `None`. No pool, no
 //!    task, no readiness handle. This is the state every cell is in today.
 //! 2. **Configuration bounds** — `[outbox_relay]` must be inside CR-032's
@@ -60,6 +63,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use lore_base::lore_spawn;
 use lore_postgres::domain::DatabaseIdentity;
+use lore_postgres::domain::outbox::EventPlane;
 use lore_postgres::pool::Pool;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -71,6 +75,7 @@ use crate::event_relay::admission::OutboxAdmission;
 use crate::event_relay::config::EventRelayConfig;
 use crate::event_relay::envelope_map::EnvelopeSource;
 use crate::event_relay::evaluator_task::ConsumerSafetyTask;
+use crate::event_relay::plane;
 use crate::event_relay::prune_task::RetentionTask;
 use crate::event_relay::publisher::DurablePublisher;
 use crate::event_relay::readiness::EventRelayReadiness;
@@ -212,6 +217,15 @@ pub async fn prepare_event_relay(
     database_identity: Option<&DatabaseIdentity>,
     domain: Option<&Arc<DomainContext>>,
 ) -> Result<Option<EventRelayPreparation>> {
+    // Contract amendment A-32. Resolved before anything else so a `remote`
+    // cell with no plane is refused by name. `live_only` runs neither a relay
+    // nor a receiver, and says so rather than ignoring either section.
+    if plane::configured_event_plane(settings).map_err(|refusal| anyhow!(refusal))?
+        == Some(EventPlane::LiveOnly)
+    {
+        return refuse_durable_sections_under_live_only(settings).map(|()| None);
+    }
+
     let raw = match settings.outbox_relay.as_ref() {
         Some(raw) if raw.enabled => raw,
         // Absent and `enabled = false` are the same state. The receiver check
@@ -491,6 +505,32 @@ fn refuse_receiver_without_relay(settings: &Settings) -> Result<()> {
     };
     if remote.receiver.is_some() {
         return Err(anyhow!(StartupRefusal::ReceiverWithoutRelay));
+    }
+    Ok(())
+}
+
+/// Refuse `[outbox_relay] enabled` or a declared durable receiver on a
+/// `live_only` cell.
+///
+/// A receiver is read through the same parse the plugin factory uses; a
+/// `[plugins.remote]` table that does not parse is left for that factory to
+/// report with the offending field named, as [`refuse_receiver_without_relay`]
+/// does.
+fn refuse_durable_sections_under_live_only(settings: &Settings) -> Result<()> {
+    if settings
+        .outbox_relay
+        .as_ref()
+        .is_some_and(|raw| raw.enabled)
+    {
+        return Err(anyhow!(StartupRefusal::LiveOnlyForbidsRelay));
+    }
+    let receiver_declared = settings
+        .plugins
+        .get(REMOTE_NOTIFICATION_MODE)
+        .and_then(|table| RemoteNotificationConfig::parse(table).ok())
+        .is_some_and(|remote| remote.receiver.is_some());
+    if receiver_declared {
+        return Err(anyhow!(StartupRefusal::LiveOnlyForbidsReceiver));
     }
     Ok(())
 }

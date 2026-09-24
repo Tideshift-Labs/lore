@@ -40,6 +40,9 @@ const MIGRATIONS_0001: &str = include_str!("../migrations/0001_init.sql");
 const MIGRATIONS_0002: &str = include_str!("../migrations/0002_fragment_promotion_send_claims.sql");
 const MIGRATIONS_0003: &str = include_str!("../migrations/0003_fragment_stage_custody.sql");
 const MIGRATIONS_0004: &str = include_str!("../migrations/0004_fragment_stage_policy_rotation.sql");
+/// Contract amendment A-32's event plane marker and retired-row evidence. The
+/// boot path applies the same file through `EVENT_PLANE_SCHEMA`.
+const MIGRATIONS_0005: &str = include_str!("../migrations/0005_outbox_event_plane.sql");
 
 /// The relations that prove `migrations/0001_init.sql` (or the isolated test
 /// fixture) ran here. `lore_locks` is excluded because it also pre-dates
@@ -328,6 +331,10 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .batch_execute(MIGRATIONS_0004)
         .await
         .expect("apply stage policy rotation migration");
+    migration_client
+        .batch_execute(MIGRATIONS_0005)
+        .await
+        .expect("apply event plane migration");
 
     // Production boot order: the domain coordinator is built before the lock
     // store plugin connects (`server.rs`), so nothing has created `lore_locks`

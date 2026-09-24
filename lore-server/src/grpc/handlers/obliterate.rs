@@ -107,7 +107,7 @@ pub async fn handler(
             // or malformed identity is a request rejection rather than a
             // rollback. `None` when this cell has no configured identity; see
             // `DomainContext::cell_id`.
-            let event = match domain.cell_id() {
+            let event = match domain.outbox_cell_id() {
                 Some(cell_id) => Some(
                     outbox_builders::repository_obliterated(
                         cell_id,

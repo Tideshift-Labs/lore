@@ -202,6 +202,11 @@ pub struct DomainContext {
     lock_coordinator: Option<Arc<PostgresLockCoordinator>>,
     fragment_coordinator: Option<Arc<PostgresFragmentCoordinator>>,
     cell_id: Option<String>,
+    /// Whether governed mutations append CR-032 outbox rows (contract
+    /// amendment A-32). `false` only on a `live_only` cell. Kept apart from
+    /// `cell_id` on purpose: that identity stays configured on a `live_only`
+    /// cell, and producers read [`Self::outbox_cell_id`], never `cell_id`.
+    outbox_production: bool,
     /// CR-032's required-event admission gate, present only on a cell whose
     /// relay was built and passed every startup precondition.
     ///
@@ -231,6 +236,7 @@ impl DomainContext {
             lock_coordinator: None,
             fragment_coordinator: None,
             cell_id: None,
+            outbox_production: true,
             admission: OnceLock::new(),
             operation_verifier: None,
             proof_namespace_reader: None,
@@ -251,6 +257,7 @@ impl DomainContext {
             lock_coordinator: Some(lock_coordinator),
             fragment_coordinator: None,
             cell_id: None,
+            outbox_production: true,
             admission: OnceLock::new(),
             operation_verifier: None,
             proof_namespace_reader: None,
@@ -303,6 +310,30 @@ impl DomainContext {
     /// every event this cell will ever emit and can restructure the subject.
     pub fn cell_id(&self) -> Option<&str> {
         self.cell_id.as_deref()
+    }
+
+    /// Turn outbox production on or off (contract amendment A-32).
+    ///
+    /// On by default, so every existing construction produces exactly as it
+    /// did. Server construction turns it off only for `live_only`.
+    #[must_use]
+    pub fn with_outbox_production(mut self, enabled: bool) -> Self {
+        self.outbox_production = enabled;
+        self
+    }
+
+    /// The cell identity a producer stamps on an outbox row, or `None` when
+    /// this cell produces no outbox rows.
+    ///
+    /// `None` when no identity is configured (the pre-CR-032 cell) **or** when
+    /// the event plane is `live_only`. Every producer reads this, never
+    /// [`Self::cell_id`], so the plane decides production in one place.
+    pub fn outbox_cell_id(&self) -> Option<&str> {
+        if self.outbox_production {
+            self.cell_id.as_deref()
+        } else {
+            None
+        }
     }
 
     /// The coordinator itself.
@@ -1366,12 +1397,13 @@ impl GovernedMetadataCas {
         }))
     }
 
-    /// This cell's configured identity, or `None` when it has none.
+    /// The identity to stamp on an outbox row, or `None` when this cell
+    /// produces none.
     ///
     /// Handlers need it to decide whether to build an event at all; see
-    /// [`DomainContext::cell_id`].
-    pub fn cell_id(&self) -> Option<&str> {
-        self.domain.cell_id()
+    /// [`DomainContext::outbox_cell_id`].
+    pub fn outbox_cell_id(&self) -> Option<&str> {
+        self.domain.outbox_cell_id()
     }
 
     /// Read a branch's committed identity for the event's bounded payload.
@@ -2094,7 +2126,7 @@ impl GovernedRepositoryCreate {
         // `None` when this cell has no configured identity; see
         // `DomainContext::cell_id`. A cell with no `cell_id` still mutates and
         // simply produces no outbox rows.
-        let events = match self.domain.cell_id() {
+        let events = match self.domain.outbox_cell_id() {
             Some(cell_id) => vec![
                 outbox_builders::repository_published(
                     cell_id,
@@ -2516,7 +2548,7 @@ impl GovernedRepositoryDelete {
         // event covering everything it hides, not one row per branch and not
         // one row per association. `None` when this cell has no configured
         // identity, exactly as the create seam does.
-        let events = match self.domain.cell_id() {
+        let events = match self.domain.outbox_cell_id() {
             Some(cell_id) => {
                 vec![
                     outbox_builders::repository_tombstoned(cell_id, publication.repository_id)
@@ -2799,7 +2831,7 @@ impl GovernedBranchDelete {
         // the branch aggregate, keyed on the committed branch generation with
         // the branch's final tip as its identity. `None` when this cell has no
         // configured identity, exactly as the create and delete seams do.
-        let events = match self.domain.cell_id() {
+        let events = match self.domain.outbox_cell_id() {
             Some(cell_id) => {
                 vec![
                     outbox_builders::branch_deleted(
@@ -3048,12 +3080,34 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
 
     let database_identity = store.identity().clone();
     let cell_id = resolve_cell_id(settings)?;
+    // Contract amendment A-32. The configured plane must agree with the cell's
+    // marker, and a `live_only` cell may hold no outbox row. Checked here, on
+    // every process that builds a domain context, because this is the process
+    // that would append.
+    let event_plane = crate::event_relay::plane::configured_event_plane(settings)
+        .map_err(|refusal| anyhow!(refusal))?;
+    if let (Some(configured), Some(cell)) = (event_plane, cell_id.as_deref()) {
+        let facts = store.event_plane_boot_facts(cell).await.map_err(|e| {
+            anyhow!(crate::event_relay::StartupRefusal::EventPlaneProbe(
+                e.to_string()
+            ))
+        })?;
+        crate::event_relay::plane::check_marker(configured, &facts)
+            .map_err(|refusal| anyhow!(refusal))?;
+    }
+    let outbox_production = crate::event_relay::plane::outbox_production_enabled(event_plane);
     // The fragment coordinator stamps the same cell identity on its bounded
     // CR-032 summaries that the governed repository seam stamps on its rows, so
-    // it is resolved once, here, and handed to both.
-    let fragment_coordinator = store
-        .fragment_coordinator()
-        .with_outbox_cell_id(cell_id.clone());
+    // it is resolved once, here, and handed to both. Under `live_only` it gets
+    // none, which is that coordinator's existing "append nothing" state.
+    let fragment_coordinator =
+        store
+            .fragment_coordinator()
+            .with_outbox_cell_id(if outbox_production {
+                cell_id.clone()
+            } else {
+                None
+            });
     // WP-120: the same private auth-grpc endpoint the receipt rail is mounted
     // on. Resolved from one place so the internal prepare and the private rail
     // can never end up pointed at different verifiers.
@@ -3082,6 +3136,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     }
     .with_proof_namespace_reader(namespace_reader)
     .with_cell_id(cell_id)
+    .with_outbox_production(outbox_production)
     .with_operation_verifier(operation_verifier);
     let context = if fragment_coordinator
         .push_membership_enabled()

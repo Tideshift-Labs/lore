@@ -102,6 +102,55 @@ pub enum StartupRefusal {
     /// The schema-state read itself failed.
     #[error("could not read this cell's outbox schema state: {0}")]
     Probe(String),
+    /// A `remote` cell did not name its event plane (contract amendment A-32).
+    #[error(
+        "[notification] mode = \"remote\" requires [notification] event_plane = \"live_only\" or \
+         \"durable\"; it has no default, so a cell cannot change plane by omission"
+    )]
+    EventPlaneMissing,
+    /// The event plane is not one of the two spellings.
+    #[error("[notification] event_plane must be \"live_only\" or \"durable\", got {0:?}")]
+    EventPlaneInvalid(String),
+    /// An event plane on a cell that is not in `remote` mode, where it means
+    /// nothing.
+    #[error(
+        "[notification] event_plane is set, but this cell is in mode `{0}`; an event plane is \
+         meaningful only with mode = \"remote\""
+    )]
+    EventPlaneWithoutRemote(String),
+    /// `live_only` with `[outbox_relay] enabled`.
+    #[error(
+        "[notification] event_plane = \"live_only\" produces no outbox rows, so [outbox_relay] \
+         must not be enabled; disable it or run event_plane = \"durable\""
+    )]
+    LiveOnlyForbidsRelay,
+    /// `live_only` with a durable receiver declared.
+    #[error(
+        "[notification] event_plane = \"live_only\" runs no durable receiver, so \
+         [plugins.remote.receiver] must not be declared; remove it or run event_plane = \"durable\""
+    )]
+    LiveOnlyForbidsReceiver,
+    /// The configured plane differs from the cell's marker in Postgres.
+    #[error(
+        "this loreserver is configured for event_plane = \"{configured}\" but the cell's marker \
+         is \"{marker}\"; stop every replica and run `loreserver outbox set-plane`, or fix the \
+         configuration"
+    )]
+    EventPlaneMismatch {
+        /// The configured plane.
+        configured: &'static str,
+        /// The marker's plane.
+        marker: &'static str,
+    },
+    /// A `live_only` cell still holds outbox rows.
+    #[error(
+        "event_plane = \"live_only\" but the cell still holds outbox rows; a live_only cell must \
+         hold none. Run `loreserver outbox set-plane live-only` with every replica stopped"
+    )]
+    LiveOnlyWithOutboxRows,
+    /// The marker could not be read.
+    #[error("could not read this cell's event plane marker: {0}")]
+    EventPlaneProbe(String),
 }
 
 /// Prove the cell is fit to run the relay, or refuse to boot.

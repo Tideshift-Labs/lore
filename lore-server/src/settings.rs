@@ -543,6 +543,15 @@ pub struct NotificationSettings {
     /// The notification backend mode. Defaults to "local" if not specified.
     #[serde(default = "default_notification_mode")]
     pub mode: String,
+    /// The event plane, `"live_only"` or `"durable"` (contract amendment A-32).
+    ///
+    /// Required when `mode = "remote"`, with no default, and refused on any
+    /// other mode. `live_only` appends no CR-032 outbox row and refuses
+    /// `[outbox_relay]` and `[plugins.remote.receiver]`. `durable` is CR-032
+    /// unchanged. Validated by `crate::event_relay::plane`, and the cell's
+    /// Postgres marker must agree with it at boot.
+    #[serde(default)]
+    pub event_plane: Option<String>,
 }
 
 fn default_notification_mode() -> String {

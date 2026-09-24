@@ -246,7 +246,7 @@ pub async fn handler(
             let previous = match &governed {
                 Some(governed) => {
                     let event =
-                        match governed.cell_id() {
+                        match governed.outbox_cell_id() {
                             Some(cell_id) => {
                                 // Read before the transaction, so the name and tip
                                 // are a preflight observation. They go in the

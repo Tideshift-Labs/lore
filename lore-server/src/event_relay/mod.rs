@@ -24,6 +24,7 @@
 //! | [`readiness`] | the relay, event, and receiver facets, separate from storage readiness |
 //! | [`admission`] | required-event mutation admission and its `RetryInfo` |
 //! | [`startup`] | the fail-closed boot gate |
+//! | [`plane`] | `[notification] event_plane` (`live_only` or `durable`) and its marker gate |
 //! | [`retry_info`] | `google.rpc.RetryInfo`, hand-transcribed |
 //! | [`wiring`] | server construction, in one reviewable sequence |
 //!
@@ -63,7 +64,8 @@
 //! cell whose relay is disabled or wedged — which is when an operator needs it.
 //! Its two writes (dead-letter requeue and obsolete-with-proof) go through the
 //! same fenced compare-and-set the relay itself uses; it has no privileged
-//! path.
+//! path. A third, `set-plane`, is the offline event plane switch: it refuses
+//! while any other backend is connected, so it never races a serving process.
 //!
 //! # What is still absent
 //!
@@ -76,6 +78,7 @@ pub mod envelope_map;
 pub mod evaluator_task;
 pub mod metrics;
 pub mod operator;
+pub mod plane;
 pub mod prune_task;
 pub mod publisher;
 pub mod readiness;

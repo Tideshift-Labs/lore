@@ -124,6 +124,7 @@ path = "{{STATE_DIR}}/mutable"
 # mode, because the relay publishes through this plugin's gateway client.
 [notification]
 mode = "remote"
+event_plane = "durable"
 
 [plugins.remote]
 gateway_uri = "{{GATEWAY_URI}}"

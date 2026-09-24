@@ -321,7 +321,7 @@ pub(crate) async fn governed_branch_create(
             input.latest_hash.clone(),
         ),
     ];
-    if let Some(cell) = governed.domain().cell_id() {
+    if let Some(cell) = governed.domain().outbox_cell_id() {
         input.events.push(
             lore_postgres::domain::outbox::builders::branch_created(
                 cell,

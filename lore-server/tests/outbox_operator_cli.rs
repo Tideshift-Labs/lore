@@ -255,6 +255,7 @@ fn operator_settings(pg_url: &str, cell_id: &str) -> Settings {
 
         [notification]
         mode = "remote"
+        event_plane = "durable"
 
         [plugins.remote]
         gateway_uri = "http://127.0.0.1:1"

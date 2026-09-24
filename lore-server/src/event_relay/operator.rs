@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! CR-032's operator command surface (WP-119 Phase 8).
 //!
-//! `loreserver outbox <status|inspect|replay|requeue-dead-letter|obsolete>`.
+//! `loreserver outbox <status|inspect|replay|requeue-dead-letter|obsolete|set-plane>`.
 //! Each subcommand loads the same settings a serving `loreserver` would, proves
 //! the same Postgres-mode and cell preconditions, runs exactly one bounded
 //! operation against `lore_postgres`'s [`operator`] module, prints, and exits.
@@ -65,6 +65,9 @@ use anyhow::anyhow;
 use clap::Args;
 use clap::Subcommand;
 use lore_postgres::domain::outbox::EvaluationBlock;
+use lore_postgres::domain::outbox::EventPlane;
+use lore_postgres::domain::outbox::SetEventPlaneOutcome;
+use lore_postgres::domain::outbox::event_plane;
 use lore_postgres::domain::outbox::operator;
 use lore_postgres::domain::outbox::relay::DeadLetterOutcome;
 use lore_postgres::domain::outbox::relay::OutboxRow;
@@ -198,6 +201,21 @@ pub enum OutboxCommand {
         #[arg(long)]
         reason: String,
     },
+    /// Switch this cell's event plane (contract amendment A-32). Offline: stop
+    /// every replica of the cell first. To live-only it refuses while pending
+    /// rows exist and moves published rows to evidence.
+    SetPlane {
+        /// The plane to switch to.
+        #[arg(value_enum)]
+        plane: PlaneArg,
+        /// Who is ordering the switch. Recorded on the transition and on every
+        /// retired row.
+        #[arg(long)]
+        actor: String,
+        /// Why. Recorded on the transition and on every retired row.
+        #[arg(long)]
+        reason: String,
+    },
     /// Mark one parked dead letter obsolete, with proof of the authoritative
     /// state that makes it obsolete. The evidence row is never deleted.
     Obsolete {
@@ -215,6 +233,24 @@ pub enum OutboxCommand {
         #[arg(long)]
         proof: String,
     },
+}
+
+/// The plane `set-plane` switches to, spelled the command-line way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PlaneArg {
+    /// `live_only`: live hints only, no outbox rows.
+    LiveOnly,
+    /// `durable`: CR-032's durable plane.
+    Durable,
+}
+
+impl From<PlaneArg> for EventPlane {
+    fn from(value: PlaneArg) -> Self {
+        match value {
+            PlaneArg::LiveOnly => Self::LiveOnly,
+            PlaneArg::Durable => Self::Durable,
+        }
+    }
 }
 
 /// What `inspect` is pointed at. Exactly one, enforced by `clap` at parse time
@@ -334,6 +370,11 @@ impl OperatorContext {
                 reason,
                 proof,
             } => self.mark_obsolete(*event, actor, reason, proof).await,
+            OutboxCommand::SetPlane {
+                plane,
+                actor,
+                reason,
+            } => self.set_plane((*plane).into(), actor, reason).await,
         }
     }
 
@@ -733,6 +774,51 @@ impl OperatorContext {
         let outcome =
             operator::mark_obsolete(&client, &self.cell_id, event, actor, reason, proof).await?;
         report_disposition("obsolete", event, &outcome)
+    }
+
+    // -----------------------------------------------------------------------
+    // event plane
+    // -----------------------------------------------------------------------
+
+    /// Switch the cell's event plane. Every refusal exits non-zero, for the
+    /// same reason a refused disposition does.
+    async fn set_plane(&self, target: EventPlane, actor: &str, reason: &str) -> Result<()> {
+        let mut client = self.client().await?;
+        // This command's own connections, which `numbackends` also counts.
+        let own_backends = i64::try_from(self.pool.status().size).unwrap_or(i64::MAX);
+        let outcome = event_plane::set_event_plane(
+            &mut client,
+            &self.cell_id,
+            target,
+            actor,
+            reason,
+            own_backends,
+        )
+        .await?;
+        match outcome {
+            SetEventPlaneOutcome::Applied {
+                from,
+                to,
+                transition_seq,
+                retired_rows,
+            } => {
+                println!(
+                    "cell {} switched from {from} to {to} (transition {transition_seq}); \
+                     {retired_rows} outbox row(s) moved to lore_outbox_retired_events",
+                    self.cell_id
+                );
+                println!(
+                    "set [notification] event_plane = \"{to}\" on every replica before starting it"
+                );
+            }
+            SetEventPlaneOutcome::AlreadyCurrent { plane } => {
+                println!(
+                    "cell {} is already {plane}; nothing was written",
+                    self.cell_id
+                );
+            }
+        }
+        Ok(())
     }
 }
 
