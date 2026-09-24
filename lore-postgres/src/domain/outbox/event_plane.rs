@@ -221,6 +221,34 @@ pub async fn read_event_plane(
     })
 }
 
+/// Whether the plane history holds configuration only: every transition row
+/// retired, carried, and re-entered nothing.
+///
+/// A fresh cell's bring-up switches its plane before the clean initializers
+/// run, because boot refuses a plane/marker mismatch. That row is operator
+/// configuration, not retained event history. A row with any non-zero count
+/// is history, and so is any row in `lore_outbox_retired_events`, which the
+/// initializers still check as an ordinary table. `cell_id`, when given, also
+/// requires every row to name that cell.
+///
+/// # Errors
+/// A database failure.
+pub async fn history_is_configuration_only(
+    client: &impl GenericClient,
+    cell_id: Option<&str>,
+) -> Result<bool, DomainError> {
+    Ok(client
+        .query_one(
+            "SELECT COALESCE(bool_and(retired_rows = 0 AND retired_generations = 0 \
+                    AND carried_pending_rows = 0 AND ($1::text IS NULL OR cell_id = $1)), true) \
+               FROM lore_outbox_event_plane_transitions",
+            &[&cell_id],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("event plane history probe", e))?
+        .get(0))
+}
+
 /// Refuse an operator recovery that would put a row back into
 /// `lore_outbox_events` on a `live_only` cell.
 ///

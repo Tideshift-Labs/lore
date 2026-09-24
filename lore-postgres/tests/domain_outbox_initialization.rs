@@ -272,6 +272,80 @@ async fn fresh_event_initialization_refuses_unarmed_retained_or_populated_state(
     assert_eq!(event_state(&direct).await, before);
 }
 
+/// A zero-count plane history, written before clean fragment initialization as
+/// the dev bootstrap does, then fresh event initialization.
+async fn with_plane_history() -> (lore_postgres::pool::Pool, Client) {
+    let (url, store, direct) = fixture(true).await;
+    direct
+        .batch_execute(
+            "INSERT INTO lore_outbox_event_plane_transitions (cell_id, transition_seq, from_plane, \
+               to_plane, actor, reason, retired_rows, transitioned_at) \
+             VALUES ('test-cell', 1, 'durable', 'live_only', 'actor', 'reason', 0, now()), \
+                    ('test-cell', 2, 'live_only', 'durable', 'actor', 'reason', 0, now())",
+        )
+        .await
+        .unwrap();
+    store
+        .fragment_coordinator()
+        .initialize_empty(&fragment_input())
+        .await
+        .unwrap();
+    (build_pool(&url, 4, &TlsConfig::default()).unwrap(), direct)
+}
+
+#[tokio::test]
+#[ignore = "owned empty PostgreSQL fixture required"]
+async fn fresh_event_initialization_accepts_a_plane_history_that_moved_nothing() {
+    let (pool, _direct) = with_plane_history().await;
+    assert_eq!(
+        initialize_empty(&pool, &input(0)).await.unwrap(),
+        FreshEventInitializationOutcome::Initialized
+    );
+}
+
+#[tokio::test]
+#[ignore = "owned empty PostgreSQL fixture required"]
+async fn fresh_event_initialization_refuses_a_plane_history_that_moved_rows_or_names_another_cell()
+{
+    let (pool, direct) = with_plane_history().await;
+    for (change, undo) in [
+        ("retired_generations = 1", "retired_generations = 0"),
+        ("carried_pending_rows = 1", "carried_pending_rows = 0"),
+        ("cell_id = 'other-cell'", "cell_id = 'test-cell'"),
+    ] {
+        direct
+            .batch_execute(&format!(
+                "UPDATE lore_outbox_event_plane_transitions SET {change} WHERE transition_seq = 2"
+            ))
+            .await
+            .unwrap();
+        let before = event_state(&direct).await;
+        let error = initialize_empty(&pool, &input(0)).await.unwrap_err();
+        assert!(
+            matches!(error, DomainError::NotReady(_)),
+            "{change}: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("populated table lore_outbox_event_plane_transitions"),
+            "{change}: {error:?}"
+        );
+        assert_eq!(event_state(&direct).await, before);
+        direct
+            .batch_execute(&format!(
+                "UPDATE lore_outbox_event_plane_transitions SET {undo} WHERE transition_seq = 2"
+            ))
+            .await
+            .unwrap();
+    }
+    // The refusals were the history's: restored, the same cell initializes.
+    assert_eq!(
+        initialize_empty(&pool, &input(0)).await.unwrap(),
+        FreshEventInitializationOutcome::Initialized
+    );
+}
+
 #[tokio::test]
 #[ignore = "owned empty PostgreSQL fixture required"]
 async fn fresh_event_initialization_refuses_receipt_placement_and_contract_drift() {

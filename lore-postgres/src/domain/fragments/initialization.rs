@@ -10,6 +10,7 @@ use super::coordinator::PostgresFragmentCoordinator;
 use super::membership;
 use super::schema;
 use crate::domain::errors::DomainError;
+use crate::domain::outbox::event_plane;
 
 /// Non-secret binding to the inspected namespace and excluded old writers.
 #[derive(Debug, Clone)]
@@ -201,6 +202,16 @@ impl PostgresFragmentCoordinator {
                 if !unused_seed {
                     return Err(DomainError::NotReady(format!(
                         "clean initialization refuses used counter seed {name}"
+                    )));
+                }
+                continue;
+            }
+            // A fresh cell sets its event plane before this runs. Only a history
+            // that moved nothing is configuration; retired evidence is checked below.
+            if name == "lore_outbox_event_plane_transitions" {
+                if !event_plane::history_is_configuration_only(&*tx, None).await? {
+                    return Err(DomainError::NotReady(format!(
+                        "clean initialization refuses populated table {name}"
                     )));
                 }
                 continue;

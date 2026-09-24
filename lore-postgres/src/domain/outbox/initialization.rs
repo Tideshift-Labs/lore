@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! Offline fresh event initialization, distinct from a retained-data cutover.
 //! Broker observations and writer exclusion are operator attestations. No receiver is made ready.
+use super::event_plane::history_is_configuration_only;
 use super::membership::MembershipCas;
 use super::membership::ensure_membership_state;
 use super::membership::set_current_placement;
@@ -160,6 +161,15 @@ pub async fn initialize_empty(
                 // Its usage seed and every custody/data table are checked below.
                 | "lore_fragment_stage_policy"
         ) {
+            continue;
+        }
+        // A plane switch that moved nothing is configuration, not broker history.
+        if name == "lore_outbox_event_plane_transitions" {
+            if !history_is_configuration_only(&*tx, Some(&input.cell_id)).await? {
+                return Err(DomainError::NotReady(format!(
+                    "event initialization refuses populated table {name}"
+                )));
+            }
             continue;
         }
         if name == "lore_fragment_stage_usage" {

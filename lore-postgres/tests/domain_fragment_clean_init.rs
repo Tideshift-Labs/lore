@@ -16,6 +16,9 @@ use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::fragments::initialization::CleanCellInitialization;
 use lore_postgres::domain::fragments::initialization::CleanCellInitializationOutcome;
 use lore_postgres::domain::locks::BackfillIssuerMap;
+use lore_postgres::domain::outbox::event_plane;
+use lore_postgres::domain::outbox::event_plane::EventPlane;
+use lore_postgres::domain::outbox::event_plane::SetEventPlaneOutcome;
 use lore_postgres::pool::TlsConfig;
 use lore_postgres::pool::build_pool;
 use tokio::time::timeout;
@@ -602,6 +605,141 @@ async fn cancellation_while_waiting_for_prior_writers_leaves_a_safe_rerun() {
     assert_dark(&store).await;
     assert_eq!(
         coordinator.initialize_empty(&request).await.unwrap(),
+        CleanCellInitializationOutcome::Initialized
+    );
+}
+
+/// Switch the plane through the supported offline path, as the dev bootstrap
+/// does before `initialize-fragments`. Every connection this case already holds
+/// counts as the caller's own; only the switch's client is added.
+async fn set_plane(url: &str, direct: &Client, target: EventPlane) {
+    let baseline: i64 = direct
+        .query_one(
+            "SELECT numbackends::bigint FROM pg_catalog.pg_stat_database \
+              WHERE datname = pg_catalog.current_database()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let pool = build_pool(url, 1, &TlsConfig::default()).unwrap();
+    let mut switch = pool.get().await.unwrap();
+    let outcome = event_plane::set_event_plane(
+        &mut switch,
+        "local",
+        target,
+        "clean-init-test",
+        "fresh cell plane configuration",
+        baseline + 1,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, SetEventPlaneOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated empty PostgreSQL required"]
+async fn a_fresh_cells_plane_configuration_does_not_block_clean_initialization() {
+    let (url, store, direct) = fixture(true).await;
+    // live_only, back to durable, and live_only again: three rows, all moving nothing.
+    for target in [
+        EventPlane::LiveOnly,
+        EventPlane::Durable,
+        EventPlane::LiveOnly,
+    ] {
+        set_plane(&url, &direct, target).await;
+    }
+    assert_eq!(
+        direct
+            .query_one(
+                "SELECT count(*) FROM lore_outbox_event_plane_transitions",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        3
+    );
+    assert_eq!(
+        store
+            .fragment_coordinator()
+            .initialize_empty(&input())
+            .await
+            .unwrap(),
+        CleanCellInitializationOutcome::Initialized
+    );
+}
+
+#[tokio::test]
+#[ignore = "isolated empty PostgreSQL required"]
+async fn plane_history_that_moved_rows_or_left_evidence_refuses_clean_initialization() {
+    let (url, store, direct) = fixture(true).await;
+    set_plane(&url, &direct, EventPlane::LiveOnly).await;
+    let coordinator = store.fragment_coordinator();
+    for column in [
+        "retired_rows",
+        "retired_generations",
+        "carried_pending_rows",
+    ] {
+        direct
+            .batch_execute(&format!(
+                "UPDATE lore_outbox_event_plane_transitions SET {column} = 1"
+            ))
+            .await
+            .unwrap();
+        let before = state(&direct).await;
+        let error = coordinator.initialize_empty(&input()).await.unwrap_err();
+        assert!(
+            matches!(error, DomainError::NotReady(_)),
+            "{column}: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("populated table lore_outbox_event_plane_transitions"),
+            "{column}: {error:?}"
+        );
+        assert_eq!(state(&direct).await, before);
+        assert_dark(&store).await;
+        direct
+            .batch_execute(&format!(
+                "UPDATE lore_outbox_event_plane_transitions SET {column} = 0"
+            ))
+            .await
+            .unwrap();
+    }
+    // Retired evidence refuses on its own, whatever the transition row says.
+    direct
+        .batch_execute(
+            "INSERT INTO lore_outbox_retired_events VALUES ( \
+               '00000000-0000-0000-0000-000000000001', 'local', 1, decode(repeat('01',32),'hex'), \
+               decode(repeat('02',16),'hex'), 1, 'branch.pushed', 'branch', '\\x03', '\\x04', 1, \
+               '\\x7b7d', 'consumer_safe', now(), now(), 1, 1, 'stream', 1, 1, 'response', 1, \
+               now(), 0, NULL, NULL, NULL, 'retired_live_only', 'actor', 'reason', now())",
+        )
+        .await
+        .unwrap();
+    let before = state(&direct).await;
+    let error = coordinator.initialize_empty(&input()).await.unwrap_err();
+    assert!(matches!(error, DomainError::NotReady(_)), "{error:?}");
+    assert!(
+        error
+            .to_string()
+            .contains("populated table lore_outbox_retired_events"),
+        "{error:?}"
+    );
+    assert_eq!(state(&direct).await, before);
+    assert_dark(&store).await;
+    // The refusals were the history's, not the cell's: without it the cell initializes.
+    direct
+        .batch_execute("DELETE FROM lore_outbox_retired_events")
+        .await
+        .unwrap();
+    assert_eq!(
+        coordinator.initialize_empty(&input()).await.unwrap(),
         CleanCellInitializationOutcome::Initialized
     );
 }

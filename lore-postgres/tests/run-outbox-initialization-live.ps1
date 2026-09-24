@@ -41,7 +41,9 @@ $cases = @(
  'fresh_event_initialization_refuses_receipt_placement_and_contract_drift',
  'fresh_event_initialization_observes_a_contending_writer_before_stamping',
  'fresh_event_initialization_refuses_lost_provenance',
- 'fresh_event_initialization_requires_membership_record_and_permanent_fences'
+ 'fresh_event_initialization_requires_membership_record_and_permanent_fences',
+ 'fresh_event_initialization_accepts_a_plane_history_that_moved_nothing',
+ 'fresh_event_initialization_refuses_a_plane_history_that_moved_rows_or_names_another_cell'
 )
 $results = @(
     foreach ($testName in $cases) {
