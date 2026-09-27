@@ -3152,3 +3152,136 @@ async fn live_fresh_r25_upgrade_and_r26_resume_attest_identical_manifests() {
         "a fresh install and a cell resumed from R26 must attest byte-identical manifests"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// WP-115 ledger row 59: two replicas re-claim the same released custody rows on every cleanup
+// pass. The loser's claim must read as `Contended`, which cleanup skips, and never as the
+// `Refused` it used to be, which failed the whole pass and aged into
+// `cleanup_backpressure_sustained` on an idle cell. The second replica here is a real runtime
+// session calling the same claim function inside its own SERIALIZABLE transaction.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database with a real BLAKE3 provider"]
+async fn live_a_cleanup_claim_lost_to_another_replica_reads_as_contended() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_CLAIM_RACE_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema(&migrator)
+        .await
+        .expect("install a current cell");
+    let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
+    let now = now_ms(&fixture.client).await;
+    let boundary = "claim-race-boundary";
+    let cell = "claim-race-cell";
+    install_blake3_provider(&fixture.client).await;
+    let allocation = publish_budget(
+        &fixture.client,
+        boundary,
+        cell,
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    let policy = drain_policy(
+        boundary,
+        cell,
+        "claim-race-service",
+        "claim-race-policy-v1",
+        u64::try_from(now + 3_600_000).unwrap(),
+        16_384 * 8,
+        1_000_000,
+    );
+    publish_drain_policy(&fixture.client, &policy).await;
+    let policy_digest = policy.digest().unwrap();
+    let client = DrainClient::new(Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    ));
+    // Warm the pool first: a cold connect-and-attest can outlast the descriptor's short send
+    // window and fail the reservation as DRAIN_EXPIRED.
+    client
+        .verify_schema_revision()
+        .await
+        .expect("a current cell's schema marker");
+
+    // One released (state 3) row: the idle-cell shape every cleanup pass re-scans.
+    let descriptor = synthetic_descriptor(
+        0,
+        &policy,
+        &policy_digest,
+        &allocation,
+        now_ms(&fixture.client).await,
+    );
+    client
+        .reserve(&descriptor)
+        .await
+        .expect("a real reservation");
+    tokio::time::sleep(Duration::from_millis(policy.maximum_ttl_ms + 500)).await;
+    let intent = client
+        .claim_cleanup(descriptor.spool_object_id)
+        .await
+        .expect("the first cleanup claim");
+    client
+        .release_cleanup(&intent)
+        .await
+        .expect("the first cleanup release");
+    let spool = descriptor.spool_object_id;
+
+    // Controls. Uncontended, a released row is re-claimable; a missing row is still a refusal.
+    client
+        .claim_cleanup(spool)
+        .await
+        .expect("an uncontended re-scan claim succeeds");
+    assert_eq!(
+        client.claim_cleanup(Uuid::now_v7()).await.err(),
+        Some(DrainError::Refused),
+        "a claim the function itself rejects must stay Refused"
+    );
+
+    let (replica, _replica_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_runtime").await;
+    let claim_sql = "SELECT * FROM object_store_retention.drain_cleanup_claim_v1($1)";
+
+    // Lock timeout (55P03): the other replica holds the row for the whole wait.
+    replica
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    replica.query(claim_sql, &[&spool]).await.unwrap();
+    assert_eq!(
+        client.claim_cleanup(spool).await.err(),
+        Some(DrainError::Contended),
+        "a claim that times out on another replica's row lock must read as Contended"
+    );
+    replica.batch_execute("ROLLBACK").await.unwrap();
+    // The failed call poisoned its connection. Warm a new one now, or the next claim spends the
+    // race window connecting and starts only after the other replica has committed.
+    client
+        .verify_schema_revision()
+        .await
+        .expect("re-warm the pool");
+
+    // Serialization failure (40001): the other replica commits its claim while this one waits.
+    replica
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    replica.query(claim_sql, &[&spool]).await.unwrap();
+    let (claimed, committed) = tokio::join!(client.claim_cleanup(spool), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        replica.batch_execute("COMMIT").await
+    });
+    committed.expect("the other replica's claim commits");
+    assert_eq!(
+        claimed.err(),
+        Some(DrainError::Contended),
+        "a claim that loses to another replica's committed claim must read as Contended"
+    );
+
+    client
+        .claim_cleanup(spool)
+        .await
+        .expect("once the race is over the row is claimable again");
+}

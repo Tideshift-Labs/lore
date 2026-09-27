@@ -187,11 +187,9 @@ impl FragmentDrainMaintenanceHandle {
             *pending = None;
             let (intent, removed) =
                 result.map_err(|_error| FragmentProviderError::DrainSpoolIo)??;
-            self.client
-                .release_cleanup(&intent)
-                .await
-                .map_err(FragmentProviderError::DrainAuthority)?;
-            count += u32::from(removed);
+            if released(self.client.release_cleanup(&intent).await)? {
+                count += u32::from(removed);
+            }
         }
         let ids = self
             .client
@@ -199,11 +197,13 @@ impl FragmentDrainMaintenanceHandle {
             .await
             .map_err(FragmentProviderError::DrainAuthority)?;
         for id in ids {
-            let intent = self
-                .client
-                .claim_cleanup(id)
-                .await
-                .map_err(FragmentProviderError::DrainAuthority)?;
+            // Every replica scans the same candidates. Losing the row to another replica means
+            // that replica is doing this work, so skip it rather than fail the whole pass.
+            let intent = match self.client.claim_cleanup(id).await {
+                Ok(intent) => intent,
+                Err(DrainError::Contended) => continue,
+                Err(error) => return Err(FragmentProviderError::DrainAuthority(error)),
+            };
             let layout = self.layout.clone();
             let writer = self.writer.clone();
             *pending = Some(lore_base::lore_spawn_blocking!(move || {
@@ -219,14 +219,22 @@ impl FragmentDrainMaintenanceHandle {
             *pending = None;
             let (intent, removed) =
                 result.map_err(|_error| FragmentProviderError::DrainSpoolIo)??;
-            self.client
-                .release_cleanup(&intent)
-                .await
-                .map_err(FragmentProviderError::DrainAuthority)?;
             // Rechecking a compact tombstone is not progress against backlog.
-            count += u32::from(removed);
+            if released(self.client.release_cleanup(&intent).await)? {
+                count += u32::from(removed);
+            }
         }
         Ok(count)
+    }
+}
+
+/// Whether a cleanup release committed. A release lost to another replica committed nothing and
+/// is left for a later pass: the claim is re-entrant and the unlink is idempotent.
+fn released(result: Result<(), DrainError>) -> Result<bool, FragmentProviderError> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(DrainError::Contended) => Ok(false),
+        Err(error) => Err(FragmentProviderError::DrainAuthority(error)),
     }
 }
 
@@ -416,4 +424,25 @@ pub(super) async fn assert_cleanup_recovers_after_worker_panic(
         "an already compact tombstone does not report fresh cleanup progress"
     );
     assert!(maintenance.io.lock().await.is_none());
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+
+    #[test]
+    fn a_release_lost_to_another_replica_is_skipped_not_failed() {
+        assert!(matches!(released(Ok(())), Ok(true)));
+        assert!(matches!(released(Err(DrainError::Contended)), Ok(false)));
+        for error in [
+            DrainError::Refused,
+            DrainError::Unavailable,
+            DrainError::Invalid,
+        ] {
+            assert!(matches!(
+                released(Err(error)),
+                Err(FragmentProviderError::DrainAuthority(inner)) if inner == error
+            ));
+        }
+    }
 }

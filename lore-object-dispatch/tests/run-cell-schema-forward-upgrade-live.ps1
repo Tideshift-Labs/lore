@@ -111,7 +111,9 @@ $tests = @(
             'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FROM_R25_PG_URL' = 'r25_parity_from_r25'
             'LORE_TEST_CELL_SCHEMA_UPGRADE_R25_PARITY_FROM_R26_PG_URL' = 'r25_parity_from_r26'
         }
-    }
+    },
+    # WP-115 ledger row 59: a cleanup claim lost to another replica reads as Contended.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_CLAIM_RACE_PG_URL'; Name = 'live_a_cleanup_claim_lost_to_another_replica_reads_as_contended'; Database = 'claim_race' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

@@ -9,6 +9,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio_postgres::IsolationLevel;
 use tokio_postgres::Row;
+use tokio_postgres::error::SqlState;
 use uuid::Uuid;
 
 use crate::dispatch_pool::DispatchRuntimePool;
@@ -93,12 +94,41 @@ pub enum DrainError {
     Refused,
     #[error("drain authority is unavailable; the operation may have committed")]
     Unavailable,
+    /// Another session held or had just changed the same row. Nothing committed. Two replicas
+    /// scanning one cell meet this routinely, so it is not a refusal of the operation itself.
+    #[error("drain authority lost a race for the same row to another session; nothing committed")]
+    Contended,
     #[error(
         "the cell schema predates the spool metadata true-up: stop every replica and run `cell-schema-install upgrade`"
     )]
     SchemaUpgradeRequired,
     #[error("the cell schema revision is not one this build knows; refusing write-behind")]
     SchemaUnknown,
+}
+
+/// Serialization failure, lock timeout and deadlock each roll the transaction back. They report
+/// a race with another session, not a verdict on the operation.
+fn is_contention(code: &SqlState) -> bool {
+    *code == SqlState::T_R_SERIALIZATION_FAILURE
+        || *code == SqlState::LOCK_NOT_AVAILABLE
+        || *code == SqlState::T_R_DEADLOCK_DETECTED
+}
+
+/// A statement error with a SQLSTATE is the authority's answer; without one the outcome is unknown.
+fn statement_error(code: Option<&SqlState>) -> DrainError {
+    match code {
+        Some(code) if is_contention(code) => DrainError::Contended,
+        Some(_) => DrainError::Refused,
+        None => DrainError::Unavailable,
+    }
+}
+
+/// A commit that reports contention rolled back. Any other commit failure may have committed.
+fn commit_error(code: Option<&SqlState>) -> DrainError {
+    match code {
+        Some(code) if is_contention(code) => DrainError::Contended,
+        _ => DrainError::Unavailable,
+    }
 }
 
 fn framed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), DrainError> {
@@ -323,16 +353,11 @@ impl DrainClient {
             tx.batch_execute(&self.pool.bounded_execution_preamble())
                 .await
                 .map_err(|_error| DrainError::Unavailable)?;
-            let rows = tx.query(sql, values).await.map_err(|e| {
-                if e.code().is_some() {
-                    DrainError::Refused
-                } else {
-                    DrainError::Unavailable
-                }
-            })?;
-            tx.commit()
+            let rows = tx
+                .query(sql, values)
                 .await
-                .map_err(|_error| DrainError::Unavailable)?;
+                .map_err(|e| statement_error(e.code()))?;
+            tx.commit().await.map_err(|e| commit_error(e.code()))?;
             Ok(rows)
         })
         .await;
@@ -593,5 +618,37 @@ impl DrainClient {
             )
             .map_err(|_error| DrainError::Invalid)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lost_row_race_is_contention_not_a_refusal() {
+        for code in [
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+        ] {
+            assert_eq!(statement_error(Some(&code)), DrainError::Contended);
+            assert_eq!(commit_error(Some(&code)), DrainError::Contended);
+        }
+    }
+
+    #[test]
+    fn other_sqlstates_keep_their_existing_meaning() {
+        // A raised exception (P0001) and a statement timeout are the authority's own answer.
+        for code in [
+            SqlState::RAISE_EXCEPTION,
+            SqlState::QUERY_CANCELED,
+            SqlState::NO_DATA_FOUND,
+        ] {
+            assert_eq!(statement_error(Some(&code)), DrainError::Refused);
+            assert_eq!(commit_error(Some(&code)), DrainError::Unavailable);
+        }
+        assert_eq!(statement_error(None), DrainError::Unavailable);
+        assert_eq!(commit_error(None), DrainError::Unavailable);
     }
 }
