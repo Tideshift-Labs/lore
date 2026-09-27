@@ -1284,8 +1284,15 @@ impl DurableReceiver {
             } => {
                 // The snapshot moved under this report. Adopt the current
                 // version and let the next cadence tick resend; the frontier
-                // itself is unchanged and nothing was lost.
+                // itself is unchanged and nothing was lost. The attempt spends
+                // this tick: restart the interval and clear the event count, or
+                // a persistent conflict re-sends on every idle poll. Clearing
+                // `reported_frontier` keeps the unreported work due, since a
+                // park moves no frontier and would otherwise look reported.
                 session.membership_version = current_membership_version;
+                session.last_checkpoint = Instant::now();
+                session.events_since_checkpoint = 0;
+                session.reported_frontier = None;
                 metrics::record_receiver_checkpoint("version_conflict");
                 Err(BootstrapFailure::Transient(REASON_BOOTSTRAPPING))
             }
@@ -1843,6 +1850,51 @@ mod tests {
             "a park must arm the checkpoint even when the tracker is saturated and \
              record_poison itself pushed nothing new, or the synthetic \
              FRONTIER_TRACKER_SATURATED entry never reaches the durable projection"
+        );
+    }
+
+    /// A membership-version conflict is a checkpoint attempt, so it spends the
+    /// cadence tick it was sent on. Before this, the conflict reset neither
+    /// `last_checkpoint` nor `events_since_checkpoint`, so a generation parked
+    /// under a persistent conflict stayed due and re-sent a store write on
+    /// every idle poll rather than on the next cadence tick. The unreported
+    /// work must survive the conflict, or the park never reaches the row.
+    #[tokio::test]
+    async fn a_membership_version_conflict_waits_for_the_next_cadence_tick() {
+        let mut harness = harness(900);
+        harness.receiver.receiver.checkpoint_every_events = 1;
+        harness.receiver.receiver.checkpoint_interval = Duration::from_secs(60);
+        let mut session = harness.receiver.bootstrap().await.expect("bootstraps");
+
+        harness
+            .stream
+            .push_envelope(900, durable_with_unsupported_payload_version(0x9f, 1));
+        assert_eq!(
+            harness.receiver.step(&mut session).await,
+            StepOutcome::Parked(POISON_CLASS_UNSUPPORTED_SCHEMA)
+        );
+        assert!(session.needs_checkpoint(&harness.receiver.receiver));
+
+        let current = harness.store.membership_version() + 1;
+        harness
+            .store
+            .next_checkpoint(Ok(CheckpointOutcome::MembershipVersionConflict {
+                current_membership_version: current,
+            }));
+        assert!(matches!(
+            harness.receiver.checkpoint(&mut session).await,
+            Err(BootstrapFailure::Transient(REASON_BOOTSTRAPPING))
+        ));
+        assert_eq!(session.membership_version, current);
+
+        assert!(
+            !session.needs_checkpoint(&harness.receiver.receiver),
+            "a conflicted report must wait for the next cadence tick, not retry every idle poll"
+        );
+        harness.receiver.receiver.checkpoint_interval = Duration::ZERO;
+        assert!(
+            session.needs_checkpoint(&harness.receiver.receiver),
+            "the park is still unreported, so the next cadence tick must resend it"
         );
     }
 
