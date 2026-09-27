@@ -226,8 +226,11 @@ $databaseNames = @($tests | ForEach-Object { $_.Database }) + @($installChainPro
 
 # CR-033 D5's cell install set, shared with the classification check below so the two cannot
 # drift apart.
-$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24)
+$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27)
 $cd1KnownDeferredNumbers = @(4, 5, 6)
+# CR-038 forward steps: bodies with no BEGIN/COMMIT that only `cell-schema-install` runs, inside its
+# own transaction after a prelude. They are not frozen install artifacts, so this proof skips them.
+$cd1ForwardStepNumbers = @(28)
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })
 $priorEnvironment = @{}
@@ -358,6 +361,29 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_postgres_cell_schema_refuses_a_drifted_catalog',
         'live_postgres_cell_schema_revokes_service_privileges_after_replacement',
         'live_postgres_cell_schema_measure_catalog_manifest',
+        'live_drain_policy_publication_is_maintenance_only_and_replays_exactly',
+        # Cell-schema forward upgrade -- run-cell-schema-forward-upgrade-live.ps1
+        'live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_double_give_back',
+        'live_fresh_install_and_upgraded_cell_attest_identical_manifests',
+        'live_fresh_r25_upgrade_and_r26_resume_attest_identical_manifests',
+        'live_install_at_r25_upgrades_to_current_and_drain_client_writes',
+        'live_r25_upgrade_refuses_a_spool_object_or_charged_quota_and_leaves_the_cell_at_r25',
+        'live_r25_upgrade_refuses_a_state_outside_the_known_list',
+        'live_release_true_up_matches_actual_size_and_underflow_raises',
+        'live_two_concurrent_upgrades_exactly_one_proceeds',
+        'live_upgrade_recovers_from_a_kill_before_commit',
+        'live_upgrade_recovers_from_a_kill_mid_attest',
+        'live_upgrade_recovers_from_a_lost_commit_after_the_r25_to_r26_step',
+        'live_upgrade_recovers_from_a_lost_commit_reply',
+        'live_upgrade_refuses_unknown_states_future_markers_and_active_replicas',
+        'live_upgraded_cell_at_real_dev_cap_stays_writable',
+        'live_upgraded_cell_survives_the_load_that_wedges_an_unupgraded_cell',
+        'live_write_behind_refuses_an_unupgraded_cell_and_accepts_an_upgraded_one',
+        # CR-034 budget pin refresh -- run-budget-pin-refresh-live.ps1
+        'live_postgres_head_read_function_is_the_only_door_and_is_least_privilege',
+        'live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the_new_fence',
+        'live_postgres_two_generations_of_drift_refuses_the_attempt_and_debits_nothing',
+        'live_postgres_expiry_refuses_typed_and_never_enters_the_refresh_branch',
         # WP-114 CD-4 provider charge tier -- run-provider-charge-live.ps1
         'live_postgres_last_unit_charges_are_atomic_and_fail_closed',
         'live_postgres_frozen_revision_grammar_and_idempotent_publication_replay',
@@ -373,6 +399,7 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_budget_exact_binding_drift_and_absence_refuse',
         'live_budget_wrong_role_tls_and_database_identity_refuse',
         'live_budget_renewal_carries_depletion_without_reset',
+        'live_budget_legacy_replay_and_v2_successor_preserve_old_identity_and_depletion',
         'live_budget_expired_reconcile_is_read_only_and_allows_successor',
         # Cell retention -- run-cell-retention-live.ps1
         'live_cell_retention_removes_children_atomically_and_preserves_both_horizons',
@@ -509,7 +536,7 @@ function Assert-MigrationSetIsFullyClassified {
 
 try {
     Assert-IgnoredTestCatalogMatchesKnownTests -Tests $tests
-    Assert-MigrationSetIsFullyClassified -InstallSet $cd1InstallSetNumbers -KnownDeferred $cd1KnownDeferredNumbers
+    Assert-MigrationSetIsFullyClassified -InstallSet $cd1InstallSetNumbers -KnownDeferred (@($cd1KnownDeferredNumbers) + @($cd1ForwardStepNumbers))
     Assert-NoCollidingContainer
 
     # Set before the call, not after: `docker run --detach` can create the container and still
@@ -609,7 +636,7 @@ $$;
         )
     }
 
-    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0022) into $installChainProofDatabase..."
+    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0027) into $installChainProofDatabase..."
     foreach ($number in $cd1InstallSetNumbers) {
         Install-MigrationToDatabase -DatabaseName $installChainProofDatabase -Path (Resolve-MigrationPath -Number $number)
     }
@@ -644,7 +671,7 @@ WHERE n.nspname = 'object_store_retention'
     if ($deferredProcedureCount -ne '0') {
         throw "expected zero installed 0004-0006 procedures, found $deferredProcedureCount"
     }
-    Write-Host "Install-chain proof: 0002, 0003, 0007-0022 installed cleanly; 4 of the 5 tables" `
+    Write-Host "Install-chain proof: 0002, 0003, 0007-0027 installed cleanly; 4 of the 5 tables" `
         "0002 creates are present-but-inert; 0 deferred 0004-0006 procedures are installed."
 
     Write-Host "Pre-installing 0002 and 0009 into $($tests[0].Database) for the canonical-codec live test..."
