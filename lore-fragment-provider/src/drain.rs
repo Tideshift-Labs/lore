@@ -228,9 +228,6 @@ impl FragmentDrainMaintenanceHandle {
     }
 }
 
-/// Whether a cleanup release committed. A release lost to another replica committed nothing and
-/// is left for a later pass: the claim is re-entrant and the unlink is idempotent. A lost
-/// compaction after a committed release is already `Ok` from `release_cleanup`.
 /// How many times one pass tries a release before leaving it for a later pass.
 const RELEASE_ATTEMPTS: usize = 3;
 
@@ -253,6 +250,9 @@ where
     released(release().await)
 }
 
+/// Whether a cleanup release committed. A release lost to another replica committed nothing and
+/// is left for a later pass: the claim is re-entrant and the unlink is idempotent. A lost
+/// compaction after a committed release is already `Ok` from `release_cleanup`.
 fn released(result: Result<(), DrainError>) -> Result<bool, FragmentProviderError> {
     match result {
         Ok(()) => Ok(true),

@@ -273,6 +273,9 @@ fn record_pass_outcome(
 /// that finishes a row whose body an earlier, lost release already unlinked
 /// counts as nothing. The backlog falls only when a row is released, by any
 /// replica, so it is the direct measure. A gap leaves nothing to compare with.
+/// The cost: a replica whose passes succeed but clean nothing reads ready while
+/// a peer drains the cell. A replica whose passes fail still ages out through
+/// `cleanup_stale`.
 ///
 /// Pure and synchronous, so the rule is testable without a store, a runtime or a
 /// Postgres fixture — the same reason `record_pass_outcome` is.
