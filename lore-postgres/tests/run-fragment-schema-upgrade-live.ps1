@@ -90,6 +90,20 @@ $inventory = @(
             'real_loreserver_binary_upgrades_a_revision_4_clean_cell_and_emits_parseable_json'
         )
     }
+    # WP-115 ledger row 62: the NOWAIT backstop needs a pause between the backend count and the
+    # table locks, so it compiles only with `failure_generator`. That build also lists the 21
+    # cases above, hence not `Exact`: this entry checks only that its own case exists.
+    [pscustomobject]@{
+        Package  = 'lore-postgres'
+        Kind     = 'test'
+        Target   = 'domain_fragment_schema_upgrade'
+        Exact    = $false
+        Features = @('failure_generator')
+        Failpoints = 'schema_upgrade.drain.before_update=pause'
+        Cases    = @(
+            'the_nowait_backstop_refuses_a_lock_holder_that_races_the_backend_count'
+        )
+    }
 )
 
 function Invoke-Checked([string]$Program, [string[]]$ArgumentList) {
@@ -109,7 +123,9 @@ $results = [Collections.Generic.List[object]]::new()
 Push-Location $loreRoot
 try {
     foreach ($target in $inventory) {
-        $arguments = @('test', '-j', '4', '-p', $target.Package, '--test', $target.Target, '--', '--ignored', '--list')
+        $featureArgs = if ($target.PSObject.Properties['Features']) { @('--features', ($target.Features -join ',')) } else { @() }
+        $failpoints = if ($target.PSObject.Properties['Failpoints']) { $target.Failpoints } else { $null }
+        $arguments = @('test', '-j', '4', '-p', $target.Package, '--test', $target.Target) + $featureArgs + @('--', '--ignored', '--list')
         $catalog = Invoke-CargoCaptured $arguments
         $names = @([regex]::Matches($catalog, '(?m)^([A-Za-z0-9_:]+): test\r?$') | ForEach-Object { $_.Groups[1].Value })
         if ($target.Exact) {
@@ -118,12 +134,15 @@ try {
                 throw "ignored catalog mismatch for $($target.Target): compiled [$($names -join ', ')] expected [$($target.Cases -join ', ')]"
             }
         }
-        foreach ($case in $target.Cases) {
-            if ($OnlyCase.Count -gt 0 -and $OnlyCase -notcontains $case) {
-                $results.Add([pscustomobject]@{ Package = $target.Package; Target = $target.Target; Test = $case; Status = 'NOT RUN' })
-                continue
+        else {
+            $missing = @($target.Cases | Where-Object { $names -notcontains $_ })
+            if ($missing.Count -ne 0) {
+                throw "ignored catalog for $($target.Target) $($featureArgs -join ' ') is missing [$($missing -join ', ')]"
             }
-            $results.Add([pscustomobject]@{ Package = $target.Package; Target = $target.Target; Test = $case; Status = 'PENDING' })
+        }
+        foreach ($case in $target.Cases) {
+            $status = if ($OnlyCase.Count -gt 0 -and $OnlyCase -notcontains $case) { 'NOT RUN' } else { 'PENDING' }
+            $results.Add([pscustomobject]@{ Package = $target.Package; Target = $target.Target; Test = $case; Status = $status; FeatureArgs = $featureArgs; Failpoints = $failpoints })
         }
     }
 
@@ -163,7 +182,10 @@ try {
     }
     Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
-    $savedUrl = [Environment]::GetEnvironmentVariable('LORE_TEST_PG_URL', 'Process')
+    $savedEnv = @{}
+    foreach ($key in @('LORE_TEST_PG_URL', 'LORE_FRAGMENT_FAILPOINTS', 'LORE_FRAGMENT_FAILPOINT_DIR')) {
+        $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+    }
     $index = 0
     foreach ($result in $results) {
         if ($result.Status -ne 'PENDING') { continue }
@@ -171,8 +193,19 @@ try {
         $index++
         Invoke-Checked docker @('exec', $containerName, 'createdb', '-U', 'postgres', $database)
         $env:LORE_TEST_PG_URL = "postgresql://postgres@127.0.0.1:$pgPort/$database`?sslmode=disable"
+        # Failpoints are armed for their own case only, with a fresh rendezvous directory.
+        $rendezvous = $null
+        if ($result.Failpoints) {
+            $rendezvous = Join-Path ([IO.Path]::GetTempPath()) "cr039-failpoints-$runId-$index"
+            New-Item -ItemType Directory -Path $rendezvous | Out-Null
+            $env:LORE_FRAGMENT_FAILPOINTS = $result.Failpoints
+            $env:LORE_FRAGMENT_FAILPOINT_DIR = $rendezvous
+        }
+        else {
+            Remove-Item Env:\LORE_FRAGMENT_FAILPOINTS, Env:\LORE_FRAGMENT_FAILPOINT_DIR -ErrorAction SilentlyContinue
+        }
         try {
-            $arguments = @('test', '-j', '4', '-p', $result.Package, '--test', $result.Target, '--', '--ignored', '--exact', $result.Test, '--nocapture')
+            $arguments = @('test', '-j', '4', '-p', $result.Package, '--test', $result.Target) + $result.FeatureArgs + @('--', '--ignored', '--exact', $result.Test, '--nocapture')
             $output = Invoke-CargoCaptured $arguments
             Write-Host $output
             if ($output -notmatch 'test result: ok\. 1 passed; 0 failed; 0 ignored;') { throw 'expected exactly one executed test' }
@@ -182,8 +215,13 @@ try {
             $result.Status = 'FAIL'
             Write-Warning $_
         }
+        finally {
+            if ($rendezvous) { Remove-Item -Recurse -Force -LiteralPath $rendezvous -ErrorAction SilentlyContinue }
+        }
     }
-    if ($null -ne $savedUrl) { $env:LORE_TEST_PG_URL = $savedUrl } else { Remove-Item Env:\LORE_TEST_PG_URL -ErrorAction SilentlyContinue }
+    foreach ($key in $savedEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $savedEnv[$key], 'Process')
+    }
 
     $runPassed = @($results | Where-Object Status -eq 'FAIL').Count -eq 0
     if (-not $runPassed) { throw 'fragment schema upgrade live tests failed' }
@@ -193,7 +231,7 @@ catch {
     throw
 }
 finally {
-    $results | Format-Table -AutoSize | Out-String -Width 240 | Write-Host
+    $results | Format-Table Package, Target, Test, Status -AutoSize | Out-String -Width 240 | Write-Host
     if ($containerCreationAttempted) {
         if ($KeepOnFailure -and -not $runPassed) {
             Write-Host "Preserved owned container $containerName"

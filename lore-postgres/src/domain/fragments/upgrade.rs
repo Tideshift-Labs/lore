@@ -43,6 +43,7 @@ use super::stage_rotation_schema::STAGE_POLICY_ROTATION_SCHEMA;
 use super::stage_schema::STAGE_CUSTODY_SCHEMA;
 use super::states::FragmentLifecycleState;
 use crate::domain::errors::DomainError;
+use crate::domain::fragments::failpoint;
 
 /// The revision a clean cell initialized before WP-122's stage custody holds.
 pub const PRE_STAGE_SCHEMA_VERSION: i64 = 4;
@@ -273,6 +274,8 @@ impl PostgresFragmentCoordinator {
             "LOCK TABLE {} IN ACCESS EXCLUSIVE MODE NOWAIT",
             locked.join(", ")
         );
+        // The window a session can race the backend count through.
+        failpoint!("schema_upgrade.drain.before_update")?;
         if let Err(error) = tx.batch_execute(&lock).await {
             if error.code() == Some(&SqlState::LOCK_NOT_AVAILABLE) {
                 return Err(DomainError::Contention(

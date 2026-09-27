@@ -394,7 +394,14 @@ impl FragmentLifecycleReadiness {
                     // pass readiness against a revision-4 binary and then die at
                     // runtime on SQLSTATE 42703 at the first promotion. At `>= 4`
                     // it routes legacy instead.
-                    && self.schema_version >= 4
+                    //
+                    // Raised again to the compiled revision (CR-039 follow-up,
+                    // WP-115 ledger row 62). The same relation probe cannot tell
+                    // a revision-5 cell, which lacks revision 6's rotation
+                    // columns, from a current one, and a revision-4 clean cell
+                    // has no stage custody at all. Both are refused by
+                    // `bootstrap()` already; readiness now agrees.
+                    && self.schema_version == schema::FRAGMENT_SCHEMA_VERSION
                     && self.lifecycle_enabled
                     && self.write_capability.claims_required()))
             && self.same_database

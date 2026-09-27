@@ -315,9 +315,11 @@ fn write_claim_kind_round_trips_and_stays_inside_the_two_value_check() {
 /// `ready_for_lifecycle`'s clean-init arm is the one path this bites --
 /// its floor moved from `>= 3` to `>= 4` specifically because
 /// `FRAGMENT_SCHEMA_RELATIONS`'s relation-level probe cannot see a missing
-/// column.
+/// column, and then to the compiled revision exactly (CR-039 follow-up,
+/// WP-115 ledger row 62), because revisions 4 and 5 lack stage objects the
+/// same probe cannot see either.
 #[test]
-fn ready_for_lifecycle_clean_init_arm_requires_schema_version_at_least_four() {
+fn ready_for_lifecycle_clean_init_arm_requires_the_compiled_schema_version() {
     let ready_capability = FragmentWriteCapability::ClaimsRequired {
         provider_write_authority_revision: "write-claims-v1".to_owned(),
     };
@@ -337,6 +339,14 @@ fn ready_for_lifecycle_clean_init_arm_requires_schema_version_at_least_four() {
         !readiness.ready_for_lifecycle(),
         "a version-3 cell must not half-enable on the clean-init path against a version-4 binary"
     );
+    for behind in 4..FRAGMENT_SCHEMA_VERSION {
+        readiness.schema_version = behind;
+        assert!(
+            !readiness.ready_for_lifecycle(),
+            "a clean version-{behind} cell must not be ready against a version-\
+             {FRAGMENT_SCHEMA_VERSION} binary"
+        );
+    }
     readiness.schema_version = FRAGMENT_SCHEMA_VERSION;
     assert!(
         readiness.ready_for_lifecycle(),

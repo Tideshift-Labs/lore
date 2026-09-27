@@ -1098,9 +1098,9 @@ async fn a_live_lock_holder_refuses_while_another_session_is_connected() {
     // `holder` itself is then the ONE other session, and IS still counted
     // the same way -- the count check refuses on it before the NOWAIT lock
     // attempt is ever reached, so this proves "refused while another
-    // session is connected", not the NOWAIT statement in isolation. See
-    // testing-gotchas: the NOWAIT backstop has no live-second-connection
-    // test that reaches it anymore.
+    // session is connected", not the NOWAIT statement in isolation. The
+    // backstop's own case is
+    // `the_nowait_backstop_refuses_a_lock_holder_that_races_the_backend_count`.
     drop(direct);
     let mut holder = client(&url).await;
     let tx = holder.transaction().await.unwrap();
@@ -1468,4 +1468,79 @@ async fn bootstrap_on_a_clean_v5_cell_names_restore_or_escalate() {
 
     let after = schema_state_snapshot(&direct).await;
     assert_eq!(before, after, "a refused bootstrap must write nothing");
+}
+
+// ---------------------------------------------------------------------------
+// WP-115 ledger row 62: the NOWAIT backstop, on its own.
+// ---------------------------------------------------------------------------
+
+/// Every other contention case above is refused by the backend count, which
+/// runs first, so none of them reaches `LOCK TABLE ... NOWAIT`. This one
+/// pauses the upgrade just after the count passes, connects a second session
+/// and locks a fragment table, then releases the upgrade. Only the NOWAIT
+/// statement can refuse it, and the refusal must name that statement's
+/// reason, not the count's. Needs a `failure_generator` build; the runner
+/// arms the anchor and the rendezvous directory for this case alone.
+#[cfg(feature = "failure_generator")]
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn the_nowait_backstop_refuses_a_lock_holder_that_races_the_backend_count() {
+    const ANCHOR: &str = "schema_upgrade.drain.before_update";
+    assert_eq!(
+        std::env::var("LORE_FRAGMENT_FAILPOINTS").as_deref(),
+        Ok("schema_upgrade.drain.before_update=pause"),
+        "the runner must arm exactly this case's anchor"
+    );
+    let dir = std::path::PathBuf::from(
+        std::env::var("LORE_FRAGMENT_FAILPOINT_DIR").expect("runner must set the rendezvous dir"),
+    );
+    let hold = dir.join(format!("{ANCHOR}.hold"));
+    let reached = dir.join(format!("{ANCHOR}.reached"));
+    let _ = std::fs::remove_file(&reached);
+
+    let url = pg_url();
+    let (store, direct) = revision4_clean_cell(&url).await;
+    let before = schema_state_snapshot(&direct).await;
+    drop(direct);
+
+    std::fs::write(&hold, b"").unwrap();
+    let coordinator = store.fragment_coordinator();
+    let upgrade = lore_base::lore_spawn!(async move { coordinator.upgrade_clean_schema().await });
+
+    // Positive control: the upgrade really stopped between the count and the
+    // lock. Without this, a refusal could come from a path that never reached
+    // the window.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !reached.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the upgrade never reached {ANCHOR}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let mut holder = client(&url).await;
+    let tx = holder.transaction().await.unwrap();
+    tx.batch_execute("LOCK TABLE lore_fragment_lifecycle IN ACCESS SHARE MODE")
+        .await
+        .unwrap();
+    std::fs::remove_file(&hold).unwrap();
+
+    let outcome = upgrade.await.expect("upgrade task joins");
+    let Err(DomainError::Contention(message)) = outcome else {
+        panic!("expected Err(Contention(..)) from the NOWAIT lock, got {outcome:?}");
+    };
+    assert!(
+        message.contains("a live session holds a fragment table"),
+        "expected the NOWAIT refusal, not the backend-count one, got {message:?}"
+    );
+    tx.rollback().await.unwrap();
+    drop(holder);
+
+    let direct = client(&url).await;
+    assert_eq!(
+        schema_state_snapshot(&direct).await,
+        before,
+        "a refused upgrade must leave the cell at exact revision 4"
+    );
 }

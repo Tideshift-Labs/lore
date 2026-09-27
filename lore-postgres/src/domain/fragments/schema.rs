@@ -36,8 +36,8 @@ pub const FRAGMENT_SCHEMA_VERSION: i64 = 6;
 /// and its numbered follow-ons raise the stored value to
 /// [`FRAGMENT_SCHEMA_VERSION`]. A cell that ran only `0001` therefore records
 /// revision 3, which is exactly what makes it route legacy rather than
-/// half-enable against a revision-4 binary (`ready_for_lifecycle`'s clean-init
-/// arm requires `>= 4`, and `enable_lifecycle` requires an exact match).
+/// half-enable against a current binary (`ready_for_lifecycle`'s clean-init
+/// arm and `enable_lifecycle` both require an exact match).
 pub const FRAGMENT_SCHEMA_BASE_VERSION: i64 = 3;
 
 /// Provider writes are allowed during a rolling upgrade, but destructive

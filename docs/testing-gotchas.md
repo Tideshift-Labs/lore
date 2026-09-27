@@ -273,9 +273,11 @@ silently stopped discriminating the two refusal paths) and
 `a_realistic_row_exclusive_writer_refuses_while_another_session_is_connected` both now assert the
 exact count-check message (`"other backend(s) are connected"`), naming what they actually prove.
 The NOWAIT statement is still real and still matters as the documented race backstop (a
-connection that lands between the count check passing and the `LOCK TABLE ... NOWAIT` call), but
-that race is not exercised by any test in this file; reaching it would need a hook inside the
-coordinator (a failpoint) that does not exist here, not a second plain connection.
+connection that lands between the count check passing and the `LOCK TABLE ... NOWAIT` call). No
+plain second connection reaches it. Since 2026-09-27 (WP-115 ledger row 62) the failpoint
+`schema_upgrade.drain.before_update` pauses the upgrade in exactly that window, and
+`the_nowait_backstop_refuses_a_lock_holder_that_races_the_backend_count` (a `failure_generator`
+build, armed per case by `run-fragment-schema-upgrade-live.ps1`) asserts the NOWAIT message itself.
 An event-trigger fault injection (`CREATE EVENT TRIGGER ... ON ddl_command_start WHEN TAG IN
 ('ALTER TABLE')`, gated on `current_query() LIKE '%<a string unique to the target DDL>%'`) is a
 reliable way to fail a specific statement mid-multi-statement-`batch_execute` without touching

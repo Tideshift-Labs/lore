@@ -318,6 +318,13 @@ const ANCHORS: &[(&str, &str)] = &[
         "cutover.enable_lifecycle.post_write",
         "P3 restart: lifecycle routing enabled, against a concurrent boot readiness check",
     ),
+    // ---- CR-039 clean-cell schema upgrade -------------------------------
+    (
+        "schema_upgrade.drain.before_update",
+        "CR-039 NOWAIT backstop: the backend count passed and the table locks are not yet \
+         taken, so a session that connects and locks a fragment table in this window must be \
+         refused by ACCESS EXCLUSIVE NOWAIT alone (WP-115 ledger row 62)",
+    ),
     // ---- CR-032 outbox relay (WP-119 Step A) ---------------------------
     //
     // These anchor `domain/outbox/relay.rs`, not this coordinator. They live in

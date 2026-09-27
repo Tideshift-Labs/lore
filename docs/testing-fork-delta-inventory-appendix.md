@@ -411,9 +411,10 @@ offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BL
   and the `lore_fragment_write_claim_promotion_shape` CHECK, in lockstep with `FRAGMENT_SCHEMA` as
   always). `ready_for_lifecycle`'s clean-init arm floor moved `schema_version >= 3` to `>= 4`
   (a version-3 cell must route legacy against a version-4 binary, not half-enable and hit
-  SQLSTATE 42703 on the first promotion).
+  SQLSTATE 42703 on the first promotion). CR-039's follow-up (WP-115 ledger row 62, 2026-09-27)
+  then made it an exact match on `FRAGMENT_SCHEMA_VERSION`, refusing clean cells at 4 and 5.
   Offline (no DB): `fragment_write_claim_schema.rs` -- `FragmentWriteClaimKind` bits round-trip,
-  the schema-version-4 clean-init guardrail (constructs `FragmentLifecycleReadiness` directly, no
+  the exact-revision clean-init guardrail (constructs `FragmentLifecycleReadiness` directly, no
   database needed), and DDL premise pins across both `FRAGMENT_SCHEMA` and the 0002 migration.
   `domain_migration_parity.rs` applies 0001 then 0002 in the live catalog-parity case, plus an
   idempotent-reapply case for 0002 (Postgres has no `ADD CONSTRAINT IF NOT EXISTS`, so a

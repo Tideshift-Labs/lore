@@ -7,7 +7,7 @@
 //! Every case is `#[ignore]` and is executed by
 //! `run-fragment-lifecycle-live.ps1`, which gives each exact case a fresh
 //! PostgreSQL 16 database. Offline pins (DDL, `FragmentWriteClaimKind`,
-//! the `ready_for_lifecycle` schema-version-4 guardrail) live in
+//! the `ready_for_lifecycle` exact-schema-version guardrail) live in
 //! `fragment_write_claim_schema.rs`.
 //!
 //! # API surface (confirmed against the landed implementation and frozen by
