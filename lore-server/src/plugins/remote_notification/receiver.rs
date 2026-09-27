@@ -1898,6 +1898,65 @@ mod tests {
         );
     }
 
+    /// The conflict above clears `events_since_checkpoint`, so after it only
+    /// the cleared `reported_frontier` keeps [`DurableReceiver::final_checkpoint`]
+    /// from reading the park as reported. The frontier was already reported
+    /// before the park, and a park does not move it, so without that reset the
+    /// shutdown report is skipped and the park never reaches the durable row.
+    #[tokio::test]
+    async fn the_final_checkpoint_still_sends_a_park_after_a_membership_version_conflict() {
+        let mut harness = harness(900);
+        harness.receiver.receiver.checkpoint_every_events = 1;
+        harness.receiver.receiver.checkpoint_interval = Duration::from_secs(60);
+        let mut session = harness.receiver.bootstrap().await.expect("bootstraps");
+
+        // Report the frontier first, so it reads as reported before the park.
+        assert!(harness.receiver.checkpoint(&mut session).await.is_ok());
+        assert_eq!(session.reported_frontier, Some(899));
+
+        harness
+            .stream
+            .push_envelope(900, durable_with_unsupported_payload_version(0x9f, 1));
+        assert_eq!(
+            harness.receiver.step(&mut session).await,
+            StepOutcome::Parked(POISON_CLASS_UNSUPPORTED_SCHEMA)
+        );
+        assert_eq!(session.contiguous_frontier(), 899);
+
+        // A concurrent join moves the cell's version, so the next report conflicts.
+        let current = harness.store.membership_version() + 1;
+        harness.store.set_membership_version(current);
+        assert!(matches!(
+            harness.receiver.checkpoint(&mut session).await,
+            Err(BootstrapFailure::Transient(REASON_BOOTSTRAPPING))
+        ));
+        assert_eq!(session.events_since_checkpoint, 0);
+
+        let checkpoints = |harness: &Harness| -> Vec<CheckpointReport> {
+            harness
+                .store
+                .calls()
+                .iter()
+                .filter_map(|call| match call {
+                    StoreCall::Checkpoint(report) => Some((**report).clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let before = checkpoints(&harness).len();
+        harness.receiver.final_checkpoint(&mut session).await;
+        let sent = checkpoints(&harness);
+        assert_eq!(
+            sent.len(),
+            before + 1,
+            "the shutdown report must still carry the park after a conflict"
+        );
+        let last = sent.last().expect("one final report");
+        assert_eq!(last.membership_version, current);
+        assert_eq!(last.poison.len(), 1);
+        assert_eq!(session.reported_frontier, Some(899));
+    }
+
     /// The finding an executed live two-process run caught: a parked delivery
     /// acknowledges nothing, so nothing else makes a checkpoint due, and
     /// without [`ReceiverSession::park`] counting the park itself neither the
