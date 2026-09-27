@@ -1,13 +1,25 @@
 # Copyright 2026 Tideshift Labs
 # SPDX-License-Identifier: MIT
 
+<#
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
+#>
+
 [CmdletBinding()]
 param(
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+# The image tag names the major; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
 $loreRoot = Split-Path -Parent $crateRoot
@@ -102,7 +114,7 @@ openssl x509 -req -sha256 -in admin.csr -CA ca.crt -CAkey ca.key -CAcreateserial
     Invoke-Checked docker @(
         'run', '--rm',
         '--mount', "type=bind,source=$fixtureRoot,destination=/fixture",
-        'postgres:16', 'bash', '-euc', $certificateScript
+        $PostgresImage, 'bash', '-euc', $certificateScript
     )
 
     $postgresStartScript = @'
@@ -127,7 +139,7 @@ exec docker-entrypoint.sh postgres \
         '--env', 'POSTGRES_DB=retention',
         '--env', 'POSTGRES_PASSWORD=fixture-only-unused',
         '--mount', "type=bind,source=$fixtureRoot,destination=/fixture,readonly",
-        'postgres:16', 'bash', '-euc', $postgresStartScript
+        $PostgresImage, 'bash', '-euc', $postgresStartScript
     )
     $containerStarted = $true
 
@@ -154,6 +166,15 @@ exec docker-entrypoint.sh postgres \
         & docker logs $containerName
         throw 'disposable PostgreSQL did not become ready within 60 seconds'
     }
+    $serverVersionRaw = & docker exec $containerName psql -U postgres -d retention -tAc 'SHOW server_version_num'
+    if ($LASTEXITCODE -ne 0) {
+        throw 'failed to query the disposable PostgreSQL server version'
+    }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
     $roleSql = @'
 CREATE ROLE object_dispatch_retention_owner NOLOGIN;
@@ -226,7 +247,7 @@ finally {
     if ($containerStarted -and ($runPassed -or -not $KeepOnFailure)) {
         $actualLabel = (& docker inspect --format "{{ index .Config.Labels `"com.tideshift.lore.retention-client-live`" }}" $containerName 2>$null).Trim()
         if ($LASTEXITCODE -eq 0 -and $actualLabel -eq $runId) {
-            # --volumes: postgres:16 declares VOLUME /var/lib/postgresql/data, so a plain
+            # --volumes: the postgres image declares a data VOLUME, so a plain
             # `docker rm --force` leaves an anonymous, now-unreferenced volume behind every run.
             & docker rm --force --volumes $containerName *> $null
         }

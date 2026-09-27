@@ -3,13 +3,22 @@
 
 <#
 .SYNOPSIS
-Runs WP-114 CD-4's ignored provider-charge tests against disposable PostgreSQL 16.
+Runs WP-114 CD-4's ignored provider-charge tests against disposable PostgreSQL 18 (or 16, with
+-PostgresImage).
+
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
 #>
 
 [CmdletBinding()]
-param([switch]$KeepOnFailure)
+param([switch]$KeepOnFailure, [string]$PostgresImage = 'postgres:18')
 
 $ErrorActionPreference = 'Stop'
+# The image tag names the major; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 $runId = [Guid]::NewGuid().ToString('N')
 $container = "wp114-provider-charge-live-$runId"
 $label = "com.tideshift.lore.provider-charge-live=$runId"
@@ -57,7 +66,7 @@ try {
     Invoke-Checked docker @(
         'run', '--detach', '--name', $container, '--label', $label,
         '--label', "com.tideshift.lore.provider-charge-live.pid=$PID",
-        '--publish', '127.0.0.1::5432', '--env', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:16'
+        '--publish', '127.0.0.1::5432', '--env', 'POSTGRES_HOST_AUTH_METHOD=trust', $PostgresImage
     )
     $portRaw = & docker port $container '5432/tcp'
     if ($LASTEXITCODE -ne 0 -or ($portRaw | Out-String) -notmatch ':(?<port>\d+)') {
@@ -74,6 +83,13 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if (-not $ready) { throw 'PostgreSQL did not become ready' }
+    $serverVersionRaw = & docker exec $container psql -U postgres -d postgres -tAc 'SHOW server_version_num'
+    if ($LASTEXITCODE -ne 0) { throw 'failed to query the disposable PostgreSQL server version' }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
     $roleSql = @'
 DO $$ BEGIN

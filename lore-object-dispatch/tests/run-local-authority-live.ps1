@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 and runs the twelve cell-authority live
+Provisions a disposable PostgreSQL 18 (or 16, with -PostgresImage) and runs the twelve cell-authority live
 tests in lore-object-dispatch by exact name, reporting pass/fail/NOT RUN distinctly.
 
 .DESCRIPTION
@@ -25,7 +25,7 @@ the total from nine to eleven, and WP-114 CD-3's typed-client tier took it to tw
      a *self-consistency* check (its label equals its own name's run-id) that was mistaken for an
      *ownership* check -- it destroyed a different, still-in-progress run. See
      `Assert-NoCollidingContainer`'s comment for the full account.
-  3. Starts one labelled, disposable PostgreSQL 16 container (no TLS -- these tests call
+  3. Starts one labelled, disposable PostgreSQL container (no TLS -- these tests call
      `tokio_postgres::connect` with `NoTls`, unlike the retention-client live tier), additionally
      labelled with the owning PowerShell process id and an ISO 8601 UTC start time so an outside
      observer can check whether the owning process is actually still alive before ever treating a
@@ -115,15 +115,25 @@ all -- it is unenumerable here, not merely ignored, and `cargo test -- --ignored
 rig never lists it. This runner cannot detect it and does not attempt it; it is reported NOT RUN
 from static knowledge of the source, not from anything this harness observed. The
 retention-client live tier keeps its own runner unmodified.
+
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+# The image tag names the major; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
 $loreRoot = Split-Path -Parent $crateRoot
@@ -519,7 +529,7 @@ try {
         '--label', "com.tideshift.lore.local-authority-live.started=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
         '--publish', '127.0.0.1::5432',
         '--env', 'POSTGRES_HOST_AUTH_METHOD=trust',
-        'postgres:16'
+        $PostgresImage
     )
 
     $portOutputRaw = & docker port $containerName '5432/tcp'
@@ -547,6 +557,11 @@ try {
         & docker logs $containerName
         throw 'disposable PostgreSQL did not become ready within 60 seconds'
     }
+    $serverVersion = [int](Get-PgScalar -DatabaseName 'postgres' -Sql 'SHOW server_version_num')
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
     # Cluster-wide roles, created once, idempotently. Every self-provisioning live test also
     # creates these itself with the same IF-NOT-EXISTS guard, so this is redundant for those
@@ -730,7 +745,7 @@ finally {
         $inspectExitCode = $LASTEXITCODE
         $actualLabel = if ($null -ne $actualLabelRaw) { ($actualLabelRaw | Out-String).Trim() } else { '' }
         if ($inspectExitCode -eq 0 -and $actualLabel -eq $runId) {
-            # --volumes: postgres:16 declares VOLUME /var/lib/postgresql/data, so a plain
+            # --volumes: the postgres image declares a data VOLUME, so a plain
             # `docker rm --force` leaves an anonymous, now-unreferenced volume behind every run.
             & docker rm --force --volumes $containerName *> $null
         }

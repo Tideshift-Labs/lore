@@ -6,11 +6,18 @@ Run WP118 single-server authenticated RPC proof against owned PostgreSQL and Min
 .DESCRIPTION
 Every ignored case receives an empty database. Operator cases create their own buckets.
 The compiled catalog must agree with the test source. Zero-test runs fail.
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18-alpine`. Its major must be 16 or 18, and the
+server's `server_version_num` must match that major, or the run stops before any test.
 #>
 [CmdletBinding()]
-param([switch]$KeepOnFailure, [switch]$SkipBuild)
+param([switch]$KeepOnFailure, [string]$PostgresImage = 'postgres:18-alpine', [switch]$SkipBuild)
 
 $ErrorActionPreference = 'Stop'
+# The image tag names the major; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 $loreRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $runId = [Guid]::NewGuid().ToString('N')
 $label = 'com.tideshift.lore.single-rpc-tests'
@@ -67,7 +74,7 @@ try {
         }
     }
     foreach ($spec in @(
-        @{ Name = $pgName; Args = @('-p', '127.0.0.1::5432', '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:16-alpine') },
+        @{ Name = $pgName; Args = @('-p', '127.0.0.1::5432', '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', $PostgresImage) },
         @{ Name = $s3Name; Args = @('-p', '127.0.0.1::9000', '-e', 'MINIO_ROOT_USER=cleaninit', '-e', 'MINIO_ROOT_PASSWORD=cleaninit-local-tests', 'minio/minio:latest', 'server', '/data') }
     )) {
         $owned.Add($spec.Name)
@@ -119,6 +126,13 @@ try {
     $probe = [Net.Sockets.TcpClient]::new()
     try { $probe.Connect('127.0.0.1', [int]$pgPort) }
     finally { $probe.Dispose() }
+    $serverVersionRaw = & docker exec $pgName psql -U postgres -d postgres -tAc 'SHOW server_version_num'
+    if ($LASTEXITCODE -ne 0) { throw 'failed to query the disposable PostgreSQL server version' }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
     Invoke-Checked docker @('exec', $pgName, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-c', 'CREATE ROLE object_dispatch_retention_owner NOLOGIN; CREATE ROLE object_dispatch_retention_runtime LOGIN; CREATE ROLE object_dispatch_retention_maintenance LOGIN; CREATE ROLE object_dispatch_retention_migrator LOGIN; GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator WITH INHERIT FALSE, SET TRUE;')
     $env:LORE_TEST_CLEAN_INIT_CA_PATH = $ca
     $env:LORE_TEST_S3_ENDPOINT = "http://127.0.0.1:$s3Port"

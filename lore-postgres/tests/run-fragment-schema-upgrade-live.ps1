@@ -3,8 +3,8 @@
 
 <#
 .SYNOPSIS
-Provisions an owned PostgreSQL 16 instance and runs CR-039's fragment schema forward upgrade
-inventory.
+Provisions an owned PostgreSQL 18 (or 16, with -PostgresImage) instance and runs CR-039's
+fragment schema forward upgrade inventory.
 
 .DESCRIPTION
 The Rust cases remain `#[ignore]`. This runner opts in to each case by exact name, one at a
@@ -17,16 +17,26 @@ The inventory spans two compiled targets: `lore-postgres`'s `domain_fragment_sch
 MinIO/S3: CR-039's upgrade is offline and database-only. Each case gets a fresh database in one
 owned disposable container. Cleanup checks both the random run label and the owning PowerShell
 process before removing the container and anonymous volume.
+
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
 #>
 
 [CmdletBinding()]
 param(
     [switch]$KeepOnFailure,
-    [string[]]$OnlyCase = @()
+    [string[]]$OnlyCase = @(),
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+
+# The image tag names the major; the live server must then report that major.
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"
+}
 
 $crateRoot = Split-Path -Parent $PSScriptRoot
 $loreRoot = Split-Path -Parent $crateRoot
@@ -121,7 +131,7 @@ try {
     Invoke-Checked docker @(
         'run', '-d', '--name', $containerName,
         '--label', $ownershipLabel, '--label', "$ownershipLabelName.pid=$PID",
-        '-p', '127.0.0.1::5432', '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:16'
+        '-p', '127.0.0.1::5432', '-e', 'POSTGRES_HOST_AUTH_METHOD=trust', $PostgresImage
     )
     $pgPort = ((& docker port $containerName '5432/tcp') -split ':')[-1].Trim()
     # The official image restarts internally after its first init pass, so
@@ -145,6 +155,13 @@ try {
         $ErrorActionPreference = $priorErrorAction
     }
     if (-not $ready) { throw 'PostgreSQL readiness timed out' }
+    $serverVersionRaw = & docker exec $containerName psql -U postgres -d postgres -tAc 'SHOW server_version_num'
+    if ($LASTEXITCODE -ne 0) { throw 'failed to query the disposable PostgreSQL server version' }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
     $savedUrl = [Environment]::GetEnvironmentVariable('LORE_TEST_PG_URL', 'Process')
     $index = 0

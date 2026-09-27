@@ -1,9 +1,11 @@
 # Copyright 2026 Tideshift Labs
 # SPDX-License-Identifier: MIT
 # CD-6 real SDK retry proof against an owned TLS PostgreSQL fixture.
+# -PostgresImage defaults to postgres:18; its tag must name 16 or 18 and the server must report that major.
 [CmdletBinding()]
-param([switch]$KeepOnFailure)
+param([switch]$KeepOnFailure, [string]$PostgresImage = 'postgres:18')
 $ErrorActionPreference = 'Stop'
+$expectedMajor = if ($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else { throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag" }
 $runId = [Guid]::NewGuid().ToString('N')
 $container = "wp115-fragment-retry-live-$runId"
 $labelKey = 'com.tideshift.lore.fragment-retry-live'
@@ -57,7 +59,7 @@ try {
  Invoke-Checked openssl @('genrsa', '-out', $key, '2048')
  Invoke-Checked openssl @('req', '-new', '-sha256', '-key', $key, '-subj', '/CN=localhost', '-out', $csr)
  Invoke-Checked openssl @('x509', '-req', '-sha256', '-in', $csr, '-CA', $ca, '-CAkey', $caKey, '-CAcreateserial', '-days', '2', '-extfile', $ext, '-out', $cert)
- Invoke-Checked docker @('run', '--detach', '--name', $container, '--label', "$labelKey=$runId", '--label', "$labelKey.pid=$PID", '--publish', '127.0.0.1::5432', '--env', 'POSTGRES_HOST_AUTH_METHOD=trust', 'postgres:16')
+ Invoke-Checked docker @('run', '--detach', '--name', $container, '--label', "$labelKey=$runId", '--label', "$labelKey.pid=$PID", '--publish', '127.0.0.1::5432', '--env', 'POSTGRES_HOST_AUTH_METHOD=trust', $PostgresImage)
  $started = $true
  $ready = $false
  foreach ($attempt in 1..120) {
@@ -85,6 +87,11 @@ try {
   Start-Sleep -Milliseconds 500
  }
  if (-not $ready) { throw 'PostgreSQL TLS restart timeout' }
+ $serverVersionRaw = & docker exec $container psql -U postgres -d postgres -tAc 'SHOW server_version_num'
+ if ($LASTEXITCODE -ne 0) { throw 'failed to query the disposable PostgreSQL server version' }
+ $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+ if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) { throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion" }
+ Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
  $portRaw = (& docker port $container '5432/tcp' | Out-String).Trim()
  if ($LASTEXITCODE -ne 0 -or $portRaw -notmatch ':(?<port>\d+)$') { throw 'failed to resolve owned port' }
  $port = $Matches.port

@@ -2,14 +2,19 @@
 # SPDX-License-Identifier: MIT
 <#
 .SYNOPSIS
-Run WP118 repository-create metadata transaction tests on owned PostgreSQL16.
+Run WP118 repository-create metadata transaction tests on owned PostgreSQL 18 (or 16).
 .DESCRIPTION
 Each ignored test receives a fresh database. Provider observations are fixture-only;
 the separate single-server RPC tier proves actual provider uploads.
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18-alpine`. Its major must be 16 or 18, and the
+server's `server_version_num` must match that major, or the run stops before any test.
 #>
 [CmdletBinding()]
-param([switch]$KeepOnFailure, [switch]$LegacyProjection)
+param([switch]$KeepOnFailure, [switch]$LegacyProjection, [string]$PostgresImage='postgres:18-alpine')
 $ErrorActionPreference='Stop'
+# The image tag names the major; the live server must then report that major.
+$expectedMajor=if($PostgresImage -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)'){[int]$Matches.major}else{throw "PostgresImage $PostgresImage does not name a supported major (16 or 18) in its tag"}
 $loreRoot=Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $runId=[Guid]::NewGuid().ToString('N')
 $name="lore-create-metadata-$runId"
@@ -29,10 +34,15 @@ try {
     if($names.Count -eq 0 -or $expected.Count -eq 0 -or @(Compare-Object $names $expected).Count -ne 0){throw 'compiled/source inventory mismatch'}
     foreach($test in $names){$results.Add([pscustomobject]@{Test=$test;Status='NOT RUN'})}
     $created=$true
-    Checked docker @('run','-d','--name',$name,'--label',"$label=$runId",'--label',"$label.pid=$PID",'-p','127.0.0.1::5432','-e','POSTGRES_HOST_AUTH_METHOD=trust','postgres:16-alpine')
+    Checked docker @('run','-d','--name',$name,'--label',"$label=$runId",'--label',"$label.pid=$PID",'-p','127.0.0.1::5432','-e','POSTGRES_HOST_AUTH_METHOD=trust',$PostgresImage)
     $deadline=[DateTime]::UtcNow.AddSeconds(60)
     do{$logs=(& docker logs $name 2>&1)-join "`n";if([regex]::Matches($logs,'database system is ready to accept connections').Count -ge 2){break};if([DateTime]::UtcNow -ge $deadline){throw 'PostgreSQL readiness deadline'};Start-Sleep -Milliseconds 200}while($true)
     $port=((& docker port $name '5432/tcp')-split ':')[-1].Trim()
+    $serverVersionRaw=& docker exec $name psql -U postgres -d postgres -tAc 'SHOW server_version_num'
+    if($LASTEXITCODE -ne 0){throw 'failed to query the disposable PostgreSQL server version'}
+    $serverVersion=[int](($serverVersionRaw|Out-String).Trim())
+    if($serverVersion -lt ($expectedMajor*10000) -or $serverVersion -ge (($expectedMajor+1)*10000)){throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"}
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
     $index=0
     foreach($result in $results){
         $database="metadata_$index";$index++
@@ -44,7 +54,7 @@ try {
     if(-not $passed){throw 'repository create metadata tests failed'}
     if($LegacyProjection){
         # Reuse the existing oracle on this runner's disposable backend, never its shared default.
-        Checked pwsh @('-NoProfile','-File',(Join-Path $loreRoot 'lore-server/tests/run-p12-live.ps1'),'-OnlyCase','governed_create_projection_rows_match_the_legacy_writers_exactly','-PgContainer',$name,'-PgHost','127.0.0.1','-PgPort',$port,'-PgUser','postgres','-PgPassword','fixture')
+        Checked pwsh @('-NoProfile','-File',(Join-Path $loreRoot 'lore-server/tests/run-p12-live.ps1'),'-OnlyCase','governed_create_projection_rows_match_the_legacy_writers_exactly','-PgContainer',$name,'-PgHost','127.0.0.1','-PgPort',$port,'-PgUser','postgres','-PgPassword','fixture','-PostgresMajor',"$expectedMajor")
     }
 }finally{
     $results|Format-Table -AutoSize|Out-String -Width 200|Write-Host

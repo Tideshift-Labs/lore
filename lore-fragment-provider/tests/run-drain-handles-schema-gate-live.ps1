@@ -3,7 +3,7 @@
 
 <#
 .SYNOPSIS
-Provisions a disposable PostgreSQL 16 and runs CR-038 D5's `drain_handles` schema-gate live tier
+Provisions a disposable PostgreSQL 18 (or 16, with -PostgresImage) and runs CR-038 D5's `drain_handles` schema-gate live tier
 by exact name, reporting PASS / FAIL / NOT RUN as three distinct states.
 
 .DESCRIPTION
@@ -17,14 +17,14 @@ revision this build does not know (`DrainError::SchemaUnknown`). Both live tests
 Neither test needs a real BLAKE3 provider: `cell_schema_install`'s forward steps and
 `install_cell_schema` do not call `local_blake3_v1`, only real drain reservation traffic does (see
 `run-cell-schema-forward-upgrade-live.ps1`'s own note), and both tests here refuse before reaching
-reservation traffic. A plain `postgres:16` image is enough.
+reservation traffic. A plain `postgres` image is enough.
 
 Steps:
 
   1. Cross-checks its own test name map against `cargo test -p lore-fragment-provider --lib --
      --ignored --list` before touching Docker.
   2. Refuses to continue if any container already carries this runner's ownership label.
-  3. Starts one labelled, disposable `postgres:16` container.
+  3. Starts one labelled, disposable `-PostgresImage` container and checks its server major.
   4. Creates the four `object_dispatch_retention_*` roles ONCE, cluster-wide (the same load-bearing
      shape `run-cell-schema-forward-upgrade-live.ps1` uses).
   5. Creates one database per test, handed to the test as the `postgres` superuser URL.
@@ -35,11 +35,16 @@ Steps:
 
 .PARAMETER KeepOnFailure
 Keeps the container for debugging when the run did not fully pass.
+
+.PARAMETER PostgresImage
+The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
+`server_version_num` must match that major, or the run stops before any test.
 #>
 
 [CmdletBinding()]
 param(
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    [string]$PostgresImage = 'postgres:18'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,7 +58,11 @@ $ownershipLabel = "com.tideshift.lore.drain-handles-schema-gate-live=$runId"
 $containerStarted = $false
 $runPassed = $false
 
-$imageTag = 'postgres:16'
+$imageTag = $PostgresImage
+# The image tag names the major; the live server must then report that major.
+$expectedMajor = if ($imageTag -match ':(?:pg|postgres)?(?<major>16|18)(?:[.-]|$)') { [int]$Matches.major } else {
+    throw "PostgresImage $imageTag does not name a supported major (16 or 18) in its tag"
+}
 
 $tests = @(
     @{ EnvVar = 'LORE_TEST_DRAIN_HANDLES_SCHEMA_GATE_UPGRADE_REQUIRED_PG_URL'; Name = 'drain_handles_refuses_a_cell_that_predates_the_spool_metadata_true_up'; Database = 'upgrade_required' },
@@ -174,6 +183,15 @@ try {
         & docker logs $containerName
         throw 'disposable PostgreSQL did not become ready within 60 seconds'
     }
+    $serverVersionRaw = & docker exec $containerName psql -U postgres -d postgres -tAc 'SHOW server_version_num'
+    if ($LASTEXITCODE -ne 0) {
+        throw 'failed to query the disposable PostgreSQL server version'
+    }
+    $serverVersion = [int](($serverVersionRaw | Out-String).Trim())
+    if ($serverVersion -lt ($expectedMajor * 10000) -or $serverVersion -ge (($expectedMajor + 1) * 10000)) {
+        throw "expected PostgreSQL $expectedMajor, found server_version_num=$serverVersion"
+    }
+    Write-Host "PostgreSQL server_version_num=$serverVersion ($imageTag)"
 
     $roleSql = @'
 DO $$
