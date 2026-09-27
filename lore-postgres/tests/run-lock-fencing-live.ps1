@@ -112,7 +112,13 @@ $inventory = @(
         Target        = 'domain_migration_parity'
         Exact         = $true
         ExactPrefixes = @()
-        Cases         = @('migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs')
+        # Exact target: the two L1 (WP-114/WP-115) migration cases joined it after this runner
+        # pinned it, so they are listed here as in `run-fragment-lifecycle-live.ps1`.
+        Cases         = @(
+            'migration_file_and_boot_time_ensure_schema_produce_identical_domain_catalogs',
+            'migration_0002_is_idempotent_against_an_already_migrated_database',
+            'a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readiness_gate_requires'
+        )
     },
     [pscustomobject]@{
         Package       = 'lore-postgres'
