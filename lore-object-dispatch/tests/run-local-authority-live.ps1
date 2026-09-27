@@ -56,7 +56,8 @@ the total from nine to eleven, and WP-114 CD-3's typed-client tier took it to tw
      The `ALTER ROLE` line in `local_authority_schema.rs` remains a string literal inside a
      forbidden-keyword assertion list, not an execution.
   5. Creates thirteen databases: one per live test, plus `local_install_chain_proof`.
-  6. Installs the CD-1 cell install set (0002, 0003, then 0007 through 0022, in that exact
+  6. Installs the CD-1 cell install set (`CELL_INSTALL_SET`, read from
+     `src/cell_schema_install.rs`: today 0002, 0003, then 0007 through 0027, in that exact
      order, resolved by numeric prefix) into `local_install_chain_proof` and asserts the CD-1
      "expected inert state": four of the five tables 0002 creates -- the ones inert while
      0004-0006 are uninstalled; the fifth, `object_dispatch_retention_schema_state`, is written by
@@ -224,13 +225,65 @@ $tests = @(
 $installChainProofDatabase = 'local_install_chain_proof'
 $databaseNames = @($tests | ForEach-Object { $_.Database }) + @($installChainProofDatabase)
 
-# CR-033 D5's cell install set, shared with the classification check below so the two cannot
-# drift apart.
-$cd1InstallSetNumbers = @(2, 3, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27)
-$cd1KnownDeferredNumbers = @(4, 5, 6)
-# CR-038 forward steps: bodies with no BEGIN/COMMIT that only `cell-schema-install` runs, inside its
-# own transaction after a prelude. They are not frozen install artifacts, so this proof skips them.
-$cd1ForwardStepNumbers = @(28)
+# The migration classification is read from `src/cell_schema_install.rs`, not copied by hand, so
+# this runner cannot drift from the installer. A parse that does not match the declared array
+# lengths is a hard failure.
+function Read-CellMigrationClassification {
+    $sourcePath = Join-Path $crateRoot 'src/cell_schema_install.rs'
+    $source = [IO.File]::ReadAllText($sourcePath)
+
+    $installBlock = [regex]::Match(
+        $source,
+        'pub const CELL_INSTALL_SET: \[CellMigration; (?<count>[0-9]+)\] = \[(?<body>.*?)\r?\n\];',
+        [Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    if (-not $installBlock.Success) {
+        throw "could not find CELL_INSTALL_SET in $sourcePath"
+    }
+    $install = @([regex]::Matches($installBlock.Groups['body'].Value, 'cell_migration!\(\s*(?<n>[0-9]+),') |
+            ForEach-Object { [int]$_.Groups['n'].Value })
+    if ($install.Count -ne [int]$installBlock.Groups['count'].Value) {
+        throw "parsed $($install.Count) CELL_INSTALL_SET entries, but the constant declares $($installBlock.Groups['count'].Value)"
+    }
+
+    $deferredMatch = [regex]::Match(
+        $source,
+        'pub const CELL_DEFERRED_MIGRATIONS: \[u16; (?<count>[0-9]+)\] = \[(?<body>[^\]]*)\];'
+    )
+    if (-not $deferredMatch.Success) {
+        throw "could not find CELL_DEFERRED_MIGRATIONS in $sourcePath"
+    }
+    $deferred = @($deferredMatch.Groups['body'].Value -split ',' |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { [int]$_ })
+    if ($deferred.Count -ne [int]$deferredMatch.Groups['count'].Value) {
+        throw "parsed $($deferred.Count) CELL_DEFERRED_MIGRATIONS entries, but the constant declares $($deferredMatch.Groups['count'].Value)"
+    }
+
+    # Only a forward step that embeds its own artifact adds a file. The others reuse an install-set
+    # entry (`CELL_INSTALL_SET[i]`), which the install list already covers.
+    $forwardBlock = [regex]::Match(
+        $source,
+        'pub const CELL_FORWARD_STEPS: \[CellForwardStep; [0-9]+\] = \[(?<body>.*?)\r?\n\];',
+        [Text.RegularExpressions.RegexOptions]::Singleline
+    )
+    if (-not $forwardBlock.Success) {
+        throw "could not find CELL_FORWARD_STEPS in $sourcePath"
+    }
+    $forwardOnly = @([regex]::Matches($forwardBlock.Groups['body'].Value, 'cell_migration!\(\s*(?<n>[0-9]+),') |
+            ForEach-Object { [int]$_.Groups['n'].Value })
+
+    return @{ Install = $install; Deferred = $deferred; ForwardOnly = $forwardOnly }
+}
+
+$cellMigrations = Read-CellMigrationClassification
+# CR-033 D5's cell install set, shared with the classification check below.
+$cd1InstallSetNumbers = $cellMigrations.Install
+$cd1KnownDeferredNumbers = $cellMigrations.Deferred
+# CR-038 forward-only steps (today 0028): bodies with no BEGIN/COMMIT that only
+# `cell-schema-install upgrade` runs, inside its own transaction after a prelude. They are not frozen
+# install artifacts, so this proof skips them. 0026 and 0027 are forward steps too, but they are
+# also frozen install artifacts (`unwrap_frozen_transaction: true`), so they stay in the install set.
+$cd1ForwardStepNumbers = $cellMigrations.ForwardOnly
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })
 $priorEnvironment = @{}
@@ -636,7 +689,7 @@ $$;
         )
     }
 
-    Write-Host "Installing the CD-1 cell install set (0002, 0003, 0007-0027) into $installChainProofDatabase..."
+    Write-Host "Installing the CD-1 cell install set ($($cd1InstallSetNumbers -join ', ')) into $installChainProofDatabase..."
     foreach ($number in $cd1InstallSetNumbers) {
         Install-MigrationToDatabase -DatabaseName $installChainProofDatabase -Path (Resolve-MigrationPath -Number $number)
     }
