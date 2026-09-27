@@ -86,11 +86,17 @@ impl DrainClient {
             &[&intent.spool, &intent.fence],
         )
         .await?;
-        self.query(
-            "SELECT object_store_retention.drain_cleanup_compact_v1($1)",
-            &[&intent.spool],
-        )
-        .await?;
-        Ok(())
+        // The release above has committed. A compaction lost to another replica is redone on the
+        // row's next re-scan, so it must not read as a release that committed nothing.
+        match self
+            .query(
+                "SELECT object_store_retention.drain_cleanup_compact_v1($1)",
+                &[&intent.spool],
+            )
+            .await
+        {
+            Ok(_) | Err(DrainError::Contended) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 }

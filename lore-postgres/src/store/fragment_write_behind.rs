@@ -941,6 +941,8 @@ impl FragmentWriteBehindHandle {
                 Err(
                     lore_fragment_provider::FragmentProviderError::DrainAuthority(
                         lore_fragment_provider::FragmentDrainAuthorityError::Unavailable
+                            // Rolled back for certain; the same descriptor is safe to replay.
+                            | lore_fragment_provider::FragmentDrainAuthorityError::Contended
                     )
                 )
             ) {

@@ -119,6 +119,10 @@ function Invoke-CargoCaptured([string[]]$ArgumentList) {
 }
 
 $results = [Collections.Generic.List[object]]::new()
+$savedEnv = @{}
+foreach ($key in @('LORE_TEST_PG_URL', 'LORE_FRAGMENT_FAILPOINTS', 'LORE_FRAGMENT_FAILPOINT_DIR')) {
+    $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
+}
 
 Push-Location $loreRoot
 try {
@@ -182,10 +186,6 @@ try {
     }
     Write-Host "PostgreSQL server_version_num=$serverVersion ($PostgresImage)"
 
-    $savedEnv = @{}
-    foreach ($key in @('LORE_TEST_PG_URL', 'LORE_FRAGMENT_FAILPOINTS', 'LORE_FRAGMENT_FAILPOINT_DIR')) {
-        $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key, 'Process')
-    }
     $index = 0
     foreach ($result in $results) {
         if ($result.Status -ne 'PENDING') { continue }
@@ -219,10 +219,6 @@ try {
             if ($rendezvous) { Remove-Item -Recurse -Force -LiteralPath $rendezvous -ErrorAction SilentlyContinue }
         }
     }
-    foreach ($key in $savedEnv.Keys) {
-        [Environment]::SetEnvironmentVariable($key, $savedEnv[$key], 'Process')
-    }
-
     $runPassed = @($results | Where-Object Status -eq 'FAIL').Count -eq 0
     if (-not $runPassed) { throw 'fragment schema upgrade live tests failed' }
 }
@@ -231,6 +227,9 @@ catch {
     throw
 }
 finally {
+    foreach ($key in $savedEnv.Keys) {
+        [Environment]::SetEnvironmentVariable($key, $savedEnv[$key], 'Process')
+    }
     $results | Format-Table Package, Target, Test, Status -AutoSize | Out-String -Width 240 | Write-Host
     if ($containerCreationAttempted) {
         if ($KeepOnFailure -and -not $runPassed) {
