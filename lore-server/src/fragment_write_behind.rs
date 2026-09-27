@@ -268,6 +268,12 @@ fn record_pass_outcome(
 /// remove. Clearing costs one extra budget before a genuinely full stage ages
 /// out, and `observation_unknown` answers 503 throughout the gap regardless.
 ///
+/// **A cell-wide cleanup backlog that fell since the last sample is cleanup
+/// progress.** A pass reports progress only for a body it unlinked, so a release
+/// that finishes a row whose body an earlier, lost release already unlinked
+/// counts as nothing. The backlog falls only when a row is released, by any
+/// replica, so it is the direct measure. A gap leaves nothing to compare with.
+///
 /// Pure and synchronous, so the rule is testable without a store, a runtime or a
 /// Postgres fixture — the same reason `record_pass_outcome` is.
 fn record_observation(state: &mut State, observation: Option<WriteBehindObservation>, at: Instant) {
@@ -277,6 +283,13 @@ fn record_observation(state: &mut State, observation: Option<WriteBehindObservat
                 state.capacity_unavailable_since = None;
             } else {
                 state.capacity_unavailable_since.get_or_insert(at);
+            }
+            if state
+                .observation
+                .as_ref()
+                .is_some_and(|(_, previous)| value.cleanup_backlog < previous.cleanup_backlog)
+            {
+                state.cleanup_progress = state.cleanup_progress.max(Some(at));
             }
             state.observation = Some((at, value));
         }
@@ -773,6 +786,60 @@ mod tests {
         assert_eq!(reason(&state), Some("cleanup_not_progressing"));
         state.cleanup_progress = Some(now);
         assert_eq!(reason(&state), None);
+    }
+
+    // --- A falling cell-wide cleanup backlog is cleanup progress -----------
+
+    fn backlog_observation(cleanup_backlog: u64) -> WriteBehindObservation {
+        WriteBehindObservation {
+            cleanup_backlog,
+            ..healthy_observation()
+        }
+    }
+
+    #[test]
+    fn a_falling_cleanup_backlog_counts_as_cleanup_progress() {
+        // Row 34, 2026-09-27: after load stopped, releases of spool rows whose body an earlier,
+        // lost release had already unlinked removed no file, so no pass reported progress. The
+        // backlog fell from 654 to 102 over 35 minutes while both idle replicas answered 503
+        // `cleanup_not_progressing`. The backlog falling is the progress.
+        let now = Instant::now();
+        let old = now - Duration::from_secs(30);
+        let mut state = healthy_state(now);
+        state.cleanup_progress = Some(old);
+        record_observation(&mut state, Some(backlog_observation(654)), now);
+        assert_eq!(reason(&state), Some("cleanup_not_progressing"));
+        record_observation(&mut state, Some(backlog_observation(643)), now);
+        assert_eq!(state.cleanup_progress, Some(now));
+        assert_eq!(reason(&state), None);
+    }
+
+    #[test]
+    fn a_flat_or_rising_cleanup_backlog_is_not_cleanup_progress() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(30);
+        for next in [654, 655] {
+            let mut state = healthy_state(now);
+            state.cleanup_progress = Some(old);
+            record_observation(&mut state, Some(backlog_observation(654)), now);
+            record_observation(&mut state, Some(backlog_observation(next)), now);
+            assert_eq!(state.cleanup_progress, Some(old), "backlog {next}");
+            assert_eq!(reason(&state), Some("cleanup_not_progressing"));
+        }
+    }
+
+    #[test]
+    fn a_backlog_read_after_an_observation_gap_is_not_cleanup_progress() {
+        // No earlier sample means nothing to compare against.
+        let now = Instant::now();
+        let old = now - Duration::from_secs(30);
+        let mut state = healthy_state(now);
+        state.cleanup_progress = Some(old);
+        record_observation(&mut state, Some(backlog_observation(654)), now);
+        record_observation(&mut state, None, now);
+        record_observation(&mut state, Some(backlog_observation(10)), now);
+        assert_eq!(state.cleanup_progress, Some(old));
+        assert_eq!(reason(&state), Some("cleanup_not_progressing"));
     }
 
     // --- CR-035: write-behind backpressure is not unreadiness --------------

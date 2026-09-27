@@ -187,7 +187,7 @@ impl FragmentDrainMaintenanceHandle {
             *pending = None;
             let (intent, removed) =
                 result.map_err(|_error| FragmentProviderError::DrainSpoolIo)??;
-            if released(self.client.release_cleanup(&intent).await)? {
+            if release_retrying(|| self.client.release_cleanup(&intent)).await? {
                 count += u32::from(removed);
             }
         }
@@ -220,7 +220,7 @@ impl FragmentDrainMaintenanceHandle {
             let (intent, removed) =
                 result.map_err(|_error| FragmentProviderError::DrainSpoolIo)??;
             // Rechecking a compact tombstone is not progress against backlog.
-            if released(self.client.release_cleanup(&intent).await)? {
+            if release_retrying(|| self.client.release_cleanup(&intent)).await? {
                 count += u32::from(removed);
             }
         }
@@ -231,6 +231,28 @@ impl FragmentDrainMaintenanceHandle {
 /// Whether a cleanup release committed. A release lost to another replica committed nothing and
 /// is left for a later pass: the claim is re-entrant and the unlink is idempotent. A lost
 /// compaction after a committed release is already `Ok` from `release_cleanup`.
+/// How many times one pass tries a release before leaving it for a later pass.
+const RELEASE_ATTEMPTS: usize = 3;
+
+/// Retry a release another session won, at once. Every release updates the same quota counter
+/// rows, so two replicas releasing different rows collide there, and the loser's row stays
+/// claimed with its body already unlinked. The winner has committed by the time the loser
+/// sees the conflict, so a retry reads the new counters. The retry is safe: the fence is
+/// unchanged by a re-entrant claim, and a row already released returns without effect.
+async fn release_retrying<F, Fut>(mut release: F) -> Result<bool, FragmentProviderError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), DrainError>>,
+{
+    for _ in 1..RELEASE_ATTEMPTS {
+        match release().await {
+            Err(DrainError::Contended) => {}
+            result => return released(result),
+        }
+    }
+    released(release().await)
+}
+
 fn released(result: Result<(), DrainError>) -> Result<bool, FragmentProviderError> {
     match result {
         Ok(()) => Ok(true),
@@ -444,6 +466,65 @@ mod release_tests {
                 released(Err(error)),
                 Err(FragmentProviderError::DrainAuthority(inner)) if inner == error
             ));
+        }
+    }
+
+    /// Answers each attempt from `outcomes` in order and counts the attempts.
+    async fn release_from(
+        outcomes: &[Result<(), DrainError>],
+    ) -> (Result<bool, FragmentProviderError>, usize) {
+        let calls = std::cell::Cell::new(0);
+        let result = release_retrying(|| {
+            let index = calls.get();
+            calls.set(index + 1);
+            let outcome = outcomes[index];
+            async move { outcome }
+        })
+        .await;
+        (result, calls.get())
+    }
+
+    #[tokio::test]
+    async fn a_contended_release_is_retried_before_it_is_left_for_the_next_rescan() {
+        // Row 34, 2026-09-27: two replicas releasing different rows collide on the shared quota
+        // counter rows, and the loser's row stayed in state 2 with its body already unlinked.
+        let (result, calls) = release_from(&[Err(DrainError::Contended), Ok(())]).await;
+        assert!(matches!(result, Ok(true)));
+        assert_eq!(calls, 2);
+        let (result, calls) = release_from(&[
+            Err(DrainError::Contended),
+            Err(DrainError::Contended),
+            Ok(()),
+        ])
+        .await;
+        assert!(matches!(result, Ok(true)));
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn a_release_contended_on_every_attempt_is_skipped_after_the_bound() {
+        let outcomes = [Err(DrainError::Contended); RELEASE_ATTEMPTS];
+        let (result, calls) = release_from(&outcomes).await;
+        assert!(matches!(result, Ok(false)));
+        assert_eq!(calls, RELEASE_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_committed_or_refused_release_is_not_retried() {
+        let (result, calls) = release_from(&[Ok(())]).await;
+        assert!(matches!(result, Ok(true)));
+        assert_eq!(calls, 1);
+        for error in [
+            DrainError::Refused,
+            DrainError::Unavailable,
+            DrainError::Invalid,
+        ] {
+            let (result, calls) = release_from(&[Err(error)]).await;
+            assert!(matches!(
+                result,
+                Err(FragmentProviderError::DrainAuthority(inner)) if inner == error
+            ));
+            assert_eq!(calls, 1, "{error:?} may have committed or is a verdict");
         }
     }
 }
