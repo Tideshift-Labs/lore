@@ -17,6 +17,9 @@ use lore_proto::lore::object_dispatch::v1::PutReservationStateV1;
 use lore_proto::lore::object_dispatch::v1::PutSpoolReadyV1;
 use lore_proto::lore::object_dispatch::v1::ReservePutAckV1;
 use tokio_util::task::AbortOnDropHandle;
+#[path = "common/cell_migration_sql.rs"]
+mod cell_migration_sql;
+use cell_migration_sql::cell_install_sql;
 
 const EXPECTED_BYTES: usize = 13_373;
 const EXPECTED_BLAKE3: &str = "1bf102fce2e86f48eed6295e1349795564c4aae48aa5ac5d5af5ab5233b0462c";
@@ -502,7 +505,10 @@ async fn live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark() {
         include_str!("../migrations/0007_object_store_dispatch_authority_core.sql"),
         include_str!("../migrations/0008_object_store_dispatch_authority_provisioning.sql"),
     ] {
-        client.batch_execute(sql).await.expect("base migration");
+        client
+            .batch_execute(&cell_install_sql(&client, sql).await)
+            .await
+            .expect("base migration");
     }
     assert_eq!(install(&client,&format!("SELECT (object_store_retention.object_store_retention_install_v1('object-store-retention-provisioning-v1','object-store-retention-authority-schema-v1',decode('{RETENTION}','hex'),1)).result_code")).await,"CREATED");
     assert_eq!(install(&client,&format!("SELECT (object_store_retention.object_store_dispatch_authority_install_v1('object-store-dispatch-authority-provisioning-v1','object-store-dispatch-authority-schema-v1',decode('{AUTHORITY}','hex'),1)).result_code")).await,"CREATED");
@@ -512,7 +518,7 @@ async fn live_postgres_spool_ready_is_atomic_replay_safe_and_source_dark() {
         include_str!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql"),
     ] {
         client
-            .batch_execute(sql)
+            .batch_execute(&cell_install_sql(&client, sql).await)
             .await
             .expect("PUT schema migration");
     }

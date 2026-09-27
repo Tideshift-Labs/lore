@@ -16,6 +16,9 @@ use lore_proto::lore::object_dispatch::v1::ObjectStoreQuotaUnitsV1;
 use lore_proto::lore::object_dispatch::v1::PutReservationStateV1;
 use lore_proto::lore::object_dispatch::v1::ReservePutAckV1;
 use tokio_util::task::AbortOnDropHandle;
+#[path = "common/cell_migration_sql.rs"]
+mod cell_migration_sql;
+use cell_migration_sql::cell_install_sql;
 
 const EXPECTED_MIGRATION_BYTES: usize = 10_942;
 const EXPECTED_MIGRATION_BLAKE3: &str =
@@ -497,7 +500,7 @@ async fn live_postgres_progress_mutation_is_atomic_and_replay_safe() {
         include_str!("../migrations/0008_object_store_dispatch_authority_provisioning.sql"),
     ] {
         client
-            .batch_execute(sql)
+            .batch_execute(&cell_install_sql(&client, sql).await)
             .await
             .expect("apply base migration");
     }
@@ -511,7 +514,7 @@ async fn live_postgres_progress_mutation_is_atomic_and_replay_safe() {
         include_str!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql"),
     ] {
         client
-            .batch_execute(sql)
+            .batch_execute(&cell_install_sql(&client, sql).await)
             .await
             .expect("apply PUT schema migration");
     }

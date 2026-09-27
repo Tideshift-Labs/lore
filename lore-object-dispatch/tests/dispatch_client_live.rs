@@ -62,6 +62,9 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
+#[path = "common/cell_migration_sql.rs"]
+mod cell_migration_sql;
+use cell_migration_sql::cell_install_sql;
 
 const RETENTION_SCHEMA_BLAKE3: &str =
     "f86d1a574cab9346ef39843fed6ffb849cafe5967881a45d0c6d89028780f6dd";
@@ -535,7 +538,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         include_str!("../migrations/0008_object_store_dispatch_authority_provisioning.sql"),
     ] {
         admin
-            .batch_execute(migration)
+            .batch_execute(&cell_install_sql(&admin, migration).await)
             .await
             .expect("apply base migration");
     }
@@ -571,7 +574,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         include_str!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql"),
     ] {
         admin
-            .batch_execute(migration)
+            .batch_execute(&cell_install_sql(&admin, migration).await)
             .await
             .expect("apply put-reservation migration");
     }

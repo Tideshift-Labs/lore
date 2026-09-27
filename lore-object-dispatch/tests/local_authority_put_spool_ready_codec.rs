@@ -17,6 +17,9 @@ use lore_proto::lore::object_dispatch::v1::PutReservationStateV1;
 use lore_proto::lore::object_dispatch::v1::PutSpoolReadyV1;
 use lore_proto::lore::object_dispatch::v1::ReservePutAckV1;
 use tokio_util::task::AbortOnDropHandle;
+#[path = "common/cell_migration_sql.rs"]
+mod cell_migration_sql;
+use cell_migration_sql::cell_install_sql;
 
 const EXPECTED_MIGRATION_BYTES: usize = 17_033;
 const EXPECTED_MIGRATION_BLAKE3: &str =
@@ -509,7 +512,10 @@ async fn live_postgres_ready_codec_is_exact_fail_closed_and_replay_safe() {
         include_str!("../migrations/0007_object_store_dispatch_authority_core.sql"),
         include_str!("../migrations/0008_object_store_dispatch_authority_provisioning.sql"),
     ] {
-        client.batch_execute(sql).await.expect("base migration");
+        client
+            .batch_execute(&cell_install_sql(&client, sql).await)
+            .await
+            .expect("base migration");
     }
     assert_eq!(install(&client,&format!("SELECT(object_store_retention.object_store_retention_install_v1('object-store-retention-provisioning-v1','object-store-retention-authority-schema-v1',decode('{RETENTION_DIGEST}','hex'),1)).result_code")).await,"CREATED");
     assert_eq!(install(&client,&format!("SELECT(object_store_retention.object_store_dispatch_authority_install_v1('object-store-dispatch-authority-provisioning-v1','object-store-dispatch-authority-schema-v1',decode('{AUTHORITY_DIGEST}','hex'),1)).result_code")).await,"CREATED");
@@ -518,7 +524,10 @@ async fn live_postgres_ready_codec_is_exact_fail_closed_and_replay_safe() {
         include_str!("../migrations/0010_object_store_dispatch_put_reservation_schema.sql"),
         include_str!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql"),
     ] {
-        client.batch_execute(sql).await.expect("schema migration");
+        client
+            .batch_execute(&cell_install_sql(&client, sql).await)
+            .await
+            .expect("schema migration");
     }
     assert_eq!(install(&client,&format!("SELECT(object_store_retention.object_store_dispatch_put_reservation_install_v1('object-store-dispatch-put-reservation-provisioning-v1','object-store-dispatch-put-reservation-schema-v1',decode('{PUT_SCHEMA_DIGEST}','hex'),1)).result_code")).await,"CREATED");
     for sql in [

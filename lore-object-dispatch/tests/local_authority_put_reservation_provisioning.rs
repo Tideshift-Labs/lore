@@ -15,6 +15,9 @@ use lore_object_dispatch::local_authority_put_reservation_provisioning::LOCAL_AU
 use lore_object_dispatch::local_authority_put_reservation_provisioning::validate_embedded_local_authority_put_reservation_provisioning_migration_v1;
 use tokio_postgres::error::SqlState;
 use tokio_util::task::AbortOnDropHandle;
+#[path = "common/cell_migration_sql.rs"]
+mod cell_migration_sql;
+use cell_migration_sql::cell_install_sql;
 
 const EXPECTED_MIGRATION_BYTES: usize = 31_471;
 const EXPECTED_MIGRATION_BLAKE3: &str =
@@ -621,7 +624,7 @@ async fn live_postgres_chain_install_replay_read_and_drift_fail_closed() {
         include_str!("../migrations/0008_object_store_dispatch_authority_provisioning.sql"),
     ] {
         client
-            .batch_execute(migration)
+            .batch_execute(&cell_install_sql(&client, migration).await)
             .await
             .expect("apply base migration");
     }
@@ -665,7 +668,7 @@ async fn live_postgres_chain_install_replay_read_and_drift_fail_closed() {
         include_str!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql"),
     ] {
         client
-            .batch_execute(migration)
+            .batch_execute(&cell_install_sql(&client, migration).await)
             .await
             .expect("apply extension migration");
     }
