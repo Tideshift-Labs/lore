@@ -259,18 +259,55 @@ function Read-CellMigrationClassification {
         throw "parsed $($deferred.Count) CELL_DEFERRED_MIGRATIONS entries, but the constant declares $($deferredMatch.Groups['count'].Value)"
     }
 
-    # Only a forward step that embeds its own artifact adds a file. The others reuse an install-set
-    # entry (`CELL_INSTALL_SET[i]`), which the install list already covers.
+    # Classify each forward step by its own `unwrap_frozen_transaction`, not by whether it embeds
+    # its own artifact: a frozen step that embeds `cell_migration!` is still an install artifact, and
+    # reading it as forward-only would silently drop it from the install-chain proof.
     $forwardBlock = [regex]::Match(
         $source,
-        'pub const CELL_FORWARD_STEPS: \[CellForwardStep; [0-9]+\] = \[(?<body>.*?)\r?\n\];',
+        'pub const CELL_FORWARD_STEPS: \[CellForwardStep; (?<count>[0-9]+)\] = \[(?<body>.*?)\r?\n\];',
         [Text.RegularExpressions.RegexOptions]::Singleline
     )
     if (-not $forwardBlock.Success) {
         throw "could not find CELL_FORWARD_STEPS in $sourcePath"
     }
-    $forwardOnly = @([regex]::Matches($forwardBlock.Groups['body'].Value, 'cell_migration!\(\s*(?<n>[0-9]+),') |
-            ForEach-Object { [int]$_.Groups['n'].Value })
+    $steps = @([regex]::Matches(
+            $forwardBlock.Groups['body'].Value,
+            'CellForwardStep \{(?<step>.*?)\r?\n    \},',
+            [Text.RegularExpressions.RegexOptions]::Singleline
+        ))
+    if ($steps.Count -ne [int]$forwardBlock.Groups['count'].Value) {
+        throw "parsed $($steps.Count) CELL_FORWARD_STEPS entries, but the constant declares $($forwardBlock.Groups['count'].Value)"
+    }
+    $forwardOnly = @()
+    foreach ($step in $steps) {
+        $body = $step.Groups['step'].Value
+        $embedded = [regex]::Match($body, 'migration: cell_migration!\(\s*(?<n>[0-9]+),')
+        $indexed = [regex]::Match($body, 'migration: CELL_INSTALL_SET\[(?<i>[0-9]+)\],')
+        $unwrap = [regex]::Match($body, 'unwrap_frozen_transaction: (?<v>true|false),')
+        if (-not $unwrap.Success -or ($embedded.Success -eq $indexed.Success)) {
+            throw "could not classify CELL_FORWARD_STEPS entry:`n$body"
+        }
+        $number = if ($embedded.Success) {
+            [int]$embedded.Groups['n'].Value
+        } else {
+            $index = [int]$indexed.Groups['i'].Value
+            if ($index -ge $install.Count) {
+                throw "CELL_FORWARD_STEPS names CELL_INSTALL_SET[$index], past the install set's end"
+            }
+            $install[$index]
+        }
+        if ($unwrap.Groups['v'].Value -eq 'true') {
+            if ($number -notin $install) {
+                throw "frozen forward step $number is not in CELL_INSTALL_SET, so the install-chain proof would skip it"
+            }
+        } else {
+            $forwardOnly += $number
+        }
+    }
+    $overlap = @($forwardOnly | Where-Object { $_ -in $install })
+    if ($overlap.Count -ne 0) {
+        throw "forward-only step(s) $($overlap -join ', ') also appear in CELL_INSTALL_SET"
+    }
 
     return @{ Install = $install; Deferred = $deferred; ForwardOnly = $forwardOnly }
 }
