@@ -118,6 +118,8 @@ struct Fixture {
     source_epoch: i64,
     root: PathBuf,
     port: Port,
+    store: PostgresImmutableStore,
+    stage: Arc<WriteBehindStage>,
     _connection: tokio_util::task::AbortOnDropHandle<()>,
 }
 
@@ -313,6 +315,8 @@ impl Fixture {
             source_epoch: source.epoch,
             root,
             port,
+            store,
+            stage,
             _connection: connection,
         }
     }
@@ -402,6 +406,54 @@ async fn adapter_created_put_publishes_once_and_uses_real_reservation_and_claim(
         .unwrap()
         .get(0);
     assert_eq!(rows, 1, "one accepted physical reservation");
+}
+
+/// A put refused for staging I/O capacity must leave no live preparation.
+/// Otherwise every retry of that hash is fenced until `prepare_ttl` runs out,
+/// which turned transient capacity refusals into 30 s commit stalls live.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retry() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let bytes = Bytes::from("capacity refused payload repeated ".repeat(512));
+    let address = Address {
+        context: Context::default(),
+        hash: Hash::from(blake3::hash(&bytes).as_bytes().as_slice()),
+    };
+    let permits = std::iter::from_fn(|| fixture.stage.root().try_io_permit().ok())
+        .take(64)
+        .collect::<Vec<_>>();
+    assert!(
+        !permits.is_empty(),
+        "the fixture holds every staging I/O permit"
+    );
+    let refused = fixture
+        .store
+        .put_staged(
+            &fixture.handle.coordinator,
+            &fixture.stage,
+            address,
+            raw_fragment(&bytes),
+            bytes.clone(),
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(error) if error.is_slow_down()),
+        "capacity refusal is retryable backpressure"
+    );
+    drop(permits);
+    let retried = fixture
+        .store
+        .put_staged(
+            &fixture.handle.coordinator,
+            &fixture.stage,
+            address,
+            raw_fragment(&bytes),
+            bytes,
+        )
+        .await
+        .expect("the retry is admitted at once, not fenced by the refused attempt");
+    assert_eq!(retried.state, FragmentLifecycleState::Staged);
 }
 
 #[tokio::test]

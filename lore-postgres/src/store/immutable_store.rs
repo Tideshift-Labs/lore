@@ -1761,6 +1761,9 @@ impl PostgresImmutableStore {
         payload: Bytes,
     ) -> Result<crate::domain::fragments::EpochWitness, StoreError> {
         Self::validate_put_candidate(address, fragment, &payload, "staged")?;
+        // Before `begin_stage`: a capacity refusal after it would leave a live
+        // preparation that fences every retry of this hash until it expires.
+        let permit = stage.reserve_io().map_err(|error| error.store_error())?;
         let begin = coordinator
             .begin_stage(
                 address.hash.data(),
@@ -1790,7 +1793,13 @@ impl PostgresImmutableStore {
         // are durable, and a `Staged` row without readable bytes is corruption
         // the read path must fail closed on.
         if let Err(error) = stage
-            .stage(&intent.hash, intent.epoch, &intent.object_key, &payload)
+            .stage_reserved(
+                permit,
+                &intent.hash,
+                intent.epoch,
+                &intent.object_key,
+                &payload,
+            )
             .await
         {
             // Nothing is committed, so nothing advertises these bytes. The

@@ -41,25 +41,40 @@
 
 use bytes::Bytes;
 use lore_base::lore_spawn_blocking;
+use tokio::sync::OwnedSemaphorePermit;
 
 use super::WriteBehindError;
 use super::root::ConfinedRoot;
 use super::root::ResolvedStagedPath;
 use super::root::StagedLeaf;
 
-/// Durably place one payload at its resolved staged path.
-///
-/// # Errors
-///
-/// Returns [`WriteBehindError::UnsupportedPlatform`] off Unix and `Io` for any
-/// filesystem failure or exhausted I/O capacity. Temporary-file removal on an
-/// I/O failure is best effort; coordinator-fenced cleanup handles residue.
+/// [`finalize_reserved`] that takes its own I/O slot. Test-only: production
+/// reserves the slot before allocating an epoch.
+#[cfg(all(test, unix))]
 pub(crate) async fn finalize(
     root: &ConfinedRoot,
     resolved: &ResolvedStagedPath,
     payload: &Bytes,
 ) -> Result<(), WriteBehindError> {
     let permit = root.try_io_permit()?;
+    finalize_reserved(permit, root, resolved, payload).await
+}
+
+/// Durably place one payload at its resolved staged path, using an I/O slot
+/// the caller reserved before allocating its epoch, so a capacity refusal
+/// never leaves a live preparation behind.
+///
+/// # Errors
+///
+/// Returns [`WriteBehindError::UnsupportedPlatform`] off Unix and `Io` for any
+/// filesystem failure. Temporary-file removal on an I/O failure is best
+/// effort; coordinator-fenced cleanup handles residue.
+pub(crate) async fn finalize_reserved(
+    permit: OwnedSemaphorePermit,
+    root: &ConfinedRoot,
+    resolved: &ResolvedStagedPath,
+    payload: &Bytes,
+) -> Result<(), WriteBehindError> {
     let root = root.clone();
     let resolved = resolved.clone();
     let payload = payload.clone();

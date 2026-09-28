@@ -209,6 +209,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_before_object_effect_keeps_source_and_send_barrier',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retry',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_precondition_adopts_actual_alternate_compression_manifest',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_remote_readback_keeps_staged_source_and_late_effect_barrier',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',

@@ -59,6 +59,9 @@ pub use self::admission::StagingMode;
 pub use self::admission::WriteBehindWatermarks;
 use self::root::ConfinedRoot;
 
+/// One reserved staging I/O slot. See [`WriteBehindStage::reserve_io`].
+pub(crate) struct StageIoPermit(tokio::sync::OwnedSemaphorePermit);
+
 /// How long one admission sample may run before the sampler reports the root
 /// unavailable for that tick.
 ///
@@ -444,11 +447,34 @@ impl WriteBehindStage {
         object_key: &str,
         payload: &Bytes,
     ) -> Result<(), WriteBehindError> {
+        let permit = self.reserve_io()?;
+        self.stage_reserved(permit, hash, epoch, object_key, payload)
+            .await
+    }
+
+    /// Reserve the I/O slot one [`Self::stage_reserved`] will use.
+    ///
+    /// Take it before `begin_stage`. A refusal after `begin_stage` leaves a
+    /// live `PreparingStage` head that fences every retry of the hash until
+    /// its preparation deadline passes.
+    pub(crate) fn reserve_io(&self) -> Result<StageIoPermit, WriteBehindError> {
+        self.root.try_io_permit().map(StageIoPermit)
+    }
+
+    /// [`Self::stage`] with a slot from [`Self::reserve_io`].
+    pub(crate) async fn stage_reserved(
+        &self,
+        permit: StageIoPermit,
+        hash: &[u8],
+        epoch: i64,
+        object_key: &str,
+        payload: &Bytes,
+    ) -> Result<(), WriteBehindError> {
         if payload.len() > FRAGMENT_SIZE_THRESHOLD {
             return Err(WriteBehindError::PayloadOversized);
         }
         let resolved = self.root.resolve(hash, epoch, object_key)?;
-        finalize::finalize(&self.root, &resolved, payload).await
+        finalize::finalize_reserved(permit.0, &self.root, &resolved, payload).await
     }
 
     /// Read one staged fragment's bytes.
