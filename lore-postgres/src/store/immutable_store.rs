@@ -3223,6 +3223,39 @@ mod tests {
     use crate::domain::fragments::schema;
     use crate::pool::TlsConfig;
 
+    /// `put_staged` runs this before `reserve_io` and `begin_stage`. An
+    /// oversized payload refused only by the stage would leave a live
+    /// `PreparingStage` head that fences every retry of the hash.
+    #[test]
+    fn staged_put_preflight_refuses_an_oversized_payload() {
+        let payload = Bytes::from(vec![7u8; lore_base::types::FRAGMENT_SIZE_THRESHOLD + 1]);
+        let address = Address {
+            context: Context::default(),
+            hash: Hash::hash_buffer(&payload),
+        };
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        assert!(
+            PostgresImmutableStore::validate_put_candidate(address, fragment, &payload, "staged")
+                .is_err()
+        );
+        let at_limit = payload.slice(..lore_base::types::FRAGMENT_SIZE_THRESHOLD);
+        let address = Address {
+            context: Context::default(),
+            hash: Hash::hash_buffer(&at_limit),
+        };
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: at_limit.len() as u32,
+            size_content: at_limit.len() as u64,
+        };
+        PostgresImmutableStore::validate_put_candidate(address, fragment, &at_limit, "staged")
+            .expect("a payload at the threshold passes preflight");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     #[ignore = "requires owned LORE_TEST_PG_URL and Unix staging filesystem"]

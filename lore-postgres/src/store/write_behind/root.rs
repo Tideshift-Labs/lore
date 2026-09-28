@@ -50,6 +50,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use opentelemetry::KeyValue;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
@@ -148,18 +149,60 @@ pub(crate) fn derived_staged_key(hash: &[u8], epoch: i64) -> Result<String, Writ
     Ok(format!("{}.s{epoch}", hex::encode(hash)))
 }
 
+/// The staging path that asked for an I/O slot.
+///
+/// Puts, reads, purge and the physical inventory share one bounded slot pool.
+/// A put holds its slot across `begin_stage`, so a slow coordinator can starve
+/// the other paths. The refusal counter carries this label so that shows up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageIoPath {
+    Put,
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(dead_code, reason = "staging is Unix-only")
+    )]
+    Read,
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(dead_code, reason = "staging is Unix-only")
+    )]
+    Remove,
+    Inventory,
+}
+
+impl StageIoPath {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Put => "put",
+            Self::Read => "read",
+            Self::Remove => "remove",
+            Self::Inventory => "inventory",
+        }
+    }
+
+    fn refusal_labels(self) -> [KeyValue; 1] {
+        [KeyValue::new("path", self.label())]
+    }
+}
+
 impl ConfinedRoot {
     /// Refuse excess work before queueing it on Tokio's blocking pool.
     ///
     /// Move this permit into the blocking closure. Keeping it on the awaiting
     /// future would release capacity on cancellation while I/O still runs.
-    pub(crate) fn try_io_permit(&self) -> Result<OwnedSemaphorePermit, WriteBehindError> {
+    pub(crate) fn try_io_permit(
+        &self,
+        path: StageIoPath,
+    ) -> Result<OwnedSemaphorePermit, WriteBehindError> {
         match self.inner.io_capacity.clone().try_acquire_owned() {
             Ok(permit) => Ok(permit),
-            Err(_) => Err(WriteBehindError::Io {
-                operation: "staging I/O capacity",
-                kind: std::io::ErrorKind::WouldBlock,
-            }),
+            Err(_) => {
+                crate::metrics::record_stage_io_refusal(&path.refusal_labels());
+                Err(WriteBehindError::Io {
+                    operation: "staging I/O capacity",
+                    kind: std::io::ErrorKind::WouldBlock,
+                })
+            }
         }
     }
 
@@ -225,6 +268,7 @@ mod platform {
     use super::ResolvedStagedPath;
     use super::RootInner;
     use super::STAGED_DIR;
+    use super::StageIoPath;
     use super::StagedLeaf;
     use super::WriteBehindError;
 
@@ -445,7 +489,7 @@ mod platform {
             &self,
             resolved: &ResolvedStagedPath,
         ) -> Result<Option<Bytes>, WriteBehindError> {
-            let permit = self.try_io_permit()?;
+            let permit = self.try_io_permit(StageIoPath::Read)?;
             let root = self.clone();
             let path = resolved.path().to_path_buf();
             let device = self.inner.device;
@@ -467,7 +511,7 @@ mod platform {
             &self,
             resolved: &ResolvedStagedPath,
         ) -> Result<(), WriteBehindError> {
-            let permit = self.try_io_permit()?;
+            let permit = self.try_io_permit(StageIoPath::Remove)?;
             let root = self.clone();
             let resolved = resolved.clone();
             join(lore_spawn_blocking!(move || {
@@ -847,6 +891,23 @@ mod tests {
             Err(WriteBehindError::HashWidth)
         );
         assert_eq!(derived_staged_key(&[], 1), Err(WriteBehindError::HashWidth));
+    }
+
+    #[test]
+    fn io_refusals_are_labelled_by_the_refused_path() {
+        let cases = [
+            (StageIoPath::Put, "put"),
+            (StageIoPath::Read, "read"),
+            (StageIoPath::Remove, "remove"),
+            (StageIoPath::Inventory, "inventory"),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                path.refusal_labels(),
+                [KeyValue::new("path", expected)],
+                "{path:?}"
+            );
+        }
     }
 
     #[test]

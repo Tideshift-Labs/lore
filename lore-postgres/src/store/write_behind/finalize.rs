@@ -56,7 +56,7 @@ pub(crate) async fn finalize(
     resolved: &ResolvedStagedPath,
     payload: &Bytes,
 ) -> Result<(), WriteBehindError> {
-    let permit = root.try_io_permit()?;
+    let permit = root.try_io_permit(super::StageIoPath::Put)?;
     finalize_reserved(permit, root, resolved, payload).await
 }
 

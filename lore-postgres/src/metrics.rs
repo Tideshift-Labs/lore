@@ -14,6 +14,7 @@
 //! is captured on every exit path — including `?` short-circuits — without
 //! restructuring method bodies.
 
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use deadpool_postgres::Status;
@@ -91,6 +92,15 @@ impl Drop for OpTimer<'_> {
             .latency_ms
             .record(self.start.elapsed().as_secs_f64() * 1000.0, &labels);
     }
+}
+
+/// Count one refused staging I/O slot. The labels name the refused path; see
+/// `store::write_behind::root::StageIoPath`.
+pub(crate) fn record_stage_io_refusal(labels: &[KeyValue]) {
+    static REFUSALS: OnceLock<Counter<u64>> = OnceLock::new();
+    REFUSALS
+        .get_or_init(|| PostgresStoreInstrumentProvider.counter("stage_io_refusals"))
+        .add(1, labels);
 }
 
 /// CR-032 relay instruments (WP-119 Step A).

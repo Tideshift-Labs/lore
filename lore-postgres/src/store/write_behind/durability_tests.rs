@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::ConfinedRoot;
+use super::StageIoPath;
 use super::WriteBehindError;
 use super::derived_staged_key;
 
@@ -70,18 +71,18 @@ async fn cancelled_file_reader_retains_its_io_slot_until_the_blocking_job_finish
         .unwrap()
         .expect("real blocking read entered");
     let permits = (0..15)
-        .map(|_| root.try_io_permit().unwrap())
+        .map(|_| root.try_io_permit(StageIoPath::Put).unwrap())
         .collect::<Vec<_>>();
     reader.abort();
     assert!(reader.await.unwrap_err().is_cancelled());
     assert!(
-        root.try_io_permit().is_err(),
+        root.try_io_permit(StageIoPath::Put).is_err(),
         "cancelling the waiter cannot free a live blocking job's slot"
     );
     release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(permit) = root.try_io_permit() {
+            if let Ok(permit) = root.try_io_permit(StageIoPath::Put) {
                 drop(permit);
                 break;
             }
@@ -146,7 +147,7 @@ async fn root_clones_share_the_bounded_io_capacity_before_read_or_finalize() {
     let key = derived_staged_key(&hash, 1).unwrap();
     let resolved = root.resolve(&hash, 1, &key).unwrap();
     let mut permits = (0..16)
-        .map(|_| root.try_io_permit().unwrap())
+        .map(|_| root.try_io_permit(StageIoPath::Put).unwrap())
         .collect::<Vec<_>>();
     assert!(matches!(
         clone.read_regular(&resolved).await,

@@ -699,7 +699,7 @@ impl FragmentWriteBehindHandle {
             let permit = self
                 .stage
                 .root()
-                .try_io_permit()
+                .try_io_permit(crate::store::write_behind::StageIoPath::Inventory)
                 .map_err(|error| error.store_error())?;
             let mut scanner = state
                 .scanner

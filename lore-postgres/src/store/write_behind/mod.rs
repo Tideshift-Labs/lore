@@ -58,6 +58,7 @@ use self::admission::AdmissionSample;
 pub use self::admission::StagingMode;
 pub use self::admission::WriteBehindWatermarks;
 use self::root::ConfinedRoot;
+pub(crate) use self::root::StageIoPath;
 
 /// One reserved staging I/O slot. See [`WriteBehindStage::reserve_io`].
 pub(crate) struct StageIoPermit(tokio::sync::OwnedSemaphorePermit);
@@ -458,7 +459,7 @@ impl WriteBehindStage {
     /// live `PreparingStage` head that fences every retry of the hash until
     /// its preparation deadline passes.
     pub(crate) fn reserve_io(&self) -> Result<StageIoPermit, WriteBehindError> {
-        self.root.try_io_permit().map(StageIoPermit)
+        self.root.try_io_permit(StageIoPath::Put).map(StageIoPermit)
     }
 
     /// [`Self::stage`] with a slot from [`Self::reserve_io`].

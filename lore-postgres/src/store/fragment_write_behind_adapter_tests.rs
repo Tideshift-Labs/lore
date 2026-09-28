@@ -420,9 +420,15 @@ async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retr
         context: Context::default(),
         hash: Hash::from(blake3::hash(&bytes).as_bytes().as_slice()),
     };
-    let permits = std::iter::from_fn(|| fixture.stage.root().try_io_permit().ok())
-        .take(64)
-        .collect::<Vec<_>>();
+    let permits = std::iter::from_fn(|| {
+        fixture
+            .stage
+            .root()
+            .try_io_permit(crate::store::write_behind::StageIoPath::Put)
+            .ok()
+    })
+    .take(64)
+    .collect::<Vec<_>>();
     assert!(
         !permits.is_empty(),
         "the fixture holds every staging I/O permit"
@@ -441,6 +447,22 @@ async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retr
         matches!(&refused, Err(error) if error.is_slow_down()),
         "capacity refusal is retryable backpressure"
     );
+    for table in [
+        "lore_fragment_lifecycle",
+        "lore_fragment_epochs",
+        "lore_fragment_stage_custody",
+    ] {
+        let rows: i64 = fixture
+            .admin
+            .query_one(
+                &format!("SELECT count(*) FROM {table} WHERE hash=$1"),
+                &[&address.hash.data().as_slice()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(rows, 0, "a refused put writes no {table} row");
+    }
     drop(permits);
     let retried = fixture
         .store
