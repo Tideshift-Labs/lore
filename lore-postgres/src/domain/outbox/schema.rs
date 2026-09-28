@@ -899,17 +899,61 @@ CREATE INDEX IF NOT EXISTS lore_outbox_events_safe_retention
 --
 -- `ADD COLUMN IF NOT EXISTS`, never an edit to a `CREATE TABLE IF NOT EXISTS`
 -- body: that body is silently skipped on a database that already has the table.
+--
+-- Neither the columns nor the constraints may scan the table. The boot path
+-- applies this under `ensure_schema_online`'s 250 ms statement timeout, and a
+-- cell provisioned before this block can hold a large backlog. An inline column
+-- CHECK, or a plain `ADD CONSTRAINT`, validates every existing row under ACCESS
+-- EXCLUSIVE, so a big enough outbox would fail boot on every attempt. The
+-- columns are therefore added bare (the default is a constant, so no rewrite),
+-- and every constraint is added by the guarded block below as `NOT VALID`:
+-- PostgreSQL still enforces it on every insert and update, and skips only the
+-- scan of rows that already exist. Those rows cannot violate it, because the
+-- columns were added by this same step and hold 0 or NULL on every such row.
+--
+-- The three column bounds keep the names PostgreSQL gives an inline column
+-- CHECK (`<table>_<column>_check`). This block first shipped with inline
+-- CHECKs, so a cell that already took it has validated constraints under
+-- exactly those names, and the catalog guards leave them alone rather than add
+-- a second copy. Such a cell skips the `ALTER` too, since its columns exist.
 ALTER TABLE lore_outbox_events
-    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0
-        CHECK (replay_count >= 0),
+    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS replayed_at timestamptz,
-    ADD COLUMN IF NOT EXISTS replay_actor text
-        CHECK (octet_length(replay_actor) BETWEEN 1 AND 256),
-    ADD COLUMN IF NOT EXISTS replay_reason text
-        CHECK (octet_length(replay_reason) BETWEEN 1 AND 1024);
+    ADD COLUMN IF NOT EXISTS replay_actor text,
+    ADD COLUMN IF NOT EXISTS replay_reason text;
 
 DO $outbox_replay_constraints$
 BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_replay_count_check'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_replay_count_check CHECK (
+                replay_count >= 0
+            ) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_replay_actor_check'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_replay_actor_check CHECK (
+                octet_length(replay_actor) BETWEEN 1 AND 256
+            ) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_replay_reason_check'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_replay_reason_check CHECK (
+                octet_length(replay_reason) BETWEEN 1 AND 1024
+            ) NOT VALID;
+    END IF;
     -- The three audit facts are one fact. A row carrying an actor with no
     -- reason, or a replay count with no actor, records that a replay happened
     -- while withholding the half CR-032 actually requires -- and the operator
@@ -930,7 +974,7 @@ BEGIN
                 (replayed_at IS NULL) = (replay_actor IS NULL)
                 AND (replayed_at IS NULL) = (replay_reason IS NULL)
                 AND (replayed_at IS NULL) = (replay_count = 0)
-            );
+            ) NOT VALID;
     END IF;
 END
 $outbox_replay_constraints$;
@@ -1021,17 +1065,49 @@ CREATE INDEX IF NOT EXISTS lore_outbox_events_pending_unpublished
 -- The evidence copy is immutable, so these are carried verbatim by
 -- `dead_letter` and carried back verbatim by `requeue_dead_letter`; nothing
 -- recomputes them.
+--
+-- Bare columns and named `NOT VALID` constraints, for the reasons the
+-- `lore_outbox_events` replay block above records: nothing bounds this table
+-- either, and a cell that took the first, inline-CHECK spelling keeps its
+-- validated constraints under the same names.
 ALTER TABLE lore_outbox_dead_letters
-    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0
-        CHECK (replay_count >= 0),
+    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS replayed_at timestamptz,
-    ADD COLUMN IF NOT EXISTS replay_actor text
-        CHECK (octet_length(replay_actor) BETWEEN 1 AND 256),
-    ADD COLUMN IF NOT EXISTS replay_reason text
-        CHECK (octet_length(replay_reason) <= 1024);
+    ADD COLUMN IF NOT EXISTS replay_actor text,
+    ADD COLUMN IF NOT EXISTS replay_reason text;
 
 DO $outbox_dead_letter_replay_constraints$
 BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_dead_letters_replay_count_check'
+          AND conrelid = 'lore_outbox_dead_letters'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_dead_letters
+            ADD CONSTRAINT lore_outbox_dead_letters_replay_count_check CHECK (
+                replay_count >= 0
+            ) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_dead_letters_replay_actor_check'
+          AND conrelid = 'lore_outbox_dead_letters'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_dead_letters
+            ADD CONSTRAINT lore_outbox_dead_letters_replay_actor_check CHECK (
+                octet_length(replay_actor) BETWEEN 1 AND 256
+            ) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_dead_letters_replay_reason_check'
+          AND conrelid = 'lore_outbox_dead_letters'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_dead_letters
+            ADD CONSTRAINT lore_outbox_dead_letters_replay_reason_check CHECK (
+                octet_length(replay_reason) <= 1024
+            ) NOT VALID;
+    END IF;
     -- The same three-way shape the live table carries, for the same reason.
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
@@ -1043,7 +1119,7 @@ BEGIN
                 (replayed_at IS NULL) = (replay_actor IS NULL)
                 AND (replayed_at IS NULL) = (replay_reason IS NULL)
                 AND (replayed_at IS NULL) = (replay_count = 0)
-            );
+            ) NOT VALID;
     END IF;
 END
 $outbox_dead_letter_replay_constraints$;

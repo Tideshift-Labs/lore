@@ -1066,6 +1066,311 @@ async fn retry_history_migration_boots_on_a_populated_outbox_under_the_boot_time
     namespace.release().await;
 }
 
+/// Dead letters in the populated-table replay case. The dead-letter table is
+/// rarely large, but nothing bounds it, and its replay ALTER had the same
+/// validating spelling.
+const POPULATED_DEAD_LETTER_ROWS: i64 = 5_000;
+
+/// The replay-audit DDL `OUTBOX_SCHEMA` first shipped with (Lore `53b36213`):
+/// inline column CHECKs and plain `ADD CONSTRAINT`s, each of which validates
+/// every existing row under ACCESS EXCLUSIVE. Kept verbatim so a case can
+/// build a cell that took the old spelling.
+const VALIDATING_REPLAY_DDL: &str = "\
+ALTER TABLE lore_outbox_events
+    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0
+        CHECK (replay_count >= 0),
+    ADD COLUMN IF NOT EXISTS replayed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS replay_actor text
+        CHECK (octet_length(replay_actor) BETWEEN 1 AND 256),
+    ADD COLUMN IF NOT EXISTS replay_reason text
+        CHECK (octet_length(replay_reason) BETWEEN 1 AND 1024);
+ALTER TABLE lore_outbox_events
+    ADD CONSTRAINT lore_outbox_events_replay_shape CHECK (
+        (replayed_at IS NULL) = (replay_actor IS NULL)
+        AND (replayed_at IS NULL) = (replay_reason IS NULL)
+        AND (replayed_at IS NULL) = (replay_count = 0)
+    );
+ALTER TABLE lore_outbox_dead_letters
+    ADD COLUMN IF NOT EXISTS replay_count integer NOT NULL DEFAULT 0
+        CHECK (replay_count >= 0),
+    ADD COLUMN IF NOT EXISTS replayed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS replay_actor text
+        CHECK (octet_length(replay_actor) BETWEEN 1 AND 256),
+    ADD COLUMN IF NOT EXISTS replay_reason text
+        CHECK (octet_length(replay_reason) <= 1024);
+ALTER TABLE lore_outbox_dead_letters
+    ADD CONSTRAINT lore_outbox_dead_letters_replay_shape CHECK (
+        (replayed_at IS NULL) = (replay_actor IS NULL)
+        AND (replayed_at IS NULL) = (replay_reason IS NULL)
+        AND (replayed_at IS NULL) = (replay_count = 0)
+    );";
+
+/// Remove the replay-audit columns from both tables, which also drops every
+/// CHECK that names them. What is left is a cell provisioned before
+/// `53b36213`, as far as the replay DDL can tell.
+async fn drop_replay_columns(client: &Client) {
+    client
+        .batch_execute(
+            "ALTER TABLE lore_outbox_events \
+                 DROP COLUMN replay_count, DROP COLUMN replayed_at, \
+                 DROP COLUMN replay_actor, DROP COLUMN replay_reason; \
+             ALTER TABLE lore_outbox_dead_letters \
+                 DROP COLUMN replay_count, DROP COLUMN replayed_at, \
+                 DROP COLUMN replay_actor, DROP COLUMN replay_reason",
+        )
+        .await
+        .expect("remove the replay columns");
+}
+
+/// Every CHECK constraint on either outbox table whose definition names a
+/// replay column, as `(table, conname, convalidated, definition)`.
+async fn replay_checks(client: &Client) -> Vec<(String, String, bool, String)> {
+    client
+        .query(
+            "SELECT conrelid::regclass::text AS relation, conname, convalidated, \
+                    pg_get_constraintdef(oid) AS definition \
+               FROM pg_constraint \
+              WHERE conrelid IN ('lore_outbox_events'::regclass, \
+                                 'lore_outbox_dead_letters'::regclass) \
+                AND contype = 'c' \
+                AND pg_get_constraintdef(oid) ~ 'replay' \
+              ORDER BY 1, 2",
+            &[],
+        )
+        .await
+        .expect("read replay constraints")
+        .iter()
+        .map(|row| {
+            (
+                row.get("relation"),
+                row.get("conname"),
+                row.get("convalidated"),
+                row.get("definition"),
+            )
+        })
+        .collect()
+}
+
+/// The replay-audit DDL in `OUTBOX_SCHEMA` on a populated pre-replay cell,
+/// through the real boot path and its 250 ms / 100 ms timeouts. The inline
+/// CHECKs and plain `ADD CONSTRAINT`s it first shipped with scanned every row
+/// of both tables under ACCESS EXCLUSIVE, so a large enough backlog failed boot
+/// on every attempt. The named `NOT VALID` constraints skip that scan, still
+/// refuse a bad write, and a restart is a no-op.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn replay_audit_ddl_boots_on_a_populated_outbox_under_the_boot_timeouts() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "replay-audit-populated").await;
+    let url = namespace.pg_url().to_owned();
+    connect_domain_store(&url).await;
+    let mut raw = pg_client(&url).await;
+
+    // A cell provisioned before the replay audit, with a backlog in both
+    // tables.
+    drop_replay_columns(&raw).await;
+    let cell_id = rand_cell_id();
+    raw.execute(
+        "INSERT INTO lore_outbox_events \
+             (event_id, cell_id, idempotency_key, repository_id, repository_generation, \
+              event_kind, aggregate_kind, aggregate_id, aggregate_version, \
+              payload_schema_version, payload, state, created_at, available_at) \
+         SELECT gen_random_uuid(), $1, \
+                decode(lpad(to_hex(g), 64, '0'), 'hex'), \
+                decode(lpad(to_hex(g), 32, '0'), 'hex'), 1, \
+                'branch.pushed', 'branch', \
+                decode(lpad(to_hex(g), 32, '0'), 'hex'), \
+                decode('0000000000000001', 'hex'), \
+                1, '{}', 'pending', clock_timestamp(), clock_timestamp() \
+           FROM generate_series(1, $2::bigint) AS g",
+        &[&cell_id, &POPULATED_OUTBOX_ROWS],
+    )
+    .await
+    .expect("seed the outbox backlog");
+    raw.execute(
+        "INSERT INTO lore_outbox_dead_letters \
+             (event_id, cell_id, idempotency_key, repository_id, repository_generation, \
+              event_kind, aggregate_kind, aggregate_id, aggregate_version, \
+              payload_schema_version, payload, created_at, attempt_count, \
+              terminal_class, first_failed_at, last_failed_at, disposition) \
+         SELECT gen_random_uuid(), $1, \
+                decode(lpad(to_hex(g), 64, '0'), 'hex'), \
+                decode(lpad(to_hex(g), 32, '0'), 'hex'), 1, \
+                'branch.pushed', 'branch', \
+                decode(lpad(to_hex(g), 32, '0'), 'hex'), \
+                decode('0000000000000001', 'hex'), \
+                1, '{}', clock_timestamp(), 1, \
+                'terminal', clock_timestamp(), clock_timestamp(), 'parked' \
+           FROM generate_series(1, $2::bigint) AS g",
+        &[&cell_id, &POPULATED_DEAD_LETTER_ROWS],
+    )
+    .await
+    .expect("seed the dead letters");
+    raw.batch_execute("ANALYZE lore_outbox_events; ANALYZE lore_outbox_dead_letters")
+        .await
+        .expect("analyze");
+
+    // Control: the spelling `53b36213` shipped produces VALIDATED constraints,
+    // which is PostgreSQL's record that it scanned every row. So
+    // `convalidated = false` below is the assertion that tells the two
+    // spellings apart; rolled back, so the boot path still sees a pre-replay
+    // cell.
+    let tx = raw.transaction().await.expect("begin control");
+    tx.batch_execute(VALIDATING_REPLAY_DDL)
+        .await
+        .expect("control: the validating spelling");
+    let control_validated: bool = tx
+        .query_one(
+            "SELECT bool_and(convalidated) AND count(*) = 8 AS validated \
+               FROM pg_constraint \
+              WHERE conrelid IN ('lore_outbox_events'::regclass, \
+                                 'lore_outbox_dead_letters'::regclass) \
+                AND contype = 'c' \
+                AND pg_get_constraintdef(oid) ~ 'replay'",
+            &[],
+        )
+        .await
+        .expect("control constraints")
+        .get("validated");
+    assert!(
+        control_validated,
+        "control: all eight replay CHECKs of the old spelling are validated, i.e. scanned"
+    );
+    tx.rollback().await.expect("roll the control back");
+
+    // The boot path, twice: the first run applies the replay DDL, the second is
+    // a restart.
+    let started = std::time::Instant::now();
+    connect_domain_store(&url).await;
+    eprintln!(
+        "boot over {POPULATED_OUTBOX_ROWS} events and {POPULATED_DEAD_LETTER_ROWS} dead \
+         letters applied the replay DDL in {:?}",
+        started.elapsed()
+    );
+    connect_domain_store(&url).await;
+
+    let checks: Vec<(String, String, bool)> = replay_checks(&raw)
+        .await
+        .into_iter()
+        .map(|(relation, name, validated, _)| (relation, name, validated))
+        .collect();
+    let expected: Vec<(String, String, bool)> = [
+        (
+            "lore_outbox_dead_letters",
+            "lore_outbox_dead_letters_replay_actor_check",
+        ),
+        (
+            "lore_outbox_dead_letters",
+            "lore_outbox_dead_letters_replay_count_check",
+        ),
+        (
+            "lore_outbox_dead_letters",
+            "lore_outbox_dead_letters_replay_reason_check",
+        ),
+        (
+            "lore_outbox_dead_letters",
+            "lore_outbox_dead_letters_replay_shape",
+        ),
+        (
+            "lore_outbox_events",
+            "lore_outbox_events_replay_actor_check",
+        ),
+        (
+            "lore_outbox_events",
+            "lore_outbox_events_replay_count_check",
+        ),
+        (
+            "lore_outbox_events",
+            "lore_outbox_events_replay_reason_check",
+        ),
+        ("lore_outbox_events", "lore_outbox_events_replay_shape"),
+    ]
+    .into_iter()
+    .map(|(relation, name)| (relation.to_owned(), name.to_owned(), false))
+    .collect();
+    assert_eq!(
+        checks, expected,
+        "exactly the eight named NOT VALID replay constraints, once each after a restart"
+    );
+
+    // NOT VALID still binds every new write, on both tables.
+    for table in ["lore_outbox_events", "lore_outbox_dead_letters"] {
+        for (label, assignment) in [
+            ("negative count", "replay_count = -1"),
+            (
+                "half-set audit",
+                "replay_count = 1, replayed_at = clock_timestamp()",
+            ),
+            (
+                "over-wide actor",
+                "replay_count = 1, replayed_at = clock_timestamp(), \
+                 replay_actor = repeat('a', 257), replay_reason = 'r'",
+            ),
+            (
+                "over-wide reason",
+                "replay_count = 1, replayed_at = clock_timestamp(), \
+                 replay_actor = 'a', replay_reason = repeat('r', 1025)",
+            ),
+        ] {
+            let update = format!(
+                "UPDATE {table} SET {assignment} \
+                  WHERE event_id = (SELECT event_id FROM {table} LIMIT 1)"
+            );
+            let refused = raw.execute(&update, &[]).await;
+            assert_eq!(
+                refused
+                    .as_ref()
+                    .err()
+                    .and_then(|error| error.code().cloned()),
+                Some(tokio_postgres::error::SqlState::CHECK_VIOLATION),
+                "{table}: {label} must be refused: {refused:?}"
+            );
+        }
+    }
+
+    namespace.release().await;
+}
+
+/// A cell that already took the validating replay DDL keeps exactly the
+/// constraints it has. The fixed DDL names each constraint the way PostgreSQL
+/// names an inline column CHECK, so its catalog guards find the old ones and
+/// add nothing: no duplicate constraint, and no scan.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn replay_audit_ddl_leaves_an_already_migrated_cell_unchanged() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "replay-audit-migrated").await;
+    let url = namespace.pg_url().to_owned();
+    connect_domain_store(&url).await;
+    let raw = pg_client(&url).await;
+
+    drop_replay_columns(&raw).await;
+    raw.batch_execute(VALIDATING_REPLAY_DDL)
+        .await
+        .expect("migrate with the validating spelling");
+    let before = replay_checks(&raw).await;
+    assert_eq!(before.len(), 8, "the old spelling makes eight CHECKs");
+    assert!(
+        before.iter().all(|(_, _, validated, _)| *validated),
+        "the old spelling validates every CHECK: {before:?}"
+    );
+
+    connect_domain_store(&url).await;
+    assert_eq!(
+        replay_checks(&raw).await,
+        before,
+        "the boot path must leave an already-migrated cell's replay constraints as they are"
+    );
+
+    namespace.release().await;
+}
+
 // ---------------------------------------------------------------------------
 // dead_letter / requeue_dead_letter / mark_obsolete
 // ---------------------------------------------------------------------------
