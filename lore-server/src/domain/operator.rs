@@ -489,7 +489,11 @@ impl DomainOperatorContext {
                 .map_err(|error| anyhow!("{error}"))?;
         }
 
-        let pool = crate::event_relay::wiring::build_operator_pool(settings, OPERATOR_POOL_MAX)?;
+        let pool = crate::event_relay::wiring::build_operator_pool(
+            settings,
+            OPERATOR_POOL_MAX,
+            "loreserver domain status|cutover",
+        )?;
         let lock_coordinator = store.lock_coordinator();
         let auth = settings.server.auth.as_ref();
         Ok(Self {

@@ -356,7 +356,11 @@ impl OperatorContext {
             EventRelayConfig::from_settings(&settings.outbox_relay.clone().unwrap_or_default())
                 .map_err(|error| anyhow!("Invalid [outbox_relay] configuration: {error}"))?;
 
-        let pool = crate::event_relay::wiring::build_operator_pool(settings, OPERATOR_POOL_MAX)?;
+        let pool = crate::event_relay::wiring::build_operator_pool(
+            settings,
+            OPERATOR_POOL_MAX,
+            "loreserver outbox",
+        )?;
 
         Ok(Self {
             cell_id: remote.cell_id,

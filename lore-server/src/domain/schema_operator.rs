@@ -21,6 +21,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use clap::Subcommand;
 use lore_postgres::domain::constraint_validation::ConstraintValidation;
+use lore_postgres::domain::constraint_validation::ConstraintValidationError;
 use lore_postgres::domain::constraint_validation::ValidationOutcome;
 use lore_postgres::domain::constraint_validation::ValidationTimeouts;
 use lore_postgres::domain::constraint_validation::list_not_valid_constraints;
@@ -75,7 +76,11 @@ pub async fn run(command: &SchemaCommand, settings: &Settings) -> Result<()> {
             dry_run,
             json,
         } => {
-            let pool = crate::event_relay::wiring::build_operator_pool(settings, 1)?;
+            let pool = crate::event_relay::wiring::build_operator_pool(
+                settings,
+                1,
+                "loreserver schema validate-constraints",
+            )?;
             let client = pool
                 .get()
                 .await
@@ -91,7 +96,7 @@ pub async fn run(command: &SchemaCommand, settings: &Settings) -> Result<()> {
                 print_dry_run(&pending, *json);
                 return Ok(());
             }
-            let results = validate_not_valid_constraints(
+            let results = match validate_not_valid_constraints(
                 client,
                 ValidationTimeouts {
                     lock_timeout: Duration::from_millis(*lock_timeout_ms),
@@ -99,7 +104,22 @@ pub async fn run(command: &SchemaCommand, settings: &Settings) -> Result<()> {
                 },
             )
             .await
-            .map_err(|error| anyhow!("Constraint validation did not run: {error}"))?;
+            {
+                Ok(results) => results,
+                // The scan ran to completion and every result below is real;
+                // only the post-scan session-timeout reset failed. Report the
+                // results rather than discarding them for a cleanup error.
+                Err(ConstraintValidationError::ResetFailed { results, error }) => {
+                    print_results(&results, *json);
+                    return Err(anyhow!(
+                        "constraint validation ran and is reported above, but resetting the \
+                         session's timeouts afterward failed: {error}"
+                    ));
+                }
+                Err(error @ ConstraintValidationError::Setup(_)) => {
+                    return Err(anyhow!("Constraint validation did not run: {error}"));
+                }
+            };
             print_results(&results, *json);
             let left = results
                 .iter()

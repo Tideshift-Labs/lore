@@ -538,32 +538,43 @@ fn refuse_durable_sections_under_live_only(settings: &Settings) -> Result<()> {
 /// Build the relay's own small pool from the same `[plugins.postgres]`
 /// connection shape the CR-007 stores use.
 fn build_relay_pool(settings: &Settings) -> Result<Pool> {
-    build_cell_pool(settings, RELAY_POOL_MAX)
+    build_cell_pool(settings, RELAY_POOL_MAX, "[outbox_relay] enabled")
 }
 
-/// The same pool, sized for a one-shot operator command (WP-119 Phase 8).
+/// The same pool, sized for a one-shot operator command (WP-119 Phase 8; also
+/// used by `loreserver domain status|cutover` and `loreserver schema
+/// validate-constraints`).
 ///
 /// Shares [`build_cell_pool`] with the relay rather than resolving the
 /// connection shape a second time: an operator command that reached a different
 /// database than the relay would report on a cell nobody is publishing from,
 /// which is the one failure this surface exists to rule out.
-pub(crate) fn build_operator_pool(settings: &Settings, max_size: u32) -> Result<Pool> {
-    build_cell_pool(settings, max_size)
+///
+/// `context` names the caller (e.g. `"loreserver schema validate-constraints"`)
+/// so a refusal names the command that actually failed rather than always
+/// blaming the outbox relay, which this pool builder also serves.
+pub(crate) fn build_operator_pool(
+    settings: &Settings,
+    max_size: u32,
+    context: &str,
+) -> Result<Pool> {
+    build_cell_pool(settings, max_size, context)
 }
 
 /// Resolve the cell database's connection shape and open a pool of `max_size`.
-fn build_cell_pool(settings: &Settings, max_size: u32) -> Result<Pool> {
+///
+/// `context` names the caller for the error messages below, since this helper
+/// is shared by the outbox relay's own startup and by unrelated operator
+/// commands that have nothing to do with the outbox.
+fn build_cell_pool(settings: &Settings, max_size: u32, context: &str) -> Result<Pool> {
     if settings.mutable_store.mode != POSTGRES_MODE {
         return Err(anyhow!(StartupRefusal::NotPostgresMode));
     }
     let config =
         resolve_plugin_config_with_fallback(&settings.plugins, POSTGRES_MODE, "mutable_store")
             .ok_or_else(|| {
-                anyhow!(
-                    "[outbox_relay] enabled requires a [plugins.postgres] section for the cell \
-                     database"
-                )
+                anyhow!("{context} requires a [plugins.postgres] section for the cell database")
             })?;
     crate::plugins::postgres::connect_relay_pool(&config, max_size)
-        .map_err(|error| anyhow!("Failed to build the outbox relay pool: {error}"))
+        .map_err(|error| anyhow!("Failed to build the connection pool for {context}: {error}"))
 }

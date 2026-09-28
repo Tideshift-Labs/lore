@@ -47,7 +47,10 @@ pub enum ValidationOutcome {
     Violated(String),
     /// The table lock was not granted within the lock timeout.
     LockTimeout,
-    /// The scan did not finish within the statement timeout.
+    /// PostgreSQL reported `QUERY_CANCELED`. Usually the scan ran past the
+    /// statement timeout, but the same SQLSTATE also covers an operator's
+    /// manual `pg_cancel_backend`, so this outcome does not claim which one
+    /// happened.
     StatementTimeout,
     /// Any other failure, with PostgreSQL's message.
     Failed(String),
@@ -61,7 +64,7 @@ impl ValidationOutcome {
             Self::Validated => "validated",
             Self::Violated(_) => "violated",
             Self::LockTimeout => "lock_timeout",
-            Self::StatementTimeout => "statement_timeout",
+            Self::StatementTimeout => "canceled (statement_timeout or manual cancel)",
             Self::Failed(_) => "failed",
         }
     }
@@ -112,33 +115,71 @@ pub async fn list_not_valid_constraints(
         .collect())
 }
 
+/// Failure of [`validate_not_valid_constraints`].
+///
+/// Split from a plain [`DomainError`] so a failure in the final session-reset
+/// step does not discard the constraint results the run already produced:
+/// those results are real work, proved against the database, and a caller
+/// should see them even when the cleanup step afterward fails.
+#[derive(Debug, thiserror::Error)]
+pub enum ConstraintValidationError {
+    /// Failed before any constraint was attempted: a zero timeout, a catalog
+    /// read failure, or a failure to set the session's validation timeouts.
+    /// No constraint was touched.
+    #[error("{0}")]
+    Setup(#[source] DomainError),
+    /// Every constraint in `results` was attempted and the outcomes are
+    /// final, but resetting the session's `lock_timeout`/`statement_timeout`
+    /// afterward failed.
+    #[error(
+        "constraint validation ran to completion, but resetting the session's \
+         timeouts afterward failed: {error}"
+    )]
+    ResetFailed {
+        /// The results from every constraint this run attempted. Complete and
+        /// trustworthy; only the post-scan cleanup failed.
+        results: Vec<ConstraintValidation>,
+        /// Why the reset failed.
+        #[source]
+        error: DomainError,
+    },
+}
+
 /// Validate every `NOT VALID` constraint in scope, one statement each.
 ///
 /// Returns one entry per constraint attempted, in catalog order. A failure on
 /// one constraint is recorded and the next one still runs; only a failure to
-/// read the catalog or to set the timeouts is an `Err`. The session timeouts
-/// are reset before returning, including on a per-constraint failure.
+/// read the catalog or to set the timeouts is an [`ConstraintValidationError::Setup`].
+/// The session timeouts are reset before returning; if that reset fails, the
+/// results are not lost — they come back in
+/// [`ConstraintValidationError::ResetFailed`] alongside the reset error.
 ///
 /// # Errors
-/// `InvalidInput` for a zero timeout; a database failure reading the catalog
-/// or setting the session timeouts.
+/// [`ConstraintValidationError::Setup`] for a zero timeout or a database
+/// failure reading the catalog or setting the session timeouts;
+/// [`ConstraintValidationError::ResetFailed`] when every constraint ran but
+/// the final timeout reset failed.
 pub async fn validate_not_valid_constraints(
     client: &impl GenericClient,
     timeouts: ValidationTimeouts,
-) -> Result<Vec<ConstraintValidation>, DomainError> {
+) -> Result<Vec<ConstraintValidation>, ConstraintValidationError> {
     if timeouts.lock_timeout.is_zero() || timeouts.statement_timeout.is_zero() {
         // Zero means "no timeout" to PostgreSQL, which is the opposite of what
         // an operator passing a bound asked for.
-        return Err(DomainError::InvalidInput(
+        return Err(ConstraintValidationError::Setup(DomainError::InvalidInput(
             "constraint validation timeouts must be greater than zero".to_owned(),
-        ));
+        )));
     }
-    let pending = not_valid_constraints(client).await?;
+    let pending = not_valid_constraints(client)
+        .await
+        .map_err(ConstraintValidationError::Setup)?;
     if pending.is_empty() {
         return Ok(Vec::new());
     }
 
-    set_session_timeouts(client, timeouts).await?;
+    set_session_timeouts(client, timeouts)
+        .await
+        .map_err(ConstraintValidationError::Setup)?;
     let mut results = Vec::with_capacity(pending.len());
     for constraint in pending {
         let started = std::time::Instant::now();
@@ -153,7 +194,9 @@ pub async fn validate_not_valid_constraints(
             elapsed: started.elapsed(),
         });
     }
-    reset_session_timeouts(client).await?;
+    if let Err(error) = reset_session_timeouts(client).await {
+        return Err(ConstraintValidationError::ResetFailed { results, error });
+    }
     Ok(results)
 }
 
@@ -225,15 +268,25 @@ fn classify(error: &tokio_postgres::Error) -> ValidationOutcome {
     let Some(db_error) = error.as_db_error() else {
         return ValidationOutcome::Failed(error.to_string());
     };
-    let code = db_error.code();
+    classify_code(db_error.code(), db_error.message())
+}
+
+/// The SQLSTATE-to-outcome mapping itself, split out from [`classify`] so it
+/// can be unit-tested directly: `tokio_postgres::Error`/`DbError` have no
+/// public constructor, so a test cannot build one to drive `classify` without
+/// a live database round trip.
+fn classify_code(code: &SqlState, message: &str) -> ValidationOutcome {
     if *code == SqlState::CHECK_VIOLATION || *code == SqlState::FOREIGN_KEY_VIOLATION {
-        ValidationOutcome::Violated(db_error.message().to_owned())
+        ValidationOutcome::Violated(message.to_owned())
     } else if *code == SqlState::LOCK_NOT_AVAILABLE {
         ValidationOutcome::LockTimeout
     } else if *code == SqlState::QUERY_CANCELED {
+        // QUERY_CANCELED also fires for an operator's manual
+        // `pg_cancel_backend`, not only a statement-timeout abort; the label
+        // says so rather than assuming the timeout.
         ValidationOutcome::StatementTimeout
     } else {
-        ValidationOutcome::Failed(db_error.message().to_owned())
+        ValidationOutcome::Failed(message.to_owned())
     }
 }
 
@@ -253,5 +306,22 @@ mod tests {
         let labels: std::collections::BTreeSet<&str> =
             outcomes.iter().map(ValidationOutcome::label).collect();
         assert_eq!(labels.len(), outcomes.len());
+    }
+
+    /// A SQLSTATE this run has no other classification for — e.g. the
+    /// table-owner-role gap the runbook now documents (INSUFFICIENT_PRIVILEGE,
+    /// `42501`) — falls through to `Failed` with PostgreSQL's own message
+    /// preserved, rather than being silently dropped or misclassified as one
+    /// of the named outcomes.
+    #[test]
+    fn classify_code_maps_insufficient_privilege_to_failed() {
+        let outcome = classify_code(
+            &SqlState::INSUFFICIENT_PRIVILEGE,
+            "permission denied for table lore_fragment_state",
+        );
+        assert_eq!(
+            outcome,
+            ValidationOutcome::Failed("permission denied for table lore_fragment_state".to_owned())
+        );
     }
 }
