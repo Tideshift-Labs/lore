@@ -135,6 +135,20 @@ pub struct SpoolPhysicalInventory {
     pub files: u64,
 }
 
+/// One bounded step of the physical walk.
+///
+/// `started` is true when this step began a new traversal, and `completed` is
+/// the traversal this step finished, if any. A caller that compares a walk with
+/// a ledger needs both edges: a body counted by the walk was reserved before it
+/// was placed and released only after it was unlinked, so the ledger read before
+/// the walk started and the ledger read after it completed bound what the walk
+/// can legitimately count between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpoolInventoryStep {
+    pub started: bool,
+    pub completed: Option<SpoolPhysicalInventory>,
+}
+
 impl fmt::Debug for SpoolWriteReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -167,12 +181,26 @@ mod platform {
     use rustix::io::Errno;
 
     use super::MAX_SPOOL_BODY_BYTES;
+    use super::SpoolInventoryStep;
     use super::SpoolLayout;
     use super::SpoolObjectKey;
     use super::SpoolPhysicalInventory;
     use super::SpoolWriteError;
     use super::SpoolWriteReceipt;
     use crate::spool::SpoolObjectKind;
+
+    /// How many directory levels above a purged body may be removed once empty:
+    /// the per-request directory and its fan-out directory. The layout revision,
+    /// boundary and kind directories stay.
+    const REMOVABLE_PARENT_LEVELS: usize = 2;
+    /// Bounded retries for a placement whose directory a concurrent purge removed.
+    const PLACEMENT_ATTEMPTS: usize = 3;
+    /// A directory in the placement chain was removed between creation and use.
+    /// Only a concurrent purge of the same directory does that, and the next
+    /// attempt recreates it.
+    const DIRECTORY_REMOVED: SpoolWriteError = SpoolWriteError::Io {
+        operation: "placement directory removed",
+    };
 
     const ROOT_RESOLVE: ResolveFlags = ResolveFlags::NO_MAGICLINKS
         .union(ResolveFlags::NO_SYMLINKS)
@@ -233,18 +261,45 @@ mod platform {
                 .physical_inventory
                 .lock()
                 .map_err(|_error| SpoolWriteError::RootUnavailable)?;
-            let result = self.advance_physical_inventory(&mut inventory, maximum_entries);
-            if result.is_err() {
+            if let Err(error) = self.advance_physical_inventory(&mut inventory, maximum_entries) {
                 *inventory = PhysicalInventory::default();
+                return Err(error);
             }
-            result
+            Ok(inventory
+                .completed
+                .filter(|completed| completed.completed_at.elapsed() <= Duration::from_secs(300)))
         }
 
+        /// Advance the same bounded inventory, reporting whether this step began
+        /// a traversal and which traversal it finished. A failed step resets the
+        /// inventory, so the next step starts a new traversal.
+        pub fn physical_usage_step(
+            &self,
+            maximum_entries: u32,
+        ) -> Result<SpoolInventoryStep, SpoolWriteError> {
+            let mut inventory = self
+                .physical_inventory
+                .lock()
+                .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+            let started = inventory.stack.is_empty();
+            match self.advance_physical_inventory(&mut inventory, maximum_entries) {
+                Ok(completed) => Ok(SpoolInventoryStep {
+                    started,
+                    completed: completed.then_some(inventory.completed).flatten(),
+                }),
+                Err(error) => {
+                    *inventory = PhysicalInventory::default();
+                    Err(error)
+                }
+            }
+        }
+
+        /// Returns whether this call completed a traversal.
         fn advance_physical_inventory(
             &self,
             inventory: &mut PhysicalInventory,
             maximum_entries: u32,
-        ) -> Result<Option<SpoolPhysicalInventory>, SpoolWriteError> {
+        ) -> Result<bool, SpoolWriteError> {
             self.assert_configured_root_stable()?;
             if inventory.stack.is_empty() {
                 let root = self
@@ -267,7 +322,17 @@ mod platform {
                     continue;
                 };
                 visited += 1;
-                let entry = entry.map_err(|_error| SpoolWriteError::RootUnavailable)?;
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    // Purge removes empty directories, and reading a removed
+                    // directory is ENOENT. That ends this directory; the root
+                    // itself is revalidated below.
+                    Err(Errno::NOENT) => {
+                        inventory.stack.pop();
+                        continue;
+                    }
+                    Err(_) => return Err(SpoolWriteError::RootUnavailable),
+                };
                 let name = entry.file_name();
                 if name.to_bytes() == b"." || name.to_bytes() == b".." {
                     continue;
@@ -279,16 +344,24 @@ mod platform {
                 };
                 let kind = FileType::from_raw_mode(stat.st_mode);
                 if kind.is_dir() {
-                    let child = rustix::fs::openat2(
+                    // A directory purged between the stat and the open is absent,
+                    // exactly like an entry purged before the stat.
+                    let child = match rustix::fs::openat2(
                         &*directory,
                         name,
                         DIRECTORY_FLAGS,
                         Mode::empty(),
                         ARTIFACT_RESOLVE,
-                    )
-                    .map_err(|_error| SpoolWriteError::UnsafeOrNonRegular)?;
-                    let entries = rustix::fs::Dir::read_from(&child)
-                        .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+                    ) {
+                        Ok(child) => child,
+                        Err(Errno::NOENT) => continue,
+                        Err(_) => return Err(SpoolWriteError::UnsafeOrNonRegular),
+                    };
+                    let entries = match rustix::fs::Dir::read_from(&child) {
+                        Ok(entries) => entries,
+                        Err(Errno::NOENT) => continue,
+                        Err(_) => return Err(SpoolWriteError::RootUnavailable),
+                    };
                     if inventory.stack.len() >= 32 {
                         return Err(SpoolWriteError::UnsafeOrNonRegular);
                     }
@@ -307,16 +380,15 @@ mod platform {
                 }
             }
             self.assert_configured_root_stable()?;
-            if inventory.stack.is_empty() {
-                inventory.completed = Some(SpoolPhysicalInventory {
-                    completed_at: Instant::now(),
-                    bytes: inventory.bytes,
-                    files: inventory.files,
-                });
+            if !inventory.stack.is_empty() {
+                return Ok(false);
             }
-            Ok(inventory
-                .completed
-                .filter(|completed| completed.completed_at.elapsed() <= Duration::from_secs(300)))
+            inventory.completed = Some(SpoolPhysicalInventory {
+                completed_at: Instant::now(),
+                bytes: inventory.bytes,
+                files: inventory.files,
+            });
+            Ok(true)
         }
 
         /// Sample the pinned root, refusing mount/root replacement since construction.
@@ -409,6 +481,8 @@ mod platform {
                 .root_fd
                 .try_clone()
                 .map_err(|_error| SpoolWriteError::RootUnavailable)?;
+            // Each opened level with the descriptor of the directory holding it.
+            let mut chain = Vec::new();
             for component in parent.components() {
                 let Component::Normal(name) = component else {
                     return Err(SpoolWriteError::PathBindingMismatch);
@@ -420,7 +494,7 @@ mod platform {
                     Mode::empty(),
                     ARTIFACT_RESOLVE,
                 ) {
-                    Ok(fd) => directory = fd,
+                    Ok(fd) => chain.push((std::mem::replace(&mut directory, fd), name)),
                     Err(Errno::NOENT) => {
                         // Absence is durable only after the nearest surviving
                         // parent is synced, including a peer's uncommitted unlink.
@@ -451,6 +525,7 @@ mod platform {
             rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
                 operation: "purge directory fsync",
             })?;
+            remove_empty_parents(&chain);
             self.assert_configured_root_stable()?;
             Ok(removed)
         }
@@ -563,9 +638,27 @@ mod platform {
             let Some(directory_relative) = blob_relative.parent() else {
                 return Err(SpoolWriteError::PathBindingMismatch);
             };
-            let directory_fd = self.ensure_directory_chain(directory_relative)?;
-
-            let outcome = self.place_body(&part_relative, &blob_relative, &directory_fd, body);
+            // A purge in the same directory may remove it while it is still
+            // empty, between step 1 and the part create. Redo step 1 then: the
+            // durability order is unchanged, because every attempt syncs its own
+            // chain before placing anything.
+            let mut attempt = 1;
+            let outcome = loop {
+                let directory_fd = match self.ensure_directory_chain(directory_relative) {
+                    Err(DIRECTORY_REMOVED) if attempt < PLACEMENT_ATTEMPTS => {
+                        attempt += 1;
+                        continue;
+                    }
+                    result => result?,
+                };
+                #[cfg(test)]
+                before_place::run();
+                let outcome = self.place_body(&part_relative, &blob_relative, &directory_fd, body);
+                if outcome != Err(DIRECTORY_REMOVED) || attempt == PLACEMENT_ATTEMPTS {
+                    break outcome;
+                }
+                attempt += 1;
+            };
             if outcome.is_err() {
                 // Best effort, and exactly `finalize_blocking`'s reasoning: the
                 // rename either happened or it did not. If it did this removes
@@ -627,6 +720,9 @@ mod platform {
             ) {
                 Ok(fd) => fd,
                 Err(Errno::EXIST) => return Err(SpoolWriteError::PartAlreadyPresent),
+                // `O_CREAT` names only the final component, so ENOENT means the
+                // leaf directory step 1 made has gone.
+                Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
                 Err(Errno::LOOP | Errno::XDEV | Errno::NOTDIR) => {
                     return Err(SpoolWriteError::UnsafeOrNonRegular);
                 }
@@ -676,6 +772,8 @@ mod platform {
                     // entry without syncing, which is why the fsync below is
                     // unconditional rather than inside the `Ok` arm.
                     Err(Errno::EXIST) => {}
+                    // The parent opened on the previous level has been purged.
+                    Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
                     Err(_) => {
                         return Err(SpoolWriteError::Io {
                             operation: "fanout create",
@@ -696,6 +794,8 @@ mod platform {
                     Err(Errno::LOOP | Errno::XDEV | Errno::NOTDIR) => {
                         return Err(SpoolWriteError::UnsafeOrNonRegular);
                     }
+                    // Created or found by the mkdirat above, then purged.
+                    Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
                     Err(_) => {
                         return Err(SpoolWriteError::Io {
                             operation: "fanout open",
@@ -744,6 +844,67 @@ mod platform {
         }
     }
 
+    /// Test seam: runs once per placement attempt, after step 1 and before the
+    /// part create, which is the window a concurrent purge can empty-remove the
+    /// directory in. Thread-local, so parallel tests cannot see each other's hook.
+    #[cfg(test)]
+    pub(super) mod before_place {
+        use std::cell::RefCell;
+
+        type Hook = Box<dyn FnMut()>;
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        pub(crate) fn run() {
+            HOOK.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook();
+                }
+            });
+        }
+
+        pub(crate) fn install(hook: impl FnMut() + 'static) {
+            HOOK.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        }
+
+        pub(crate) fn clear() {
+            HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    /// Remove the purged body's per-request and fan-out directories if they are
+    /// now empty, deepest first.
+    ///
+    /// Without this every reservation leaves two directories behind forever,
+    /// and the physical walk, which readiness compares with the ledger, grows
+    /// with every reservation the cell ever took (INV-FT F2).
+    ///
+    /// `unlinkat(AT_REMOVEDIR)` removes only an empty directory, so a body a
+    /// concurrent writer has already created keeps its directory: that is
+    /// `ENOTEMPTY`, and the walk stops. A peer that already removed the directory
+    /// is `ENOENT`, and the walk stops. Any other error also stops the walk
+    /// without failing the purge, because the body's removal is already durable
+    /// and an empty directory is only a cost. Each removal is relative to a
+    /// descriptor opened under the pinned root with `openat2`'s confinement, and
+    /// names one normal component, so nothing outside the spool root is reachable.
+    /// A writer that loses its freshly created directory to this retries the
+    /// placement; see `write_put_body`.
+    ///
+    /// The removal is not fsynced. A crash can bring back an empty directory,
+    /// which a later purge in it removes again.
+    fn remove_empty_parents(chain: &[(OwnedFd, &std::ffi::OsStr)]) {
+        // The derived layout always has fixed levels above the removable ones.
+        if chain.len() <= REMOVABLE_PARENT_LEVELS {
+            return;
+        }
+        for (parent, name) in chain.iter().rev().take(REMOVABLE_PARENT_LEVELS) {
+            if rustix::fs::unlinkat(parent, *name, AtFlags::REMOVEDIR).is_err() {
+                return;
+            }
+        }
+    }
+
     impl std::fmt::Debug for LinuxSpoolWriter {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -763,6 +924,7 @@ mod platform {
 
 #[cfg(not(target_os = "linux"))]
 mod platform {
+    use super::SpoolInventoryStep;
     use super::SpoolLayout;
     use super::SpoolObjectKey;
     use super::SpoolPhysicalInventory;
@@ -786,6 +948,12 @@ mod platform {
             &self,
             _maximum_entries: u32,
         ) -> Result<Option<SpoolPhysicalInventory>, SpoolWriteError> {
+            Err(SpoolWriteError::UnsupportedPlatform)
+        }
+        pub fn physical_usage_step(
+            &self,
+            _maximum_entries: u32,
+        ) -> Result<SpoolInventoryStep, SpoolWriteError> {
             Err(SpoolWriteError::UnsupportedPlatform)
         }
         pub fn available_bytes(&self) -> Result<u64, SpoolWriteError> {
@@ -834,3 +1002,147 @@ mod platform {
 }
 
 pub use platform::ExportedLinuxSpoolWriter as LinuxSpoolWriter;
+
+#[cfg(all(test, target_os = "linux"))]
+mod purge_tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use super::LinuxSpoolWriter;
+    use super::MAX_SPOOL_BODY_BYTES;
+    use crate::spool::SpoolLayout;
+    use crate::spool::SpoolObjectKey;
+    use crate::spool::SpoolObjectKind;
+
+    struct TestRoot(PathBuf);
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_root(label: &str) -> TestRoot {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = PathBuf::from(format!(
+            "/tmp/lore-spool-purge-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).expect("create isolated absolute spool root");
+        TestRoot(path)
+    }
+
+    fn key(logical: u32, attempt: u32) -> SpoolObjectKey {
+        SpoolObjectKey {
+            provider_boundary_id: "boundary".into(),
+            logical_request_id: format!("018f3e12-a456-7abc-8def-{logical:012x}"),
+            attempt_id: format!("018f3e12-a457-7abc-8def-{attempt:012x}"),
+            kind: SpoolObjectKind::Put,
+        }
+    }
+
+    /// INV-FT F2: every purge used to leave its request and fan-out directories.
+    #[test]
+    fn purge_removes_the_empty_request_and_fanout_directories_only() {
+        let root = test_root("empty-parents");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let key = key(1, 1);
+        let paths = layout.derive_paths(&key).unwrap();
+        writer.write_put_body(&layout, &key, b"body").unwrap();
+        let request = paths.final_path().parent().unwrap().to_path_buf();
+        let fanout = request.parent().unwrap().to_path_buf();
+        let kind = fanout.parent().unwrap().to_path_buf();
+
+        assert!(writer.purge_put_body(&layout, &key).unwrap());
+
+        assert!(!request.exists(), "the empty request directory is removed");
+        assert!(!fanout.exists(), "the empty fan-out directory is removed");
+        assert!(kind.is_dir(), "the fixed kind directory stays");
+        assert_eq!(
+            writer.physical_usage(4096).unwrap(),
+            Some((0, 0)),
+            "an empty spool walks as empty"
+        );
+    }
+
+    #[test]
+    fn purge_keeps_a_directory_that_still_holds_another_body() {
+        let root = test_root("shared-parent");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let (first, second) = (key(1, 1), key(1, 2));
+        writer.write_put_body(&layout, &first, b"first").unwrap();
+        writer.write_put_body(&layout, &second, b"second").unwrap();
+
+        assert!(writer.purge_put_body(&layout, &first).unwrap());
+
+        let survivor = layout.derive_paths(&second).unwrap();
+        assert_eq!(fs::read(survivor.final_path()).unwrap(), b"second");
+        assert!(
+            !writer.purge_put_body(&layout, &first).unwrap(),
+            "idempotent"
+        );
+        assert!(writer.purge_put_body(&layout, &second).unwrap());
+        assert!(!survivor.final_path().parent().unwrap().exists());
+    }
+
+    /// A purge in the same directory can empty-remove the request and fan-out
+    /// directories after step 1 made them and before the part create. The
+    /// writer must redo step 1 rather than fail the write.
+    #[test]
+    fn directories_purged_between_creation_and_placement_are_recreated() {
+        let root = test_root("purged-before-place");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let key = key(1, 1);
+        let paths = layout.derive_paths(&key).unwrap();
+        let request = paths.final_path().parent().unwrap().to_path_buf();
+        let fanout = request.parent().unwrap().to_path_buf();
+        let mut fired = false;
+        super::platform::before_place::install(move || {
+            if !fired {
+                fired = true;
+                fs::remove_dir(&request).unwrap();
+                fs::remove_dir(&fanout).unwrap();
+            }
+        });
+        let result = writer.write_put_body(&layout, &key, b"body");
+        super::platform::before_place::clear();
+        result.expect("the write redoes step 1 and places the body");
+        assert_eq!(fs::read(paths.final_path()).unwrap(), b"body");
+    }
+
+    /// Smoke only: a purger racing a writer in the same directory. The window is
+    /// too narrow for this to discriminate; the seam case above does.
+    #[test]
+    fn concurrent_purges_in_the_same_directory_do_not_fail_a_write() {
+        let root = test_root("concurrent");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = Arc::new(LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap());
+        let purger = {
+            let layout = layout.clone();
+            let writer = writer.clone();
+            std::thread::spawn(move || {
+                for attempt in 0..200 {
+                    let _ = writer.purge_put_body(&layout, &key(1, attempt));
+                }
+            })
+        };
+        for attempt in 0..200 {
+            writer
+                .write_put_body(&layout, &key(1, 10_000 + attempt), b"x")
+                .unwrap_or_else(|error| panic!("write {attempt} failed: {error}"));
+            assert!(
+                writer
+                    .purge_put_body(&layout, &key(1, 10_000 + attempt))
+                    .unwrap()
+            );
+        }
+        purger.join().unwrap();
+    }
+}

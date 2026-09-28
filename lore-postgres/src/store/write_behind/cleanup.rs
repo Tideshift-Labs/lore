@@ -93,6 +93,15 @@ impl StageFileScanner {
         self.physical
     }
 
+    /// Whether a traversal is part-way through. The next `scan` starts a new
+    /// traversal when this is false.
+    pub fn walk_in_progress(&self) -> bool {
+        #[cfg(unix)]
+        return !self.directories.is_empty();
+        #[cfg(not(unix))]
+        false
+    }
+
     /// Bounded traversal with retained cursors, so late residue and high hashes
     /// are eventually revisited without an unbounded recursive enumeration.
     pub fn scan(
@@ -158,8 +167,19 @@ impl StageFileScanner {
                 self.directories.pop();
                 continue;
             };
-            let entry = entry
-                .map_err(|error| WriteBehindError::io("stage inventory entry", &error.into()))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                // Purge removes empty fan-out directories, and reading a removed
+                // directory is ENOENT. That ends this directory; the root's
+                // device is revalidated below.
+                Err(Errno::NOENT) => {
+                    self.directories.pop();
+                    continue;
+                }
+                Err(error) => {
+                    return Err(WriteBehindError::io("stage inventory entry", &error.into()));
+                }
+            };
             let name = entry.file_name();
             if name.to_bytes() == b"." || name.to_bytes() == b".." {
                 continue;
@@ -198,18 +218,40 @@ impl StageFileScanner {
                 );
                 #[cfg(not(target_os = "linux"))]
                 let child = rustix::fs::openat(&*directory, name, flags, Mode::empty());
-                let child = child.map_err(|error| {
-                    WriteBehindError::io("stage inventory descend", &error.into())
-                })?;
+                // A directory purged between the stat and the open is absent,
+                // exactly like an entry purged before the stat.
+                let child = match child {
+                    Ok(child) => child,
+                    Err(Errno::NOENT) => continue,
+                    Err(error) => {
+                        return Err(WriteBehindError::io(
+                            "stage inventory descend",
+                            &error.into(),
+                        ));
+                    }
+                };
                 let child_stat = rustix::fs::fstat(&child).map_err(|error| {
                     WriteBehindError::io("stage inventory child stat", &error.into())
                 })?;
-                if child_stat.st_dev != root_stat.st_dev || child_stat.st_ino != metadata.st_ino {
+                if child_stat.st_dev != root_stat.st_dev {
                     return Err(WriteBehindError::RootDeviceChanged);
                 }
-                let entries = rustix::fs::Dir::read_from(&child).map_err(|error| {
-                    WriteBehindError::io("stage inventory descend", &error.into())
-                })?;
+                if child_stat.st_ino != metadata.st_ino {
+                    // Purged and recreated between the stat and the open. The
+                    // open was confined beneath this directory, so skip the new
+                    // one; the next traversal counts it.
+                    continue;
+                }
+                let entries = match rustix::fs::Dir::read_from(&child) {
+                    Ok(entries) => entries,
+                    Err(Errno::NOENT) => continue,
+                    Err(error) => {
+                        return Err(WriteBehindError::io(
+                            "stage inventory descend",
+                            &error.into(),
+                        ));
+                    }
+                };
                 self.directories.push((child, entries, path));
                 continue;
             }

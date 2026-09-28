@@ -158,7 +158,9 @@ pub struct Snapshot {
     pub capacity_unavailable_millis: Option<u64>,
     /// Which capacity predicates failed at the last observation, the age of
     /// each physical inventory when it was compared, and both sides of each
-    /// comparison. Observability only; no readiness decision reads it.
+    /// comparison. The `*_ledger_*` side is the ledger bound that walk was
+    /// compared with, not the latest read. Observability only; no readiness
+    /// decision reads it.
     pub capacity: Option<CapacityDetail>,
 }
 
@@ -325,9 +327,10 @@ fn record_pass_outcome(
 ///
 /// **A stage with no room is not the same claim as a ledger that disagrees with
 /// itself.** `capacity_available` is computed by comparing the last completed
-/// physical inventory against a freshly read charged ledger, so it goes false
-/// whenever the two are momentarily out of step — which is the normal condition
-/// while fragments are being staged. Treating that instant as unreadiness is what
+/// physical inventory against the charged ledger read around that walk (the
+/// larger of the reads before it started and after it completed). A walk that
+/// overlapped both new charges and releases can still exceed both reads, so the
+/// predicate can go false transiently while fragments are being staged. Treating that instant as unreadiness is what
 /// ejects every replica of a cell at once, because they all read the same ledger.
 ///
 /// So the run is remembered and `readiness_reason` reports it only once it has

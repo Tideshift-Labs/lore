@@ -20,6 +20,7 @@ use crate::domain::fragments::FragmentDrainCandidate;
 use crate::domain::fragments::FragmentDrainCandidateBatch;
 use crate::domain::fragments::StageCleanupIntent;
 use crate::domain::fragments::states::FragmentLifecycleState;
+use crate::store::write_behind::CapacityVerdict;
 use crate::store::write_behind::cleanup::StageFileCandidate;
 use crate::store::write_behind::cleanup::StageFileScanner;
 
@@ -365,10 +366,25 @@ pub struct WriteBehindActivity {
     pub cleanup_progress: Option<Instant>,
 }
 
+/// A completed stage walk: completion time, bytes, files, unknown entries.
+type StagePhysical = (Instant, u64, u64, u64);
+/// One stage inventory step's retained scanner and whether it completed a walk.
+type StageInventoryTask = tokio::task::JoinHandle<Result<(StageFileScanner, bool), StoreError>>;
+
+/// The step in flight, whether it starts a walk, and the latest stage ledger
+/// read when it was issued.
+type PendingStageStep = (StageInventoryTask, bool, Option<(u64, u64)>);
+
+/// A completed stage walk older than this is not compared, as before.
+const STAGE_PHYSICAL_MAX_AGE: Duration = Duration::from_secs(300);
+
 struct PhysicalInventory {
     scanner: Option<StageFileScanner>,
-    task: Option<tokio::task::JoinHandle<Result<StageFileScanner, StoreError>>>,
-    observation: Option<(Instant, u64, u64, u64)>,
+    task: Option<PendingStageStep>,
+    /// Completed walks and the ledger each is compared with. See
+    /// [`lore_fragment_provider::WalkLedgerBound`] for why one later read is not
+    /// enough.
+    walk: lore_fragment_provider::WalkLedgerBound<StagePhysical>,
 }
 
 impl Default for PhysicalInventory {
@@ -376,7 +392,7 @@ impl Default for PhysicalInventory {
         Self {
             scanner: Some(StageFileScanner::default()),
             task: None,
-            observation: None,
+            walk: lore_fragment_provider::WalkLedgerBound::default(),
         }
     }
 }
@@ -409,10 +425,13 @@ pub struct CapacityEvidence {
     pub spool_inventory_age: Option<Duration>,
     pub stage_physical_bytes: Option<u64>,
     pub stage_physical_files: Option<u64>,
+    /// The ledger the stage walk was compared with: the larger of the reads
+    /// before the walk started and after it completed.
     pub stage_ledger_bytes: u64,
     pub stage_ledger_files: u64,
     pub spool_physical_bytes: Option<u64>,
     pub spool_physical_files: Option<u64>,
+    /// The ledger the spool walk was compared with, bound the same way.
     pub spool_ledger_bytes: u64,
     pub spool_ledger_files: u64,
     pub available_bytes: Option<u64>,
@@ -450,14 +469,15 @@ impl CapacityEvidence {
                 }
             }
         }
+        let (spool_ledger_bytes, spool_ledger_files) = spool.physical_ledger_bound();
         match spool.physical_spool_bytes {
             None => failing.push("spool_bytes_inventory_missing"),
-            Some(bytes) if bytes > spool.spool_bytes => failing.push("spool_bytes_over_ledger"),
+            Some(bytes) if bytes > spool_ledger_bytes => failing.push("spool_bytes_over_ledger"),
             Some(_) => {}
         }
         match spool.physical_spool_files {
             None => failing.push("spool_files_inventory_missing"),
-            Some(files) if files > spool.spool_files => failing.push("spool_files_over_ledger"),
+            Some(files) if files > spool_ledger_files => failing.push("spool_files_over_ledger"),
             Some(_) => {}
         }
         match spool.available_bytes {
@@ -475,12 +495,47 @@ impl CapacityEvidence {
             stage_ledger_files,
             spool_physical_bytes: spool.physical_spool_bytes,
             spool_physical_files: spool.physical_spool_files,
-            spool_ledger_bytes: spool.spool_bytes,
-            spool_ledger_files: spool.spool_files,
+            spool_ledger_bytes,
+            spool_ledger_files,
             available_bytes: spool.available_bytes,
         }
     }
+
+    /// Classify the failing predicates for staging admission.
+    ///
+    /// Only a physical inventory above its ledger bound is a reconciliation
+    /// disagreement that can clear by itself, as the walk and the ledger catch
+    /// up. Everything else refuses at once:
+    ///
+    /// - a full metadata budget, free space below the minimum, or free space
+    ///   that cannot be read, because more staging makes each worse;
+    /// - a missing inventory (no completed walk, a failed walk, or one older than
+    ///   five minutes), because there is then no physical evidence to reconcile,
+    ///   only its absence, and a wedged walk must not look like a transient;
+    /// - unknown stage entries, because no ledger charges a foreign or malformed
+    ///   file and waiting does not remove it.
+    pub fn verdict(&self) -> CapacityVerdict {
+        if self.failing.is_empty() {
+            CapacityVerdict::Available
+        } else if self
+            .failing
+            .iter()
+            .all(|name| RECONCILING_PREDICATES.contains(name))
+        {
+            CapacityVerdict::Reconciling
+        } else {
+            CapacityVerdict::Unavailable
+        }
+    }
 }
+
+/// The snapshot-vs-ledger predicates staging admission gives a time budget.
+const RECONCILING_PREDICATES: [&str; 4] = [
+    "stage_bytes_over_ledger",
+    "stage_files_over_ledger",
+    "spool_bytes_over_ledger",
+    "spool_files_over_ledger",
+];
 
 struct DrainState {
     cursor: Vec<u8>,
@@ -617,18 +672,25 @@ impl FragmentWriteBehindHandle {
     /// Advance inventory independently of slow cleanup/provider operations.
     /// One retained job owns the scanner and an I/O permit until actual syscall
     /// completion; cancellation cannot start a second scanner on a wedged root.
-    async fn physical_inventory(&self) -> Result<Option<(Instant, u64, u64, u64)>, StoreError> {
+    ///
+    /// Collects a finished step and issues the next one. The step issued here
+    /// runs concurrently with this observation's ledger read, so it is bound to
+    /// the previous read, and a walk it completes is bound by a later read; see
+    /// [`Self::bind_stage_inventory`].
+    async fn physical_inventory(&self) -> Result<(), StoreError> {
         let mut state = self.inventory.lock().await;
-        if let Some(task) = state.task.as_mut()
+        if let Some((task, started, before)) = state.task.as_mut()
             && task.is_finished()
         {
+            let (started, before) = (*started, *before);
             let result = task.await;
             state.task = None;
-            if let Ok(Ok(scanner)) = result {
-                state.observation = scanner.physical_observation();
+            if let Ok(Ok((scanner, completed))) = result {
+                let walk = completed.then(|| scanner.physical_observation()).flatten();
+                state.walk.record_step(before, started, walk);
                 state.scanner = Some(scanner);
             } else {
-                state.observation = None;
+                state.walk.record_failure();
                 state.scanner = Some(StageFileScanner::default());
                 return Err(StoreError::from(SlowDown));
             }
@@ -643,29 +705,42 @@ impl FragmentWriteBehindHandle {
                 .scanner
                 .take()
                 .ok_or_else(|| StoreError::internal("physical inventory scanner missing"))?;
+            let started = !scanner.walk_in_progress();
+            let before = state.walk.last_ledger();
             let stage = self.stage.clone();
-            state.task = Some(lore_base::lore_spawn_blocking!(
-                "stage-physical-inventory",
-                move || {
-                    let _permit = permit;
-                    let previous = scanner.physical_observation().map(|(at, _, _, _)| at);
-                    // Up to 4096 entries per observer tick, with the scanner's own
-                    // depth/handle bound. Cleanup keeps its separate candidate cursor.
-                    for _ in 0..16 {
-                        let _ = scanner
-                            .scan(&stage, 256)
-                            .map_err(|error| error.store_error())?;
-                        if scanner.physical_observation().map(|(at, _, _, _)| at) != previous {
-                            break;
-                        }
+            let task = lore_base::lore_spawn_blocking!("stage-physical-inventory", move || {
+                let _permit = permit;
+                let previous = scanner.physical_observation().map(|(at, _, _, _)| at);
+                // Up to 4096 entries per observer tick, with the scanner's own
+                // depth/handle bound. Cleanup keeps its separate candidate cursor.
+                // It stops at a completion, so a step starts at most one walk.
+                for _ in 0..16 {
+                    let _ = scanner
+                        .scan(&stage, 256)
+                        .map_err(|error| error.store_error())?;
+                    if scanner.physical_observation().map(|(at, _, _, _)| at) != previous {
+                        return Ok((scanner, true));
                     }
-                    Ok(scanner)
                 }
-            ));
+                Ok((scanner, false))
+            });
+            state.task = Some((task, started, before));
         }
-        Ok(state
-            .observation
-            .filter(|(at, _, _, _)| at.elapsed() < Duration::from_secs(300)))
+        Ok(())
+    }
+
+    /// Record the stage ledger read taken after [`Self::physical_inventory`],
+    /// and return the latest completed walk with the ledger it must not exceed.
+    async fn bind_stage_inventory(
+        &self,
+        ledger: (u64, u64),
+    ) -> Option<(StagePhysical, (u64, u64))> {
+        let mut state = self.inventory.lock().await;
+        state.walk.record_ledger(ledger);
+        state
+            .walk
+            .current()
+            .filter(|((at, _, _, _), _)| at.elapsed() < STAGE_PHYSICAL_MAX_AGE)
     }
 
     pub fn mode(&self) -> StagingMode {
@@ -683,7 +758,7 @@ impl FragmentWriteBehindHandle {
 
     pub async fn observe(&self) -> Result<WriteBehindObservation, StoreError> {
         self.stage.note_observation_unknown();
-        let stage_physical = self.physical_inventory().await?;
+        self.physical_inventory().await?;
         self.coordinator
             .verify_stage_policy(
                 &self.policy.cell_id,
@@ -704,15 +779,19 @@ impl FragmentWriteBehindHandle {
             .map_err(provider_store_err)?;
         let charged_bytes = positive(observation.resident_bytes)?;
         let charged_files = positive(observation.resident_files)?;
+        let bound = self
+            .bind_stage_inventory((charged_bytes, charged_files))
+            .await;
+        let stage_physical = bound.map(|(walk, _)| walk);
         let capacity = CapacityEvidence::evaluate(
             observation.metadata_full,
             stage_physical,
-            (charged_bytes, charged_files),
+            bound.map_or((charged_bytes, charged_files), |(_, ledger)| ledger),
             &spool,
             self.stage.min_free_bytes(),
         );
         let capacity_available = capacity.failing.is_empty();
-        self.stage.note_capacity(capacity_available);
+        self.stage.note_capacity(capacity.verdict());
         let stage_bytes = charged_bytes.max(stage_physical.map_or(0, |(_, bytes, _, _)| bytes));
         let stage_files = charged_files.max(stage_physical.map_or(0, |(_, _, files, _)| files));
         self.stage.note_occupancy(stage_bytes, stage_files);
@@ -1327,6 +1406,7 @@ mod capacity_evidence_tests {
             physical_spool_bytes: Some(100),
             physical_spool_files: Some(10),
             physical_spool_age: Some(Duration::from_millis(1_500)),
+            physical_spool_ledger: None,
         }
     }
 
@@ -1507,6 +1587,122 @@ mod capacity_evidence_tests {
                     }
                 }
             }
+        }
+    }
+
+    /// INV-FT row 67: the spool walk is compared with its own ledger bound, not
+    /// the current read. The 2026-09-28 sample: 118 bodies walked, 116 in the
+    /// read taken after a cleanup burst, 118 in the read before the walk.
+    #[test]
+    fn the_spool_walk_is_compared_with_its_bound_not_the_current_read() {
+        let mut spool = healthy_spool();
+        spool.spool_bytes = 8_492_370;
+        spool.spool_files = 116;
+        spool.physical_spool_bytes = Some(8_750_269);
+        spool.physical_spool_files = Some(118);
+        spool.physical_spool_ledger = Some((8_750_269, 118));
+        let evidence = evaluate(false, healthy_stage(Instant::now()), &spool);
+        assert!(evidence.failing.is_empty(), "{:?}", evidence.failing);
+        assert_eq!(
+            (evidence.spool_ledger_bytes, evidence.spool_ledger_files),
+            (8_750_269, 118),
+            "the evidence names the side it compared"
+        );
+        spool.physical_spool_ledger = Some((8_750_268, 118));
+        let evidence = evaluate(false, healthy_stage(Instant::now()), &spool);
+        assert_eq!(evidence.failing, vec!["spool_bytes_over_ledger"]);
+    }
+
+    /// Staging's budget covers only the snapshot-vs-ledger predicates.
+    #[test]
+    fn only_over_ledger_predicates_are_reconciling() {
+        use crate::store::write_behind::CapacityVerdict;
+        let now = Instant::now();
+        assert_eq!(
+            evaluate(false, healthy_stage(now), &healthy_spool()).verdict(),
+            CapacityVerdict::Available
+        );
+        let mut spool = healthy_spool();
+        spool.physical_spool_bytes = Some(101);
+        spool.physical_spool_files = Some(11);
+        assert_eq!(
+            evaluate(false, Some((now, 201, 21, 0)), &spool).verdict(),
+            CapacityVerdict::Reconciling,
+            "all four over-ledger predicates together are still reconciling"
+        );
+        let hard: Vec<(&str, CapacityEvidence)> = vec![
+            (
+                "stage_metadata_full",
+                evaluate(true, healthy_stage(now), &spool),
+            ),
+            ("stage_inventory_missing", evaluate(false, None, &spool)),
+            (
+                "stage_unknown_entries",
+                evaluate(false, Some((now, 201, 21, 1)), &spool),
+            ),
+            (
+                "spool_metadata_full",
+                evaluate(
+                    false,
+                    healthy_stage(now),
+                    &FragmentDrainObservation {
+                        metadata_full: true,
+                        ..spool
+                    },
+                ),
+            ),
+            (
+                "spool_bytes_inventory_missing",
+                evaluate(
+                    false,
+                    healthy_stage(now),
+                    &FragmentDrainObservation {
+                        physical_spool_bytes: None,
+                        ..spool
+                    },
+                ),
+            ),
+            (
+                "spool_files_inventory_missing",
+                evaluate(
+                    false,
+                    healthy_stage(now),
+                    &FragmentDrainObservation {
+                        physical_spool_files: None,
+                        ..spool
+                    },
+                ),
+            ),
+            (
+                "free_space_unknown",
+                evaluate(
+                    false,
+                    healthy_stage(now),
+                    &FragmentDrainObservation {
+                        available_bytes: None,
+                        ..spool
+                    },
+                ),
+            ),
+            (
+                "free_space_below_minimum",
+                evaluate(
+                    false,
+                    healthy_stage(now),
+                    &FragmentDrainObservation {
+                        available_bytes: Some(MIN_FREE - 1),
+                        ..spool
+                    },
+                ),
+            ),
+        ];
+        for (name, evidence) in hard {
+            assert!(evidence.failing.contains(&name), "{name}: {evidence:?}");
+            assert_eq!(
+                evidence.verdict(),
+                CapacityVerdict::Unavailable,
+                "{name} beside reconciling predicates still refuses at once"
+            );
         }
     }
 

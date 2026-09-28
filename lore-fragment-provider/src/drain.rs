@@ -11,6 +11,7 @@ use lore_object_dispatch::spool::SpoolLayout;
 use lore_object_dispatch::spool::SpoolObjectKey;
 use lore_object_dispatch::spool::SpoolObjectKind;
 use lore_object_dispatch::spool_writer::LinuxSpoolWriter;
+use lore_object_dispatch::spool_writer::SpoolInventoryStep;
 use lore_object_dispatch::spool_writer::SpoolPhysicalInventory;
 use lore_object_dispatch::spool_writer::SpoolWriteError;
 use lore_object_dispatch::spool_writer::SpoolWriteReceipt;
@@ -110,8 +111,122 @@ impl FragmentDrainReservation {
 type CleanupTask = tokio::task::JoinHandle<
     Result<(lore_object_dispatch::drain_spool::DrainCleanupIntent, bool), FragmentProviderError>,
 >;
-type PhysicalSpoolSample = (Option<u64>, Option<SpoolPhysicalInventory>);
+type PhysicalSpoolSample = (Option<u64>, Result<SpoolInventoryStep, SpoolWriteError>);
 type ObservationTask = tokio::task::JoinHandle<PhysicalSpoolSample>;
+/// Spool ledger bytes and files, as one `drain_observe_v1` read reported them.
+type SpoolLedger = (u64, u64);
+
+/// A completed walk older than this is not reported, as before.
+const PHYSICAL_SPOOL_MAX_AGE: Duration = Duration::from_secs(300);
+
+/// Pairs each completed physical walk with the ledger that bounds it (INV-FT F2).
+///
+/// A body is charged to its ledger before it is placed, and released only after
+/// it is unlinked. So every body a walk counts was charged no later than the
+/// walk's end and released no earlier than its start. Comparing a completed walk
+/// with one later ledger read is not order-consistent: a cleanup burst after the
+/// walk counted a body lowers that read, and a body placed after the read raises
+/// the walk. The 2026-09-28 live check saw spool walks 0 to 2 s old over ledger.
+///
+/// The bound is the larger of the ledger read before the walk started and the
+/// first ledger read after it completed, per component. It covers a window that
+/// only grew and a window that only shrank. A window with both charges and
+/// releases can still exceed both reads; readiness and staging give that a time
+/// budget rather than treating one sample as unavailability.
+///
+/// The caller must keep the order this relies on: `before` is a read taken
+/// before the step was issued, and `record_ledger` is called only with a read
+/// taken after every step already recorded.
+#[derive(Debug)]
+pub struct WalkLedgerBound<W> {
+    /// The latest ledger read. Every step recorded so far was issued before it.
+    last_ledger: Option<(u64, u64)>,
+    /// The ledger read before the walk in progress started, when known.
+    walk_start: Option<(u64, u64)>,
+    /// A completed walk still waiting for the first ledger read after it.
+    unbound: Option<(W, Option<(u64, u64)>)>,
+    /// The latest completed walk and the ledger bound it is compared with.
+    bound: Option<(W, (u64, u64))>,
+}
+
+impl<W> Default for WalkLedgerBound<W> {
+    fn default() -> Self {
+        Self {
+            last_ledger: None,
+            walk_start: None,
+            unbound: None,
+            bound: None,
+        }
+    }
+}
+
+impl<W: Copy> WalkLedgerBound<W> {
+    /// The latest ledger read, to pass as `before` for the next step.
+    pub fn last_ledger(&self) -> Option<(u64, u64)> {
+        self.last_ledger
+    }
+
+    /// Record one walk step. `before` is the latest ledger read when the step
+    /// was issued, which precedes everything the step walked.
+    pub fn record_step(&mut self, before: Option<(u64, u64)>, started: bool, completed: Option<W>) {
+        if started {
+            self.walk_start = before;
+        }
+        if let Some(completed) = completed {
+            self.unbound = Some((completed, self.walk_start.take()));
+        }
+    }
+
+    /// A failed step resets the walk, so nothing completed is left to report.
+    pub fn record_failure(&mut self) {
+        *self = Self {
+            last_ledger: self.last_ledger,
+            ..Self::default()
+        };
+    }
+
+    /// Record a ledger read taken after every step recorded so far.
+    pub fn record_ledger(&mut self, ledger: (u64, u64)) {
+        self.last_ledger = Some(ledger);
+        if let Some((walk, start)) = self.unbound.take() {
+            let bound = start.map_or(ledger, |(bytes, files)| {
+                (bytes.max(ledger.0), files.max(ledger.1))
+            });
+            self.bound = Some((walk, bound));
+        }
+    }
+
+    /// The latest completed walk that has a bound, and that bound.
+    pub fn current(&self) -> Option<(W, (u64, u64))> {
+        self.bound
+    }
+}
+
+type SpoolWalkBound = WalkLedgerBound<SpoolPhysicalInventory>;
+
+fn record_spool_step(
+    bound: &mut SpoolWalkBound,
+    before: Option<SpoolLedger>,
+    step: Result<SpoolInventoryStep, SpoolWriteError>,
+) {
+    match step {
+        Ok(step) => bound.record_step(before, step.started, step.completed),
+        Err(_) => bound.record_failure(),
+    }
+}
+
+fn current_spool_walk(bound: &SpoolWalkBound) -> Option<(SpoolPhysicalInventory, SpoolLedger)> {
+    bound
+        .current()
+        .filter(|(walk, _)| walk.completed_at.elapsed() <= PHYSICAL_SPOOL_MAX_AGE)
+}
+
+#[derive(Default)]
+struct SpoolObservationState {
+    /// The step in flight and the latest ledger read when it was issued.
+    task: Option<(ObservationTask, Option<SpoolLedger>)>,
+    walk: SpoolWalkBound,
+}
 
 pub struct FragmentDrainMaintenanceHandle {
     client: DrainClient,
@@ -122,7 +237,7 @@ pub struct FragmentDrainMaintenanceHandle {
     writer: Arc<LinuxSpoolWriter>,
     // The handle survives cancellation of cleanup_pass. There is at most one syscall lane.
     io: tokio::sync::Mutex<Option<CleanupTask>>,
-    observation_io: tokio::sync::Mutex<Option<ObservationTask>>,
+    observation_io: tokio::sync::Mutex<SpoolObservationState>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +253,10 @@ pub struct FragmentDrainObservation {
     /// Age of the completed spool inventory the physical fields report, taken
     /// when this observation was assembled. Observability only.
     pub physical_spool_age: Option<Duration>,
+    /// The ledger bytes and files the physical fields must not exceed: the
+    /// larger of the reads taken before that walk started and after it
+    /// completed. `spool_bytes`/`spool_files` are the current read.
+    pub physical_spool_ledger: Option<(u64, u64)>,
 }
 
 impl FragmentDrainObservation {
@@ -145,7 +264,7 @@ impl FragmentDrainObservation {
     fn assemble(
         sample: &DrainObservation,
         available_bytes: Option<u64>,
-        physical: Option<SpoolPhysicalInventory>,
+        physical: Option<(SpoolPhysicalInventory, SpoolLedger)>,
     ) -> Self {
         Self {
             spool_bytes: sample.spool_bytes,
@@ -154,14 +273,31 @@ impl FragmentDrainObservation {
             roots_usable: available_bytes.is_some(),
             metadata_full: sample.metadata_full,
             available_bytes,
-            physical_spool_bytes: physical.map(|inventory| inventory.bytes),
-            physical_spool_files: physical.map(|inventory| inventory.files),
-            physical_spool_age: physical.map(|inventory| inventory.completed_at.elapsed()),
+            physical_spool_bytes: physical.map(|(inventory, _)| inventory.bytes),
+            physical_spool_files: physical.map(|(inventory, _)| inventory.files),
+            physical_spool_age: physical.map(|(inventory, _)| inventory.completed_at.elapsed()),
+            physical_spool_ledger: physical.map(|(_, ledger)| ledger),
         }
+    }
+
+    /// The ledger the physical inventory is compared with. An observation
+    /// built without a walk bound compares with the current read.
+    pub fn physical_ledger_bound(&self) -> (u64, u64) {
+        self.physical_spool_ledger
+            .unwrap_or((self.spool_bytes, self.spool_files))
     }
 }
 
 impl FragmentDrainMaintenanceHandle {
+    async fn read_ledger(&self) -> Result<DrainObservation, FragmentProviderError> {
+        self.client
+            .observe(&self.boundary, &self.cell)
+            .await
+            .map_err(FragmentProviderError::DrainAuthority)
+    }
+
+    /// One walk step, then the ledger. Reading the ledger after the step is what
+    /// lets it bound a walk the step completed; see [`SpoolWalkBound`].
     pub async fn observe(&self) -> Result<FragmentDrainObservation, FragmentProviderError> {
         self.client
             .read(
@@ -172,30 +308,47 @@ impl FragmentDrainMaintenanceHandle {
             )
             .await
             .map_err(FragmentProviderError::DrainAuthority)?;
-        let sample = self
-            .client
-            .observe(&self.boundary, &self.cell)
-            .await
-            .map_err(FragmentProviderError::DrainAuthority)?;
-        let mut pending = self.observation_io.lock().await;
-        if pending.is_none() {
+        let mut state = self.observation_io.lock().await;
+        if state.task.is_none() {
+            if state.walk.last_ledger().is_none() {
+                // The first walk needs a read before it starts too.
+                let sample = self.read_ledger().await?;
+                state
+                    .walk
+                    .record_ledger((sample.spool_bytes, sample.spool_files));
+            }
             let writer = self.writer.clone();
-            *pending = Some(lore_base::lore_spawn_blocking!(move || {
-                (
-                    writer.available_bytes().ok(),
-                    writer.physical_usage_completed(4096).ok().flatten(),
-                )
-            }));
+            let before = state.walk.last_ledger();
+            state.task = Some((
+                lore_base::lore_spawn_blocking!(move || {
+                    (
+                        writer.available_bytes().ok(),
+                        writer.physical_usage_step(4096),
+                    )
+                }),
+                before,
+            ));
         }
-        let (available_bytes, physical_usage) = match pending.as_mut() {
-            Some(task) => task.await.unwrap_or((None, None)),
-            None => (None, None),
+        let (available_bytes, step, before) = match state.task.as_mut() {
+            Some((task, before)) => {
+                let before = *before;
+                let (available_bytes, step) = task
+                    .await
+                    .unwrap_or((None, Err(SpoolWriteError::RootUnavailable)));
+                (available_bytes, step, before)
+            }
+            None => (None, Err(SpoolWriteError::RootUnavailable), None),
         };
-        *pending = None;
+        state.task = None;
+        record_spool_step(&mut state.walk, before, step);
+        let sample = self.read_ledger().await?;
+        state
+            .walk
+            .record_ledger((sample.spool_bytes, sample.spool_files));
         Ok(FragmentDrainObservation::assemble(
             &sample,
             available_bytes,
-            physical_usage,
+            current_spool_walk(&state.walk),
         ))
     }
     pub async fn cleanup_pass(&self, batch: u32) -> Result<u32, FragmentProviderError> {
@@ -328,7 +481,7 @@ impl FragmentProviderEntry {
             policy_pin: pin.clone(),
             writer: writer.clone(),
             io: tokio::sync::Mutex::new(None),
-            observation_io: tokio::sync::Mutex::new(None),
+            observation_io: tokio::sync::Mutex::new(SpoolObservationState::default()),
         };
         let mut capability = self
             .drain_capability(root)
@@ -489,11 +642,14 @@ mod observation_tests {
         let observation = FragmentDrainObservation::assemble(
             &ledger(),
             Some(1 << 20),
-            Some(SpoolPhysicalInventory {
-                completed_at,
-                bytes: 150,
-                files: 12,
-            }),
+            Some((
+                SpoolPhysicalInventory {
+                    completed_at,
+                    bytes: 150,
+                    files: 12,
+                },
+                (160, 13),
+            )),
         );
         assert_eq!(observation.physical_spool_bytes, Some(150));
         assert_eq!(observation.physical_spool_files, Some(12));
@@ -504,6 +660,8 @@ mod observation_tests {
             (observation.spool_bytes, observation.spool_files),
             (100, 10)
         );
+        assert_eq!(observation.physical_spool_ledger, Some((160, 13)));
+        assert_eq!(observation.physical_ledger_bound(), (160, 13));
         assert!(observation.roots_usable);
     }
 
@@ -513,7 +671,114 @@ mod observation_tests {
         assert_eq!(observation.physical_spool_bytes, None);
         assert_eq!(observation.physical_spool_files, None);
         assert_eq!(observation.physical_spool_age, None);
+        assert_eq!(observation.physical_spool_ledger, None);
+        assert_eq!(observation.physical_ledger_bound(), (100, 10));
         assert!(!observation.roots_usable);
+    }
+
+    fn walk(bytes: u64, files: u64) -> SpoolPhysicalInventory {
+        SpoolPhysicalInventory {
+            completed_at: std::time::Instant::now(),
+            bytes,
+            files,
+        }
+    }
+
+    fn step(started: bool, completed: Option<SpoolPhysicalInventory>) -> SpoolInventoryStep {
+        SpoolInventoryStep { started, completed }
+    }
+
+    /// INV-FT row 67, the 2026-09-28 live shape: a walk counted 118 bodies, then
+    /// cleanup released two before the next ledger read. The read after is
+    /// below the walk; the read before it started is not.
+    #[test]
+    fn a_release_burst_after_the_walk_is_bounded_by_the_ledger_before_it() {
+        let mut bound = SpoolWalkBound::default();
+        bound.record_ledger((8_750_269, 118));
+        record_spool_step(&mut bound, Some((8_750_269, 118)), Ok(step(true, None)));
+        bound.record_ledger((8_750_269, 118));
+        record_spool_step(
+            &mut bound,
+            Some((8_750_269, 118)),
+            Ok(step(false, Some(walk(8_750_269, 118)))),
+        );
+        bound.record_ledger((8_492_370, 116));
+        let (inventory, ledger) = bound.current().expect("bound walk");
+        assert_eq!((inventory.bytes, inventory.files), (8_750_269, 118));
+        assert_eq!(ledger, (8_750_269, 118));
+    }
+
+    /// A body placed after the ledger read and before the walk reached it counts
+    /// physically; the read after the walk completed includes its reservation.
+    #[test]
+    fn a_body_placed_during_the_walk_is_bounded_by_the_ledger_after_it() {
+        let mut bound = SpoolWalkBound::default();
+        bound.record_ledger((100, 10));
+        record_spool_step(
+            &mut bound,
+            Some((100, 10)),
+            Ok(step(true, Some(walk(110, 11)))),
+        );
+        assert_eq!(
+            bound.current(),
+            None,
+            "unbound until a read after completion"
+        );
+        bound.record_ledger((110, 11));
+        let (_, ledger) = bound.current().expect("bound walk");
+        assert_eq!(ledger, (110, 11));
+    }
+
+    /// The bound is taken per component: bytes and files may peak on
+    /// different sides of the walk.
+    #[test]
+    fn each_component_takes_the_larger_side() {
+        let mut bound = SpoolWalkBound::default();
+        record_spool_step(&mut bound, Some((200, 5)), Ok(step(true, None)));
+        record_spool_step(&mut bound, None, Ok(step(false, Some(walk(0, 0)))));
+        bound.record_ledger((150, 9));
+        assert_eq!(bound.current().expect("bound").1, (200, 9));
+    }
+
+    /// A walk that started with no earlier read is bounded by the read after it.
+    #[test]
+    fn a_walk_with_no_earlier_read_is_bounded_by_the_read_after_it() {
+        let mut bound = SpoolWalkBound::default();
+        record_spool_step(&mut bound, None, Ok(step(true, Some(walk(7, 1)))));
+        bound.record_ledger((5, 1));
+        assert_eq!(bound.current().expect("bound").1, (5, 1));
+    }
+
+    /// A later walk's start read belongs to that walk only.
+    #[test]
+    fn each_walk_uses_its_own_start_read() {
+        let mut bound = SpoolWalkBound::default();
+        record_spool_step(
+            &mut bound,
+            Some((500, 50)),
+            Ok(step(true, Some(walk(1, 1)))),
+        );
+        bound.record_ledger((10, 1));
+        assert_eq!(bound.current().expect("first").1, (500, 50));
+        record_spool_step(&mut bound, Some((10, 1)), Ok(step(true, Some(walk(2, 1)))));
+        bound.record_ledger((20, 2));
+        assert_eq!(bound.current().expect("second").1, (20, 2));
+    }
+
+    /// The writer resets its walk on failure, so nothing completed is reported.
+    #[test]
+    fn a_failed_step_drops_every_walk() {
+        let mut bound = SpoolWalkBound::default();
+        record_spool_step(&mut bound, Some((1, 1)), Ok(step(true, Some(walk(1, 1)))));
+        bound.record_ledger((1, 1));
+        record_spool_step(
+            &mut bound,
+            Some((1, 1)),
+            Err(SpoolWriteError::RootUnavailable),
+        );
+        bound.record_ledger((1, 1));
+        assert_eq!(bound.current(), None);
+        assert_eq!(bound.last_ledger, Some((1, 1)));
     }
 }
 

@@ -165,6 +165,88 @@ mod linux_live {
         assert_eq!(writer.physical_usage(4096).unwrap(), Some((4, 1)));
     }
 
+    /// INV-FT row 67: readiness binds a walk to the ledger read before it
+    /// started and after it completed, so each step must say which edge it hit.
+    #[test]
+    fn each_inventory_step_reports_the_traversal_it_started_and_completed() {
+        let root = test_root("inventory-steps");
+        for index in 0..5000 {
+            fs::create_dir(root.0.join(format!("historical-{index:05}"))).unwrap();
+        }
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let first = writer.physical_usage_step(4096).unwrap();
+        assert!(first.started, "the first step starts a traversal");
+        assert_eq!(
+            first.completed, None,
+            "5,000 directories need a second step"
+        );
+        let mut steps = 1;
+        let completed = loop {
+            let step = writer.physical_usage_step(4096).unwrap();
+            steps += 1;
+            assert!(!step.started, "a traversal in progress is not restarted");
+            if let Some(completed) = step.completed {
+                break completed;
+            }
+            assert!(steps < 16, "the traversal must complete");
+        };
+        assert_eq!((completed.bytes, completed.files), (0, 0));
+        let next = writer.physical_usage_step(4096).unwrap();
+        assert!(
+            next.started,
+            "the step after a completion starts the next traversal"
+        );
+        assert_eq!(
+            writer.physical_usage_completed(0).unwrap(),
+            Some(completed),
+            "a step that completes nothing still leaves the last completed traversal readable"
+        );
+    }
+
+    /// Purge removes empty directories, and reading a directory removed after
+    /// the walk opened it is ENOENT. That must end the directory, not reset the
+    /// walk into a missing inventory.
+    #[test]
+    fn a_directory_removed_while_the_walk_holds_it_ends_that_directory() {
+        let root = test_root("removed-mid-walk");
+        let doomed = root.0.join("doomed");
+        fs::create_dir_all(doomed.join("inner")).unwrap();
+        fs::write(doomed.join("inner").join("body"), b"gone").unwrap();
+        fs::write(root.0.join("survivor"), b"kept").unwrap();
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        // One entry per step, until the walk has descended into `doomed`.
+        let mut descended = false;
+        for _ in 0..8 {
+            let step = writer.physical_usage_step(1).unwrap();
+            assert_eq!(step.completed, None, "one entry per step cannot finish yet");
+            if Path::new("/proc/self/fd").read_dir().unwrap().any(|fd| {
+                fs::read_link(fd.unwrap().path()).is_ok_and(|target| target.starts_with(&doomed))
+            }) {
+                descended = true;
+                break;
+            }
+        }
+        assert!(
+            descended,
+            "the walk must hold a descriptor inside the doomed tree"
+        );
+        fs::remove_dir_all(&doomed).unwrap();
+        let mut completed = None;
+        for _ in 0..16 {
+            let step = writer
+                .physical_usage_step(1)
+                .expect("a removed directory is not a lost root");
+            if step.completed.is_some() {
+                completed = step.completed;
+                break;
+            }
+        }
+        let completed = completed.expect("the walk completes past the removed directory");
+        assert_eq!((completed.bytes, completed.files), (4, 1));
+    }
+
     fn result_key(attempt_id: &str) -> SpoolObjectKey {
         SpoolObjectKey {
             provider_boundary_id: BOUNDARY.into(),

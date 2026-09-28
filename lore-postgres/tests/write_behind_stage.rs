@@ -301,6 +301,83 @@ async fn inventory_retains_directory_handles_when_a_shard_is_replaced_by_a_symli
     std::fs::remove_file(leaf).unwrap();
 }
 
+/// INV-FT F2 (WP-115 row 67): purge now removes empty fan-out directories, and
+/// reading a directory removed after the walk opened it is ENOENT. That must end
+/// the directory, not fail the walk into a missing inventory.
+#[tokio::test]
+async fn inventory_completes_past_a_fanout_directory_removed_while_held() {
+    use lore_postgres::store::write_behind::cleanup::StageFileScanner;
+    let root = ScratchRoot::new("inventory-removed-leaf");
+    let stage = open(&root);
+    let doomed = [0x46; 32];
+    stage
+        .stage(
+            &doomed,
+            0,
+            &staged_key(&doomed, 0),
+            &Bytes::from_static(b"doomed"),
+        )
+        .await
+        .unwrap();
+    let survivor = [0x91; 32];
+    stage
+        .stage(
+            &survivor,
+            0,
+            &staged_key(&survivor, 0),
+            &Bytes::from_static(b"kept"),
+        )
+        .await
+        .unwrap();
+    let upper = staged_path(root.path(), &doomed, 0)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let mut scanner = StageFileScanner::default();
+    let mut held = false;
+    for _ in 0..64 {
+        scanner.scan(&stage, 1).unwrap();
+        let holds_doomed = std::fs::read_dir("/proc/self/fd").is_ok_and(|mut fds| {
+            fds.any(|fd| {
+                fd.ok()
+                    .and_then(|fd| std::fs::read_link(fd.path()).ok())
+                    .is_some_and(|target| target.starts_with(&upper))
+            })
+        });
+        if holds_doomed {
+            held = true;
+            break;
+        }
+        assert!(
+            scanner.physical_observation().is_none(),
+            "the first walk must not finish before it reaches the doomed shard"
+        );
+    }
+    if !cfg!(target_os = "linux") {
+        // The descriptor check needs Linux `/proc`.
+        return;
+    }
+    assert!(
+        held,
+        "the walk must hold a descriptor inside the doomed shard"
+    );
+    std::fs::remove_dir_all(&upper).unwrap();
+    let mut completed = None;
+    for _ in 0..64 {
+        scanner
+            .scan(&stage, 1)
+            .expect("a removed fan-out directory is not a failed walk");
+        if let Some(observation) = scanner.physical_observation() {
+            completed = Some(observation);
+            break;
+        }
+    }
+    let (_, bytes, files, unknown) = completed.expect("the walk completes");
+    assert_eq!((bytes, files, unknown), (4, 1, 0));
+}
+
 #[tokio::test]
 async fn stage_then_read_staged_round_trips_byte_identical_payload() {
     let root = ScratchRoot::new("roundtrip");

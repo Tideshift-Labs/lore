@@ -324,8 +324,9 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
         finalize_blocking,
         &[
             // Step 1: fan-out directories exist and are durable before anything
-            // is written under incoming/, let alone renamed.
-            "root.ensure_parent(resolved)?;",
+            // is written under incoming/, let alone renamed. Retried when a
+            // concurrent purge removed an empty fan-out directory (row 67).
+            "ensure_parent_retrying(root, resolved)?;",
             // Step 2: the payload lands in incoming/, never directly at its
             // final staged path.
             ".create_new(true)",
@@ -334,10 +335,17 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
             // Step 3: contents AND metadata are durable before the rename that
             // publishes them.
             "file.sync_all()",
-            // Step 4: atomic rename onto the content-derived identity.
+            // Step 4: atomic rename onto the content-derived identity. A rename
+            // into a directory a purge removed redoes step 1 before retrying.
             "fs::rename(&temporary, resolved.path())",
+            "ensure_parent_retrying(root, resolved)?;",
             // Step 5: the leaf directory entry is durable only after this.
             "sync_directory(resolved.parent())",
         ],
+    );
+    let retrying = function(&source, "fn ensure_parent_retrying(");
+    assert!(
+        retrying.contains("root.ensure_parent(resolved)"),
+        "every retry of step 1 is the real durable ensure_parent"
     );
 }

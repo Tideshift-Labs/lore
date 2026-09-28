@@ -174,6 +174,60 @@ pub struct WriteBehindSettings {
     pub sample_interval: Duration,
 }
 
+/// How staging admission reads one capacity observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityVerdict {
+    /// Every capacity predicate holds.
+    Available,
+    /// Only a physical inventory above its ledger bound failed. A walk and a
+    /// ledger read are not atomic, so this disagrees transiently while bodies
+    /// arrive and leave; it refuses only once it outlives the budget.
+    Reconciling,
+    /// A predicate that does not clear by waiting failed. It refuses at once.
+    Unavailable,
+}
+
+/// Staging admission's view of the capacity observations so far.
+///
+/// The budget is the one readiness gives `capacity_unavailable`: the same
+/// `drain_stale_after`, measured from the first sample of an unbroken run that
+/// was not `Available`. Before 2026-09-28 one reconciling sample refused
+/// staging, so each transient disagreement answered PUTs with `SlowDown` while
+/// readiness stayed green (INV-FT F2, WP-115 ledger row 67).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CapacityState {
+    /// The latest observation failed a predicate that refuses at once.
+    unavailable: bool,
+    /// When the current unbroken run of non-`Available` samples began. A hard
+    /// sample inside the run keeps its start, as readiness's run does.
+    unavailable_since: Option<std::time::Instant>,
+}
+
+impl CapacityState {
+    fn note(&mut self, verdict: CapacityVerdict, at: std::time::Instant) {
+        match verdict {
+            CapacityVerdict::Available => *self = Self::default(),
+            CapacityVerdict::Reconciling => {
+                self.unavailable = false;
+                self.unavailable_since.get_or_insert(at);
+            }
+            CapacityVerdict::Unavailable => {
+                self.unavailable = true;
+                self.unavailable_since.get_or_insert(at);
+            }
+        }
+    }
+
+    /// A failed observation changes nothing here: it is not evidence that room
+    /// returned, and a run already in progress keeps aging toward refusal.
+    fn refuses(&self, now: std::time::Instant, budget: Duration) -> bool {
+        self.unavailable
+            || self
+                .unavailable_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= budget)
+    }
+}
+
 /// The staging tier.
 ///
 /// Constructed once per store and shared. Holds the confined root, the admission
@@ -192,7 +246,7 @@ pub struct WriteBehindStage {
     pending_staged: AtomicBool,
     pending_observed: std::sync::Mutex<Option<std::time::Instant>>,
     observation_stale_after: Duration,
-    capacity_available: AtomicBool,
+    capacity: std::sync::Mutex<CapacityState>,
     min_free_bytes: u64,
     hard_limits: (u64, u64),
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
@@ -270,7 +324,7 @@ impl WriteBehindStage {
             pending_staged: AtomicBool::new(true),
             pending_observed: std::sync::Mutex::new(None),
             observation_stale_after: settings.drain_stale_after,
-            capacity_available: AtomicBool::new(true),
+            capacity: std::sync::Mutex::new(CapacityState::default()),
             min_free_bytes: settings.watermarks.min_free_bytes,
             hard_limits: (
                 settings.watermarks.hard_bytes,
@@ -289,11 +343,16 @@ impl WriteBehindStage {
             .ok()
             .and_then(|time| *time)
             .is_some_and(|time| time.elapsed() < self.observation_stale_after);
+        let capacity_refused = self
+            .capacity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .refuses(std::time::Instant::now(), self.observation_stale_after);
         staging_mode(
             &self.admission,
             fresh,
             self.pending_staged.load(Ordering::Acquire),
-            self.capacity_available.load(Ordering::Acquire),
+            capacity_refused,
         )
     }
 
@@ -332,8 +391,11 @@ impl WriteBehindStage {
         }
     }
 
-    pub(crate) fn note_capacity(&self, available: bool) {
-        self.capacity_available.store(available, Ordering::Release);
+    pub(crate) fn note_capacity(&self, verdict: CapacityVerdict) {
+        self.capacity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .note(verdict, std::time::Instant::now());
     }
 
     pub(crate) fn min_free_bytes(&self) -> u64 {
@@ -473,12 +535,12 @@ fn staging_mode(
     admission: &Admission,
     pending_fresh: bool,
     pending_staged: bool,
-    capacity_available: bool,
+    capacity_refused: bool,
 ) -> StagingMode {
     if admission.root_unavailable() && (!pending_fresh || pending_staged) {
         return StagingMode::Unready;
     }
-    if !capacity_available {
+    if capacity_refused {
         return StagingMode::Refuse;
     }
     admission.mode()
@@ -540,26 +602,81 @@ mod tests {
         admission
     }
 
-    /// Documented gap, not an endorsement. One false capacity sample refuses
-    /// staging at once, and the next true sample restores it at once. Unlike
-    /// readiness's sustained `capacity_unavailable` run, admission has no budget.
-    /// Whether to add one is a pending decision (WP-115 ledger row 67). This
-    /// pins current behavior so a change to it is deliberate.
+    /// Replaces the documented gap `documented_gap_one_false_capacity_sample_
+    /// refuses_staging_with_no_budget` (WP-115 ledger row 67, KV ruling
+    /// 2026-09-28). A reconciling sample keeps staging until its run outlives
+    /// the budget readiness uses; an available sample clears the run at once.
     #[test]
-    fn documented_gap_one_false_capacity_sample_refuses_staging_with_no_budget() {
+    fn a_reconciling_capacity_run_refuses_staging_only_once_it_outlives_the_budget() {
         let admission = staging_admission();
+        let budget = Duration::from_secs(5);
+        let start = Instant::now();
+        let mut capacity = CapacityState::default();
+        let mode = |capacity: &CapacityState, now: Instant| {
+            staging_mode(&admission, true, false, capacity.refuses(now, budget))
+        };
+        assert_eq!(mode(&capacity, start), StagingMode::Stage);
+
+        capacity.note(CapacityVerdict::Reconciling, start);
+        assert_eq!(mode(&capacity, start), StagingMode::Stage, "one sample");
+        capacity.note(CapacityVerdict::Reconciling, start + Duration::from_secs(4));
         assert_eq!(
-            staging_mode(&admission, true, false, true),
-            StagingMode::Stage
+            mode(&capacity, start + Duration::from_millis(4_999)),
+            StagingMode::Stage,
+            "the run is measured from its first sample, not its latest"
         );
         assert_eq!(
-            staging_mode(&admission, true, false, false),
+            mode(&capacity, start + budget),
+            StagingMode::Refuse,
+            "a run that outlives the budget refuses"
+        );
+
+        capacity.note(CapacityVerdict::Available, start + Duration::from_secs(6));
+        assert_eq!(
+            mode(&capacity, start + Duration::from_secs(6)),
+            StagingMode::Stage,
+            "an available sample clears the run at once"
+        );
+        capacity.note(CapacityVerdict::Reconciling, start + Duration::from_secs(7));
+        assert_eq!(
+            mode(&capacity, start + Duration::from_millis(11_999)),
+            StagingMode::Stage,
+            "a new run gets a fresh budget"
+        );
+    }
+
+    /// A predicate that waiting does not clear refuses on its first sample, and
+    /// the next available sample restores staging at once.
+    #[test]
+    fn a_hard_capacity_sample_refuses_staging_at_once() {
+        let admission = staging_admission();
+        let budget = Duration::from_secs(5);
+        let now = Instant::now();
+        let mut capacity = CapacityState::default();
+        capacity.note(CapacityVerdict::Unavailable, now);
+        assert_eq!(
+            staging_mode(&admission, true, false, capacity.refuses(now, budget)),
             StagingMode::Refuse
         );
+        capacity.note(CapacityVerdict::Available, now);
         assert_eq!(
-            staging_mode(&admission, true, false, true),
+            staging_mode(&admission, true, false, capacity.refuses(now, budget)),
             StagingMode::Stage
         );
+    }
+
+    /// A hard sample inside a reconciling run keeps the run's start, so the
+    /// reconciling samples after it do not get a fresh budget.
+    #[test]
+    fn a_hard_sample_inside_a_run_keeps_the_run_start() {
+        let budget = Duration::from_secs(5);
+        let start = Instant::now();
+        let mut capacity = CapacityState::default();
+        capacity.note(CapacityVerdict::Reconciling, start);
+        capacity.note(CapacityVerdict::Unavailable, start + Duration::from_secs(1));
+        capacity.note(CapacityVerdict::Reconciling, start + Duration::from_secs(2));
+        assert!(!capacity.refuses(start + Duration::from_millis(4_999), budget));
+        assert!(capacity.refuses(start + budget, budget));
     }
 
     #[tokio::test]

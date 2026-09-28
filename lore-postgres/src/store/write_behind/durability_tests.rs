@@ -311,3 +311,93 @@ fn existing_fanout_parent_fsync_failure_refuses_the_second_writer() {
         );
     }
 }
+
+// --- INV-FT F2 (WP-115 row 67): purge removes empty fan-out directories ---
+
+fn staged_file(root: &ConfinedRoot, hash: &[u8; 32], epoch: i64) -> super::ResolvedStagedPath {
+    root.resolve(hash, epoch, &derived_staged_key(hash, epoch).unwrap())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn purge_removes_the_empty_fanout_directories_but_keeps_staged() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_file(&root, &[0xab; 32], 1);
+    crate::store::write_behind::finalize::finalize(
+        &root,
+        &resolved,
+        &bytes::Bytes::from_static(b"x"),
+    )
+    .await
+    .unwrap();
+    root.remove_placement_blocking(&resolved, false).unwrap();
+    assert!(
+        !scratch.0.join("staged/ab/ab").exists(),
+        "leaf fan-out removed"
+    );
+    assert!(
+        !scratch.0.join("staged/ab").exists(),
+        "upper fan-out removed"
+    );
+    assert!(scratch.0.join("staged").is_dir(), "staged itself stays");
+    assert!(scratch.0.join("incoming").is_dir(), "incoming stays");
+}
+
+#[tokio::test]
+async fn purge_keeps_a_fanout_directory_that_still_holds_another_file() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let (first, second) = (
+        staged_file(&root, &[0xab; 32], 1),
+        staged_file(&root, &[0xab; 32], 2),
+    );
+    for resolved in [&first, &second] {
+        crate::store::write_behind::finalize::finalize(
+            &root,
+            resolved,
+            &bytes::Bytes::from_static(b"x"),
+        )
+        .await
+        .unwrap();
+    }
+    root.remove_placement_blocking(&first, false).unwrap();
+    assert!(
+        second.path().is_file(),
+        "the other file keeps its directory"
+    );
+    root.remove_placement_blocking(&first, false).unwrap();
+    root.remove_placement_blocking(&second, false).unwrap();
+    assert!(!scratch.0.join("staged/ab").exists());
+}
+
+/// A purge may remove a fan-out directory a concurrent finalizer has just
+/// made and not yet renamed into. The finalizer must redo step 1, not fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_purges_in_the_same_fanout_never_fail_a_finalize() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let hash = [0xab; 32];
+    let purger_root = root.clone();
+    let purger = std::thread::spawn(move || {
+        for epoch in 0..400 {
+            // Absent files still remove the empty fan-out: the race under test.
+            let resolved = staged_file(&purger_root, &hash, 1_000_000 + epoch);
+            purger_root
+                .remove_placement_blocking(&resolved, false)
+                .unwrap();
+        }
+    });
+    for epoch in 0..400 {
+        let resolved = staged_file(&root, &hash, epoch);
+        crate::store::write_behind::finalize::finalize(
+            &root,
+            &resolved,
+            &bytes::Bytes::from_static(b"x"),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("finalize {epoch} failed: {error}"));
+        root.remove_placement_blocking(&resolved, false).unwrap();
+    }
+    purger.join().unwrap();
+}

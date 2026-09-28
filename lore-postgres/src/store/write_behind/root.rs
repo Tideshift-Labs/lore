@@ -449,6 +449,8 @@ mod platform {
             let mut components = relative.components().peekable();
             let mut directory = self.verified_root_directory()?;
             let mut directory_path = self.inner.canonical.clone();
+            // Each opened level with the descriptor of the directory holding it.
+            let mut chain = Vec::new();
             while let Some(component) = components.next() {
                 let std::path::Component::Normal(name) = component else {
                     return Err(WriteBehindError::KeyMismatch);
@@ -470,7 +472,11 @@ mod platform {
                     }
                     // Even ENOENT needs this barrier: the prior unlink may
                     // have succeeded without its caller completing fsync.
-                    return sync_directory_handle(&directory, &directory_path);
+                    sync_directory_handle(&directory, &directory_path)?;
+                    if !temporary {
+                        remove_empty_fanout(&chain);
+                    }
+                    return Ok(());
                 }
                 // SAFETY: the parent fd remains live through the call; name
                 // contains exactly one path component. NOFOLLOW rejects
@@ -501,7 +507,7 @@ mod platform {
                     return Err(WriteBehindError::RootDeviceChanged);
                 }
                 directory_path.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
-                directory = child;
+                chain.push((std::mem::replace(&mut directory, child), name));
             }
             Err(WriteBehindError::KeyMismatch)
         }
@@ -514,6 +520,42 @@ mod platform {
             match free_bytes(&self.inner.canonical) {
                 Ok(free) => AdmissionSample::Reachable { free_bytes: free },
                 Err(_) => AdmissionSample::RootUnavailable,
+            }
+        }
+    }
+
+    /// How many fan-out levels above a purged staged file may be removed once
+    /// empty: `staged/<aa>/<bb>` loses `<bb>` then `<aa>`, never `staged`.
+    const REMOVABLE_FANOUT_LEVELS: usize = 2;
+
+    /// Remove the purged file's fan-out directories if they are now empty,
+    /// deepest first (INV-FT F2: empty directories made every physical walk
+    /// slower as the cell aged).
+    ///
+    /// `unlinkat(AT_REMOVEDIR)` removes only an empty directory, so a file a
+    /// concurrent finalizer has already renamed in keeps its directory
+    /// (`ENOTEMPTY`), and a directory a peer already removed is `ENOENT`. Either
+    /// stops the walk. Any other error also stops it without failing the purge,
+    /// because the file's removal is already durable and an empty directory is
+    /// only a cost. Each removal is relative to a descriptor this purge opened
+    /// with `O_NOFOLLOW` under the verified root and names one normal component.
+    /// A finalizer that loses its freshly made directory to this retries; see
+    /// `finalize_blocking`.
+    ///
+    /// The removal is not fsynced. A crash can bring back an empty directory,
+    /// which a later purge in it removes again.
+    fn remove_empty_fanout(chain: &[(fs::File, CString)]) {
+        if chain.len() <= REMOVABLE_FANOUT_LEVELS {
+            return;
+        }
+        for (parent, name) in chain.iter().rev().take(REMOVABLE_FANOUT_LEVELS) {
+            // SAFETY: `parent` owns a live directory fd for the call, and `name`
+            // is one NUL-terminated normal component. AT_REMOVEDIR removes only
+            // an empty directory and never follows a symlink.
+            let result =
+                unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) };
+            if result != 0 {
+                return;
             }
         }
     }

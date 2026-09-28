@@ -86,7 +86,7 @@ fn finalize_blocking(
     use std::io::Write as _;
 
     // Step 1, and it must precede the rename. See the module header.
-    root.ensure_parent(resolved)?;
+    ensure_parent_retrying(root, resolved)?;
 
     let key = resolved
         .path()
@@ -118,8 +118,23 @@ fn finalize_blocking(
         // Step 4. Atomic within one filesystem, which the recorded device
         // guarantees. The target cannot already exist: `(hash, epoch)` is unique
         // by construction and an epoch row is immutable.
-        fs::rename(&temporary, resolved.path())
-            .map_err(|error| WriteBehindError::io("staging rename", &error))?;
+        let mut attempt = 1;
+        loop {
+            match fs::rename(&temporary, resolved.path()) {
+                Ok(()) => break,
+                // Purge removes an empty fan-out directory, so the one step 1
+                // made can be gone by now. Redo step 1 first, so the rename
+                // still lands in a directory whose entry is durable.
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && attempt < PLACEMENT_ATTEMPTS =>
+                {
+                    attempt += 1;
+                    ensure_parent_retrying(root, resolved)?;
+                }
+                Err(error) => return Err(WriteBehindError::io("staging rename", &error)),
+            }
+        }
         #[cfg(feature = "failure_generator")]
         blocking_failpoint(async { crate::domain::fragments::failpoint!("stage.final.renamed") })
             .map_err(|_| WriteBehindError::Io {
@@ -137,6 +152,27 @@ fn finalize_blocking(
         let _ = root.remove_placement_blocking(resolved, true);
     }
     outcome
+}
+
+/// Bounded attempts at a step whose fan-out directory a concurrent purge removed.
+const PLACEMENT_ATTEMPTS: usize = 3;
+
+/// Step 1, retried when a concurrent purge removed a directory it just made or
+/// found. Each attempt syncs every level again, so the durability order holds.
+fn ensure_parent_retrying(
+    root: &ConfinedRoot,
+    resolved: &ResolvedStagedPath,
+) -> Result<(), WriteBehindError> {
+    let mut attempt = 1;
+    loop {
+        match root.ensure_parent(resolved) {
+            Err(WriteBehindError::Io {
+                kind: std::io::ErrorKind::NotFound,
+                ..
+            }) if attempt < PLACEMENT_ATTEMPTS => attempt += 1,
+            result => return result,
+        }
+    }
 }
 
 /// Finalization runs on a retained blocking worker. Its failpoint can wait on
