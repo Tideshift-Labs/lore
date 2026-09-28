@@ -70,7 +70,7 @@ pub enum ReceiverStoreError {
     Rejected(String),
 }
 
-/// The receiver's seven durable operations.
+/// The receiver's eight durable operations.
 #[async_trait]
 pub trait ReceiverStore: Send + Sync + std::fmt::Debug {
     /// The cell this store is scoped to.
@@ -122,8 +122,21 @@ pub trait ReceiverStore: Send + Sync + std::fmt::Debug {
         report: &CheckpointReport,
     ) -> Result<CheckpointOutcome, ReceiverStoreError>;
 
+    /// Project this generation's final checkpoint and mark it `draining`, in
+    /// one transaction. The graceful-shutdown write (WP-115 row 68): it is the
+    /// proof `loreserver outbox retire-generation` needs that this receiver
+    /// stopped rather than went idle.
+    ///
+    /// # Errors
+    /// [`ReceiverStoreError`] when the write could not complete.
+    async fn report_draining_checkpoint(
+        &self,
+        report: &CheckpointReport,
+    ) -> Result<CheckpointOutcome, ReceiverStoreError>;
+
     /// Compare-and-set this generation to ready, rereading the authoritative
-    /// placement.
+    /// placement. A `draining` generation moves back to ready on the same
+    /// proof, which is how a restarted receiver resumes it.
     ///
     /// # Errors
     /// [`ReceiverStoreError`] when the write could not complete.
@@ -285,6 +298,20 @@ impl ReceiverStore for PostgresReceiverStore {
         .map_err(classify)
     }
 
+    async fn report_draining_checkpoint(
+        &self,
+        report: &CheckpointReport,
+    ) -> Result<CheckpointOutcome, ReceiverStoreError> {
+        let mut client = self.pool.get().await.map_err(pool_error)?;
+        lore_postgres::domain::outbox::checkpoint::report_draining_checkpoint(
+            &mut client,
+            &self.cell_id,
+            report,
+        )
+        .await
+        .map_err(classify)
+    }
+
     async fn readiness_cas(
         &self,
         receiver_identity: &str,
@@ -332,6 +359,7 @@ enum Override {
     Capture(Result<MembershipCas, ReceiverStoreError>),
     Baseline(Result<MembershipCas, ReceiverStoreError>),
     Checkpoint(Result<CheckpointOutcome, ReceiverStoreError>),
+    DrainingCheckpoint(Result<CheckpointOutcome, ReceiverStoreError>),
     Readiness(Result<MembershipCas, ReceiverStoreError>),
 }
 
@@ -361,6 +389,8 @@ pub enum StoreCall {
     },
     /// A checkpoint report.
     Checkpoint(Box<CheckpointReport>),
+    /// A graceful-shutdown checkpoint report that also marks `draining`.
+    DrainingCheckpoint(Box<CheckpointReport>),
     /// A readiness compare-and-set.
     Readiness {
         /// The generation the CAS was attempted for.
@@ -537,6 +567,31 @@ impl InMemoryReceiverStore {
     pub fn next_checkpoint(&self, outcome: Result<CheckpointOutcome, ReceiverStoreError>) -> &Self {
         self.push_override(Override::Checkpoint(outcome));
         self
+    }
+
+    /// Script the next [`ReceiverStore::report_draining_checkpoint`].
+    pub fn next_draining_checkpoint(
+        &self,
+        outcome: Result<CheckpointOutcome, ReceiverStoreError>,
+    ) -> &Self {
+        self.push_override(Override::DrainingCheckpoint(outcome));
+        self
+    }
+
+    /// The state of one member row, as the store holds it now.
+    pub fn member_state(
+        &self,
+        receiver_identity: &str,
+        membership_generation: i64,
+    ) -> Option<String> {
+        self.lock()
+            .members
+            .iter()
+            .find(|member| {
+                member.receiver_identity == receiver_identity
+                    && member.membership_generation == membership_generation
+            })
+            .map(|member| member.state.clone())
     }
 
     /// Script the next [`ReceiverStore::readiness_cas`].
@@ -800,6 +855,66 @@ impl ReceiverStore for InMemoryReceiverStore {
         })
     }
 
+    async fn report_draining_checkpoint(
+        &self,
+        report: &CheckpointReport,
+    ) -> Result<CheckpointOutcome, ReceiverStoreError> {
+        self.record(StoreCall::DrainingCheckpoint(Box::new(report.clone())));
+        if let Some(scripted) = self.take_override(|value| match value {
+            Override::DrainingCheckpoint(outcome) => Some(outcome.clone()),
+            _ => None,
+        }) {
+            return scripted;
+        }
+        let mut state = self.lock();
+        // Step C's order: the version fence, then the generation's own state,
+        // and only then the projection and the marker, both or neither.
+        if report.membership_version != state.membership_version {
+            return Ok(CheckpointOutcome::MembershipVersionConflict {
+                current_membership_version: state.membership_version,
+            });
+        }
+        let member_state =
+            match state.member_mut(&report.receiver_identity, report.membership_generation) {
+                Some(member) => member.state.clone(),
+                None => return Ok(CheckpointOutcome::GenerationNotFound),
+            };
+        if member_state == "retired" {
+            return Ok(CheckpointOutcome::RetiredGeneration);
+        }
+        if member_state != "ready" && member_state != "draining" {
+            return Ok(CheckpointOutcome::NotDrainable {
+                state: member_state,
+            });
+        }
+        state.frontier = Some(report.contiguous_frontier);
+        let now = SystemTime::UNIX_EPOCH;
+        upsert_checkpoint(
+            &mut state.checkpoints,
+            CheckpointRecord {
+                cell_id: self.cell_id.clone(),
+                stream_identity: report.stream_identity.clone(),
+                stream_epoch: report.stream_epoch,
+                receiver_identity: report.receiver_identity.clone(),
+                membership_generation: report.membership_generation,
+                membership_version: report.membership_version,
+                contiguous_frontier: report.contiguous_frontier,
+                gaps: report.gaps.clone(),
+                poison: report.poison.clone(),
+                reported_at: now,
+                projection_at: now,
+            },
+        );
+        if let Some(member) =
+            state.member_mut(&report.receiver_identity, report.membership_generation)
+        {
+            member.state = "draining".to_string();
+        }
+        Ok(CheckpointOutcome::Applied {
+            contiguous_frontier: report.contiguous_frontier,
+        })
+    }
+
     async fn readiness_cas(
         &self,
         receiver_identity: &str,
@@ -837,6 +952,39 @@ impl ReceiverStore for InMemoryReceiverStore {
         // BEFORE rereading the placement.
         if member_state == "ready" {
             return Ok(MembershipCas::AlreadyRecorded);
+        }
+        // A restart resuming the generation its graceful shutdown marked
+        // `draining`: back to ready on a matching placement and a checkpoint
+        // at it, no version bump, never retired here on a mismatch.
+        if member_state == "draining" {
+            let placement_matches = captured.as_ref().is_some_and(|captured| {
+                state.current_stream_identity.as_deref() == Some(captured.stream_identity.as_str())
+                    && state.current_stream_epoch == Some(captured.stream_epoch)
+            });
+            if !placement_matches {
+                return Ok(MembershipCas::PlacementMoved {
+                    current_stream_identity: state.current_stream_identity.clone(),
+                    current_stream_epoch: state.current_stream_epoch,
+                });
+            }
+            let checkpointed = state.checkpoints.iter().any(|record| {
+                record.receiver_identity == receiver_identity
+                    && record.membership_generation == membership_generation
+                    && Some(record.stream_identity.as_str())
+                        == state.current_stream_identity.as_deref()
+                    && Some(record.stream_epoch) == state.current_stream_epoch
+            });
+            if !checkpointed {
+                return Ok(MembershipCas::NoCheckpointAtCurrentPlacement);
+            }
+            let membership_version = state.membership_version;
+            if let Some(member) = state.member_mut(receiver_identity, membership_generation) {
+                member.state = "ready".to_string();
+            }
+            return Ok(MembershipCas::Applied {
+                membership_version,
+                membership_generation,
+            });
         }
         if member_state != "joining" {
             return Ok(MembershipCas::WrongState {

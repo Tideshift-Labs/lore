@@ -46,6 +46,8 @@ use crate::domain::outbox::membership::validate_cell_id;
 use crate::domain::outbox::membership::validate_receiver_identity;
 use crate::domain::outbox::membership::validate_stream;
 use crate::domain::outbox::schema::MAX_CHECKPOINT_BLOCKERS;
+use crate::domain::outbox::schema::MEMBERSHIP_STATE_DRAINING;
+use crate::domain::outbox::schema::MEMBERSHIP_STATE_READY;
 use crate::domain::outbox::schema::MEMBERSHIP_STATE_RETIRED;
 use crate::domain::retry::classify_commit;
 
@@ -173,6 +175,13 @@ pub enum CheckpointOutcome {
     FrontierRegressed {
         /// The frontier still on the row.
         current_contiguous_frontier: i64,
+    },
+    /// [`report_draining_checkpoint`] only: the generation is not `ready` or
+    /// `draining`, so it has no graceful stop to record. Refused whole; the
+    /// projection and the membership row are unchanged.
+    NotDrainable {
+        /// The state the generation is in.
+        state: String,
     },
 }
 
@@ -355,6 +364,47 @@ pub async fn report_checkpoint(
     cell_id: &str,
     report: &CheckpointReport,
 ) -> Result<CheckpointOutcome, DomainError> {
+    report_checkpoint_inner(client, cell_id, report, false).await
+}
+
+/// Persist a receiver's final checkpoint and mark its generation `draining`,
+/// in one transaction (WP-115 row 68).
+///
+/// The receiver calls this on graceful shutdown. `draining` is the fact
+/// [`super::membership::retire_generation`]'s graceful path requires: a
+/// caught-up frontier proves the receiver drained, and only the receiver
+/// itself can say it stopped. Writing both in one transaction means a
+/// `draining` row always carries the frontier the receiver stopped at, so the
+/// retirement proof never reads a stale checkpoint beside a fresh marker.
+///
+/// Every fence [`report_checkpoint`] applies applies here, in the same order.
+/// Beyond them, the generation must be `ready` or already `draining`; a
+/// `joining` generation never proved readiness, so it has no graceful stop to
+/// record and the whole call is refused with [`CheckpointOutcome::NotDrainable`].
+///
+/// The cell's membership version is not bumped. `draining` still counts toward
+/// safety exactly as `ready` does
+/// ([`super::membership::MembershipMember::counts_toward_safety`]), so the
+/// required set an evaluation reads is unchanged, and bumping would make the
+/// evaluator's own compare-and-set retry for nothing.
+///
+/// A receiver that restarts on a `draining` generation resumes it:
+/// [`super::membership::readiness_cas`] moves it back to `ready` after the
+/// same placement and checkpoint proof a fresh generation passes.
+pub async fn report_draining_checkpoint(
+    client: &mut deadpool_postgres::Client,
+    cell_id: &str,
+    report: &CheckpointReport,
+) -> Result<CheckpointOutcome, DomainError> {
+    report_checkpoint_inner(client, cell_id, report, true).await
+}
+
+async fn report_checkpoint_inner(
+    client: &mut deadpool_postgres::Client,
+    cell_id: &str,
+    report: &CheckpointReport,
+    mark_draining: bool,
+) -> Result<CheckpointOutcome, DomainError> {
     validate_cell_id(cell_id)?;
     validate_report(report)?;
 
@@ -430,6 +480,15 @@ pub async fn report_checkpoint(
     if current_state == MEMBERSHIP_STATE_RETIRED {
         drop(tx);
         return Ok(CheckpointOutcome::RetiredGeneration);
+    }
+    if mark_draining
+        && current_state != MEMBERSHIP_STATE_READY
+        && current_state != MEMBERSHIP_STATE_DRAINING
+    {
+        drop(tx);
+        return Ok(CheckpointOutcome::NotDrainable {
+            state: current_state,
+        });
     }
 
     let gap_starts: Vec<i64> = report.gaps.iter().map(|gap| gap.from).collect();
@@ -516,6 +575,41 @@ pub async fn report_checkpoint(
         });
     };
     let contiguous_frontier: i64 = row.get("contiguous_frontier");
+
+    // The marker, in the checkpoint's own transaction. The `FOR SHARE` on the
+    // cell row above still holds, so no retirement or reset can move this
+    // generation between the state read and this write. An already draining
+    // generation (a repeated shutdown report) is left as it is.
+    if mark_draining && current_state == MEMBERSHIP_STATE_READY {
+        let marked = tx
+            .execute(
+                "UPDATE lore_outbox_receiver_membership SET \
+                     state = 'draining', \
+                     membership_version = $4, \
+                     updated_at = clock_timestamp() \
+                 WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3 \
+                   AND state = 'ready'",
+                &[
+                    &cell_id,
+                    &report.receiver_identity,
+                    &report.membership_generation,
+                    &current_membership_version,
+                ],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("outbox checkpoint draining mark", e))?;
+        if marked != 1 {
+            // Every membership writer takes the cell row `FOR UPDATE`, which
+            // this transaction's share lock excludes, so the state read above
+            // cannot have changed.
+            drop(tx);
+            return Err(DomainError::Internal(format!(
+                "outbox draining mark of {:?} generation {} in cell {cell_id} updated {marked} \
+                 rows under the cell's share lock",
+                report.receiver_identity, report.membership_generation
+            )));
+        }
+    }
 
     classify_commit(tx.commit().await, "outbox checkpoint commit")?;
     Ok(CheckpointOutcome::Applied {

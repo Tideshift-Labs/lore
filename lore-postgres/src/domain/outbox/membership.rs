@@ -64,6 +64,9 @@ use crate::domain::outbox::schema::MEMBERSHIP_STATE_RETIRED;
 use crate::domain::outbox::schema::PLACEHOLDER_GENERATION;
 use crate::domain::outbox::schema::REQUIRED_REPLACEMENT_PLACEHOLDER;
 use crate::domain::outbox::schema::RESET_STATE_CLEARED;
+use crate::domain::outbox::schema::RETIREMENT_BASIS_CONFIRMED_STOPPED;
+use crate::domain::outbox::schema::RETIREMENT_BASIS_GRACEFUL_DRAIN;
+use crate::domain::outbox::schema::RETIREMENT_BASIS_REPLACEMENT;
 use crate::domain::outbox::schema::is_valid_cell_id;
 use crate::domain::retry::classify_commit;
 
@@ -114,9 +117,11 @@ impl MembershipMember {
 
     /// Whether this generation's frontier is what a safety evaluation reads.
     ///
-    /// `draining` counts: a member shutting down is still consuming and still
-    /// retires only after its final checkpoint, so crediting safety without it
-    /// would release rows it has not acknowledged.
+    /// `draining` counts. The receiver stopped gracefully and reported its
+    /// final checkpoint ([`super::checkpoint::report_draining_checkpoint`]), but
+    /// it stays required until an operator retires it or its own restart
+    /// resumes it: crediting safety without it would release rows above the
+    /// frontier it stopped at, which nothing has acknowledged.
     pub fn counts_toward_safety(&self) -> bool {
         self.state == MEMBERSHIP_STATE_READY || self.state == MEMBERSHIP_STATE_DRAINING
     }
@@ -298,6 +303,15 @@ pub enum MembershipCas {
     /// release every row above its frontier, so this is a refusal rather than a
     /// warning.
     RetirementUnproven,
+    /// The retirement was refused because the generation's checkpoint has
+    /// caught up but nothing proves the receiver stopped: it is not `draining`
+    /// (its graceful shutdown never marked it) and the operator did not
+    /// confirm the stop. A caught-up frontier on a live receiver proves only
+    /// that it was idle.
+    ReceiverNotStopped {
+        /// The state the generation is in.
+        state: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +888,73 @@ pub async fn readiness_cas(
         drop(tx);
         return Ok(MembershipCas::AlreadyRecorded);
     }
+    // A receiver resuming the generation its graceful shutdown marked
+    // `draining` (WP-115 row 68). It moves back to `ready` only on the proof a
+    // joining generation needs (captured placement still current, a checkpoint
+    // at it), minus the fence exit: an accepted reset retires
+    // every generation, so no draining one survives into a fence. The cell
+    // version is not bumped, because `draining` and `ready` count toward safety
+    // alike and the required set is unchanged. A retirement racing this is
+    // serialised by the cell row's `FOR UPDATE` above: whichever commits first
+    // wins, and the loser sees `retired` or `ready`.
+    if member.state == MEMBERSHIP_STATE_DRAINING {
+        let placement_matches = member.captured.as_ref().is_some_and(|captured| {
+            state.current_stream_identity.as_deref() == Some(captured.stream_identity.as_str())
+                && state.current_stream_epoch == Some(captured.stream_epoch)
+        });
+        if !placement_matches {
+            drop(tx);
+            // Not retired here, unlike the joining path: an operator may still
+            // be proving this generation's drain, and the successor a
+            // receiver starts instead outranks it in the required set anyway.
+            return Ok(MembershipCas::PlacementMoved {
+                current_stream_identity: state.current_stream_identity,
+                current_stream_epoch: state.current_stream_epoch,
+            });
+        }
+        let checkpointed: bool = tx
+            .query_one(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM lore_outbox_checkpoints \
+                     WHERE stream_identity = $1 AND stream_epoch = $2 \
+                       AND receiver_identity = $3 AND membership_generation = $4 \
+                 ) AS checkpointed",
+                &[
+                    &state.current_stream_identity,
+                    &state.current_stream_epoch,
+                    &receiver_identity,
+                    &membership_generation,
+                ],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("outbox readiness cas resume checkpoint probe", e))?
+            .get("checkpointed");
+        if !checkpointed {
+            drop(tx);
+            return Ok(MembershipCas::NoCheckpointAtCurrentPlacement);
+        }
+        tx.execute(
+            "UPDATE lore_outbox_receiver_membership SET \
+                 state = 'ready', \
+                 membership_version = $4, \
+                 updated_at = clock_timestamp() \
+             WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3 \
+               AND state = 'draining'",
+            &[
+                &cell_id,
+                &receiver_identity,
+                &membership_generation,
+                &state.membership_version,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("outbox readiness cas resume draining", e))?;
+        classify_commit(tx.commit().await, "outbox readiness cas resume commit")?;
+        return Ok(MembershipCas::Applied {
+            membership_version: state.membership_version,
+            membership_generation,
+        });
+    }
     if member.state != "joining" {
         drop(tx);
         return Ok(MembershipCas::WrongState {
@@ -1022,17 +1103,37 @@ pub async fn readiness_cas(
 /// The contract gives exactly two ways a generation may leave, and this
 /// **enforces both** rather than documenting them as a caller obligation:
 ///
-/// * **graceful drain** — the generation's persisted checkpoint at the cell's
-///   current placement has reached the committed frontier: it carries no
-///   unresolved gap or poison park, and no row this cell's relay recorded as
-///   `broker_accepted` on that stream and epoch has a broker sequence above its
-///   contiguous frontier. So every publication the broker accepted is already
-///   acknowledged by this generation; or
+/// * **graceful drain** — the receiver **stopped**, and the generation's
+///   persisted checkpoint at the cell's current placement has reached the
+///   committed frontier: it carries no unresolved gap or poison park, and no
+///   row this cell's relay recorded as `broker_accepted` on that stream and
+///   epoch has a broker sequence above its contiguous frontier. So every
+///   publication the broker accepted is already acknowledged by this
+///   generation; or
 /// * **hard-dead replacement** — a strictly greater generation for the same
 ///   receiver is already `ready`, which by [`readiness_cas`] means it captured,
 ///   baselined, drained, and checkpointed at the current placement.
 ///
-/// Neither holding is [`MembershipCas::RetirementUnproven`]. The alternative —
+/// "Stopped" has two proofs (KV ruling 2026-09-28, WP-115 row 68). The normal
+/// one is the `draining` marker the receiver's own graceful shutdown writes
+/// with its final checkpoint
+/// ([`super::checkpoint::report_draining_checkpoint`]). The escape hatch is
+/// `confirm_receiver_stopped`: the operator's audited word that a receiver
+/// which died without a graceful stop is gone. It replaces only the marker;
+/// the frontier must still have caught up. A caught-up generation with
+/// neither is [`MembershipCas::ReceiverNotStopped`], because a live idle
+/// receiver has a caught-up frontier too: retiring it would drop it from the
+/// required set while it still consumes, and a newly accepted row could then
+/// become `consumer_safe` and prunable before it acknowledged the row. The
+/// replacement path needs no stop proof: the ready successor is itself
+/// required, so nothing is released.
+///
+/// The row records which proof held in `retirement_basis`: `graceful_drain`,
+/// `replacement`, or `confirmed_stopped`, checked in that order, so the flag
+/// is recorded only when it was the proof that retired the generation.
+///
+/// Neither contract precondition holding is
+/// [`MembershipCas::RetirementUnproven`]. The alternative —
 /// retiring on request — is not a smaller version of this: retiring a lagging
 /// current generation drops it out of
 /// [`MembershipSnapshot::required_members`], and the very next evaluation takes
@@ -1072,24 +1173,17 @@ pub async fn readiness_cas(
 /// [`super::relay::record_broker_accepted`] has not committed yet is invisible
 /// here.
 ///
-/// **The graceful path proves the frontier caught up, not that the receiver
-/// stopped.** Nothing marks a generation `draining` today: the schema admits
-/// the state, but no writer sets it, and a receiver's graceful shutdown only
-/// reports a final checkpoint. So a live, idle, caught-up receiver satisfies
-/// the drain proof and is retired while still running. It learns this only
-/// when its next checkpoint report answers `RetiredGeneration`
-/// (`remote_notification/receiver.rs`, `checkpoint`), and it reports only
-/// when a checkpoint is due: after an acknowledgement or park, at
-/// `checkpoint_every_events` or `checkpoint_interval`. An idle receiver whose
-/// frontier is already reported never reports, so the window stays open
-/// while the stream is idle and closes no sooner than one checkpoint cadence
-/// after deliveries resume. Until it closes, and until the successor
-/// generation's `joining` row exists, this receiver has no required member:
-/// a newly accepted row is evaluated against the other members' frontiers
-/// alone and can become `consumer_safe`, then prunable, before this receiver
-/// acknowledges it. With no other member, the empty required set refuses
-/// the evaluation instead. Operators should retire a live receiver's
-/// generation only after that receiver has stopped.
+/// **`confirm_receiver_stopped` on a receiver that is in fact running** puts
+/// back the window the marker closes. The receiver learns it was retired only
+/// when its next checkpoint report answers `RetiredGeneration`, and an idle
+/// receiver whose frontier is already reported does not report. Until then
+/// it has no required member, so rows accepted meanwhile are evaluated
+/// without it. That is why the flag is audited rather than silent.
+///
+/// A `draining` receiver that restarts before it is retired resumes its
+/// generation through [`readiness_cas`], which moves it back to `ready`; a
+/// retirement that commits first wins, and the restarted receiver then
+/// starts a new generation.
 ///
 /// The reset fence's placeholder (`receiver_identity`
 /// [`REQUIRED_REPLACEMENT_PLACEHOLDER`], generation
@@ -1097,9 +1191,9 @@ pub async fn readiness_cas(
 /// [`readiness_cas`] removes it, after a real replacement proves itself;
 /// retiring it here would empty the required set in the middle of a reset.
 ///
-/// `actor` and `reason` are the operator audit, written to the row by the same
-/// statement that retires it. A rerun on an already retired generation writes
-/// nothing, so the first audit stands.
+/// `actor`, `reason`, and the basis are the operator audit, written to the row
+/// by the same statement that retires it. A rerun on an already retired
+/// generation writes nothing, so the first audit stands.
 ///
 /// Production caller: `loreserver outbox retire-generation`
 /// (`lore-server/src/event_relay/operator.rs`), WP-115 ledger row 68.
@@ -1110,6 +1204,7 @@ pub async fn retire_generation(
     membership_generation: i64,
     actor: &str,
     reason: &str,
+    confirm_receiver_stopped: bool,
 ) -> Result<MembershipCas, DomainError> {
     validate_cell_id(cell_id)?;
     validate_receiver_identity(receiver_identity)?;
@@ -1162,7 +1257,8 @@ pub async fn retire_generation(
         drop(tx);
         return Ok(MembershipCas::GenerationNotFound);
     };
-    if member_from(&member_row).is_retired() {
+    let member = member_from(&member_row);
+    if member.is_retired() {
         drop(tx);
         return Ok(MembershipCas::AlreadyRecorded);
     }
@@ -1182,10 +1278,11 @@ pub async fn retire_generation(
     // the planner can prove it implies `lore_outbox_events_accepted_sequence`'s
     // partial predicate; the scan is then one index probe above the frontier.
     // The stream and epoch bound it, not the cell: a checkpoint's frontier
-    // counts broker sequences on the whole stream.
-    let proven: bool = tx
+    // counts broker sequences on the whole stream. The member row is locked
+    // `FOR UPDATE` above, so the state read with it is still current here.
+    let proofs = tx
         .query_one(
-            "SELECT ( \
+            "SELECT \
                  EXISTS ( \
                      SELECT 1 FROM lore_outbox_checkpoints AS checkpoint \
                       WHERE checkpoint.stream_identity = $4 \
@@ -1201,14 +1298,13 @@ pub async fn retire_generation(
                                AND event.stream_epoch = $5 \
                                AND event.broker_sequence > checkpoint.contiguous_frontier \
                         ) \
-                 ) \
-                 OR EXISTS ( \
+                 ) AS caught_up, \
+                 EXISTS ( \
                      SELECT 1 FROM lore_outbox_receiver_membership \
                       WHERE cell_id = $1 AND receiver_identity = $2 \
                         AND membership_generation > $3 \
                         AND state = 'ready' \
-                 ) \
-             ) AS proven",
+                 ) AS replaced",
             &[
                 &cell_id,
                 &receiver_identity,
@@ -1218,12 +1314,17 @@ pub async fn retire_generation(
             ],
         )
         .await
-        .map_err(|e| DomainError::from_pg("outbox retire precondition probe", e))?
-        .get("proven");
-    if !proven {
-        drop(tx);
-        return Ok(MembershipCas::RetirementUnproven);
-    }
+        .map_err(|e| DomainError::from_pg("outbox retire precondition probe", e))?;
+    let caught_up: bool = proofs.get("caught_up");
+    let replaced: bool = proofs.get("replaced");
+    let basis = match retirement_basis(&member.state, caught_up, replaced, confirm_receiver_stopped)
+    {
+        Ok(basis) => basis,
+        Err(refusal) => {
+            drop(tx);
+            return Ok(refusal);
+        }
+    };
 
     let updated = tx
         .execute(
@@ -1232,6 +1333,7 @@ pub async fn retire_generation(
                  membership_version = $4, \
                  retirement_actor = $5, \
                  retirement_reason = $6, \
+                 retirement_basis = $7, \
                  retirement_recorded_at = clock_timestamp(), \
                  updated_at = clock_timestamp() \
              WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3 \
@@ -1243,6 +1345,7 @@ pub async fn retire_generation(
                 &membership_version,
                 &actor,
                 &reason,
+                &basis,
             ],
         )
         .await
@@ -1262,6 +1365,36 @@ pub async fn retire_generation(
         membership_version,
         membership_generation,
     })
+}
+
+/// Decide which proof retires a generation, or which refusal applies.
+///
+/// Pure, so the order is pinned by a unit test rather than only by live cases:
+/// the graceful drain first, then replacement, then the operator's
+/// confirmation. The confirmation is last so the audit records it only when
+/// it was the proof that held, never beside a proof that needed no word from
+/// anyone.
+fn retirement_basis(
+    state: &str,
+    caught_up: bool,
+    replaced: bool,
+    confirm_receiver_stopped: bool,
+) -> Result<&'static str, MembershipCas> {
+    if caught_up && state == MEMBERSHIP_STATE_DRAINING {
+        return Ok(RETIREMENT_BASIS_GRACEFUL_DRAIN);
+    }
+    if replaced {
+        return Ok(RETIREMENT_BASIS_REPLACEMENT);
+    }
+    if caught_up && confirm_receiver_stopped {
+        return Ok(RETIREMENT_BASIS_CONFIRMED_STOPPED);
+    }
+    if caught_up {
+        return Err(MembershipCas::ReceiverNotStopped {
+            state: state.to_owned(),
+        });
+    }
+    Err(MembershipCas::RetirementUnproven)
 }
 
 /// Install the reset fence's required-replacement placeholder.
@@ -1617,6 +1750,100 @@ mod tests {
         // safe sequence would be the minimum over one member instead of two.
         assert_eq!(stranded.required_members().len(), 1);
         assert_eq!(stranded.safety_block(), None);
+    }
+
+    /// WP-115 row 68: a caught-up frontier alone never retires a generation.
+    /// The stop proof is the `draining` marker or the operator's confirmation,
+    /// and the audit names the flag only when it was the proof that held.
+    #[test]
+    fn a_caught_up_generation_retires_only_with_a_stop_proof() {
+        use crate::domain::outbox::schema::MEMBERSHIP_STATE_JOINING;
+
+        // (state, caught_up, replaced, confirm) -> expected
+        type Case = (
+            &'static str,
+            bool,
+            bool,
+            bool,
+            Result<&'static str, MembershipCas>,
+        );
+        let cases: [Case; 9] = [
+            (
+                MEMBERSHIP_STATE_DRAINING,
+                true,
+                false,
+                false,
+                Ok(RETIREMENT_BASIS_GRACEFUL_DRAIN),
+            ),
+            // The flag is not recorded when the marker already proved the stop.
+            (
+                MEMBERSHIP_STATE_DRAINING,
+                true,
+                true,
+                true,
+                Ok(RETIREMENT_BASIS_GRACEFUL_DRAIN),
+            ),
+            (
+                MEMBERSHIP_STATE_READY,
+                true,
+                false,
+                false,
+                Err(MembershipCas::ReceiverNotStopped {
+                    state: MEMBERSHIP_STATE_READY.to_owned(),
+                }),
+            ),
+            (
+                MEMBERSHIP_STATE_READY,
+                true,
+                false,
+                true,
+                Ok(RETIREMENT_BASIS_CONFIRMED_STOPPED),
+            ),
+            (
+                MEMBERSHIP_STATE_JOINING,
+                true,
+                false,
+                true,
+                Ok(RETIREMENT_BASIS_CONFIRMED_STOPPED),
+            ),
+            // The flag never stands in for the frontier.
+            (
+                MEMBERSHIP_STATE_READY,
+                false,
+                false,
+                true,
+                Err(MembershipCas::RetirementUnproven),
+            ),
+            (
+                MEMBERSHIP_STATE_DRAINING,
+                false,
+                false,
+                false,
+                Err(MembershipCas::RetirementUnproven),
+            ),
+            // Hard-dead replacement needs no stop proof and no frontier.
+            (
+                MEMBERSHIP_STATE_JOINING,
+                false,
+                true,
+                false,
+                Ok(RETIREMENT_BASIS_REPLACEMENT),
+            ),
+            (
+                MEMBERSHIP_STATE_READY,
+                true,
+                true,
+                true,
+                Ok(RETIREMENT_BASIS_REPLACEMENT),
+            ),
+        ];
+        for (state, caught_up, replaced, confirm, expected) in cases {
+            assert_eq!(
+                retirement_basis(state, caught_up, replaced, confirm),
+                expected,
+                "state {state} caught_up {caught_up} replaced {replaced} confirm {confirm}"
+            );
+        }
     }
 
     #[test]

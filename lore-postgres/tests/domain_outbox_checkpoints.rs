@@ -755,6 +755,16 @@ async fn retire(
     receiver_identity: &str,
     generation: i64,
 ) -> MembershipCas {
+    retire_with(deadpool, cell_id, receiver_identity, generation, false).await
+}
+
+async fn retire_with(
+    deadpool: &mut deadpool_postgres::Client,
+    cell_id: &str,
+    receiver_identity: &str,
+    generation: i64,
+    confirm_receiver_stopped: bool,
+) -> MembershipCas {
     membership::retire_generation(
         deadpool,
         cell_id,
@@ -762,6 +772,7 @@ async fn retire(
         generation,
         RETIRE_ACTOR,
         RETIRE_REASON,
+        confirm_receiver_stopped,
     )
     .await
     .expect("retire call")
@@ -789,6 +800,48 @@ async fn retirement_audit(
         row.get("retirement_reason"),
         row.get("recorded"),
     )
+}
+
+/// `retirement_basis`: which proof retired the generation (migration 0008).
+async fn retirement_basis(
+    raw: &Client,
+    cell_id: &str,
+    receiver_identity: &str,
+    generation: i64,
+) -> Option<String> {
+    raw.query_one(
+        "SELECT retirement_basis FROM lore_outbox_receiver_membership \
+          WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3",
+        &[&cell_id, &receiver_identity, &generation],
+    )
+    .await
+    .expect("read retirement basis")
+    .get("retirement_basis")
+}
+
+/// The receiver's graceful-shutdown write: its final checkpoint at `frontier`
+/// and the `draining` marker, in one call.
+async fn drain(
+    deadpool: &mut deadpool_postgres::Client,
+    raw: &Client,
+    cell_id: &str,
+    receiver_identity: &str,
+    generation: i64,
+    frontier: i64,
+) -> CheckpointOutcome {
+    let report = CheckpointReport {
+        stream_identity: "DURABLE-x".to_string(),
+        stream_epoch: 1,
+        receiver_identity: receiver_identity.to_string(),
+        membership_generation: generation,
+        membership_version: current_membership_version(raw, cell_id).await,
+        contiguous_frontier: frontier,
+        gaps: Vec::new(),
+        poison: Vec::new(),
+    };
+    checkpoint::report_draining_checkpoint(deadpool, cell_id, &report)
+        .await
+        .expect("draining checkpoint call")
 }
 
 async fn member_state(raw: &Client, cell_id: &str, generation: i64) -> String {
@@ -856,9 +909,11 @@ async fn retire_generation_refuses_a_generation_with_no_checkpoint_and_no_ready_
     namespace.release().await;
 }
 
-/// Graceful drain: a generation whose checkpoint has reached every
+/// Graceful drain: a generation whose receiver stopped gracefully (its
+/// shutdown marked it `draining`) and whose checkpoint has reached every
 /// broker-accepted row on the current stream and epoch retires, records the
-/// operator audit, and a second call is idempotent and keeps the first audit.
+/// operator audit with the `graceful_drain` basis, and a second call is
+/// idempotent and keeps the first audit.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
@@ -893,6 +948,29 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
     .await;
     let version_before = current_membership_version(&raw, &cell_id).await;
 
+    // The receiver stops gracefully: the same frontier it already reported,
+    // plus the marker. Neither bumps the snapshot version.
+    assert_eq!(
+        drain(
+            &mut deadpool,
+            &raw,
+            &cell_id,
+            "loreserver-1",
+            generation,
+            40
+        )
+        .await,
+        CheckpointOutcome::Applied {
+            contiguous_frontier: 40
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "draining");
+    assert_eq!(
+        current_membership_version(&raw, &cell_id).await,
+        version_before,
+        "the draining marker leaves the required set, and so the version, unchanged"
+    );
+
     let outcome = retire(&mut deadpool, &cell_id, "loreserver-1", generation).await;
     assert_eq!(
         outcome,
@@ -914,6 +992,12 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
             true
         )
     );
+    assert_eq!(
+        retirement_basis(&raw, &cell_id, "loreserver-1", generation)
+            .await
+            .as_deref(),
+        Some("graceful_drain")
+    );
 
     // A rerun by someone else, for another reason, writes nothing.
     let again = membership::retire_generation(
@@ -923,6 +1007,7 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
         generation,
         "someone-else",
         "a second reason",
+        true,
     )
     .await
     .expect("second retire call");
@@ -937,8 +1022,249 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
         "the first audit stands"
     );
     assert_eq!(
+        retirement_basis(&raw, &cell_id, "loreserver-1", generation)
+            .await
+            .as_deref(),
+        Some("graceful_drain"),
+        "a rerun with the confirmation does not rewrite the basis"
+    );
+    assert_eq!(
         current_membership_version(&raw, &cell_id).await,
         version_before + 1
+    );
+
+    namespace.release().await;
+}
+
+/// WP-115 row 68 (KV ruling 2026-09-28): a caught-up frontier proves the
+/// receiver drained, not that it stopped. A `ready` generation whose checkpoint
+/// has reached every accepted row is a live receiver as far as the store can
+/// tell, so the graceful path refuses it until the receiver's own graceful
+/// shutdown marks it `draining`.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_refuses_a_caught_up_live_generation_that_is_not_draining() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-live").await;
+    let url = namespace.pg_url().to_owned();
+    let mut raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    seed_broker_accepted_rows(
+        &mut raw,
+        &cell_id,
+        &rand_repository_id(),
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let version_before = current_membership_version(&raw, &cell_id).await;
+
+    assert_eq!(
+        retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+        MembershipCas::ReceiverNotStopped {
+            state: "ready".to_owned()
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "ready");
+    assert_eq!(
+        current_membership_version(&raw, &cell_id).await,
+        version_before
+    );
+    assert_eq!(
+        retirement_audit(&raw, &cell_id, "loreserver-1", generation).await,
+        (None, None, false)
+    );
+
+    namespace.release().await;
+}
+
+/// A receiver that restarts on the generation its graceful shutdown marked
+/// `draining` resumes it: `readiness_cas` moves it back to `ready` without
+/// bumping the snapshot version, and the graceful path then refuses it again,
+/// because it is live. A `joining` generation has no graceful stop to record,
+/// so the draining write refuses it whole.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_draining_generation_that_restarts_resumes_to_ready() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "drain-restart").await;
+    let url = namespace.pg_url().to_owned();
+    let mut raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    seed_broker_accepted_rows(
+        &mut raw,
+        &cell_id,
+        &rand_repository_id(),
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    assert!(matches!(
+        drain(
+            &mut deadpool,
+            &raw,
+            &cell_id,
+            "loreserver-1",
+            generation,
+            40
+        )
+        .await,
+        CheckpointOutcome::Applied { .. }
+    ));
+    // A repeated shutdown report is idempotent.
+    assert!(matches!(
+        drain(
+            &mut deadpool,
+            &raw,
+            &cell_id,
+            "loreserver-1",
+            generation,
+            40
+        )
+        .await,
+        CheckpointOutcome::Applied { .. }
+    ));
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "draining");
+    let version = current_membership_version(&raw, &cell_id).await;
+
+    // The restart's bootstrap reports its checkpoint, then the readiness CAS.
+    let resumed = membership::readiness_cas(&mut deadpool, &cell_id, "loreserver-1", generation)
+        .await
+        .expect("readiness cas on a draining generation");
+    assert_eq!(
+        resumed,
+        MembershipCas::Applied {
+            membership_version: version,
+            membership_generation: generation,
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "ready");
+    assert_eq!(current_membership_version(&raw, &cell_id).await, version);
+    assert_eq!(
+        retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+        MembershipCas::ReceiverNotStopped {
+            state: "ready".to_owned()
+        },
+        "the resumed receiver is live again"
+    );
+
+    // A second receiver that has only joined cannot be marked draining.
+    let version = current_membership_version(&raw, &cell_id).await;
+    let MembershipCas::Applied {
+        membership_generation: joining,
+        ..
+    } = membership::join_receiver(&mut deadpool, &cell_id, "loreserver-2", version)
+        .await
+        .expect("join")
+    else {
+        panic!("join must apply");
+    };
+    assert_eq!(
+        drain(&mut deadpool, &raw, &cell_id, "loreserver-2", joining, 0).await,
+        CheckpointOutcome::NotDrainable {
+            state: "joining".to_owned()
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, joining).await, "joining");
+    assert_eq!(
+        checkpoint::read_checkpoint(&raw, "DURABLE-x", 1, "loreserver-2", joining)
+            .await
+            .expect("read checkpoint"),
+        None,
+        "a refused draining write projects nothing"
+    );
+
+    namespace.release().await;
+}
+
+/// The escape hatch: a receiver that died without a graceful stop never wrote
+/// the marker. With `confirm_receiver_stopped` and a caught-up frontier it
+/// retires, and the row records `confirmed_stopped` beside the actor and
+/// reason.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_with_a_stop_confirmation_retires_and_records_it() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-confirmed").await;
+    let url = namespace.pg_url().to_owned();
+    let mut raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    seed_broker_accepted_rows(
+        &mut raw,
+        &cell_id,
+        &rand_repository_id(),
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let version_before = current_membership_version(&raw, &cell_id).await;
+
+    assert_eq!(
+        retire_with(&mut deadpool, &cell_id, "loreserver-1", generation, true).await,
+        MembershipCas::Applied {
+            membership_version: version_before + 1,
+            membership_generation: generation,
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "retired");
+    assert_eq!(
+        retirement_audit(&raw, &cell_id, "loreserver-1", generation).await,
+        (
+            Some(RETIRE_ACTOR.to_owned()),
+            Some(RETIRE_REASON.to_owned()),
+            true
+        )
+    );
+    assert_eq!(
+        retirement_basis(&raw, &cell_id, "loreserver-1", generation)
+            .await
+            .as_deref(),
+        Some("confirmed_stopped")
     );
 
     namespace.release().await;
@@ -996,7 +1322,34 @@ async fn retire_generation_refuses_a_ready_generation_behind_an_accepted_row() {
         (None, None, false)
     );
 
-    // The receiver catches up; now it has drained.
+    // A draining marker does not stand in for the frontier: stopped at 40
+    // with an accepted row at 41 is still refused.
+    assert_eq!(
+        drain(
+            &mut deadpool,
+            &raw,
+            &cell_id,
+            "loreserver-1",
+            generation,
+            40
+        )
+        .await,
+        CheckpointOutcome::Applied {
+            contiguous_frontier: 40
+        }
+    );
+    assert_eq!(
+        retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+        MembershipCas::RetirementUnproven
+    );
+    // Nor does the operator's confirmation.
+    assert_eq!(
+        retire_with(&mut deadpool, &cell_id, "loreserver-1", generation, true).await,
+        MembershipCas::RetirementUnproven
+    );
+
+    // The receiver comes back, catches up, and stops again; now it has
+    // drained. `report_checkpoint` accepts a draining generation's report.
     let caught_up = CheckpointReport {
         stream_identity: "DURABLE-x".to_string(),
         stream_epoch: 1,
@@ -1162,9 +1515,16 @@ async fn retire_generation_refuses_the_placeholder_and_an_unaudited_call() {
         ("loreserver-1", generation, "", RETIRE_REASON),
         ("loreserver-1", generation, RETIRE_ACTOR, ""),
     ] {
-        let refused =
-            membership::retire_generation(&mut deadpool, &cell_id, receiver, target, actor, reason)
-                .await;
+        let refused = membership::retire_generation(
+            &mut deadpool,
+            &cell_id,
+            receiver,
+            target,
+            actor,
+            reason,
+            true,
+        )
+        .await;
         assert!(
             matches!(refused, Err(DomainError::InvalidInput(_))),
             "{receiver} generation {target} actor {actor:?} reason {reason:?}: expected \
@@ -1230,6 +1590,13 @@ async fn retire_generation_retires_a_dead_generation_once_a_greater_one_is_ready
     );
     assert_eq!(member_state(&raw, &cell_id, dead).await, "retired");
     assert_eq!(member_state(&raw, &cell_id, successor).await, "ready");
+    assert_eq!(
+        retirement_basis(&raw, &cell_id, "loreserver-1", dead)
+            .await
+            .as_deref(),
+        Some("replacement"),
+        "the hard-dead path needs no stop proof and records its own basis"
+    );
 
     namespace.release().await;
 }

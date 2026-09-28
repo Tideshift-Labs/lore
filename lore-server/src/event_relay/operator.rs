@@ -220,14 +220,18 @@ pub enum OutboxCommand {
         #[arg(long)]
         reason: String,
     },
-    /// Retire one receiver generation that is gone for good. Refused unless its
-    /// checkpoint at the current placement has reached every broker-accepted
-    /// row with no gap or park, or a greater generation of the same receiver
-    /// is ready. The reset placeholder (generation 0) is refused.
+    /// Retire one receiver generation that is gone for good. Refused unless a
+    /// greater generation of the same receiver is ready, or the receiver
+    /// stopped and its checkpoint at the current placement has reached every
+    /// broker-accepted row with no gap or park. The reset placeholder
+    /// (generation 0) is refused.
     ///
-    /// Stop the receiver first. The drain check proves the frontier caught up,
-    /// not that the receiver stopped; a live receiver retired here stays out
-    /// of the safety set until its next checkpoint report.
+    /// "Stopped" means the receiver's graceful shutdown marked the generation
+    /// draining. A receiver that died without a graceful stop never writes
+    /// that marker; for it, pass --confirm-receiver-stopped after checking the
+    /// process is gone. The flag is recorded on the row. On a receiver that is
+    /// in fact running it lets rows accepted meanwhile become consumer-safe
+    /// without that receiver's acknowledgement.
     ///
     /// A generation with a poison park never passes the drain check, and
     /// `requeue-dead-letter`/`obsolete` do not clear it (they act on relay
@@ -247,6 +251,12 @@ pub enum OutboxCommand {
         /// Why. Recorded on the generation's row.
         #[arg(long)]
         reason: String,
+        /// The receiver died without a graceful stop and is confirmed gone.
+        /// Stands in for the draining marker only; its checkpoint must still
+        /// have caught up. Recorded on the row as `confirmed_stopped` when it
+        /// is the proof that retires the generation.
+        #[arg(long)]
+        confirm_receiver_stopped: bool,
     },
     /// Mark one parked dead letter obsolete, with proof of the authoritative
     /// state that makes it obsolete. The evidence row is never deleted.
@@ -416,9 +426,16 @@ impl OperatorContext {
                 generation,
                 actor,
                 reason,
+                confirm_receiver_stopped,
             } => {
-                self.retire_generation(receiver, *generation, actor, reason)
-                    .await
+                self.retire_generation(
+                    receiver,
+                    *generation,
+                    actor,
+                    reason,
+                    *confirm_receiver_stopped,
+                )
+                .await
             }
         }
     }
@@ -842,6 +859,7 @@ impl OperatorContext {
         generation: i64,
         actor: &str,
         reason: &str,
+        confirm_receiver_stopped: bool,
     ) -> Result<()> {
         refuse_reserved_generation(receiver, generation)?;
         let mut client = self.client().await?;
@@ -852,6 +870,7 @@ impl OperatorContext {
             generation,
             actor,
             reason,
+            confirm_receiver_stopped,
         )
         .await?;
         report_retirement(&self.cell_id, receiver, generation, &outcome)
@@ -989,6 +1008,12 @@ fn report_retirement(
              cell's current placement is absent, carries a gap or park, or is below a \
              broker-accepted row) and no greater generation of {receiver} is ready. Retiring it \
              would drop it from the required set and release every row above its frontier"
+        )),
+        MembershipCas::ReceiverNotStopped { state } => Err(anyhow!(
+            "refused: {receiver} generation {generation} has caught up but is '{state}', not \
+             draining, so nothing proves the receiver stopped. Stop it gracefully and rerun. If \
+             it died without a graceful stop and is confirmed gone, rerun with \
+             --confirm-receiver-stopped"
         )),
         MembershipCas::CellUnknown => Err(anyhow!(
             "cell {cell_id} has no membership state; no receiver has ever joined it"
@@ -1283,6 +1308,7 @@ mod tests {
                     generation,
                     actor,
                     reason,
+                    confirm_receiver_stopped,
                 },
         } = parsed.command
         else {
@@ -1292,6 +1318,23 @@ mod tests {
         assert_eq!(generation, 7);
         assert_eq!(actor, "kv");
         assert_eq!(reason, "replica 1 decommissioned");
+        assert!(
+            !confirm_receiver_stopped,
+            "the stop confirmation is opt-in, never a default"
+        );
+
+        let mut confirmed = argv(&full);
+        confirmed.push("--confirm-receiver-stopped");
+        let parsed = Harness::try_parse_from(confirmed).expect("parse with the confirmation");
+        assert!(matches!(
+            parsed.command,
+            MaintenanceCommand::Outbox {
+                command: OutboxCommand::RetireGeneration {
+                    confirm_receiver_stopped: true,
+                    ..
+                }
+            }
+        ));
 
         for skipped in 0..full.len() {
             let partial: Vec<_> = full
@@ -1350,6 +1393,9 @@ mod tests {
         assert!(report(MembershipCas::AlreadyRecorded).is_ok());
         for refused in [
             MembershipCas::RetirementUnproven,
+            MembershipCas::ReceiverNotStopped {
+                state: "ready".to_owned(),
+            },
             MembershipCas::CellUnknown,
             MembershipCas::GenerationNotFound,
             MembershipCas::WrongState {

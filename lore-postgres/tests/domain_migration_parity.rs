@@ -49,6 +49,9 @@ const MIGRATIONS_0006: &str = include_str!("../migrations/0006_outbox_retry_hist
 /// WP-115 row 68's retirement audit columns. The boot path applies the same file
 /// through `OUTBOX_RETIREMENT_AUDIT_SCHEMA`.
 const MIGRATIONS_0007: &str = include_str!("../migrations/0007_outbox_retirement_audit.sql");
+/// WP-115 row 68's retirement basis column. The boot path applies the same file
+/// through `OUTBOX_RETIREMENT_BASIS_SCHEMA`.
+const MIGRATIONS_0008: &str = include_str!("../migrations/0008_outbox_retirement_basis.sql");
 
 /// The relations that prove `migrations/0001_init.sql` (or the isolated test
 /// fixture) ran here. `lore_locks` is excluded because it also pre-dates
@@ -349,6 +352,10 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .batch_execute(MIGRATIONS_0007)
         .await
         .expect("apply outbox retirement audit migration");
+    migration_client
+        .batch_execute(MIGRATIONS_0008)
+        .await
+        .expect("apply outbox retirement basis migration");
 
     // Production boot order: the domain coordinator is built before the lock
     // store plugin connects (`server.rs`), so nothing has created `lore_locks`

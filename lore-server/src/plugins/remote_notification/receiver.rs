@@ -20,8 +20,8 @@
 //! # Resuming an existing generation
 //!
 //! A process restart does not always cost a generation. When this receiver's
-//! own highest generation already captured a position, is not retired or
-//! draining, and its captured identity and epoch still equal the cell's
+//! own highest generation already captured a position, is not retired, and
+//! its captured identity and epoch still equal the cell's
 //! authoritative placement, the bootstrap resumes it: it reads that
 //! generation's PERSISTED frontier back through
 //! [`super::receiver_store::ReceiverStore::read_checkpoint`], attaches with the
@@ -73,10 +73,18 @@
 //!
 //! # Shutdown
 //!
-//! Cancellation stops the loop at the next boundary, reports a final
-//! checkpoint if there is anything unreported, and returns. It never
+//! Cancellation stops the loop at the next boundary and returns. It never
 //! acknowledges to make the shutdown tidy: an event accepted but not applied
 //! is redelivered to the next generation, which is exactly right.
+//!
+//! A ready generation's graceful stop reports its final checkpoint and marks
+//! the generation `draining` in one transaction, even when the frontier is
+//! already reported (WP-115 row 68). The marker is how an operator's
+//! `retire-generation` tells a stopped receiver from an idle one. A
+//! restart resumes a `draining` generation like any other resumable one, and
+//! the readiness compare-and-set moves it back to `ready`. A generation that
+//! is not ready, or whose marker write is refused, reports an ordinary final
+//! checkpoint if there is anything unreported.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -536,11 +544,17 @@ impl DurableReceiver {
                     // The steady state returns only on cancellation or on a
                     // retirement, and a final checkpoint is attempted in both
                     // cases: an unreported frontier is retention a successor
-                    // has to re-prove.
-                    self.final_checkpoint(&mut session).await;
+                    // has to re-prove. A graceful stop of a ready generation
+                    // also marks it `draining` with that checkpoint.
                     if self.cancel.is_cancelled() {
+                        if session.ready {
+                            self.draining_checkpoint(&mut session).await;
+                        } else {
+                            self.final_checkpoint(&mut session).await;
+                        }
                         break;
                     }
+                    self.final_checkpoint(&mut session).await;
                 }
                 Err(failure) => {
                     self.readiness.set_blocked(failure.reason(), None);
@@ -658,8 +672,8 @@ impl DurableReceiver {
         //    both correct and the only way to bound that.
         //
         //    A captured generation that is NOT resumable — a moved placement,
-        //    a retired or draining row, or a persisted checkpoint carrying a
-        //    blocker — falls through to the same fresh join, exactly as before.
+        //    a retired row, or a persisted checkpoint carrying a blocker —
+        //    falls through to the same fresh join, exactly as before.
         let resumable = self
             .resumable_generation(&snapshot, identity, &placement)
             .await?;
@@ -997,7 +1011,11 @@ impl DurableReceiver {
         let Some(latest) = latest else {
             return Ok(None);
         };
-        if latest.state != "joining" && latest.state != "ready" {
+        // `draining` resumes too: it is this receiver's own graceful stop, and
+        // the readiness compare-and-set moves it back to `ready` on the same
+        // placement and checkpoint proof. Replacing it instead would cost a
+        // generation on every rolling restart.
+        if latest.state != "joining" && latest.state != "ready" && latest.state != "draining" {
             return Ok(None);
         }
         let Some(captured) = latest.captured.as_ref() else {
@@ -1336,6 +1354,66 @@ impl DurableReceiver {
         }
     }
 
+    /// Report the final checkpoint AND mark this generation `draining`, on a
+    /// graceful stop (WP-115 row 68).
+    ///
+    /// Sent even when the frontier is already reported: the marker is the
+    /// point. It is what lets `loreserver outbox retire-generation` tell a
+    /// stopped receiver from an idle one, whose caught-up frontier looks the
+    /// same. A membership version conflict is adopted and resent once, as the
+    /// bootstrap does. Any other refusal falls back to the ordinary final
+    /// checkpoint, and the operator then needs `--confirm-receiver-stopped`
+    /// to retire this generation.
+    async fn draining_checkpoint(&self, session: &mut ReceiverSession) {
+        for _ in 0..2 {
+            let report = session.checkpoint_report(&self.receiver.membership_identity);
+            match self.runtime.store.report_draining_checkpoint(&report).await {
+                Ok(CheckpointOutcome::Applied {
+                    contiguous_frontier,
+                }) => {
+                    session.reported_frontier = Some(contiguous_frontier);
+                    session.events_since_checkpoint = 0;
+                    session.last_checkpoint = Instant::now();
+                    metrics::record_receiver_checkpoint("draining");
+                    info!(
+                        cell_id = %self.cell_id,
+                        receiver_identity = %self.receiver.membership_identity,
+                        membership_generation = session.membership_generation,
+                        contiguous_frontier,
+                        "marked this receiver generation draining with its final checkpoint"
+                    );
+                    return;
+                }
+                Ok(CheckpointOutcome::MembershipVersionConflict {
+                    current_membership_version,
+                }) => {
+                    session.membership_version = current_membership_version;
+                }
+                Ok(other) => {
+                    warn!(
+                        cell_id = %self.cell_id,
+                        receiver_identity = %self.receiver.membership_identity,
+                        membership_generation = session.membership_generation,
+                        outcome = ?other,
+                        "this receiver generation was not marked draining on shutdown"
+                    );
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        cell_id = %self.cell_id,
+                        receiver_identity = %self.receiver.membership_identity,
+                        membership_generation = session.membership_generation,
+                        %error,
+                        "this receiver generation was not marked draining on shutdown"
+                    );
+                    break;
+                }
+            }
+        }
+        self.final_checkpoint(session).await;
+    }
+
     /// Sleep, unless cancellation arrives first.
     async fn sleep(&self, duration: Duration) {
         tokio::select! {
@@ -1578,6 +1656,7 @@ mod tests {
                 StoreCall::Capture { .. } => "capture",
                 StoreCall::Baseline { .. } => "baseline",
                 StoreCall::Checkpoint(_) => "checkpoint",
+                StoreCall::DrainingCheckpoint(_) => "draining_checkpoint",
                 StoreCall::Readiness { .. } => "readiness",
                 StoreCall::ReadCheckpoint { .. } => "read_checkpoint",
             })
@@ -2015,10 +2094,14 @@ mod tests {
             .expect("receiver must finish promptly")
             .expect("shutdown succeeds");
 
+        // A ready generation's graceful stop sends its final report as the
+        // draining write (WP-115 row 68), so both kinds count here.
         let checkpoints: Vec<CheckpointReport> = harness.store.calls()[before_shutdown..]
             .iter()
             .filter_map(|call| match call {
-                StoreCall::Checkpoint(report) => Some((**report).clone()),
+                StoreCall::Checkpoint(report) | StoreCall::DrainingCheckpoint(report) => {
+                    Some((**report).clone())
+                }
                 _ => None,
             })
             .collect();
@@ -2734,11 +2817,200 @@ mod tests {
             harness.store.calls()[before_shutdown..]
                 .iter()
                 .any(|call| matches!(
-                    call, StoreCall::Checkpoint(report) if report.contiguous_frontier == 900
+                    call, StoreCall::DrainingCheckpoint(report) if report.contiguous_frontier == 900
                 )),
-            "shutdown must persist the accepted frontier before returning"
+            "shutdown must persist the accepted frontier, with the draining marker, before \
+             returning"
+        );
+        assert_eq!(
+            harness.store.member_state(IDENTITY, 1).as_deref(),
+            Some("draining")
         );
         assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
+    }
+
+    /// Run a bootstrapped receiver until it is ready, optionally apply one
+    /// event, then shut it down gracefully. Returns the store calls made from
+    /// the shutdown signal on.
+    async fn run_then_shut_down(harness: &mut Harness, apply_one: bool) -> Vec<StoreCall> {
+        harness.receiver.receiver.checkpoint_interval = Duration::from_secs(60);
+        let readiness = harness.receiver.readiness();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let receiver = std::mem::replace(
+            &mut harness.receiver,
+            DurableReceiver::new(
+                &config(),
+                ReceiverRuntime {
+                    store: Arc::new(harness.store.clone()),
+                    stream: Arc::new(harness.stream.clone()),
+                    target: Arc::new(harness.target.clone()),
+                },
+            )
+            .expect("the test config declares a required receiver"),
+        );
+        let run = receiver.run_with_shutdown(shutdown_rx);
+        tokio::pin!(run);
+        let stream = harness.stream.clone();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !readiness.is_ready() {
+                tokio::select! {
+                    result = &mut run => panic!("receiver stopped before shutdown: {result:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+            if apply_one {
+                stream.push_envelope(900, durable(0x9f, 1, None));
+                while stream.acked().is_empty() {
+                    tokio::select! {
+                        result = &mut run => panic!("receiver stopped before application: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("receiver must reach readiness");
+        let before_shutdown = harness.store.calls().len();
+        shutdown_tx.send(true).expect("receiver observes shutdown");
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("receiver must finish promptly")
+            .expect("shutdown succeeds");
+        harness.store.calls()[before_shutdown..].to_vec()
+    }
+
+    /// WP-115 row 68: the case the marker exists for. An idle receiver whose
+    /// frontier is already reported had nothing to send on shutdown, so its
+    /// generation stayed `ready` and looked exactly like a live one. The
+    /// graceful stop now sends the draining write anyway.
+    #[tokio::test]
+    async fn a_graceful_shutdown_marks_an_idle_caught_up_generation_draining() {
+        let mut harness = harness(900);
+        let calls = run_then_shut_down(&mut harness, false).await;
+        let draining: Vec<&CheckpointReport> = calls
+            .iter()
+            .filter_map(|call| match call {
+                StoreCall::DrainingCheckpoint(report) => Some(&**report),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draining.len(),
+            1,
+            "exactly one draining write on a graceful stop"
+        );
+        assert_eq!(draining[0].contiguous_frontier, 899);
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, StoreCall::Checkpoint(_))),
+            "an accepted draining write needs no second, ordinary report"
+        );
+        assert_eq!(
+            harness.store.member_state(IDENTITY, 1).as_deref(),
+            Some("draining")
+        );
+    }
+
+    /// A refused draining write (here, the store answers that the generation
+    /// is not drainable) still leaves the ordinary final checkpoint of any
+    /// unreported work. The generation is not marked, so an operator would
+    /// need the stop confirmation to retire it.
+    #[tokio::test]
+    async fn a_refused_draining_write_falls_back_to_the_ordinary_final_checkpoint() {
+        let mut harness = harness(900);
+        harness
+            .store
+            .next_draining_checkpoint(Ok(CheckpointOutcome::NotDrainable {
+                state: "joining".to_string(),
+            }));
+        let calls = run_then_shut_down(&mut harness, true).await;
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, StoreCall::DrainingCheckpoint(_))),
+            "the draining write is attempted first"
+        );
+        assert!(
+            calls.iter().any(|call| matches!(
+                call, StoreCall::Checkpoint(report) if report.contiguous_frontier == 900
+            )),
+            "the unreported frontier still reaches the projection"
+        );
+        assert_eq!(
+            harness.store.member_state(IDENTITY, 1).as_deref(),
+            Some("ready")
+        );
+    }
+
+    /// A draining write that meets a concurrent join adopts the cell's version
+    /// and resends once, as the bootstrap's own checkpoint does.
+    #[tokio::test]
+    async fn a_draining_write_resends_once_after_a_membership_version_conflict() {
+        let mut harness = harness(900);
+        harness
+            .store
+            .next_draining_checkpoint(Ok(CheckpointOutcome::MembershipVersionConflict {
+                current_membership_version: 2,
+            }));
+        let calls = run_then_shut_down(&mut harness, false).await;
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| matches!(call, StoreCall::DrainingCheckpoint(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            harness.store.member_state(IDENTITY, 1).as_deref(),
+            Some("draining")
+        );
+    }
+
+    /// A receiver restarting on the generation its graceful shutdown marked
+    /// `draining` resumes it rather than joining a new one: no join, no new
+    /// capture, the persisted frontier restored, and the generation back to
+    /// `ready`.
+    #[tokio::test]
+    async fn a_restart_resumes_a_draining_generation_to_ready() {
+        let mut first = harness(900);
+        let calls = run_then_shut_down(&mut first, true).await;
+        assert!(
+            calls
+                .iter()
+                .any(|call| matches!(call, StoreCall::DrainingCheckpoint(_)))
+        );
+        assert_eq!(
+            first.store.member_state(IDENTITY, 1).as_deref(),
+            Some("draining")
+        );
+
+        // A second process over the same durable store and stream.
+        let restarted = DurableReceiver::new(
+            &config(),
+            ReceiverRuntime {
+                store: Arc::new(first.store.clone()),
+                stream: Arc::new(first.stream.clone()),
+                target: Arc::new(first.target.clone()),
+            },
+        )
+        .expect("the test config declares a required receiver");
+        let before = first.store.calls().len();
+        let session = restarted.bootstrap().await.expect("the restart resumes");
+        assert!(session.ready);
+        assert_eq!(session.membership_generation, 1, "no generation is spent");
+        assert_eq!(session.contiguous_frontier(), 900);
+        let restart_calls = &first.store.calls()[before..];
+        assert!(
+            !restart_calls
+                .iter()
+                .any(|call| matches!(call, StoreCall::Join { .. } | StoreCall::Capture { .. })),
+            "a resume neither joins nor re-records the capture: {restart_calls:?}"
+        );
+        assert_eq!(
+            first.store.member_state(IDENTITY, 1).as_deref(),
+            Some("ready")
+        );
     }
 
     #[test]

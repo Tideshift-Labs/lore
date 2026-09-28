@@ -172,11 +172,14 @@ pub const MAX_DISPOSITION_ACTOR_BYTES: usize = 256;
 pub const MEMBERSHIP_STATE_JOINING: &str = "joining";
 /// A receiver generation that captured a position, took an authoritative
 /// baseline, drained from that position, and passed the readiness
-/// compare-and-set against the cell's current stream identity and epoch. Only
-/// these count toward consumer safety.
+/// compare-and-set against the cell's current stream identity and epoch. These
+/// and `draining` generations count toward consumer safety.
 pub const MEMBERSHIP_STATE_READY: &str = "ready";
-/// A ready generation that is shutting down. Still required, because it is
-/// still consuming; it retires only after its final checkpoint.
+/// A ready generation whose receiver stopped gracefully. Its shutdown wrote the
+/// final checkpoint and this marker in one transaction
+/// (`checkpoint::report_draining_checkpoint`). Still required, with the frontier
+/// it stopped at, until an operator retires it or its restart resumes it to
+/// `ready` through `membership::readiness_cas`.
 pub const MEMBERSHIP_STATE_DRAINING: &str = "draining";
 /// A generation that no longer participates. A retired generation cannot
 /// checkpoint, cannot advance readiness, and can never satisfy its successor's
@@ -255,6 +258,27 @@ pub const OUTBOX_RETRY_HISTORY_SCHEMA: &str =
 /// after [`OUTBOX_SCHEMA`], whose membership table it alters.
 pub const OUTBOX_RETIREMENT_AUDIT_SCHEMA: &str =
     include_str!("../../../migrations/0007_outbox_retirement_audit.sql");
+
+/// Which proof retired a receiver generation: `graceful_drain`, `replacement`,
+/// or `confirmed_stopped` (WP-115 row 68).
+///
+/// An `include_str!` of the migration file for the same reason as
+/// [`OUTBOX_RETRY_HISTORY_SCHEMA`]. `PostgresDomainStore::connect` applies it
+/// after [`OUTBOX_RETIREMENT_AUDIT_SCHEMA`], whose `retirement_recorded_at` its
+/// constraint pairs with.
+pub const OUTBOX_RETIREMENT_BASIS_SCHEMA: &str =
+    include_str!("../../../migrations/0008_outbox_retirement_basis.sql");
+
+/// `retirement_basis`: the receiver's graceful shutdown marked the generation
+/// `draining` and its checkpoint reached every accepted row.
+pub const RETIREMENT_BASIS_GRACEFUL_DRAIN: &str = "graceful_drain";
+
+/// `retirement_basis`: a greater generation of the same receiver was ready.
+pub const RETIREMENT_BASIS_REPLACEMENT: &str = "replacement";
+
+/// `retirement_basis`: the operator confirmed the receiver stopped
+/// (`--confirm-receiver-stopped`) and its checkpoint reached every accepted row.
+pub const RETIREMENT_BASIS_CONFIRMED_STOPPED: &str = "confirmed_stopped";
 
 /// Outbox base DDL. Idempotent; applied under the shared schema advisory lock.
 pub const OUTBOX_SCHEMA: &str = r#"

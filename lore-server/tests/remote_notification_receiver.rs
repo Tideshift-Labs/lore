@@ -753,7 +753,9 @@ async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpoi
         .expect("read membership")
         .expect("membership row present");
     assert_eq!(snapshot.members.len(), 1);
-    assert_eq!(snapshot.members[0].state, "ready");
+    // A graceful stop of a ready generation marks it draining with its final
+    // checkpoint (WP-115 row 68). The resume below moves it back to ready.
+    assert_eq!(snapshot.members[0].state, "draining");
 
     // The second "process": a fresh receiver over the SAME store and cell.
     // The fake stream's own default start (999) deliberately disagrees with
@@ -1299,4 +1301,144 @@ async fn a_persisted_checkpoint_with_a_blocker_is_not_resumed_and_a_fresh_genera
          gap, and the resume decision never wrote to this row"
     );
     assert_eq!(ready.state, "ready");
+}
+
+// ---------------------------------------------------------------------------
+// WP-115 row 68: graceful shutdown marks the generation draining
+// ---------------------------------------------------------------------------
+
+/// Run a real receiver over the real projection until it is ready, then stop
+/// it through the server's shutdown signal.
+async fn run_until_ready_then_shut_down(receiver: DurableReceiver) {
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !readiness.is_ready() {
+            tokio::select! {
+                result = &mut run => panic!("receiver stopped before shutdown: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    })
+    .await
+    .expect("the receiver reaches readiness against real Postgres");
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("receiver must finish promptly")
+        .expect("shutdown succeeds");
+}
+
+async fn member_state(store: &PostgresReceiverStore, generation: i64) -> String {
+    store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present")
+        .members
+        .iter()
+        .find(|member| {
+            member.receiver_identity == IDENTITY && member.membership_generation == generation
+        })
+        .expect("the generation's row is present")
+        .state
+        .clone()
+}
+
+/// The whole row-68 lifecycle against real Postgres: a live, caught-up
+/// receiver is refused retirement; its graceful shutdown marks it draining; a
+/// restart resumes the same generation back to ready without a join; a
+/// second graceful shutdown marks it draining again; and the operator's
+/// retirement then succeeds with the `graceful_drain` basis recorded.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_graceful_shutdown_drains_a_restart_resumes_and_a_drained_generation_retires() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "row68-drain").await;
+    let url = namespace.pg_url().to_owned();
+    relay_harness::ensure_schema_bootstrapped(&url).await;
+    let pool = build_pool(&url, 8, &TlsConfig::default()).expect("build pool");
+    bootstrap_cell(&pool, CELL, "DURABLE-sfo3-cell-a", 8).await;
+    let store = PostgresReceiverStore::new(pool.clone(), CELL);
+    let stream = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
+    let target = RecordingInvalidationTarget::new();
+    let receiver = || {
+        DurableReceiver::new(
+            &config(),
+            ReceiverRuntime {
+                store: Arc::new(store.clone()),
+                stream: Arc::new(stream.clone()),
+                target: Arc::new(target.clone()),
+            },
+        )
+        .expect("the test config declares a required receiver")
+    };
+
+    // A live receiver: caught up (no accepted rows at all) and ready.
+    let live = receiver();
+    let session = live.bootstrap().await.expect("bootstraps");
+    assert_eq!(session.membership_generation, 1);
+    let mut client = pool.get().await.expect("checkout pool client");
+    assert_eq!(
+        membership::retire_generation(&mut client, CELL, IDENTITY, 1, "kv", "row 68", false)
+            .await
+            .expect("retire call"),
+        MembershipCas::ReceiverNotStopped {
+            state: "ready".to_owned()
+        },
+        "a caught-up live receiver is not proof of a stop"
+    );
+    drop(live);
+
+    // Its graceful stop. The fresh process resumes generation 1 first.
+    run_until_ready_then_shut_down(receiver()).await;
+    assert_eq!(member_state(&store, 1).await, "draining");
+
+    // A restart resumes the draining generation: no new generation.
+    let restarted = receiver();
+    let session = restarted.bootstrap().await.expect("the restart resumes");
+    assert_eq!(session.membership_generation, 1, "no generation is spent");
+    assert_eq!(member_state(&store, 1).await, "ready");
+    drop(restarted);
+
+    // Stop gracefully again, then retire without the confirmation.
+    run_until_ready_then_shut_down(receiver()).await;
+    assert_eq!(member_state(&store, 1).await, "draining");
+    let snapshot = store
+        .read_membership()
+        .await
+        .expect("read membership")
+        .expect("membership row present");
+    assert_eq!(
+        snapshot.members.len(),
+        1,
+        "every restart resumed generation 1"
+    );
+    assert!(matches!(
+        membership::retire_generation(&mut client, CELL, IDENTITY, 1, "kv", "row 68", false)
+            .await
+            .expect("retire call"),
+        MembershipCas::Applied {
+            membership_generation: 1,
+            ..
+        }
+    ));
+    let basis: Option<String> = client
+        .query_one(
+            "SELECT retirement_basis FROM lore_outbox_receiver_membership \
+              WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = 1",
+            &[&CELL, &IDENTITY],
+        )
+        .await
+        .expect("read retirement basis")
+        .get("retirement_basis");
+    assert_eq!(basis.as_deref(), Some("graceful_drain"));
+    assert_eq!(member_state(&store, 1).await, "retired");
+
+    namespace.release().await;
 }
