@@ -8,7 +8,7 @@
 //! Each platform drops cases and gains others: off Linux, `linux_live`'s whole
 //! module is compiled out and only `open_returns_unsupported_platform_off_linux`
 //! (below, top level) exists; on Linux the reverse holds and that case never
-//! compiles. **Here the counts happen to differ (1 off Linux, 10 on it), so a
+//! compiles. **Here the counts happen to differ (1 off Linux, 12 on it), so a
 //! count IS discriminating for this file today** — but only by accident of the
 //! ratio. The general trap, and the reason the rule is "diff names, not counts",
 //! is a `cfg(unix)`/`cfg(not(unix))` PAIR: one case each way leaves the total
@@ -146,6 +146,23 @@ mod linux_live {
             Some((14, 2)),
             "completed scans must wrap and observe later residue"
         );
+    }
+
+    #[test]
+    fn a_completed_physical_walk_reports_when_it_completed() {
+        let root = test_root("completed-inventory");
+        fs::write(root.0.join("body"), b"abcd").unwrap();
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let before = std::time::Instant::now();
+        let inventory = writer
+            .physical_usage_completed(4096)
+            .unwrap()
+            .expect("a small root completes in one pass");
+        assert_eq!((inventory.bytes, inventory.files), (4, 1));
+        assert!(inventory.completed_at >= before);
+        assert!(inventory.completed_at <= std::time::Instant::now());
+        assert_eq!(writer.physical_usage(4096).unwrap(), Some((4, 1)));
     }
 
     fn result_key(attempt_id: &str) -> SpoolObjectKey {

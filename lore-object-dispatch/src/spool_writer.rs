@@ -125,6 +125,16 @@ impl SpoolWriteReceipt {
     }
 }
 
+/// A completed physical walk of the spool root, and when it completed. The walk
+/// lags the ledger by at least its age, so readiness reports that age beside the
+/// capacity verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpoolPhysicalInventory {
+    pub completed_at: std::time::Instant,
+    pub bytes: u64,
+    pub files: u64,
+}
+
 impl fmt::Debug for SpoolWriteReceipt {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -159,6 +169,7 @@ mod platform {
     use super::MAX_SPOOL_BODY_BYTES;
     use super::SpoolLayout;
     use super::SpoolObjectKey;
+    use super::SpoolPhysicalInventory;
     use super::SpoolWriteError;
     use super::SpoolWriteReceipt;
     use crate::spool::SpoolObjectKind;
@@ -186,7 +197,7 @@ mod platform {
         stack: Vec<(OwnedFd, rustix::fs::Dir)>,
         bytes: u64,
         files: u64,
-        completed: Option<(Instant, u64, u64)>,
+        completed: Option<SpoolPhysicalInventory>,
     }
 
     pub struct LinuxSpoolWriter {
@@ -210,16 +221,14 @@ mod platform {
         ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
             Ok(self
                 .physical_usage_completed(maximum_entries)?
-                .map(|(_, bytes, files)| (bytes, files)))
+                .map(|inventory| (inventory.bytes, inventory.files)))
         }
 
-        /// `physical_usage`, plus when the reported inventory completed. The
-        /// inventory lags the ledger by at least that age, so readiness reports
-        /// it beside the capacity verdict.
+        /// `physical_usage`, plus when the reported inventory completed.
         pub fn physical_usage_completed(
             &self,
             maximum_entries: u32,
-        ) -> Result<Option<(Instant, u64, u64)>, SpoolWriteError> {
+        ) -> Result<Option<SpoolPhysicalInventory>, SpoolWriteError> {
             let mut inventory = self
                 .physical_inventory
                 .lock()
@@ -235,7 +244,7 @@ mod platform {
             &self,
             inventory: &mut PhysicalInventory,
             maximum_entries: u32,
-        ) -> Result<Option<(Instant, u64, u64)>, SpoolWriteError> {
+        ) -> Result<Option<SpoolPhysicalInventory>, SpoolWriteError> {
             self.assert_configured_root_stable()?;
             if inventory.stack.is_empty() {
                 let root = self
@@ -299,11 +308,15 @@ mod platform {
             }
             self.assert_configured_root_stable()?;
             if inventory.stack.is_empty() {
-                inventory.completed = Some((Instant::now(), inventory.bytes, inventory.files));
+                inventory.completed = Some(SpoolPhysicalInventory {
+                    completed_at: Instant::now(),
+                    bytes: inventory.bytes,
+                    files: inventory.files,
+                });
             }
             Ok(inventory
                 .completed
-                .filter(|(at, _, _)| at.elapsed() <= Duration::from_secs(300)))
+                .filter(|completed| completed.completed_at.elapsed() <= Duration::from_secs(300)))
         }
 
         /// Sample the pinned root, refusing mount/root replacement since construction.
@@ -752,6 +765,7 @@ mod platform {
 mod platform {
     use super::SpoolLayout;
     use super::SpoolObjectKey;
+    use super::SpoolPhysicalInventory;
     use super::SpoolWriteError;
     use super::SpoolWriteReceipt;
 
@@ -771,7 +785,7 @@ mod platform {
         pub fn physical_usage_completed(
             &self,
             _maximum_entries: u32,
-        ) -> Result<Option<(std::time::Instant, u64, u64)>, SpoolWriteError> {
+        ) -> Result<Option<SpoolPhysicalInventory>, SpoolWriteError> {
             Err(SpoolWriteError::UnsupportedPlatform)
         }
         pub fn available_bytes(&self) -> Result<u64, SpoolWriteError> {

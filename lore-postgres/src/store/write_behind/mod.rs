@@ -289,15 +289,12 @@ impl WriteBehindStage {
             .ok()
             .and_then(|time| *time)
             .is_some_and(|time| time.elapsed() < self.observation_stale_after);
-        if self.admission.root_unavailable()
-            && (!fresh || self.pending_staged.load(Ordering::Acquire))
-        {
-            return StagingMode::Unready;
-        }
-        if !self.capacity_available.load(Ordering::Acquire) {
-            return StagingMode::Refuse;
-        }
-        self.admission.mode()
+        staging_mode(
+            &self.admission,
+            fresh,
+            self.pending_staged.load(Ordering::Acquire),
+            self.capacity_available.load(Ordering::Acquire),
+        )
     }
 
     /// The full admission picture, for the composing server's readiness probe
@@ -470,6 +467,23 @@ where
     }
 }
 
+/// [`WriteBehindStage::mode`]'s decision over values the stage has already
+/// read. Split out so the decision is testable without a Unix staging root.
+fn staging_mode(
+    admission: &Admission,
+    pending_fresh: bool,
+    pending_staged: bool,
+    capacity_available: bool,
+) -> StagingMode {
+    if admission.root_unavailable() && (!pending_fresh || pending_staged) {
+        return StagingMode::Unready;
+    }
+    if !capacity_available {
+        return StagingMode::Refuse;
+    }
+    admission.mode()
+}
+
 /// One admission snapshot, exposed for the store's metrics and readiness.
 pub use self::admission::AdmissionSnapshot;
 
@@ -506,6 +520,46 @@ mod tests {
             }
             AdmissionSample::Reachable { free_bytes: 42 }
         })
+    }
+
+    fn staging_admission() -> Admission {
+        let admission = Admission::new(
+            WriteBehindWatermarks {
+                low_bytes: 100,
+                high_bytes: 200,
+                hard_bytes: 300,
+                low_count: 10,
+                high_count: 20,
+                hard_count: 30,
+                min_free_bytes: 50,
+            },
+            Duration::from_secs(60),
+        );
+        admission.observe_root(AdmissionSample::Reachable { free_bytes: 1_000 });
+        admission.note_drain_heartbeat();
+        admission
+    }
+
+    /// Documented gap, not an endorsement. One false capacity sample refuses
+    /// staging at once, and the next true sample restores it at once. Unlike
+    /// readiness's sustained `capacity_unavailable` run, admission has no budget.
+    /// Whether to add one is a pending decision (WP-115 ledger row 67). This
+    /// pins current behavior so a change to it is deliberate.
+    #[test]
+    fn documented_gap_one_false_capacity_sample_refuses_staging_with_no_budget() {
+        let admission = staging_admission();
+        assert_eq!(
+            staging_mode(&admission, true, false, true),
+            StagingMode::Stage
+        );
+        assert_eq!(
+            staging_mode(&admission, true, false, false),
+            StagingMode::Refuse
+        );
+        assert_eq!(
+            staging_mode(&admission, true, false, true),
+            StagingMode::Stage
+        );
     }
 
     #[tokio::test]

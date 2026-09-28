@@ -208,18 +208,28 @@ fn capacity_transition(previous: Option<bool>, current: bool) -> Option<bool> {
     }
 }
 
-fn log_capacity_transition(available: bool, evidence: &CapacityEvidence) {
-    let detail = CapacityDetail::from(evidence);
+/// Record a successful observation and return the capacity transition it made,
+/// if any. The caller logs the transition after releasing the state lock.
+fn record_capacity_observation(
+    state: &mut State,
+    observation: WriteBehindObservation,
+    at: Instant,
+) -> Option<(bool, CapacityDetail)> {
+    let previous = state
+        .observation
+        .as_ref()
+        .map(|(_, value)| value.capacity_available);
+    let transition = capacity_transition(previous, observation.capacity_available)
+        .map(|available| (available, CapacityDetail::from(&observation.capacity)));
+    record_observation(state, Some(observation), at);
+    transition
+}
+
+fn log_capacity_transition(available: bool, detail: &CapacityDetail) {
     if available {
         info!(?detail, "write-behind capacity predicate holds again");
     } else {
-        info!(
-            failing = ?detail.failing,
-            stage_inventory_age_millis = ?detail.stage_inventory_age_millis,
-            spool_inventory_age_millis = ?detail.spool_inventory_age_millis,
-            ?detail,
-            "write-behind capacity predicate failed"
-        );
+        info!(?detail, "write-behind capacity predicate failed");
     }
 }
 
@@ -622,21 +632,15 @@ pub(crate) fn configure_fragment_write_behind(
                 // Explicit block, matching the worker loops: the guard is released at the
                 // brace rather than at a statement temporary, so `snapshot()` below cannot
                 // be folded into the same expression and self-deadlock this std `Mutex`.
-                {
+                let transition = {
                     let mut state = observer_readiness
                         .state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    let previous = state
-                        .observation
-                        .as_ref()
-                        .map(|(_, value)| value.capacity_available);
-                    if let Some(available) =
-                        capacity_transition(previous, observation.capacity_available)
-                    {
-                        log_capacity_transition(available, &observation.capacity);
-                    }
-                    record_observation(&mut state, Some(observation), Instant::now());
+                    record_capacity_observation(&mut state, observation, Instant::now())
+                };
+                if let Some((available, detail)) = transition {
+                    log_capacity_transition(available, &detail);
                 }
                 if observer_readiness.snapshot().ready {
                     handle.note_drain_heartbeat();
@@ -1478,6 +1482,43 @@ mod tests {
         assert_eq!(capacity_transition(Some(false), false), None);
         assert_eq!(capacity_transition(None, false), Some(false));
         assert_eq!(capacity_transition(None, true), None);
+    }
+
+    /// The observer loop's recording step: a run of samples yields exactly one
+    /// transition per flip, carrying the evidence of the flipping sample.
+    #[test]
+    fn recording_observations_yields_one_transition_per_flip() {
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let mut transitions = Vec::new();
+        for available in [true, true, false, false, false, true, true, false] {
+            let observation = WriteBehindObservation {
+                capacity: if available {
+                    CapacityEvidence::default()
+                } else {
+                    failing_evidence()
+                },
+                ..capacity_observation(available)
+            };
+            transitions.push(record_capacity_observation(&mut state, observation, now));
+        }
+        let flips: Vec<(usize, bool, Vec<&'static str>)> = transitions
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, transition)| {
+                transition.map(|(available, detail)| (index, available, detail.failing))
+            })
+            .collect();
+        let failing = failing_evidence().failing;
+        assert_eq!(
+            flips,
+            vec![
+                (2, false, failing.clone()),
+                (5, true, Vec::new()),
+                (7, false, failing),
+            ]
+        );
+        assert!(state.observation.is_some());
     }
 
     /// Observability must not move the verdict: evidence naming failures on an

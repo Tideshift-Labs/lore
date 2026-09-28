@@ -5,11 +5,13 @@
 use lore_object_dispatch::drain_policy::DrainClient;
 use lore_object_dispatch::drain_policy::DrainDescriptor;
 use lore_object_dispatch::drain_policy::DrainError;
+use lore_object_dispatch::drain_policy::DrainObservation;
 use lore_object_dispatch::drain_policy::hex;
 use lore_object_dispatch::spool::SpoolLayout;
 use lore_object_dispatch::spool::SpoolObjectKey;
 use lore_object_dispatch::spool::SpoolObjectKind;
 use lore_object_dispatch::spool_writer::LinuxSpoolWriter;
+use lore_object_dispatch::spool_writer::SpoolPhysicalInventory;
 use lore_object_dispatch::spool_writer::SpoolWriteError;
 use lore_object_dispatch::spool_writer::SpoolWriteReceipt;
 
@@ -108,7 +110,7 @@ impl FragmentDrainReservation {
 type CleanupTask = tokio::task::JoinHandle<
     Result<(lore_object_dispatch::drain_spool::DrainCleanupIntent, bool), FragmentProviderError>,
 >;
-type PhysicalSpoolSample = (Option<u64>, Option<(std::time::Instant, u64, u64)>);
+type PhysicalSpoolSample = (Option<u64>, Option<SpoolPhysicalInventory>);
 type ObservationTask = tokio::task::JoinHandle<PhysicalSpoolSample>;
 
 pub struct FragmentDrainMaintenanceHandle {
@@ -136,6 +138,27 @@ pub struct FragmentDrainObservation {
     /// Age of the completed spool inventory the physical fields report, taken
     /// when this observation was assembled. Observability only.
     pub physical_spool_age: Option<Duration>,
+}
+
+impl FragmentDrainObservation {
+    /// Join the authority's ledger sample with the writer's own filesystem sample.
+    fn assemble(
+        sample: &DrainObservation,
+        available_bytes: Option<u64>,
+        physical: Option<SpoolPhysicalInventory>,
+    ) -> Self {
+        Self {
+            spool_bytes: sample.spool_bytes,
+            spool_files: sample.spool_files,
+            cleanup_backlog: sample.cleanup_backlog,
+            roots_usable: available_bytes.is_some(),
+            metadata_full: sample.metadata_full,
+            available_bytes,
+            physical_spool_bytes: physical.map(|inventory| inventory.bytes),
+            physical_spool_files: physical.map(|inventory| inventory.files),
+            physical_spool_age: physical.map(|inventory| inventory.completed_at.elapsed()),
+        }
+    }
 }
 
 impl FragmentDrainMaintenanceHandle {
@@ -169,17 +192,11 @@ impl FragmentDrainMaintenanceHandle {
             None => (None, None),
         };
         *pending = None;
-        Ok(FragmentDrainObservation {
-            spool_bytes: sample.spool_bytes,
-            spool_files: sample.spool_files,
-            cleanup_backlog: sample.cleanup_backlog,
-            roots_usable: available_bytes.is_some(),
-            metadata_full: sample.metadata_full,
+        Ok(FragmentDrainObservation::assemble(
+            &sample,
             available_bytes,
-            physical_spool_bytes: physical_usage.map(|value| value.1),
-            physical_spool_files: physical_usage.map(|value| value.2),
-            physical_spool_age: physical_usage.map(|value| value.0.elapsed()),
-        })
+            physical_usage,
+        ))
     }
     pub async fn cleanup_pass(&self, batch: u32) -> Result<u32, FragmentProviderError> {
         let batch = u16::try_from(batch)
@@ -451,6 +468,53 @@ pub(super) async fn assert_cleanup_recovers_after_worker_panic(
         "an already compact tombstone does not report fresh cleanup progress"
     );
     assert!(maintenance.io.lock().await.is_none());
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    fn ledger() -> DrainObservation {
+        DrainObservation {
+            spool_bytes: 100,
+            spool_files: 10,
+            cleanup_backlog: 3,
+            metadata_full: false,
+        }
+    }
+
+    #[test]
+    fn a_completed_spool_walk_reports_its_size_and_age() {
+        let completed_at = std::time::Instant::now() - Duration::from_secs(7);
+        let observation = FragmentDrainObservation::assemble(
+            &ledger(),
+            Some(1 << 20),
+            Some(SpoolPhysicalInventory {
+                completed_at,
+                bytes: 150,
+                files: 12,
+            }),
+        );
+        assert_eq!(observation.physical_spool_bytes, Some(150));
+        assert_eq!(observation.physical_spool_files, Some(12));
+        let age = observation.physical_spool_age.expect("age");
+        assert!(age >= Duration::from_secs(7), "{age:?}");
+        assert!(age < Duration::from_secs(60), "{age:?}");
+        assert_eq!(
+            (observation.spool_bytes, observation.spool_files),
+            (100, 10)
+        );
+        assert!(observation.roots_usable);
+    }
+
+    #[test]
+    fn no_completed_spool_walk_reports_no_size_and_no_age() {
+        let observation = FragmentDrainObservation::assemble(&ledger(), None, None);
+        assert_eq!(observation.physical_spool_bytes, None);
+        assert_eq!(observation.physical_spool_files, None);
+        assert_eq!(observation.physical_spool_age, None);
+        assert!(!observation.roots_usable);
+    }
 }
 
 #[cfg(test)]
