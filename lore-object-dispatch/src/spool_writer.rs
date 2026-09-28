@@ -208,6 +208,18 @@ mod platform {
             &self,
             maximum_entries: u32,
         ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
+            Ok(self
+                .physical_usage_completed(maximum_entries)?
+                .map(|(_, bytes, files)| (bytes, files)))
+        }
+
+        /// `physical_usage`, plus when the reported inventory completed. The
+        /// inventory lags the ledger by at least that age, so readiness reports
+        /// it beside the capacity verdict.
+        pub fn physical_usage_completed(
+            &self,
+            maximum_entries: u32,
+        ) -> Result<Option<(Instant, u64, u64)>, SpoolWriteError> {
             let mut inventory = self
                 .physical_inventory
                 .lock()
@@ -223,7 +235,7 @@ mod platform {
             &self,
             inventory: &mut PhysicalInventory,
             maximum_entries: u32,
-        ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
+        ) -> Result<Option<(Instant, u64, u64)>, SpoolWriteError> {
             self.assert_configured_root_stable()?;
             if inventory.stack.is_empty() {
                 let root = self
@@ -291,8 +303,7 @@ mod platform {
             }
             Ok(inventory
                 .completed
-                .filter(|(at, _, _)| at.elapsed() <= Duration::from_secs(300))
-                .map(|(_, bytes, files)| (bytes, files)))
+                .filter(|(at, _, _)| at.elapsed() <= Duration::from_secs(300)))
         }
 
         /// Sample the pinned root, refusing mount/root replacement since construction.
@@ -755,6 +766,12 @@ mod platform {
             &self,
             _maximum_entries: u32,
         ) -> Result<Option<(u64, u64)>, SpoolWriteError> {
+            Err(SpoolWriteError::UnsupportedPlatform)
+        }
+        pub fn physical_usage_completed(
+            &self,
+            _maximum_entries: u32,
+        ) -> Result<Option<(std::time::Instant, u64, u64)>, SpoolWriteError> {
             Err(SpoolWriteError::UnsupportedPlatform)
         }
         pub fn available_bytes(&self) -> Result<u64, SpoolWriteError> {

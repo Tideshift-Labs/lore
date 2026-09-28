@@ -392,6 +392,94 @@ pub struct WriteBehindObservation {
     pub cleanup_backlog: u64,
     pub roots_usable: bool,
     pub capacity_available: bool,
+    /// Why `capacity_available` holds or fails. Observability only; the
+    /// verdict above is `capacity.failing.is_empty()`.
+    pub capacity: CapacityEvidence,
+}
+
+/// Each `capacity_available` predicate, evaluated separately, plus the ages of
+/// the two physical inventories it compared against the ledger.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CapacityEvidence {
+    /// The names of every failing predicate, in evaluation order.
+    pub failing: Vec<&'static str>,
+    /// Age of the last completed stage walk when the predicate was evaluated.
+    pub stage_inventory_age: Option<Duration>,
+    /// Age of the last completed spool walk when the predicate was evaluated.
+    pub spool_inventory_age: Option<Duration>,
+    pub stage_physical_bytes: Option<u64>,
+    pub stage_physical_files: Option<u64>,
+    pub stage_ledger_bytes: u64,
+    pub stage_ledger_files: u64,
+    pub spool_physical_bytes: Option<u64>,
+    pub spool_physical_files: Option<u64>,
+    pub spool_ledger_bytes: u64,
+    pub spool_ledger_files: u64,
+    pub available_bytes: Option<u64>,
+}
+
+impl CapacityEvidence {
+    /// The same conjunction `observe` has always computed, split so each
+    /// failing conjunct is named. The verdict must not change here.
+    fn evaluate(
+        stage_metadata_full: bool,
+        stage_physical: Option<(Instant, u64, u64, u64)>,
+        stage_ledger: (u64, u64),
+        spool: &lore_fragment_provider::FragmentDrainObservation,
+        min_free_bytes: u64,
+    ) -> Self {
+        let (stage_ledger_bytes, stage_ledger_files) = stage_ledger;
+        let mut failing = Vec::new();
+        if stage_metadata_full {
+            failing.push("stage_metadata_full");
+        }
+        if spool.metadata_full {
+            failing.push("spool_metadata_full");
+        }
+        match stage_physical {
+            None => failing.push("stage_inventory_missing"),
+            Some((_, bytes, files, unknown)) => {
+                if unknown != 0 {
+                    failing.push("stage_unknown_entries");
+                }
+                if bytes > stage_ledger_bytes {
+                    failing.push("stage_bytes_over_ledger");
+                }
+                if files > stage_ledger_files {
+                    failing.push("stage_files_over_ledger");
+                }
+            }
+        }
+        match spool.physical_spool_bytes {
+            None => failing.push("spool_bytes_inventory_missing"),
+            Some(bytes) if bytes > spool.spool_bytes => failing.push("spool_bytes_over_ledger"),
+            Some(_) => {}
+        }
+        match spool.physical_spool_files {
+            None => failing.push("spool_files_inventory_missing"),
+            Some(files) if files > spool.spool_files => failing.push("spool_files_over_ledger"),
+            Some(_) => {}
+        }
+        match spool.available_bytes {
+            None => failing.push("free_space_unknown"),
+            Some(free) if free < min_free_bytes => failing.push("free_space_below_minimum"),
+            Some(_) => {}
+        }
+        Self {
+            failing,
+            stage_inventory_age: stage_physical.map(|(at, _, _, _)| at.elapsed()),
+            spool_inventory_age: spool.physical_spool_age,
+            stage_physical_bytes: stage_physical.map(|(_, bytes, _, _)| bytes),
+            stage_physical_files: stage_physical.map(|(_, _, files, _)| files),
+            stage_ledger_bytes,
+            stage_ledger_files,
+            spool_physical_bytes: spool.physical_spool_bytes,
+            spool_physical_files: spool.physical_spool_files,
+            spool_ledger_bytes: spool.spool_bytes,
+            spool_ledger_files: spool.spool_files,
+            available_bytes: spool.available_bytes,
+        }
+    }
 }
 
 struct DrainState {
@@ -616,20 +704,14 @@ impl FragmentWriteBehindHandle {
             .map_err(provider_store_err)?;
         let charged_bytes = positive(observation.resident_bytes)?;
         let charged_files = positive(observation.resident_files)?;
-        let capacity_available = !observation.metadata_full
-            && !spool.metadata_full
-            && stage_physical.is_some_and(|(_, bytes, files, unknown)| {
-                unknown == 0 && bytes <= charged_bytes && files <= charged_files
-            })
-            && spool
-                .physical_spool_bytes
-                .is_some_and(|bytes| bytes <= spool.spool_bytes)
-            && spool
-                .physical_spool_files
-                .is_some_and(|files| files <= spool.spool_files)
-            && spool
-                .available_bytes
-                .is_some_and(|free| free >= self.stage.min_free_bytes());
+        let capacity = CapacityEvidence::evaluate(
+            observation.metadata_full,
+            stage_physical,
+            (charged_bytes, charged_files),
+            &spool,
+            self.stage.min_free_bytes(),
+        );
+        let capacity_available = capacity.failing.is_empty();
         self.stage.note_capacity(capacity_available);
         let stage_bytes = charged_bytes.max(stage_physical.map_or(0, |(_, bytes, _, _)| bytes));
         let stage_files = charged_files.max(stage_physical.map_or(0, |(_, _, files, _)| files));
@@ -654,6 +736,7 @@ impl FragmentWriteBehindHandle {
                 .saturating_add(spool.cleanup_backlog),
             roots_usable: self.stage.snapshot().root_available && spool.roots_usable,
             capacity_available,
+            capacity,
         })
     }
 
@@ -1220,4 +1303,219 @@ impl FragmentWriteBehindHandle {
 
 fn positive(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_error| StoreError::internal("negative write-behind observation"))
+}
+
+#[cfg(test)]
+mod capacity_evidence_tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use lore_fragment_provider::FragmentDrainObservation;
+
+    use super::CapacityEvidence;
+
+    const MIN_FREE: u64 = 64;
+
+    fn healthy_spool() -> FragmentDrainObservation {
+        FragmentDrainObservation {
+            spool_bytes: 100,
+            spool_files: 10,
+            cleanup_backlog: 0,
+            roots_usable: true,
+            metadata_full: false,
+            available_bytes: Some(MIN_FREE),
+            physical_spool_bytes: Some(100),
+            physical_spool_files: Some(10),
+            physical_spool_age: Some(Duration::from_millis(1_500)),
+        }
+    }
+
+    fn healthy_stage(at: Instant) -> Option<(Instant, u64, u64, u64)> {
+        Some((at, 200, 20, 0))
+    }
+
+    fn evaluate(
+        stage_metadata_full: bool,
+        stage_physical: Option<(Instant, u64, u64, u64)>,
+        spool: &FragmentDrainObservation,
+    ) -> CapacityEvidence {
+        CapacityEvidence::evaluate(
+            stage_metadata_full,
+            stage_physical,
+            (200, 20),
+            spool,
+            MIN_FREE,
+        )
+    }
+
+    #[test]
+    fn a_reconciled_cell_names_no_failing_predicate() {
+        let evidence = evaluate(false, healthy_stage(Instant::now()), &healthy_spool());
+        assert!(evidence.failing.is_empty(), "{:?}", evidence.failing);
+    }
+
+    /// One case per conjunct: each must fail alone and report exactly its name.
+    #[test]
+    fn each_predicate_reports_its_own_name() {
+        let now = Instant::now();
+        let mut cases: Vec<(&str, CapacityEvidence)> = Vec::new();
+        cases.push((
+            "stage_metadata_full",
+            evaluate(true, healthy_stage(now), &healthy_spool()),
+        ));
+        let mut spool = healthy_spool();
+        spool.metadata_full = true;
+        cases.push((
+            "spool_metadata_full",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        cases.push((
+            "stage_inventory_missing",
+            evaluate(false, None, &healthy_spool()),
+        ));
+        cases.push((
+            "stage_unknown_entries",
+            evaluate(false, Some((now, 200, 20, 1)), &healthy_spool()),
+        ));
+        cases.push((
+            "stage_bytes_over_ledger",
+            evaluate(false, Some((now, 201, 20, 0)), &healthy_spool()),
+        ));
+        cases.push((
+            "stage_files_over_ledger",
+            evaluate(false, Some((now, 200, 21, 0)), &healthy_spool()),
+        ));
+        let mut spool = healthy_spool();
+        spool.physical_spool_bytes = None;
+        cases.push((
+            "spool_bytes_inventory_missing",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        let mut spool = healthy_spool();
+        spool.physical_spool_bytes = Some(101);
+        cases.push((
+            "spool_bytes_over_ledger",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        let mut spool = healthy_spool();
+        spool.physical_spool_files = None;
+        cases.push((
+            "spool_files_inventory_missing",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        let mut spool = healthy_spool();
+        spool.physical_spool_files = Some(11);
+        cases.push((
+            "spool_files_over_ledger",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        let mut spool = healthy_spool();
+        spool.available_bytes = None;
+        cases.push((
+            "free_space_unknown",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        let mut spool = healthy_spool();
+        spool.available_bytes = Some(MIN_FREE - 1);
+        cases.push((
+            "free_space_below_minimum",
+            evaluate(false, healthy_stage(now), &spool),
+        ));
+        for (name, evidence) in cases {
+            assert_eq!(evidence.failing, vec![name], "case {name}");
+        }
+    }
+
+    /// Equal to the ledger is reconciled; only strictly larger fails, as before.
+    #[test]
+    fn a_physical_inventory_equal_to_its_ledger_passes() {
+        let mut spool = healthy_spool();
+        spool.available_bytes = Some(MIN_FREE);
+        let evidence = evaluate(false, Some((Instant::now(), 200, 20, 0)), &spool);
+        assert!(evidence.failing.is_empty(), "{:?}", evidence.failing);
+    }
+
+    #[test]
+    fn both_inventory_ages_and_both_sides_of_each_comparison_are_reported() {
+        let completed = Instant::now() - Duration::from_secs(7);
+        let mut spool = healthy_spool();
+        spool.physical_spool_bytes = Some(150);
+        let evidence = evaluate(false, Some((completed, 180, 19, 0)), &spool);
+        assert_eq!(evidence.failing, vec!["spool_bytes_over_ledger"]);
+        let stage_age = evidence.stage_inventory_age.expect("stage age");
+        assert!(stage_age >= Duration::from_secs(7), "{stage_age:?}");
+        assert!(stage_age < Duration::from_secs(60), "{stage_age:?}");
+        assert_eq!(
+            evidence.spool_inventory_age,
+            Some(Duration::from_millis(1_500))
+        );
+        assert_eq!(evidence.stage_physical_bytes, Some(180));
+        assert_eq!(evidence.stage_physical_files, Some(19));
+        assert_eq!(
+            (evidence.stage_ledger_bytes, evidence.stage_ledger_files),
+            (200, 20)
+        );
+        assert_eq!(evidence.spool_physical_bytes, Some(150));
+        assert_eq!(
+            (evidence.spool_ledger_bytes, evidence.spool_ledger_files),
+            (100, 10)
+        );
+        assert_eq!(evidence.available_bytes, Some(MIN_FREE));
+    }
+
+    /// The verdict must equal the single conjunction `observe` computed before
+    /// the predicates were split out, over every boundary of every input.
+    #[test]
+    fn the_verdict_matches_the_original_conjunction_on_every_boundary() {
+        let now = Instant::now();
+        let options = |values: [u64; 3]| [None, Some(values[0]), Some(values[1]), Some(values[2])];
+        for stage_full in [false, true] {
+            for spool_full in [false, true] {
+                for stage in [
+                    None,
+                    Some((now, 200, 20, 0)),
+                    Some((now, 201, 20, 0)),
+                    Some((now, 200, 21, 0)),
+                    Some((now, 199, 19, 1)),
+                ] {
+                    for spool_bytes in options([99, 100, 101]) {
+                        for spool_files in options([9, 10, 11]) {
+                            for free in options([0, MIN_FREE - 1, MIN_FREE]) {
+                                let spool = FragmentDrainObservation {
+                                    metadata_full: spool_full,
+                                    physical_spool_bytes: spool_bytes,
+                                    physical_spool_files: spool_files,
+                                    available_bytes: free,
+                                    ..healthy_spool()
+                                };
+                                let original = !stage_full
+                                    && !spool.metadata_full
+                                    && stage.is_some_and(|(_, bytes, files, unknown)| {
+                                        unknown == 0 && bytes <= 200 && files <= 20
+                                    })
+                                    && spool
+                                        .physical_spool_bytes
+                                        .is_some_and(|bytes| bytes <= spool.spool_bytes)
+                                    && spool
+                                        .physical_spool_files
+                                        .is_some_and(|files| files <= spool.spool_files)
+                                    && spool.available_bytes.is_some_and(|free| free >= MIN_FREE);
+                                let evidence = evaluate(stage_full, stage, &spool);
+                                assert_eq!(evidence.failing.is_empty(), original, "{evidence:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_inventory_reports_no_age() {
+        let mut spool = healthy_spool();
+        spool.physical_spool_age = None;
+        let evidence = evaluate(false, None, &spool);
+        assert_eq!(evidence.stage_inventory_age, None);
+        assert_eq!(evidence.spool_inventory_age, None);
+    }
 }

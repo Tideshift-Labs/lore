@@ -12,6 +12,7 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::bail;
 use lore_base::lore_spawn;
+use lore_postgres::store::fragment_write_behind::CapacityEvidence;
 use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
 use lore_postgres::store::fragment_write_behind::WriteBehindActivity;
 use lore_postgres::store::fragment_write_behind::WriteBehindObservation;
@@ -25,6 +26,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tracing::debug;
+use tracing::info;
 use tracing::warn;
 
 struct WriteBehindInstrumentProvider;
@@ -154,6 +156,71 @@ pub struct Snapshot {
     /// a 503 can be told from a transient ledger disagreement without reading the
     /// server log, the same way the backpressure ages are.
     pub capacity_unavailable_millis: Option<u64>,
+    /// Which capacity predicates failed at the last observation, the age of
+    /// each physical inventory when it was compared, and both sides of each
+    /// comparison. Observability only; no readiness decision reads it.
+    pub capacity: Option<CapacityDetail>,
+}
+
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct CapacityDetail {
+    pub failing: Vec<&'static str>,
+    pub stage_inventory_age_millis: Option<u64>,
+    pub spool_inventory_age_millis: Option<u64>,
+    pub stage_physical_bytes: Option<u64>,
+    pub stage_physical_files: Option<u64>,
+    pub stage_ledger_bytes: u64,
+    pub stage_ledger_files: u64,
+    pub spool_physical_bytes: Option<u64>,
+    pub spool_physical_files: Option<u64>,
+    pub spool_ledger_bytes: u64,
+    pub spool_ledger_files: u64,
+    pub available_bytes: Option<u64>,
+}
+
+impl From<&CapacityEvidence> for CapacityDetail {
+    fn from(evidence: &CapacityEvidence) -> Self {
+        Self {
+            failing: evidence.failing.clone(),
+            stage_inventory_age_millis: evidence.stage_inventory_age.map(millis),
+            spool_inventory_age_millis: evidence.spool_inventory_age.map(millis),
+            stage_physical_bytes: evidence.stage_physical_bytes,
+            stage_physical_files: evidence.stage_physical_files,
+            stage_ledger_bytes: evidence.stage_ledger_bytes,
+            stage_ledger_files: evidence.stage_ledger_files,
+            spool_physical_bytes: evidence.spool_physical_bytes,
+            spool_physical_files: evidence.spool_physical_files,
+            spool_ledger_bytes: evidence.spool_ledger_bytes,
+            spool_ledger_files: evidence.spool_ledger_files,
+            available_bytes: evidence.available_bytes,
+        }
+    }
+}
+
+/// `Some(new value)` when this observation flips `capacity_available`, or is
+/// the first after a gap and reports it false. A first observation reporting
+/// true is the expected state and is not a transition worth a log line.
+fn capacity_transition(previous: Option<bool>, current: bool) -> Option<bool> {
+    match previous {
+        Some(previous) if previous == current => None,
+        None if current => None,
+        _ => Some(current),
+    }
+}
+
+fn log_capacity_transition(available: bool, evidence: &CapacityEvidence) {
+    let detail = CapacityDetail::from(evidence);
+    if available {
+        info!(?detail, "write-behind capacity predicate holds again");
+    } else {
+        info!(
+            failing = ?detail.failing,
+            stage_inventory_age_millis = ?detail.stage_inventory_age_millis,
+            spool_inventory_age_millis = ?detail.spool_inventory_age_millis,
+            ?detail,
+            "write-behind capacity predicate failed"
+        );
+    }
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -403,6 +470,7 @@ impl FragmentWriteBehindReadiness {
             capacity_unavailable_millis: state
                 .capacity_unavailable_since
                 .map(|at| millis(at.elapsed())),
+            capacity: observation.map(|value| CapacityDetail::from(&value.capacity)),
         }
     }
 }
@@ -559,6 +627,15 @@ pub(crate) fn configure_fragment_write_behind(
                         .state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
+                    let previous = state
+                        .observation
+                        .as_ref()
+                        .map(|(_, value)| value.capacity_available);
+                    if let Some(available) =
+                        capacity_transition(previous, observation.capacity_available)
+                    {
+                        log_capacity_transition(available, &observation.capacity);
+                    }
                     record_observation(&mut state, Some(observation), Instant::now());
                 }
                 if observer_readiness.snapshot().ready {
@@ -671,6 +748,7 @@ mod tests {
                     cleanup_backlog: 4,
                     roots_usable: true,
                     capacity_available: true,
+                    capacity: CapacityEvidence::default(),
                 },
             )),
             worker: Some(old),
@@ -746,6 +824,7 @@ mod tests {
             cleanup_backlog: 0,
             roots_usable: true,
             capacity_available: true,
+            capacity: CapacityEvidence::default(),
         };
         let mut state = State {
             observation: Some((now, observation)),
@@ -859,6 +938,7 @@ mod tests {
             cleanup_backlog: 0,
             roots_usable: true,
             capacity_available: true,
+            capacity: CapacityEvidence::default(),
         }
     }
 
@@ -1334,6 +1414,91 @@ mod tests {
             Some(sustained),
             "a cleanup pass must not affect drain's backpressure state"
         );
+    }
+
+    // --- INV-FT F2(c): name the failing capacity predicate and inventory age --
+
+    fn failing_evidence() -> CapacityEvidence {
+        CapacityEvidence {
+            failing: vec!["spool_bytes_over_ledger", "spool_files_over_ledger"],
+            stage_inventory_age: Some(Duration::from_millis(6_250)),
+            spool_inventory_age: Some(Duration::from_millis(1_200)),
+            stage_physical_bytes: Some(10),
+            stage_physical_files: Some(1),
+            stage_ledger_bytes: 20,
+            stage_ledger_files: 2,
+            spool_physical_bytes: Some(26_521_120),
+            spool_physical_files: Some(392),
+            spool_ledger_bytes: 22_609_473,
+            spool_ledger_files: 330,
+            available_bytes: Some(1 << 30),
+        }
+    }
+
+    #[test]
+    fn capacity_detail_carries_the_failing_predicates_and_both_inventory_ages() {
+        let detail = CapacityDetail::from(&failing_evidence());
+        assert_eq!(
+            detail.failing,
+            vec!["spool_bytes_over_ledger", "spool_files_over_ledger"]
+        );
+        assert_eq!(detail.stage_inventory_age_millis, Some(6_250));
+        assert_eq!(detail.spool_inventory_age_millis, Some(1_200));
+        assert_eq!(
+            (detail.spool_physical_bytes, detail.spool_ledger_bytes),
+            (Some(26_521_120), 22_609_473)
+        );
+        assert_eq!(
+            (detail.spool_physical_files, detail.spool_ledger_files),
+            (Some(392), 330)
+        );
+    }
+
+    /// The field names are the operator-facing surface of `/event_readiness`.
+    #[test]
+    fn capacity_detail_serializes_under_stable_field_names() {
+        let json = serde_json::to_value(CapacityDetail::from(&failing_evidence())).expect("json");
+        assert_eq!(json["failing"][0], "spool_bytes_over_ledger");
+        assert_eq!(json["stage_inventory_age_millis"], 6_250);
+        assert_eq!(json["spool_inventory_age_millis"], 1_200);
+        assert_eq!(json["spool_physical_bytes"], 26_521_120);
+        assert_eq!(json["spool_ledger_bytes"], 22_609_473);
+        assert_eq!(json["available_bytes"], 1_u64 << 30);
+        let missing =
+            serde_json::to_value(CapacityDetail::from(&CapacityEvidence::default())).expect("json");
+        assert!(missing["stage_inventory_age_millis"].is_null());
+        assert!(missing["spool_inventory_age_millis"].is_null());
+    }
+
+    #[test]
+    fn a_capacity_transition_is_a_flip_or_a_false_first_sample() {
+        assert_eq!(capacity_transition(Some(true), false), Some(false));
+        assert_eq!(capacity_transition(Some(false), true), Some(true));
+        assert_eq!(capacity_transition(Some(true), true), None);
+        assert_eq!(capacity_transition(Some(false), false), None);
+        assert_eq!(capacity_transition(None, false), Some(false));
+        assert_eq!(capacity_transition(None, true), None);
+    }
+
+    /// Observability must not move the verdict: evidence naming failures on an
+    /// observation whose `capacity_available` is true changes nothing, and the
+    /// reverse still starts the run.
+    #[test]
+    fn capacity_evidence_does_not_drive_the_readiness_decision() {
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let observation = WriteBehindObservation {
+            capacity: failing_evidence(),
+            ..capacity_observation(true)
+        };
+        record_observation(&mut state, Some(observation), now);
+        assert_eq!(state.capacity_unavailable_since, None);
+        let observation = WriteBehindObservation {
+            capacity: CapacityEvidence::default(),
+            ..capacity_observation(false)
+        };
+        record_observation(&mut state, Some(observation), now);
+        assert_eq!(state.capacity_unavailable_since, Some(now));
     }
 
     // --- CR-037: capacity_unavailable needs a sustained run, not one sample --

@@ -108,7 +108,7 @@ impl FragmentDrainReservation {
 type CleanupTask = tokio::task::JoinHandle<
     Result<(lore_object_dispatch::drain_spool::DrainCleanupIntent, bool), FragmentProviderError>,
 >;
-type PhysicalSpoolSample = (Option<u64>, Option<(u64, u64)>);
+type PhysicalSpoolSample = (Option<u64>, Option<(std::time::Instant, u64, u64)>);
 type ObservationTask = tokio::task::JoinHandle<PhysicalSpoolSample>;
 
 pub struct FragmentDrainMaintenanceHandle {
@@ -133,6 +133,9 @@ pub struct FragmentDrainObservation {
     pub available_bytes: Option<u64>,
     pub physical_spool_bytes: Option<u64>,
     pub physical_spool_files: Option<u64>,
+    /// Age of the completed spool inventory the physical fields report, taken
+    /// when this observation was assembled. Observability only.
+    pub physical_spool_age: Option<Duration>,
 }
 
 impl FragmentDrainMaintenanceHandle {
@@ -157,7 +160,7 @@ impl FragmentDrainMaintenanceHandle {
             *pending = Some(lore_base::lore_spawn_blocking!(move || {
                 (
                     writer.available_bytes().ok(),
-                    writer.physical_usage(4096).ok().flatten(),
+                    writer.physical_usage_completed(4096).ok().flatten(),
                 )
             }));
         }
@@ -173,8 +176,9 @@ impl FragmentDrainMaintenanceHandle {
             roots_usable: available_bytes.is_some(),
             metadata_full: sample.metadata_full,
             available_bytes,
-            physical_spool_bytes: physical_usage.map(|value| value.0),
-            physical_spool_files: physical_usage.map(|value| value.1),
+            physical_spool_bytes: physical_usage.map(|value| value.1),
+            physical_spool_files: physical_usage.map(|value| value.2),
+            physical_spool_age: physical_usage.map(|value| value.0.elapsed()),
         })
     }
     pub async fn cleanup_pass(&self, batch: u32) -> Result<u32, FragmentProviderError> {
