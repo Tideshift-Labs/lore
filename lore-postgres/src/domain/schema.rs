@@ -330,9 +330,24 @@ CREATE TABLE IF NOT EXISTS lore_domain_schema_state (
 -- Nullable on purpose. A client older than WP-120 sends no attempt id, and a receipt without one
 -- is an ordinary receipt rather than a defective one, so there is no default to backfill and
 -- nothing to migrate.
+--
+-- Neither this column nor the direct-evidence columns below may scan the table.
+-- The boot path applies them under `ensure_schema_online`'s 250 ms statement
+-- timeout, and the receipts table grows with every governed mutation. An inline
+-- column CHECK, or a plain `ADD CONSTRAINT`, validates every existing row under
+-- ACCESS EXCLUSIVE, so a big enough table would fail boot on every attempt. The
+-- columns are therefore added bare, and both constraints are added by the
+-- guarded block below as `NOT VALID`: PostgreSQL still enforces them on every
+-- insert and update, and skips only the scan of rows that already exist. Those
+-- rows hold NULL in every new column, which satisfies both.
+--
+-- The attempt-id bound keeps the name PostgreSQL gives an inline column CHECK
+-- (`<table>_<column>_check`), and the evidence shape keeps its own name. Both
+-- first shipped validating, so a cell that already took them keeps its
+-- validated constraints under exactly those names, and the catalog guards add
+-- no second copy.
 ALTER TABLE lore_domain_operation_receipts
-    ADD COLUMN IF NOT EXISTS client_attempt_id bytea
-    CHECK (client_attempt_id IS NULL OR octet_length(client_attempt_id) = 16);
+    ADD COLUMN IF NOT EXISTS client_attempt_id bytea;
 
 -- CR-029 P-029-3: additive, server-only evidence for direct-human receipts.
 -- Historical rows remain NULL; no authorization evidence is fabricated.
@@ -343,6 +358,16 @@ ALTER TABLE lore_domain_operation_receipts
     ADD COLUMN IF NOT EXISTS direct_bound_fields_digest bytea;
 DO $direct_evidence$
 BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conrelid = 'lore_domain_operation_receipts'::regclass
+          AND conname = 'lore_domain_operation_receipts_client_attempt_id_check'
+    ) THEN
+        ALTER TABLE lore_domain_operation_receipts
+            ADD CONSTRAINT lore_domain_operation_receipts_client_attempt_id_check CHECK (
+                client_attempt_id IS NULL OR octet_length(client_attempt_id) = 16
+            ) NOT VALID;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conrelid = 'lore_domain_operation_receipts'::regclass
@@ -369,7 +394,7 @@ BEGIN
                  AND verification_nonce IS NULL
                  AND bound_fields_digest IS NULL
                  AND consumed_ticket_sha256 IS NULL)
-            );
+            ) NOT VALID;
     END IF;
 END
 $direct_evidence$;

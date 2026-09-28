@@ -87,7 +87,11 @@ $expectedCases = @(
     [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'repository_create_exact_replay_returns_the_committed_outcome' },
     [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'expired_prepare_terminalization_survives_the_coordinator_return' },
     [pscustomobject]@{ Target = 'domain_coordinator_regressions'; Test = 'concurrent_repository_create_name_conflict_is_decisive_name_taken' },
-    [pscustomobject]@{ Target = 'domain_claim_identity_digest'; Test = 'every_one_field_digest_mutation_is_refused_against_the_prepared_fence' }
+    [pscustomobject]@{ Target = 'domain_claim_identity_digest'; Test = 'every_one_field_digest_mutation_is_refused_against_the_prepared_fence' },
+    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'receipt_upgrade_ddl_boots_on_a_populated_receipts_table_without_scanning' },
+    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'receipt_upgrade_ddl_leaves_an_already_migrated_cell_unchanged' },
+    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'mediated_upgrade_ddl_boots_on_populated_tables_without_scanning' },
+    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'mediated_upgrade_ddl_leaves_fresh_and_already_migrated_cells_unchanged' }
 )
 
 $results = @(

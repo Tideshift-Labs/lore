@@ -408,28 +408,108 @@ CREATE UNIQUE INDEX IF NOT EXISTS lore_domain_prune_ranges_end
 -- Additive upgrade path for cells that booted the guarded maintenance schema.
 -- The guarded handlers could not create lifecycle rows, so sentinel defaults
 -- can only affect manually seeded data. Such rows fail exact runtime binding.
+--
+-- Neither the columns nor the constraints may scan a table. The boot path
+-- applies this under `ensure_schema_online`'s 250 ms statement timeout, and a
+-- cell that booted the guarded maintenance schema can hold rows in all three
+-- tables. An inline column CHECK, or a plain `ADD CONSTRAINT`, validates every
+-- existing row under ACCESS EXCLUSIVE. The columns are therefore added bare
+-- (every default is a constant, so no rewrite), and every constraint is added
+-- by the guarded blocks below as `NOT VALID`: PostgreSQL still enforces it on
+-- every insert and update, and skips only the scan of rows that already exist.
+-- Those rows hold the constant default or NULL in each new column, and both
+-- satisfy every bound.
+--
+-- Each column bound keeps the name PostgreSQL gives an inline column CHECK:
+-- `<table>_<column>_check`, with both parts cut to fit 63 bytes. That is the
+-- name the `CREATE TABLE` bodies above give it on a fresh cell, and the name
+-- this block's first, inline-CHECK spelling gave it on an upgraded one. Either
+-- way the catalog guards find the existing constraint and add no second copy.
 ALTER TABLE lore_domain_operation_reserve_release_tombstones
     ADD COLUMN IF NOT EXISTS canonical_intent_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(canonical_intent_digest) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS phase1_request_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(phase1_request_digest) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS phase1_verification_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(phase1_verification_digest) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS terminal_outcome smallint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS terminal_receipt_sha256 bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(terminal_receipt_sha256) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS platform_terminal_status_revision bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS platform_acknowledged_at timestamptz NOT NULL DEFAULT '-infinity',
     ADD COLUMN IF NOT EXISTS release_proof_reservation_revision bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS release_proof_reservation_nonce bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(release_proof_reservation_nonce) = 32),
-    ADD COLUMN IF NOT EXISTS active_release_intent_revision bigint
-        CHECK (active_release_intent_revision IS NULL OR active_release_intent_revision >= 0),
-    ADD COLUMN IF NOT EXISTS active_release_intent_nonce bytea
-        CHECK (active_release_intent_nonce IS NULL OR octet_length(active_release_intent_nonce) = 32);
+        DEFAULT decode(repeat('00', 32), 'hex'),
+    ADD COLUMN IF NOT EXISTS active_release_intent_revision bigint,
+    ADD COLUMN IF NOT EXISTS active_release_intent_nonce bytea;
 
 DO $$
 BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserve_rel_canonical_intent_digest_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserve_rel_canonical_intent_digest_check
+                CHECK (octet_length(canonical_intent_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserve_relea_phase1_request_digest_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserve_relea_phase1_request_digest_check
+                CHECK (octet_length(phase1_request_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserve__phase1_verification_digest_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserve__phase1_verification_digest_check
+                CHECK (octet_length(phase1_verification_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserve_rel_terminal_receipt_sha256_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserve_rel_terminal_receipt_sha256_check
+                CHECK (octet_length(terminal_receipt_sha256) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserv_release_proof_reservation_no_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserv_release_proof_reservation_no_check
+                CHECK (octet_length(release_proof_reservation_nonce) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserv_active_release_intent_revisi_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserv_active_release_intent_revisi_check
+                CHECK (active_release_intent_revision IS NULL
+                       OR active_release_intent_revision >= 0) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserve_active_release_intent_nonce_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserve_active_release_intent_nonce_check
+                CHECK (active_release_intent_nonce IS NULL
+                       OR octet_length(active_release_intent_nonce) = 32) NOT VALID;
+    END IF;
     IF NOT EXISTS (
         SELECT 1
         FROM pg_constraint
@@ -446,31 +526,122 @@ BEGIN
                     AND active_release_intent_revision IS NOT NULL
                     AND active_release_intent_nonce IS NOT NULL
                     AND active_release_intent_ack_at IS NOT NULL)
-            );
+            ) NOT VALID;
     END IF;
 END
 $$;
 
 ALTER TABLE lore_domain_operation_tombstone_release_completion_markers
     ADD COLUMN IF NOT EXISTS completion_request_binding bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(completion_request_binding) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS completion_request_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(completion_request_digest) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS completion_verification_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(completion_verification_digest) = 32),
-    ADD COLUMN IF NOT EXISTS byte_charge bigint NOT NULL DEFAULT 0 CHECK (byte_charge >= 0),
+        DEFAULT decode(repeat('00', 32), 'hex'),
+    ADD COLUMN IF NOT EXISTS byte_charge bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS final_prune_after timestamptz NOT NULL DEFAULT '-infinity';
+
+DO $completion_marker_constraints$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_tombston_completion_request_binding_check'
+          AND conrelid = 'lore_domain_operation_tombstone_release_completion_markers'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_tombstone_release_completion_markers
+            ADD CONSTRAINT lore_domain_operation_tombston_completion_request_binding_check
+                CHECK (octet_length(completion_request_binding) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_tombstone_completion_request_digest_check'
+          AND conrelid = 'lore_domain_operation_tombstone_release_completion_markers'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_tombstone_release_completion_markers
+            ADD CONSTRAINT lore_domain_operation_tombstone_completion_request_digest_check
+                CHECK (octet_length(completion_request_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_tombst_completion_verification_dige_check'
+          AND conrelid = 'lore_domain_operation_tombstone_release_completion_markers'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_tombstone_release_completion_markers
+            ADD CONSTRAINT lore_domain_operation_tombst_completion_verification_dige_check
+                CHECK (octet_length(completion_verification_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_tombstone_release_compl_byte_charge_check'
+          AND conrelid = 'lore_domain_operation_tombstone_release_completion_markers'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_tombstone_release_completion_markers
+            ADD CONSTRAINT lore_domain_operation_tombstone_release_compl_byte_charge_check
+                CHECK (byte_charge >= 0) NOT VALID;
+    END IF;
+END
+$completion_marker_constraints$;
 
 ALTER TABLE lore_domain_proof_namespaces
     ADD COLUMN IF NOT EXISTS org_uuid bytea NOT NULL
-        DEFAULT decode(repeat('00', 16), 'hex') CHECK (octet_length(org_uuid) = 16),
+        DEFAULT decode(repeat('00', 16), 'hex'),
     ADD COLUMN IF NOT EXISTS materialization_request_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(materialization_request_digest) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS materialization_verification_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(materialization_verification_digest) = 32),
+        DEFAULT decode(repeat('00', 32), 'hex'),
     ADD COLUMN IF NOT EXISTS materialization_response_digest bytea NOT NULL
-        DEFAULT decode(repeat('00', 32), 'hex') CHECK (octet_length(materialization_response_digest) = 32),
-    ADD COLUMN IF NOT EXISTS namespace_revision bigint NOT NULL DEFAULT 1 CHECK (namespace_revision >= 1),
+        DEFAULT decode(repeat('00', 32), 'hex'),
+    ADD COLUMN IF NOT EXISTS namespace_revision bigint NOT NULL DEFAULT 1,
     ADD COLUMN IF NOT EXISTS materialized_global_counter_revision bigint NOT NULL DEFAULT 0,
     ADD COLUMN IF NOT EXISTS materialized_org_counter_revision bigint NOT NULL DEFAULT 0;
+
+DO $proof_namespace_constraints$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_proof_namespaces_org_uuid_check'
+          AND conrelid = 'lore_domain_proof_namespaces'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_proof_namespaces
+            ADD CONSTRAINT lore_domain_proof_namespaces_org_uuid_check
+                CHECK (octet_length(org_uuid) = 16) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_proof_namespaces_materialization_request_dige_check'
+          AND conrelid = 'lore_domain_proof_namespaces'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_proof_namespaces
+            ADD CONSTRAINT lore_domain_proof_namespaces_materialization_request_dige_check
+                CHECK (octet_length(materialization_request_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_proof_namespaces_materialization_verification_check'
+          AND conrelid = 'lore_domain_proof_namespaces'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_proof_namespaces
+            ADD CONSTRAINT lore_domain_proof_namespaces_materialization_verification_check
+                CHECK (octet_length(materialization_verification_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_proof_namespaces_materialization_response_dig_check'
+          AND conrelid = 'lore_domain_proof_namespaces'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_proof_namespaces
+            ADD CONSTRAINT lore_domain_proof_namespaces_materialization_response_dig_check
+                CHECK (octet_length(materialization_response_digest) = 32) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_proof_namespaces_namespace_revision_check'
+          AND conrelid = 'lore_domain_proof_namespaces'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_proof_namespaces
+            ADD CONSTRAINT lore_domain_proof_namespaces_namespace_revision_check
+                CHECK (namespace_revision >= 1) NOT VALID;
+    END IF;
+END
+$proof_namespace_constraints$;
 "#;
