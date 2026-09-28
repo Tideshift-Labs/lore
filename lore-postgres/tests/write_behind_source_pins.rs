@@ -335,17 +335,31 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
             // Step 3: contents AND metadata are durable before the rename that
             // publishes them.
             "file.sync_all()",
-            // Step 4: atomic rename onto the content-derived identity. A rename
-            // into a directory a purge removed redoes step 1 before retrying.
-            "fs::rename(&temporary, resolved.path())",
-            "ensure_parent_retrying(root, resolved)?;",
+            // Step 4: atomic rename onto the content-derived identity, into the
+            // leaf step 1 synced and still holds. A rename into a leaf a purge
+            // removed redoes step 1 before retrying.
+            "root.rename_into(&temporary, resolved, &leaf)",
+            "leaf = ensure_parent_retrying(root, resolved)?;",
             // Step 5: the leaf directory entry is durable only after this.
-            "sync_directory(resolved.parent())",
+            "root.sync_leaf(&leaf, resolved)",
         ],
     );
     let retrying = function(&source, "fn ensure_parent_retrying(");
     assert!(
         retrying.contains("root.ensure_parent(resolved)"),
         "every retry of step 1 is the real durable ensure_parent"
+    );
+    // Steps 4 and 5 must act on the held leaf, not on a path a purge and a
+    // second finalizer can make name a different, unsynced directory.
+    let root_source = read_source("src/store/write_behind/root.rs");
+    let rename_into = function(&root_source, "fn rename_into(");
+    assert!(
+        rename_into.contains("&leaf.handle"),
+        "the rename targets the held leaf descriptor"
+    );
+    let sync_leaf = function(&root_source, "fn sync_leaf(");
+    assert!(
+        sync_leaf.contains("&leaf.handle"),
+        "step 5 syncs the held leaf descriptor"
     );
 }

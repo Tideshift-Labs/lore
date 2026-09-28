@@ -45,7 +45,7 @@ use lore_base::lore_spawn_blocking;
 use super::WriteBehindError;
 use super::root::ConfinedRoot;
 use super::root::ResolvedStagedPath;
-use super::root::sync_directory;
+use super::root::StagedLeaf;
 
 /// Durably place one payload at its resolved staged path.
 ///
@@ -85,8 +85,9 @@ fn finalize_blocking(
     use std::fs;
     use std::io::Write as _;
 
-    // Step 1, and it must precede the rename. See the module header.
-    ensure_parent_retrying(root, resolved)?;
+    // Step 1, and it must precede the rename. See the module header. The leaf
+    // stays held so steps 4 and 5 act on the directory step 1 synced.
+    let mut leaf = ensure_parent_retrying(root, resolved)?;
 
     let key = resolved
         .path()
@@ -120,19 +121,20 @@ fn finalize_blocking(
         // by construction and an epoch row is immutable.
         let mut attempt = 1;
         loop {
-            match fs::rename(&temporary, resolved.path()) {
+            match root.rename_into(&temporary, resolved, &leaf) {
                 Ok(()) => break,
-                // Purge removes an empty fan-out directory, so the one step 1
-                // made can be gone by now. Redo step 1 first, so the rename
-                // still lands in a directory whose entry is durable.
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::NotFound
-                        && attempt < PLACEMENT_ATTEMPTS =>
-                {
+                // Purge removes an empty fan-out directory, so the leaf step 1
+                // synced can be gone by now, and a path might name a newer,
+                // unsynced one. Redo step 1, so the rename lands in a directory
+                // whose entry is durable.
+                Err(WriteBehindError::Io {
+                    kind: std::io::ErrorKind::NotFound,
+                    ..
+                }) if attempt < PLACEMENT_ATTEMPTS => {
                     attempt += 1;
-                    ensure_parent_retrying(root, resolved)?;
+                    leaf = ensure_parent_retrying(root, resolved)?;
                 }
-                Err(error) => return Err(WriteBehindError::io("staging rename", &error)),
+                Err(error) => return Err(error),
             }
         }
         #[cfg(feature = "failure_generator")]
@@ -142,7 +144,7 @@ fn finalize_blocking(
             kind: std::io::ErrorKind::Interrupted,
         })?;
         // Step 5.
-        sync_directory(resolved.parent())
+        root.sync_leaf(&leaf, resolved)
     })();
 
     if outcome.is_err() {
@@ -162,7 +164,7 @@ const PLACEMENT_ATTEMPTS: usize = 3;
 fn ensure_parent_retrying(
     root: &ConfinedRoot,
     resolved: &ResolvedStagedPath,
-) -> Result<(), WriteBehindError> {
+) -> Result<StagedLeaf, WriteBehindError> {
     let mut attempt = 1;
     loop {
         match root.ensure_parent(resolved) {

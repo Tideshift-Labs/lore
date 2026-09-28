@@ -136,7 +136,9 @@ const PHYSICAL_SPOOL_MAX_AGE: Duration = Duration::from_secs(300);
 ///
 /// The caller must keep the order this relies on: `before` is a read taken
 /// before the step was issued, and `record_ledger` is called only with a read
-/// taken after every step already recorded.
+/// taken after every step already recorded. When the read right after a
+/// completion fails or is cancelled, a later read binds the walk instead; it is
+/// still taken after the walk completed, so the bound stays sound.
 #[derive(Debug)]
 pub struct WalkLedgerBound<W> {
     /// The latest ledger read. Every step recorded so far was issued before it.

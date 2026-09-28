@@ -306,7 +306,7 @@ fn existing_fanout_parent_fsync_failure_refuses_the_second_writer() {
             Ok(())
         });
         assert_eq!(
-            root.ensure_parent(&resolved),
+            root.ensure_parent(&resolved).map(|_| ()),
             Err(WriteBehindError::RootProbeFailed)
         );
     }
@@ -400,4 +400,34 @@ async fn concurrent_purges_in_the_same_fanout_never_fail_a_finalize() {
         root.remove_placement_blocking(&resolved, false).unwrap();
     }
     purger.join().unwrap();
+}
+
+/// The reviewer's case: a purge removes the leaf step 1 synced and another
+/// finalizer recreates one at the same path before syncing it. The rename must
+/// refuse the held, removed leaf rather than land in the recreated directory.
+#[test]
+fn a_rename_into_a_removed_and_recreated_leaf_is_not_found() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_file(&root, &[0xab; 32], 1);
+    let leaf = root.ensure_parent(&resolved).unwrap();
+    std::fs::remove_dir(resolved.parent()).unwrap();
+    std::fs::create_dir(resolved.parent()).unwrap();
+    let temporary = scratch.0.join("incoming").join("case.tmp");
+    std::fs::write(&temporary, b"x").unwrap();
+    assert!(matches!(
+        root.rename_into(&temporary, &resolved, &leaf),
+        Err(WriteBehindError::Io {
+            kind: std::io::ErrorKind::NotFound,
+            ..
+        })
+    ));
+    assert!(
+        !resolved.path().exists(),
+        "nothing lands in the recreated leaf"
+    );
+    assert!(
+        temporary.exists(),
+        "the synced temporary file is kept for the retry"
+    );
 }

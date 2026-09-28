@@ -630,6 +630,11 @@ mod platform {
                 .map_err(|_| SpoolWriteError::InvalidSpoolKey)?;
             let blob_relative = self.relative_artifact_path(paths.final_path())?;
             let part_relative = self.relative_artifact_path(paths.part_path())?;
+            let (Some(blob_name), Some(part_name)) =
+                (blob_relative.file_name(), part_relative.file_name())
+            else {
+                return Err(SpoolWriteError::PathBindingMismatch);
+            };
 
             self.assert_configured_root_stable()?;
 
@@ -638,10 +643,12 @@ mod platform {
             let Some(directory_relative) = blob_relative.parent() else {
                 return Err(SpoolWriteError::PathBindingMismatch);
             };
-            // A purge in the same directory may remove it while it is still
-            // empty, between step 1 and the part create. Redo step 1 then: the
-            // durability order is unchanged, because every attempt syncs its own
-            // chain before placing anything.
+            // Steps 2 to 5 act on the leaf descriptor step 1 synced, never on a
+            // path. A purge may empty-remove that leaf before the part create,
+            // and another writer may recreate a directory at the same path
+            // without having synced it yet. Creating in the removed leaf is then
+            // ENOENT, so this attempt redoes step 1 instead of placing the body
+            // somewhere whose entry is not durable.
             let mut attempt = 1;
             let outcome = loop {
                 let directory_fd = match self.ensure_directory_chain(directory_relative) {
@@ -653,19 +660,20 @@ mod platform {
                 };
                 #[cfg(test)]
                 before_place::run();
-                let outcome = self.place_body(&part_relative, &blob_relative, &directory_fd, body);
-                if outcome != Err(DIRECTORY_REMOVED) || attempt == PLACEMENT_ATTEMPTS {
-                    break outcome;
+                let outcome = self.place_body(part_name, blob_name, &directory_fd, body);
+                if outcome == Err(DIRECTORY_REMOVED) && attempt < PLACEMENT_ATTEMPTS {
+                    attempt += 1;
+                    continue;
                 }
-                attempt += 1;
+                if outcome.is_err() {
+                    // Best effort, and exactly `finalize_blocking`'s reasoning:
+                    // the rename either happened or it did not. If it did this
+                    // removes nothing; if it did not this removes the part file
+                    // that would otherwise wait for recovery.
+                    let _ = rustix::fs::unlinkat(&directory_fd, part_name, AtFlags::empty());
+                }
+                break outcome;
             };
-            if outcome.is_err() {
-                // Best effort, and exactly `finalize_blocking`'s reasoning: the
-                // rename either happened or it did not. If it did this removes
-                // nothing; if it did not this removes the part file that would
-                // otherwise wait for recovery.
-                let _ = rustix::fs::unlinkat(&self.root_fd, &part_relative, AtFlags::empty());
-            }
             outcome?;
 
             self.assert_configured_root_stable()?;
@@ -676,11 +684,11 @@ mod platform {
             })
         }
 
-        /// Steps 2 through 5.
+        /// Steps 2 through 5, each relative to the leaf descriptor step 1 synced.
         fn place_body(
             &self,
-            part_relative: &Path,
-            blob_relative: &Path,
+            part_name: &std::ffi::OsStr,
+            blob_name: &std::ffi::OsStr,
             directory_fd: &OwnedFd,
             body: &[u8],
         ) -> Result<(), SpoolWriteError> {
@@ -690,8 +698,8 @@ mod platform {
             // leaves a `.blob` and no `.part`, and silently rewriting it is the
             // one outcome that could change bytes another party already trusts.
             match rustix::fs::openat2(
-                &self.root_fd,
-                blob_relative,
+                directory_fd,
+                blob_name,
                 DIRECTORY_FLAGS.difference(OFlags::DIRECTORY),
                 Mode::empty(),
                 ARTIFACT_RESOLVE,
@@ -712,16 +720,16 @@ mod platform {
             // part file is a concurrent or abandoned writer, never something to
             // truncate.
             let part_fd = match rustix::fs::openat2(
-                &self.root_fd,
-                part_relative,
+                directory_fd,
+                part_name,
                 PART_FLAGS,
                 FILE_MODE,
                 ARTIFACT_RESOLVE,
             ) {
                 Ok(fd) => fd,
                 Err(Errno::EXIST) => return Err(SpoolWriteError::PartAlreadyPresent),
-                // `O_CREAT` names only the final component, so ENOENT means the
-                // leaf directory step 1 made has gone.
+                // One component under a live descriptor: ENOENT means the leaf
+                // step 1 synced has been removed.
                 Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
                 Err(Errno::LOOP | Errno::XDEV | Errno::NOTDIR) => {
                     return Err(SpoolWriteError::UnsafeOrNonRegular);
@@ -742,13 +750,15 @@ mod platform {
             })?;
             drop(part);
 
-            // Step 4. Both sides are relative to the pinned root descriptor, so
-            // the rename cannot cross out of it and is atomic within the one
-            // filesystem `NO_XDEV` has already held every open to.
-            rustix::fs::renameat(&self.root_fd, part_relative, &self.root_fd, blob_relative)
-                .map_err(|_| SpoolWriteError::Io {
+            // Step 4. Both sides are one component in the leaf descriptor, so
+            // the rename cannot leave it and is atomic within the one filesystem
+            // `NO_XDEV` has already held every open to. The leaf holds the part
+            // file now, so no purge can remove it.
+            rustix::fs::renameat(directory_fd, part_name, directory_fd, blob_name).map_err(
+                |_| SpoolWriteError::Io {
                     operation: "part rename",
-                })?;
+                },
+            )?;
 
             // Step 5.
             rustix::fs::fsync(directory_fd).map_err(|_| SpoolWriteError::Io {
@@ -758,6 +768,12 @@ mod platform {
 
         /// Create every level of `relative` below the root, fsyncing each
         /// parent before descending, and return the leaf directory descriptor.
+        ///
+        /// Each level is opened before its parent is synced. Purge removes
+        /// empty directories, so the entry at a name can be removed and
+        /// recreated by another writer. Opening first means the sync covers the
+        /// directory this writer holds: if that one is removed later, creating
+        /// in it is ENOENT and the caller starts over.
         fn ensure_directory_chain(&self, relative: &Path) -> Result<OwnedFd, SpoolWriteError> {
             let mut parent = self.root_fd.try_clone().map_err(|_| SpoolWriteError::Io {
                 operation: "root descriptor clone",
@@ -780,9 +796,6 @@ mod platform {
                         });
                     }
                 }
-                rustix::fs::fsync(&parent).map_err(|_| SpoolWriteError::Io {
-                    operation: "fanout parent fsync",
-                })?;
                 let child = match rustix::fs::openat2(
                     &parent,
                     name,
@@ -802,6 +815,9 @@ mod platform {
                         });
                     }
                 };
+                rustix::fs::fsync(&parent).map_err(|_| SpoolWriteError::Io {
+                    operation: "fanout parent fsync",
+                })?;
                 let stat = rustix::fs::fstat(&child).map_err(|_| SpoolWriteError::Io {
                     operation: "fanout stat",
                 })?;
@@ -1114,6 +1130,34 @@ mod purge_tests {
         let result = writer.write_put_body(&layout, &key, b"body");
         super::platform::before_place::clear();
         result.expect("the write redoes step 1 and places the body");
+        assert_eq!(fs::read(paths.final_path()).unwrap(), b"body");
+    }
+
+    /// A purge removes the leaf step 1 synced, then another writer recreates a
+    /// directory at the same path without syncing it. The writer must not place
+    /// its body there through the path; it redoes step 1, which syncs the new
+    /// directory itself.
+    #[test]
+    fn a_removed_and_recreated_leaf_makes_the_writer_redo_step_one() {
+        let root = test_root("recreated-before-place");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let key = key(1, 1);
+        let paths = layout.derive_paths(&key).unwrap();
+        let request = paths.final_path().parent().unwrap().to_path_buf();
+        let attempts = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = attempts.clone();
+        super::platform::before_place::install(move || {
+            counted.set(counted.get() + 1);
+            if counted.get() == 1 {
+                fs::remove_dir(&request).unwrap();
+                fs::create_dir(&request).unwrap();
+            }
+        });
+        let result = writer.write_put_body(&layout, &key, b"body");
+        super::platform::before_place::clear();
+        result.expect("the write redoes step 1 and places the body");
+        assert_eq!(attempts.get(), 2, "the first attempt's leaf was removed");
         assert_eq!(fs::read(paths.final_path()).unwrap(), b"body");
     }
 

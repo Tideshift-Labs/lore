@@ -84,9 +84,22 @@ impl ResolvedStagedPath {
         &self.path
     }
 
+    #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
     pub(crate) fn parent(&self) -> &Path {
         &self.parent
     }
+}
+
+/// The fan-out leaf directory step 1 made durable, held open for steps 4 and 5.
+///
+/// Purge removes empty fan-out directories, and another finalizer can then
+/// recreate one at the same path before syncing it. Renaming into this held
+/// directory, rather than into a path, means a removed leaf fails the rename
+/// with `NotFound` instead of publishing into a directory whose entry is not
+/// durable.
+pub(crate) struct StagedLeaf {
+    #[cfg(unix)]
+    handle: std::fs::File,
 }
 
 #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
@@ -212,6 +225,7 @@ mod platform {
     use super::ResolvedStagedPath;
     use super::RootInner;
     use super::STAGED_DIR;
+    use super::StagedLeaf;
     use super::WriteBehindError;
 
     impl ConfinedRoot {
@@ -360,12 +374,19 @@ mod platform {
         /// proceeding. `AlreadyExists` does not establish the entry's type or
         /// durability. See the module header for the intermediate-symlink
         /// residual this path does not close.
+        ///
+        /// Each level is opened before its parent is synced, and the leaf is
+        /// created relative to the held upper level. Purge removes empty fan-out
+        /// directories, so a name can be removed and recreated by another
+        /// finalizer; opening first means every sync covers a directory this
+        /// finalizer holds. If a held directory is removed afterwards, the next
+        /// act in it is `NotFound` and the caller starts over.
         pub(crate) fn ensure_parent(
             &self,
             resolved: &ResolvedStagedPath,
-        ) -> Result<(), WriteBehindError> {
+        ) -> Result<StagedLeaf, WriteBehindError> {
             let parent = resolved.parent();
-            let Some(grandparent) = parent.parent() else {
+            let (Some(grandparent), Some(leaf_name)) = (parent.parent(), parent.file_name()) else {
                 return Err(WriteBehindError::RootUnresolvable);
             };
             match fs::create_dir(grandparent) {
@@ -373,17 +394,44 @@ mod platform {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(WriteBehindError::io("fanout create", &error)),
             }
+            let upper = open_directory_at(None, grandparent)?;
             // Every finalizer establishes its own durability barrier. A peer
             // can pause after mkdir, so observing its entry is not proof that
             // the peer has synced the parent before this writer acknowledges.
             sync_directory(&self.inner.staged)?;
-            match fs::create_dir(parent) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(WriteBehindError::io("fanout create", &error)),
+            let mode = rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO;
+            match rustix::fs::mkdirat(&upper, leaf_name, mode) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(WriteBehindError::io("fanout create", &error.into())),
             }
-            sync_directory(grandparent)?;
-            Ok(())
+            let handle = open_directory_at(Some(&upper), Path::new(leaf_name))?;
+            sync_directory_handle(&upper, grandparent)?;
+            Ok(StagedLeaf { handle })
+        }
+
+        /// Step 4: rename the synced temporary file into the held leaf.
+        /// `NotFound` when the leaf has been removed since `ensure_parent`.
+        pub(crate) fn rename_into(
+            &self,
+            temporary: &Path,
+            resolved: &ResolvedStagedPath,
+            leaf: &StagedLeaf,
+        ) -> Result<(), WriteBehindError> {
+            let name = resolved
+                .path()
+                .file_name()
+                .ok_or(WriteBehindError::KeyMismatch)?;
+            rustix::fs::renameat(rustix::fs::CWD, temporary, &leaf.handle, name)
+                .map_err(|error| WriteBehindError::io("staging rename", &error.into()))
+        }
+
+        /// Step 5: make the renamed entry durable in the held leaf.
+        pub(crate) fn sync_leaf(
+            &self,
+            leaf: &StagedLeaf,
+            resolved: &ResolvedStagedPath,
+        ) -> Result<(), WriteBehindError> {
+            sync_directory_handle(&leaf.handle, resolved.parent())
         }
 
         /// Read one staged file, bounded, refusing anything that is not a
@@ -522,6 +570,25 @@ mod platform {
                 Err(_) => AdmissionSample::RootUnavailable,
             }
         }
+    }
+
+    /// Open one directory without following a final symlink, by path or as one
+    /// component relative to `parent`.
+    fn open_directory_at(
+        parent: Option<&fs::File>,
+        path: &Path,
+    ) -> Result<fs::File, WriteBehindError> {
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let opened = match parent {
+            Some(parent) => rustix::fs::openat(parent, path, flags, rustix::fs::Mode::empty()),
+            None => rustix::fs::open(path, flags, rustix::fs::Mode::empty()),
+        };
+        opened
+            .map(fs::File::from)
+            .map_err(|error| WriteBehindError::io("fanout open", &error.into()))
     }
 
     /// How many fan-out levels above a purged staged file may be removed once
@@ -677,6 +744,7 @@ mod platform {
     use super::AdmissionSample;
     use super::ConfinedRoot;
     use super::ResolvedStagedPath;
+    use super::StagedLeaf;
     use super::WriteBehindError;
 
     // Staging is Unix-only (owner ruling, 2026-09-16): directory fsync and
@@ -699,6 +767,23 @@ mod platform {
 
         pub(crate) fn ensure_parent(
             &self,
+            _resolved: &ResolvedStagedPath,
+        ) -> Result<StagedLeaf, WriteBehindError> {
+            Err(WriteBehindError::UnsupportedPlatform)
+        }
+
+        pub(crate) fn rename_into(
+            &self,
+            _temporary: &Path,
+            _resolved: &ResolvedStagedPath,
+            _leaf: &StagedLeaf,
+        ) -> Result<(), WriteBehindError> {
+            Err(WriteBehindError::UnsupportedPlatform)
+        }
+
+        pub(crate) fn sync_leaf(
+            &self,
+            _leaf: &StagedLeaf,
             _resolved: &ResolvedStagedPath,
         ) -> Result<(), WriteBehindError> {
             Err(WriteBehindError::UnsupportedPlatform)
@@ -730,13 +815,7 @@ mod platform {
             AdmissionSample::RootUnavailable
         }
     }
-
-    pub(crate) fn sync_directory(_directory: &Path) -> Result<(), WriteBehindError> {
-        Err(WriteBehindError::UnsupportedPlatform)
-    }
 }
-
-pub(crate) use platform::sync_directory;
 
 #[cfg(all(test, unix))]
 #[path = "durability_tests.rs"]
