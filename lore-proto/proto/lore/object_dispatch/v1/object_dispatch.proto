@@ -87,6 +87,12 @@ enum PutUploadClosedStateV1 {
   PUT_UPLOAD_CLOSED_STATE_UPLOAD_CLOSED = 1;
   PUT_UPLOAD_CLOSED_STATE_RESULT_PAYLOAD_DISPOSED = 2;
 }
+// UNIMPLEMENTED (WP-115 ledger row 22, cut 2026-09-27). Nothing builds, encodes,
+// decodes or reads this message. The in-process authority refuses UPLOAD_CLOSED
+// with a closed error and no typed detail. Owed by whoever first emits or reads
+// it: no_dispatch_proof.logical_request_id must equal logical_request_id, with a
+// test that pins the check. Until then any use trips
+// lore-object-dispatch/tests/unimplemented_put_refusal_details.rs.
 message PutUploadClosedV1 {
   string protocol_revision = 1; string provider_boundary_id = 2;
   string authenticated_cell_id = 3; string authenticated_tenant_id = 4;
@@ -260,6 +266,13 @@ message ObjectStoreNoDispatchProofV1 {
   uint64 authority_epoch = 5; bytes proof_blake3 = 6;
   string logical_request_id = 7;
 }
+// UNIMPLEMENTED (WP-115 ledger row 22, cut 2026-09-27). Nothing builds, encodes,
+// decodes or reads this message. The in-process authority refuses
+// DISPATCH_PUT_RESERVATION_UNAVAILABLE with a closed error and no typed detail.
+// Owed by whoever first emits or reads it: reservation_no_dispatch_proof's
+// logical_request_id must equal logical_request_id, with a test that pins the
+// check. Until then any use trips
+// lore-object-dispatch/tests/unimplemented_put_refusal_details.rs.
 message PutReservationUnavailableV1 {
   string protocol_revision = 1; string provider_boundary_id = 2;
   string authenticated_cell_id = 3; string authenticated_tenant_id = 4;

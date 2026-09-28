@@ -242,6 +242,12 @@ impl ::prost::Name for PutReservationClosureV1 {
         "/lore.object_dispatch.v1.PutReservationClosureV1".into()
     }
 }
+/// UNIMPLEMENTED (WP-115 ledger row 22, cut 2026-09-27). Nothing builds, encodes,
+/// decodes or reads this message. The in-process authority refuses UPLOAD_CLOSED
+/// with a closed error and no typed detail. Owed by whoever first emits or reads
+/// it: no_dispatch_proof.logical_request_id must equal logical_request_id, with a
+/// test that pins the check. Until then any use trips
+/// lore-object-dispatch/tests/unimplemented_put_refusal_details.rs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PutUploadClosedV1 {
     #[prost(string, tag = "1")]
@@ -708,6 +714,13 @@ impl ::prost::Name for ObjectStoreNoDispatchProofV1 {
         "/lore.object_dispatch.v1.ObjectStoreNoDispatchProofV1".into()
     }
 }
+/// UNIMPLEMENTED (WP-115 ledger row 22, cut 2026-09-27). Nothing builds, encodes,
+/// decodes or reads this message. The in-process authority refuses
+/// DISPATCH_PUT_RESERVATION_UNAVAILABLE with a closed error and no typed detail.
+/// Owed by whoever first emits or reads it: reservation_no_dispatch_proof's
+/// logical_request_id must equal logical_request_id, with a test that pins the
+/// check. Until then any use trips
+/// lore-object-dispatch/tests/unimplemented_put_refusal_details.rs.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PutReservationUnavailableV1 {
     #[prost(string, tag = "1")]
