@@ -1365,6 +1365,30 @@ pub(super) fn retry_record_from(
     }
 }
 
+/// Group the three replay-audit columns into one record.
+///
+/// Read as three `Option`s for the reason [`retry_record_from`] reads two:
+/// `lore_outbox_events_replay_shape` is `NOT VALID`, so a partly set audit is
+/// a drifted row, and it surfaces as a `DomainError` rather than a panic
+/// decoding a null into a `String`.
+pub(super) fn replay_audit_from(
+    at: Option<SystemTime>,
+    actor: Option<String>,
+    reason: Option<String>,
+) -> Result<Option<ReplayAudit>, DomainError> {
+    match (at, actor, reason) {
+        (Some(at), Some(actor), Some(reason)) => Ok(Some(ReplayAudit { actor, reason, at })),
+        (None, None, None) => Ok(None),
+        (at, actor, reason) => Err(DomainError::Internal(format!(
+            "outbox row replay audit is partly set (replayed_at present: {}, replay_actor \
+             present: {}, replay_reason present: {}); lore_outbox_events_replay_shape has drifted",
+            at.is_some(),
+            actor.is_some(),
+            reason.is_some()
+        ))),
+    }
+}
+
 /// Decode one row selected with `{EVENT_COLUMNS}, {ROW_STATE_COLUMNS}`.
 pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
     // The `lore_outbox_events_publication_shape` CHECK makes these six columns
@@ -1380,13 +1404,17 @@ pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
         publisher_contract_version: row.get("publisher_contract_version"),
     });
 
-    // Same shape argument, against `lore_outbox_events_replay_shape`.
-    let replayed_at: Option<SystemTime> = row.get("replayed_at");
-    let replay = replayed_at.map(|at| ReplayAudit {
-        actor: row.get("replay_actor"),
-        reason: row.get("replay_reason"),
-        at,
-    });
+    let replay = replay_audit_from(
+        row.try_get("replayed_at").map_err(|e| {
+            DomainError::Internal(format!("outbox row replayed_at is unreadable: {e}"))
+        })?,
+        row.try_get("replay_actor").map_err(|e| {
+            DomainError::Internal(format!("outbox row replay_actor is unreadable: {e}"))
+        })?,
+        row.try_get("replay_reason").map_err(|e| {
+            DomainError::Internal(format!("outbox row replay_reason is unreadable: {e}"))
+        })?,
+    )?;
 
     let last_retry = retry_record_from(
         row.try_get("last_retry_class").map_err(|e| {
@@ -1715,6 +1743,35 @@ mod tests {
             let error = retry_record_from(class, stamp).expect_err("half set");
             assert!(
                 matches!(&error, DomainError::Internal(message) if message.contains("half set")),
+                "unexpected {error:?}"
+            );
+        }
+    }
+
+    /// The replay audit decodes the same way: all three set or none, and a
+    /// partly set audit is a `DomainError`, never a panic, because
+    /// `lore_outbox_events_replay_shape` is `NOT VALID` too.
+    #[test]
+    fn a_partly_set_replay_audit_is_an_error_not_a_panic() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(replay_audit_from(None, None, None).expect("absent"), None);
+        assert_eq!(
+            replay_audit_from(Some(at), Some("kv".to_owned()), Some("incident".to_owned()))
+                .expect("present"),
+            Some(ReplayAudit {
+                actor: "kv".to_owned(),
+                reason: "incident".to_owned(),
+                at,
+            })
+        );
+        for (stamp, actor, reason) in [
+            (Some(at), None, Some("incident".to_owned())),
+            (Some(at), Some("kv".to_owned()), None),
+            (None, Some("kv".to_owned()), Some("incident".to_owned())),
+        ] {
+            let error = replay_audit_from(stamp, actor, reason).expect_err("partly set");
+            assert!(
+                matches!(&error, DomainError::Internal(message) if message.contains("partly set")),
                 "unexpected {error:?}"
             );
         }
