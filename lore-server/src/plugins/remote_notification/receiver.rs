@@ -436,6 +436,9 @@ struct ResumableGeneration {
     /// persisted contiguous frontier, or the captured position when this
     /// generation never reported one.
     frontier_start_sequence: i64,
+    /// The generation is `draining`: this receiver's own graceful stop. It
+    /// moves back to `ready` before this bootstrap consumes anything.
+    draining: bool,
 }
 
 /// The durable invalidation receiver.
@@ -677,6 +680,33 @@ impl DurableReceiver {
         let resumable = self
             .resumable_generation(&snapshot, identity, &placement)
             .await?;
+
+        // A resumed `draining` generation leaves `draining` BEFORE this
+        // bootstrap consumes anything. Left for step 9, the row would read as
+        // a stopped, caught-up receiver while this process acknowledged and
+        // checkpointed deliveries, and a graceful `retire-generation` in that
+        // window would retire a running receiver (WP-115 row 68). The proof
+        // `readiness_cas` needs is already persisted: the draining write's
+        // checkpoint at the captured placement. `ready` and `draining` count
+        // toward safety alike, so this changes nothing an evaluation reads.
+        // A retirement that won the race answers here, before any capture.
+        if let Some(resume) = resumable
+            && resume.draining
+        {
+            match self
+                .runtime
+                .store
+                .readiness_cas(identity, resume.membership_generation)
+                .await
+                .map_err(store_failure)?
+            {
+                MembershipCas::Applied { .. } | MembershipCas::AlreadyRecorded => {}
+                MembershipCas::VersionConflict { .. } => {
+                    return Err(BootstrapFailure::Transient(REASON_BOOTSTRAPPING));
+                }
+                other => return Err(retire_on(other)),
+            }
+        }
 
         let reusable = snapshot
             .members
@@ -1074,6 +1104,7 @@ impl DurableReceiver {
             membership_generation: latest.membership_generation,
             captured_start_sequence: captured.start_sequence,
             frontier_start_sequence: start_sequence,
+            draining: latest.state == "draining",
         }))
     }
 
@@ -1363,7 +1394,9 @@ impl DurableReceiver {
     /// same. A membership version conflict is adopted and resent once, as the
     /// bootstrap does. Any other refusal falls back to the ordinary final
     /// checkpoint, and the operator then needs `--confirm-receiver-stopped`
-    /// to retire this generation.
+    /// to retire this generation. That includes `FrontierRegressed`, which a
+    /// single process reporting its own generation should never meet: it is
+    /// logged and left unmarked rather than retried with a guessed frontier.
     async fn draining_checkpoint(&self, session: &mut ReceiverSession) {
         for _ in 0..2 {
             let report = session.checkpoint_report(&self.receiver.membership_identity);
@@ -3010,6 +3043,61 @@ mod tests {
         assert_eq!(
             first.store.member_state(IDENTITY, 1).as_deref(),
             Some("ready")
+        );
+        // The un-drain is the restart's first membership write, ahead of the
+        // capture, so no delivery is consumed behind a `draining` row.
+        let first_readiness = restart_calls
+            .iter()
+            .position(|call| matches!(call, StoreCall::Readiness { .. }))
+            .expect("the resume moves the generation back to ready");
+        let first_baseline = restart_calls
+            .iter()
+            .position(|call| matches!(call, StoreCall::Baseline { .. }))
+            .expect("the resume records its baseline");
+        assert!(
+            first_readiness < first_baseline,
+            "the draining generation must leave draining before it consumes: {restart_calls:?}"
+        );
+        assert_eq!(
+            first.stream.captures().len(),
+            2,
+            "one capture per process, and the resume did not join or capture anew"
+        );
+    }
+
+    /// A retirement that commits while the receiver is down wins. The
+    /// restart's un-drain is refused before it captures or consumes anything,
+    /// and the next bootstrap starts a new generation.
+    #[tokio::test]
+    async fn a_draining_generation_retired_before_the_restart_is_not_resumed() {
+        let mut first = harness(900);
+        run_then_shut_down(&mut first, false).await;
+        assert_eq!(
+            first.store.member_state(IDENTITY, 1).as_deref(),
+            Some("draining")
+        );
+        first.store.next_readiness(Ok(MembershipCas::WrongState {
+            state: "retired".to_string(),
+        }));
+        let captures_before = first.stream.captures().len();
+        let restarted = DurableReceiver::new(
+            &config(),
+            ReceiverRuntime {
+                store: Arc::new(first.store.clone()),
+                stream: Arc::new(first.stream.clone()),
+                target: Arc::new(first.target.clone()),
+            },
+        )
+        .expect("the test config declares a required receiver");
+        let failure = restarted
+            .bootstrap()
+            .await
+            .expect_err("a retired generation is not resumed");
+        assert_eq!(failure, BootstrapFailure::Retired(REASON_PLACEMENT_MOVED));
+        assert_eq!(
+            first.stream.captures().len(),
+            captures_before,
+            "the refusal lands before any capture"
         );
     }
 

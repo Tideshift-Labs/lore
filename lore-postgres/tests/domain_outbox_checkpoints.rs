@@ -1207,6 +1207,59 @@ async fn a_draining_generation_that_restarts_resumes_to_ready() {
     namespace.release().await;
 }
 
+/// A `draining` generation whose placement moved is not resumed, and unlike a
+/// joining one it is not retired by the refusal either: an operator may still
+/// be proving its drain, and the successor the receiver starts outranks it.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn readiness_cas_refuses_a_draining_generation_whose_placement_moved_without_retiring_it() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "drain-moved").await;
+    let url = namespace.pg_url().to_owned();
+    let raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        0,
+    )
+    .await;
+    assert!(matches!(
+        drain(&mut deadpool, &raw, &cell_id, "loreserver-1", generation, 0).await,
+        CheckpointOutcome::Applied { .. }
+    ));
+    let version = current_membership_version(&raw, &cell_id).await;
+    assert!(matches!(
+        membership::set_current_placement(&raw, &cell_id, "DURABLE-y", 2, 1, version)
+            .await
+            .expect("move placement"),
+        MembershipCas::Applied { .. }
+    ));
+    let version = current_membership_version(&raw, &cell_id).await;
+
+    assert_eq!(
+        membership::readiness_cas(&mut deadpool, &cell_id, "loreserver-1", generation)
+            .await
+            .expect("readiness cas"),
+        MembershipCas::PlacementMoved {
+            current_stream_identity: Some("DURABLE-y".to_owned()),
+            current_stream_epoch: Some(2),
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "draining");
+    assert_eq!(current_membership_version(&raw, &cell_id).await, version);
+
+    namespace.release().await;
+}
+
 /// The escape hatch: a receiver that died without a graceful stop never wrote
 /// the marker. With `confirm_receiver_stopped` and a caught-up frontier it
 /// retires, and the row records `confirmed_stopped` beside the actor and

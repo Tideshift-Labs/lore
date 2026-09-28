@@ -1181,9 +1181,10 @@ pub async fn readiness_cas(
 /// without it. That is why the flag is audited rather than silent.
 ///
 /// A `draining` receiver that restarts before it is retired resumes its
-/// generation through [`readiness_cas`], which moves it back to `ready`; a
-/// retirement that commits first wins, and the restarted receiver then
-/// starts a new generation.
+/// generation through [`readiness_cas`], which moves it back to `ready`. The
+/// receiver makes that call before it captures or consumes anything, so no
+/// running receiver sits behind a `draining` row. A retirement that commits
+/// first wins, and the restarted receiver then starts a new generation.
 ///
 /// The reset fence's placeholder (`receiver_identity`
 /// [`REQUIRED_REPLACEMENT_PLACEHOLDER`], generation

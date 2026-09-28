@@ -24,8 +24,11 @@
 --
 -- Nullable with no default, and the constraint named and `NOT VALID`, so this
 -- never scans the table under `ensure_schema_online`'s 250 ms statement timeout.
--- A row retired before this migration carries an actor and a NULL basis; the
--- constraint is not checked against it, and nothing updates a retired row.
+-- A row retired before this migration carries an actor and a NULL basis. The
+-- constraint is not checked against it as it stands, but any UPDATE of such a
+-- row is rejected, and a later `VALIDATE CONSTRAINT` fails while one exists.
+-- Every writer of this table filters `state <> 'retired'` today, so none
+-- updates one.
 ALTER TABLE lore_outbox_receiver_membership
     ADD COLUMN IF NOT EXISTS retirement_basis text;
 
