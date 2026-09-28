@@ -200,6 +200,13 @@ pub enum MaintenanceOperation {
         #[command(subcommand)]
         command: crate::domain::operator::DomainCommand,
     },
+    /// The cell database's schema: validate the boot path's NOT VALID
+    /// constraints.
+    Schema {
+        /// The operation to run.
+        #[command(subcommand)]
+        command: crate::domain::schema_operator::SchemaCommand,
+    },
 }
 
 fn ensure_postgres_rebuild_mode(mode: &str) -> Result<()> {
@@ -348,6 +355,9 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
                     .map_err(|error| {
                         anyhow!("The domain maintenance task did not complete: {error}")
                     })?,
+                    MaintenanceOperation::Schema { command } => {
+                        crate::domain::schema_operator::run(&command, &settings).await
+                    }
                 }
             } else {
                 async_main((settings, settings_hash), config).await

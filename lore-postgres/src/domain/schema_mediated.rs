@@ -490,6 +490,26 @@ BEGIN
             ADD CONSTRAINT lore_domain_operation_reserv_release_proof_reservation_no_check
                 CHECK (octet_length(release_proof_reservation_nonce) = 32) NOT VALID;
     END IF;
+    -- The first upgrade spelling omitted these two bounds, so a cell that took
+    -- it has neither while a fresh cell has both from `CREATE TABLE`.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserv_platform_terminal_status_rev_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserv_platform_terminal_status_rev_check
+                CHECK (platform_terminal_status_revision >= 0) NOT VALID;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_domain_operation_reserv_release_proof_reservation_re_check'
+          AND conrelid = 'lore_domain_operation_reserve_release_tombstones'::regclass
+    ) THEN
+        ALTER TABLE lore_domain_operation_reserve_release_tombstones
+            ADD CONSTRAINT lore_domain_operation_reserv_release_proof_reservation_re_check
+                CHECK (release_proof_reservation_revision >= 0) NOT VALID;
+    END IF;
     IF NOT EXISTS (
         SELECT 1 FROM pg_constraint
         WHERE conname = 'lore_domain_operation_reserv_active_release_intent_revisi_check'

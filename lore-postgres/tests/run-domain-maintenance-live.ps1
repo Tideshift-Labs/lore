@@ -91,7 +91,8 @@ $expectedCases = @(
     [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'receipt_upgrade_ddl_boots_on_a_populated_receipts_table_without_scanning' },
     [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'receipt_upgrade_ddl_leaves_an_already_migrated_cell_unchanged' },
     [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'mediated_upgrade_ddl_boots_on_populated_tables_without_scanning' },
-    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'mediated_upgrade_ddl_leaves_fresh_and_already_migrated_cells_unchanged' }
+    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'mediated_upgrade_ddl_leaves_fresh_and_already_migrated_cells_unchanged' },
+    [pscustomobject]@{ Target = 'domain_schema_not_valid_upgrade'; Test = 'validate_constraints_proves_each_not_valid_constraint_once' }
 )
 
 $results = @(

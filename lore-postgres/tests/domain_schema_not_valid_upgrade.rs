@@ -132,6 +132,29 @@ const MEDIATED_CONSTRAINTS: [(&str, &str); 17] = [
     ),
 ];
 
+/// The two tombstone column bounds the first upgrade spelling omitted, so a
+/// cell that took it has neither. A fresh cell has both from `CREATE TABLE`;
+/// the upgrade DDL adds them `NOT VALID` under the same PostgreSQL names.
+const DRIFT_CONSTRAINTS: [(&str, &str); 2] = [
+    (
+        TOMBSTONES,
+        "lore_domain_operation_reserv_platform_terminal_status_rev_check",
+    ),
+    (
+        TOMBSTONES,
+        "lore_domain_operation_reserv_release_proof_reservation_re_check",
+    ),
+];
+
+/// Every constraint the mediated upgrade DDL guarantees.
+fn all_mediated_constraints() -> Vec<(&'static str, &'static str)> {
+    MEDIATED_CONSTRAINTS
+        .iter()
+        .chain(DRIFT_CONSTRAINTS.iter())
+        .copied()
+        .collect()
+}
+
 /// The receipt upgrade DDL `schema::SCHEMA` first shipped with: an inline
 /// column CHECK and a plain `ADD CONSTRAINT`, both validating. Kept verbatim so
 /// a case can build a cell that took the old spelling.
@@ -586,8 +609,9 @@ async fn receipt_upgrade_ddl_leaves_an_already_migrated_cell_unchanged() {
 
 /// The mediated upgrade DDL on populated tombstone, completion-marker, and
 /// proof-namespace tables, through the real boot path. The first spelling
-/// scanned all three under ACCESS EXCLUSIVE. The seventeen named `NOT VALID`
-/// constraints skip that scan, each still refuses its own bad write, and a
+/// scanned all three under ACCESS EXCLUSIVE. The nineteen named `NOT VALID`
+/// constraints (the first spelling's seventeen plus the two revision bounds it
+/// omitted) skip that scan, each still refuses its own bad write, and a
 /// restart is a no-op.
 #[tokio::test]
 #[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
@@ -625,8 +649,8 @@ async fn mediated_upgrade_ddl_boots_on_populated_tables_without_scanning() {
 
     assert_named_not_valid(
         &raw,
-        &MEDIATED_CONSTRAINTS,
-        "exactly the seventeen named NOT VALID mediated constraints, once each after a restart",
+        &all_mediated_constraints(),
+        "exactly the nineteen named NOT VALID mediated constraints, once each after a restart",
     )
     .await;
 
@@ -731,6 +755,182 @@ async fn mediated_upgrade_ddl_boots_on_populated_tables_without_scanning() {
     for (table, assignment, constraint) in &refusals {
         assert_refused_by(&raw, table, assignment, constraint).await;
     }
+    assert_refused_by(
+        &raw,
+        TOMBSTONES,
+        "platform_terminal_status_revision = -1",
+        DRIFT_CONSTRAINTS[0].1,
+    )
+    .await;
+    assert_refused_by(
+        &raw,
+        TOMBSTONES,
+        "release_proof_reservation_revision = -1",
+        DRIFT_CONSTRAINTS[1].1,
+    )
+    .await;
+}
+
+/// `(relation, conname)` of every NOT VALID CHECK or foreign key in the
+/// connection's schemas, sorted.
+async fn not_valid(client: &Client) -> Vec<(String, String)> {
+    client
+        .query(
+            "SELECT c.conrelid::regclass::text AS relation, c.conname::text AS name \
+               FROM pg_constraint AS c \
+               JOIN pg_class AS r ON r.oid = c.conrelid \
+               JOIN pg_namespace AS n ON n.oid = r.relnamespace \
+              WHERE NOT c.convalidated AND c.contype IN ('c', 'f') \
+                AND n.nspname = ANY(current_schemas(false)) \
+              ORDER BY r.relname, c.conname",
+            &[],
+        )
+        .await
+        .expect("read NOT VALID constraints")
+        .iter()
+        .map(|row| (row.get("relation"), row.get("name")))
+        .collect()
+}
+
+/// `loreserver schema validate-constraints`' store half on an upgraded,
+/// populated cell. Every `NOT VALID` constraint on a `lore_` table is validated
+/// once; a constraint an old row breaks is reported `violated` and left
+/// `NOT VALID`; a held table lock is reported `lock_timeout`; another
+/// application's table is never touched; and a rerun retries only what is left.
+#[tokio::test]
+#[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]
+async fn validate_constraints_proves_each_not_valid_constraint_once() {
+    use std::time::Duration;
+
+    use lore_postgres::domain::constraint_validation::ValidationOutcome;
+    use lore_postgres::domain::constraint_validation::ValidationTimeouts;
+    use lore_postgres::domain::constraint_validation::list_not_valid_constraints;
+    use lore_postgres::domain::constraint_validation::validate_not_valid_constraints;
+
+    const PROBE: &str = "lore_zz_validation_probe";
+    const PROBE_CHECK: &str = "lore_zz_validation_probe_v_check";
+    const FOREIGN: &str = "other_app_validation_probe";
+    let timeouts = ValidationTimeouts {
+        lock_timeout: Duration::from_secs(10),
+        statement_timeout: Duration::from_secs(600),
+    };
+
+    let url = pg_url().expect("disposable runner must provide LORE_TEST_PG_URL");
+    connect_domain_store(&url).await.expect("fresh boot");
+    let raw = pg_client(&url).await;
+    drop_mediated_upgrade_columns(&raw).await;
+    seed_mediated(&raw).await;
+    connect_domain_store(&url).await.expect("upgrade boot");
+
+    // An old row that breaks a constraint, and another application's table.
+    raw.batch_execute(&format!(
+        "CREATE TABLE {PROBE} (v integer); INSERT INTO {PROBE} VALUES (-1); \
+         ALTER TABLE {PROBE} ADD CONSTRAINT {PROBE_CHECK} CHECK (v >= 0) NOT VALID; \
+         CREATE TABLE {FOREIGN} (v integer); INSERT INTO {FOREIGN} VALUES (-1); \
+         ALTER TABLE {FOREIGN} ADD CONSTRAINT {FOREIGN}_v_check CHECK (v >= 0) NOT VALID;"
+    ))
+    .await
+    .expect("seed the probes");
+
+    let before = not_valid(&raw).await;
+    let foreign = (FOREIGN.to_owned(), format!("{FOREIGN}_v_check"));
+    let probe = (PROBE.to_owned(), PROBE_CHECK.to_owned());
+    for (table, name) in all_mediated_constraints() {
+        assert!(
+            before.contains(&(table.to_owned(), name.to_owned())),
+            "the upgrade left {name} NOT VALID: {before:?}"
+        );
+    }
+    let in_scope: Vec<(String, String)> = before
+        .iter()
+        .filter(|entry| **entry != foreign)
+        .cloned()
+        .collect();
+    assert_eq!(
+        list_not_valid_constraints(&raw).await.expect("list"),
+        in_scope,
+        "the work list is every NOT VALID lore_ constraint and nothing else"
+    );
+
+    // A held SHARE UPDATE EXCLUSIVE lock on the probe: its validation times
+    // out waiting, and every other constraint still validates.
+    let holder = pg_client(&url).await;
+    holder
+        .batch_execute(&format!(
+            "BEGIN; LOCK TABLE {PROBE} IN SHARE UPDATE EXCLUSIVE MODE"
+        ))
+        .await
+        .expect("hold the probe's lock");
+    let first = validate_not_valid_constraints(
+        &raw,
+        ValidationTimeouts {
+            lock_timeout: Duration::from_millis(200),
+            ..timeouts
+        },
+    )
+    .await
+    .expect("first run");
+    holder.batch_execute("ROLLBACK").await.expect("release");
+    assert_eq!(first.len(), in_scope.len());
+    for result in &first {
+        let entry = (result.relation.clone(), result.constraint.clone());
+        let expected = if entry == probe {
+            ValidationOutcome::LockTimeout
+        } else {
+            ValidationOutcome::Validated
+        };
+        assert_eq!(result.outcome, expected, "{entry:?}");
+    }
+    assert_eq!(
+        not_valid(&raw).await,
+        vec![probe.clone(), foreign.clone()],
+        "only the locked probe and the other application's constraint remain"
+    );
+
+    // The rerun retries only the probe, and its old row breaks it.
+    let second = validate_not_valid_constraints(&raw, timeouts)
+        .await
+        .expect("second run");
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0].constraint, PROBE_CHECK);
+    assert!(
+        matches!(&second[0].outcome, ValidationOutcome::Violated(_)),
+        "{second:?}"
+    );
+
+    // Repaired, it validates; after that there is nothing left to do.
+    raw.batch_execute(&format!("UPDATE {PROBE} SET v = 0"))
+        .await
+        .expect("repair the row");
+    let third = validate_not_valid_constraints(&raw, timeouts)
+        .await
+        .expect("third run");
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].outcome, ValidationOutcome::Validated);
+    assert!(
+        validate_not_valid_constraints(&raw, timeouts)
+            .await
+            .expect("fourth run")
+            .is_empty()
+    );
+    assert_eq!(not_valid(&raw).await, vec![foreign]);
+
+    // The session timeouts were reset.
+    let row = raw
+        .query_one(
+            "SELECT current_setting('lock_timeout') AS lock, \
+                    current_setting('statement_timeout') AS statement",
+            &[],
+        )
+        .await
+        .expect("read timeouts");
+    assert_eq!(
+        (
+            row.get::<_, String>("lock"),
+            row.get::<_, String>("statement")
+        ),
+        ("0".to_owned(), "0".to_owned())
+    );
 }
 
 /// A fresh cell and a cell that already took the validating mediated DDL each
@@ -746,10 +946,11 @@ async fn mediated_upgrade_ddl_leaves_fresh_and_already_migrated_cells_unchanged(
     let tables = [TOMBSTONES, MARKERS, NAMESPACES];
 
     // A fresh cell: every name comes from a CREATE TABLE body, validated, once.
-    let fresh = named_checks(&raw, &MEDIATED_CONSTRAINTS).await;
+    let all = all_mediated_constraints();
+    let fresh = named_checks(&raw, &all).await;
     assert_eq!(
         fresh.len(),
-        MEDIATED_CONSTRAINTS.len(),
+        all.len(),
         "a fresh cell carries every name exactly once: {fresh:?}"
     );
     assert!(
@@ -773,11 +974,39 @@ async fn mediated_upgrade_ddl_leaves_fresh_and_already_migrated_cells_unchanged(
         "the old spelling validates every constraint: {upgraded:?}"
     );
 
+    assert!(
+        named_checks(&raw, &DRIFT_CONSTRAINTS).await.is_empty(),
+        "the old spelling omitted the two revision bounds"
+    );
+
     connect_domain_store(&url).await.expect("boot");
     connect_domain_store(&url).await.expect("restart");
+    // The only change is the two bounds the old spelling omitted, added once
+    // each and NOT VALID. Every constraint it did make stays as it was.
+    let after = all_checks(&raw, &tables).await;
+    let drift: Vec<(String, String, bool, String)> = after
+        .iter()
+        .filter(|check| !before.contains(check))
+        .cloned()
+        .collect();
     assert_eq!(
-        all_checks(&raw, &tables).await,
-        before,
+        after.len(),
+        before.len() + DRIFT_CONSTRAINTS.len(),
+        "the boot path adds only the two omitted bounds: {drift:?}"
+    );
+    assert!(
+        before.iter().all(|check| after.contains(check)),
         "the boot path must leave an already-migrated cell's mediated constraints as they are"
+    );
+    assert_eq!(
+        drift
+            .iter()
+            .map(|(relation, name, validated, _)| (relation.as_str(), name.as_str(), *validated))
+            .collect::<Vec<_>>(),
+        DRIFT_CONSTRAINTS
+            .iter()
+            .map(|(table, name)| (*table, *name, false))
+            .collect::<Vec<_>>(),
+        "the two omitted bounds arrive NOT VALID under PostgreSQL's names"
     );
 }
