@@ -30,7 +30,8 @@
 //!
 //! No retirement call. A generation is retired *by* Step C — `readiness_cas`
 //! retires it on a placement mismatch, and `retire_generation` is WP-119's
-//! graceful-drain and hard-dead-member path, not a receiver's self-service. A
+//! graceful-drain and hard-dead-member path, reached through the operator's
+//! `loreserver outbox retire-generation`, not a receiver's self-service. A
 //! receiver that finds itself retired starts a new generation; it does not
 //! reach back and write its own tombstone.
 

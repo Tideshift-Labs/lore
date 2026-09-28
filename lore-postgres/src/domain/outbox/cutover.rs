@@ -57,6 +57,14 @@ pub enum CutoverOutcome {
 /// Creates the cell's membership counters if it has none, then stamps the
 /// singleton's `cutover_at` and `retention_policy_version`.
 ///
+/// **No production caller, by decision (WP-115 ledger row 68).** Production
+/// cutover is `initialize_empty` (`loreserver domain initialize-events`),
+/// which proves an empty cell before it stamps. This function proves none of
+/// the three facts in the module docs, so it is kept as test and fixture API:
+/// the two-process harness and the live server tests use it to arm a cell they
+/// built themselves. It is dormant durable-plane code and is not deleted. Wire
+/// it to an operator command only together with the proofs it lacks.
+///
 /// The stamp is guarded by `cutover_at IS NULL` rather than written
 /// unconditionally, so a second call cannot move a marker an operator has
 /// already correlated an incident against, and two concurrent operators produce
@@ -108,8 +116,8 @@ pub async fn stamp_cutover(
             Some(cutover_at) => Ok(CutoverOutcome::AlreadyStamped { cutover_at }),
             // The guarded update matched nothing and the column is still null,
             // which one concurrent transaction holding the row can produce.
-            // Reported rather than retried here: the caller is an operator
-            // command, and a retry loop belongs to it.
+            // Reported rather than retried here: a retry loop belongs to the
+            // caller.
             None => Err(DomainError::Contention(
                 "outbox cutover marker is still unset after a guarded stamp; another transaction \
                  holds the schema-state row"

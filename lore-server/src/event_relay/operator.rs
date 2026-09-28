@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! CR-032's operator command surface (WP-119 Phase 8).
 //!
-//! `loreserver outbox <status|inspect|replay|requeue-dead-letter|obsolete|set-plane>`.
+//! `loreserver outbox <status|inspect|replay|requeue-dead-letter|obsolete|set-plane|retire-generation>`.
 //! Each subcommand loads the same settings a serving `loreserver` would, proves
 //! the same Postgres-mode and cell preconditions, runs exactly one bounded
 //! operation against `lore_postgres`'s [`operator`] module, prints, and exits.
@@ -66,8 +66,10 @@ use clap::Args;
 use clap::Subcommand;
 use lore_postgres::domain::outbox::EvaluationBlock;
 use lore_postgres::domain::outbox::EventPlane;
+use lore_postgres::domain::outbox::MembershipCas;
 use lore_postgres::domain::outbox::SetEventPlaneOutcome;
 use lore_postgres::domain::outbox::event_plane;
+use lore_postgres::domain::outbox::membership;
 use lore_postgres::domain::outbox::operator;
 use lore_postgres::domain::outbox::relay::DeadLetterOutcome;
 use lore_postgres::domain::outbox::relay::OutboxRow;
@@ -215,6 +217,17 @@ pub enum OutboxCommand {
         /// Why. Recorded on the transition and on every retired row.
         #[arg(long)]
         reason: String,
+    },
+    /// Retire one receiver generation that is gone for good. Refused unless it
+    /// has a checkpoint at the current placement or a greater generation of
+    /// the same receiver is ready.
+    RetireGeneration {
+        /// The receiver's configured identity.
+        #[arg(long)]
+        receiver: String,
+        /// The generation to retire.
+        #[arg(long)]
+        generation: i64,
     },
     /// Mark one parked dead letter obsolete, with proof of the authoritative
     /// state that makes it obsolete. The evidence row is never deleted.
@@ -375,6 +388,10 @@ impl OperatorContext {
                 actor,
                 reason,
             } => self.set_plane((*plane).into(), actor, reason).await,
+            OutboxCommand::RetireGeneration {
+                receiver,
+                generation,
+            } => self.retire_generation(receiver, *generation).await,
         }
     }
 
@@ -777,6 +794,24 @@ impl OperatorContext {
     }
 
     // -----------------------------------------------------------------------
+    // membership
+    // -----------------------------------------------------------------------
+
+    /// Retire one receiver generation (WP-115 row 68).
+    ///
+    /// CR-032's graceful-drain and hard-dead retirement path. The two contract
+    /// preconditions are [`membership::retire_generation`]'s own, enforced in
+    /// one transaction; this command adds only the configured cell scope. It is
+    /// the operator's answer to a receiver that is gone for good and whose
+    /// generation would otherwise stay in the required set.
+    async fn retire_generation(&self, receiver: &str, generation: i64) -> Result<()> {
+        let mut client = self.client().await?;
+        let outcome =
+            membership::retire_generation(&mut client, &self.cell_id, receiver, generation).await?;
+        report_retirement(&self.cell_id, receiver, generation, &outcome)
+    }
+
+    // -----------------------------------------------------------------------
     // event plane
     // -----------------------------------------------------------------------
 
@@ -853,6 +888,48 @@ fn report_disposition(operation: &str, event: Uuid, outcome: &DeadLetterOutcome)
         DeadLetterOutcome::RelayIncompatible { relay_compat_floor } => Err(anyhow!(
             "this binary's relay contract is below the cell's floor of {relay_compat_floor}, so it \
              may not requeue work it cannot publish; upgrade the cell's loreserver first"
+        )),
+    }
+}
+
+/// Print one retirement outcome, and fail the process on anything but
+/// `Applied` or `AlreadyRecorded`.
+///
+/// `AlreadyRecorded` succeeds because the generation is retired, which is what
+/// the operator asked for; a rerun of the same runbook step must not fail.
+fn report_retirement(
+    cell_id: &str,
+    receiver: &str,
+    generation: i64,
+    outcome: &MembershipCas,
+) -> Result<()> {
+    match outcome {
+        MembershipCas::Applied {
+            membership_version, ..
+        } => {
+            println!(
+                "retired {receiver} generation {generation} in cell {cell_id}; membership \
+                 version is now {membership_version}"
+            );
+            Ok(())
+        }
+        MembershipCas::AlreadyRecorded => {
+            println!("{receiver} generation {generation} was already retired; nothing was written");
+            Ok(())
+        }
+        MembershipCas::RetirementUnproven => Err(anyhow!(
+            "refused: {receiver} generation {generation} has no checkpoint at the cell's current \
+             placement and no greater generation of {receiver} is ready. Retiring it would drop \
+             it from the required set and release every row above its frontier"
+        )),
+        MembershipCas::CellUnknown => Err(anyhow!(
+            "cell {cell_id} has no membership state; no receiver has ever joined it"
+        )),
+        MembershipCas::GenerationNotFound => Err(anyhow!(
+            "no generation {generation} for receiver {receiver} in cell {cell_id}"
+        )),
+        other => Err(anyhow!(
+            "retirement of {receiver} generation {generation} was not applied: {other:?}"
         )),
     }
 }
@@ -1100,6 +1177,92 @@ mod tests {
             ..row
         };
         assert_eq!(row_json(&never_retried)["last_retry"], Value::Null);
+    }
+
+    /// WP-115 row 68: `retire-generation` parses with both required
+    /// arguments and refuses to parse without either.
+    #[test]
+    fn retire_generation_parses_with_a_receiver_and_a_generation() {
+        use clap::Parser;
+
+        #[derive(Debug, Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            command: MaintenanceCommand,
+        }
+
+        let parsed = Harness::try_parse_from([
+            "loreserver",
+            "outbox",
+            "retire-generation",
+            "--receiver",
+            "loreserver-sfo3-cell-a-1",
+            "--generation",
+            "7",
+        ])
+        .expect("parse");
+        let MaintenanceCommand::Outbox {
+            command:
+                OutboxCommand::RetireGeneration {
+                    receiver,
+                    generation,
+                },
+        } = parsed.command
+        else {
+            panic!("expected retire-generation, got {:?}", parsed.command);
+        };
+        assert_eq!(receiver, "loreserver-sfo3-cell-a-1");
+        assert_eq!(generation, 7);
+
+        for missing in [
+            vec![
+                "loreserver",
+                "outbox",
+                "retire-generation",
+                "--generation",
+                "7",
+            ],
+            vec![
+                "loreserver",
+                "outbox",
+                "retire-generation",
+                "--receiver",
+                "r",
+            ],
+        ] {
+            assert!(Harness::try_parse_from(missing).is_err());
+        }
+    }
+
+    /// Only a retired generation succeeds; every refusal exits non-zero so a
+    /// runbook script cannot read a refused retirement as done.
+    #[test]
+    fn only_a_retired_generation_succeeds() {
+        let report = |outcome: MembershipCas| report_retirement("sfo3-cell-a", "r", 3, &outcome);
+        assert!(
+            report(MembershipCas::Applied {
+                membership_version: 9,
+                membership_generation: 3,
+            })
+            .is_ok()
+        );
+        assert!(report(MembershipCas::AlreadyRecorded).is_ok());
+        for refused in [
+            MembershipCas::RetirementUnproven,
+            MembershipCas::CellUnknown,
+            MembershipCas::GenerationNotFound,
+            MembershipCas::WrongState {
+                state: "joining".to_owned(),
+            },
+            MembershipCas::VersionConflict {
+                current_membership_version: 4,
+            },
+        ] {
+            assert!(
+                report(refused.clone()).is_err(),
+                "{refused:?} must exit non-zero"
+            );
+        }
     }
 
     /// A window an operator could type must not wrap into a small one.

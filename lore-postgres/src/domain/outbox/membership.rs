@@ -1037,6 +1037,9 @@ pub async fn readiness_cas(
 /// too. That is the honest reading: it has no proof of anything, so there is
 /// nothing to retire it *against*. Deleting such a row is an operator action,
 /// not a lifecycle transition.
+///
+/// Production caller: `loreserver outbox retire-generation`
+/// (`lore-server/src/event_relay/operator.rs`), WP-115 ledger row 68.
 pub async fn retire_generation(
     client: &mut deadpool_postgres::Client,
     cell_id: &str,

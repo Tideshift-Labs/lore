@@ -723,6 +723,200 @@ async fn a_report_cannot_claim_a_frontier_above_its_own_unresolved_gap_or_poison
 }
 
 // ---------------------------------------------------------------------------
+// 2b. Retirement (WP-115 row 68: `loreserver outbox retire-generation`)
+// ---------------------------------------------------------------------------
+
+/// A placed cell, for the retirement cases.
+async fn placed_cell(raw: &Client, stream_identity: &str, stream_epoch: i64) -> String {
+    let cell_id = rand_cell_id();
+    let state = membership::ensure_membership_state(raw, &cell_id)
+        .await
+        .expect("ensure membership state");
+    membership::set_current_placement(
+        raw,
+        &cell_id,
+        stream_identity,
+        stream_epoch,
+        0,
+        state.membership_version,
+    )
+    .await
+    .expect("place");
+    cell_id
+}
+
+async fn member_state(raw: &Client, cell_id: &str, generation: i64) -> String {
+    membership::read_membership_snapshot(raw, cell_id)
+        .await
+        .expect("read snapshot")
+        .expect("snapshot present")
+        .members
+        .iter()
+        .find(|m| m.membership_generation == generation)
+        .expect("the generation")
+        .state
+        .clone()
+}
+
+/// Neither contract precondition holds for a generation that only joined: no
+/// checkpoint at the current placement, no ready successor. Retiring it anyway
+/// would drop it from the required set, so the call refuses and writes nothing.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_refuses_a_generation_with_no_checkpoint_and_no_ready_successor() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-unproven").await;
+    let url = namespace.pg_url().to_owned();
+    let raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+
+    let version = current_membership_version(&raw, &cell_id).await;
+    let MembershipCas::Applied {
+        membership_generation: generation,
+        ..
+    } = membership::join_receiver(&mut deadpool, &cell_id, "loreserver-1", version)
+        .await
+        .expect("join")
+    else {
+        panic!("join must apply");
+    };
+    let version_before = current_membership_version(&raw, &cell_id).await;
+
+    let outcome =
+        membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", generation)
+            .await
+            .expect("retire call");
+    assert_eq!(outcome, MembershipCas::RetirementUnproven);
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "joining");
+    assert_eq!(
+        current_membership_version(&raw, &cell_id).await,
+        version_before,
+        "a refused retirement must not bump the snapshot version"
+    );
+
+    // An unknown cell is its own answer, not a refusal of the generation.
+    let unknown_cell =
+        membership::retire_generation(&mut deadpool, &rand_cell_id(), "loreserver-1", generation)
+            .await
+            .expect("retire on an unknown cell");
+    assert_eq!(unknown_cell, MembershipCas::CellUnknown);
+
+    namespace.release().await;
+}
+
+/// Graceful drain: a generation with a persisted checkpoint at the current
+/// placement retires, and a second call is idempotent.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-drained").await;
+    let url = namespace.pg_url().to_owned();
+    let raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let version_before = current_membership_version(&raw, &cell_id).await;
+
+    let outcome =
+        membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", generation)
+            .await
+            .expect("retire call");
+    assert_eq!(
+        outcome,
+        MembershipCas::Applied {
+            membership_version: version_before + 1,
+            membership_generation: generation,
+        }
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "retired");
+    assert_eq!(
+        current_membership_version(&raw, &cell_id).await,
+        version_before + 1
+    );
+
+    let again = membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", generation)
+        .await
+        .expect("second retire call");
+    assert_eq!(again, MembershipCas::AlreadyRecorded);
+
+    namespace.release().await;
+}
+
+/// Hard-dead replacement: a generation that never checkpointed retires once a
+/// strictly greater generation of the same receiver is ready.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_retires_a_dead_generation_once_a_greater_one_is_ready() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-replaced").await;
+    let url = namespace.pg_url().to_owned();
+    let raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+
+    let version = current_membership_version(&raw, &cell_id).await;
+    let MembershipCas::Applied {
+        membership_generation: dead,
+        ..
+    } = membership::join_receiver(&mut deadpool, &cell_id, "loreserver-1", version)
+        .await
+        .expect("join the generation that dies")
+    else {
+        panic!("join must apply");
+    };
+    assert_eq!(
+        membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", dead)
+            .await
+            .expect("retire before the successor is ready"),
+        MembershipCas::RetirementUnproven
+    );
+
+    let successor = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        12,
+    )
+    .await;
+    assert!(successor > dead);
+
+    let outcome = membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", dead)
+        .await
+        .expect("retire once the successor is ready");
+    assert!(
+        matches!(outcome, MembershipCas::Applied { membership_generation, .. } if membership_generation == dead),
+        "expected Applied, got {outcome:?}"
+    );
+    assert_eq!(member_state(&raw, &cell_id, dead).await, "retired");
+    assert_eq!(member_state(&raw, &cell_id, successor).await, "ready");
+
+    namespace.release().await;
+}
+
+// ---------------------------------------------------------------------------
 // 3. Evaluator
 // ---------------------------------------------------------------------------
 
