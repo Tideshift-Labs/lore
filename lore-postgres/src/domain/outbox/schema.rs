@@ -247,6 +247,15 @@ pub const DEAD_LETTER_OBSOLETE: &str = "obsolete";
 pub const OUTBOX_RETRY_HISTORY_SCHEMA: &str =
     include_str!("../../../migrations/0006_outbox_retry_history.sql");
 
+/// The operator audit on a retired receiver generation: who ran
+/// `loreserver outbox retire-generation`, why, and when.
+///
+/// An `include_str!` of the migration file for the same reason as
+/// [`OUTBOX_RETRY_HISTORY_SCHEMA`]. `PostgresDomainStore::connect` applies it
+/// after [`OUTBOX_SCHEMA`], whose membership table it alters.
+pub const OUTBOX_RETIREMENT_AUDIT_SCHEMA: &str =
+    include_str!("../../../migrations/0007_outbox_retirement_audit.sql");
+
 /// Outbox base DDL. Idempotent; applied under the shared schema advisory lock.
 pub const OUTBOX_SCHEMA: &str = r#"
 -- One row per classified domain event, appended inside the mutation

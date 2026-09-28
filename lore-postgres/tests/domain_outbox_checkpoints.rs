@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use case_namespace::CaseNamespace;
 use lore_postgres::domain::PostgresDomainStore;
+use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::outbox::CapturedPosition;
 use lore_postgres::domain::outbox::CheckpointOutcome;
 use lore_postgres::domain::outbox::CheckpointReport;
@@ -745,6 +746,51 @@ async fn placed_cell(raw: &Client, stream_identity: &str, stream_epoch: i64) -> 
     cell_id
 }
 
+const RETIRE_ACTOR: &str = "kv";
+const RETIRE_REASON: &str = "replica decommissioned";
+
+async fn retire(
+    deadpool: &mut deadpool_postgres::Client,
+    cell_id: &str,
+    receiver_identity: &str,
+    generation: i64,
+) -> MembershipCas {
+    membership::retire_generation(
+        deadpool,
+        cell_id,
+        receiver_identity,
+        generation,
+        RETIRE_ACTOR,
+        RETIRE_REASON,
+    )
+    .await
+    .expect("retire call")
+}
+
+/// `(retirement_actor, retirement_reason, retirement_recorded_at IS NOT NULL)`.
+async fn retirement_audit(
+    raw: &Client,
+    cell_id: &str,
+    receiver_identity: &str,
+    generation: i64,
+) -> (Option<String>, Option<String>, bool) {
+    let row = raw
+        .query_one(
+            "SELECT retirement_actor, retirement_reason, \
+                    retirement_recorded_at IS NOT NULL AS recorded \
+               FROM lore_outbox_receiver_membership \
+              WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3",
+            &[&cell_id, &receiver_identity, &generation],
+        )
+        .await
+        .expect("read retirement audit");
+    (
+        row.get("retirement_actor"),
+        row.get("retirement_reason"),
+        row.get("recorded"),
+    )
+}
+
 async fn member_state(raw: &Client, cell_id: &str, generation: i64) -> String {
     membership::read_membership_snapshot(raw, cell_id)
         .await
@@ -786,10 +832,7 @@ async fn retire_generation_refuses_a_generation_with_no_checkpoint_and_no_ready_
     };
     let version_before = current_membership_version(&raw, &cell_id).await;
 
-    let outcome =
-        membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", generation)
-            .await
-            .expect("retire call");
+    let outcome = retire(&mut deadpool, &cell_id, "loreserver-1", generation).await;
     assert_eq!(outcome, MembershipCas::RetirementUnproven);
     assert_eq!(member_state(&raw, &cell_id, generation).await, "joining");
     assert_eq!(
@@ -797,19 +840,25 @@ async fn retire_generation_refuses_a_generation_with_no_checkpoint_and_no_ready_
         version_before,
         "a refused retirement must not bump the snapshot version"
     );
+    assert_eq!(
+        retirement_audit(&raw, &cell_id, "loreserver-1", generation).await,
+        (None, None, false),
+        "a refused retirement records no audit"
+    );
 
     // An unknown cell is its own answer, not a refusal of the generation.
-    let unknown_cell =
-        membership::retire_generation(&mut deadpool, &rand_cell_id(), "loreserver-1", generation)
-            .await
-            .expect("retire on an unknown cell");
+    let unknown_cell = retire(&mut deadpool, &rand_cell_id(), "loreserver-1", generation).await;
     assert_eq!(unknown_cell, MembershipCas::CellUnknown);
+    // So is an unknown generation of a known cell.
+    let unknown_generation = retire(&mut deadpool, &cell_id, "loreserver-1", generation + 5).await;
+    assert_eq!(unknown_generation, MembershipCas::GenerationNotFound);
 
     namespace.release().await;
 }
 
-/// Graceful drain: a generation with a persisted checkpoint at the current
-/// placement retires, and a second call is idempotent.
+/// Graceful drain: a generation whose checkpoint has reached every
+/// broker-accepted row on the current stream and epoch retires, records the
+/// operator audit, and a second call is idempotent and keeps the first audit.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
 async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
@@ -819,9 +868,19 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
     };
     let namespace = CaseNamespace::acquire(&base_url, "retire-drained").await;
     let url = namespace.pg_url().to_owned();
-    let raw = pg_client(&url).await;
+    let mut raw = pg_client(&url).await;
     let mut deadpool = deadpool_client(&url).await;
     let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    // Accepted rows at 1..=40, exactly the frontier the receiver reports.
+    seed_broker_accepted_rows(
+        &mut raw,
+        &cell_id,
+        &rand_repository_id(),
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
     let generation = join_ready_receiver(
         &raw,
         &mut deadpool,
@@ -834,10 +893,7 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
     .await;
     let version_before = current_membership_version(&raw, &cell_id).await;
 
-    let outcome =
-        membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", generation)
-            .await
-            .expect("retire call");
+    let outcome = retire(&mut deadpool, &cell_id, "loreserver-1", generation).await;
     assert_eq!(
         outcome,
         MembershipCas::Applied {
@@ -850,11 +906,254 @@ async fn retire_generation_retires_a_drained_generation_and_is_idempotent() {
         current_membership_version(&raw, &cell_id).await,
         version_before + 1
     );
+    assert_eq!(
+        retirement_audit(&raw, &cell_id, "loreserver-1", generation).await,
+        (
+            Some(RETIRE_ACTOR.to_owned()),
+            Some(RETIRE_REASON.to_owned()),
+            true
+        )
+    );
 
-    let again = membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", generation)
-        .await
-        .expect("second retire call");
+    // A rerun by someone else, for another reason, writes nothing.
+    let again = membership::retire_generation(
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        generation,
+        "someone-else",
+        "a second reason",
+    )
+    .await
+    .expect("second retire call");
     assert_eq!(again, MembershipCas::AlreadyRecorded);
+    assert_eq!(
+        retirement_audit(&raw, &cell_id, "loreserver-1", generation).await,
+        (
+            Some(RETIRE_ACTOR.to_owned()),
+            Some(RETIRE_REASON.to_owned()),
+            true
+        ),
+        "the first audit stands"
+    );
+    assert_eq!(
+        current_membership_version(&raw, &cell_id).await,
+        version_before + 1
+    );
+
+    namespace.release().await;
+}
+
+/// The review's blocker: a live, ready receiver whose checkpoint is behind a
+/// broker-accepted row is refused, not retired. Its checkpoint exists at the
+/// current placement, which the old proof took as a drain. Once it reports a
+/// frontier at the last accepted row, the same call retires it.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_refuses_a_ready_generation_behind_an_accepted_row() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-lagging").await;
+    let url = namespace.pg_url().to_owned();
+    let mut raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    // Accepted rows at 1..=41; the receiver has acknowledged only through 40.
+    seed_broker_accepted_rows(
+        &mut raw,
+        &cell_id,
+        &rand_repository_id(),
+        "DURABLE-x",
+        1,
+        41,
+    )
+    .await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let version_before = current_membership_version(&raw, &cell_id).await;
+
+    assert_eq!(
+        retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+        MembershipCas::RetirementUnproven
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "ready");
+    assert_eq!(
+        current_membership_version(&raw, &cell_id).await,
+        version_before
+    );
+    assert_eq!(
+        retirement_audit(&raw, &cell_id, "loreserver-1", generation).await,
+        (None, None, false)
+    );
+
+    // The receiver catches up; now it has drained.
+    let caught_up = CheckpointReport {
+        stream_identity: "DURABLE-x".to_string(),
+        stream_epoch: 1,
+        receiver_identity: "loreserver-1".to_string(),
+        membership_generation: generation,
+        membership_version: version_before,
+        contiguous_frontier: 41,
+        gaps: Vec::new(),
+        poison: Vec::new(),
+    };
+    assert_eq!(
+        report_checkpoint(&mut deadpool, &cell_id, &caught_up)
+            .await
+            .expect("catch-up report"),
+        CheckpointOutcome::Applied {
+            contiguous_frontier: 41
+        }
+    );
+    assert!(
+        matches!(
+            retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+            MembershipCas::Applied { membership_generation, .. } if membership_generation == generation
+        ),
+        "a drained generation must retire"
+    );
+
+    namespace.release().await;
+}
+
+/// A checkpoint at the last accepted row that still carries a poison park has
+/// not drained: the parked event is not applied.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_refuses_a_generation_whose_checkpoint_carries_a_park() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-parked").await;
+    let url = namespace.pg_url().to_owned();
+    let mut raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    seed_broker_accepted_rows(
+        &mut raw,
+        &cell_id,
+        &rand_repository_id(),
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    let version = current_membership_version(&raw, &cell_id).await;
+    let parked = CheckpointReport {
+        stream_identity: "DURABLE-x".to_string(),
+        stream_epoch: 1,
+        receiver_identity: "loreserver-1".to_string(),
+        membership_generation: generation,
+        membership_version: version,
+        contiguous_frontier: 40,
+        gaps: Vec::new(),
+        poison: vec![PoisonEntry {
+            broker_sequence: 45,
+            class: "UNSUPPORTED_SCHEMA".to_string(),
+        }],
+    };
+    report_checkpoint(&mut deadpool, &cell_id, &parked)
+        .await
+        .expect("parked report");
+
+    assert_eq!(
+        retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+        MembershipCas::RetirementUnproven
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "ready");
+
+    namespace.release().await;
+}
+
+/// The reset fence's placeholder is refused by identity and by generation,
+/// and so are an empty actor and an empty reason. None of them touch the row.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retire_generation_refuses_the_placeholder_and_an_unaudited_call() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retire-placeholder").await;
+    let url = namespace.pg_url().to_owned();
+    let raw = pg_client(&url).await;
+    let mut deadpool = deadpool_client(&url).await;
+    let cell_id = placed_cell(&raw, "DURABLE-x", 1).await;
+    let generation = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        0,
+    )
+    .await;
+    let version = current_membership_version(&raw, &cell_id).await;
+    raw.execute(
+        "INSERT INTO lore_outbox_receiver_membership \
+             (cell_id, receiver_identity, membership_generation, membership_version, state, \
+              created_at, updated_at) \
+         VALUES ($1, 'required-replacement-placeholder', 0, $2, 'required_placeholder', \
+                 clock_timestamp(), clock_timestamp())",
+        &[&cell_id, &version],
+    )
+    .await
+    .expect("install the placeholder row");
+
+    for (receiver, target, actor, reason) in [
+        (
+            "required-replacement-placeholder",
+            0,
+            RETIRE_ACTOR,
+            RETIRE_REASON,
+        ),
+        (
+            "required-replacement-placeholder",
+            generation,
+            RETIRE_ACTOR,
+            RETIRE_REASON,
+        ),
+        ("loreserver-1", 0, RETIRE_ACTOR, RETIRE_REASON),
+        ("loreserver-1", generation, "", RETIRE_REASON),
+        ("loreserver-1", generation, RETIRE_ACTOR, ""),
+    ] {
+        let refused =
+            membership::retire_generation(&mut deadpool, &cell_id, receiver, target, actor, reason)
+                .await;
+        assert!(
+            matches!(refused, Err(DomainError::InvalidInput(_))),
+            "{receiver} generation {target} actor {actor:?} reason {reason:?}: expected \
+             InvalidInput, got {refused:?}"
+        );
+    }
+    assert_eq!(
+        member_state(&raw, &cell_id, 0).await,
+        "required_placeholder"
+    );
+    assert_eq!(member_state(&raw, &cell_id, generation).await, "ready");
+    assert_eq!(current_membership_version(&raw, &cell_id).await, version);
 
     namespace.release().await;
 }
@@ -885,9 +1184,7 @@ async fn retire_generation_retires_a_dead_generation_once_a_greater_one_is_ready
         panic!("join must apply");
     };
     assert_eq!(
-        membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", dead)
-            .await
-            .expect("retire before the successor is ready"),
+        retire(&mut deadpool, &cell_id, "loreserver-1", dead).await,
         MembershipCas::RetirementUnproven
     );
 
@@ -903,9 +1200,7 @@ async fn retire_generation_retires_a_dead_generation_once_a_greater_one_is_ready
     .await;
     assert!(successor > dead);
 
-    let outcome = membership::retire_generation(&mut deadpool, &cell_id, "loreserver-1", dead)
-        .await
-        .expect("retire once the successor is ready");
+    let outcome = retire(&mut deadpool, &cell_id, "loreserver-1", dead).await;
     assert!(
         matches!(outcome, MembershipCas::Applied { membership_generation, .. } if membership_generation == dead),
         "expected Applied, got {outcome:?}"

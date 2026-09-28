@@ -33,13 +33,36 @@
 --
 -- Both columns are nullable with no default, so adding them does not rewrite a
 -- populated table.
+--
+-- Neither the column additions nor the constraints may scan the table. The boot
+-- path applies this file under `ensure_schema_online`'s 250 ms statement
+-- timeout, and `lore_outbox_events` is the one table here that can hold a large
+-- backlog. An inline column CHECK, or a plain `ADD CONSTRAINT`, validates every
+-- existing row under ACCESS EXCLUSIVE, so a big enough outbox would fail boot
+-- on every attempt. Both constraints are therefore named and `NOT VALID`:
+-- PostgreSQL still enforces them on every insert and update, and skips only the
+-- scan of rows that already exist. Those rows cannot violate them, because both
+-- columns were added by this same file and are NULL on every such row. An
+-- operator may run `ALTER TABLE lore_outbox_events VALIDATE CONSTRAINT ...` out
+-- of band (it takes SHARE UPDATE EXCLUSIVE, which does not block writes); the
+-- relay does not need it.
 ALTER TABLE lore_outbox_events
-    ADD COLUMN IF NOT EXISTS last_retry_class text
-        CHECK (octet_length(last_retry_class) BETWEEN 1 AND 64),
+    ADD COLUMN IF NOT EXISTS last_retry_class text,
     ADD COLUMN IF NOT EXISTS last_retry_at timestamptz;
 
 DO $outbox_retry_history_constraints$
 BEGIN
+    -- The bounded class width `release_for_retry` writes.
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'lore_outbox_events_retry_class_bounds'
+          AND conrelid = 'lore_outbox_events'::regclass
+    ) THEN
+        ALTER TABLE lore_outbox_events
+            ADD CONSTRAINT lore_outbox_events_retry_class_bounds CHECK (
+                octet_length(last_retry_class) BETWEEN 1 AND 64
+            ) NOT VALID;
+    END IF;
     -- A class and its timestamp are one fact: both set or both null. Written as
     -- an equality of two IS NULL tests, which are never NULL themselves, so the
     -- CHECK cannot pass vacuously.
@@ -51,7 +74,7 @@ BEGIN
         ALTER TABLE lore_outbox_events
             ADD CONSTRAINT lore_outbox_events_retry_history_shape CHECK (
                 (last_retry_class IS NULL) = (last_retry_at IS NULL)
-            );
+            ) NOT VALID;
     END IF;
 END
 $outbox_retry_history_constraints$;

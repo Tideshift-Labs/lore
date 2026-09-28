@@ -20,6 +20,7 @@ use crate::domain::errors::DomainError;
 use crate::domain::outbox::event_plane::EVENT_PLANE_SCHEMA;
 use crate::domain::outbox::event_plane::EventPlaneBootFacts;
 use crate::domain::outbox::schema::OUTBOX_BASE_API_VERSION;
+use crate::domain::outbox::schema::OUTBOX_RETIREMENT_AUDIT_SCHEMA;
 use crate::domain::outbox::schema::OUTBOX_RETRY_HISTORY_SCHEMA;
 use crate::domain::outbox::schema::OUTBOX_SCHEMA;
 use crate::domain::schema;
@@ -115,8 +116,11 @@ impl PostgresDomainStore {
         // evidence. Two new tables, empty on every cell that never switched.
         crate::pool::ensure_schema_online(&pool, EVENT_PLANE_SCHEMA).await?;
         // WP-115 row 60: the retry record acceptance keeps. Two nullable
-        // columns on `lore_outbox_events`, so no table rewrite.
+        // columns on `lore_outbox_events` and `NOT VALID` constraints, so no
+        // table rewrite and no validation scan.
         crate::pool::ensure_schema_online(&pool, OUTBOX_RETRY_HISTORY_SCHEMA).await?;
+        // WP-115 row 68: the operator audit on a retired receiver generation.
+        crate::pool::ensure_schema_online(&pool, OUTBOX_RETIREMENT_AUDIT_SCHEMA).await?;
 
         let identity = read_database_identity(&pool)
             .await

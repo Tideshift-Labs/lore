@@ -918,6 +918,154 @@ async fn acceptance_keeps_the_most_recent_retry_class_that_delayed_the_row() {
     namespace.release().await;
 }
 
+/// Rows in the populated-table case.
+///
+/// Not large enough to make the old validating spelling overrun the 250 ms
+/// boot timeout, and deliberately so: measured on postgres:18 on this rig, a
+/// CHECK validation over 2,000,000 narrow rows took 143 ms, so a timeout-based
+/// discriminator needs a table far larger than a test should seed. The case
+/// discriminates on `convalidated` instead, which PostgreSQL sets exactly when
+/// it scanned the rows, and the control step proves the old spelling sets it.
+const POPULATED_OUTBOX_ROWS: i64 = 50_000;
+
+/// Migration 0006 on a populated outbox, through the real boot path and its
+/// 250 ms / 100 ms timeouts. The inline CHECK and plain `ADD CONSTRAINT` the
+/// file first shipped with scanned every row under ACCESS EXCLUSIVE, so a
+/// large enough backlog failed boot on every attempt. The named `NOT VALID`
+/// constraints skip that scan, still refuse a bad write, and a restart is a
+/// no-op.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn retry_history_migration_boots_on_a_populated_outbox_under_the_boot_timeouts() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retry-history-populated").await;
+    let url = namespace.pg_url().to_owned();
+    connect_domain_store(&url).await;
+    let mut raw = pg_client(&url).await;
+
+    // A cell provisioned before migration 0006: no retry-history columns, and a
+    // backlog.
+    raw.batch_execute(
+        "ALTER TABLE lore_outbox_events \
+             DROP COLUMN last_retry_class, DROP COLUMN last_retry_at",
+    )
+    .await
+    .expect("remove the 0006 columns");
+    let cell_id = rand_cell_id();
+    raw.execute(
+        "INSERT INTO lore_outbox_events \
+             (event_id, cell_id, idempotency_key, repository_id, repository_generation, \
+              event_kind, aggregate_kind, aggregate_id, aggregate_version, \
+              payload_schema_version, payload, state, created_at, available_at) \
+         SELECT gen_random_uuid(), $1, \
+                decode(lpad(to_hex(g), 64, '0'), 'hex'), \
+                decode(lpad(to_hex(g), 32, '0'), 'hex'), 1, \
+                'branch.pushed', 'branch', \
+                decode(lpad(to_hex(g), 32, '0'), 'hex'), \
+                decode('0000000000000001', 'hex'), \
+                1, '{}', 'pending', clock_timestamp(), clock_timestamp() \
+           FROM generate_series(1, $2::bigint) AS g",
+        &[&cell_id, &POPULATED_OUTBOX_ROWS],
+    )
+    .await
+    .expect("seed the backlog");
+    raw.batch_execute("ANALYZE lore_outbox_events")
+        .await
+        .expect("analyze");
+
+    // Control: the spelling 0006 first shipped with produces a VALIDATED
+    // constraint, which is PostgreSQL's record that it scanned every row. So
+    // `convalidated = false` below is the assertion that tells the two
+    // spellings apart; rolled back, so the boot path still sees a pre-0006 cell.
+    let tx = raw.transaction().await.expect("begin control");
+    tx.batch_execute(
+        "ALTER TABLE lore_outbox_events \
+             ADD COLUMN IF NOT EXISTS last_retry_class text \
+                 CHECK (octet_length(last_retry_class) BETWEEN 1 AND 64), \
+             ADD COLUMN IF NOT EXISTS last_retry_at timestamptz",
+    )
+    .await
+    .expect("control: the validating spelling");
+    let control_validated: bool = tx
+        .query_one(
+            "SELECT bool_and(convalidated) AS validated FROM pg_constraint \
+              WHERE conrelid = 'lore_outbox_events'::regclass \
+                AND pg_get_constraintdef(oid) LIKE '%last_retry_class%'",
+            &[],
+        )
+        .await
+        .expect("control constraint")
+        .get("validated");
+    assert!(
+        control_validated,
+        "control: an inline CHECK is validated, i.e. scanned"
+    );
+    tx.rollback().await.expect("roll the control back");
+
+    // The boot path, twice: the first run applies 0006, the second is a restart.
+    let started = std::time::Instant::now();
+    connect_domain_store(&url).await;
+    eprintln!(
+        "boot over {POPULATED_OUTBOX_ROWS} rows applied 0006 in {:?}",
+        started.elapsed()
+    );
+    connect_domain_store(&url).await;
+
+    let constraints = raw
+        .query(
+            "SELECT conname, convalidated FROM pg_constraint \
+              WHERE conrelid = 'lore_outbox_events'::regclass \
+                AND (pg_get_constraintdef(oid) LIKE '%last_retry_class%' \
+                     OR pg_get_constraintdef(oid) LIKE '%last_retry_at%') \
+              ORDER BY conname",
+            &[],
+        )
+        .await
+        .expect("read constraints");
+    let constraints: Vec<(String, bool)> = constraints
+        .iter()
+        .map(|row| (row.get("conname"), row.get("convalidated")))
+        .collect();
+    assert_eq!(
+        constraints,
+        vec![
+            ("lore_outbox_events_retry_class_bounds".to_owned(), false),
+            ("lore_outbox_events_retry_history_shape".to_owned(), false),
+        ],
+        "exactly the two named NOT VALID constraints, once each after a restart"
+    );
+
+    // NOT VALID still binds every new write.
+    for (label, update) in [
+        (
+            "half-set pair",
+            "UPDATE lore_outbox_events SET last_retry_class = 'timeout' \
+              WHERE event_id = (SELECT event_id FROM lore_outbox_events LIMIT 1)",
+        ),
+        (
+            "over-wide class",
+            "UPDATE lore_outbox_events SET last_retry_class = repeat('x', 65), \
+                    last_retry_at = clock_timestamp() \
+              WHERE event_id = (SELECT event_id FROM lore_outbox_events LIMIT 1)",
+        ),
+    ] {
+        let refused = raw.execute(update, &[]).await;
+        assert_eq!(
+            refused
+                .as_ref()
+                .err()
+                .and_then(|error| error.code().cloned()),
+            Some(tokio_postgres::error::SqlState::CHECK_VIOLATION),
+            "{label} must be refused: {refused:?}"
+        );
+    }
+
+    namespace.release().await;
+}
+
 // ---------------------------------------------------------------------------
 // dead_letter / requeue_dead_letter / mark_obsolete
 // ---------------------------------------------------------------------------

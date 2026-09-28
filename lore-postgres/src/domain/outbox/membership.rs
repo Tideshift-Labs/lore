@@ -54,6 +54,8 @@ use tokio_postgres::GenericClient;
 use tokio_postgres::Row;
 
 use crate::domain::errors::DomainError;
+use crate::domain::outbox::schema::MAX_DISPOSITION_ACTOR_BYTES;
+use crate::domain::outbox::schema::MAX_DISPOSITION_REASON_BYTES;
 use crate::domain::outbox::schema::MAX_RECEIVER_IDENTITY_BYTES;
 use crate::domain::outbox::schema::MAX_STREAM_IDENTITY_BYTES;
 use crate::domain::outbox::schema::MEMBERSHIP_STATE_DRAINING;
@@ -287,9 +289,10 @@ pub enum MembershipCas {
     /// never marks a receiver caught up.
     NoCheckpointAtCurrentPlacement,
     /// The retirement was refused because neither of the contract's two
-    /// preconditions holds: this generation has no persisted checkpoint at the
-    /// current placement (graceful drain), and no strictly greater generation
-    /// for the same receiver is ready (hard-dead replacement).
+    /// preconditions holds: this generation's checkpoint at the current
+    /// placement has not reached the committed frontier (graceful drain), and
+    /// no strictly greater generation for the same receiver is ready
+    /// (hard-dead replacement).
     ///
     /// Retiring anyway would drop the receiver out of the required set and
     /// release every row above its frontier, so this is a refusal rather than a
@@ -1019,8 +1022,12 @@ pub async fn readiness_cas(
 /// The contract gives exactly two ways a generation may leave, and this
 /// **enforces both** rather than documenting them as a caller obligation:
 ///
-/// * **graceful drain** — the generation has persisted a checkpoint at the
-///   cell's current placement, so its work is accounted for; or
+/// * **graceful drain** — the generation's persisted checkpoint at the cell's
+///   current placement has reached the committed frontier: it carries no
+///   unresolved gap or poison park, and no row this cell's relay recorded as
+///   `broker_accepted` on that stream and epoch has a broker sequence above its
+///   contiguous frontier. So every publication the broker accepted is already
+///   acknowledged by this generation; or
 /// * **hard-dead replacement** — a strictly greater generation for the same
 ///   receiver is already `ready`, which by [`readiness_cas`] means it captured,
 ///   baselined, drained, and checkpointed at the current placement.
@@ -1038,6 +1045,34 @@ pub async fn readiness_cas(
 /// nothing to retire it *against*. Deleting such a row is an operator action,
 /// not a lifecycle transition.
 ///
+/// **Why "a checkpoint exists" is not a drain.** A live ready receiver always
+/// has a checkpoint at the current placement; it is how it became ready. Taking
+/// that as the proof let a lagging receiver at sequence 40, with accepted rows
+/// at 41 and above, be retired and those rows released. The drain proof is
+/// therefore the frontier comparison above, not the checkpoint's existence.
+///
+/// The comparison reads only `broker_accepted` rows, for two reasons. A
+/// `consumer_safe` row is at or below every required member's frontier by
+/// construction ([`super::evaluator`]), so it can never be above this one while
+/// this generation is required; and a generation that is not its receiver's
+/// greatest is not in the required set at all, so retiring it releases nothing.
+/// A `pending` row has no broker sequence yet. One window remains and is
+/// accepted: a publication the broker has accepted whose
+/// [`super::relay::record_broker_accepted`] has not committed yet is invisible
+/// here. A receiver retired in that window that is in fact still running finds
+/// itself retired, starts a new generation, and that generation's `joining`
+/// row blocks every safety evaluation until it re-baselines.
+///
+/// The reset fence's placeholder (`receiver_identity`
+/// [`REQUIRED_REPLACEMENT_PLACEHOLDER`], generation
+/// [`PLACEHOLDER_GENERATION`]) is refused as `InvalidInput`. Only
+/// [`readiness_cas`] removes it, after a real replacement proves itself;
+/// retiring it here would empty the required set in the middle of a reset.
+///
+/// `actor` and `reason` are the operator audit, written to the row by the same
+/// statement that retires it. A rerun on an already retired generation writes
+/// nothing, so the first audit stands.
+///
 /// Production caller: `loreserver outbox retire-generation`
 /// (`lore-server/src/event_relay/operator.rs`), WP-115 ledger row 68.
 pub async fn retire_generation(
@@ -1045,14 +1080,20 @@ pub async fn retire_generation(
     cell_id: &str,
     receiver_identity: &str,
     membership_generation: i64,
+    actor: &str,
+    reason: &str,
 ) -> Result<MembershipCas, DomainError> {
     validate_cell_id(cell_id)?;
     validate_receiver_identity(receiver_identity)?;
-    if membership_generation < 0 {
+    if receiver_identity == REQUIRED_REPLACEMENT_PLACEHOLDER {
         return Err(DomainError::InvalidInput(format!(
-            "outbox membership_generation must be >= 0, got {membership_generation}"
+            "outbox receiver_identity {REQUIRED_REPLACEMENT_PLACEHOLDER:?} is the reset fence's \
+             placeholder; only an accepted reset's successor readiness removes it"
         )));
     }
+    validate_generation(membership_generation)?;
+    bounded("retirement_actor", actor, MAX_DISPOSITION_ACTOR_BYTES)?;
+    bounded("retirement_reason", reason, MAX_DISPOSITION_REASON_BYTES)?;
 
     let tx = client
         .transaction()
@@ -1075,50 +1116,85 @@ pub async fn retire_generation(
     let state = state_from(&state_row);
     let membership_version: i64 = state.membership_version + 1;
 
+    // The member row under the same lock order `readiness_cas` uses: counters
+    // first, then the member. Read before the proof so a rerun on a retired
+    // generation answers `AlreadyRecorded` whatever the outbox holds now.
+    let Some(member_row) = tx
+        .query_opt(
+            &format!(
+                "SELECT {MEMBER_COLUMNS} FROM lore_outbox_receiver_membership \
+                 WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3 \
+                 FOR UPDATE"
+            ),
+            &[&cell_id, &receiver_identity, &membership_generation],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("outbox retire member select", e))?
+    else {
+        drop(tx);
+        return Ok(MembershipCas::GenerationNotFound);
+    };
+    if member_from(&member_row).is_retired() {
+        drop(tx);
+        return Ok(MembershipCas::AlreadyRecorded);
+    }
+
+    let (Some(current_identity), Some(current_epoch)) = (
+        state.current_stream_identity.as_deref(),
+        state.current_stream_epoch,
+    ) else {
+        drop(tx);
+        // With no authoritative placement there is no checkpoint key to prove a
+        // graceful drain against, so neither precondition can hold.
+        return Ok(MembershipCas::RetirementUnproven);
+    };
+
     // The two contract preconditions, in one query so a retirement cannot slip
-    // between two reads. The placeholder is exempt: it is not a receiver, it
-    // has no work to account for, and only an accepted reset installs or
-    // removes it.
-    if membership_generation != PLACEHOLDER_GENERATION {
-        let (Some(current_identity), Some(current_epoch)) = (
-            state.current_stream_identity.as_deref(),
-            state.current_stream_epoch,
-        ) else {
-            drop(tx);
-            // With no authoritative placement there is no checkpoint key to
-            // prove a graceful drain against, so neither precondition can hold.
-            return Ok(MembershipCas::RetirementUnproven);
-        };
-        let proven: bool = tx
-            .query_one(
-                "SELECT ( \
-                     EXISTS ( \
-                         SELECT 1 FROM lore_outbox_checkpoints \
-                          WHERE stream_identity = $4 AND stream_epoch = $5 \
-                            AND receiver_identity = $2 AND membership_generation = $3 \
-                     ) \
-                     OR EXISTS ( \
-                         SELECT 1 FROM lore_outbox_receiver_membership \
-                          WHERE cell_id = $1 AND receiver_identity = $2 \
-                            AND membership_generation > $3 \
-                            AND state = 'ready' \
-                     ) \
-                 ) AS proven",
-                &[
-                    &cell_id,
-                    &receiver_identity,
-                    &membership_generation,
-                    &current_identity,
-                    &current_epoch,
-                ],
-            )
-            .await
-            .map_err(|e| DomainError::from_pg("outbox retire precondition probe", e))?
-            .get("proven");
-        if !proven {
-            drop(tx);
-            return Ok(MembershipCas::RetirementUnproven);
-        }
+    // between two reads. `event.state = 'broker_accepted'` is a SQL literal so
+    // the planner can prove it implies `lore_outbox_events_accepted_sequence`'s
+    // partial predicate; the scan is then one index probe above the frontier.
+    // The stream and epoch bound it, not the cell: a checkpoint's frontier
+    // counts broker sequences on the whole stream.
+    let proven: bool = tx
+        .query_one(
+            "SELECT ( \
+                 EXISTS ( \
+                     SELECT 1 FROM lore_outbox_checkpoints AS checkpoint \
+                      WHERE checkpoint.stream_identity = $4 \
+                        AND checkpoint.stream_epoch = $5 \
+                        AND checkpoint.receiver_identity = $2 \
+                        AND checkpoint.membership_generation = $3 \
+                        AND cardinality(checkpoint.gap_starts) = 0 \
+                        AND cardinality(checkpoint.poison_sequences) = 0 \
+                        AND NOT EXISTS ( \
+                            SELECT 1 FROM lore_outbox_events AS event \
+                             WHERE event.state = 'broker_accepted' \
+                               AND event.stream_identity = $4 \
+                               AND event.stream_epoch = $5 \
+                               AND event.broker_sequence > checkpoint.contiguous_frontier \
+                        ) \
+                 ) \
+                 OR EXISTS ( \
+                     SELECT 1 FROM lore_outbox_receiver_membership \
+                      WHERE cell_id = $1 AND receiver_identity = $2 \
+                        AND membership_generation > $3 \
+                        AND state = 'ready' \
+                 ) \
+             ) AS proven",
+            &[
+                &cell_id,
+                &receiver_identity,
+                &membership_generation,
+                &current_identity,
+                &current_epoch,
+            ],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("outbox retire precondition probe", e))?
+        .get("proven");
+    if !proven {
+        drop(tx);
+        return Ok(MembershipCas::RetirementUnproven);
     }
 
     let updated = tx
@@ -1126,6 +1202,9 @@ pub async fn retire_generation(
             "UPDATE lore_outbox_receiver_membership SET \
                  state = 'retired', \
                  membership_version = $4, \
+                 retirement_actor = $5, \
+                 retirement_reason = $6, \
+                 retirement_recorded_at = clock_timestamp(), \
                  updated_at = clock_timestamp() \
              WHERE cell_id = $1 AND receiver_identity = $2 AND membership_generation = $3 \
                AND state <> 'retired'",
@@ -1134,21 +1213,20 @@ pub async fn retire_generation(
                 &receiver_identity,
                 &membership_generation,
                 &membership_version,
+                &actor,
+                &reason,
             ],
         )
         .await
         .map_err(|e| DomainError::from_pg("outbox retire", e))?;
-    if updated == 0 {
+    if updated != 1 {
+        // The row is locked `FOR UPDATE` and was not retired above, so this is
+        // unreachable short of a concurrent delete that ignored the lock.
         drop(tx);
-        let client: &tokio_postgres::Client = client;
-        return classify_member_miss(
-            client,
-            cell_id,
-            receiver_identity,
-            membership_generation,
-            MembershipMember::is_retired,
-        )
-        .await;
+        return Err(DomainError::Internal(format!(
+            "outbox retire of {receiver_identity:?} generation {membership_generation} in cell \
+             {cell_id} updated {updated} rows under its own row lock"
+        )));
     }
     bump_membership_version(&*tx, cell_id).await?;
     classify_commit(tx.commit().await, "outbox retire commit")?;

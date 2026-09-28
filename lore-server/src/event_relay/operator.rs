@@ -73,6 +73,8 @@ use lore_postgres::domain::outbox::membership;
 use lore_postgres::domain::outbox::operator;
 use lore_postgres::domain::outbox::relay::DeadLetterOutcome;
 use lore_postgres::domain::outbox::relay::OutboxRow;
+use lore_postgres::domain::outbox::schema::PLACEHOLDER_GENERATION;
+use lore_postgres::domain::outbox::schema::REQUIRED_REPLACEMENT_PLACEHOLDER;
 use lore_postgres::pool::Pool;
 use serde_json::Value;
 use serde_json::json;
@@ -218,16 +220,23 @@ pub enum OutboxCommand {
         #[arg(long)]
         reason: String,
     },
-    /// Retire one receiver generation that is gone for good. Refused unless it
-    /// has a checkpoint at the current placement or a greater generation of
-    /// the same receiver is ready.
+    /// Retire one receiver generation that is gone for good. Refused unless its
+    /// checkpoint at the current placement has reached every broker-accepted
+    /// row, or a greater generation of the same receiver is ready. The reset
+    /// placeholder (generation 0) is refused.
     RetireGeneration {
         /// The receiver's configured identity.
         #[arg(long)]
         receiver: String,
-        /// The generation to retire.
-        #[arg(long)]
+        /// The generation to retire. 1 or greater.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(1..))]
         generation: i64,
+        /// Who is ordering the retirement. Recorded on the generation's row.
+        #[arg(long)]
+        actor: String,
+        /// Why. Recorded on the generation's row.
+        #[arg(long)]
+        reason: String,
     },
     /// Mark one parked dead letter obsolete, with proof of the authoritative
     /// state that makes it obsolete. The evidence row is never deleted.
@@ -391,7 +400,12 @@ impl OperatorContext {
             OutboxCommand::RetireGeneration {
                 receiver,
                 generation,
-            } => self.retire_generation(receiver, *generation).await,
+                actor,
+                reason,
+            } => {
+                self.retire_generation(receiver, *generation, actor, reason)
+                    .await
+            }
         }
     }
 
@@ -804,10 +818,28 @@ impl OperatorContext {
     /// one transaction; this command adds only the configured cell scope. It is
     /// the operator's answer to a receiver that is gone for good and whose
     /// generation would otherwise stay in the required set.
-    async fn retire_generation(&self, receiver: &str, generation: i64) -> Result<()> {
+    ///
+    /// The reset placeholder is refused here, before any connection, as well as
+    /// by the store function: only an accepted reset's successor readiness
+    /// removes it.
+    async fn retire_generation(
+        &self,
+        receiver: &str,
+        generation: i64,
+        actor: &str,
+        reason: &str,
+    ) -> Result<()> {
+        refuse_reserved_generation(receiver, generation)?;
         let mut client = self.client().await?;
-        let outcome =
-            membership::retire_generation(&mut client, &self.cell_id, receiver, generation).await?;
+        let outcome = membership::retire_generation(
+            &mut client,
+            &self.cell_id,
+            receiver,
+            generation,
+            actor,
+            reason,
+        )
+        .await?;
         report_retirement(&self.cell_id, receiver, generation, &outcome)
     }
 
@@ -892,6 +924,27 @@ fn report_disposition(operation: &str, event: Uuid, outcome: &DeadLetterOutcome)
     }
 }
 
+/// Refuse the reset fence's placeholder by identity or by generation.
+///
+/// `clap` already refuses generation 0 at parse time; this is the same rule
+/// for a caller that reaches [`OperatorContext::retire_generation`] another
+/// way, and the only check on the reserved identity.
+fn refuse_reserved_generation(receiver: &str, generation: i64) -> Result<()> {
+    if receiver == REQUIRED_REPLACEMENT_PLACEHOLDER || generation == PLACEHOLDER_GENERATION {
+        return Err(anyhow!(
+            "refused: {REQUIRED_REPLACEMENT_PLACEHOLDER} generation {PLACEHOLDER_GENERATION} is the \
+             reset fence's placeholder. Only a successor passing readiness after an accepted reset \
+             removes it; retiring it would empty the required set mid-reset"
+        ));
+    }
+    if generation < 1 {
+        return Err(anyhow!(
+            "refused: generation must be 1 or greater, got {generation}"
+        ));
+    }
+    Ok(())
+}
+
 /// Print one retirement outcome, and fail the process on anything but
 /// `Applied` or `AlreadyRecorded`.
 ///
@@ -918,9 +971,10 @@ fn report_retirement(
             Ok(())
         }
         MembershipCas::RetirementUnproven => Err(anyhow!(
-            "refused: {receiver} generation {generation} has no checkpoint at the cell's current \
-             placement and no greater generation of {receiver} is ready. Retiring it would drop \
-             it from the required set and release every row above its frontier"
+            "refused: {receiver} generation {generation} has not drained (its checkpoint at the \
+             cell's current placement is absent, carries a gap or park, or is below a \
+             broker-accepted row) and no greater generation of {receiver} is ready. Retiring it \
+             would drop it from the required set and release every row above its frontier"
         )),
         MembershipCas::CellUnknown => Err(anyhow!(
             "cell {cell_id} has no membership state; no receiver has ever joined it"
@@ -1179,10 +1233,11 @@ mod tests {
         assert_eq!(row_json(&never_retried)["last_retry"], Value::Null);
     }
 
-    /// WP-115 row 68: `retire-generation` parses with both required
-    /// arguments and refuses to parse without either.
+    /// WP-115 row 68: `retire-generation` parses with all four required
+    /// arguments, refuses to parse without any one of them, and refuses
+    /// generation 0 or a negative generation at parse time.
     #[test]
-    fn retire_generation_parses_with_a_receiver_and_a_generation() {
+    fn retire_generation_requires_receiver_generation_actor_and_reason() {
         use clap::Parser;
 
         #[derive(Debug, Parser)]
@@ -1191,21 +1246,29 @@ mod tests {
             command: MaintenanceCommand,
         }
 
-        let parsed = Harness::try_parse_from([
-            "loreserver",
-            "outbox",
-            "retire-generation",
-            "--receiver",
-            "loreserver-sfo3-cell-a-1",
-            "--generation",
-            "7",
-        ])
-        .expect("parse");
+        let full = [
+            ("--receiver", "loreserver-sfo3-cell-a-1"),
+            ("--generation", "7"),
+            ("--actor", "kv"),
+            ("--reason", "replica 1 decommissioned"),
+        ];
+        let argv = |pairs: &[(&'static str, &'static str)]| {
+            let mut argv = vec!["loreserver", "outbox", "retire-generation"];
+            for &(flag, value) in pairs {
+                argv.push(flag);
+                argv.push(value);
+            }
+            argv
+        };
+
+        let parsed = Harness::try_parse_from(argv(&full)).expect("parse");
         let MaintenanceCommand::Outbox {
             command:
                 OutboxCommand::RetireGeneration {
                     receiver,
                     generation,
+                    actor,
+                    reason,
                 },
         } = parsed.command
         else {
@@ -1213,24 +1276,48 @@ mod tests {
         };
         assert_eq!(receiver, "loreserver-sfo3-cell-a-1");
         assert_eq!(generation, 7);
+        assert_eq!(actor, "kv");
+        assert_eq!(reason, "replica 1 decommissioned");
 
-        for missing in [
-            vec![
-                "loreserver",
-                "outbox",
-                "retire-generation",
-                "--generation",
-                "7",
-            ],
-            vec![
-                "loreserver",
-                "outbox",
-                "retire-generation",
-                "--receiver",
-                "r",
-            ],
+        for skipped in 0..full.len() {
+            let partial: Vec<_> = full
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != skipped)
+                .map(|(_, pair)| *pair)
+                .collect();
+            assert!(
+                Harness::try_parse_from(argv(&partial)).is_err(),
+                "{} must be required",
+                full[skipped].0
+            );
+        }
+
+        for reserved in ["0", "-1"] {
+            let mut pairs = full;
+            pairs[1] = ("--generation", reserved);
+            assert!(
+                Harness::try_parse_from(argv(&pairs)).is_err(),
+                "generation {reserved} must not parse"
+            );
+        }
+    }
+
+    /// The reset placeholder is refused by identity and by generation before
+    /// any connection is made.
+    #[test]
+    fn retire_generation_refuses_the_reset_placeholder() {
+        assert!(refuse_reserved_generation("loreserver-1", 3).is_ok());
+        for (receiver, generation) in [
+            (REQUIRED_REPLACEMENT_PLACEHOLDER, PLACEHOLDER_GENERATION),
+            (REQUIRED_REPLACEMENT_PLACEHOLDER, 3),
+            ("loreserver-1", PLACEHOLDER_GENERATION),
+            ("loreserver-1", -1),
         ] {
-            assert!(Harness::try_parse_from(missing).is_err());
+            assert!(
+                refuse_reserved_generation(receiver, generation).is_err(),
+                "{receiver} generation {generation} must be refused"
+            );
         }
     }
 

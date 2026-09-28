@@ -1341,6 +1341,30 @@ pub(super) const ROW_STATE_COLUMNS: &str = "state, available_at, \
      gateway_response_id, publisher_contract_version, broker_accepted_at, \
      replay_count, replayed_at, replay_actor, replay_reason";
 
+/// Pair the two retry-history columns into one record.
+///
+/// Read as two `Option`s rather than keyed off one of them, because
+/// `lore_outbox_events_retry_history_shape` is `NOT VALID` (migration 0006):
+/// it binds every write since the migration, but it is not the proof the other
+/// shape constraints are. A half-set pair is a drifted row, and it surfaces as
+/// a `DomainError` here instead of a panic in the relay worker or an operator
+/// command.
+pub(super) fn retry_record_from(
+    class: Option<String>,
+    at: Option<SystemTime>,
+) -> Result<Option<RetryRecord>, DomainError> {
+    match (class, at) {
+        (Some(class), Some(at)) => Ok(Some(RetryRecord { class, at })),
+        (None, None) => Ok(None),
+        (class, at) => Err(DomainError::Internal(format!(
+            "outbox row retry history is half set (last_retry_class present: {}, last_retry_at \
+             present: {}); lore_outbox_events_retry_history_shape has drifted",
+            class.is_some(),
+            at.is_some()
+        ))),
+    }
+}
+
 /// Decode one row selected with `{EVENT_COLUMNS}, {ROW_STATE_COLUMNS}`.
 pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
     // The `lore_outbox_events_publication_shape` CHECK makes these six columns
@@ -1364,12 +1388,14 @@ pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
         at,
     });
 
-    // Same shape argument, against `lore_outbox_events_retry_history_shape`.
-    let last_retry_at: Option<SystemTime> = row.get("last_retry_at");
-    let last_retry = last_retry_at.map(|at| RetryRecord {
-        class: row.get("last_retry_class"),
-        at,
-    });
+    let last_retry = retry_record_from(
+        row.try_get("last_retry_class").map_err(|e| {
+            DomainError::Internal(format!("outbox row last_retry_class is unreadable: {e}"))
+        })?,
+        row.try_get("last_retry_at").map_err(|e| {
+            DomainError::Internal(format!("outbox row last_retry_at is unreadable: {e}"))
+        })?,
+    )?;
 
     Ok(OutboxRow {
         event: event_from(row)?,
@@ -1669,6 +1695,29 @@ mod tests {
         assert_eq!(DEAD_LETTER_PARKED, "parked");
         assert_eq!(DEAD_LETTER_REQUEUED, "requeued");
         assert_eq!(DEAD_LETTER_OBSOLETE, "obsolete");
+    }
+
+    /// The retry-history pair decodes to a record or to nothing, and a
+    /// half-set pair is a `DomainError`, never a panic: the shape constraint
+    /// that forbids it is `NOT VALID`.
+    #[test]
+    fn a_half_set_retry_history_is_an_error_not_a_panic() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(retry_record_from(None, None).expect("absent"), None);
+        assert_eq!(
+            retry_record_from(Some("timeout".to_owned()), Some(at)).expect("present"),
+            Some(RetryRecord {
+                class: "timeout".to_owned(),
+                at,
+            })
+        );
+        for (class, stamp) in [(Some("timeout".to_owned()), None), (None, Some(at))] {
+            let error = retry_record_from(class, stamp).expect_err("half set");
+            assert!(
+                matches!(&error, DomainError::Internal(message) if message.contains("half set")),
+                "unexpected {error:?}"
+            );
+        }
     }
 
     #[test]

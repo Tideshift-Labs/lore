@@ -122,6 +122,7 @@ pub use reset::StoredReset;
 pub use reset::accept_reset;
 pub use schema::OUTBOX_BASE_API_VERSION;
 pub use schema::OUTBOX_RELAY_SCHEMA_VERSION;
+pub use schema::OUTBOX_RETIREMENT_AUDIT_SCHEMA;
 pub use schema::OUTBOX_RETRY_HISTORY_SCHEMA;
 pub use schema::OUTBOX_SCHEMA;
 pub use schema::relay_is_compatible;
