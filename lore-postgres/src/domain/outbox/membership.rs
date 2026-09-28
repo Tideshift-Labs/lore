@@ -1045,6 +1045,17 @@ pub async fn readiness_cas(
 /// nothing to retire it *against*. Deleting such a row is an operator action,
 /// not a lifecycle transition.
 ///
+/// A generation whose checkpoint carries a poison park is refused on the
+/// graceful path for the same reason: the parked event is not applied, and
+/// nothing clears a receiver's park (the dead-letter dispositions act on
+/// relay dead letters in `lore_outbox_dead_letters`, not on checkpoints). The
+/// operator path is to restart that receiver. Its bootstrap will not resume
+/// a checkpoint carrying a blocker, so it joins, baselines, and readies a
+/// new generation, and the parked one then retires by replacement. A
+/// receiver that will never run again has no such path: its parked
+/// generation stays required and holds every later row until an operator
+/// removes the row by hand.
+///
 /// **Why "a checkpoint exists" is not a drain.** A live ready receiver always
 /// has a checkpoint at the current placement; it is how it became ready. Taking
 /// that as the proof let a lagging receiver at sequence 40, with accepted rows
@@ -1059,9 +1070,26 @@ pub async fn readiness_cas(
 /// A `pending` row has no broker sequence yet. One window remains and is
 /// accepted: a publication the broker has accepted whose
 /// [`super::relay::record_broker_accepted`] has not committed yet is invisible
-/// here. A receiver retired in that window that is in fact still running finds
-/// itself retired, starts a new generation, and that generation's `joining`
-/// row blocks every safety evaluation until it re-baselines.
+/// here.
+///
+/// **The graceful path proves the frontier caught up, not that the receiver
+/// stopped.** Nothing marks a generation `draining` today: the schema admits
+/// the state, but no writer sets it, and a receiver's graceful shutdown only
+/// reports a final checkpoint. So a live, idle, caught-up receiver satisfies
+/// the drain proof and is retired while still running. It learns this only
+/// when its next checkpoint report answers `RetiredGeneration`
+/// (`remote_notification/receiver.rs`, `checkpoint`), and it reports only
+/// when a checkpoint is due: after an acknowledgement or park, at
+/// `checkpoint_every_events` or `checkpoint_interval`. An idle receiver whose
+/// frontier is already reported never reports, so the window stays open
+/// while the stream is idle and closes no sooner than one checkpoint cadence
+/// after deliveries resume. Until it closes, and until the successor
+/// generation's `joining` row exists, this receiver has no required member:
+/// a newly accepted row is evaluated against the other members' frontiers
+/// alone and can become `consumer_safe`, then prunable, before this receiver
+/// acknowledges it. With no other member, the empty required set refuses
+/// the evaluation instead. Operators should retire a live receiver's
+/// generation only after that receiver has stopped.
 ///
 /// The reset fence's placeholder (`receiver_identity`
 /// [`REQUIRED_REPLACEMENT_PLACEHOLDER`], generation

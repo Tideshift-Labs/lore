@@ -1083,6 +1083,29 @@ async fn retire_generation_refuses_a_generation_whose_checkpoint_carries_a_park(
     );
     assert_eq!(member_state(&raw, &cell_id, generation).await, "ready");
 
+    // The operator path for a permanent park: restart the receiver. Its
+    // bootstrap refuses to resume a parked checkpoint and readies a new
+    // generation, and the parked one then retires by replacement.
+    let successor = join_ready_receiver(
+        &raw,
+        &mut deadpool,
+        &cell_id,
+        "loreserver-1",
+        "DURABLE-x",
+        1,
+        40,
+    )
+    .await;
+    assert!(successor > generation);
+    assert!(
+        matches!(
+            retire(&mut deadpool, &cell_id, "loreserver-1", generation).await,
+            MembershipCas::Applied { membership_generation, .. } if membership_generation == generation
+        ),
+        "a parked generation must retire once a greater one is ready"
+    );
+    assert_eq!(member_state(&raw, &cell_id, successor).await, "ready");
+
     namespace.release().await;
 }
 

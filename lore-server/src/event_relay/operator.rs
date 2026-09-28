@@ -222,8 +222,18 @@ pub enum OutboxCommand {
     },
     /// Retire one receiver generation that is gone for good. Refused unless its
     /// checkpoint at the current placement has reached every broker-accepted
-    /// row, or a greater generation of the same receiver is ready. The reset
-    /// placeholder (generation 0) is refused.
+    /// row with no gap or park, or a greater generation of the same receiver
+    /// is ready. The reset placeholder (generation 0) is refused.
+    ///
+    /// Stop the receiver first. The drain check proves the frontier caught up,
+    /// not that the receiver stopped; a live receiver retired here stays out
+    /// of the safety set until its next checkpoint report.
+    ///
+    /// A generation with a poison park never passes the drain check, and
+    /// `requeue-dead-letter`/`obsolete` do not clear it (they act on relay
+    /// dead letters, not receiver parks). Restart that receiver: its bootstrap
+    /// will not resume a parked checkpoint, so it readies a new generation,
+    /// and this command then retires the parked one by replacement.
     RetireGeneration {
         /// The receiver's configured identity.
         #[arg(long)]
