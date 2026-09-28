@@ -220,7 +220,14 @@ pub struct OutboxRow {
     /// Attempts made so far.
     pub attempt_count: i32,
     /// Last bounded error classification, if any.
+    ///
+    /// The repetition rule's input, so acceptance clears it. For what delayed a
+    /// row that has since drained, read [`Self::last_retry`].
     pub last_error_class: Option<String>,
+    /// The most recent release for retry, which acceptance keeps (WP-115 row
+    /// 60, `migrations/0006_outbox_retry_history.sql`). `None` on a row that
+    /// has never been released.
+    pub last_retry: Option<RetryRecord>,
     /// The publication result, present exactly when `state` is past `pending`.
     pub acceptance: Option<BrokerAcceptanceRecord>,
     /// When the broker accepted, present exactly when `acceptance` is.
@@ -234,6 +241,20 @@ pub struct OutboxRow {
     /// `replay_count` is non-zero. `lore_outbox_events_replay_shape` makes the
     /// three all-set or all-null together.
     pub replay: Option<ReplayAudit>,
+}
+
+/// The cause and time of a row's most recent release for retry.
+///
+/// Written by every [`release_for_retry`] and cleared by no update, so it
+/// survives acceptance and replay. `lore_outbox_events_retry_history_shape`
+/// makes the two columns all-set or all-null together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryRecord {
+    /// The bounded class the release recorded, the same value
+    /// `last_error_class` received.
+    pub class: String,
+    /// The database clock at that release.
+    pub at: SystemTime,
 }
 
 /// The operator/reason audit CR-032 requires a replay to write to the row.
@@ -735,6 +756,10 @@ pub async fn record_broker_accepted(
 /// `available_at` to the caller's next attempt time. The backoff and jitter
 /// themselves are the worker's (Step B); this only makes the decision durable.
 ///
+/// The class goes to two places. `last_error_class` is the repetition rule's
+/// input and acceptance clears it; `last_retry_class`/`last_retry_at` are the
+/// durable record of what delayed the row, and nothing clears them.
+///
 /// The row stays `pending`, which is what keeps a transient failure — transport
 /// error, timeout, 429, 5xx, broker unavailability — out of the poison path.
 pub async fn release_for_retry(
@@ -750,6 +775,8 @@ pub async fn release_for_retry(
             "UPDATE lore_outbox_events SET \
                  attempt_count = attempt_count + 1, \
                  last_error_class = $3, \
+                 last_retry_class = $3, \
+                 last_retry_at = clock_timestamp(), \
                  available_at = $4, \
                  claim_owner = NULL, \
                  claim_expires_at = NULL \
@@ -1309,7 +1336,7 @@ pub async fn lookup_by_idempotency_key(
 /// other.
 pub(super) const ROW_STATE_COLUMNS: &str = "state, available_at, \
      claim_generation, claim_owner, claim_expires_at, \
-     attempt_count, last_error_class, \
+     attempt_count, last_error_class, last_retry_class, last_retry_at, \
      stream_identity, stream_epoch, broker_sequence, \
      gateway_response_id, publisher_contract_version, broker_accepted_at, \
      replay_count, replayed_at, replay_actor, replay_reason";
@@ -1337,6 +1364,13 @@ pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
         at,
     });
 
+    // Same shape argument, against `lore_outbox_events_retry_history_shape`.
+    let last_retry_at: Option<SystemTime> = row.get("last_retry_at");
+    let last_retry = last_retry_at.map(|at| RetryRecord {
+        class: row.get("last_retry_class"),
+        at,
+    });
+
     Ok(OutboxRow {
         event: event_from(row)?,
         state: row.get("state"),
@@ -1346,6 +1380,7 @@ pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
         claim_expires_at: row.get("claim_expires_at"),
         attempt_count: row.get("attempt_count"),
         last_error_class: row.get("last_error_class"),
+        last_retry,
         acceptance,
         broker_accepted_at: row.get("broker_accepted_at"),
         replay_count: row.get("replay_count"),

@@ -871,6 +871,13 @@ fn print_row(row: &OutboxRow) {
             None => String::new(),
         }
     );
+    if let Some(retry) = row.last_retry.as_ref() {
+        println!(
+            "      last retried at {} ({})",
+            epoch_seconds(retry.at),
+            retry.class
+        );
+    }
     if let Some(acceptance) = row.acceptance.as_ref() {
         println!(
             "      accepted on {}@{} sequence {}",
@@ -900,6 +907,10 @@ fn row_json(row: &OutboxRow) -> Value {
         "claim_owner": row.claim_owner,
         "attempt_count": row.attempt_count,
         "last_error_class": row.last_error_class,
+        "last_retry": row.last_retry.as_ref().map(|retry| json!({
+            "class": retry.class,
+            "at": epoch_seconds(retry.at),
+        })),
         "acceptance": row.acceptance.as_ref().map(|acceptance| json!({
             "stream_identity": acceptance.stream_identity,
             "stream_epoch": acceptance.stream_epoch,
@@ -1041,6 +1052,54 @@ mod tests {
             !block_label(&block).contains("loreserver"),
             "the metric label must stay identity-free"
         );
+    }
+
+    /// WP-115 row 60: `inspect` shows what delayed a row even after it was
+    /// accepted, when `last_error_class` has already been cleared.
+    #[test]
+    fn inspect_shows_the_retry_record_of_an_accepted_row() {
+        let at = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let row = OutboxRow {
+            event: lore_postgres::domain::outbox::OutboxEventRecord {
+                event_id: Uuid::nil(),
+                cell_id: "sfo3-cell-a".to_owned(),
+                idempotency_key: [0; 32],
+                repository_id: vec![0; 16],
+                repository_generation: 1,
+                event_kind: "branch.pushed".to_owned(),
+                aggregate_kind: "branch".to_owned(),
+                aggregate_id: vec![1],
+                aggregate_version: vec![0; 8],
+                payload_schema_version: 1,
+                payload: b"{}".to_vec(),
+                created_at: at,
+            },
+            state: "broker_accepted".to_owned(),
+            available_at: at,
+            claim_generation: 3,
+            claim_owner: None,
+            claim_expires_at: None,
+            attempt_count: 2,
+            last_error_class: None,
+            last_retry: Some(lore_postgres::domain::outbox::RetryRecord {
+                class: "placement_quiescing".to_owned(),
+                at,
+            }),
+            acceptance: None,
+            broker_accepted_at: None,
+            replay_count: 0,
+            replay: None,
+        };
+        let rendered = row_json(&row);
+        assert_eq!(rendered["last_error_class"], Value::Null);
+        assert_eq!(rendered["last_retry"]["class"], "placement_quiescing");
+        assert_eq!(rendered["last_retry"]["at"], 1_700_000_000.0);
+
+        let never_retried = OutboxRow {
+            last_retry: None,
+            ..row
+        };
+        assert_eq!(row_json(&never_retried)["last_retry"], Value::Null);
     }
 
     /// A window an operator could type must not wrap into a small one.

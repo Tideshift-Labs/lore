@@ -162,6 +162,8 @@ struct RowSnapshot {
     gateway_response_id: Option<String>,
     publisher_contract_version: Option<i32>,
     broker_accepted_at: Option<SystemTime>,
+    last_retry_class: Option<String>,
+    last_retry_at: Option<SystemTime>,
     idempotency_key: Vec<u8>,
 }
 
@@ -171,7 +173,7 @@ async fn snapshot(client: &Client, event_id: Uuid) -> Option<RowSnapshot> {
             "SELECT state, available_at, claim_generation, claim_owner, claim_expires_at, \
                     attempt_count, last_error_class, stream_identity, stream_epoch, \
                     broker_sequence, gateway_response_id, publisher_contract_version, \
-                    broker_accepted_at, idempotency_key \
+                    broker_accepted_at, last_retry_class, last_retry_at, idempotency_key \
              FROM lore_outbox_events WHERE event_id = $1",
             &[&event_id],
         )
@@ -191,6 +193,8 @@ async fn snapshot(client: &Client, event_id: Uuid) -> Option<RowSnapshot> {
         gateway_response_id: r.get("gateway_response_id"),
         publisher_contract_version: r.get("publisher_contract_version"),
         broker_accepted_at: r.get("broker_accepted_at"),
+        last_retry_class: r.get("last_retry_class"),
+        last_retry_at: r.get("last_retry_at"),
         idempotency_key: r.get("idempotency_key"),
     })
 }
@@ -244,6 +248,14 @@ fn assert_snapshots_equal(before: &RowSnapshot, after: &RowSnapshot, context: &s
     assert_eq!(
         before.broker_accepted_at, after.broker_accepted_at,
         "{context}: broker_accepted_at changed"
+    );
+    assert_eq!(
+        before.last_retry_class, after.last_retry_class,
+        "{context}: last_retry_class changed"
+    );
+    assert_eq!(
+        before.last_retry_at, after.last_retry_at,
+        "{context}: last_retry_at changed"
     );
     assert_eq!(
         before.idempotency_key, after.idempotency_key,
@@ -766,6 +778,142 @@ async fn release_for_retry_with_a_stale_generation_is_a_no_op() {
     assert!(matches!(outcome, CasOutcome::StaleClaim { .. }));
     let after = snapshot(&raw, event_id).await.expect("after");
     assert_snapshots_equal(&before, &after, "release_for_retry with a stale generation");
+
+    namespace.release().await;
+}
+
+/// WP-115 row 60 fix 2 (INV-FS): acceptance clears `last_error_class`, which
+/// the repetition rule reads, so the cause that delayed a row used to be lost
+/// the moment it drained. `last_retry_class`/`last_retry_at` are the durable
+/// record: every release writes them, and acceptance leaves them alone.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn acceptance_keeps_the_most_recent_retry_class_that_delayed_the_row() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "retry-history").await;
+    let url = namespace.pg_url().to_owned();
+    connect_domain_store(&url).await;
+    let mut raw = pg_client(&url).await;
+    let mut pool_client = deadpool_client(&url).await;
+
+    let repository_id = rand_repository_id();
+    let cell_id = rand_cell_id();
+    let delayed = append_pending(
+        &mut raw,
+        &cell_id,
+        &repository_id,
+        "branch.pushed",
+        "branch",
+        &rand::random::<[u8; 16]>(),
+        1,
+    )
+    .await;
+
+    // Two releases with different classes: the record is the LATEST one.
+    let released_from = SystemTime::now();
+    for class in ["TRANSPORT_TIMEOUT_V1", "placement_quiescing"] {
+        let claimed = claim_batch(&mut pool_client, "worker-a", 10, Duration::from_secs(30))
+            .await
+            .expect("claim");
+        assert_eq!(claimed.len(), 1, "the delayed row is claimable again");
+        let outcome = release_for_retry(
+            &raw,
+            delayed,
+            claimed[0].claim_generation,
+            class,
+            SystemTime::now() - Duration::from_secs(1),
+        )
+        .await
+        .expect("release for retry");
+        assert_eq!(outcome, CasOutcome::Applied);
+    }
+    let released = snapshot(&raw, delayed).await.expect("row after releases");
+    assert_eq!(
+        released.last_retry_class.as_deref(),
+        Some("placement_quiescing")
+    );
+    assert_eq!(
+        released.last_error_class.as_deref(),
+        Some("placement_quiescing")
+    );
+
+    let claimed = claim_batch(&mut pool_client, "worker-a", 10, Duration::from_secs(30))
+        .await
+        .expect("claim for acceptance");
+    let outcome = record_broker_accepted(
+        &raw,
+        delayed,
+        claimed[0].claim_generation,
+        &sample_acceptance("stream-a", 1, 7),
+    )
+    .await
+    .expect("record acceptance");
+    assert_eq!(outcome, CasOutcome::Applied);
+
+    let accepted = snapshot(&raw, delayed).await.expect("row after acceptance");
+    assert_eq!(accepted.state, "broker_accepted");
+    assert_eq!(
+        accepted.last_error_class, None,
+        "the repetition rule's input is still cleared on acceptance"
+    );
+    assert_eq!(
+        accepted.last_retry_class.as_deref(),
+        Some("placement_quiescing"),
+        "acceptance must keep the class that delayed the row"
+    );
+    assert_eq!(accepted.attempt_count, 2);
+    let retry_at = accepted
+        .last_retry_at
+        .expect("a released row records when it was last released");
+    assert_eq!(Some(retry_at), released.last_retry_at);
+    assert!(
+        retry_at >= released_from - Duration::from_secs(5)
+            && retry_at <= accepted.broker_accepted_at.expect("accepted at"),
+        "last_retry_at is the database clock at the release, before acceptance"
+    );
+    // The decoded row `loreserver outbox inspect` renders carries the same record.
+    let key: [u8; 32] = accepted
+        .idempotency_key
+        .as_slice()
+        .try_into()
+        .expect("32-byte key");
+    let decoded = lookup_by_idempotency_key(&raw, &cell_id, &key)
+        .await
+        .expect("lookup")
+        .expect("row present");
+    let record = decoded.last_retry.expect("decoded retry record");
+    assert_eq!(record.class, "placement_quiescing");
+    assert_eq!(record.at, retry_at);
+
+    // Control: a row accepted on its first attempt carries no retry record.
+    let prompt = append_pending(
+        &mut raw,
+        &cell_id,
+        &repository_id,
+        "branch.pushed",
+        "branch",
+        &rand::random::<[u8; 16]>(),
+        2,
+    )
+    .await;
+    let claimed = claim_batch(&mut pool_client, "worker-a", 10, Duration::from_secs(30))
+        .await
+        .expect("claim the prompt row");
+    assert_eq!(claimed[0].event.event_id, prompt);
+    record_broker_accepted(
+        &raw,
+        prompt,
+        claimed[0].claim_generation,
+        &sample_acceptance("stream-a", 1, 8),
+    )
+    .await
+    .expect("accept the prompt row");
+    let prompt_row = snapshot(&raw, prompt).await.expect("prompt row");
+    assert_eq!(prompt_row.last_retry_class, None);
+    assert_eq!(prompt_row.last_retry_at, None);
 
     namespace.release().await;
 }

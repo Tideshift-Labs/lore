@@ -236,6 +236,17 @@ pub const DEAD_LETTER_REQUEUED: &str = "requeued";
 /// The evidence row is retained; only the disposition changes.
 pub const DEAD_LETTER_OBSOLETE: &str = "obsolete";
 
+/// The retry-history columns (WP-115 row 60, fix 2): the cause and time of a
+/// row's most recent release for retry, kept after acceptance.
+///
+/// An `include_str!` of the migration file rather than a copy, so the
+/// out-of-band provisioning path and the boot path are one declaration.
+/// `PostgresDomainStore::connect` applies it after [`OUTBOX_SCHEMA`], whose
+/// table it alters. The file's own header says why these are not
+/// `last_error_class`.
+pub const OUTBOX_RETRY_HISTORY_SCHEMA: &str =
+    include_str!("../../../migrations/0006_outbox_retry_history.sql");
+
 /// Outbox base DDL. Idempotent; applied under the shared schema advisory lock.
 pub const OUTBOX_SCHEMA: &str = r#"
 -- One row per classified domain event, appended inside the mutation
