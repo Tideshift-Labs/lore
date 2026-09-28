@@ -421,6 +421,9 @@ mod platform {
                 .path()
                 .file_name()
                 .ok_or(WriteBehindError::KeyMismatch)?;
+            // Only the target side is descriptor-relative. The source is still
+            // the absolute path under `incoming/`, a fixed directory no purge
+            // removes, so resolving it by path (from CWD) cannot redirect it.
             rustix::fs::renameat(rustix::fs::CWD, temporary, &leaf.handle, name)
                 .map_err(|error| WriteBehindError::io("staging rename", &error.into()))
         }

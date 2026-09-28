@@ -77,7 +77,7 @@ pub(crate) async fn finalize(
     }
 }
 
-fn finalize_blocking(
+pub(super) fn finalize_blocking(
     root: &ConfinedRoot,
     resolved: &ResolvedStagedPath,
     payload: &Bytes,
@@ -134,6 +134,9 @@ fn finalize_blocking(
                     attempt += 1;
                     leaf = ensure_parent_retrying(root, resolved)?;
                 }
+                // Out of attempts, `NotFound` stays an `Io` error, and
+                // `WriteBehindError::store_error` maps every `Io` to `SlowDown`:
+                // the PUT is retryable, not failed hard.
                 Err(error) => return Err(error),
             }
         }

@@ -431,3 +431,57 @@ fn a_rename_into_a_removed_and_recreated_leaf_is_not_found() {
         "the synced temporary file is kept for the retry"
     );
 }
+
+/// A purge removes the upper fan-out directory after `ensure_parent` opened it
+/// and before it creates the leaf inside it. The held upper is then removed, so
+/// creating the leaf is `NotFound` and finalize redoes step 1.
+#[test]
+fn finalize_redoes_step_one_when_the_upper_fanout_is_removed_before_the_leaf() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_file(&root, &[0xab; 32], 1);
+    let staged = scratch.0.canonicalize().unwrap().join("staged");
+    let upper = staged.join("ab");
+    let mut fired = false;
+    let _hook = Hook::install(move |path, done| {
+        // Syncing `staged` happens after `upper` is opened, before the leaf mkdirat.
+        if path == staged && !done && !fired {
+            fired = true;
+            std::fs::remove_dir(&upper).unwrap();
+        }
+        Ok(())
+    });
+    super::super::finalize::finalize_blocking(&root, &resolved, &bytes::Bytes::from_static(b"x"))
+        .expect("finalize recreates the removed fan-out directory");
+    assert_eq!(std::fs::read(resolved.path()).unwrap(), b"x");
+}
+
+/// End to end: a purge removes the leaf after step 1 synced it and another
+/// finalizer recreates it at the same path. The rename into the held leaf is
+/// `NotFound`, finalize redoes step 1, and the file lands in a leaf it synced.
+#[test]
+fn finalize_redoes_step_one_when_the_leaf_is_removed_and_recreated() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_file(&root, &[0xab; 32], 1);
+    let upper = scratch.0.canonicalize().unwrap().join("staged/ab");
+    let leaf = upper.join("ab");
+    let upper_syncs = Arc::new(Mutex::new(0));
+    let counted = upper_syncs.clone();
+    let _hook = Hook::install(move |path, done| {
+        // The upper sync completes after the leaf is opened, before the rename.
+        if path == upper && done {
+            let mut count = counted.lock().unwrap();
+            *count += 1;
+            if *count == 1 {
+                std::fs::remove_dir(&leaf).unwrap();
+                std::fs::create_dir(&leaf).unwrap();
+            }
+        }
+        Ok(())
+    });
+    super::super::finalize::finalize_blocking(&root, &resolved, &bytes::Bytes::from_static(b"x"))
+        .expect("finalize retries into a leaf it synced");
+    assert_eq!(*upper_syncs.lock().unwrap(), 2, "step 1 ran again");
+    assert_eq!(std::fs::read(resolved.path()).unwrap(), b"x");
+}
