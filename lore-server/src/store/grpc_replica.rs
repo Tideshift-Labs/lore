@@ -601,13 +601,17 @@ impl ImmutableStore for GrpcReplica {
             })
     }
 
+    /// Refused because the replication protocol has no obliterate message: a
+    /// success here would claim the peer dropped a payload it still holds.
     async fn obliterate(
         self: Arc<Self>,
         _repository: Partition,
         _address: Address,
         _stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
-        Ok(())
+        Err(StoreError::from(NotSupported {
+            operation: "obliterate".to_owned(),
+        }))
     }
 
     async fn evict(
@@ -804,6 +808,29 @@ mod tests {
             .repository_stats(Partition::default())
             .await
             .expect_err("GrpcReplica explicitly refuses repository_stats");
+
+        assert!(matches!(err, StoreError::NotSupported(_)));
+    }
+
+    /// The replication protocol has no obliterate message, so `GrpcReplica`
+    /// cannot remove the peer's copy. It must refuse rather than report a
+    /// success it did not perform, matching its `copy` sibling and
+    /// `Replica::obliterate`. The mock client needs no `.expect_*()` because
+    /// the refusal never touches it.
+    #[tokio::test]
+    async fn obliterate_refuses_instead_of_reporting_success() {
+        let client = MockReplicationClientImpl::default();
+        let store = GrpcReplica::new(client);
+        let (_, address, _) = generate_random();
+
+        let err = Arc::new(store)
+            .obliterate(
+                Partition::default(),
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("GrpcReplica must not report an obliterate it did not perform");
 
         assert!(matches!(err, StoreError::NotSupported(_)));
     }
