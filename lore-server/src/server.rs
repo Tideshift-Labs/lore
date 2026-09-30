@@ -1117,7 +1117,7 @@ struct QuicInternalStreamHandler {
 impl QuicInternalStreamHandler {
     fn new(
         immutable_store: Arc<dyn ImmutableStore>,
-        local_store: Arc<dyn ImmutableStore>,
+        local_store: Option<Arc<dyn ImmutableStore>>,
         process_limit: usize,
         handler_duration_timeout: Option<Duration>,
     ) -> Self {
@@ -1126,8 +1126,15 @@ impl QuicInternalStreamHandler {
             service_store.add_service(
                 ReplicationStoreClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
-                    let protocol =
-                        ReplicationStoreService::new(immutable_store.clone(), local_store.clone());
+                    let protocol = match &local_store {
+                        Some(local_store) => ReplicationStoreService::new(
+                            immutable_store.clone(),
+                            local_store.clone(),
+                        ),
+                        None => {
+                            ReplicationStoreService::without_local_store(immutable_store.clone())
+                        }
+                    };
                     Box::new(StreamHandler::new(
                         Arc::new(protocol),
                         context,
@@ -1509,6 +1516,28 @@ static LOCAL_STORE: OnceLock<Weak<dyn ImmutableStore>> = OnceLock::new();
 
 fn local_store() -> Option<Arc<dyn ImmutableStore>> {
     LOCAL_STORE.get().and_then(|weak| weak.upgrade())
+}
+
+/// The store behind the internal QUIC server's `ImmutableLocal*` opcodes. It
+/// must be local, the property `GrpcInternalServerBuilder::with_components`
+/// checks for its sibling. The main store stands in only when it is itself
+/// local. Otherwise `None`, and those opcodes are refused rather than turned
+/// into durable-store traffic (WP-109 D3). The server still starts, because
+/// its `Immutable*` opcodes serve replicated topologies with no local store.
+fn internal_quic_local_store(
+    local_store: Option<Arc<dyn ImmutableStore>>,
+    immutable_store: &Arc<dyn ImmutableStore>,
+) -> Option<Arc<dyn ImmutableStore>> {
+    let store = local_store.unwrap_or_else(|| immutable_store.clone());
+    if store.is_local() {
+        Some(store)
+    } else {
+        warn!(
+            "No local store available for internal QUIC server, ImmutableLocal* opcodes will be \
+             refused"
+        );
+        None
+    }
 }
 
 /// Directory under the system temporary directory where the server keeps
@@ -2916,10 +2945,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 .handler_timeout_seconds
                 .map(Duration::from_secs);
 
-            let local_immutable_store = local_store().unwrap_or_else(|| {
-                warn!("No local store available for internal QUIC server, ImmutableLocal* opcodes will route to the main store");
-                immutable_store.clone()
-            });
+            let local_immutable_store = internal_quic_local_store(local_store(), &immutable_store);
 
             launch_quinn_server(
                 "internal",
@@ -3054,6 +3080,52 @@ fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, mess
 
 #[cfg(test)]
 mod tests {
+    /// WP-109 D3. The internal QUIC server's `ImmutableLocal*` opcodes must
+    /// reach a local store, the property the gRPC internal server enforces at
+    /// construction. With no local store they are refused, never routed to a
+    /// non-local main store.
+    #[tokio::test]
+    async fn internal_quic_refuses_a_non_local_store_for_immutable_local_opcodes() {
+        use std::sync::Arc;
+
+        use lore_storage::ImmutableStore;
+
+        use crate::store::grpc_replica::GrpcReplica;
+        use crate::store::grpc_replica::ReplicationClient;
+
+        let non_local: Arc<dyn ImmutableStore> =
+            Arc::new(GrpcReplica::new(ReplicationClient::default()));
+
+        assert!(
+            super::internal_quic_local_store(None, &non_local).is_none(),
+            "no local store and a non-local main store must not serve ImmutableLocal* opcodes"
+        );
+        assert!(
+            super::internal_quic_local_store(Some(non_local.clone()), &non_local).is_none(),
+            "a non-local store must not serve ImmutableLocal* opcodes"
+        );
+    }
+
+    /// A local store serves `ImmutableLocal*` opcodes, and so does a main store
+    /// that is itself local.
+    #[tokio::test]
+    async fn internal_quic_accepts_a_local_store() -> Result<(), lore_storage::StoreError> {
+        use std::sync::Arc;
+
+        use lore_storage::ImmutableStore;
+
+        use crate::store::grpc_replica::GrpcReplica;
+        use crate::store::grpc_replica::ReplicationClient;
+
+        let (local, _mutable, _execution) = crate::store::test_store_create().await?;
+        let non_local: Arc<dyn ImmutableStore> =
+            Arc::new(GrpcReplica::new(ReplicationClient::default()));
+
+        assert!(super::internal_quic_local_store(Some(local.clone()), &non_local).is_some());
+        assert!(super::internal_quic_local_store(None, &local).is_some());
+        Ok(())
+    }
+
     #[test]
     fn compiled_features_advertise_domain_rails_only_when_service_is_available() {
         let enabled = super::compiled_features(true, true);

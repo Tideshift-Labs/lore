@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -7,6 +8,7 @@ use bytes::Bytes;
 use enum_dispatch::enum_dispatch;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::errors::NotSupported;
 use lore_telemetry::tracing::fields::CONNECTION_ID;
 use lore_telemetry::tracing::fields::CORRELATION_ID;
 use lore_telemetry::tracing::fields::PROTOCOL;
@@ -29,6 +31,7 @@ use crate::protocol::replication_store::get;
 use crate::protocol::replication_store::get::GetHandler;
 use crate::protocol::replication_store::get_metadata;
 use crate::protocol::replication_store::get_metadata::GetMetadataHandler;
+use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::replication_store::obliterate;
 use crate::protocol::replication_store::obliterate::ObliterateHandler;
 use crate::protocol::replication_store::put;
@@ -68,6 +71,47 @@ pub enum ParsedReplicationStoreRequest {
     GetMetadata(GetMetadataHandler),
     Query(QueryHandler),
     Copy(ImmutableCopyHandler),
+    LocalStoreUnavailable(LocalStoreUnavailableHandler),
+}
+
+/// Answers an `ImmutableLocal*` opcode on a server with no local store. Serving
+/// it from the main store would turn a local-cache operation into durable-store
+/// traffic (WP-109 D3), so the request is refused instead.
+#[derive(Debug)]
+pub struct LocalStoreUnavailableHandler {
+    pub header: ReplicationHeader,
+    opcode: &'static str,
+}
+
+impl LocalStoreUnavailableHandler {
+    fn create_handler(
+        bytes: Bytes,
+        command: Command,
+    ) -> Result<ParsedReplicationStoreRequest, MessageParseError> {
+        if bytes.len() < size_of::<ReplicationHeader>() {
+            return Err(MessageParseError::InvalidFieldLength);
+        }
+        Ok(ParsedReplicationStoreRequest::LocalStoreUnavailable(Self {
+            header: bytes.slice(..size_of::<ReplicationHeader>()).into(),
+            opcode: command_name(&command),
+        }))
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestHandler for LocalStoreUnavailableHandler {
+    fn span(&self) -> Span {
+        info_span!("local_store_unavailable",
+            {CORRELATION_ID} = %self.header.correlation_id.as_hyphenated(),
+            {REPOSITORY_ID} = %self.header.repository,
+            opcode = self.opcode)
+    }
+
+    async fn run(self) -> Result<Vec<Bytes>, StoreError> {
+        Err(StoreError::from(NotSupported {
+            operation: format!("{} (this server has no local store)", self.opcode),
+        }))
+    }
 }
 
 pub fn command_name(command: &Command) -> &'static str {
@@ -87,7 +131,7 @@ pub fn command_name(command: &Command) -> &'static str {
 
 pub struct ReplicationStoreService {
     immutable_store: Arc<dyn ImmutableStore>,
-    local_store: Arc<dyn ImmutableStore>,
+    local_store: Option<Arc<dyn ImmutableStore>>,
 }
 
 impl ReplicationStoreService {
@@ -97,7 +141,16 @@ impl ReplicationStoreService {
     ) -> Self {
         Self {
             immutable_store,
-            local_store,
+            local_store: Some(local_store),
+        }
+    }
+
+    /// A service for a server with no local store: `Immutable*` opcodes reach
+    /// the main store as usual, and `ImmutableLocal*` opcodes are refused.
+    pub fn without_local_store(immutable_store: Arc<dyn ImmutableStore>) -> Self {
+        Self {
+            immutable_store,
+            local_store: None,
         }
     }
 }
@@ -138,21 +191,29 @@ impl QuicService for ReplicationStoreService {
             Command::ImmutableGetMetadata => {
                 get_metadata::create_handler(bytes, self.immutable_store.clone(), "get_metadata")?
             }
-            Command::ImmutableLocalGet => {
-                get::create_handler(bytes, self.local_store.clone(), "local_get")?
-            }
-            Command::ImmutableLocalPut => {
-                put::create_handler(bytes, self.local_store.clone(), "local_put")?
-            }
-            Command::ImmutableLocalGetMetadata => {
-                get_metadata::create_handler(bytes, self.local_store.clone(), "local_get_metadata")?
-            }
+            Command::ImmutableLocalGet => match &self.local_store {
+                Some(local_store) => get::create_handler(bytes, local_store.clone(), "local_get")?,
+                None => LocalStoreUnavailableHandler::create_handler(bytes, command)?,
+            },
+            Command::ImmutableLocalPut => match &self.local_store {
+                Some(local_store) => put::create_handler(bytes, local_store.clone(), "local_put")?,
+                None => LocalStoreUnavailableHandler::create_handler(bytes, command)?,
+            },
+            Command::ImmutableLocalGetMetadata => match &self.local_store {
+                Some(local_store) => {
+                    get_metadata::create_handler(bytes, local_store.clone(), "local_get_metadata")?
+                }
+                None => LocalStoreUnavailableHandler::create_handler(bytes, command)?,
+            },
             Command::ImmutableQuery => {
                 query::create_handler(bytes, self.immutable_store.clone(), "query")?
             }
-            Command::ImmutableLocalQuery => {
-                query::create_handler(bytes, self.local_store.clone(), "local_query")?
-            }
+            Command::ImmutableLocalQuery => match &self.local_store {
+                Some(local_store) => {
+                    query::create_handler(bytes, local_store.clone(), "local_query")?
+                }
+                None => LocalStoreUnavailableHandler::create_handler(bytes, command)?,
+            },
             Command::ImmutableCopy => copy::create_handler(bytes, self.immutable_store.clone())?,
         };
 
@@ -214,6 +275,7 @@ impl QuicService for ReplicationStoreService {
             ParsedReplicationStoreRequest::GetMetadata(h) => &h.request.header,
             ParsedReplicationStoreRequest::Query(h) => &h.request.header,
             ParsedReplicationStoreRequest::Copy(h) => &h.request.header,
+            ParsedReplicationStoreRequest::LocalStoreUnavailable(h) => &h.header,
         };
         let repository_id = replication_header.repository.to_string();
         let correlation_id = replication_header
@@ -1124,5 +1186,118 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// WP-109 D3. With no local store, every `ImmutableLocal*` opcode is
+    /// refused with an error naming the opcode, and the main store is never
+    /// touched. The refusal reads only the replication header, so one `Get`
+    /// body serves all four opcodes.
+    #[tokio::test]
+    async fn immutable_local_opcodes_are_refused_without_a_local_store() {
+        let (main_store, _, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+        {
+            let main_store = main_store.clone();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    main_store
+                        .put(repository.into(), address, fragment, Some(payload), false)
+                        .await
+                        .expect("put should work");
+                })
+                .await;
+        }
+
+        let request = Get {
+            header: ReplicationHeader {
+                correlation_id: Uuid::new_v4(),
+                repository,
+            },
+            address,
+        };
+        let service = ReplicationStoreService::without_local_store(main_store);
+
+        for command in [
+            Command::ImmutableLocalGet,
+            Command::ImmutableLocalPut,
+            Command::ImmutableLocalGetMetadata,
+            Command::ImmutableLocalQuery,
+        ] {
+            let opcode = command_name(&command);
+            let parse_output = service
+                .parse_request_bytes(
+                    &CommandHeader::new(command as QuicOpCode, 0, 0),
+                    collapse_bytes_without_header(&request.clone().to_quic_chunks()),
+                )
+                .expect("Failed to parse");
+            assert!(
+                matches!(
+                    parse_output,
+                    ParsedReplicationStoreRequest::LocalStoreUnavailable(_)
+                ),
+                "{opcode} must not reach a store"
+            );
+
+            let error = service
+                .run_request_handler(AttributeMap::default().into(), parse_output)
+                .await
+                .expect_err("an ImmutableLocal* opcode must be refused without a local store");
+            assert!(matches!(error, StoreError::NotSupported(_)), "{opcode}");
+            let message = error.to_string();
+            assert!(message.contains(opcode), "{message}");
+            assert!(message.contains("no local store"), "{message}");
+        }
+    }
+
+    /// The refusal is scoped to `ImmutableLocal*`: on a server with no local
+    /// store, `Immutable*` opcodes still reach the main store.
+    #[tokio::test]
+    async fn immutable_opcodes_still_work_without_a_local_store() {
+        let (main_store, _, _) = test_store_create().await.expect("Failed to create stores");
+
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+        let header = ReplicationHeader {
+            correlation_id: Uuid::new_v4(),
+            repository,
+        };
+        let service = ReplicationStoreService::without_local_store(main_store);
+
+        let put = Put {
+            header: header.clone(),
+            address,
+            fragment,
+            flags: 0,
+            payload: Some(payload.clone()),
+        };
+        let parse_output = service
+            .parse_request_bytes(
+                &CommandHeader::new(Command::ImmutablePut as QuicOpCode, 0, 0),
+                collapse_bytes_without_header(&put.to_quic_chunks()),
+            )
+            .expect("Failed to parse");
+        service
+            .run_request_handler(AttributeMap::default().into(), parse_output)
+            .await
+            .expect("ImmutablePut must reach the main store");
+
+        let get = Get { header, address };
+        let parse_output = service
+            .parse_request_bytes(
+                &CommandHeader::new(Command::ImmutableGet as QuicOpCode, 0, 0),
+                collapse_bytes_without_header(&get.to_quic_chunks()),
+            )
+            .expect("Failed to parse");
+        let handle_output = service
+            .run_request_handler(AttributeMap::default().into(), parse_output)
+            .await
+            .expect("ImmutableGet must reach the main store");
+        let response = get::parse_response(collapse_bytes(&handle_output))
+            .expect("response parse should work");
+        assert_eq!(response.fragment, fragment);
+        assert_eq!(response.payload, Some(payload));
     }
 }
