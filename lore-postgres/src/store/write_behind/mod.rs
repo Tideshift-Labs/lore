@@ -63,6 +63,63 @@ pub(crate) use self::root::StageIoPath;
 /// One reserved staging I/O slot. See [`WriteBehindStage::reserve_io`].
 pub(crate) struct StageIoPermit(tokio::sync::OwnedSemaphorePermit);
 
+/// Whether one staging attempt may still withdraw its preparation.
+///
+/// The durable-effect boundary is the rename into the staged leaf (finalize
+/// step 4). Before it, the attempt has placed nothing under `staged/`, so its
+/// `PreparingStage` head can be withdrawn and a retry admitted at once. From
+/// the moment the finalizer claims the rename, the file may exist, and the
+/// preparation is left for the prepare deadline and fenced cleanup as before.
+///
+/// The finalizer and the withdrawer race through one compare-and-set, so
+/// exactly one wins: a withdrawn attempt never renames, and an attempt that
+/// may have renamed is never withdrawn. This holds even when the awaiting
+/// future is cancelled while its blocking finalizer is still running.
+#[derive(Clone, Default)]
+pub(crate) struct StageAttempt(Arc<std::sync::atomic::AtomicU8>);
+
+impl StageAttempt {
+    const UNPLACED: u8 = 0;
+    const PLACING: u8 = 1;
+    const WITHDRAWN: u8 = 2;
+
+    /// Claim the rename. `false` when the attempt was already withdrawn.
+    pub(crate) fn claim_placement(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::UNPLACED,
+                Self::PLACING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Release a claimed rename that returned an error. `renameat` is atomic,
+    /// so an error means nothing was placed and withdrawal is safe again.
+    pub(crate) fn placement_failed(&self) {
+        let _ = self.0.compare_exchange(
+            Self::PLACING,
+            Self::UNPLACED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// Take the right to withdraw the preparation. `false` once a rename was
+    /// claimed, or when another path already withdrew.
+    pub(crate) fn withdraw(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::UNPLACED,
+                Self::WITHDRAWN,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
 /// How long one admission sample may run before the sampler reports the root
 /// unavailable for that tick.
 ///
@@ -449,8 +506,15 @@ impl WriteBehindStage {
         payload: &Bytes,
     ) -> Result<(), WriteBehindError> {
         let permit = self.reserve_io()?;
-        self.stage_reserved(permit, hash, epoch, object_key, payload)
-            .await
+        self.stage_reserved(
+            permit,
+            &StageAttempt::default(),
+            hash,
+            epoch,
+            object_key,
+            payload,
+        )
+        .await
     }
 
     /// Reserve the I/O slot one [`Self::stage_reserved`] will use.
@@ -462,10 +526,12 @@ impl WriteBehindStage {
         self.root.try_io_permit(StageIoPath::Put).map(StageIoPermit)
     }
 
-    /// [`Self::stage`] with a slot from [`Self::reserve_io`].
+    /// [`Self::stage`] with a slot from [`Self::reserve_io`]. The rename is
+    /// skipped when `attempt` was withdrawn first; see [`StageAttempt`].
     pub(crate) async fn stage_reserved(
         &self,
         permit: StageIoPermit,
+        attempt: &StageAttempt,
         hash: &[u8],
         epoch: i64,
         object_key: &str,
@@ -475,7 +541,7 @@ impl WriteBehindStage {
             return Err(WriteBehindError::PayloadOversized);
         }
         let resolved = self.root.resolve(hash, epoch, object_key)?;
-        finalize::finalize_reserved(permit.0, &self.root, &resolved, payload).await
+        finalize::finalize_reserved(permit.0, attempt.clone(), &self.root, &resolved, payload).await
     }
 
     /// Read one staged fragment's bytes.

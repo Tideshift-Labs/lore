@@ -356,6 +356,66 @@ impl PostgresFragmentCoordinator {
         }))
     }
 
+    /// Withdraw this attempt's own `PreparingStage` intent after a failure
+    /// that placed nothing under `staged/`.
+    ///
+    /// A compare-and-set on the exact head (`PreparingStage`, epoch, fence) and
+    /// the exact live custody row. The custody row is sealed for cleanup
+    /// (`state=2`), so the next `begin_stage` no longer sees a live preparation
+    /// and admits a new epoch at once. The head takes a fresh fence, so a late
+    /// commit of the withdrawn intent is `Fenced` on every observation, and the
+    /// sealed row refuses `publish_stage_locked` as well. The capacity charge
+    /// stays with the row until fenced cleanup releases it, exactly as for an
+    /// expired preparation, so no residue is reclaimed twice.
+    ///
+    /// `Ok(false)` when the head or the row moved; nothing is written then. The
+    /// caller must not call this once the attempt may have renamed its file.
+    pub async fn withdraw_stage(&self, intent: &FragmentIntent) -> Result<bool, DomainError> {
+        if intent.authority != EpochAuthority::Staged {
+            return Err(DomainError::InvalidInput(
+                "only a stage intent can be withdrawn".into(),
+            ));
+        }
+        let mut client = self.checkout().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| DomainError::from_pg("stage withdraw begin", e))?;
+        let mut sequence = LockSequence::new();
+        let head = lock_fragment_head(&tx, &mut sequence, &intent.hash).await?;
+        let owned = head.is_some_and(|head| {
+            head.state == FragmentLifecycleState::PreparingStage
+                && head.current_epoch == intent.epoch
+                && head.last_fence == intent.fence
+        });
+        if !owned {
+            return Ok(false);
+        }
+        sequence.enter(LockClass::StageCustody)?;
+        let sealed = tx
+            .execute(
+                "UPDATE lore_fragment_stage_custody SET state=2 \
+             WHERE hash=$1 AND epoch=$2 AND operation_fence=$3 AND state=0",
+                &[&intent.hash, &intent.epoch, &intent.fence],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("stage withdraw seal", e))?;
+        if sealed != 1 {
+            return Ok(false);
+        }
+        let fence = next_fence(&tx).await?;
+        tx.execute(
+            "UPDATE lore_fragment_lifecycle \
+                SET last_fence = $2, updated_at = clock_timestamp() \
+              WHERE hash = $1",
+            &[&intent.hash, &fence],
+        )
+        .await
+        .map_err(|e| DomainError::from_pg("stage withdraw fence stamp", e))?;
+        classify_commit(tx.commit().await, "stage withdraw commit")?;
+        Ok(true)
+    }
+
     pub async fn commit_stage_cleanup(
         &self,
         intent: &StageCleanupIntent,

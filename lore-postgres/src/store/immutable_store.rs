@@ -87,6 +87,7 @@ use crate::domain::fragments::FragmentDrainCapability;
 use crate::domain::fragments::FragmentGetAttempt;
 use crate::domain::fragments::FragmentGetOperation;
 use crate::domain::fragments::FragmentGetResponse;
+use crate::domain::fragments::FragmentIntent;
 use crate::domain::fragments::FragmentManifest;
 use crate::domain::fragments::FragmentObliterateBegin;
 use crate::domain::fragments::FragmentObliteratePhase;
@@ -119,6 +120,7 @@ use crate::domain::fragments::decodable_encoding;
 use crate::domain::fragments::read_fragment_write_capability;
 use crate::pool::Pool;
 use crate::store::write_behind::AdmissionSnapshot;
+use crate::store::write_behind::StageAttempt;
 use crate::store::write_behind::StagedRead;
 use crate::store::write_behind::StagingMode;
 use crate::store::write_behind::WriteBehindError;
@@ -126,6 +128,59 @@ use crate::store::write_behind::WriteBehindStage;
 
 pub mod clean_namespace;
 pub mod creation_metadata;
+
+/// Withdraw a staged put's own preparation, when the attempt has not claimed
+/// its rename. Best effort: a failed withdrawal leaves the preparation to its
+/// prepare deadline, which is the behavior without withdrawal, and never
+/// replaces the caller's own error.
+async fn withdraw_preparation(
+    coordinator: &PostgresFragmentCoordinator,
+    attempt: &StageAttempt,
+    intent: &FragmentIntent,
+) {
+    if !attempt.withdraw() {
+        return;
+    }
+    if let Err(error) = coordinator.withdraw_stage(intent).await {
+        tracing::debug!(
+            epoch = intent.epoch,
+            %error,
+            "staged put could not withdraw its preparation; it expires at its prepare deadline"
+        );
+    }
+}
+
+/// The cancellation arm of [`withdraw_preparation`]. `Drop` cannot wait, so
+/// the database half runs on a detached task and the dropped future does not
+/// block on it. The attempt is marked withdrawn synchronously here, which is
+/// what stops a still-running finalizer from renaming afterwards.
+struct WithdrawOnDrop {
+    attempt: StageAttempt,
+    coordinator: PostgresFragmentCoordinator,
+    intent: FragmentIntent,
+}
+
+impl Drop for WithdrawOnDrop {
+    fn drop(&mut self) {
+        if !self.attempt.withdraw() {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let coordinator = self.coordinator.clone();
+        let intent = self.intent.clone();
+        drop(lore_base::lore_spawn!("stage-withdraw", async move {
+            if let Err(error) = coordinator.withdraw_stage(&intent).await {
+                tracing::debug!(
+                    epoch = intent.epoch,
+                    %error,
+                    "cancelled staged put could not withdraw its preparation"
+                );
+            }
+        }));
+    }
+}
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
@@ -1786,8 +1841,29 @@ impl PostgresImmutableStore {
             }
             BeginOutcome::Admitted(intent) => intent,
         };
-        let manifest =
-            Self::epoch_manifest(&intent, address, fragment, &payload, EpochAuthority::Staged)?;
+        // From here until the finalizer claims its rename, a failure or a
+        // cancellation withdraws this attempt's own preparation, so a retry of
+        // the hash is admitted at once rather than fenced until the prepare
+        // deadline. See `StageAttempt` for the boundary.
+        let attempt = StageAttempt::default();
+        let _withdraw_on_cancel = WithdrawOnDrop {
+            attempt: attempt.clone(),
+            coordinator: coordinator.clone(),
+            intent: (*intent).clone(),
+        };
+        let manifest = match Self::epoch_manifest(
+            &intent,
+            address,
+            fragment,
+            &payload,
+            EpochAuthority::Staged,
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                withdraw_preparation(coordinator, &attempt, &intent).await;
+                return Err(error);
+            }
+        };
         // File durability strictly precedes the authoritative commit. The
         // reverse order would make a `Staged` row reachable before its bytes
         // are durable, and a `Staged` row without readable bytes is corruption
@@ -1795,6 +1871,7 @@ impl PostgresImmutableStore {
         if let Err(error) = stage
             .stage_reserved(
                 permit,
+                &attempt,
                 &intent.hash,
                 intent.epoch,
                 &intent.object_key,
@@ -1803,10 +1880,12 @@ impl PostgresImmutableStore {
             .await
         {
             // Nothing is committed, so nothing advertises these bytes. The
-            // preparing intent is left for the next operation on this hash to
-            // fence; it is not abandoned here, because `commit_staged` with an
-            // `Unusable` observation would publish a `Missing` head for a
-            // fragment whose only problem is this replica's filesystem.
+            // intent is not abandoned through `commit_staged`: an `Unusable`
+            // observation would publish a `Missing` head for a fragment whose
+            // only problem is this replica's filesystem. Before the rename it
+            // is withdrawn instead; after it, it is left for the prepare
+            // deadline and fenced cleanup.
+            withdraw_preparation(coordinator, &attempt, &intent).await;
             return Err(error.store_error());
         }
         match coordinator

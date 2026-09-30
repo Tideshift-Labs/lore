@@ -38,11 +38,20 @@
 //! it. Missing epoch rows alone never authorize unlinking either kind of file.
 //! A paused finalizer can leave late residue after fencing; retained custody
 //! markers allow a later pass to remove it without releasing capacity twice.
+//!
+//! # The durable-effect boundary
+//!
+//! Step 4 is the first act that can leave this attempt's bytes under
+//! `staged/`. Before it, a failed attempt may withdraw its preparation so a
+//! retry need not wait for the prepare deadline. The finalizer claims the
+//! rename through [`StageAttempt::claim_placement`] immediately before step 4
+//! and refuses to rename an attempt that was already withdrawn.
 
 use bytes::Bytes;
 use lore_base::lore_spawn_blocking;
 use tokio::sync::OwnedSemaphorePermit;
 
+use super::StageAttempt;
 use super::WriteBehindError;
 use super::root::ConfinedRoot;
 use super::root::ResolvedStagedPath;
@@ -57,7 +66,7 @@ pub(crate) async fn finalize(
     payload: &Bytes,
 ) -> Result<(), WriteBehindError> {
     let permit = root.try_io_permit(super::StageIoPath::Put)?;
-    finalize_reserved(permit, root, resolved, payload).await
+    finalize_reserved(permit, StageAttempt::default(), root, resolved, payload).await
 }
 
 /// Durably place one payload at its resolved staged path, using an I/O slot
@@ -71,6 +80,7 @@ pub(crate) async fn finalize(
 /// effort; coordinator-fenced cleanup handles residue.
 pub(crate) async fn finalize_reserved(
     permit: OwnedSemaphorePermit,
+    attempt: StageAttempt,
     root: &ConfinedRoot,
     resolved: &ResolvedStagedPath,
     payload: &Bytes,
@@ -81,7 +91,7 @@ pub(crate) async fn finalize_reserved(
     let handle = lore_spawn_blocking!(move || {
         let _permit = permit;
         root.verify_device()?;
-        finalize_blocking(&root, &resolved, &payload)
+        finalize_blocking(&root, &attempt, &resolved, &payload)
     });
     match handle.await {
         Ok(result) => result,
@@ -94,6 +104,7 @@ pub(crate) async fn finalize_reserved(
 
 pub(super) fn finalize_blocking(
     root: &ConfinedRoot,
+    attempt: &StageAttempt,
     resolved: &ResolvedStagedPath,
     payload: &Bytes,
 ) -> Result<(), WriteBehindError> {
@@ -131,30 +142,50 @@ pub(super) fn finalize_blocking(
                 kind: std::io::ErrorKind::Interrupted,
             })?;
         drop(file);
+        #[cfg(all(test, unix))]
+        test_faults::before_rename(key)?;
+        // The durable-effect boundary. A withdrawn attempt must not place its
+        // file; see the module header.
+        if !attempt.claim_placement() {
+            return Err(WriteBehindError::Io {
+                operation: "staging attempt withdrawn",
+                kind: std::io::ErrorKind::Interrupted,
+            });
+        }
         // Step 4. Atomic within one filesystem, which the recorded device
         // guarantees. The target cannot already exist: `(hash, epoch)` is unique
         // by construction and an epoch row is immutable.
-        let mut attempt = 1;
-        loop {
-            match root.rename_into(&temporary, resolved, &leaf) {
-                Ok(()) => break,
-                // Purge removes an empty fan-out directory, so the leaf step 1
-                // synced can be gone by now, and a path might name a newer,
-                // unsynced one. Redo step 1, so the rename lands in a directory
-                // whose entry is durable.
-                Err(WriteBehindError::Io {
-                    kind: std::io::ErrorKind::NotFound,
-                    ..
-                }) if attempt < PLACEMENT_ATTEMPTS => {
-                    attempt += 1;
-                    leaf = ensure_parent_retrying(root, resolved)?;
+        let placed = (|| -> Result<(), WriteBehindError> {
+            let mut tries = 1;
+            loop {
+                match root.rename_into(&temporary, resolved, &leaf) {
+                    Ok(()) => return Ok(()),
+                    // Purge removes an empty fan-out directory, so the leaf step 1
+                    // synced can be gone by now, and a path might name a newer,
+                    // unsynced one. Redo step 1, so the rename lands in a directory
+                    // whose entry is durable.
+                    Err(WriteBehindError::Io {
+                        kind: std::io::ErrorKind::NotFound,
+                        ..
+                    }) if tries < PLACEMENT_ATTEMPTS => {
+                        tries += 1;
+                        leaf = ensure_parent_retrying(root, resolved)?;
+                    }
+                    // Out of attempts, `NotFound` stays an `Io` error, and
+                    // `WriteBehindError::store_error` maps every `Io` to `SlowDown`:
+                    // the PUT is retryable, not failed hard.
+                    Err(error) => return Err(error),
                 }
-                // Out of attempts, `NotFound` stays an `Io` error, and
-                // `WriteBehindError::store_error` maps every `Io` to `SlowDown`:
-                // the PUT is retryable, not failed hard.
-                Err(error) => return Err(error),
             }
+        })();
+        if let Err(error) = placed {
+            // Every error above precedes a successful `renameat`, which is
+            // atomic, so nothing was placed.
+            attempt.placement_failed();
+            return Err(error);
         }
+        #[cfg(all(test, unix))]
+        test_faults::after_rename(key)?;
         #[cfg(feature = "failure_generator")]
         blocking_failpoint(async { crate::domain::fragments::failpoint!("stage.final.renamed") })
             .map_err(|_| WriteBehindError::Io {
@@ -176,6 +207,78 @@ pub(super) fn finalize_blocking(
 
 /// Bounded attempts at a step whose fan-out directory a concurrent purge removed.
 const PLACEMENT_ATTEMPTS: usize = 3;
+
+/// Faults the adapter tests inject on either side of the durable-effect
+/// boundary. Keyed by the hex fragment hash, because the epoch is allocated
+/// inside the call under test; each fault fires once.
+///
+/// A static map rather than the thread-local sync observer: finalization runs
+/// on a blocking worker the test does not own.
+#[cfg(all(test, unix))]
+pub(crate) mod test_faults {
+    use std::collections::BTreeMap;
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::WriteBehindError;
+
+    pub(crate) enum Fault {
+        /// Fail after the temp fsync, before the rename claim.
+        PreDurableError,
+        /// Fail after the rename, before the leaf fsync.
+        PostDurableError,
+        /// Signal `entered`, then wait for `release`, before the rename claim.
+        PreDurablePause {
+            entered: tokio::sync::oneshot::Sender<()>,
+            release: mpsc::Receiver<()>,
+        },
+    }
+
+    static FAULTS: LazyLock<Mutex<BTreeMap<String, Fault>>> =
+        LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    pub(crate) fn install(hash: &[u8], fault: Fault) {
+        FAULTS.lock().unwrap().insert(hex::encode(hash), fault);
+    }
+
+    fn injected(operation: &'static str) -> WriteBehindError {
+        WriteBehindError::Io {
+            operation,
+            kind: std::io::ErrorKind::Other,
+        }
+    }
+
+    fn take(key: &str, wanted: fn(&Fault) -> bool) -> Option<Fault> {
+        let hash = key.split('.').next()?;
+        let mut faults = FAULTS.lock().unwrap();
+        if faults.get(hash).is_some_and(wanted) {
+            faults.remove(hash)
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn before_rename(key: &str) -> Result<(), WriteBehindError> {
+        match take(key, |fault| !matches!(fault, Fault::PostDurableError)) {
+            Some(Fault::PreDurableError) => Err(injected("injected pre-rename fault")),
+            Some(Fault::PreDurablePause { entered, release }) => {
+                let _ = entered.send(());
+                release.recv_timeout(Duration::from_secs(20)).unwrap();
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub(super) fn after_rename(key: &str) -> Result<(), WriteBehindError> {
+        match take(key, |fault| matches!(fault, Fault::PostDurableError)) {
+            Some(_) => Err(injected("injected post-rename fault")),
+            None => Ok(()),
+        }
+    }
+}
 
 /// Step 1, retried when a concurrent purge removed a directory it just made or
 /// found. Each attempt syncs every level again, so the durability order holds.

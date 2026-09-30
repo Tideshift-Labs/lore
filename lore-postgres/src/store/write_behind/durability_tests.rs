@@ -445,6 +445,7 @@ async fn finalize_with_hook(
         let _hook = Hook::install(hook);
         super::super::finalize::finalize_blocking(
             &root,
+            &super::super::StageAttempt::default(),
             &resolved,
             &bytes::Bytes::from_static(b"x"),
         )

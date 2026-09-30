@@ -335,6 +335,9 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
             // Step 3: contents AND metadata are durable before the rename that
             // publishes them.
             "file.sync_all()",
+            // The durable-effect boundary: the rename is claimed against a
+            // withdrawal before it runs, so a withdrawn attempt never renames.
+            "if !attempt.claim_placement() {",
             // Step 4: atomic rename onto the content-derived identity, into the
             // leaf step 1 synced and still holds. A rename into a leaf a purge
             // removed redoes step 1 before retrying.
