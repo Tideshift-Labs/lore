@@ -59,7 +59,7 @@
 //!   authorizations live in memory for the life of the case. Replay within a
 //!   case is answered from that map, which is the property loreserver's fence
 //!   depends on; expiry is not exercised, because loreserver mints a fresh
-//!   UUIDv7 per attempt and calls prepare immediately.
+//!   `UUIDv7` per attempt and calls prepare immediately.
 //! * **`CheckUserPermission` is deliberately permissive.** Setting `auth_url`
 //!   also switches loreserver's repository-query authorizer from
 //!   `AllowAllRepositoryAuthorizer` to the auth-grpc one, so the read cases
@@ -569,7 +569,7 @@ impl StubState {
         let mut minted = self
             .minted
             .lock()
-            .map_err(|_| Status::internal("the stub's authorization map is poisoned"))?;
+            .map_err(|_err| Status::internal("the stub's authorization map is poisoned"))?;
         if let Some(existing) = minted.get(operation_id) {
             let same = existing.verified_issuer == request.verified_issuer
                 && existing.authenticated_subject == request.authenticated_subject

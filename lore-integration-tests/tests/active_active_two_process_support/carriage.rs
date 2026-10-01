@@ -7,14 +7,14 @@
 //! A branch push appends an outbox row only on the governed path
 //! (`lore-server/src/grpc/handlers/branch_push.rs:550`), and the governed path
 //! is entered only when the request carries CR-029 operation identity in gRPC
-//! request metadata: a UUIDv7 operation id, a versioned fingerprint, and a
+//! request metadata: a `UUIDv7` operation id, a versioned fingerprint, and a
 //! 32-byte single-use prepare token.
 //!
 //! The prepare token comes from `domain_operation_prepare`. In production that
 //! call is made by the control plane through the private
 //! `lore.domain.v1.DomainOperationService`, which loreserver mounts only when
 //! `[environment.endpoint] auth_url` is set and which then verifies every
-//! prepare through an auth-grpc ReBAC callback
+//! prepare through an `auth-grpc` `ReBAC` callback
 //! (`lore-server/src/grpc/server.rs:100-106,729-746`). There is no released
 //! client that mints carriage, so no stock client can produce an outbox row —
 //! that is a real gap, reported as such, not something this harness papers

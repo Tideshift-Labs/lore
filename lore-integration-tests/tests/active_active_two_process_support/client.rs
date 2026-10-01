@@ -217,7 +217,7 @@ pub async fn lock_release(
 ///
 /// `attempt_id` travels as ASCII in `lore-attempt-id` (not a `-bin` key, and
 /// not the raw sixteen bytes): `extract_attempt_id` reads it with `read_ascii`
-/// and parses it with `Uuid::parse_str`. It must be a UUIDv7 — the receipt rail
+/// and parses it with `Uuid::parse_str`. It must be a `UUIDv7` — the receipt rail
 /// classifies replay by the embedded timestamp, so a non-v7 value is refused
 /// rather than filed as an identity nothing can order.
 ///
