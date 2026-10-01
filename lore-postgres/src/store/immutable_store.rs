@@ -87,7 +87,6 @@ use crate::domain::fragments::FragmentDrainCapability;
 use crate::domain::fragments::FragmentGetAttempt;
 use crate::domain::fragments::FragmentGetOperation;
 use crate::domain::fragments::FragmentGetResponse;
-use crate::domain::fragments::FragmentIntent;
 use crate::domain::fragments::FragmentManifest;
 use crate::domain::fragments::FragmentObliterateBegin;
 use crate::domain::fragments::FragmentObliteratePhase;
@@ -129,58 +128,11 @@ use crate::store::write_behind::WriteBehindStage;
 pub mod clean_namespace;
 pub mod creation_metadata;
 
-/// Withdraw a staged put's own preparation, when the attempt has not claimed
-/// its rename. Best effort: a failed withdrawal leaves the preparation to its
-/// prepare deadline, which is the behavior without withdrawal, and never
-/// replaces the caller's own error.
-async fn withdraw_preparation(
-    coordinator: &PostgresFragmentCoordinator,
-    attempt: &StageAttempt,
-    intent: &FragmentIntent,
-) {
-    if !attempt.withdraw() {
-        return;
-    }
-    if let Err(error) = coordinator.withdraw_stage(intent).await {
-        tracing::debug!(
-            epoch = intent.epoch,
-            %error,
-            "staged put could not withdraw its preparation; it expires at its prepare deadline"
-        );
-    }
-}
-
-/// The cancellation arm of [`withdraw_preparation`]. `Drop` cannot wait, so
-/// the database half runs on a detached task and the dropped future does not
-/// block on it. The attempt is marked withdrawn synchronously here, which is
-/// what stops a still-running finalizer from renaming afterwards.
-struct WithdrawOnDrop {
-    attempt: StageAttempt,
-    coordinator: PostgresFragmentCoordinator,
-    intent: FragmentIntent,
-}
-
-impl Drop for WithdrawOnDrop {
-    fn drop(&mut self) {
-        if !self.attempt.withdraw() {
-            return;
-        }
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let coordinator = self.coordinator.clone();
-        let intent = self.intent.clone();
-        drop(lore_base::lore_spawn!("stage-withdraw", async move {
-            if let Err(error) = coordinator.withdraw_stage(&intent).await {
-                tracing::debug!(
-                    epoch = intent.epoch,
-                    %error,
-                    "cancelled staged put could not withdraw its preparation"
-                );
-            }
-        }));
-    }
-}
+mod stage_withdraw;
+use self::stage_withdraw::CANCEL_WITHDRAW_PERMITS;
+use self::stage_withdraw::CancelWithdrawals;
+use self::stage_withdraw::WithdrawOnDrop;
+use self::stage_withdraw::withdraw_preparation;
 
 /// Self-bootstrapping schema. The `(hash, repository, context)` primary key is
 /// the association identity; its B-tree also serves the leftmost-prefix
@@ -354,6 +306,8 @@ pub struct PostgresImmutableStore {
     /// care about.
     write_behind: Option<Arc<WriteBehindStage>>,
     io_timeout: Duration,
+    /// Bounds the detached withdrawals of cancelled staged puts.
+    cancel_withdrawals: CancelWithdrawals,
 }
 
 enum FragmentLifecycleRoute {
@@ -482,6 +436,7 @@ impl PostgresImmutableStore {
             staged_epoch_cleanup: None,
             write_behind: None,
             io_timeout,
+            cancel_withdrawals: CancelWithdrawals::new(CANCEL_WITHDRAW_PERMITS),
         })
     }
 
@@ -1850,6 +1805,7 @@ impl PostgresImmutableStore {
             attempt: attempt.clone(),
             coordinator: coordinator.clone(),
             intent: (*intent).clone(),
+            bound: self.cancel_withdrawals.clone(),
         };
         let manifest = match Self::epoch_manifest(
             &intent,
@@ -3380,6 +3336,7 @@ mod tests {
             staged_epoch_cleanup: None,
             write_behind: None,
             io_timeout: Duration::from_secs(30),
+            cancel_withdrawals: CancelWithdrawals::new(CANCEL_WITHDRAW_PERMITS),
         };
         let root = std::env::temp_dir().join(format!("lore-private-staged-{}", Uuid::now_v7()));
         std::fs::create_dir(&root).unwrap();

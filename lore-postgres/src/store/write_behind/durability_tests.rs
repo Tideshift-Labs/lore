@@ -507,3 +507,74 @@ async fn finalize_redoes_step_one_when_the_leaf_is_removed_and_recreated() {
     assert_eq!(*upper_syncs.lock().unwrap(), 2, "step 1 ran again");
     assert_eq!(std::fs::read(resolved.path()).unwrap(), b"x");
 }
+
+// --- The withdraw/rename boundary (StageAttempt) ---
+
+async fn finalize_attempt(
+    root: ConfinedRoot,
+    resolved: super::ResolvedStagedPath,
+    attempt: super::super::StageAttempt,
+) -> Result<(), WriteBehindError> {
+    lore_base::lore_spawn_blocking!(move || {
+        super::super::finalize::finalize_blocking(
+            &root,
+            &attempt,
+            &resolved,
+            &bytes::Bytes::from_static(b"x"),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+fn temporary_for(scratch: &Scratch, resolved: &super::ResolvedStagedPath) -> PathBuf {
+    let key = resolved.path().file_name().unwrap().to_str().unwrap();
+    scratch.0.join("incoming").join(format!("{key}.tmp"))
+}
+
+#[tokio::test]
+async fn a_withdrawn_attempt_refuses_its_rename_and_places_nothing() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_file(&root, &[0x5a; 32], 1);
+    let attempt = super::super::StageAttempt::default();
+    assert!(attempt.withdraw());
+    assert_eq!(
+        finalize_attempt(root, resolved.clone(), attempt).await,
+        Err(WriteBehindError::Withdrawn)
+    );
+    assert!(
+        !resolved.path().exists(),
+        "a withdrawn attempt never renames"
+    );
+    assert!(
+        !temporary_for(&scratch, &resolved).exists(),
+        "its temporary file is removed"
+    );
+}
+
+/// The release path: the rename is claimed, the rename fails, and the claim
+/// is released, so the caller can withdraw the preparation.
+#[tokio::test]
+async fn a_failed_rename_releases_its_claim_so_the_attempt_can_withdraw() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let hash = [0x5b; 32];
+    let resolved = staged_file(&root, &hash, 1);
+    super::super::finalize::test_faults::install(
+        &hash,
+        super::super::finalize::test_faults::Fault::RenameError,
+    );
+    let attempt = super::super::StageAttempt::default();
+    let failed = finalize_attempt(root, resolved.clone(), attempt.clone()).await;
+    assert!(
+        matches!(failed, Err(WriteBehindError::Io { .. })),
+        "the rename error reaches the caller: {failed:?}"
+    );
+    assert!(
+        attempt.withdraw(),
+        "a failed rename releases its claim, so withdrawal wins"
+    );
+    assert!(!resolved.path().exists());
+    assert!(!temporary_for(&scratch, &resolved).exists());
+}

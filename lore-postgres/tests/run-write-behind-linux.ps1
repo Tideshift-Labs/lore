@@ -196,7 +196,9 @@ $libUnixOnlyOffline = @(
     'durability_tests::open_syncs_root_after_provisioning_both_top_level_directories',
     'durability_tests::root_fsync_failure_refuses_open',
     'durability_tests::each_writer_syncs_both_ancestors_even_when_creator_has_not_synced_them',
-    'durability_tests::existing_fanout_parent_fsync_failure_refuses_the_second_writer'
+    'durability_tests::existing_fanout_parent_fsync_failure_refuses_the_second_writer',
+    'durability_tests::a_withdrawn_attempt_refuses_its_rename_and_places_nothing',
+    'durability_tests::a_failed_rename_releases_its_claim_so_the_attempt_can_withdraw'
 )
 $libUnixOnlyLive = @(
         'store::immutable_store::fragment_write_behind::adapter_tests::adapter_valid_bytes_with_conflicting_content_flags_cannot_replace_staged_authority',
@@ -215,6 +217,8 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::post_rename_failure_does_not_withdraw',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::withdraw_database_failure_falls_back_to_the_prepare_deadline',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::cancelled_put_before_rename_withdraws_and_its_finalizer_does_not_rename',
+    'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::a_failed_rename_releases_its_claim_and_the_put_withdraws',
+    'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::a_cancellation_over_the_withdraw_bound_falls_back_to_the_prepare_deadline',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_precondition_adopts_actual_alternate_compression_manifest',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_remote_readback_keeps_staged_source_and_late_effect_barrier',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',

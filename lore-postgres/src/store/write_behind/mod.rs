@@ -95,14 +95,21 @@ impl StageAttempt {
             .is_ok()
     }
 
-    /// Release a claimed rename that returned an error. `renameat` is atomic,
-    /// so an error means nothing was placed and withdrawal is safe again.
+    /// Release a claimed rename that returned an error, so withdrawal is
+    /// possible again. On a remote mount the body can still be in place; see
+    /// the release comment in `finalize_blocking` for why that is harmless.
     pub(crate) fn placement_failed(&self) {
-        let _ = self.0.compare_exchange(
+        let released = self.0.compare_exchange(
             Self::PLACING,
             Self::UNPLACED,
             Ordering::AcqRel,
             Ordering::Acquire,
+        );
+        // Only `claim_placement` enters `PLACING`, and nothing but this call
+        // leaves it, so the claim this finalizer took is still held here.
+        debug_assert!(
+            released.is_ok(),
+            "placement_failed without a held rename claim: state {released:?}"
         );
     }
 
@@ -160,6 +167,11 @@ pub enum WriteBehindError {
     NotARegularFile,
     #[error("a staged payload exceeds the fragment size threshold")]
     PayloadOversized,
+    /// The attempt was withdrawn before the finalizer claimed its rename, so
+    /// nothing was placed. Seen only by a finalizer whose put already failed
+    /// or was cancelled.
+    #[error("write-behind staging attempt was withdrawn before its rename")]
+    Withdrawn,
     #[error("write-behind staging I/O failed during {operation}")]
     Io {
         operation: &'static str,
@@ -193,6 +205,7 @@ impl WriteBehindError {
             | Self::RootNotADirectory
             | Self::RootProbeFailed
             | Self::RootDeviceChanged
+            | Self::Withdrawn
             | Self::Io { .. } => StoreError::from(SlowDown),
             Self::HashWidth
             | Self::EpochNegative
@@ -871,5 +884,55 @@ mod tests {
             2,
             "with the slot free the next tick samples again"
         );
+    }
+
+    /// The withdraw/rename boundary as a pure state machine, so it runs on
+    /// every platform rather than only behind the Unix staging root.
+    #[test]
+    fn stage_attempt_lets_exactly_one_of_rename_and_withdraw_win() {
+        // A withdrawal first: the rename is refused, and so is a second
+        // withdrawal.
+        let withdrawn = StageAttempt::default();
+        assert!(withdrawn.withdraw());
+        assert!(
+            !withdrawn.claim_placement(),
+            "a withdrawn attempt never renames"
+        );
+        assert!(!withdrawn.withdraw(), "only one path withdraws");
+
+        // A claimed rename first: withdrawal is refused while it is held.
+        let placing = StageAttempt::default();
+        assert!(placing.claim_placement());
+        assert!(
+            !placing.withdraw(),
+            "an attempt that may have renamed is kept"
+        );
+        assert!(!placing.claim_placement(), "the claim is not re-entrant");
+
+        // A rename that failed releases its claim, and withdrawal wins again.
+        placing.placement_failed();
+        assert!(placing.withdraw());
+        assert!(!placing.claim_placement());
+
+        // A clone shares the state: the cancellation guard and the finalizer
+        // hold clones of one attempt.
+        let shared = StageAttempt::default();
+        let finalizer = shared.clone();
+        assert!(finalizer.claim_placement());
+        assert!(!shared.withdraw());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "placement_failed without a held rename claim")]
+    fn stage_attempt_release_without_a_claim_is_a_bug() {
+        let attempt = StageAttempt::default();
+        assert!(attempt.withdraw());
+        attempt.placement_failed();
+    }
+
+    #[test]
+    fn a_withdrawn_attempt_is_retryable_backpressure() {
+        assert!(WriteBehindError::Withdrawn.store_error().is_slow_down());
     }
 }

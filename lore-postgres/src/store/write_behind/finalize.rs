@@ -147,15 +147,14 @@ pub(super) fn finalize_blocking(
         // The durable-effect boundary. A withdrawn attempt must not place its
         // file; see the module header.
         if !attempt.claim_placement() {
-            return Err(WriteBehindError::Io {
-                operation: "staging attempt withdrawn",
-                kind: std::io::ErrorKind::Interrupted,
-            });
+            return Err(WriteBehindError::Withdrawn);
         }
         // Step 4. Atomic within one filesystem, which the recorded device
         // guarantees. The target cannot already exist: `(hash, epoch)` is unique
         // by construction and an epoch row is immutable.
         let placed = (|| -> Result<(), WriteBehindError> {
+            #[cfg(all(test, unix))]
+            test_faults::at_rename(key)?;
             let mut tries = 1;
             loop {
                 match ConfinedRoot::rename_into(&temporary, resolved, &leaf) {
@@ -179,8 +178,14 @@ pub(super) fn finalize_blocking(
             }
         })();
         if let Err(error) = placed {
-            // Every error above precedes a successful `renameat`, which is
-            // atomic, so nothing was placed.
+            // On a local ext4 or XFS mount a failed `renameat` has no partial
+            // effect, so nothing was placed. On NFS or a soft mount the rename
+            // can succeed on the server yet return `ENOENT` or `ETIMEDOUT`. The
+            // claim is still released and the attempt withdrawn, while the body
+            // may be in place. That is harmless: withdrawal burns the epoch, so
+            // it can never publish, and the sealed custody row (state 2) makes
+            // cleanup purge both the temporary and the final placement
+            // (`WriteBehindStage::purge_placement`).
             attempt.placement_failed();
             return Err(error);
         }
@@ -227,6 +232,8 @@ pub(crate) mod test_faults {
     pub(crate) enum Fault {
         /// Fail after the temp fsync, before the rename claim.
         PreDurableError,
+        /// Fail after the rename claim, as the rename itself would.
+        RenameError,
         /// Fail after the rename, before the leaf fsync.
         PostDurableError,
         /// Signal `entered`, then wait for `release`, before the rename claim.
@@ -261,7 +268,12 @@ pub(crate) mod test_faults {
     }
 
     pub(super) fn before_rename(key: &str) -> Result<(), WriteBehindError> {
-        match take(key, |fault| !matches!(fault, Fault::PostDurableError)) {
+        match take(key, |fault| {
+            matches!(
+                fault,
+                Fault::PreDurableError | Fault::PreDurablePause { .. }
+            )
+        }) {
             Some(Fault::PreDurableError) => Err(injected("injected pre-rename fault")),
             Some(Fault::PreDurablePause { entered, release }) => {
                 let _ = entered.send(());
@@ -269,6 +281,13 @@ pub(crate) mod test_faults {
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    pub(super) fn at_rename(key: &str) -> Result<(), WriteBehindError> {
+        match take(key, |fault| matches!(fault, Fault::RenameError)) {
+            Some(_) => Err(injected("injected rename fault")),
+            None => Ok(()),
         }
     }
 

@@ -269,6 +269,7 @@ impl Fixture {
             staged_epoch_cleanup: None,
             write_behind: Some(stage.clone()),
             io_timeout: Duration::from_secs(3),
+            cancel_withdrawals: CancelWithdrawals::new(CANCEL_WITHDRAW_PERMITS),
         }
         .with_fragment_lifecycle(
             coordinator.clone(),

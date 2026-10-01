@@ -107,6 +107,127 @@ async fn pre_rename_failure_withdraws_so_an_immediate_retry_is_admitted() {
     );
 }
 
+/// The release path end to end: the finalizer claims the rename, the rename
+/// fails, the claim is released, and the put withdraws its preparation.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn a_failed_rename_releases_its_claim_and_the_put_withdraws() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let bytes = Bytes::from("rename fault payload repeated ".repeat(512));
+    let address = address_of(&bytes);
+    test_faults::install(address.hash.data(), test_faults::Fault::RenameError);
+    let failed = put(&fixture, &bytes).await;
+    assert!(
+        matches!(&failed, Err(error) if error.is_slow_down()),
+        "{failed:?}"
+    );
+    let rows = custody(&fixture, address).await;
+    let retried = put(&fixture, &bytes)
+        .await
+        .expect("the retry is admitted at once after the released claim withdrew");
+    assert_eq!(rows.len(), 1);
+    let (epoch, state, _) = rows[0];
+    assert_eq!(
+        state, CUSTODY_SEALED,
+        "the released claim let the put withdraw"
+    );
+    let key = derived_staged_key(address.hash.data(), epoch).unwrap();
+    assert!(
+        matches!(
+            fixture
+                .stage
+                .read_staged(address.hash.data(), epoch, &key)
+                .await,
+            StagedRead::Absent
+        ),
+        "the failed rename placed nothing"
+    );
+    assert!(retried.epoch > epoch);
+}
+
+/// More cancellations than withdrawal permits: the excess skips its database
+/// withdrawal, is counted, and falls back to the prepare deadline. The
+/// skipped attempt is still marked withdrawn, so its finalizer never renames.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn a_cancellation_over_the_withdraw_bound_falls_back_to_the_prepare_deadline() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let bytes = Bytes::from("bounded cancellation payload repeated ".repeat(512));
+    let address = address_of(&bytes);
+    let held = fixture
+        .store
+        .cancel_withdrawals
+        .exhaust()
+        .expect("every withdrawal permit is held, as by a burst in flight");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    test_faults::install(
+        address.hash.data(),
+        test_faults::Fault::PreDurablePause {
+            entered: entered_tx,
+            release: release_rx,
+        },
+    );
+    {
+        let pending = put(&fixture, &bytes);
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("the paused put completed: {result:?}"),
+            entered = entered_rx => entered.unwrap(),
+        }
+    }
+    assert_eq!(
+        fixture.store.cancel_withdrawals.skipped(),
+        1,
+        "the cancellation over the bound is counted"
+    );
+    drop(held);
+    release_tx.send(()).unwrap();
+    let rows = custody(&fixture, address).await;
+    assert_eq!(rows.len(), 1);
+    let (epoch, _, _) = rows[0];
+    let key = derived_staged_key(address.hash.data(), epoch).unwrap();
+    let temporary = fixture.stage.root().incoming().join(format!("{key}.tmp"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while temporary.exists() {
+        assert!(Instant::now() < deadline, "the finalizer finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        custody(&fixture, address).await[0].1,
+        CUSTODY_PREPARING,
+        "a skipped withdrawal writes nothing"
+    );
+    assert!(
+        matches!(
+            fixture
+                .stage
+                .read_staged(address.hash.data(), epoch, &key)
+                .await,
+            StagedRead::Absent
+        ),
+        "the skipped attempt is still withdrawn in memory and never renames"
+    );
+    let fenced = put(&fixture, &bytes).await;
+    assert!(
+        matches!(&fenced, Err(error) if error.is_slow_down()),
+        "the retry waits for the prepare deadline: {fenced:?}"
+    );
+    fixture
+        .admin
+        .execute(
+            "UPDATE lore_fragment_stage_custody SET prepare_deadline = clock_timestamp() \
+             WHERE hash=$1",
+            &[&address.hash.data().as_slice()],
+        )
+        .await
+        .unwrap();
+    let retried = put(&fixture, &bytes)
+        .await
+        .expect("the retry is admitted once the prepare deadline passes");
+    assert!(retried.epoch > epoch);
+}
+
 /// The withdrawn intent cannot be published afterwards, whatever it observed.
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
