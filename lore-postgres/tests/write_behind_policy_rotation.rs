@@ -598,27 +598,84 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
     for name in [
         "stage_usage",
         "stage_custody",
-        "spool",
         "dispatch_usage",
         "dispatch_metadata",
     ] {
         assert_eq!(after[name], before[name], "rotation preserves {name}");
     }
+    // Migration 0029: rotation marks each preserved row superseded and fences it, and changes
+    // nothing else about it.
+    let without_0029 = |rows: &serde_json::Value| -> Vec<serde_json::Value> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let mut row = row.clone();
+                for column in ["superseded", "marker_fence_ms", "lease_until_ms", "due_ms"] {
+                    row.as_object_mut().unwrap().remove(column);
+                }
+                row
+            })
+            .collect()
+    };
+    assert_eq!(
+        without_0029(&after["spool"]),
+        without_0029(&before["spool"]),
+        "rotation preserves spool"
+    );
+    assert!(
+        after["spool"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["superseded"] == true && row["marker_fence_ms"].as_i64().unwrap() > 0)
+    );
     fixture.runtime.release_cleanup(&cleanup).await.unwrap();
     coordinator.commit_stage_cleanup(&orphan).await.unwrap();
     let replayed: serde_json::Value = serde_json::from_str(&fixture.snapshot().await).unwrap();
-    for name in [
-        "stage_usage",
-        "stage_custody",
-        "spool",
-        "dispatch_usage",
-        "dispatch_metadata",
-    ] {
+    for name in ["stage_usage", "stage_custody", "dispatch_usage"] {
         assert_eq!(
             replayed[name], after[name],
             "old cleanup replay cannot refund twice"
         );
     }
+    // The replay's compaction step now finds its row superseded, so the row becomes a marker at
+    // once. That gives back exactly that row's retained bytes above the 1024-byte marker, never
+    // a metadata row, and leaves the other row alone. The replay's pre-rotation claim cannot
+    // delete the marker.
+    let spool_row = |snapshot: &serde_json::Value, id: Uuid| -> serde_json::Value {
+        snapshot["spool"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["spool_id"] == id.to_string())
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    };
+    let replayed_row = spool_row(&replayed, descriptor.spool_object_id);
+    assert_eq!(replayed_row["state"], 4);
+    assert_eq!(replayed_row["metadata_bytes"], 1024);
+    assert_eq!(
+        spool_row(&replayed, second_descriptor.spool_object_id),
+        spool_row(&after, second_descriptor.spool_object_id)
+    );
+    let freed = spool_row(&after, descriptor.spool_object_id)["metadata_bytes"]
+        .as_i64()
+        .unwrap()
+        - 1024;
+    let metadata = |snapshot: &serde_json::Value| -> (i64, i64) {
+        let rows = snapshot["dispatch_metadata"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "one drain policy row");
+        let number = |value: &serde_json::Value| -> i64 {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+                .unwrap()
+        };
+        (number(&rows[0][0]), number(&rows[0][1]))
+    };
+    let (after_bytes, after_rows) = metadata(&after);
+    assert_eq!(metadata(&replayed), (after_bytes - freed, after_rows));
     fixture.wait_until(short.expires_at_ms).await;
     assert!(fixture.now().await < next.expires_at_ms);
     fixture.runtime.release_cleanup(&cleanup).await.unwrap();
