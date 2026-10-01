@@ -28,7 +28,7 @@ use super::*;
 // Fixtures
 // -----------------------------------------------------------------------
 
-/// Canonical UUIDv7s whose 48-bit timestamp is 1_700_000_000_000 ms.
+/// Canonical `UUIDv7s` whose 48-bit timestamp is `1_700_000_000_000` ms.
 const REQUEST_ID: &str = "018bcfe5-6800-7abc-8def-000000000001";
 const ATTEMPT_ID: &str = "018bcfe5-6800-7abc-8def-000000000002";
 const GRANT_ID: &str = "018bcfe5-6800-7abc-8def-000000000003";
@@ -369,8 +369,8 @@ impl FragmentTransportPort for SharedGetPort {
             FragmentTransportOperation::ListVersions { .. } => {
                 FragmentTransportResponse::Versions(Vec::new())
             }
-            FragmentTransportOperation::DeleteVersion { .. } => FragmentTransportResponse::Deleted,
-            FragmentTransportOperation::DeleteExact { .. } => FragmentTransportResponse::Deleted,
+            FragmentTransportOperation::DeleteVersion { .. }
+            | FragmentTransportOperation::DeleteExact { .. } => FragmentTransportResponse::Deleted,
         };
         Box::pin(async move {
             FragmentTransportExchange {

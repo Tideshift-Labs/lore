@@ -556,7 +556,7 @@ pub enum FragmentSchemaAttestationError {
 /// Why the one fragment-provider composition door refused activation.
 ///
 /// Every underlying error is retained as a typed, redaction-safe source. No variant carries a URL,
-/// credential, PostgreSQL diagnostic, or physical database identity value.
+/// credential, `PostgreSQL` diagnostic, or physical database identity value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FragmentProviderActivationError {
     #[error("fragment provider dispatch pool configuration is invalid: {0}")]
@@ -739,10 +739,15 @@ impl FragmentProviderError {
             | Self::Provider(ProviderClientError::PreTransportGuardRefused) => {
                 FragmentProviderDisposition::Transient
             }
-            Self::Provider(ProviderClientError::ChargeAmbiguous)
-            | Self::Provider(ProviderClientError::ChargeRecovered) => {
-                FragmentProviderDisposition::OutcomeUnknown
-            }
+            Self::Provider(
+                ProviderClientError::ChargeAmbiguous | ProviderClientError::ChargeRecovered,
+            ) => FragmentProviderDisposition::OutcomeUnknown,
+            // Reason: `BudgetExhausted`/`ClassCapExhausted`/`AuthorityUnavailable`/`Unwired` and
+            // `DeadlineExceeded` both resolve to `Transient`, but for unrelated reasons (capacity
+            // vs. the attempt's own deadline) that are worth keeping as separate, separately
+            // commented arms rather than merging into one pattern clippy can't attach a single
+            // rationale to.
+            #[allow(clippy::match_same_arms)]
             Self::Provider(ProviderClientError::ChargeRefused(refusal)) => match refusal {
                 // Capacity, not correctness. The caller backs off and re-drives.
                 ProviderChargeError::BudgetExhausted
@@ -1145,7 +1150,7 @@ where
 ///   this attestation. CD-4's own procedure checks it at charge time and fails
 ///   closed. This value proves "the cell database is the installed cell this
 ///   build expects", not "the limiter is publishable".
-/// - It does not attest the live PostgreSQL catalog. That is the migrator-only
+/// - It does not attest the live `PostgreSQL` catalog. That is the migrator-only
 ///   out-of-band attester's job.
 /// - It does not prove the cell database and the provider bucket belong to the
 ///   same cell. 0019's readback carries no boundary identity at all, so no
@@ -1318,6 +1323,10 @@ impl InFlightPutBound {
         if permits == 0 || permits > MAX_IN_FLIGHT_PUTS || acquire_timeout.is_zero() {
             return Err(FragmentProviderError::InvalidInFlightPutBound);
         }
+        // Reason: `permits` is a u32 already bound-checked above; a `usize` on any platform this
+        // crate ships on can represent it, so the conversion error carries no information beyond
+        // what `InvalidInFlightPutBound` already names.
+        #[allow(clippy::map_err_ignore)]
         let permits =
             usize::try_from(permits).map_err(|_| FragmentProviderError::InvalidInFlightPutBound)?;
         Ok(Self {
@@ -1360,6 +1369,10 @@ impl InFlightChargeBound {
         if permits == 0 || permits > MAX_IN_FLIGHT_CHARGES || acquire_timeout.is_zero() {
             return Err(FragmentProviderError::InvalidInFlightChargeBound);
         }
+        // Reason: `permits` is a u32 already bound-checked above; a `usize` on any platform this
+        // crate ships on can represent it, so the conversion error carries no information beyond
+        // what `InvalidInFlightChargeBound` already names.
+        #[allow(clippy::map_err_ignore)]
         let permits = usize::try_from(permits)
             .map_err(|_| FragmentProviderError::InvalidInFlightChargeBound)?;
         Ok(Self {
@@ -1729,9 +1742,9 @@ pub struct FragmentProviderAttempt {
     pub traffic_class: ProviderTrafficClass,
     /// The physical attempt class. Must be in [`FRAGMENT_PROVIDER_ATTEMPT_CLASSES`].
     pub attempt_class: ProviderAttemptClass,
-    /// Canonical UUIDv7 identifying the logical request.
+    /// Canonical `UUIDv7` identifying the logical request.
     pub logical_request_id: String,
-    /// Canonical UUIDv7 identifying this physical attempt.
+    /// Canonical `UUIDv7` identifying this physical attempt.
     pub attempt_id: String,
     /// Positive ordinal of this attempt within its logical request.
     pub attempt_ordinal: u32,
@@ -1787,7 +1800,7 @@ impl fmt::Debug for FragmentDispatchTls {
 
 /// Expected physical database identity supplied by the already-attested domain store.
 ///
-/// The system identifier is accepted in the exact canonical decimal form PostgreSQL returns.
+/// The system identifier is accepted in the exact canonical decimal form `PostgreSQL` returns.
 /// Database aliases, credentials, and TLS parameters are deliberately absent.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FragmentDatabaseIdentity(DispatchDatabaseIdentity);
@@ -1803,6 +1816,10 @@ impl FragmentDatabaseIdentity {
         system_identifier: &str,
         database_oid: u32,
     ) -> Result<Self, FragmentDatabaseIdentityError> {
+        // Reason: the parse failure would only ever repeat `system_identifier` back (a value this
+        // type's own `Debug` redacts), so keeping it as a source would reopen the disclosure this
+        // type exists to close. `InvalidSystemIdentifier` already names the failure mode.
+        #[allow(clippy::map_err_ignore)]
         let parsed_system_identifier = system_identifier
             .parse::<u64>()
             .map_err(|_| FragmentDatabaseIdentityError::InvalidSystemIdentifier)?;
@@ -1814,6 +1831,10 @@ impl FragmentDatabaseIdentity {
         if database_oid == 0 {
             return Err(FragmentDatabaseIdentityError::InvalidDatabaseOid);
         }
+        // Reason: `DispatchDatabaseIdentityError` is itself a redacted sentinel (no identity
+        // component in its Display); the zero-checks above already cover the only ways `new` can
+        // fail, so `InvalidDatabaseOid` names the failure exactly as well as the source would.
+        #[allow(clippy::map_err_ignore)]
         let identity = DispatchDatabaseIdentity::new(parsed_system_identifier, database_oid)
             .map_err(|_| FragmentDatabaseIdentityError::InvalidDatabaseOid)?;
         Ok(Self(identity))
@@ -2053,9 +2074,9 @@ impl fmt::Debug for FragmentDrainReady {
 /// from this worker's view of the filesystem.
 #[derive(PartialEq, Eq)]
 pub struct FragmentDrainAttempt {
-    /// Canonical UUIDv7 identifying the logical request.
+    /// Canonical `UUIDv7` identifying the logical request.
     pub logical_request_id: String,
-    /// Canonical UUIDv7 identifying this physical attempt.
+    /// Canonical `UUIDv7` identifying this physical attempt.
     pub attempt_id: String,
     /// Positive ordinal of this attempt within its logical request.
     pub attempt_ordinal: u32,
@@ -2493,7 +2514,7 @@ impl<'a> AdmittedFragmentAttempt<'a> {
         self,
         ledger: &mut FragmentAttemptLedger,
     ) -> Result<FragmentTransportExecution, FragmentProviderError> {
-        self.gateway.check_ingress_cap(&self.attempt)?;
+        FragmentProviderGateway::check_ingress_cap(&self.attempt)?;
         let request =
             MeteredProviderAttemptRequest::try_from(self.gateway.build_request(&self.attempt))
                 .map_err(FragmentProviderError::Provider)?;
@@ -2706,9 +2727,7 @@ impl FragmentProviderGateway {
             ) | (
                 ProviderAttemptClass::DeleteObject,
                 FragmentTransportOperation::DeleteVersion { .. }
-            ) | (
-                ProviderAttemptClass::DeleteObject,
-                FragmentTransportOperation::DeleteExact { .. }
+                    | FragmentTransportOperation::DeleteExact { .. }
             )
         );
         if !matches || attempt.put_body.is_some() {
@@ -2799,7 +2818,7 @@ impl FragmentProviderGateway {
             return Err(FragmentProviderError::OperationRequired);
         }
         Self::check_attempt_class(attempt.attempt_class)?;
-        self.check_ingress_cap(attempt)?;
+        Self::check_ingress_cap(attempt)?;
         let _permit = self.admit(attempt.attempt_class).await?;
         let request = MeteredProviderAttemptRequest::try_from(self.build_request(attempt))
             .map_err(FragmentProviderError::Provider)?;
@@ -2857,7 +2876,7 @@ impl FragmentProviderGateway {
         attempt: &FragmentProviderAttempt,
     ) -> Result<(), FragmentProviderError> {
         Self::check_attempt_class(attempt.attempt_class)?;
-        self.check_ingress_cap(attempt)?;
+        Self::check_ingress_cap(attempt)?;
         let request = MeteredProviderAttemptRequest::try_from(self.build_request(attempt))
             .map_err(FragmentProviderError::Provider)?;
         self.client
@@ -2901,10 +2920,7 @@ impl FragmentProviderGateway {
         })
     }
 
-    fn check_ingress_cap(
-        &self,
-        attempt: &FragmentProviderAttempt,
-    ) -> Result<(), FragmentProviderError> {
+    fn check_ingress_cap(attempt: &FragmentProviderAttempt) -> Result<(), FragmentProviderError> {
         let Some(body) = attempt.put_body.as_ref() else {
             return Ok(());
         };
