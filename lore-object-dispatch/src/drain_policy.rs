@@ -104,6 +104,11 @@ pub enum DrainError {
     SchemaUpgradeRequired,
     #[error("the cell schema revision is not one this build knows; refusing write-behind")]
     SchemaUnknown,
+    /// `DRAIN_METADATA_UNDERFLOW`: giving back this row's metadata charge would take the policy's
+    /// counters below zero. Nothing committed. That is a bookkeeping fault on one row, so cleanup
+    /// skips the row and leaves it for an operator rather than failing its whole pass.
+    #[error("the drain metadata counters would underflow; this row is left for an operator")]
+    MetadataUnderflow,
 }
 
 /// Serialization failure, lock timeout and deadlock each roll the transaction back. They report
@@ -120,6 +125,14 @@ fn statement_error(code: Option<&SqlState>) -> DrainError {
         Some(code) if is_contention(code) => DrainError::Contended,
         Some(_) => DrainError::Refused,
         None => DrainError::Unavailable,
+    }
+}
+
+/// [`statement_error`], except that the one authority refusal a caller acts on by name is kept.
+fn statement_error_of(error: &tokio_postgres::Error) -> DrainError {
+    match error.as_db_error() {
+        Some(db) if db.message() == "DRAIN_METADATA_UNDERFLOW" => DrainError::MetadataUnderflow,
+        _ => statement_error(error.code()),
     }
 }
 
@@ -376,7 +389,7 @@ impl DrainClient {
             let rows = tx
                 .query(sql, values)
                 .await
-                .map_err(|e| statement_error(e.code()))?;
+                .map_err(|e| statement_error_of(&e))?;
             tx.commit().await.map_err(|e| commit_error(e.code()))?;
             Ok(rows)
         })

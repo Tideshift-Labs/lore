@@ -69,13 +69,24 @@ impl DrainClient {
 
     /// A row another replica already deleted reads as [`DrainError::Contended`]: that replica did
     /// this row's work.
+    ///
+    /// A contended claim also clears this caller's lease on the row, best effort, so the row is
+    /// due again at once rather than after the lease. The claim rolled back, so this caller holds
+    /// nothing; the lease only kept every other replica away for 30 s.
     pub async fn claim_cleanup(&self, spool: Uuid) -> Result<DrainCleanupIntent, DrainError> {
-        let rows = self
+        let rows = match self
             .query(
                 "SELECT * FROM object_store_retention.drain_cleanup_claim_v2($1)",
                 &[&spool],
             )
-            .await?;
+            .await
+        {
+            Err(DrainError::Contended) => {
+                self.unlease(spool).await;
+                return Err(DrainError::Contended);
+            }
+            other => other?,
+        };
         let r = rows.first().ok_or(DrainError::Contended)?;
         Ok(DrainCleanupIntent {
             spool,
@@ -96,8 +107,32 @@ impl DrainClient {
         })
     }
 
+    /// Clear a lease, best effort and below `SERIALIZABLE` like the lease itself. A row another
+    /// session holds is skipped: that session is working on it. A failure only leaves the lease.
+    async fn unlease(&self, spool: Uuid) {
+        let _ = self
+            .query_at(
+                IsolationLevel::ReadCommitted,
+                "SELECT object_store_retention.drain_cleanup_unlease_v1($1)",
+                &[&spool],
+            )
+            .await;
+    }
+
     /// Call only after this intent's unlink finished.
     pub async fn release_cleanup(&self, intent: &DrainCleanupIntent) -> Result<(), DrainError> {
+        let result = self.release_and_compact(intent).await;
+        if result == Err(DrainError::MetadataUnderflow) {
+            tracing::warn!(
+                spool = %intent.spool,
+                "drain cleanup skipped a row: giving back its metadata charge would underflow the \
+                 policy counters; the row is left for an operator"
+            );
+        }
+        result
+    }
+
+    async fn release_and_compact(&self, intent: &DrainCleanupIntent) -> Result<(), DrainError> {
         self.query(
             "SELECT object_store_retention.drain_cleanup_release_v1($1,$2)",
             &[&intent.spool, &intent.fence],

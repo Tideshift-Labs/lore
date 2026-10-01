@@ -240,6 +240,8 @@ pub struct FragmentDrainMaintenanceHandle {
     // The handle survives cancellation of cleanup_pass. There is at most one syscall lane.
     io: tokio::sync::Mutex<Option<CleanupTask>>,
     observation_io: tokio::sync::Mutex<SpoolObservationState>,
+    /// Rows skipped because giving back their metadata charge would underflow (row 56).
+    underflow_skips: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -358,6 +360,27 @@ impl FragmentDrainMaintenanceHandle {
             current_spool_walk(&state.walk),
         ))
     }
+    /// Rows cleanup skipped since start because giving back their metadata charge would underflow
+    /// the policy counters. The drain client also logs each one at warn. Such a row stays, and is
+    /// skipped again on each rescan, until an operator repairs the counters.
+    pub fn underflow_skips(&self) -> u64 {
+        self.underflow_skips
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What one release adds to the pass's progress count.
+    fn counted(&self, outcome: Release, removed: bool) -> u32 {
+        match outcome {
+            Release::Committed => u32::from(removed),
+            Release::Lost => 0,
+            Release::Underflow => {
+                self.underflow_skips
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                0
+            }
+        }
+    }
+
     pub async fn cleanup_pass(&self, batch: u32) -> Result<u32, FragmentProviderError> {
         let batch = u16::try_from(batch)
             .map_err(|_error| FragmentProviderError::DrainAuthority(DrainError::Invalid))?;
@@ -368,9 +391,10 @@ impl FragmentDrainMaintenanceHandle {
             *pending = None;
             let (intent, removed) =
                 result.map_err(|_error| FragmentProviderError::DrainSpoolIo)??;
-            if release_retrying(|| self.client.release_cleanup(&intent)).await? {
-                count += u32::from(removed);
-            }
+            count += self.counted(
+                release_retrying(|| self.client.release_cleanup(&intent)).await?,
+                removed,
+            );
         }
         let ids = self
             .client
@@ -401,12 +425,23 @@ impl FragmentDrainMaintenanceHandle {
             let (intent, removed) =
                 result.map_err(|_error| FragmentProviderError::DrainSpoolIo)??;
             // Rechecking a compact tombstone is not progress against backlog.
-            if release_retrying(|| self.client.release_cleanup(&intent)).await? {
-                count += u32::from(removed);
-            }
+            count += self.counted(
+                release_retrying(|| self.client.release_cleanup(&intent)).await?,
+                removed,
+            );
         }
         Ok(count)
     }
+}
+
+/// How one cleanup release ended for its pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Release {
+    Committed,
+    /// Lost to another replica. Nothing committed; a later pass takes the row.
+    Lost,
+    /// Refused because the give-back would underflow. The row is skipped and counted (row 56).
+    Underflow,
 }
 
 /// How many times one pass tries a release before leaving it for a later pass.
@@ -417,7 +452,7 @@ const RELEASE_ATTEMPTS: usize = 3;
 /// claimed with its body already unlinked. The winner has committed by the time the loser
 /// sees the conflict, so a retry reads the new counters. The retry is safe: the fence is
 /// unchanged by a re-entrant claim, and a row already released returns without effect.
-async fn release_retrying<F, Fut>(mut release: F) -> Result<bool, FragmentProviderError>
+async fn release_retrying<F, Fut>(mut release: F) -> Result<Release, FragmentProviderError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<(), DrainError>>,
@@ -434,10 +469,11 @@ where
 /// Whether a cleanup release committed. A release lost to another replica committed nothing and
 /// is left for a later pass: the claim is re-entrant and the unlink is idempotent. A lost
 /// compaction after a committed release is already `Ok` from `release_cleanup`.
-fn released(result: Result<(), DrainError>) -> Result<bool, FragmentProviderError> {
+fn released(result: Result<(), DrainError>) -> Result<Release, FragmentProviderError> {
     match result {
-        Ok(()) => Ok(true),
-        Err(DrainError::Contended) => Ok(false),
+        Ok(()) => Ok(Release::Committed),
+        Err(DrainError::Contended) => Ok(Release::Lost),
+        Err(DrainError::MetadataUnderflow) => Ok(Release::Underflow),
         Err(error) => Err(FragmentProviderError::DrainAuthority(error)),
     }
 }
@@ -489,6 +525,7 @@ impl FragmentProviderEntry {
             writer: writer.clone(),
             io: tokio::sync::Mutex::new(None),
             observation_io: tokio::sync::Mutex::new(SpoolObservationState::default()),
+            underflow_skips: std::sync::atomic::AtomicU64::new(0),
         };
         let mut capability = self
             .drain_capability(root)
@@ -796,8 +833,11 @@ mod release_tests {
 
     #[test]
     fn a_release_lost_to_another_replica_is_skipped_not_failed() {
-        assert!(matches!(released(Ok(())), Ok(true)));
-        assert!(matches!(released(Err(DrainError::Contended)), Ok(false)));
+        assert!(matches!(released(Ok(())), Ok(Release::Committed)));
+        assert!(matches!(
+            released(Err(DrainError::Contended)),
+            Ok(Release::Lost)
+        ));
         for error in [
             DrainError::Refused,
             DrainError::Unavailable,
@@ -810,10 +850,19 @@ mod release_tests {
         }
     }
 
+    #[test]
+    fn a_release_refused_for_metadata_underflow_is_skipped_not_failed() {
+        // Row 56 residual 3: one row whose give-back would underflow must not fail the pass.
+        assert!(matches!(
+            released(Err(DrainError::MetadataUnderflow)),
+            Ok(Release::Underflow)
+        ));
+    }
+
     /// Answers each attempt from `outcomes` in order and counts the attempts.
     async fn release_from(
         outcomes: &[Result<(), DrainError>],
-    ) -> (Result<bool, FragmentProviderError>, usize) {
+    ) -> (Result<Release, FragmentProviderError>, usize) {
         let calls = std::cell::Cell::new(0);
         let result = release_retrying(|| {
             let index = calls.get();
@@ -830,7 +879,7 @@ mod release_tests {
         // Row 34, 2026-09-27: two replicas releasing different rows collide on the shared quota
         // counter rows, and the loser's row stayed in state 2 with its body already unlinked.
         let (result, calls) = release_from(&[Err(DrainError::Contended), Ok(())]).await;
-        assert!(matches!(result, Ok(true)));
+        assert!(matches!(result, Ok(Release::Committed)));
         assert_eq!(calls, 2);
         let (result, calls) = release_from(&[
             Err(DrainError::Contended),
@@ -838,7 +887,7 @@ mod release_tests {
             Ok(()),
         ])
         .await;
-        assert!(matches!(result, Ok(true)));
+        assert!(matches!(result, Ok(Release::Committed)));
         assert_eq!(calls, 3);
     }
 
@@ -846,14 +895,14 @@ mod release_tests {
     async fn a_release_contended_on_every_attempt_is_skipped_after_the_bound() {
         let outcomes = [Err(DrainError::Contended); RELEASE_ATTEMPTS];
         let (result, calls) = release_from(&outcomes).await;
-        assert!(matches!(result, Ok(false)));
+        assert!(matches!(result, Ok(Release::Lost)));
         assert_eq!(calls, RELEASE_ATTEMPTS);
     }
 
     #[tokio::test]
     async fn a_committed_or_refused_release_is_not_retried() {
         let (result, calls) = release_from(&[Ok(())]).await;
-        assert!(matches!(result, Ok(true)));
+        assert!(matches!(result, Ok(Release::Committed)));
         assert_eq!(calls, 1);
         for error in [
             DrainError::Refused,

@@ -77,6 +77,18 @@ BEGIN
  ) SELECT leased.spool_id FROM leased;
 END $$;
 
+-- A claim that lost to another session clears the caller's lease, so the row is due again at once
+-- instead of after 30 s. Same rules as the lease: READ COMMITTED from the client, a hint only, and
+-- a row another session holds is skipped because that session is working on it.
+CREATE FUNCTION object_store_retention.drain_cleanup_unlease_v1(spool uuid)
+RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$
+BEGIN
+ PERFORM object_store_retention.assert_dispatch_runtime_v1();
+ UPDATE object_store_retention.drain_spool_custody x SET lease_until_ms=0
+ WHERE x.spool_id IN(SELECT y.spool_id FROM object_store_retention.drain_spool_custody y
+  WHERE y.spool_id=spool FOR UPDATE SKIP LOCKED);
+END $$;
+
 -- Claim, returning the claim's own scan time. A row a peer has already deleted returns no row.
 CREATE FUNCTION object_store_retention.drain_cleanup_claim_v2(spool uuid)
 RETURNS TABLE(boundary text,logical_id uuid,attempt_id uuid,fence bigint,scanned_ms bigint)
@@ -242,8 +254,10 @@ BEGIN
 END $$;
 
 REVOKE ALL ON FUNCTION object_store_retention.drain_cleanup_claim_v2(uuid),
+ object_store_retention.drain_cleanup_unlease_v1(uuid),
  object_store_retention.drain_cleanup_compact_v2(uuid,bigint),
  object_store_retention.drain_observe_v1(text,text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION object_store_retention.drain_cleanup_claim_v2(uuid),
+ object_store_retention.drain_cleanup_unlease_v1(uuid),
  object_store_retention.drain_cleanup_compact_v2(uuid,bigint),
  object_store_retention.drain_observe_v1(text,text) TO object_dispatch_retention_runtime;

@@ -510,7 +510,13 @@ fn public_type_aliases(text: &str) -> Vec<String> {
 fn public_fn_signatures(text: &str) -> Vec<String> {
     let mut signatures = Vec::new();
     let mut rest = text;
-    while let Some(offset) = rest.find("pub fn ").or_else(|| rest.find("pub async fn ")) {
+    // The earlier of the two forms. Preferring `pub fn ` whenever one exists anywhere later would
+    // step over every `pub async fn` before it.
+    while let Some(offset) = [rest.find("pub fn "), rest.find("pub async fn ")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
         let tail = &rest[offset..];
         let Some(end) = tail.find('{') else {
             break;
@@ -921,7 +927,13 @@ fn the_cell_retention_client_buys_only_the_retention_procedures() {
     let client_impl = block_after(RETENTION_CLIENT, "impl CellRetentionClient {", '{', '}');
     let mut methods = Vec::new();
     let mut rest = strip_line_comments(&client_impl);
-    while let Some(offset) = rest.find("pub fn ").or_else(|| rest.find("pub async fn ")) {
+    // The earlier of the two forms. Preferring `pub fn ` whenever one exists anywhere later would
+    // step over every `pub async fn` before it.
+    while let Some(offset) = [rest.find("pub fn "), rest.find("pub async fn ")]
+        .into_iter()
+        .flatten()
+        .min()
+    {
         let tail = rest[offset..]
             .trim_start_matches("pub ")
             .trim_start_matches("async ")
@@ -984,7 +996,13 @@ fn the_drain_capability_exposes_exactly_reserve_ready_and_attempt() {
     let mut methods = Vec::new();
     for block in &capability_blocks {
         let mut rest = strip_line_comments(block);
-        while let Some(offset) = rest.find("pub fn ").or_else(|| rest.find("pub async fn ")) {
+        // The earlier of the two forms. Preferring `pub fn ` whenever one exists anywhere later would
+        // step over every `pub async fn` before it.
+        while let Some(offset) = [rest.find("pub fn "), rest.find("pub async fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+        {
             let tail = rest[offset..]
                 .trim_start_matches("pub ")
                 .trim_start_matches("async ")
@@ -1041,7 +1059,8 @@ fn reservation_and_maintenance_handles_expose_only_their_approved_operations() {
         ("FragmentDrainReservation", vec!["budget_pin", "write_body"]),
         (
             "FragmentDrainMaintenanceHandle",
-            vec!["cleanup_pass", "observe"],
+            // `underflow_skips` is a read-only counter (row 56), not an operation.
+            vec!["cleanup_pass", "observe", "underflow_skips"],
         ),
     ] {
         let prefix = format!("impl {name} {{");

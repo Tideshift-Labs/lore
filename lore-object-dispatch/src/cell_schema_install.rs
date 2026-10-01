@@ -413,7 +413,7 @@ pub const CELL_FORWARD_STEPS: [CellForwardStep; 4] = [
         migration: cell_migration!(
             29,
             "0029_object_store_dispatch_drain_superseded_markers.sql",
-            "3831d4535dbdeb4ed9c039f953790ea475617ad727886b75b3f92f8e285aea31"
+            "685d8909ec814e1039b6bda25cc4f9391ba831ac114ed8ac77302b9c7f8b28e7"
         ),
         unwrap_frozen_transaction: false,
         prelude_sql: DRAIN_TABLES_LOCK_SQL,
@@ -1267,7 +1267,7 @@ pub const CELL_CATALOG_MANIFEST_BLAKE3_R28: [u8; 32] =
 /// Pinned per-section digests of state [`CellSchemaRevision::R29`], `PostgreSQL` 16.
 ///
 /// Forward step 0029 adds four custody columns (one generated), swaps the cleanup index, creates
-/// two functions and drops the two they replace, recreates `drain_observe_v1`, and replaces four
+/// three functions, drops the two the new claim and compact replace, recreates `drain_observe_v1`, and replaces four
 /// bodies. So `relations`, `columns`, `constraints`, `indexes`, `functions`, `function_acls` and
 /// `relation_acls` (it carries column ACL rows) move against the R28 pin. `schema`, `types`,
 /// `default_acls`, `triggers` and `rules_and_policies` do not. Measured 2026-09-30 on
@@ -1279,8 +1279,8 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R29: [[u8; 32]; 12] = [
     hex32("938cd17c998a176a7f9742c7512e9ca3491f3844bad1743a576fe82afb84b145"),
     hex32("675cce03de4c19bad2da80b3b272eec868a7f13392b8b103675ef813de285055"),
     CELL_CATALOG_SECTION_BLAKE3_R28[5],
-    hex32("78a6a9e7c2e64eae58c5da813ccff60355b42efa11c162ac93292ab8fcc13073"),
-    hex32("1fa268434decb0928801e7a72f06d4f1b4cc5447dd4414ead228c5ba506a6578"),
+    hex32("c98275a291935fd9c59d4c433b036d40743ecab9206209882ad4337da258b737"),
+    hex32("5de141b61308020c6bc319479353a3c447495a9dab947bed11ad8998b49dc18a"),
     hex32("0724503d81f8eb394a93cf5bf7cfb96798e26a141b5b40fb13810ad683784532"),
     CELL_CATALOG_SECTION_BLAKE3_R28[9],
     CELL_CATALOG_SECTION_BLAKE3_R28[10],
@@ -1289,7 +1289,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R29: [[u8; 32]; 12] = [
 
 /// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R29`] cell, `PostgreSQL` 16.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R29: [u8; 32] =
-    hex32("41f7835f7fabaf7a5d93920d4f3cab8b65a9a13cb59ff41d795d6b76a793c7dc");
+    hex32("0420ad05265eeb48167acb0ee9316dc77dba6d28485d31cb3263e9e2ed0fe8f0");
 
 /// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 16 (CR-038 addendum).
 ///
@@ -1472,7 +1472,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R29_PG18: [[u8; 32]; 12] = [
     hex32("c6c8b65b2ec02a3ba8a18a4f6a82ab3014c7dee4a99cd6cf08a3bea38a4e201f"),
     CELL_CATALOG_SECTION_BLAKE3_R29[4],
     CELL_CATALOG_SECTION_BLAKE3_R29[5],
-    hex32("3415e91e2d66b7205c1a7ed85d6482b78653c71e79de98e705ba2f03ce66f30e"),
+    hex32("4312d666b7e3999256efdb1ce0c4b1ce72a4d5575ce6fa6ca2f5653db1f7aecb"),
     CELL_CATALOG_SECTION_BLAKE3_R29[7],
     hex32("b3b2544c31e79ce17f246f987c7067ba9607218579a2513753ff531fb6130b45"),
     CELL_CATALOG_SECTION_BLAKE3_R29[9],
@@ -1482,7 +1482,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R29_PG18: [[u8; 32]; 12] = [
 
 /// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R29`] cell, `PostgreSQL` 18.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R29_PG18: [u8; 32] =
-    hex32("81a773415c4cbea3a794267a10bec2ab1a24eea03fc7e4fa73b6fb184806b054");
+    hex32("140cbae97b4382af2feb7f0e0b92df1bfe966947ef33e5a89fa4219458cc05c2");
 
 /// One major's closed list of known states: each state with its section pins and manifest pin.
 pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 5];

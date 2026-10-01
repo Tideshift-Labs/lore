@@ -3800,10 +3800,75 @@ async fn live_superseded_marker_deletion_refuses_a_counter_underflow() {
     let intent = cell.client.claim_cleanup(ids[0]).await.unwrap();
     assert_eq!(
         cell.client.release_cleanup(&intent).await,
-        Err(DrainError::Refused),
-        "a marker deletion that would take metadata_rows below zero must refuse"
+        Err(DrainError::MetadataUnderflow),
+        "a marker deletion that would take metadata_rows below zero must refuse, and say why, so \
+         cleanup can skip this one row instead of failing its pass"
     );
     assert_eq!(cell.custody_states().await, vec![(4, true)]);
+}
+
+// Row 66 residual 1: a claim lost to another session clears its own lease, so the row is due
+// again at once instead of after the 30 s lease. The loser here lost on a serialization failure:
+// the other session claimed and committed while it waited.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database with a real BLAKE3 provider"]
+async fn live_a_contended_claim_clears_its_lease_so_a_peer_retakes_the_row_at_once() {
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_UNLEASE_PG_URL",
+        "unlease",
+        16,
+    )
+    .await;
+    let replica = drain_client(&cell.fixture.base_url, cell.identity).await;
+    let descriptor = cell.descriptor(0, &cell.policy).await;
+    cell.client.reserve(&descriptor).await.expect("reservation");
+    tokio::time::sleep(Duration::from_millis(cell.policy.maximum_ttl_ms + 500)).await;
+    let spool = descriptor.spool_object_id;
+    let (boundary, cell_id) = (&cell.policy.boundary, &cell.policy.cell);
+    assert_eq!(
+        cell.client
+            .cleanup_candidates(boundary, cell_id, 8)
+            .await
+            .unwrap(),
+        vec![spool],
+        "the first claimer leases the row"
+    );
+    assert!(
+        replica
+            .cleanup_candidates(boundary, cell_id, 8)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the lease keeps the row from the peer"
+    );
+
+    let (other, _other_task) =
+        connect_as(&cell.fixture.base_url, "object_dispatch_retention_runtime").await;
+    other
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    other
+        .query(
+            "SELECT * FROM object_store_retention.drain_cleanup_claim_v2($1)",
+            &[&spool],
+        )
+        .await
+        .unwrap();
+    let (claimed, committed) = tokio::join!(cell.client.claim_cleanup(spool), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        other.batch_execute("COMMIT").await
+    });
+    committed.expect("the other session's claim commits");
+    assert_eq!(claimed.err(), Some(DrainError::Contended));
+    assert_eq!(
+        replica
+            .cleanup_candidates(boundary, cell_id, 8)
+            .await
+            .unwrap(),
+        vec![spool],
+        "the lost claim cleared its lease, so the peer takes the row at once"
+    );
 }
 
 // Row 66: released rows and markers leave the scan until they are due.
