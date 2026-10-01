@@ -9142,7 +9142,8 @@ async fn same_repo_lifecycle_traffic_requires_complete_proof() {
         verdicts
     };
 
-    let (samples, tally_a, tally_b, tally_c) = timeout(SUSTAINED_SUITE_WATCHDOG, async {
+    // boxed: future is ~24 KB on the stack
+    let (samples, tally_a, tally_b, tally_c) = Box::pin(timeout(SUSTAINED_SUITE_WATCHDOG, async {
         tokio::join!(
             pushes,
             run_sustained_uploader(
@@ -9173,7 +9174,7 @@ async fn same_repo_lifecycle_traffic_requires_complete_proof() {
                 deadline,
             ),
         )
-    })
+    }))
     .await
     .expect("the sustained same-repository suite must finish inside its 30s watchdog");
 
@@ -9361,7 +9362,8 @@ async fn cross_repo_bulk_upload_does_not_abort_unrelated_push() {
         verdicts
     };
 
-    let (samples, tally_a, tally_b, tally_c) = timeout(SUSTAINED_SUITE_WATCHDOG, async {
+    // boxed: future is ~24 KB on the stack
+    let (samples, tally_a, tally_b, tally_c) = Box::pin(timeout(SUSTAINED_SUITE_WATCHDOG, async {
         tokio::join!(
             pushes,
             run_sustained_uploader(
@@ -9392,7 +9394,7 @@ async fn cross_repo_bulk_upload_does_not_abort_unrelated_push() {
                 deadline,
             ),
         )
-    })
+    }))
     .await
     .expect("the sustained cross-repository suite must finish inside its 30s watchdog");
 
@@ -9945,7 +9947,8 @@ async fn fresh_same_repo_association_traffic_preserves_the_scalar_fast_path() {
         samples
     };
 
-    let (samples, tally_a, tally_b, tally_c) = timeout(SUSTAINED_SUITE_WATCHDOG, async {
+    // boxed: future is ~24 KB on the stack
+    let (samples, tally_a, tally_b, tally_c) = Box::pin(timeout(SUSTAINED_SUITE_WATCHDOG, async {
         tokio::join!(
             pushes,
             run_sustained_uploader(
@@ -9976,7 +9979,7 @@ async fn fresh_same_repo_association_traffic_preserves_the_scalar_fast_path() {
                 deadline,
             ),
         )
-    })
+    }))
     .await
     .expect("the association-traffic characterization must finish inside its 30s watchdog");
 

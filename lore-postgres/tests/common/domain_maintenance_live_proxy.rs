@@ -68,9 +68,14 @@ impl DomainMaintenanceFaultProxy {
                     connections.push(AbortOnDropHandle::new(lore_base::lore_spawn!(
                         "domain-maintenance-live-proxy-connection",
                         async move {
-                            let _ =
-                                serve_connection(downstream, &upstream_host, upstream_port, faults)
-                                    .await;
+                            // boxed: future is ~33 KB on the stack
+                            let _ = Box::pin(serve_connection(
+                                downstream,
+                                &upstream_host,
+                                upstream_port,
+                                faults,
+                            ))
+                            .await;
                         }
                     )));
                 }

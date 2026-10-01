@@ -742,7 +742,7 @@ async fn repository_delete_racing_create_never_publishes_after_the_tombstone() {
         DomainOutcome::Applied => {
             assert_eq!(created.public_result, Some(input.public_result.clone()));
         }
-        other => {
+        other @ DomainOutcome::NotApplied { .. } => {
             rejected(other, TOMBSTONED_V1);
             assert_eq!(artifacts(&client, &input).await, vec![0, 0, 0]);
         }

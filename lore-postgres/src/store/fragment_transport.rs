@@ -276,8 +276,9 @@ impl PostgresFragmentS3Transport {
         };
         let operation = request.operation();
         let counter = HttpRequestAttemptCounter::default();
-        let result = counter
-            .count_connector_attempts(
+        // boxed: future is ~21 KB on the stack
+        let result = Box::pin(
+            counter.count_connector_attempts(
                 self.client
                     .put_object()
                     .bucket(&self.bucket)
@@ -286,8 +287,9 @@ impl PostgresFragmentS3Transport {
                     .set_metadata(Some(operation.metadata.iter().cloned().collect()))
                     .body(ByteStream::from(body.to_vec()))
                     .send(),
-            )
-            .await;
+            ),
+        )
+        .await;
         match result {
             Ok(_) => Self::exchange(
                 &counter,
