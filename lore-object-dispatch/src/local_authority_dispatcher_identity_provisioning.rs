@@ -11,7 +11,7 @@
 //!
 //! Runtime code neither installs nor calls this artifact.
 
-/// Exact PostgreSQL dispatcher-identity provisioning migration bytes, embedded for parity.
+/// Exact `PostgreSQL` dispatcher-identity provisioning migration bytes, embedded for parity.
 pub const LOCAL_AUTHORITY_DISPATCHER_IDENTITY_PROVISIONING_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0019_object_store_dispatch_dispatcher_identity_provisioning.sql");
 

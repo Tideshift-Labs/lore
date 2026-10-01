@@ -9,7 +9,7 @@
 /// Frozen retention readback API revision.
 pub const RETENTION_READBACK_API_REVISION_V1: &str = "object-store-retention-readback-v1";
 
-/// Exact PostgreSQL readback migration bytes, embedded for image/provisioning parity only.
+/// Exact `PostgreSQL` readback migration bytes, embedded for image/provisioning parity only.
 pub const RETENTION_READBACK_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0004_object_store_retention_readback.sql");
 

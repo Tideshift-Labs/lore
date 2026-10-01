@@ -225,7 +225,7 @@ fn durable_context(kind: DurableConsumerKindV1) -> ResultConsumerContextV1 {
         DurableConsumerKindV1::DurableConsumerKindJob => "job",
         DurableConsumerKindV1::DurableConsumerKindOperator => "operator",
         DurableConsumerKindV1::DurableConsumerKindMigrator => "migrator",
-        _ => "invalid",
+        DurableConsumerKindV1::DurableConsumerKindUnspecified => "invalid",
     };
     ResultConsumerContextV1 {
         consumer: Some(result_consumer_context_v1::Consumer::DurableConsumer(

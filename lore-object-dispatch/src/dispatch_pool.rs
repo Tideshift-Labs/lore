@@ -4,7 +4,7 @@
 //! The separately credentialed dispatch-runtime connection pool (WP-114 CD-3), one of the
 //! steady-state pools against a cell database.
 //!
-//! CR-033 D1 made the cell's own PostgreSQL database the dispatch authority. Every retained
+//! CR-033 D1 made the cell's own `PostgreSQL` database the dispatch authority. Every retained
 //! mutation asserts `session_user = 'object_dispatch_retention_runtime'` and grants `EXECUTE` only
 //! to that role, and 0020's enrollment asserts the maintenance role, so `lore-postgres`'s
 //! immutable, mutable, lock, and domain pools cannot carry these calls. This module owns the
@@ -53,13 +53,13 @@ impl InstrumentProvider for DispatchPoolInstrumentProvider {
     }
 }
 
-/// The PostgreSQL role every 0013/0015/0017 mutation and 0020 registration asserts.
+/// The `PostgreSQL` role every 0013/0015/0017 mutation and 0020 registration asserts.
 pub const DISPATCH_RUNTIME_ROLE: &str = "object_dispatch_retention_runtime";
 
-/// The PostgreSQL role 0020's participant enrollment asserts.
+/// The `PostgreSQL` role 0020's participant enrollment asserts.
 pub const DISPATCH_MAINTENANCE_ROLE: &str = "object_dispatch_retention_maintenance";
 
-/// Hard ceiling for all PostgreSQL pools one loreserver process opens against its cell database.
+/// Hard ceiling for all `PostgreSQL` pools one loreserver process opens against its cell database.
 pub const DISPATCH_PROCESS_CONNECTION_LIMIT: u32 = 20;
 
 /// The connection-budget statement this pool is sized against, stated rather than implied.
@@ -233,7 +233,7 @@ impl DispatchConnectionBudget {
         self.dispatch_pool_max > 0
     }
 
-    /// Total PostgreSQL connections one loreserver process may hold against the cell database.
+    /// Total `PostgreSQL` connections one loreserver process may hold against the cell database.
     pub const fn connections_per_replica(self) -> u32 {
         self.connections_per_replica
     }
@@ -335,7 +335,7 @@ impl DispatchPoolRole {
 
 /// Why the pool refused a configuration or could not hand out a session.
 ///
-/// No variant carries a URL, a credential, a PEM, a PostgreSQL diagnostic, or a parameter value.
+/// No variant carries a URL, a credential, a PEM, a `PostgreSQL` diagnostic, or a parameter value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchPoolError {
     #[error("invalid dispatch pool configuration: {0}")]
@@ -356,7 +356,7 @@ pub enum DispatchPoolError {
     DatabaseIdentityMismatch,
 }
 
-/// One pooled PostgreSQL connection.
+/// One pooled `PostgreSQL` connection.
 struct DispatchSession {
     client: Client,
     _connection_task: AbortOnDropHandle<()>,
@@ -428,7 +428,7 @@ impl DispatchRuntimePool {
         // Reject the connection material once at construction so a caller cannot discover an
         // unusable URL or an unusable CA bundle only on the first authority call.
         let _ = connection_material(&config)?;
-        let permits = usize::try_from(config.pool_max).map_err(|_| {
+        let permits = usize::try_from(config.pool_max).map_err(|_err| {
             DispatchPoolError::InvalidConfiguration("dispatch pool_max is too large")
         })?;
         Ok(Self {
@@ -502,8 +502,8 @@ impl DispatchRuntimePool {
     async fn acquire_inner(&self) -> Result<DispatchLease<'_>, DispatchPoolError> {
         let permit = tokio::time::timeout(self.config.acquire_timeout, self.permits.acquire())
             .await
-            .map_err(|_| DispatchPoolError::PoolExhausted)?
-            .map_err(|_| DispatchPoolError::PoolExhausted)?;
+            .map_err(|_err| DispatchPoolError::PoolExhausted)?
+            .map_err(|_err| DispatchPoolError::PoolExhausted)?;
         loop {
             let reused = self.idle.lock().await.pop();
             match reused {
@@ -516,7 +516,7 @@ impl DispatchRuntimePool {
                 }
                 // A closed idle connection is dropped, not handed out. Keep looking before paying
                 // for a new one.
-                Some(_) => continue,
+                Some(_) => {}
                 None => break,
             }
         }
@@ -534,7 +534,7 @@ impl DispatchRuntimePool {
             let (client, connection) = postgres
                 .connect(tls)
                 .await
-                .map_err(|_| DispatchPoolError::ConnectFailed)?;
+                .map_err(|_err| DispatchPoolError::ConnectFailed)?;
             let connection_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
                 "object-store-dispatch-postgres",
                 async move {
@@ -555,7 +555,7 @@ impl DispatchRuntimePool {
             })
         })
         .await
-        .map_err(|_| DispatchPoolError::ConnectTimeout)?
+        .map_err(|_err| DispatchPoolError::ConnectTimeout)?
     }
 
     async fn release(&self, session: DispatchSession) {
@@ -580,7 +580,7 @@ async fn attest_open_connection_database_identity(
     let row = client
         .query_one(DATABASE_IDENTITY_SQL, &[])
         .await
-        .map_err(|_| DispatchPoolError::DatabaseIdentityReadFailed)?;
+        .map_err(|_err| DispatchPoolError::DatabaseIdentityReadFailed)?;
     let actual = decode_database_identity(&row).map_err(|error| match error {
         DispatchDatabaseIdentityError::Malformed => DispatchPoolError::DatabaseIdentityMalformed,
         DispatchDatabaseIdentityError::Mismatch => DispatchPoolError::DatabaseIdentityMismatch,
@@ -639,7 +639,7 @@ fn connection_material(
     let postgres = config
         .postgres_url
         .parse::<tokio_postgres::Config>()
-        .map_err(|_| DispatchPoolError::InvalidConfiguration("invalid PostgreSQL URL"))?;
+        .map_err(|_err| DispatchPoolError::InvalidConfiguration("invalid PostgreSQL URL"))?;
     let [Host::Tcp(_)] = postgres.get_hosts() else {
         return Err(DispatchPoolError::InvalidConfiguration(
             "dispatch pool requires exactly one TCP host",
@@ -676,8 +676,8 @@ fn connection_material(
             let mut added = 0usize;
             for certificate in rustls_pemfile::certs(&mut reader) {
                 let certificate = certificate
-                    .map_err(|_| DispatchPoolError::InvalidTlsMaterial("invalid root CA PEM"))?;
-                roots.add(certificate).map_err(|_| {
+                    .map_err(|_err| DispatchPoolError::InvalidTlsMaterial("invalid root CA PEM"))?;
+                roots.add(certificate).map_err(|_err| {
                     DispatchPoolError::InvalidTlsMaterial("unusable root CA certificate")
                 })?;
                 added = added.saturating_add(1);
@@ -692,7 +692,7 @@ fn connection_material(
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let tls = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|_| DispatchPoolError::InvalidTlsMaterial("unsupported TLS protocol set"))?
+        .map_err(|_err| DispatchPoolError::InvalidTlsMaterial("unsupported TLS protocol set"))?
         .with_root_certificates(roots)
         .with_no_client_auth();
     Ok((postgres, MakeRustlsConnect::new(tls)))
@@ -711,7 +711,7 @@ fn whole_millis(value: Duration, message: &'static str) -> Result<u64, DispatchP
         return Err(DispatchPoolError::InvalidConfiguration(message));
     }
     u64::try_from(value.as_millis())
-        .map_err(|_| DispatchPoolError::InvalidConfiguration("timeout is too large"))
+        .map_err(|_err| DispatchPoolError::InvalidConfiguration("timeout is too large"))
 }
 
 #[cfg(test)]
@@ -891,7 +891,7 @@ mod tests {
             (
                 "statement timeout must be a positive whole-millisecond value",
                 (|value: &mut DispatchPoolConfig| {
-                    value.statement_timeout = Duration::from_micros(1_500)
+                    value.statement_timeout = Duration::from_micros(1_500);
                 }) as fn(&mut DispatchPoolConfig),
             ),
             (

@@ -129,15 +129,15 @@ fn wire_limits(limits: &ReservePutAckLimits) -> RequestStateWireLimits {
 
 fn writer(limits: &ReservePutAckLimits) -> Result<BoundedCanonicalWriter, ReservePutAckError> {
     BoundedCanonicalWriter::new(limits.max_canonical_row_bytes)
-        .map_err(|_| ReservePutAckError::InvalidLimits)
+        .map_err(|_err| ReservePutAckError::InvalidLimits)
 }
 
 fn text(value: &str, maximum: u32) -> Result<(), ReservePutAckError> {
-    validate_canonical_text(value, maximum).map_err(|_| ReservePutAckError::InvalidCanonicalText)
+    validate_canonical_text(value, maximum).map_err(|_err| ReservePutAckError::InvalidCanonicalText)
 }
 
 fn nonnegative(value: i64) -> Result<u64, ReservePutAckError> {
-    u64::try_from(value).map_err(|_| ReservePutAckError::NegativeTime)
+    u64::try_from(value).map_err(|_err| ReservePutAckError::NegativeTime)
 }
 
 fn positive(value: u64) -> Result<u64, ReservePutAckError> {
@@ -151,7 +151,7 @@ fn positive(value: u64) -> Result<u64, ReservePutAckError> {
 fn digest(value: &[u8]) -> Result<[u8; 32], ReservePutAckError> {
     value
         .try_into()
-        .map_err(|_| ReservePutAckError::InvalidDigest)
+        .map_err(|_err| ReservePutAckError::InvalidDigest)
 }
 
 fn finish(
@@ -192,7 +192,7 @@ fn write_framed(
 ) -> Result<(), ReservePutAckError> {
     output
         .bytes(bytes)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)
 }
 
 fn write_optional_framed(
@@ -201,7 +201,7 @@ fn write_optional_framed(
 ) -> Result<(), ReservePutAckError> {
     output
         .u8(u8::from(bytes.is_some()))
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     if let Some(bytes) = bytes {
         write_framed(output, bytes)?;
     }
@@ -218,11 +218,11 @@ fn quota_child(
     let mut output = writer(limits)?;
     output
         .raw(QUOTA_DOMAIN)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     for value in [value.bytes, value.rows, value.concurrency] {
         output
             .u64(value)
-            .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+            .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     }
     complete_child(&output.finish(), limits)
 }
@@ -268,7 +268,7 @@ fn spool_child(
     let mut output = writer(limits)?;
     output
         .raw(SPOOL_DOMAIN)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     for identity in [
         &value.protocol_revision,
         &value.provider_boundary_id,
@@ -280,23 +280,23 @@ fn spool_child(
     ] {
         output
             .text(identity)
-            .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+            .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     }
     output
         .u64(positive(value.upload_fence)?)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .text(&value.durable_body_handle)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u64(value.body_size)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .raw(&digest(&value.body_blake3)?)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u64(ready_at)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     complete_child(&output.finish(), limits)
 }
 
@@ -324,13 +324,13 @@ fn closure_child(
         .as_ref()
         .map(|value| ack_child(value, &wire_limits))
         .transpose()
-        .map_err(|_| ReservePutAckError::InvalidNestedEvidence)?;
+        .map_err(|_err| ReservePutAckError::InvalidNestedEvidence)?;
     let discard = value
         .discard_receipt
         .as_ref()
         .map(|value| discard_child(value, &wire_limits))
         .transpose()
-        .map_err(|_| ReservePutAckError::InvalidNestedEvidence)?;
+        .map_err(|_err| ReservePutAckError::InvalidNestedEvidence)?;
     let receipt_time = match value.result_disposition {
         2 if ack.is_none() && discard.is_none() => None,
         3 if ack.is_some() && discard.is_none() => value
@@ -365,21 +365,21 @@ fn closure_child(
     let mut output = writer(limits)?;
     output
         .raw(CLOSURE_DOMAIN)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .text(&value.terminal_result_id)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u32(value.terminal_retryability as u32)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u32(value.result_disposition as u32)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     write_optional_framed(&mut output, ack.as_deref())?;
     write_optional_framed(&mut output, discard.as_deref())?;
     output
         .u64(closed_at)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     let (bytes, closure_blake3) =
         finish(&output.finish(), &value.closure_blake3, limits).map_err(|error| match error {
             ReservePutAckError::InvalidDigest | ReservePutAckError::DigestMismatch => {
@@ -503,7 +503,8 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
         &value.attempt_id,
         &value.upload_id,
     ] {
-        canonical_uuid_v7_timestamp(identifier).map_err(|_| ReservePutAckError::InvalidUuidV7)?;
+        canonical_uuid_v7_timestamp(identifier)
+            .map_err(|_err| ReservePutAckError::InvalidUuidV7)?;
     }
     positive(value.upload_fence)?;
     positive(value.max_chunk_bytes)?;
@@ -552,7 +553,7 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
         .as_ref()
         .map(|proof| no_dispatch_child(proof, &wire_limits))
         .transpose()
-        .map_err(|_| ReservePutAckError::InvalidNestedEvidence)?;
+        .map_err(|_err| ReservePutAckError::InvalidNestedEvidence)?;
     if let Some(proof) = value.no_dispatch_proof.as_ref() {
         let committed_at = nonnegative(proof.committed_at_unix_ms)?;
         if committed_at < admission || (proof.reason == 4 && committed_at < expires) {
@@ -564,7 +565,7 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
         .as_ref()
         .map(|release| purge_child(release, &wire_limits))
         .transpose()
-        .map_err(|_| ReservePutAckError::InvalidNestedEvidence)?;
+        .map_err(|_err| ReservePutAckError::InvalidNestedEvidence)?;
 
     let valid_state = match value.state {
         1 => spool.is_none() && closure.is_none() && proof.is_none() && release.is_none(),
@@ -616,7 +617,7 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
     let mut output = writer(limits)?;
     output
         .raw(ACK_DOMAIN)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     for identity in [
         &normalized.protocol_revision,
         &normalized.policy_revision,
@@ -629,21 +630,21 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
     ] {
         output
             .text(identity)
-            .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+            .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     }
     output
         .u64(value.upload_fence)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u32(value.state as u32)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     write_framed(&mut output, &quota_bytes)?;
     output
         .u64(expires)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u64(value.max_chunk_bytes)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     write_optional_framed(&mut output, spool.as_deref())?;
     write_optional_framed(
         &mut output,
@@ -651,10 +652,10 @@ pub fn validate_and_encode_object_store_reserve_put_ack(
     )?;
     output
         .u64(admission)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     output
         .u64(allocation_expiry)
-        .map_err(|_| ReservePutAckError::CanonicalTooLarge)?;
+        .map_err(|_err| ReservePutAckError::CanonicalTooLarge)?;
     write_optional_framed(
         &mut output,
         closure.as_ref().map(|(bytes, _)| bytes.as_slice()),

@@ -6,7 +6,7 @@
 //! The migration adds distinct reservation identity, admission, and current-ACK evidence to the
 //! unbound PUT spool row. Runtime code neither installs nor calls this artifact.
 
-/// Exact PostgreSQL PUT-reservation schema migration bytes, embedded for provisioning parity only.
+/// Exact `PostgreSQL` PUT-reservation schema migration bytes, embedded for provisioning parity only.
 pub const LOCAL_AUTHORITY_PUT_RESERVATION_SCHEMA_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0010_object_store_dispatch_put_reservation_schema.sql");
 

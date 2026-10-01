@@ -4,10 +4,10 @@
 //! Static, offline contract tests for CD-1's out-of-band cell-authority schema
 //! installer/attester (`lore_object_dispatch::cell_schema_install`).
 //!
-//! No PostgreSQL, no Docker, no `#[ignore]`. This file only reads the frozen migration SQL
+//! No `PostgreSQL`, no Docker, no `#[ignore]`. This file only reads the frozen migration SQL
 //! from disk (independently of the module's own `include_str!` copies) and the module's own
 //! public constants, and cross-checks them against each other. The live proof that installing
-//! this schema into a real PostgreSQL 16 catalog behaves as attested belongs to the main
+//! this schema into a real `PostgreSQL` 16 catalog behaves as attested belongs to the main
 //! session's live tier (see CR-033 D5 and the WP-114 CD-1 work package), not this file.
 
 use std::collections::BTreeSet;

@@ -165,9 +165,9 @@ fn canonical_preimage(
         return Err(NoDispatchProofError::InvalidAuthorityEpoch);
     }
     let committed_at = u64::try_from(fields.committed_at_unix_ms)
-        .map_err(|_| NoDispatchProofError::InvalidCommitTime)?;
+        .map_err(|_err| NoDispatchProofError::InvalidCommitTime)?;
     let proof_timestamp = canonical_uuid_v7_timestamp(&fields.proof_id)
-        .map_err(|_| NoDispatchProofError::InvalidProofId)?;
+        .map_err(|_err| NoDispatchProofError::InvalidProofId)?;
     if proof_timestamp != committed_at {
         return Err(NoDispatchProofError::ProofTimestampMismatch);
     }
@@ -177,9 +177,9 @@ fn canonical_preimage(
     // never below 36), and the two writers still agree byte for byte. That is a statement about
     // the validated limits, not an absolute one.
     canonical_uuid_v7_timestamp(&fields.logical_request_id)
-        .map_err(|_| NoDispatchProofError::InvalidLogicalRequestId)?;
+        .map_err(|_err| NoDispatchProofError::InvalidLogicalRequestId)?;
     let mut writer = BoundedCanonicalWriter::new(max_preimage_bytes)
-        .map_err(|_| NoDispatchProofError::InvalidMaximum)?;
+        .map_err(|_err| NoDispatchProofError::InvalidMaximum)?;
     writer
         .raw(NO_DISPATCH_PROOF_DOMAIN)
         .and_then(|()| writer.u32(fields.reason as u32))
@@ -188,7 +188,7 @@ fn canonical_preimage(
         .and_then(|()| writer.u64(fields.proof_fence))
         .and_then(|()| writer.u64(committed_at))
         .and_then(|()| writer.u64(fields.authority_epoch))
-        .map_err(|_| NoDispatchProofError::PreimageTooLarge)?;
+        .map_err(|_err| NoDispatchProofError::PreimageTooLarge)?;
     Ok(writer.finish())
 }
 

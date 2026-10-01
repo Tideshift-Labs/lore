@@ -131,7 +131,7 @@ pub fn validate_object_store_result_ack(
         authority.authenticated_identity,
         &limits.identity,
     )
-    .map_err(|_| ResultAckError::InvalidConsumerContext)?;
+    .map_err(|_err| ResultAckError::InvalidConsumerContext)?;
 
     for (actual, expected) in [
         (&input.protocol_revision, authority.protocol_revision),
@@ -153,8 +153,8 @@ pub fn validate_object_store_result_ack(
         }
     }
     canonical_uuid_v7_timestamp(&input.logical_request_id)
-        .map_err(|_| ResultAckError::InvalidUuidV7)?;
-    canonical_uuid_v7_timestamp(&input.attempt_id).map_err(|_| ResultAckError::InvalidUuidV7)?;
+        .map_err(|_err| ResultAckError::InvalidUuidV7)?;
+    canonical_uuid_v7_timestamp(&input.attempt_id).map_err(|_err| ResultAckError::InvalidUuidV7)?;
 
     let stored_result = authority.terminal_result.result();
     validate_text(
@@ -179,11 +179,11 @@ pub fn validate_object_store_result_ack(
     }
     if let Some(handle) = input.byte_result_handle.as_deref() {
         validate_text(handle, limits.max_result_handle_bytes)
-            .map_err(|_| ResultAckError::InvalidByteResultHandle)?;
+            .map_err(|_err| ResultAckError::InvalidByteResultHandle)?;
     }
 
     let mut writer = BoundedCanonicalWriter::new(limits.max_fingerprint_preimage_bytes)
-        .map_err(|_| ResultAckError::InvalidLimits)?;
+        .map_err(|_err| ResultAckError::InvalidLimits)?;
     write_raw(&mut writer, ACK_FINGERPRINT_DOMAIN)?;
     for value in [
         &input.protocol_revision,
@@ -257,7 +257,7 @@ fn validate_limits(limits: &ResultAckLimits) -> Result<(), ResultAckError> {
 }
 
 fn validate_text(value: &str, maximum: u32) -> Result<(), ResultAckError> {
-    validate_canonical_text(value, maximum).map_err(|_| ResultAckError::InvalidCanonicalText)
+    validate_canonical_text(value, maximum).map_err(|_err| ResultAckError::InvalidCanonicalText)
 }
 
 fn encode_proof(
@@ -395,25 +395,25 @@ fn encode_durable_proof(
 fn write_raw(writer: &mut BoundedCanonicalWriter, value: &[u8]) -> Result<(), ResultAckError> {
     writer
         .raw(value)
-        .map_err(|_| ResultAckError::PreimageTooLarge)
+        .map_err(|_err| ResultAckError::PreimageTooLarge)
 }
 
 fn write_u32(writer: &mut BoundedCanonicalWriter, value: u32) -> Result<(), ResultAckError> {
     writer
         .u32(value)
-        .map_err(|_| ResultAckError::PreimageTooLarge)
+        .map_err(|_err| ResultAckError::PreimageTooLarge)
 }
 
 fn write_u64(writer: &mut BoundedCanonicalWriter, value: u64) -> Result<(), ResultAckError> {
     writer
         .u64(value)
-        .map_err(|_| ResultAckError::PreimageTooLarge)
+        .map_err(|_err| ResultAckError::PreimageTooLarge)
 }
 
 fn write_text(writer: &mut BoundedCanonicalWriter, value: &str) -> Result<(), ResultAckError> {
     writer
         .text(value)
-        .map_err(|_| ResultAckError::PreimageTooLarge)
+        .map_err(|_err| ResultAckError::PreimageTooLarge)
 }
 
 fn write_optional_text(
@@ -422,7 +422,7 @@ fn write_optional_text(
 ) -> Result<(), ResultAckError> {
     writer
         .u8(u8::from(value.is_some()))
-        .map_err(|_| ResultAckError::PreimageTooLarge)?;
+        .map_err(|_err| ResultAckError::PreimageTooLarge)?;
     if let Some(value) = value {
         write_text(writer, value)?;
     }
@@ -435,7 +435,7 @@ fn write_optional_u64(
 ) -> Result<(), ResultAckError> {
     writer
         .u8(u8::from(value.is_some()))
-        .map_err(|_| ResultAckError::PreimageTooLarge)?;
+        .map_err(|_err| ResultAckError::PreimageTooLarge)?;
     if let Some(value) = value {
         write_u64(writer, value)?;
     }

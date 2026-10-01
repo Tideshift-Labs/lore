@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! CD-8 retention over schema-valid seeded rows, plus grants minted by the real charge client.
-//! Run only with run-cell-retention-live.ps1 (fresh PostgreSQL 16, supported installer, pinned CA).
+//! Run only with run-cell-retention-live.ps1 (fresh `PostgreSQL` 16, supported installer, pinned CA).
 //! Request/child records are relational fixtures, NOT proof of reserve -> submit -> ACK lifecycle:
 //! the installed cell API has no Submit/ACK writer. No canonical success result is claimed here.
 //! Request clocks are seeded in the past. Real grants/configurations are aged ONLY in explicit

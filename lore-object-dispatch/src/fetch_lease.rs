@@ -354,7 +354,7 @@ fn writer(limits: &FetchLeaseLimits) -> Result<BoundedCanonicalWriter, FetchLeas
         return Err(FetchLeaseError::InvalidLimits);
     }
     BoundedCanonicalWriter::new(limits.max_canonical_record_bytes)
-        .map_err(|_| FetchLeaseError::InvalidLimits)
+        .map_err(|_err| FetchLeaseError::InvalidLimits)
 }
 
 fn write_text(
@@ -363,16 +363,16 @@ fn write_text(
     limits: &FetchLeaseLimits,
 ) -> Result<(), FetchLeaseError> {
     validate_canonical_text(value, limits.max_identity_bytes)
-        .map_err(|_| FetchLeaseError::InvalidIdentity)?;
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     output
         .text(value)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)
 }
 
 fn write_time(output: &mut BoundedCanonicalWriter, value: i64) -> Result<(), FetchLeaseError> {
     output
-        .u64(u64::try_from(value).map_err(|_| FetchLeaseError::InvalidTime)?)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)
+        .u64(u64::try_from(value).map_err(|_err| FetchLeaseError::InvalidTime)?)
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)
 }
 
 fn write_scope(
@@ -381,10 +381,10 @@ fn write_scope(
     limits: &FetchLeaseLimits,
 ) -> Result<(), FetchLeaseError> {
     validate_canonical_text(value, limits.max_authenticated_scope_bytes)
-        .map_err(|_| FetchLeaseError::InvalidIdentity)?;
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     output
         .text(value)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)
 }
 
 fn write_optional_complete(
@@ -393,11 +393,11 @@ fn write_optional_complete(
 ) -> Result<(), FetchLeaseError> {
     output
         .u8(u8::from(value.is_some()))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     if let Some(value) = value {
         output
             .bytes(value)
-            .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+            .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     }
     Ok(())
 }
@@ -431,13 +431,13 @@ fn write_result_key(
         write_text(output, value, limits)?;
     }
     let logical = decode_canonical_uuid_v7(&value.logical_request_id)
-        .map_err(|_| FetchLeaseError::InvalidIdentity)?;
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     let attempt = decode_canonical_uuid_v7(&value.attempt_id)
-        .map_err(|_| FetchLeaseError::InvalidIdentity)?;
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     output
         .raw(&logical)
         .and_then(|_| output.raw(&attempt))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(output, &value.terminal_result_id, limits)?;
     write_text(output, &value.byte_result_handle, limits)?;
     output
@@ -445,7 +445,7 @@ fn write_result_key(
         .and_then(|_| output.raw(&value.canonical_result_blake3))
         .and_then(|_| output.u64(value.payload_size))
         .and_then(|_| output.raw(&value.payload_blake3))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     Ok(())
 }
 
@@ -465,7 +465,7 @@ fn pending_discard_preimage(
         .and_then(|_| output.raw(&value.discard_fingerprint))
         .and_then(|_| output.bytes(&value.canonical_discard_bytes))
         .and_then(|_| output.raw(&value.expected_request_state_blake3))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_time(&mut output, value.reserved_at_unix_ms)?;
     Ok(output.finish())
 }
@@ -486,11 +486,17 @@ pub fn validate_and_encode_object_store_fetch_head(
         return Err(FetchLeaseError::InvalidHeadState);
     }
     match (input.state, input.pending_discard.as_ref()) {
-        (ObjectStoreFetchHeadState::Unfenced, None)
-        | (ObjectStoreFetchHeadState::PayloadPurgeReserved, None)
-        | (ObjectStoreFetchHeadState::PayloadPurgeCommitted, None) => {}
-        (ObjectStoreFetchHeadState::DiscardReserved, Some(_))
-        | (ObjectStoreFetchHeadState::DiscardCommitted, Some(_)) => {}
+        (
+            ObjectStoreFetchHeadState::Unfenced
+            | ObjectStoreFetchHeadState::PayloadPurgeReserved
+            | ObjectStoreFetchHeadState::PayloadPurgeCommitted,
+            None,
+        )
+        | (
+            ObjectStoreFetchHeadState::DiscardReserved
+            | ObjectStoreFetchHeadState::DiscardCommitted,
+            Some(_),
+        ) => {}
         _ => return Err(FetchLeaseError::InvalidHeadState),
     }
     if matches!(
@@ -516,17 +522,17 @@ pub fn validate_and_encode_object_store_fetch_head(
     let mut output = writer(limits)?;
     output
         .raw(HEAD_DOMAIN)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_result_key(&mut output, &input.result_key, limits)?;
     output
         .u64(input.fence_generation)
         .and_then(|_| output.u32(input.state as u32))
         .and_then(|_| output.u64(input.open_lease_count))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_optional_complete(&mut output, pending.as_deref())?;
     output
         .u64(input.head_revision)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_time(&mut output, input.head_committed_at_unix_ms)?;
     let canonical_preimage = output.finish();
     let (canonical_bytes, head_blake3) = finish(
@@ -555,17 +561,17 @@ fn owner_revocation_preimage(
     let mut output = writer(limits)?;
     output
         .raw(OWNER_REVOCATION_DOMAIN)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(&mut output, &value.owner_service_instance_id, limits)?;
     output
         .u64(value.revoked_owner_generation)
         .and_then(|_| output.u64(value.successor_owner_generation))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(&mut output, &value.revocation_id, limits)?;
     output
         .u64(value.revocation_revision)
         .and_then(|_| output.u64(value.revocation_fence))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_time(&mut output, value.revoked_at_unix_ms)?;
     Ok(output.finish())
 }
@@ -589,40 +595,40 @@ fn terminal_semantic_fingerprint(
     let reason = lease
         .terminal_reason
         .ok_or(FetchLeaseError::InvalidLeaseState)?;
-    let lease_id =
-        decode_canonical_uuid_v7(&lease.lease_id).map_err(|_| FetchLeaseError::InvalidIdentity)?;
+    let lease_id = decode_canonical_uuid_v7(&lease.lease_id)
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     let mut output = writer(limits)?;
     output
         .raw(TERMINAL_FINGERPRINT_DOMAIN)
         .and_then(|_| output.raw(&lease_id))
         .and_then(|_| output.raw(&lease.open_fingerprint))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     match reason {
         ObjectStoreFetchLeaseTerminalReason::Completed => {
             output
                 .u32(1)
-                .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+                .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
             write_text(&mut output, &lease.owner_service_instance_id, limits)?;
             output
                 .u64(lease.owner_generation)
-                .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+                .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
         }
         ObjectStoreFetchLeaseTerminalReason::OwnerRevoked => {
             let evidence = evidence.ok_or(FetchLeaseError::InvalidOwnerRevocation)?;
             output
                 .u32(3)
                 .and_then(|_| output.bytes(evidence))
-                .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+                .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
         }
         _ => {
             output
                 .u32(2)
                 .and_then(|_| output.u32(reason as u32))
-                .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+                .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
             write_text(&mut output, &lease.owner_service_instance_id, limits)?;
             output
                 .u64(lease.owner_generation)
-                .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+                .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
         }
     }
     Ok(Some(*blake3::hash(&output.finish()).as_bytes()))
@@ -663,8 +669,8 @@ pub fn validate_and_encode_object_store_fetch_lease(
     input: &ObjectStoreFetchLease,
     limits: &FetchLeaseLimits,
 ) -> Result<CanonicalObjectStoreFetchLease, FetchLeaseError> {
-    let lease_id =
-        decode_canonical_uuid_v7(&input.lease_id).map_err(|_| FetchLeaseError::InvalidIdentity)?;
+    let lease_id = decode_canonical_uuid_v7(&input.lease_id)
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     if input.owner_generation == 0
         || input.owner_authority_revision == 0
         || input.caller_fence == 0
@@ -750,16 +756,16 @@ pub fn validate_and_encode_object_store_fetch_lease(
     let mut output = writer(limits)?;
     output
         .raw(LEASE_DOMAIN)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_result_key(&mut output, &input.result_key, limits)?;
     output
         .raw(&lease_id)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(&mut output, &input.owner_service_instance_id, limits)?;
     output
         .u64(input.owner_generation)
         .and_then(|_| output.u64(input.owner_authority_revision))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(&mut output, &input.authenticated_principal_id, limits)?;
     write_scope(&mut output, &input.authenticated_scope, limits)?;
     output
@@ -769,30 +775,30 @@ pub fn validate_and_encode_object_store_fetch_lease(
         .and_then(|_| output.raw(&input.open_fingerprint))
         .and_then(|_| output.u64(input.next_chunk_index))
         .and_then(|_| output.u64(input.lease_revision))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_time(&mut output, input.opened_at_unix_ms)?;
     output
         .u32(input.state as u32)
         .and_then(|_| output.u8(u8::from(input.terminal_reason.is_some())))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     if let Some(reason) = input.terminal_reason {
         output
             .u32(reason as u32)
-            .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+            .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     }
     output
         .u8(u8::from(input.terminal_at_unix_ms.is_some()))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     if let Some(value) = input.terminal_at_unix_ms {
         write_time(&mut output, value)?;
     }
     output
         .u8(u8::from(input.terminal_fingerprint.is_some()))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     if let Some(value) = input.terminal_fingerprint {
         output
             .raw(&value)
-            .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+            .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     }
     write_optional_complete(&mut output, evidence.as_deref())?;
     let canonical_preimage = output.finish();
@@ -841,7 +847,7 @@ fn checked_request_state(
     limits: &RequestStateWireLimits,
 ) -> Result<CanonicalObjectStoreRequestState, FetchLeaseError> {
     let checked = validate_and_encode_object_store_request_state(state.value(), limits)
-        .map_err(|_| FetchLeaseError::NotFetchable)?;
+        .map_err(|_err| FetchLeaseError::NotFetchable)?;
     if checked.canonical_bytes() != state.canonical_bytes()
         || checked.canonical_preimage() != state.canonical_preimage()
         || checked.state_blake3() != state.state_blake3()
@@ -886,7 +892,7 @@ pub fn object_store_fetch_result_key_from_state(
         .canonical_result_blake3
         .as_ref()
         .try_into()
-        .map_err(|_| FetchLeaseError::NotFetchable)?;
+        .map_err(|_err| FetchLeaseError::NotFetchable)?;
     Ok(ObjectStoreFetchResultKey {
         protocol_revision: value.protocol_revision.clone(),
         provider_boundary_id: value.provider_boundary_id.clone(),
@@ -903,7 +909,7 @@ pub fn object_store_fetch_result_key_from_state(
             .blake3
             .as_ref()
             .try_into()
-            .map_err(|_| FetchLeaseError::NotFetchable)?,
+            .map_err(|_err| FetchLeaseError::NotFetchable)?,
     })
 }
 
@@ -986,27 +992,27 @@ fn open_fingerprint(
         return Err(FetchLeaseError::InvalidLeaseState);
     }
     let lease_id =
-        decode_canonical_uuid_v7(lease_id).map_err(|_| FetchLeaseError::InvalidIdentity)?;
+        decode_canonical_uuid_v7(lease_id).map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     let mut output = writer(limits)?;
     output
         .raw(OPEN_FINGERPRINT_DOMAIN)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_result_key(&mut output, key, limits)?;
     output
         .raw(&lease_id)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(&mut output, &authority.owner_service_instance_id, limits)?;
     output
         .u64(authority.owner_generation)
         .and_then(|_| output.u64(authority.owner_authority_revision))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     write_text(&mut output, &authority.authenticated_principal_id, limits)?;
     write_scope(&mut output, &authority.authenticated_scope, limits)?;
     output
         .raw(&authority.canonical_descriptor_fingerprint)
         .and_then(|_| output.u64(authority.caller_fence))
         .and_then(|_| output.u64(admitted_generation))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     Ok(*blake3::hash(&output.finish()).as_bytes())
 }
 
@@ -1092,7 +1098,7 @@ pub fn decide_open_object_store_fetch_lease(
         .as_deref()
         .ok_or(FetchLeaseError::NotFetchable)?
         .try_into()
-        .map_err(|_| FetchLeaseError::NotFetchable)?;
+        .map_err(|_err| FetchLeaseError::NotFetchable)?;
     validate_resolved_authority(input.authority, &key, descriptor, limits)?;
     if let Some(existing) = input.existing_lease {
         let existing = checked_lease(existing, limits)?;
@@ -1268,18 +1274,18 @@ fn terminal_fingerprint(
     let mut output = writer(limits)?;
     output
         .raw(TERMINAL_FINGERPRINT_DOMAIN)
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     let lease_id = decode_canonical_uuid_v7(&lease.value().lease_id)
-        .map_err(|_| FetchLeaseError::InvalidIdentity)?;
+        .map_err(|_err| FetchLeaseError::InvalidIdentity)?;
     output
         .raw(&lease_id)
         .and_then(|_| output.raw(&lease.value().open_fingerprint))
-        .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+        .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     if let Some(evidence) = evidence.as_deref() {
         output
             .u32(3)
             .and_then(|_| output.bytes(evidence))
-            .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+            .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     } else {
         let authority = authority.ok_or(FetchLeaseError::InvalidLeaseState)?;
         let owner = authority.owner_service_instance_id.as_str();
@@ -1294,16 +1300,16 @@ fn terminal_fingerprint(
         };
         output
             .u32(tag)
-            .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+            .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
         if tag == 2 {
             output
                 .u32(reason as u32)
-                .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+                .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
         }
         write_text(&mut output, owner, limits)?;
         output
             .u64(generation)
-            .map_err(|_| FetchLeaseError::CanonicalTooLarge)?;
+            .map_err(|_err| FetchLeaseError::CanonicalTooLarge)?;
     }
     Ok(*blake3::hash(&output.finish()).as_bytes())
 }

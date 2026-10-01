@@ -96,15 +96,14 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
-    let runtime = match tokio::runtime::Builder::new_current_thread()
+    let runtime = if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
     {
-        Ok(runtime) => runtime,
-        Err(_) => {
-            eprintln!("could not start the local async runtime");
-            return ExitCode::from(2);
-        }
+        runtime
+    } else {
+        eprintln!("could not start the local async runtime");
+        return ExitCode::from(2);
     };
     runtime.block_on(run(action, &url))
 }
@@ -113,14 +112,14 @@ async fn run(action: Action, url: &str) -> ExitCode {
     // NoTls: the cell authority is the cell's own database, reached inside the cell. The external
     // endpoint contract (pinned CA, mandatory client certificate) was written for the retired
     // cross-region authority database and does not survive CR-033's re-scope.
-    let (client, connection) = match tokio_postgres::connect(url, tokio_postgres::NoTls).await {
-        Ok(pair) => pair,
-        Err(_) => {
+    let (client, connection) =
+        if let Ok(pair) = tokio_postgres::connect(url, tokio_postgres::NoTls).await {
+            pair
+        } else {
             // Never echo the URL or the driver diagnostic; either can carry credentials.
             eprintln!("could not connect to the cell authority database");
             return ExitCode::from(1);
-        }
-    };
+        };
     let _connection_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
         "cell-schema-install-postgres",
         async move {

@@ -291,7 +291,7 @@ pub fn fingerprint_object_store_request(
         &request.authenticated_cell_id,
         &request.authenticated_tenant_id,
     ] {
-        validate_canonical_id(id).map_err(|_| RequestContractError::InvalidCanonicalText)?;
+        validate_canonical_id(id).map_err(|_err| RequestContractError::InvalidCanonicalText)?;
     }
     // Cell admission is all-or-none, mirroring migration 0007's
     // CHECK (num_nonnulls(cell_admission_id, cell_admission_fence) IN (0, 2)). The cell authority
@@ -308,7 +308,7 @@ pub fn fingerprint_object_store_request(
                 limits.identity.max_identity_bytes,
             )?;
             validate_canonical_id(&request.cell_admission_id)
-                .map_err(|_| RequestContractError::InvalidCanonicalText)?;
+                .map_err(|_err| RequestContractError::InvalidCanonicalText)?;
         }
         _ => return Err(RequestContractError::AuthorityMismatch),
     }
@@ -362,8 +362,9 @@ pub fn fingerprint_object_store_request(
     writer.text(&request.cell_admission_id)?;
     writer.u64(request.cell_admission_fence)?;
     writer.u64(request.deadline_unix_ms as u64)?;
-    writer
-        .u32(u32::try_from(reservations.len()).map_err(|_| RequestContractError::InvalidLimits)?)?;
+    writer.u32(
+        u32::try_from(reservations.len()).map_err(|_err| RequestContractError::InvalidLimits)?,
+    )?;
     for reservation in &reservations {
         writer.text(&reservation.reservation_id)?;
         writer.text(&reservation.physical_dimension_id)?;
@@ -527,7 +528,7 @@ fn validate_limits(limits: &RequestFingerprintLimits) -> Result<(), RequestContr
     let mut allowed = HashSet::new();
     for key in &limits.operation.allowed_metadata_keys {
         validate_metadata_key(key, &limits.operation)
-            .map_err(|_| RequestContractError::InvalidLimits)?;
+            .map_err(|_err| RequestContractError::InvalidLimits)?;
         if !allowed.insert(key) {
             return Err(RequestContractError::InvalidLimits);
         }
@@ -609,7 +610,7 @@ fn validate_expected_authority(
         &request.authenticated_cell_id,
         &request.authenticated_tenant_id,
     ] {
-        validate_canonical_id(id).map_err(|_| RequestContractError::InvalidCanonicalText)?;
+        validate_canonical_id(id).map_err(|_err| RequestContractError::InvalidCanonicalText)?;
     }
     if expected.allocation_fence == 0
         || request.protocol_revision != expected.protocol_revision
@@ -639,7 +640,7 @@ fn validate_expected_admission(
     };
     validate_canonical_text(&expected.cell_admission_id, limits.max_identity_bytes)?;
     validate_canonical_id(&expected.cell_admission_id)
-        .map_err(|_| RequestContractError::InvalidCanonicalText)?;
+        .map_err(|_err| RequestContractError::InvalidCanonicalText)?;
     if expected.cell_admission_fence == 0
         || request.cell_admission_id != expected.cell_admission_id
         || request.cell_admission_fence != expected.cell_admission_fence
@@ -662,17 +663,17 @@ fn validate_and_sort_reservations<'a>(
     let mut pairs = HashSet::new();
     for reservation in reservations {
         validate_canonical_text(&reservation.reservation_id, limits.max_reservation_id_bytes)
-            .map_err(|_| RequestContractError::InvalidReservations)?;
+            .map_err(|_err| RequestContractError::InvalidReservations)?;
         validate_canonical_text(
             &reservation.physical_dimension_id,
             limits.max_physical_dimension_id_bytes,
         )
-        .map_err(|_| RequestContractError::InvalidReservations)?;
+        .map_err(|_err| RequestContractError::InvalidReservations)?;
         validate_canonical_text(
             &reservation.operation_class_id,
             limits.max_operation_class_id_bytes,
         )
-        .map_err(|_| RequestContractError::InvalidReservations)?;
+        .map_err(|_err| RequestContractError::InvalidReservations)?;
         if reservation.units == 0
             || !ids.insert(reservation.reservation_id.as_str())
             || !pairs.insert((
@@ -706,12 +707,12 @@ fn validate_reservation_requirements(
             &requirement.physical_dimension_id,
             limits.max_physical_dimension_id_bytes,
         )
-        .map_err(|_| RequestContractError::InvalidReservations)?;
+        .map_err(|_err| RequestContractError::InvalidReservations)?;
         validate_canonical_text(
             &requirement.operation_class_id,
             limits.max_operation_class_id_bytes,
         )
-        .map_err(|_| RequestContractError::InvalidReservations)?;
+        .map_err(|_err| RequestContractError::InvalidReservations)?;
         if requirement.units == 0
             || !required_pairs.insert((
                 requirement.physical_dimension_id.as_str(),
@@ -817,9 +818,9 @@ fn validate_and_encode_result_consumer_context(
                 context.association_epoch,
             ) {
                 validate_canonical_text(repository_id, limits.max_identity_bytes)
-                    .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+                    .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
                 validate_canonical_text(association_context, limits.max_identity_bytes)
-                    .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+                    .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
                 if generation == 0 || epoch == 0 {
                     return Err(RequestContractError::InvalidConsumerContext);
                 }
@@ -837,7 +838,7 @@ fn validate_and_encode_result_consumer_context(
             }
             if let (Some(lease), Some(fence)) = (&context.reader_lease_id, context.reader_fence) {
                 validate_canonical_text(lease, limits.max_identity_bytes)
-                    .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+                    .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
                 if fence == 0 {
                     return Err(RequestContractError::InvalidConsumerContext);
                 }
@@ -872,7 +873,7 @@ fn validate_and_encode_result_consumer_context(
                 &context.startup_attempt_id,
             ] {
                 validate_canonical_text(value, limits.max_identity_bytes)
-                    .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+                    .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
             }
             Ok((
                 2,
@@ -888,7 +889,7 @@ fn validate_and_encode_result_consumer_context(
         }
         result_consumer_context_v1::Consumer::DurableConsumer(context) => {
             validate_canonical_text(&context.operation_id, limits.max_identity_bytes)
-                .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+                .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
             if context.checkpoint_revision == 0 || context.checkpoint_fence == 0 {
                 return Err(RequestContractError::InvalidConsumerContext);
             }
@@ -930,7 +931,7 @@ fn reconstruct_authenticated_scope(
         &identity.principal_id,
     ] {
         validate_canonical_text(value, limits.max_identity_bytes)
-            .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+            .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
     }
     let encode = |value: &str| URL_SAFE_NO_PAD.encode(value.as_bytes());
     let scope = format!(
@@ -941,7 +942,7 @@ fn reconstruct_authenticated_scope(
         encode(&identity.principal_id),
     );
     validate_canonical_text(&scope, limits.max_authenticated_scope_bytes)
-        .map_err(|_| RequestContractError::InvalidConsumerContext)?;
+        .map_err(|_err| RequestContractError::InvalidConsumerContext)?;
     Ok(scope)
 }
 
@@ -1021,7 +1022,7 @@ fn validate_and_encode_operation(
             validate_bucket(&value.bucket, limits)?;
             validate_raw_text(&value.key, limits.max_key_bytes, false)?;
             validate_canonical_text(&value.durable_body_handle, limits.max_body_handle_bytes)
-                .map_err(|_| RequestContractError::InvalidOperation)?;
+                .map_err(|_err| RequestContractError::InvalidOperation)?;
             if value.body_size > limits.max_body_bytes || value.body_blake3.len() != 32 {
                 return Err(RequestContractError::InvalidOperation);
             }
@@ -1035,7 +1036,7 @@ fn validate_and_encode_operation(
                 CanonicalPart::Bytes(value.body_blake3.to_vec()),
                 CanonicalPart::U32(
                     u32::try_from(metadata.len())
-                        .map_err(|_| RequestContractError::InvalidLimits)?,
+                        .map_err(|_err| RequestContractError::InvalidLimits)?,
                 ),
             ];
             for entry in metadata {
@@ -1201,7 +1202,7 @@ fn validate_put_spool(
     match (request.operation.as_ref(), expected) {
         (Some(object_store_request_v1::Operation::PutObject(put)), Some(expected)) => {
             validate_canonical_text(&expected.durable_body_handle, limits.max_body_handle_bytes)
-                .map_err(|_| RequestContractError::PutSpoolMismatch)?;
+                .map_err(|_err| RequestContractError::PutSpoolMismatch)?;
             if expected.durable_body_handle != put.durable_body_handle
                 || expected.body_size != put.body_size
                 || expected.body_blake3.as_slice() != put.body_blake3.as_ref()
@@ -1246,7 +1247,7 @@ fn validate_first_seen_deadline(
 }
 
 fn parse_canonical_uuid_v7_timestamp(value: &str) -> Result<u64, RequestContractError> {
-    canonical_uuid_v7_timestamp(value).map_err(|_| RequestContractError::InvalidUuidV7)
+    canonical_uuid_v7_timestamp(value).map_err(|_err| RequestContractError::InvalidUuidV7)
 }
 
 fn validate_canonical_text(value: &str, maximum: u32) -> Result<(), RequestContractError> {
@@ -1338,7 +1339,8 @@ impl CanonicalWriter {
     }
 
     fn bytes(&mut self, value: &[u8]) -> Result<(), RequestContractError> {
-        let length = u32::try_from(value.len()).map_err(|_| RequestContractError::InvalidLimits)?;
+        let length =
+            u32::try_from(value.len()).map_err(|_err| RequestContractError::InvalidLimits)?;
         self.u32(length)?;
         self.raw(value)
     }

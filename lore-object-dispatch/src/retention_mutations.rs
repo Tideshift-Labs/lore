@@ -9,7 +9,7 @@
 /// Frozen retention mutation API revision.
 pub const RETENTION_MUTATIONS_API_REVISION_V1: &str = "object-store-retention-mutations-v1";
 
-/// Exact PostgreSQL mutation migration bytes, embedded for image/provisioning parity only.
+/// Exact `PostgreSQL` mutation migration bytes, embedded for image/provisioning parity only.
 pub const RETENTION_MUTATIONS_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0005_object_store_retention_mutations.sql");
 

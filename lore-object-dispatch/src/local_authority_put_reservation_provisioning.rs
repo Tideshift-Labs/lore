@@ -6,7 +6,7 @@
 //! Runtime code neither installs nor calls this migration. Provisioning must apply and attest its
 //! exact bytes after the frozen core authority, codec, and PUT-reservation schema artifacts.
 
-/// Exact PostgreSQL PUT-reservation provisioning migration bytes.
+/// Exact `PostgreSQL` PUT-reservation provisioning migration bytes.
 pub const LOCAL_AUTHORITY_PUT_RESERVATION_PROVISIONING_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql");
 

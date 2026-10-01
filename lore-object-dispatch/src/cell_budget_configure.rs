@@ -100,7 +100,7 @@ impl LocalBudgetConfiguration {
             return Err(BudgetConfigureError::InvalidConfiguration);
         }
         let value: Self = serde_json::from_slice(bytes)
-            .map_err(|_| BudgetConfigureError::InvalidConfiguration)?;
+            .map_err(|_err| BudgetConfigureError::InvalidConfiguration)?;
         value.validate()?;
         Ok(value)
     }
@@ -169,7 +169,7 @@ impl LocalBudgetConfiguration {
             None if self.allocation_fence == 1 => {}
             Some(prior) if prior.allocation_fence.checked_add(1) == Some(self.allocation_fence) => {
                 Uuid::parse_str(&prior.disposition_id)
-                    .map_err(|_| BudgetConfigureError::InvalidConfiguration)?;
+                    .map_err(|_err| BudgetConfigureError::InvalidConfiguration)?;
                 digest_bytes(&prior.disposition_digest)?;
                 digest_bytes(&prior.envelope_digest)?;
             }
@@ -182,9 +182,9 @@ impl LocalBudgetConfiguration {
         let system = self
             .system_identifier
             .parse()
-            .map_err(|_| BudgetConfigureError::InvalidConfiguration)?;
+            .map_err(|_err| BudgetConfigureError::InvalidConfiguration)?;
         DispatchDatabaseIdentity::new(system, self.database_oid)
-            .map_err(|_| BudgetConfigureError::InvalidConfiguration)
+            .map_err(|_err| BudgetConfigureError::InvalidConfiguration)
     }
 }
 
@@ -195,7 +195,7 @@ fn digest_bytes(value: &str) -> Result<Vec<u8>, BudgetConfigureError> {
     (0..32)
         .map(|i| {
             u8::from_str_radix(&value[i * 2..i * 2 + 2], 16)
-                .map_err(|_| BudgetConfigureError::InvalidConfiguration)
+                .map_err(|_err| BudgetConfigureError::InvalidConfiguration)
         })
         .collect()
 }
@@ -224,7 +224,7 @@ pub async fn configure_budget(
         configure_budget_inner(config, url, tls, action),
     )
     .await
-    .map_err(|_| match action {
+    .map_err(|_err| match action {
         BudgetAction::Publish => BudgetConfigureError::OutcomeUnknown,
         BudgetAction::Verify | BudgetAction::Reconcile => BudgetConfigureError::AuthorityRefused,
     })?
@@ -248,40 +248,40 @@ async fn configure_budget_inner(
         lock_timeout: Duration::from_secs(2),
         tls,
         budget: DispatchConnectionBudget::new(1, 1, 1, 1, 1, 0)
-            .map_err(|_| BudgetConfigureError::InvalidConfiguration)?,
+            .map_err(|_err| BudgetConfigureError::InvalidConfiguration)?,
     })
-    .map_err(|_| BudgetConfigureError::ConnectionRefused)?;
+    .map_err(|_err| BudgetConfigureError::ConnectionRefused)?;
     let mut lease = pool
         .acquire()
         .await
-        .map_err(|_| BudgetConfigureError::ConnectionRefused)?;
+        .map_err(|_err| BudgetConfigureError::ConnectionRefused)?;
     let transaction = lease
         .client()
-        .map_err(|_| BudgetConfigureError::ConnectionRefused)?
+        .map_err(|_err| BudgetConfigureError::ConnectionRefused)?
         .build_transaction()
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await
-        .map_err(|_| BudgetConfigureError::AuthorityRefused)?;
+        .map_err(|_err| BudgetConfigureError::AuthorityRefused)?;
     transaction
         .batch_execute(&pool.bounded_execution_preamble())
         .await
-        .map_err(|_| BudgetConfigureError::AuthorityRefused)?;
+        .map_err(|_err| BudgetConfigureError::AuthorityRefused)?;
     let now: i64 = transaction
         .query_one(
             "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
             &[],
         )
         .await
-        .map_err(|_| BudgetConfigureError::AuthorityRefused)?
+        .map_err(|_err| BudgetConfigureError::AuthorityRefused)?
         .try_get(0)
-        .map_err(|_| BudgetConfigureError::AuthorityRefused)?;
+        .map_err(|_err| BudgetConfigureError::AuthorityRefused)?;
     let expired = now >= config.hard_expires_at_unix_ms;
     if now < config.issued_at_unix_ms || (expired && action != BudgetAction::Reconcile) {
         return Err(BudgetConfigureError::InvalidConfiguration);
     }
     let canonical =
-        serde_json::to_vec(config).map_err(|_| BudgetConfigureError::InvalidConfiguration)?;
+        serde_json::to_vec(config).map_err(|_err| BudgetConfigureError::InvalidConfiguration)?;
     let core = digest("Commit0 local development budget core v1", &canonical);
     let disposition = digest(
         "Commit0 local development no-cache disposition v1",
@@ -310,7 +310,7 @@ async fn configure_budget_inner(
         })
         .collect::<Vec<_>>();
     let caps =
-        serde_json::to_string(&caps).map_err(|_| BudgetConfigureError::InvalidConfiguration)?;
+        serde_json::to_string(&caps).map_err(|_err| BudgetConfigureError::InvalidConfiguration)?;
     let vector = digest(
         "Commit0 local development budget vector v1",
         dimensions.as_bytes(),
@@ -320,7 +320,7 @@ async fn configure_budget_inner(
         .as_ref()
         .map(|p| Uuid::parse_str(&p.disposition_id))
         .transpose()
-        .map_err(|_| BudgetConfigureError::InvalidConfiguration)?;
+        .map_err(|_err| BudgetConfigureError::InvalidConfiguration)?;
     let prior_disposition = config
         .predecessor
         .as_ref()
@@ -360,15 +360,15 @@ async fn configure_budget_inner(
             ],
         )
         .await
-        .map_err(|_| BudgetConfigureError::AuthorityRefused)?;
+        .map_err(|_err| BudgetConfigureError::AuthorityRefused)?;
     let code: String = row
         .try_get("result_code")
-        .map_err(|_| BudgetConfigureError::AuthorityRefused)?;
+        .map_err(|_err| BudgetConfigureError::AuthorityRefused)?;
     if action != BudgetAction::Publish {
         transaction
             .rollback()
             .await
-            .map_err(|_| BudgetConfigureError::AuthorityRefused)?;
+            .map_err(|_err| BudgetConfigureError::AuthorityRefused)?;
         if code != "REPLAY" {
             return Err(BudgetConfigureError::NotPublished);
         }
@@ -379,7 +379,7 @@ async fn configure_budget_inner(
         transaction
             .commit()
             .await
-            .map_err(|_| BudgetConfigureError::OutcomeUnknown)?;
+            .map_err(|_err| BudgetConfigureError::OutcomeUnknown)?;
     }
     Ok(BudgetReceipt {
         result: match action {

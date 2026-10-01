@@ -549,7 +549,7 @@ fn all_five_states_accept_only_the_six_frozen_evidence_masks() {
             }
             let expected = matches!(
                 (state, mask),
-                (1, 0) | (2, 1) | (3, 10) | (4, 4) | (5, 6) | (5, 10)
+                (1, 0) | (2, 1) | (3 | 5, 10) | (4, 4) | (5, 6)
             );
             assert_eq!(
                 encode(&value).is_ok(),
@@ -817,7 +817,7 @@ fn no_dispatch_proof_requires_semantic_reason_uuid_time_fence_epoch_and_digest()
 
 /// WP-114 CD-6, ACK side: the durable-side twin of `ProviderAttemptLedger::record_no_dispatch`'s
 /// ledger/request binding. An ACK for request A must refuse a nested no-dispatch proof that is
-/// otherwise perfectly valid -- correct reason, canonical UUIDv7 proof ID, positive fence/epoch,
+/// otherwise perfectly valid -- correct reason, canonical `UUIDv7` proof ID, positive fence/epoch,
 /// a digest that matches its own (mutated) fields, and timing that would satisfy
 /// `InvalidTimeProjection`'s check -- but was minted for a different request B.
 #[test]

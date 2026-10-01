@@ -45,14 +45,14 @@ fn function_body<'a>(sql: &'a str, function_name: &str) -> &'a str {
     let start = sql
         .find(function_name)
         .unwrap_or_else(|| panic!("missing function: {function_name}"));
-    let body_start = sql[start..]
-        .find("AS $$")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing function body: {function_name}"));
-    let body_end = sql[body_start + 5..]
-        .find("\n$$;")
-        .map(|offset| body_start + 5 + offset)
-        .unwrap_or_else(|| panic!("missing function body terminator: {function_name}"));
+    let body_start = sql[start..].find("AS $$").map_or_else(
+        || panic!("missing function body: {function_name}"),
+        |offset| start + offset,
+    );
+    let body_end = sql[body_start + 5..].find("\n$$;").map_or_else(
+        || panic!("missing function body terminator: {function_name}"),
+        |offset| body_start + 5 + offset,
+    );
     &sql[body_start..body_end]
 }
 
@@ -233,18 +233,22 @@ fn exact_lookup_provider(entries: &[(&[u8], &[u8; 32])]) -> String {
 
 fn sql_ack_call(value: &ReservePutAckV1) -> String {
     let spool = value.spool_ready.as_ref();
-    let durable_handle = spool
-        .map(|spool| format!("'{}'::text", spool.durable_body_handle))
-        .unwrap_or_else(|| "NULL::text".to_string());
-    let body_size = spool
-        .map(|spool| format!("{}::object_store_retention.uint64", spool.body_size))
-        .unwrap_or_else(|| "NULL::object_store_retention.uint64".to_string());
-    let body_blake3 = spool
-        .map(|spool| format!("pg_catalog.decode('{}', 'hex')", hex(&spool.body_blake3)))
-        .unwrap_or_else(|| "NULL::bytea".to_string());
-    let ready_at = spool
-        .map(|spool| format!("{}::bigint", spool.ready_at_unix_ms))
-        .unwrap_or_else(|| "NULL::bigint".to_string());
+    let durable_handle = spool.map_or_else(
+        || "NULL::text".to_string(),
+        |spool| format!("'{}'::text", spool.durable_body_handle),
+    );
+    let body_size = spool.map_or_else(
+        || "NULL::object_store_retention.uint64".to_string(),
+        |spool| format!("{}::object_store_retention.uint64", spool.body_size),
+    );
+    let body_blake3 = spool.map_or_else(
+        || "NULL::bytea".to_string(),
+        |spool| format!("pg_catalog.decode('{}', 'hex')", hex(&spool.body_blake3)),
+    );
+    let ready_at = spool.map_or_else(
+        || "NULL::bigint".to_string(),
+        |spool| format!("{}::bigint", spool.ready_at_unix_ms),
+    );
     format!(
         "SELECT (encoded).canonical_bytes, (encoded).record_blake3\n\
            FROM (SELECT object_store_retention.local_reserve_put_ack_v1(\n\

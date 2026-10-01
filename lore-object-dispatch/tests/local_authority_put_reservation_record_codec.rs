@@ -4,7 +4,7 @@
 //! Static contract plus an opt-in PostgreSQL/Rust vector for the owner-only reservation-row codec.
 //!
 //! The ignored tier requires `LORE_TEST_LOCAL_PUT_RESERVATION_RECORD_CODEC_PG_URL`, an administrator
-//! URL for a fresh disposable PostgreSQL 16 database. Its exact-preimage lookup returns genuine
+//! URL for a fresh disposable `PostgreSQL` 16 database. Its exact-preimage lookup returns genuine
 //! BLAKE3 digests for this fixture only; it proves codec mechanics, not provider readiness.
 
 use std::path::Path;

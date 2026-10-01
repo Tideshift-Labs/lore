@@ -332,7 +332,7 @@ impl RetentionTlsConfig {
         let postgres = self
             .postgres_url
             .parse::<tokio_postgres::Config>()
-            .map_err(|_| RetentionError::InvalidConfiguration("invalid PostgreSQL URL"))?;
+            .map_err(|_err| RetentionError::InvalidConfiguration("invalid PostgreSQL URL"))?;
         if postgres.get_ssl_mode() != SslMode::Require {
             return Err(RetentionError::InvalidConfiguration(
                 "retention PostgreSQL requires sslmode=require",
@@ -363,10 +363,10 @@ impl RetentionTlsConfig {
         let mut root_count = 0usize;
         for certificate in rustls_pemfile::certs(&mut root_reader) {
             let certificate = certificate
-                .map_err(|_| RetentionError::InvalidTlsMaterial("invalid root CA PEM"))?;
-            roots
-                .add(certificate)
-                .map_err(|_| RetentionError::InvalidTlsMaterial("unusable root CA certificate"))?;
+                .map_err(|_err| RetentionError::InvalidTlsMaterial("invalid root CA PEM"))?;
+            roots.add(certificate).map_err(|_err| {
+                RetentionError::InvalidTlsMaterial("unusable root CA certificate")
+            })?;
             root_count = root_count.saturating_add(1);
         }
         if root_count == 0 {
@@ -377,7 +377,7 @@ impl RetentionTlsConfig {
         let mut certificate_reader = Cursor::new(self.client_certificate_chain_pem.as_bytes());
         let certificates = rustls_pemfile::certs(&mut certificate_reader)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| RetentionError::InvalidTlsMaterial("invalid client certificate PEM"))?;
+            .map_err(|_err| RetentionError::InvalidTlsMaterial("invalid client certificate PEM"))?;
         if certificates.is_empty() {
             return Err(RetentionError::InvalidTlsMaterial(
                 "client certificate chain is empty",
@@ -385,17 +385,17 @@ impl RetentionTlsConfig {
         }
         let mut key_reader = Cursor::new(self.private_key_pem.as_bytes());
         let private_key = rustls_pemfile::private_key(&mut key_reader)
-            .map_err(|_| RetentionError::InvalidTlsMaterial("invalid client private key PEM"))?
+            .map_err(|_err| RetentionError::InvalidTlsMaterial("invalid client private key PEM"))?
             .ok_or(RetentionError::InvalidTlsMaterial(
                 "client private key is empty",
             ))?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let tls = ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
-            .map_err(|_| RetentionError::InvalidTlsMaterial("unsupported TLS protocol set"))?
+            .map_err(|_err| RetentionError::InvalidTlsMaterial("unsupported TLS protocol set"))?
             .with_root_certificates(roots)
             .with_client_auth_cert(certificates, private_key)
-            .map_err(|_| {
+            .map_err(|_err| {
                 RetentionError::InvalidTlsMaterial("client certificate and key do not match")
             })?;
         Ok((postgres, MakeRustlsConnect::new(tls)))
@@ -580,7 +580,7 @@ impl RetentionMaintenanceClient {
         let (client, connection) =
             tokio::time::timeout(config.connect_timeout, postgres.connect(tls))
                 .await
-                .map_err(|_| RetentionError::ConnectTimeout)?
+                .map_err(|_err| RetentionError::ConnectTimeout)?
                 .map_err(RetentionError::postgres)?;
         let connection_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
             "object-store-retention-postgres",
@@ -619,17 +619,16 @@ impl RetentionMaintenanceClient {
         logical_request_id: Uuid,
         attempt_id: Uuid,
     ) -> Result<RetentionTransferSnapshot, RetentionError> {
-        match tokio::time::timeout(
+        if let Ok(result) = tokio::time::timeout(
             self.operation_timeout,
             self.read_transfer_once(logical_request_id, attempt_id),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self.reconnect().await;
-                Err(RetentionError::OperationTimeout)
-            }
+            result
+        } else {
+            let _ = self.reconnect().await;
+            Err(RetentionError::OperationTimeout)
         }
     }
 
@@ -677,17 +676,16 @@ impl RetentionMaintenanceClient {
                 "compact sequence must be positive",
             ));
         }
-        match tokio::time::timeout(
+        if let Ok(result) = tokio::time::timeout(
             self.operation_timeout,
             self.read_prune_once(compact_sequence),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => {
-                let _ = self.reconnect().await;
-                Err(RetentionError::OperationTimeout)
-            }
+            result
+        } else {
+            let _ = self.reconnect().await;
+            Err(RetentionError::OperationTimeout)
         }
     }
 
@@ -766,7 +764,7 @@ impl RetentionMaintenanceClient {
             policy,
             lifecycle: &lifecycle,
         })
-        .map_err(|_| RetentionError::PlannerMismatch)?;
+        .map_err(|_err| RetentionError::PlannerMismatch)?;
         if full.ownership.source_authority_blake3 != *expected_source_authority_blake3
             || recomputed != *decision
             || expected_counter_revisions.global != snapshot.global_counter.counter_revision
@@ -820,28 +818,27 @@ impl RetentionMaintenanceClient {
                 self.run_transfer_attempt(&prepared, attempt),
             )
             .await;
-            let outcome = match attempt_result {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    if self.reconnect().await.is_err() {
-                        return Err(RetentionError::AmbiguousCommit);
-                    }
-                    let readback = self
-                        .read_transfer(full.logical_request_id, full.attempt_id)
-                        .await
-                        .map_err(|_| RetentionError::AmbiguousCommit)?;
-                    if let Some(adopted) = transfer_adoption_from_readback(&readback, &prepared) {
-                        return Ok(adopted);
-                    }
-                    if readback.state != RetentionTransferState::FullOwned
-                        || attempt == REQUIRED_MUTATION_RETRY_ATTEMPTS
-                    {
-                        return Err(RetentionError::AmbiguousCommit);
-                    }
-                    MutationAttempt::Retry(
-                        retry_delay_for_attempt(attempt).ok_or(RetentionError::AmbiguousCommit)?,
-                    )
+            let outcome = if let Ok(outcome) = attempt_result {
+                outcome
+            } else {
+                if self.reconnect().await.is_err() {
+                    return Err(RetentionError::AmbiguousCommit);
                 }
+                let readback = self
+                    .read_transfer(full.logical_request_id, full.attempt_id)
+                    .await
+                    .map_err(|_err| RetentionError::AmbiguousCommit)?;
+                if let Some(adopted) = transfer_adoption_from_readback(&readback, &prepared) {
+                    return Ok(adopted);
+                }
+                if readback.state != RetentionTransferState::FullOwned
+                    || attempt == REQUIRED_MUTATION_RETRY_ATTEMPTS
+                {
+                    return Err(RetentionError::AmbiguousCommit);
+                }
+                MutationAttempt::Retry(
+                    retry_delay_for_attempt(attempt).ok_or(RetentionError::AmbiguousCommit)?,
+                )
             };
             match outcome {
                 MutationAttempt::Committed(result) => return Ok(result),
@@ -855,7 +852,7 @@ impl RetentionMaintenanceClient {
                     let readback = self
                         .read_transfer(full.logical_request_id, full.attempt_id)
                         .await
-                        .map_err(|_| RetentionError::AmbiguousCommit)?;
+                        .map_err(|_err| RetentionError::AmbiguousCommit)?;
                     if transfer_readback_matches(&readback, &precommit) {
                         return Ok(precommit);
                     }
@@ -920,7 +917,7 @@ impl RetentionMaintenanceClient {
             cell_counter: cell,
             tenant_counter: tenant,
         })
-        .map_err(|_| RetentionError::PlannerMismatch)?;
+        .map_err(|_err| RetentionError::PlannerMismatch)?;
         if installed.compact_receipt_bytes != compact.canonical_bytes()
             || recomputed != *decision
             || installed.compact_blake3 != *compact.compact_blake3()
@@ -971,31 +968,30 @@ impl RetentionMaintenanceClient {
                 self.run_prune_attempt(&prepared, attempt),
             )
             .await;
-            let outcome = match attempt_result {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    if self.reconnect().await.is_err() {
-                        return Err(RetentionError::AmbiguousCommit);
-                    }
-                    let readback = self
-                        .read_prune(installed.compact_sequence)
-                        .await
-                        .map_err(|_| RetentionError::AmbiguousCommit)?;
-                    if let Some(receipt) = readback
-                        .prune_receipt
-                        .filter(|receipt| prune_result_matches(receipt, &prepared))
-                    {
-                        return Ok(receipt);
-                    }
-                    if readback.state != RetentionPruneState::CompactInstalled
-                        || attempt == REQUIRED_MUTATION_RETRY_ATTEMPTS
-                    {
-                        return Err(RetentionError::AmbiguousCommit);
-                    }
-                    MutationAttempt::Retry(
-                        retry_delay_for_attempt(attempt).ok_or(RetentionError::AmbiguousCommit)?,
-                    )
+            let outcome = if let Ok(outcome) = attempt_result {
+                outcome
+            } else {
+                if self.reconnect().await.is_err() {
+                    return Err(RetentionError::AmbiguousCommit);
                 }
+                let readback = self
+                    .read_prune(installed.compact_sequence)
+                    .await
+                    .map_err(|_err| RetentionError::AmbiguousCommit)?;
+                if let Some(receipt) = readback
+                    .prune_receipt
+                    .filter(|receipt| prune_result_matches(receipt, &prepared))
+                {
+                    return Ok(receipt);
+                }
+                if readback.state != RetentionPruneState::CompactInstalled
+                    || attempt == REQUIRED_MUTATION_RETRY_ATTEMPTS
+                {
+                    return Err(RetentionError::AmbiguousCommit);
+                }
+                MutationAttempt::Retry(
+                    retry_delay_for_attempt(attempt).ok_or(RetentionError::AmbiguousCommit)?,
+                )
             };
             match outcome {
                 MutationAttempt::Committed(result) => return Ok(result),
@@ -1007,7 +1003,7 @@ impl RetentionMaintenanceClient {
                     let readback = self
                         .read_prune(installed.compact_sequence)
                         .await
-                        .map_err(|_| RetentionError::AmbiguousCommit)?;
+                        .map_err(|_err| RetentionError::AmbiguousCommit)?;
                     if readback.prune_receipt.as_ref() == Some(&precommit) {
                         return Ok(precommit);
                     }
@@ -1197,7 +1193,7 @@ fn validate_duration(value: Duration, message: &'static str) -> Result<(), Reten
 
 fn millis(value: Duration) -> Result<u64, RetentionError> {
     u64::try_from(value.as_millis())
-        .map_err(|_| RetentionError::InvalidConfiguration("timeout is too large"))
+        .map_err(|_err| RetentionError::InvalidConfiguration("timeout is too large"))
 }
 
 fn is_dns_name(host: &str) -> bool {
@@ -1401,7 +1397,7 @@ fn parse_u64(value: Option<String>, field: &'static str) -> Result<u64, Retentio
     let value = value.ok_or(RetentionError::InvalidResponse(field))?;
     let parsed = value
         .parse::<u64>()
-        .map_err(|_| RetentionError::InvalidResponse(field))?;
+        .map_err(|_err| RetentionError::InvalidResponse(field))?;
     if parsed.to_string() != value {
         return Err(RetentionError::InvalidResponse(field));
     }
@@ -1412,7 +1408,7 @@ fn parse_digest(value: Option<Vec<u8>>, field: &'static str) -> Result<[u8; 32],
     value
         .ok_or(RetentionError::InvalidResponse(field))?
         .try_into()
-        .map_err(|_| RetentionError::InvalidResponse(field))
+        .map_err(|_err| RetentionError::InvalidResponse(field))
 }
 
 fn canonical_bytes_match_digest(bytes: &[u8], digest: &[u8; 32]) -> bool {
@@ -1437,10 +1433,10 @@ fn parse_watermark(
         last_compact_blake3: optional_digest(row.try_get(start + 3).ok(), "last compact digest")?,
         last_pruned_at_unix_ms: row
             .try_get(start + 4)
-            .map_err(|_| RetentionError::InvalidResponse("last pruned time"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("last pruned time"))?,
         last_backup_revision: row
             .try_get(start + 5)
-            .map_err(|_| RetentionError::InvalidResponse("last backup revision"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("last backup revision"))?,
         last_backup_manifest_blake3: optional_digest(
             row.try_get(start + 6).ok(),
             "last backup digest",
@@ -1458,7 +1454,7 @@ fn optional_digest(
         .map(|bytes| {
             bytes
                 .try_into()
-                .map_err(|_| RetentionError::InvalidResponse(field))
+                .map_err(|_err| RetentionError::InvalidResponse(field))
         })
         .transpose()
 }
@@ -1469,7 +1465,7 @@ fn parse_counter(
 ) -> Result<Option<ObjectStoreRecordStorageCounter>, RetentionError> {
     let scope_kind: Option<i16> = row
         .try_get(start)
-        .map_err(|_| RetentionError::InvalidResponse("counter scope kind"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("counter scope kind"))?;
     let Some(scope_kind) = scope_kind else {
         return Ok(None);
     };
@@ -1483,7 +1479,7 @@ fn parse_counter(
         scope,
         scope_id: row
             .try_get(start + 1)
-            .map_err(|_| RetentionError::InvalidResponse("counter scope id"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("counter scope id"))?,
         full_record_rows: parse_u64(row.try_get(start + 2).ok(), "counter full rows")?,
         full_record_bytes: parse_u64(row.try_get(start + 3).ok(), "counter full bytes")?,
         compact_rows: parse_u64(row.try_get(start + 4).ok(), "counter compact rows")?,
@@ -1500,13 +1496,13 @@ fn parse_compact(
 ) -> Result<Option<RetentionCompactRecordSnapshot>, RetentionError> {
     let sequence: Option<String> = row
         .try_get(start)
-        .map_err(|_| RetentionError::InvalidResponse("compact sequence"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("compact sequence"))?;
     let Some(sequence) = sequence else {
         return Ok(None);
     };
     let compact_receipt_bytes: Vec<u8> = row
         .try_get(start + 7)
-        .map_err(|_| RetentionError::InvalidResponse("compact receipt"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("compact receipt"))?;
     let compact_bytes = parse_u64(row.try_get(start + 10).ok(), "compact bytes")?;
     let compact_blake3 = parse_digest(row.try_get(start + 8).ok(), "compact digest")?;
     if usize::try_from(compact_bytes).ok() != Some(compact_receipt_bytes.len())
@@ -1517,22 +1513,22 @@ fn parse_compact(
     let compact = RetentionCompactRecordSnapshot {
         compact_sequence: sequence
             .parse()
-            .map_err(|_| RetentionError::InvalidResponse("compact sequence"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compact sequence"))?,
         logical_request_id: row
             .try_get(start + 1)
-            .map_err(|_| RetentionError::InvalidResponse("compact request id"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compact request id"))?,
         attempt_id: row
             .try_get(start + 2)
-            .map_err(|_| RetentionError::InvalidResponse("compact attempt id"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compact attempt id"))?,
         provider_boundary_id: row
             .try_get(start + 3)
-            .map_err(|_| RetentionError::InvalidResponse("compact boundary"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compact boundary"))?,
         authenticated_cell_id: row
             .try_get(start + 4)
-            .map_err(|_| RetentionError::InvalidResponse("compact cell"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compact cell"))?,
         authenticated_tenant_id: row
             .try_get(start + 5)
-            .map_err(|_| RetentionError::InvalidResponse("compact tenant"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compact tenant"))?,
         source_authority_blake3: parse_digest(
             row.try_get(start + 6).ok(),
             "compact source digest",
@@ -1549,10 +1545,10 @@ fn parse_compact(
         transfer_fingerprint: parse_digest(row.try_get(start + 13).ok(), "transfer fingerprint")?,
         compacted_at_unix_ms: row
             .try_get(start + 14)
-            .map_err(|_| RetentionError::InvalidResponse("compacted time"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("compacted time"))?,
         compact_prune_after_unix_ms: row
             .try_get(start + 15)
-            .map_err(|_| RetentionError::InvalidResponse("prune floor"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune floor"))?,
     };
     validate_compact_projection(&compact)?;
     Ok(Some(compact))
@@ -1561,23 +1557,23 @@ fn parse_compact(
 fn parse_transfer_snapshot(row: &Row) -> Result<RetentionTransferSnapshot, RetentionError> {
     let state_text: String = row
         .try_get(0)
-        .map_err(|_| RetentionError::InvalidResponse("transfer state"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("transfer state"))?;
     let full_request: Option<Uuid> = row
         .try_get(1)
-        .map_err(|_| RetentionError::InvalidResponse("full request id"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("full request id"))?;
     let full_record = if let Some(logical_request_id) = full_request {
         let attempt_id = row
             .try_get(2)
-            .map_err(|_| RetentionError::InvalidResponse("full attempt id"))?;
+            .map_err(|_err| RetentionError::InvalidResponse("full attempt id"))?;
         let provider_boundary_id = row
             .try_get(3)
-            .map_err(|_| RetentionError::InvalidResponse("full boundary"))?;
+            .map_err(|_err| RetentionError::InvalidResponse("full boundary"))?;
         let authenticated_cell_id = row
             .try_get(4)
-            .map_err(|_| RetentionError::InvalidResponse("full cell"))?;
+            .map_err(|_err| RetentionError::InvalidResponse("full cell"))?;
         let authenticated_tenant_id = row
             .try_get(5)
-            .map_err(|_| RetentionError::InvalidResponse("full tenant"))?;
+            .map_err(|_err| RetentionError::InvalidResponse("full tenant"))?;
         let full = RetentionFullRecordSnapshot {
             logical_request_id,
             attempt_id,
@@ -1595,10 +1591,10 @@ fn parse_transfer_snapshot(row: &Row) -> Result<RetentionTransferSnapshot, Reten
             ownership_revision: parse_u64(row.try_get(10).ok(), "ownership revision")?,
             closure_committed_at_unix_ms: row
                 .try_get(11)
-                .map_err(|_| RetentionError::InvalidResponse("closure time"))?,
+                .map_err(|_err| RetentionError::InvalidResponse("closure time"))?,
             created_at_unix_ms: row
                 .try_get(12)
-                .map_err(|_| RetentionError::InvalidResponse("created time"))?,
+                .map_err(|_err| RetentionError::InvalidResponse("created time"))?,
         };
         validate_full_projection(&full)?;
         Some(full)
@@ -1630,13 +1626,7 @@ fn parse_transfer_snapshot(row: &Row) -> Result<RetentionTransferSnapshot, Reten
                 && cell_counter.is_some()
                 && tenant_counter.is_some()
         }
-        RetentionTransferState::Absent => {
-            full_record.is_none()
-                && compact_record.is_none()
-                && cell_counter.is_none()
-                && tenant_counter.is_none()
-        }
-        RetentionTransferState::Conflict => {
+        RetentionTransferState::Absent | RetentionTransferState::Conflict => {
             full_record.is_none()
                 && compact_record.is_none()
                 && cell_counter.is_none()
@@ -1684,11 +1674,11 @@ fn parse_transfer_snapshot(row: &Row) -> Result<RetentionTransferSnapshot, Reten
 fn parse_prune_snapshot(row: &Row) -> Result<RetentionPruneSnapshot, RetentionError> {
     let state_text: String = row
         .try_get(0)
-        .map_err(|_| RetentionError::InvalidResponse("prune state"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("prune state"))?;
     let compact_record = parse_compact(row, 1)?;
     let receipt_sequence: Option<String> = row
         .try_get(17)
-        .map_err(|_| RetentionError::InvalidResponse("receipt sequence"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("receipt sequence"))?;
     let watermark = parse_watermark(row, 34)?;
     let global_counter =
         parse_counter(row, 41)?.ok_or(RetentionError::InvalidResponse("global counter"))?;
@@ -1708,22 +1698,22 @@ fn parse_prune_snapshot(row: &Row) -> Result<RetentionPruneSnapshot, RetentionEr
             Ok(RetentionPruneReceiptSnapshot {
                 compact_sequence: sequence
                     .parse()
-                    .map_err(|_| RetentionError::InvalidResponse("receipt sequence"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt sequence"))?,
                 logical_request_id: row
                     .try_get(18)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt request id"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt request id"))?,
                 attempt_id: row
                     .try_get(19)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt attempt id"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt attempt id"))?,
                 provider_boundary_id: row
                     .try_get(20)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt boundary"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt boundary"))?,
                 authenticated_cell_id: row
                     .try_get(21)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt cell"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt cell"))?,
                 authenticated_tenant_id: row
                     .try_get(22)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt tenant"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt tenant"))?,
                 compact_blake3: parse_digest(row.try_get(23).ok(), "receipt compact digest")?,
                 compact_rows: parse_u64(row.try_get(24).ok(), "receipt compact rows")?,
                 compact_bytes: parse_u64(row.try_get(25).ok(), "receipt compact bytes")?,
@@ -1734,7 +1724,7 @@ fn parse_prune_snapshot(row: &Row) -> Result<RetentionPruneSnapshot, RetentionEr
                 prune_fingerprint: parse_digest(row.try_get(27).ok(), "receipt prune fingerprint")?,
                 backup_revision: row
                     .try_get(28)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt backup revision"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt backup revision"))?,
                 backup_manifest_blake3: parse_digest(
                     row.try_get(29).ok(),
                     "receipt backup digest",
@@ -1749,10 +1739,10 @@ fn parse_prune_snapshot(row: &Row) -> Result<RetentionPruneSnapshot, RetentionEr
                 )?,
                 backup_observed_at_unix_ms: row
                     .try_get(32)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt backup time"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt backup time"))?,
                 pruned_at_unix_ms: row
                     .try_get(33)
-                    .map_err(|_| RetentionError::InvalidResponse("receipt prune time"))?,
+                    .map_err(|_err| RetentionError::InvalidResponse("receipt prune time"))?,
                 post_watermark,
                 post_counters,
             })
@@ -1801,7 +1791,7 @@ fn parse_prune_snapshot(row: &Row) -> Result<RetentionPruneSnapshot, RetentionEr
     }
     let database_now_unix_ms = row
         .try_get(90)
-        .map_err(|_| RetentionError::InvalidResponse("prune database time"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("prune database time"))?;
     if database_now_unix_ms < 0 {
         return Err(RetentionError::InvalidResponse("prune database time"));
     }
@@ -1820,7 +1810,7 @@ fn parse_prune_snapshot(row: &Row) -> Result<RetentionPruneSnapshot, RetentionEr
 fn parse_transfer_mutation(row: &Row) -> Result<RetentionTransferMutationResult, RetentionError> {
     let result_code: String = row
         .try_get(0)
-        .map_err(|_| RetentionError::InvalidResponse("transfer result code"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("transfer result code"))?;
     if !matches!(result_code.as_str(), "APPLIED" | "REPLAY") {
         return Err(RetentionError::InvalidResponse("transfer result code"));
     }
@@ -1902,7 +1892,7 @@ fn transfer_adoption_from_readback(
 fn parse_prune_mutation(row: &Row) -> Result<RetentionPruneReceiptSnapshot, RetentionError> {
     let result_code: String = row
         .try_get(0)
-        .map_err(|_| RetentionError::InvalidResponse("prune result code"))?;
+        .map_err(|_err| RetentionError::InvalidResponse("prune result code"))?;
     if !matches!(result_code.as_str(), "APPLIED" | "REPLAY") {
         return Err(RetentionError::InvalidResponse("prune result code"));
     }
@@ -1917,19 +1907,19 @@ fn parse_prune_mutation(row: &Row) -> Result<RetentionPruneReceiptSnapshot, Rete
         compact_sequence: parse_u64(row.try_get(1).ok(), "prune receipt sequence")?,
         logical_request_id: row
             .try_get(2)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt request id"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt request id"))?,
         attempt_id: row
             .try_get(3)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt attempt id"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt attempt id"))?,
         provider_boundary_id: row
             .try_get(4)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt boundary"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt boundary"))?,
         authenticated_cell_id: row
             .try_get(5)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt cell"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt cell"))?,
         authenticated_tenant_id: row
             .try_get(6)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt tenant"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt tenant"))?,
         compact_blake3: parse_digest(row.try_get(7).ok(), "prune receipt compact digest")?,
         compact_rows: parse_u64(row.try_get(8).ok(), "prune receipt compact rows")?,
         compact_bytes: parse_u64(row.try_get(9).ok(), "prune receipt compact bytes")?,
@@ -1937,7 +1927,7 @@ fn parse_prune_mutation(row: &Row) -> Result<RetentionPruneReceiptSnapshot, Rete
         prune_fingerprint: parse_digest(row.try_get(11).ok(), "prune receipt fingerprint")?,
         backup_revision: row
             .try_get(12)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt backup revision"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt backup revision"))?,
         backup_manifest_blake3: parse_digest(row.try_get(13).ok(), "prune receipt backup digest")?,
         durable_covered_through_compact_sequence: parse_u64(
             row.try_get(14).ok(),
@@ -1949,10 +1939,10 @@ fn parse_prune_mutation(row: &Row) -> Result<RetentionPruneReceiptSnapshot, Rete
         )?,
         backup_observed_at_unix_ms: row
             .try_get(16)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt backup time"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt backup time"))?,
         pruned_at_unix_ms: row
             .try_get(17)
-            .map_err(|_| RetentionError::InvalidResponse("prune receipt prune time"))?,
+            .map_err(|_err| RetentionError::InvalidResponse("prune receipt prune time"))?,
         post_watermark: watermark,
         post_counters: ObjectStoreFullToCompactNextCounters {
             global,

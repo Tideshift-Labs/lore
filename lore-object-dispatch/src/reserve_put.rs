@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Pure, unwired ReservePut admission and evidence-presence state algebra.
+//! Pure, unwired `ReservePut` admission and evidence-presence state algebra.
 //!
 //! Evidence references prove only exact 32-byte record identities. They do not decode or authorize
 //! complete ACK, closure, purge-receipt, spool, quota, filesystem, or database effects.
@@ -129,7 +129,7 @@ pub struct EvidenceReference {
 impl EvidenceReference {
     pub fn from_slice(record_blake3: &[u8]) -> Result<Self, ReservePutError> {
         let record_blake3 = <[u8; 32]>::try_from(record_blake3)
-            .map_err(|_| ReservePutError::InvalidEvidenceDigest)?;
+            .map_err(|_err| ReservePutError::InvalidEvidenceDigest)?;
         Ok(Self { record_blake3 })
     }
 
@@ -187,7 +187,7 @@ pub fn validate_reserve_put_state_snapshot(
         // against that message's `logical_request_id`). Whoever writes the first encoder for
         // either owes the same check rather than inheriting this exemption.
         validate_no_dispatch_proof(proof, max_no_dispatch_proof_preimage_bytes)
-            .map_err(|_| ReservePutError::InvalidNoDispatchProof)?;
+            .map_err(|_err| ReservePutError::InvalidNoDispatchProof)?;
     }
 
     let spool = snapshot.spool_ready.is_some();

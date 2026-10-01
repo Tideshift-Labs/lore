@@ -415,7 +415,7 @@ mod linux_live {
     /// `LinuxSpoolWriter::open`, and `O_DIRECTORY` against a nonexistent path
     /// fails the syscall itself with `ENOENT`, and against an existing
     /// regular file fails it with `ENOTDIR` -- both are folded by `open`'s
-    /// `.map_err(|_| SpoolWriteError::RootUnavailable)` on that same call,
+    /// `.map_err(|_err| SpoolWriteError::RootUnavailable)` on that same call,
     /// before the code ever reaches its own `is_dir()` check (which would
     /// have produced `InvalidRoot`). Measured on `rust:slim-trixie`,
     /// 2026-09-19: both cases returned `RootUnavailable`.

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Static contract plus an opt-in PostgreSQL 16 schema probe for the per-participant
+//! Static contract plus an opt-in `PostgreSQL` 16 schema probe for the per-participant
 //! dispatcher-identity edge (WP-114 CD-3, CR-033 D8).
 //!
 //! The ignored tier requires `LORE_TEST_LOCAL_DISPATCHER_IDENTITY_SCHEMA_PG_URL`, an administrator

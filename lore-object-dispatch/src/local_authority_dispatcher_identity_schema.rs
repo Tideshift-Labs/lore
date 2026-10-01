@@ -8,7 +8,7 @@
 //! primary key -- so each participant owns its own lease chain (CR-033 D8). Runtime code neither
 //! installs nor calls this artifact.
 
-/// Exact PostgreSQL dispatcher-identity schema migration bytes, embedded for provisioning parity.
+/// Exact `PostgreSQL` dispatcher-identity schema migration bytes, embedded for provisioning parity.
 pub const LOCAL_AUTHORITY_DISPATCHER_IDENTITY_SCHEMA_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0018_object_store_dispatch_dispatcher_identity_schema.sql");
 

@@ -749,11 +749,11 @@ fn malformed_charge_ownership_and_scope_fail_closed() {
             4 => fixture.full_ownership.authenticated_tenant_id = "other-tenant".to_string(),
             5 => {
                 fixture.full_ownership.logical_request_id =
-                    "018f3e12-a460-7abc-8def-0123456789ab".to_string()
+                    "018f3e12-a460-7abc-8def-0123456789ab".to_string();
             }
             6 => {
                 fixture.full_ownership.attempt_id =
-                    "018f3e12-a461-7abc-8def-0123456789ab".to_string()
+                    "018f3e12-a461-7abc-8def-0123456789ab".to_string();
             }
             7 => fixture.full_ownership.source_authority_blake3 = OTHER_DIGEST,
             _ => unreachable!(),

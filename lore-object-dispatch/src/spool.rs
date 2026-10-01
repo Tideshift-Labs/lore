@@ -106,7 +106,7 @@ impl SpoolLayout {
         provider_boundary_id: &str,
     ) -> Result<SpoolBoundaryBinding, SpoolLayoutError> {
         validate_canonical_id(provider_boundary_id)
-            .map_err(|_| SpoolLayoutError::InvalidBoundaryId)?;
+            .map_err(|_err| SpoolLayoutError::InvalidBoundaryId)?;
         let (boundary_blake3, boundary_token) = derive_boundary_token(provider_boundary_id);
         Ok(SpoolBoundaryBinding {
             provider_boundary_id: provider_boundary_id.to_string(),
@@ -118,8 +118,9 @@ impl SpoolLayout {
     pub fn derive_paths(&self, key: &SpoolObjectKey) -> Result<SpoolPaths, SpoolLayoutError> {
         let binding = self.derive_boundary_binding(&key.provider_boundary_id)?;
         let logical_uuid = decode_canonical_uuid_v7(&key.logical_request_id)
-            .map_err(|_| SpoolLayoutError::InvalidUuidV7)?;
-        decode_canonical_uuid_v7(&key.attempt_id).map_err(|_| SpoolLayoutError::InvalidUuidV7)?;
+            .map_err(|_err| SpoolLayoutError::InvalidUuidV7)?;
+        decode_canonical_uuid_v7(&key.attempt_id)
+            .map_err(|_err| SpoolLayoutError::InvalidUuidV7)?;
         let fanout = fanout_hex(logical_uuid);
         let filename = format!("{}.blob", key.attempt_id);
         let part_filename = format!("{}.part", key.attempt_id);
@@ -210,7 +211,7 @@ pub fn validate_spool_boundary_binding(
     stored_boundary_token: &str,
 ) -> Result<SpoolBoundaryBinding, SpoolLayoutError> {
     validate_canonical_id(expected_provider_boundary_id)
-        .map_err(|_| SpoolLayoutError::InvalidBoundaryId)?;
+        .map_err(|_err| SpoolLayoutError::InvalidBoundaryId)?;
     let (expected_digest, expected_token) = derive_boundary_token(expected_provider_boundary_id);
     if stored_provider_boundary_id != expected_provider_boundary_id
         || stored_boundary_blake3 != &expected_digest
@@ -409,8 +410,9 @@ pub(crate) fn classify_spool_recovery(
         );
     }
     match ledger {
-        LedgerSpoolView::Absent => classify_absent_or_released(observation.kind),
-        LedgerSpoolView::Released { .. } => classify_absent_or_released(observation.kind),
+        LedgerSpoolView::Absent | LedgerSpoolView::Released { .. } => {
+            classify_absent_or_released(observation.kind)
+        }
         LedgerSpoolView::Reserved {
             expected_size,
             expected_blake3,
@@ -511,10 +513,7 @@ fn classify_ready(
         VerifiedFileObservationKind::Blob { .. } => {
             SpoolRecoveryDecision::FailClosed(SpoolRecoveryInconsistency::BlobMismatch)
         }
-        VerifiedFileObservationKind::None => {
-            SpoolRecoveryDecision::FailClosed(SpoolRecoveryInconsistency::MissingReadyBlob)
-        }
-        VerifiedFileObservationKind::Part { .. } => {
+        VerifiedFileObservationKind::None | VerifiedFileObservationKind::Part { .. } => {
             SpoolRecoveryDecision::FailClosed(SpoolRecoveryInconsistency::MissingReadyBlob)
         }
         VerifiedFileObservationKind::Both => {

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Static contract and opt-in PostgreSQL 16 vectors for the source-dark PUT progress codec.
+//! Static contract and opt-in `PostgreSQL` 16 vectors for the source-dark PUT progress codec.
 //! This tier proves canonical snapshot algebra, not transition monotonicity or an actual fsync.
 
 use std::path::Path;

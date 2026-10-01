@@ -169,7 +169,7 @@ fn checked_current_state(
     limits: &RequestStateWireLimits,
 ) -> Result<CanonicalObjectStoreRequestState, ResultDispositionError> {
     let checked = validate_and_encode_object_store_request_state(input.value(), limits)
-        .map_err(|_| ResultDispositionError::InvalidPersistedState)?;
+        .map_err(|_err| ResultDispositionError::InvalidPersistedState)?;
     if checked.canonical_preimage() != input.canonical_preimage()
         || checked.canonical_bytes() != input.canonical_bytes()
         || checked.state_blake3() != input.state_blake3()
@@ -195,7 +195,7 @@ fn checked_fetch_head(
 ) -> Result<CanonicalObjectStoreFetchHead, ResultDispositionError> {
     let head = head.ok_or(ResultDispositionError::InvalidFetchProjection)?;
     let checked = validate_and_encode_object_store_fetch_head(head.value(), &fetch_limits(limits))
-        .map_err(|_| ResultDispositionError::InvalidFetchProjection)?;
+        .map_err(|_err| ResultDispositionError::InvalidFetchProjection)?;
     if checked.canonical_preimage() != head.canonical_preimage()
         || checked.canonical_bytes() != head.canonical_bytes()
         || checked.head_blake3() != head.head_blake3()
@@ -203,7 +203,7 @@ fn checked_fetch_head(
         return Err(ResultDispositionError::InvalidFetchProjection);
     }
     let expected = object_store_fetch_result_key_from_state(state, &limits.state)
-        .map_err(|_| ResultDispositionError::InvalidFetchProjection)?;
+        .map_err(|_err| ResultDispositionError::InvalidFetchProjection)?;
     if checked.value().result_key != expected {
         return Err(ResultDispositionError::InvalidFetchProjection);
     }
@@ -493,7 +493,7 @@ pub fn decide_object_store_result_disposition_cas(
                     let fingerprint: [u8; 32] = intent
                         .fingerprint
                         .try_into()
-                        .map_err(|_| ResultDispositionError::InvalidFingerprint)?;
+                        .map_err(|_err| ResultDispositionError::InvalidFingerprint)?;
                     let decision = decide_reserve_object_store_fetch_discard(
                         &ReserveObjectStoreFetchDiscardInput {
                             current_head: head,
@@ -547,10 +547,8 @@ pub fn decide_object_store_result_disposition_cas(
                         });
                     }
                 }
-                ObjectStoreFetchHeadState::DiscardCommitted => {
-                    return Err(ResultDispositionError::InvalidFetchProjection);
-                }
-                ObjectStoreFetchHeadState::PayloadPurgeReserved
+                ObjectStoreFetchHeadState::DiscardCommitted
+                | ObjectStoreFetchHeadState::PayloadPurgeReserved
                 | ObjectStoreFetchHeadState::PayloadPurgeCommitted => {
                     return Err(ResultDispositionError::InvalidFetchProjection);
                 }
@@ -600,13 +598,13 @@ pub fn decide_object_store_result_disposition_cas(
                 },
                 &limits.discard.ack,
             )
-            .map_err(|_| ResultDispositionError::InvalidNextState)?;
+            .map_err(|_err| ResultDispositionError::InvalidNextState)?;
             next.result_disposition =
                 ObjectStoreResultDispositionV1::ObjectStoreResultDispositionAcked as i32;
             next.ack_receipt = Some(receipt.clone());
             next.discard_receipt = None;
             let next_state = validate_and_encode_object_store_request_state(&next, &limits.state)
-                .map_err(|_| ResultDispositionError::InvalidNextState)?;
+                .map_err(|_err| ResultDispositionError::InvalidNextState)?;
             Ok(ResultDispositionCasDecision::ApplyAck {
                 expected_state_blake3: *current.state_blake3(),
                 expected_fetch_head_blake3: fetch_head.as_ref().map(|value| *value.head_blake3()),
@@ -624,27 +622,27 @@ pub fn decide_object_store_result_disposition_cas(
                 },
                 &limits.discard,
             )
-            .map_err(|_| ResultDispositionError::InvalidNextState)?;
+            .map_err(|_err| ResultDispositionError::InvalidNextState)?;
             next.result_disposition =
                 ObjectStoreResultDispositionV1::ObjectStoreResultDispositionDiscarded as i32;
             next.ack_receipt = None;
             next.discard_receipt = Some(receipt.clone());
             let next_state = validate_and_encode_object_store_request_state(&next, &limits.state)
-                .map_err(|_| ResultDispositionError::InvalidNextState)?;
+                .map_err(|_err| ResultDispositionError::InvalidNextState)?;
             let next_fetch_head = fetch_head
                 .as_ref()
                 .map(|value| {
                     let fingerprint: [u8; 32] = intent
                         .fingerprint
                         .try_into()
-                        .map_err(|_| ResultDispositionError::InvalidFingerprint)?;
+                        .map_err(|_err| ResultDispositionError::InvalidFingerprint)?;
                     commit_object_store_fetch_discard(
                         value,
                         fingerprint,
                         input.database_now_unix_ms,
                         &fetch_limits(limits),
                     )
-                    .map_err(|_| ResultDispositionError::InvalidFetchProjection)
+                    .map_err(|_err| ResultDispositionError::InvalidFetchProjection)
                 })
                 .transpose()?
                 .map(Box::new);
@@ -706,12 +704,12 @@ pub fn decide_object_store_fetch_admission(
     };
     let head = fetch_head.ok_or(ResultDispositionError::InvalidFetchProjection)?;
     let checked = validate_and_encode_object_store_fetch_head(head.value(), &fetch_limits)
-        .map_err(|_| ResultDispositionError::InvalidFetchProjection)?;
+        .map_err(|_err| ResultDispositionError::InvalidFetchProjection)?;
     if checked.canonical_preimage() != head.canonical_preimage()
         || checked.canonical_bytes() != head.canonical_bytes()
         || checked.head_blake3() != head.head_blake3()
         || object_store_fetch_result_key_from_state(&state, limits)
-            .map_err(|_| ResultDispositionError::InvalidFetchProjection)?
+            .map_err(|_err| ResultDispositionError::InvalidFetchProjection)?
             != checked.value().result_key
     {
         return Err(ResultDispositionError::InvalidFetchProjection);

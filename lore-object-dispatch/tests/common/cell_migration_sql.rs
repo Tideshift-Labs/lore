@@ -4,11 +4,11 @@
 //! Shared fixture: the SQL `cell-schema-install` runs for a frozen cell migration on the connected
 //! server's major.
 //!
-//! Frozen 0008 and 0011 embed a PostgreSQL 16 manifest digest in their own catalog asserts, so a
+//! Frozen 0008 and 0011 embed a `PostgreSQL` 16 manifest digest in their own catalog asserts, so a
 //! live test that installs their raw bytes and then calls an install procedure is refused on
-//! PostgreSQL 18. The installer instead runs `cell_migration_sql`'s rendering there. Tests use the
+//! `PostgreSQL` 18. The installer instead runs `cell_migration_sql`'s rendering there. Tests use the
 //! same rendering, so both majors install exactly what a real cell installs. Every other artifact,
-//! and every artifact on PostgreSQL 16, is returned unchanged.
+//! and every artifact on `PostgreSQL` 16, is returned unchanged.
 
 use std::borrow::Cow;
 

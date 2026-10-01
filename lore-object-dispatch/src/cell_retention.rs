@@ -130,7 +130,7 @@
 //! 0023's candidate index is partial (`WHERE phase IN (5, 6, 7)`) and 0024's candidate query spells
 //! the same list as literals. The planner can use a partial index only when it can prove the query
 //! predicate implies the index predicate, which it can do against literals and cannot do against a
-//! bound parameter. Measured on the disposable PostgreSQL 16 this crate's live runners use, with
+//! bound parameter. Measured on the disposable `PostgreSQL` 16 this crate's live runners use, with
 //! `enable_seqscan = off` so the choice is between indexes rather than against a sequential scan:
 //!
 //! * the literal spelling plans `Index Scan using object_dispatch_requests_cell_retention_idx`,
@@ -170,7 +170,7 @@
 //! server and tool code rather than library code. That is deliberate and narrow: everything else
 //! here is a pure codec or a request-scoped client that returns its outcome to a caller, whereas
 //! this module is a background task whose failures have no caller to return to. A pass that could
-//! not reach PostgreSQL would otherwise be visible only as a facet going false several ticks later,
+//! not reach `PostgreSQL` would otherwise be visible only as a facet going false several ticks later,
 //! with nothing saying why. Nothing else in this crate should acquire a logger on this precedent.
 //!
 //! # What `lore-server` must wire
@@ -202,7 +202,7 @@
 //! on a cell where the dispatch authority is not composed, for the same reason the fragment prune
 //! is not: "no scheduler is running" and "the table is drained" are different states, and a facet
 //! that cannot tell them apart is worse than an absent one. And `run` returns `()` rather than a
-//! `Result`, deliberately, because a retention pass that cannot reach PostgreSQL must not take the
+//! `Result`, deliberately, because a retention pass that cannot reach `PostgreSQL` must not take the
 //! process down; wrap it in whatever shape the endpoint `JoinSet` expects.
 
 use std::sync::Arc;
@@ -537,7 +537,7 @@ impl CellRetentionClient {
             schema_revision == "object-store-dispatch-cell-retention-schema-v1",
             "cell retention schema revision",
         )?;
-        let install_revision: u64 = text(&row, 2)?.parse().map_err(|_| {
+        let install_revision: u64 = text(&row, 2)?.parse().map_err(|_err| {
             DispatchAuthorityError::InvalidAuthorityResponse("expected a canonical uint64 in text")
         })?;
         require(install_revision > 0, "cell retention install revision")?;
@@ -968,7 +968,7 @@ impl CellRetentionTask {
     /// Run until `shutdown` goes true.
     ///
     /// Returns nothing and **never** fails: this is spawned into the server's endpoint `JoinSet`,
-    /// where an error takes the process down, and a retention pass that cannot reach PostgreSQL is
+    /// where an error takes the process down, and a retention pass that cannot reach `PostgreSQL` is
     /// emphatically not that. It is logged, counted into the stall tolerance, and retried on the
     /// next tick. The caller wraps it in whatever result shape its `JoinSet` expects.
     ///

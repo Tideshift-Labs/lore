@@ -14,7 +14,7 @@ pub const RETENTION_SCHEMA_REVISION_V1: &str = "object-store-retention-authority
 pub const RETENTION_SCHEMA_V1: &[u8] =
     include_bytes!("../migrations/0002_object_store_retention_authority.sql");
 
-/// Exact PostgreSQL migration bytes, embedded for image/provisioning parity only.
+/// Exact `PostgreSQL` migration bytes, embedded for image/provisioning parity only.
 pub const RETENTION_MIGRATION_V1: &[u8] = RETENTION_SCHEMA_V1;
 
 /// BLAKE3-256 of [`RETENTION_MIGRATION_V1`].

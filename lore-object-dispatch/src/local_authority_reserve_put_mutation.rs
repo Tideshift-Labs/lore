@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Embedded source-dark atomic ReservePut authority mutation artifact.
+//! Embedded source-dark atomic `ReservePut` authority mutation artifact.
 //!
 //! Runtime code does not install or call this migration yet. The SQL procedure owns database-clock
 //! admission, three-scope quota reservation, canonical evidence, and the initial spool row.
 
-/// Exact PostgreSQL ReservePut mutation migration bytes.
+/// Exact `PostgreSQL` `ReservePut` mutation migration bytes.
 pub const LOCAL_AUTHORITY_RESERVE_PUT_MUTATION_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0013_object_store_dispatch_reserve_put_mutation.sql");
 

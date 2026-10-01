@@ -563,7 +563,7 @@ mod platform {
             let root_path = layout.shared_spool_root();
             let relative_root = root_path
                 .strip_prefix(Path::new("/"))
-                .map_err(|_| SpoolWriteError::InvalidRoot)?;
+                .map_err(|_err| SpoolWriteError::InvalidRoot)?;
             if relative_root.as_os_str().is_empty()
                 || relative_root
                     .components()
@@ -572,7 +572,7 @@ mod platform {
                 return Err(SpoolWriteError::InvalidRoot);
             }
             let filesystem_root = rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty())
-                .map_err(|_| SpoolWriteError::RootUnavailable)?;
+                .map_err(|_err| SpoolWriteError::RootUnavailable)?;
             let root_fd = rustix::fs::openat2(
                 &filesystem_root,
                 relative_root,
@@ -580,9 +580,9 @@ mod platform {
                 Mode::empty(),
                 ROOT_RESOLVE,
             )
-            .map_err(|_| SpoolWriteError::RootUnavailable)?;
+            .map_err(|_err| SpoolWriteError::RootUnavailable)?;
             let root_stat =
-                rustix::fs::fstat(&root_fd).map_err(|_| SpoolWriteError::RootUnavailable)?;
+                rustix::fs::fstat(&root_fd).map_err(|_err| SpoolWriteError::RootUnavailable)?;
             if !FileType::from_raw_mode(root_stat.st_mode).is_dir() {
                 return Err(SpoolWriteError::InvalidRoot);
             }
@@ -621,13 +621,14 @@ mod platform {
             if key.kind != SpoolObjectKind::Put {
                 return Err(SpoolWriteError::InvalidSpoolKind);
             }
-            let size = u64::try_from(body.len()).map_err(|_| SpoolWriteError::InvalidBodySize)?;
+            let size =
+                u64::try_from(body.len()).map_err(|_err| SpoolWriteError::InvalidBodySize)?;
             if size == 0 || size > self.maximum_body_bytes {
                 return Err(SpoolWriteError::InvalidBodySize);
             }
             let paths = layout
                 .derive_paths(key)
-                .map_err(|_| SpoolWriteError::InvalidSpoolKey)?;
+                .map_err(|_err| SpoolWriteError::InvalidSpoolKey)?;
             let blob_relative = self.relative_artifact_path(paths.final_path())?;
             let part_relative = self.relative_artifact_path(paths.part_path())?;
             let (Some(blob_name), Some(part_name)) =
@@ -660,7 +661,7 @@ mod platform {
                 };
                 #[cfg(test)]
                 before_place::run();
-                let outcome = self.place_body(part_name, blob_name, &directory_fd, body);
+                let outcome = Self::place_body(part_name, blob_name, &directory_fd, body);
                 if outcome == Err(DIRECTORY_REMOVED) && attempt < PLACEMENT_ATTEMPTS {
                     attempt += 1;
                     continue;
@@ -686,7 +687,6 @@ mod platform {
 
         /// Steps 2 through 5, each relative to the leaf descriptor step 1 synced.
         fn place_body(
-            &self,
             part_name: &std::ffi::OsStr,
             blob_name: &std::ffi::OsStr,
             directory_fd: &OwnedFd,
@@ -741,11 +741,11 @@ mod platform {
                 }
             };
             let mut part = File::from(part_fd);
-            part.write_all(body).map_err(|_| SpoolWriteError::Io {
+            part.write_all(body).map_err(|_err| SpoolWriteError::Io {
                 operation: "part write",
             })?;
             // Step 3. Contents and metadata, because the rename publishes both.
-            part.sync_all().map_err(|_| SpoolWriteError::Io {
+            part.sync_all().map_err(|_err| SpoolWriteError::Io {
                 operation: "part fsync",
             })?;
             drop(part);
@@ -755,13 +755,13 @@ mod platform {
             // `NO_XDEV` has already held every open to. The leaf holds the part
             // file now, so no purge can remove it.
             rustix::fs::renameat(directory_fd, part_name, directory_fd, blob_name).map_err(
-                |_| SpoolWriteError::Io {
+                |_err| SpoolWriteError::Io {
                     operation: "part rename",
                 },
             )?;
 
             // Step 5.
-            rustix::fs::fsync(directory_fd).map_err(|_| SpoolWriteError::Io {
+            rustix::fs::fsync(directory_fd).map_err(|_err| SpoolWriteError::Io {
                 operation: "leaf directory fsync",
             })
         }
@@ -775,19 +775,21 @@ mod platform {
         /// directory this writer holds: if that one is removed later, creating
         /// in it is ENOENT and the caller starts over.
         fn ensure_directory_chain(&self, relative: &Path) -> Result<OwnedFd, SpoolWriteError> {
-            let mut parent = self.root_fd.try_clone().map_err(|_| SpoolWriteError::Io {
-                operation: "root descriptor clone",
-            })?;
+            let mut parent = self
+                .root_fd
+                .try_clone()
+                .map_err(|_err| SpoolWriteError::Io {
+                    operation: "root descriptor clone",
+                })?;
             for component in relative.components() {
                 let Component::Normal(name) = component else {
                     return Err(SpoolWriteError::PathBindingMismatch);
                 };
                 match rustix::fs::mkdirat(&parent, name, DIRECTORY_MODE) {
-                    Ok(()) => {}
                     // Not durability evidence. A peer may have created this
                     // entry without syncing, which is why the fsync below is
                     // unconditional rather than inside the `Ok` arm.
-                    Err(Errno::EXIST) => {}
+                    Ok(()) | Err(Errno::EXIST) => {}
                     // The parent opened on the previous level has been purged.
                     Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
                     Err(_) => {
@@ -815,10 +817,10 @@ mod platform {
                         });
                     }
                 };
-                rustix::fs::fsync(&parent).map_err(|_| SpoolWriteError::Io {
+                rustix::fs::fsync(&parent).map_err(|_err| SpoolWriteError::Io {
                     operation: "fanout parent fsync",
                 })?;
-                let stat = rustix::fs::fstat(&child).map_err(|_| SpoolWriteError::Io {
+                let stat = rustix::fs::fstat(&child).map_err(|_err| SpoolWriteError::Io {
                     operation: "fanout stat",
                 })?;
                 if stat.st_dev != self.root_device {
@@ -832,7 +834,7 @@ mod platform {
         fn relative_artifact_path(&self, artifact_path: &Path) -> Result<PathBuf, SpoolWriteError> {
             let relative = artifact_path
                 .strip_prefix(&self.root_path)
-                .map_err(|_| SpoolWriteError::PathBindingMismatch)?;
+                .map_err(|_err| SpoolWriteError::PathBindingMismatch)?;
             if relative.as_os_str().is_empty()
                 || relative
                     .components()
@@ -851,41 +853,13 @@ mod platform {
                 Mode::empty(),
                 ROOT_RESOLVE,
             )
-            .map_err(|_| SpoolWriteError::RootChanged)?;
-            let current = rustix::fs::fstat(&reopened).map_err(|_| SpoolWriteError::RootChanged)?;
+            .map_err(|_err| SpoolWriteError::RootChanged)?;
+            let current =
+                rustix::fs::fstat(&reopened).map_err(|_err| SpoolWriteError::RootChanged)?;
             if current.st_dev != self.root_device || current.st_ino != self.root_inode {
                 return Err(SpoolWriteError::RootChanged);
             }
             Ok(())
-        }
-    }
-
-    /// Test seam: runs once per placement attempt, after step 1 and before the
-    /// part create, which is the window a concurrent purge can empty-remove the
-    /// directory in. Thread-local, so parallel tests cannot see each other's hook.
-    #[cfg(test)]
-    pub(super) mod before_place {
-        use std::cell::RefCell;
-
-        type Hook = Box<dyn FnMut()>;
-        thread_local! {
-            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
-        }
-
-        pub(crate) fn run() {
-            HOOK.with_borrow_mut(|hook| {
-                if let Some(hook) = hook {
-                    hook();
-                }
-            });
-        }
-
-        pub(crate) fn install(hook: impl FnMut() + 'static) {
-            HOOK.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
-        }
-
-        pub(crate) fn clear() {
-            HOOK.with_borrow_mut(|slot| *slot = None);
         }
     }
 
@@ -936,6 +910,35 @@ mod platform {
     }
 
     pub use LinuxSpoolWriter as ExportedLinuxSpoolWriter;
+
+    /// Test seam: runs once per placement attempt, after step 1 and before the
+    /// part create, which is the window a concurrent purge can empty-remove the
+    /// directory in. Thread-local, so parallel tests cannot see each other's hook.
+    #[cfg(test)]
+    pub(super) mod before_place {
+        use std::cell::RefCell;
+
+        type Hook = Box<dyn FnMut()>;
+        thread_local! {
+            static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        }
+
+        pub(crate) fn run() {
+            HOOK.with_borrow_mut(|hook| {
+                if let Some(hook) = hook {
+                    hook();
+                }
+            });
+        }
+
+        pub(crate) fn install(hook: impl FnMut() + 'static) {
+            HOOK.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+        }
+
+        pub(crate) fn clear() {
+            HOOK.with_borrow_mut(|slot| *slot = None);
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

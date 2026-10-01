@@ -402,17 +402,17 @@ fn validate_limits(limits: &ObjectStoreCompactReceiptLimits) -> Result<(), Compa
 }
 
 fn writer(maximum: u32) -> Result<BoundedCanonicalWriter, CompactReceiptError> {
-    BoundedCanonicalWriter::new(maximum).map_err(|_| CompactReceiptError::InvalidLimits)
+    BoundedCanonicalWriter::new(maximum).map_err(|_err| CompactReceiptError::InvalidLimits)
 }
 
 fn nonnegative(value: i64) -> Result<u64, CompactReceiptError> {
-    u64::try_from(value).map_err(|_| CompactReceiptError::NegativeTime)
+    u64::try_from(value).map_err(|_err| CompactReceiptError::NegativeTime)
 }
 
 fn exact_digest(value: &[u8]) -> Result<[u8; 32], CompactReceiptError> {
     value
         .try_into()
-        .map_err(|_| CompactReceiptError::InvalidDigest)
+        .map_err(|_err| CompactReceiptError::InvalidDigest)
 }
 
 fn complete(
@@ -473,15 +473,15 @@ pub fn validate_and_encode_object_store_provider_attempt_audit(
     let mut output = writer(limits.max_canonical_row_bytes)?;
     output
         .raw(AUDIT_DOMAIN)
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     for value in values {
         output
             .u64(value)
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .u8(0)
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let (canonical_bytes, audit_blake3) = complete(
         output.finish(),
         input.audit_blake3,
@@ -502,7 +502,7 @@ pub fn validate_and_encode_object_store_compact_dependency_floor(
 ) -> Result<CanonicalObjectStoreCompactDependencyFloor, CompactReceiptError> {
     validate_limits(limits)?;
     validate_canonical_text(&input.dependency_id, limits.max_identity_bytes)
-        .map_err(|_| CompactReceiptError::InvalidCanonicalText)?;
+        .map_err(|_err| CompactReceiptError::InvalidCanonicalText)?;
     let retain_until_unix_ms = nonnegative(input.retain_until_unix_ms)?;
     let mut output = writer(limits.max_canonical_row_bytes)?;
     output
@@ -510,7 +510,7 @@ pub fn validate_and_encode_object_store_compact_dependency_floor(
         .and_then(|()| output.u32(input.kind.code()))
         .and_then(|()| output.text(&input.dependency_id))
         .and_then(|()| output.u64(retain_until_unix_ms))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let (canonical_bytes, floor_blake3) = complete(
         output.finish(),
         input.floor_blake3,
@@ -537,7 +537,7 @@ fn fingerprint_id(prefix: &str, digest: &[u8]) -> Result<String, CompactReceiptE
     value.push(':');
     for byte in digest {
         use std::fmt::Write;
-        write!(&mut value, "{byte:02x}").map_err(|_| CompactReceiptError::InvalidAuthority)?;
+        write!(&mut value, "{byte:02x}").map_err(|_err| CompactReceiptError::InvalidAuthority)?;
     }
     Ok(value)
 }
@@ -547,8 +547,10 @@ fn payload_free(
 ) -> bool {
     matches!(
         ObjectStorePayloadAvailabilityV1::try_from(value.availability),
-        Ok(ObjectStorePayloadAvailabilityV1::ObjectStorePayloadAvailabilityNotApplicable)
-            | Ok(ObjectStorePayloadAvailabilityV1::ObjectStorePayloadAvailabilityDisposed)
+        Ok(
+            ObjectStorePayloadAvailabilityV1::ObjectStorePayloadAvailabilityNotApplicable
+                | ObjectStorePayloadAvailabilityV1::ObjectStorePayloadAvailabilityDisposed
+        )
     ) && value.partial_temp_bytes == 0
         && value.partial_temp_chunks == 0
 }
@@ -560,10 +562,10 @@ fn project_authority(
         ObjectStoreCompactAuthority::RequestState(value) => {
             let projected = value.value();
             let phase = ObjectStoreRequestPhaseV1::try_from(projected.phase)
-                .map_err(|_| CompactReceiptError::InvalidAuthority)?;
+                .map_err(|_err| CompactReceiptError::InvalidAuthority)?;
             let disposition =
                 ObjectStoreResultDispositionV1::try_from(projected.result_disposition)
-                    .map_err(|_| CompactReceiptError::InvalidAuthority)?;
+                    .map_err(|_err| CompactReceiptError::InvalidAuthority)?;
             let closed = matches!(
                 phase,
                 ObjectStoreRequestPhaseV1::ObjectStoreRequestPhaseNoDispatch
@@ -710,7 +712,7 @@ fn checked_wrappers(
         },
         &limits.wire_limits(),
     )
-    .map_err(|_| CompactReceiptError::WrapperMismatch)?;
+    .map_err(|_err| CompactReceiptError::WrapperMismatch)?;
     let checked_outcome = validate_and_encode_object_store_request_outcome(
         &ObjectStoreRequestOutcomeV1 {
             outcome_blake3: outcome.outcome_blake3().to_vec().into(),
@@ -718,7 +720,7 @@ fn checked_wrappers(
         },
         &limits.wire_limits(),
     )
-    .map_err(|_| CompactReceiptError::WrapperMismatch)?;
+    .map_err(|_err| CompactReceiptError::WrapperMismatch)?;
     if checked_receipt.canonical_bytes() != receipt.canonical_bytes()
         || checked_receipt.receipt_blake3() != receipt.receipt_blake3()
         || checked_outcome.canonical_bytes() != outcome.canonical_bytes()
@@ -768,7 +770,7 @@ fn compact_fingerprint(
 ) -> Result<[u8; 32], CompactReceiptError> {
     let authority_kind = authority_kind_code(authority);
     let floor_count =
-        u32::try_from(floors.len()).map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        u32::try_from(floors.len()).map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let admission_created_at_unix_ms = nonnegative(admission_created_at_unix_ms)?;
     let mut output = writer(u32::MAX)?;
     output
@@ -778,32 +780,32 @@ fn compact_fingerprint(
         .and_then(|()| output.bytes(receipt.canonical_bytes()))
         .and_then(|()| output.bytes(outcome.canonical_bytes()))
         .and_then(|()| output.u8(u8::from(reserve_put_ack.is_some())))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     if let Some(ack) = reserve_put_ack {
         output
             .bytes(ack.canonical_bytes())
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .u8(u8::from(reserve_put_ack.is_some()))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     if let Some(ack) = reserve_put_ack {
         output
             .raw(ack.ack_blake3())
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .bytes(audit.canonical_bytes())
         .and_then(|()| output.u32(floor_count))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     for floor in floors {
         output
             .bytes(floor.canonical_bytes())
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .u64(admission_created_at_unix_ms)
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     Ok(*blake3::hash(&output.finish()).as_bytes())
 }
 
@@ -818,7 +820,7 @@ fn compact_fingerprint(
 /// and a check here cannot know whose counters they are unless the producer said so.
 ///
 /// The comparison is byte equality on the canonical identity text. Both sides are produced by the
-/// same canonicalisation -- the ledger validated its request id as a canonical UUIDv7 at
+/// same canonicalisation -- the ledger validated its request id as a canonical `UUIDv7` at
 /// construction, and the projection reads the authority's own canonical field -- so a difference
 /// here is a different request, never a different spelling of one.
 fn checked_audit_binding(
@@ -849,12 +851,12 @@ fn write_optional_digest(
 ) -> Result<Option<[u8; 32]>, CompactReceiptError> {
     output
         .u8(u8::from(digest.is_some()))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let exact = digest.map(exact_digest).transpose()?;
     if let Some(value) = exact {
         output
             .raw(&value)
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     Ok(exact)
 }
@@ -928,9 +930,9 @@ pub fn validate_and_encode_object_store_compact_receipt(
         }
     }
     let logical_request_uuid_unix_ms = canonical_uuid_v7_timestamp(projection.logical_request_id)
-        .map_err(|_| CompactReceiptError::InvalidUuidV7)?;
+        .map_err(|_err| CompactReceiptError::InvalidUuidV7)?;
     let attempt_uuid_unix_ms = canonical_uuid_v7_timestamp(projection.attempt_id)
-        .map_err(|_| CompactReceiptError::InvalidUuidV7)?;
+        .map_err(|_err| CompactReceiptError::InvalidUuidV7)?;
     nonnegative(input.admission_created_at_unix_ms)?;
     nonnegative(input.closure_committed_at_unix_ms)?;
     nonnegative(input.compacted_at_unix_ms)?;
@@ -993,7 +995,7 @@ pub fn validate_and_encode_object_store_compact_receipt(
     let compact_prune_after_unix_ms = nonnegative(input.compact_prune_after_unix_ms)?;
     let authority_kind = authority_kind_code(input.authority);
     let floor_count =
-        u32::try_from(floors.len()).map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        u32::try_from(floors.len()).map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let mut output = writer(limits.max_compact_row_bytes)?;
     output
         .raw(COMPACT_DOMAIN)
@@ -1007,26 +1009,26 @@ pub fn validate_and_encode_object_store_compact_receipt(
         .and_then(|()| output.u64(logical_request_uuid_unix_ms))
         .and_then(|()| output.u64(attempt_uuid_unix_ms))
         .and_then(|()| output.u64(admission_created_at_unix_ms))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let put_reservation_fingerprint =
         write_optional_digest(&mut output, projection.put_reservation_fingerprint)?;
     let canonical_descriptor_fingerprint =
         write_optional_digest(&mut output, projection.canonical_descriptor_fingerprint)?;
     output
         .u8(u8::from(reserve_put_ack.is_some()))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     if let Some(ack) = reserve_put_ack {
         output
             .bytes(ack.canonical_bytes())
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .u8(u8::from(reserve_put_ack.is_some()))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     if let Some(ack) = reserve_put_ack {
         output
             .raw(ack.ack_blake3())
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .u32(authority_kind)
@@ -1038,18 +1040,18 @@ pub fn validate_and_encode_object_store_compact_receipt(
         .and_then(|()| output.raw(outcome.outcome_blake3()))
         .and_then(|()| output.bytes(audit.canonical_bytes()))
         .and_then(|()| output.u32(floor_count))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     for floor in &floors {
         output
             .bytes(floor.canonical_bytes())
-            .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+            .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     }
     output
         .u64(closure_committed_at_unix_ms)
         .and_then(|()| output.u64(compacted_at_unix_ms))
         .and_then(|()| output.u64(compact_prune_after_unix_ms))
         .and_then(|()| output.raw(&fingerprint))
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     let canonical_preimage = output.finish();
     let (canonical_bytes, compact_blake3) = complete(
         canonical_preimage.clone(),
@@ -1226,7 +1228,7 @@ pub fn decide_object_store_compact_receipt(
         &expanded_limits,
     )?;
     let encoded_bytes = u64::try_from(compact.canonical_bytes().len())
-        .map_err(|_| CompactReceiptError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactReceiptError::CanonicalTooLarge)?;
     if encoded_bytes > u64::from(limits.max_compact_row_bytes) {
         return Ok(ObjectStoreCompactReceiptDecision::RetainFullTooLarge { encoded_bytes });
     }

@@ -3,10 +3,10 @@
 
 //! Embedded source-dark local dispatch-authority canonical codec artifact.
 //!
-//! The SQL codec constructs database-clock-bearing ReservePut evidence through a separately
+//! The SQL codec constructs database-clock-bearing `ReservePut` evidence through a separately
 //! reviewed `public.blake3(bytea)` provider. Runtime code neither installs nor calls this artifact.
 
-/// Exact PostgreSQL canonical-codec migration bytes, embedded for provisioning parity only.
+/// Exact `PostgreSQL` canonical-codec migration bytes, embedded for provisioning parity only.
 pub const LOCAL_AUTHORITY_CANONICAL_CODEC_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0009_object_store_dispatch_authority_canonical_codec.sql");
 

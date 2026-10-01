@@ -465,10 +465,7 @@ async fn install_as_migrator(client: &tokio_postgres::Client, sql: &str) -> Stri
 }
 
 fn db_message(error: &tokio_postgres::Error) -> &str {
-    error
-        .as_db_error()
-        .map(|db| db.message())
-        .unwrap_or("untyped")
+    error.as_db_error().map_or("untyped", |db| db.message())
 }
 
 #[tokio::test]

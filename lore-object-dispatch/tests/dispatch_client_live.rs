@@ -7,7 +7,7 @@
 //! against an earlier slice caught signature order, rows/bytes/retention semantics, a typed
 //! `NOT_FOUND`, and a text-to-domain cast that every static check had found plausible. So every
 //! procedure the typed client calls is driven here, through the public client API, against a real
-//! PostgreSQL 16 with the full chain installed.
+//! `PostgreSQL` 16 with the full chain installed.
 //!
 //! Unlike the sibling live tiers, this one connects **as the authority roles themselves** rather
 //! than using `SET SESSION AUTHORIZATION`, because the pool's whole point is that it carries its
@@ -302,7 +302,7 @@ fn registration_record_preimage(
     preimage
 }
 
-/// PostgreSQL 16 has no BLAKE3, so the schema calls out to `public.blake3`. This installs an exact
+/// `PostgreSQL` 16 has no BLAKE3, so the schema calls out to `public.blake3`. This installs an exact
 /// lookup over the preimages this run's sequence hashes: a genuine digest for each, and NULL for
 /// anything else, so an unplanned preimage fails closed rather than silently returning garbage.
 fn blake3_provider_sql(vectors: &[(Vec<u8>, [u8; 32])]) -> String {
@@ -451,12 +451,10 @@ fn pool_config(
     // container.
     let without_scheme = base_url
         .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
+        .map_or(base_url, |(_, rest)| rest);
     let host_and_path = without_scheme
         .split_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_scheme);
+        .map_or(without_scheme, |(_, rest)| rest);
     DispatchPoolConfig {
         postgres_url: format!(
             "postgresql://{}@{host_and_path}?sslmode=disable",

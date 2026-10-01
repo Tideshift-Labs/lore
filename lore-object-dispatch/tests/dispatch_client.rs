@@ -6,7 +6,7 @@
 //!
 //! Every guarantee this slice adds has a pin here, in the default `cargo test -p
 //! lore-object-dispatch` tier, in addition to whatever the live tier proves. The live tier needs
-//! Docker and PostgreSQL 16; this file needs neither, so a contract drift cannot pass unnoticed on
+//! Docker and `PostgreSQL` 16; this file needs neither, so a contract drift cannot pass unnoticed on
 //! a rig without them. That is the INV-EU P2 follow-up applied ahead of time: CD-4's two P1 fixes
 //! were pinned only by the live tier and went unguarded on a default run.
 //!
@@ -306,12 +306,16 @@ fn client_bind_order(prepared_type: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("{prepared_type}: no PreparedMutation impl"));
     let bind_start = CLIENT_SOURCE[impl_start..]
         .find("fn bind(&self)")
-        .map(|offset| impl_start + offset)
-        .unwrap_or_else(|| panic!("{prepared_type}: no bind()"));
+        .map_or_else(
+            || panic!("{prepared_type}: no bind()"),
+            |offset| impl_start + offset,
+        );
     let body_end = CLIENT_SOURCE[bind_start..]
         .find("\n    fn decode(")
-        .map(|offset| bind_start + offset)
-        .unwrap_or_else(|| panic!("{prepared_type}: bind() is unterminated"));
+        .map_or_else(
+            || panic!("{prepared_type}: bind() is unterminated"),
+            |offset| bind_start + offset,
+        );
     let mut names = Vec::new();
     for line in CLIENT_SOURCE[bind_start..body_end].lines().map(str::trim) {
         if line.starts_with("for value in &self.quotas") {

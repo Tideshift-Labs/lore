@@ -118,7 +118,7 @@ pub fn validate_object_store_result_discard(
         authority.authenticated_identity,
         &limits.ack.identity,
     )
-    .map_err(|_| ResultDiscardError::InvalidConsumerContext)?;
+    .map_err(|_err| ResultDiscardError::InvalidConsumerContext)?;
 
     for (actual, expected) in [
         (&input.protocol_revision, authority.protocol_revision),
@@ -140,9 +140,9 @@ pub fn validate_object_store_result_discard(
         }
     }
     canonical_uuid_v7_timestamp(&input.logical_request_id)
-        .map_err(|_| ResultDiscardError::InvalidUuidV7)?;
+        .map_err(|_err| ResultDiscardError::InvalidUuidV7)?;
     canonical_uuid_v7_timestamp(&input.attempt_id)
-        .map_err(|_| ResultDiscardError::InvalidUuidV7)?;
+        .map_err(|_err| ResultDiscardError::InvalidUuidV7)?;
 
     let stored_result = authority.terminal_result.result();
     validate_text(
@@ -167,11 +167,11 @@ pub fn validate_object_store_result_discard(
     }
     if let Some(handle) = input.byte_result_handle.as_deref() {
         validate_text(handle, limits.ack.max_result_handle_bytes)
-            .map_err(|_| ResultDiscardError::InvalidByteResultHandle)?;
+            .map_err(|_err| ResultDiscardError::InvalidByteResultHandle)?;
     }
 
     let mut writer = BoundedCanonicalWriter::new(limits.ack.max_fingerprint_preimage_bytes)
-        .map_err(|_| ResultDiscardError::InvalidLimits)?;
+        .map_err(|_err| ResultDiscardError::InvalidLimits)?;
     write_raw(&mut writer, DISCARD_FINGERPRINT_DOMAIN)?;
     for value in [
         &input.protocol_revision,
@@ -243,7 +243,7 @@ fn validate_limits(limits: &ResultDiscardLimits) -> Result<(), ResultDiscardErro
 }
 
 fn validate_text(value: &str, maximum: u32) -> Result<(), ResultDiscardError> {
-    validate_canonical_text(value, maximum).map_err(|_| ResultDiscardError::InvalidCanonicalText)
+    validate_canonical_text(value, maximum).map_err(|_err| ResultDiscardError::InvalidCanonicalText)
 }
 
 fn encode_proof(
@@ -318,7 +318,7 @@ fn encode_fragment_proof(
         &proof.no_exposure_checkpoint_id,
         limits.max_checkpoint_id_bytes,
     )
-    .map_err(|_| ResultDiscardError::InvalidProof)?;
+    .map_err(|_err| ResultDiscardError::InvalidProof)?;
 
     let kind = closed_supersession_kind(proof.supersession_kind)?;
     let physical = [
@@ -443,13 +443,13 @@ fn encode_startup_proof(
         &proof.superseding_startup_attempt_id,
     ] {
         validate_text(value, limits.max_revision_id_bytes)
-            .map_err(|_| ResultDiscardError::InvalidProof)?;
+            .map_err(|_err| ResultDiscardError::InvalidProof)?;
     }
     validate_text(
         &proof.no_exposure_checkpoint_id,
         limits.max_checkpoint_id_bytes,
     )
-    .map_err(|_| ResultDiscardError::InvalidProof)?;
+    .map_err(|_err| ResultDiscardError::InvalidProof)?;
 
     write_u32(writer, 21)?;
     write_text(writer, &proof.policy_revision)?;
@@ -503,17 +503,17 @@ fn encode_durable_proof(
         return Err(ResultDiscardError::InvalidProof);
     }
     validate_text(&proof.operation_id, limits.max_operation_id_bytes)
-        .map_err(|_| ResultDiscardError::InvalidProof)?;
+        .map_err(|_err| ResultDiscardError::InvalidProof)?;
     validate_text(
         &proof.disposition_checkpoint_id,
         limits.max_checkpoint_id_bytes,
     )
-    .map_err(|_| ResultDiscardError::InvalidProof)?;
+    .map_err(|_err| ResultDiscardError::InvalidProof)?;
     validate_text(
         &proof.no_exposure_checkpoint_id,
         limits.max_checkpoint_id_bytes,
     )
-    .map_err(|_| ResultDiscardError::InvalidProof)?;
+    .map_err(|_err| ResultDiscardError::InvalidProof)?;
 
     let consumer_kind = closed_consumer_kind(proof.consumer_kind)?;
     let cancellation_kind = closed_cancellation_kind(proof.cancellation_kind)?;
@@ -528,7 +528,7 @@ fn encode_durable_proof(
                 return Err(ResultDiscardError::InvalidProof);
             };
             validate_text(successor, limits.max_operation_id_bytes)
-                .map_err(|_| ResultDiscardError::InvalidProof)?;
+                .map_err(|_err| ResultDiscardError::InvalidProof)?;
             if successor == proof.operation_id {
                 return Err(ResultDiscardError::InvalidProof);
             }
@@ -559,16 +559,14 @@ fn closed_supersession_kind(
     raw: i32,
 ) -> Result<FragmentLifecycleSupersessionKindV1, ResultDiscardError> {
     match FragmentLifecycleSupersessionKindV1::try_from(raw) {
-        Ok(kind @ FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindSuccessor)
-        | Ok(kind @ FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindRemoved)
-        | Ok(
-            kind
-            @ FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindAssociationTombstoned,
-        )
-        | Ok(
-            kind
-            @ FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindRepositoryTombstoned,
-        ) => Ok(kind),
+        Ok(kind @
+(FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindSuccessor
+|
+FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindRemoved
+|
+FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindAssociationTombstoned
+|
+FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindRepositoryTombstoned)) => Ok(kind),
         Ok(FragmentLifecycleSupersessionKindV1::FragmentLifecycleSupersessionKindUnspecified)
         | Err(_) => Err(ResultDiscardError::InvalidProof),
     }
@@ -576,9 +574,11 @@ fn closed_supersession_kind(
 
 fn closed_consumer_kind(raw: i32) -> Result<DurableConsumerKindV1, ResultDiscardError> {
     match DurableConsumerKindV1::try_from(raw) {
-        Ok(kind @ DurableConsumerKindV1::DurableConsumerKindJob)
-        | Ok(kind @ DurableConsumerKindV1::DurableConsumerKindOperator)
-        | Ok(kind @ DurableConsumerKindV1::DurableConsumerKindMigrator) => Ok(kind),
+        Ok(
+            kind @ (DurableConsumerKindV1::DurableConsumerKindJob
+            | DurableConsumerKindV1::DurableConsumerKindOperator
+            | DurableConsumerKindV1::DurableConsumerKindMigrator),
+        ) => Ok(kind),
         Ok(DurableConsumerKindV1::DurableConsumerKindUnspecified) | Err(_) => {
             Err(ResultDiscardError::InvalidProof)
         }
@@ -589,10 +589,10 @@ fn closed_cancellation_kind(
     raw: i32,
 ) -> Result<DurableConsumerCancellationKindV1, ResultDiscardError> {
     match DurableConsumerCancellationKindV1::try_from(raw) {
-        Ok(kind @ DurableConsumerCancellationKindV1::DurableConsumerCancellationKindCancelled)
-        | Ok(kind @ DurableConsumerCancellationKindV1::DurableConsumerCancellationKindSuperseded) => {
-            Ok(kind)
-        }
+        Ok(
+            kind @ (DurableConsumerCancellationKindV1::DurableConsumerCancellationKindCancelled
+            | DurableConsumerCancellationKindV1::DurableConsumerCancellationKindSuperseded),
+        ) => Ok(kind),
         Ok(DurableConsumerCancellationKindV1::DurableConsumerCancellationKindUnspecified)
         | Err(_) => Err(ResultDiscardError::InvalidProof),
     }
@@ -609,25 +609,25 @@ fn lex_less(next_revision: u64, next_fence: u64, prior_revision: u64, prior_fenc
 fn write_raw(writer: &mut BoundedCanonicalWriter, value: &[u8]) -> Result<(), ResultDiscardError> {
     writer
         .raw(value)
-        .map_err(|_| ResultDiscardError::PreimageTooLarge)
+        .map_err(|_err| ResultDiscardError::PreimageTooLarge)
 }
 
 fn write_u32(writer: &mut BoundedCanonicalWriter, value: u32) -> Result<(), ResultDiscardError> {
     writer
         .u32(value)
-        .map_err(|_| ResultDiscardError::PreimageTooLarge)
+        .map_err(|_err| ResultDiscardError::PreimageTooLarge)
 }
 
 fn write_u64(writer: &mut BoundedCanonicalWriter, value: u64) -> Result<(), ResultDiscardError> {
     writer
         .u64(value)
-        .map_err(|_| ResultDiscardError::PreimageTooLarge)
+        .map_err(|_err| ResultDiscardError::PreimageTooLarge)
 }
 
 fn write_text(writer: &mut BoundedCanonicalWriter, value: &str) -> Result<(), ResultDiscardError> {
     writer
         .text(value)
-        .map_err(|_| ResultDiscardError::PreimageTooLarge)
+        .map_err(|_err| ResultDiscardError::PreimageTooLarge)
 }
 
 fn write_optional_text(
@@ -636,7 +636,7 @@ fn write_optional_text(
 ) -> Result<(), ResultDiscardError> {
     writer
         .u8(u8::from(value.is_some()))
-        .map_err(|_| ResultDiscardError::PreimageTooLarge)?;
+        .map_err(|_err| ResultDiscardError::PreimageTooLarge)?;
     if let Some(value) = value {
         write_text(writer, value)?;
     }
@@ -649,7 +649,7 @@ fn write_optional_u64(
 ) -> Result<(), ResultDiscardError> {
     writer
         .u8(u8::from(value.is_some()))
-        .map_err(|_| ResultDiscardError::PreimageTooLarge)?;
+        .map_err(|_err| ResultDiscardError::PreimageTooLarge)?;
     if let Some(value) = value {
         write_u64(writer, value)?;
     }

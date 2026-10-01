@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Live PostgreSQL 16 proof for CR-038's forward schema upgrade and spool metadata true-up.
+//! Live `PostgreSQL` 16 proof for CR-038's forward schema upgrade and spool metadata true-up.
 //!
 //! Every test here is `#[ignore]` and gated on its own `LORE_TEST_CELL_SCHEMA_UPGRADE_*_PG_URL`,
 //! which must name a **fresh disposable** database, reached as the `postgres` superuser. Tests
@@ -15,7 +15,7 @@
 //! Real reservation traffic (the flagship wedge/upgrade test) needs a genuine BLAKE3 provider at
 //! `public.blake3(bytea)`, because `local_blake3_v1` refuses to run without one. This crate has no
 //! BLAKE3 extension of its own (by design -- see `cell_schema_install.rs`'s module doc); the
-//! runner supplies it via `plpython3u` and the `blake3` PyPI package, the same fixture shape as
+//! runner supplies it via `plpython3u` and the `blake3` `PyPI` package, the same fixture shape as
 //! `examples/write-behind-test-fixture.rs` and `lore-postgres/tests/run-write-behind-linux.ps1`'s
 //! `Dockerfile.postgres-blake3`. An `--ignored` run with the environment unset panics in `connect`
 //! and reports FAIL, not NOT RUN; the runner is what turns "matched zero tests" into its own NOT
@@ -100,12 +100,10 @@ async fn admin_at(base_url: String) -> Admin {
 fn url_as(base_url: &str, role: &str) -> String {
     let without_scheme = base_url
         .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
+        .map_or(base_url, |(_, rest)| rest);
     let host_and_path = without_scheme
         .split_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_scheme);
+        .map_or(without_scheme, |(_, rest)| rest);
     format!("postgresql://{role}@{host_and_path}")
 }
 
@@ -216,7 +214,7 @@ fn runtime_pool_config(base_url: &str, identity: DispatchDatabaseIdentity) -> Di
 
 /// Install a genuine BLAKE3 provider. `local_blake3_v1` refuses to run without one
 /// (`LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`); the runner's image carries `plpython3u` and the `blake3`
-/// PyPI package for exactly this purpose.
+/// `PyPI` package for exactly this purpose.
 async fn install_blake3_provider(admin: &tokio_postgres::Client) {
     admin
         .batch_execute(

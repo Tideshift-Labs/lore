@@ -15,22 +15,22 @@
 //! live catalog against the closed [`CELL_SCHEMA_STATES`] list, and [`upgrade_cell_schema`] moves an
 //! attested N-1 cell to N offline. Nothing here repairs an unknown state.
 //!
-//! ## PostgreSQL major versions
+//! ## `PostgreSQL` major versions
 //!
 //! The manifest carries server-rendered catalog text, so every pin is a property of one server
 //! major. Each entry point reads `server_version_num` and selects that major's closed pin list:
-//! [`CELL_SCHEMA_STATES`] for PostgreSQL 16, [`CELL_SCHEMA_STATES_PG18`] for PostgreSQL 18. Any
+//! [`CELL_SCHEMA_STATES`] for `PostgreSQL` 16, [`CELL_SCHEMA_STATES_PG18`] for `PostgreSQL` 18. Any
 //! other major is refused as [`CellSchemaError::UnsupportedServerMajor`]; it never falls back to
-//! another major's pins. Frozen migrations 0008 and 0011 embed a PostgreSQL 16 manifest digest in
-//! their own in-database catalog asserts, so on PostgreSQL 18 they are installed as the
+//! another major's pins. Frozen migrations 0008 and 0011 embed a `PostgreSQL` 16 manifest digest in
+//! their own in-database catalog asserts, so on `PostgreSQL` 18 they are installed as the
 //! [`CELL_PG18_RENDERINGS`]: the frozen bytes with exactly that one literal replaced, checked
 //! against their own pinned BLAKE3. The frozen files and their pins do not change. A new
 //! migration cannot fix this: the assert runs inside the install plan, between 0008 and the next
-//! artifact, so the frozen PostgreSQL 16 literal would refuse the install before any later
+//! artifact, so the frozen `PostgreSQL` 16 literal would refuse the install before any later
 //! migration could replace it. No layer identity tuple names 0008 or 0011, so the schema-state
 //! row records the same artifact digests on both majors.
-//! A PostgreSQL 16 cell moved to 18 by `pg_upgrade` re-renders catalog text such as `CHECK`
-//! expressions, matches no fresh-install PostgreSQL 18 pin, and is refused as catalog drift.
+//! A `PostgreSQL` 16 cell moved to 18 by `pg_upgrade` re-renders catalog text such as `CHECK`
+//! expressions, matches no fresh-install `PostgreSQL` 18 pin, and is refused as catalog drift.
 //!
 //! Six properties this module owns, and nothing else in the crate does:
 //!
@@ -49,7 +49,7 @@
 //!    [`install_cell_schema`] is not, and refuses rather than corrupting the caller: it cannot be,
 //!    because every frozen artifact carries its own `BEGIN`/`COMMIT` and every layer install
 //!    procedure requires `SERIALIZABLE`.
-//! 5. **Live catalog readback.** An installed-migration digest does not attest the live PostgreSQL
+//! 5. **Live catalog readback.** An installed-migration digest does not attest the live `PostgreSQL`
 //!    catalog, so attestation digests a canonical twelve-section manifest over the schema:
 //!    relations, columns, constraints, indexes, types, function definitions with their security
 //!    attributes (`prosecdef`, `proconfig`), function ACLs, relation and column ACLs (`relacl`,
@@ -1126,7 +1126,7 @@ pub const CELL_CATALOG_MANIFEST_SQL: &str = "SELECT
      WHERE space.nspname = 'object_store_retention'
   ), '[]') AS rules_and_policies";
 
-/// Pinned per-section BLAKE3-256 digests of the fully installed cell catalog, PostgreSQL 16.
+/// Pinned per-section BLAKE3-256 digests of the fully installed cell catalog, `PostgreSQL` 16.
 ///
 /// Sections are in [`CELL_CATALOG_MANIFEST_SECTIONS`] order. Measured, not derived: see
 /// `tests/run-cell-schema-install-live.ps1`.
@@ -1213,7 +1213,7 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R27: [[u8; 32]; 12] = [
 
 /// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R27`] cell, `PostgreSQL` 16.
 ///
-/// Pinned to PostgreSQL 16: the manifest carries `pg_get_functiondef` and `pg_get_indexdef` output,
+/// Pinned to `PostgreSQL` 16: the manifest carries `pg_get_functiondef` and `pg_get_indexdef` output,
 /// whose exact rendering is a server-version property. A different major version is expected to
 /// fail closed here and needs a re-measured pin, not a relaxed check.
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R27: [u8; 32] =
@@ -1324,12 +1324,12 @@ pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4
 
 /// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 18.
 ///
-/// Every PostgreSQL 18 pin is measured on `postgres:18` (180006) from a fresh install at that
-/// state, with 0008 and 0011 as their [`CELL_PG18_RENDERINGS`], never derived from a PostgreSQL 16
-/// pin. Against the PostgreSQL 16 pin of the same state, three sections move in every state:
-/// `constraints` (PostgreSQL 18 records `NOT NULL` as `pg_constraint` rows), `relation_acls`
-/// (PostgreSQL 17 added `MAINTAIN` to the default relation ACL), and `functions` (0008's and 0011's
-/// rendered digest literals). The other nine match the PostgreSQL 16 pin, which is the check.
+/// Every `PostgreSQL` 18 pin is measured on `postgres:18` (180006) from a fresh install at that
+/// state, with 0008 and 0011 as their [`CELL_PG18_RENDERINGS`], never derived from a `PostgreSQL` 16
+/// pin. Against the `PostgreSQL` 16 pin of the same state, three sections move in every state:
+/// `constraints` (`PostgreSQL` 18 records `NOT NULL` as `pg_constraint` rows), `relation_acls`
+/// (`PostgreSQL` 17 added `MAINTAIN` to the default relation ACL), and `functions` (0008's and 0011's
+/// rendered digest literals). The other nine match the `PostgreSQL` 16 pin, which is the check.
 pub const CELL_CATALOG_SECTION_BLAKE3_R25_PG18: [[u8; 32]; 12] = [
     CELL_CATALOG_SECTION_BLAKE3_R25[0],
     CELL_CATALOG_SECTION_BLAKE3_R25[1],
@@ -1391,7 +1391,7 @@ pub const CELL_CATALOG_MANIFEST_BLAKE3_R27_PG18: [u8; 32] =
 
 /// Pinned per-section digests of state [`CellSchemaRevision::R28`], `PostgreSQL` 18.
 ///
-/// As on PostgreSQL 16, forward step 0028 moves exactly `functions` and `function_acls` against
+/// As on `PostgreSQL` 16, forward step 0028 moves exactly `functions` and `function_acls` against
 /// the R27 pin of the same major.
 pub const CELL_CATALOG_SECTION_BLAKE3_R28_PG18: [[u8; 32]; 12] = [
     CELL_CATALOG_SECTION_BLAKE3_R27_PG18[0],
@@ -1415,7 +1415,7 @@ pub const CELL_CATALOG_MANIFEST_BLAKE3_R28_PG18: [u8; 32] =
 /// One major's closed list of known states: each state with its section pins and manifest pin.
 pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4];
 
-/// Every known PostgreSQL 18 state with its pins, oldest first.
+/// Every known `PostgreSQL` 18 state with its pins, oldest first.
 pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
     (
         CellSchemaRevision::R25,
@@ -1439,7 +1439,7 @@ pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
     ),
 ];
 
-/// A PostgreSQL server major this module has measured pins for.
+/// A `PostgreSQL` server major this module has measured pins for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PostgresMajor {
     /// `server_version_num` in `[160000, 170000)`.
@@ -1479,28 +1479,28 @@ impl PostgresMajor {
     }
 }
 
-/// One frozen artifact as it must be installed on PostgreSQL 18.
+/// One frozen artifact as it must be installed on `PostgreSQL` 18.
 ///
 /// 0008 and 0011 each embed the SHA-256 of their own in-database catalog manifest, measured on
-/// PostgreSQL 16. The rendering replaces exactly that one literal and nothing else. The result is
+/// `PostgreSQL` 16. The rendering replaces exactly that one literal and nothing else. The result is
 /// checked against [`CellMigrationRendering::rendered_blake3`] before it runs.
 #[derive(Clone, Copy, Debug)]
 pub struct CellMigrationRendering {
     /// The frozen artifact this renders.
     pub number: u16,
-    /// The PostgreSQL 16 manifest digest literal in the frozen bytes. It must occur exactly once.
+    /// The `PostgreSQL` 16 manifest digest literal in the frozen bytes. It must occur exactly once.
     pub frozen_literal: &'static str,
-    /// The PostgreSQL 18 manifest digest that replaces it, measured.
+    /// The `PostgreSQL` 18 manifest digest that replaces it, measured.
     pub rendered_literal: &'static str,
     /// BLAKE3-256 of the rendered artifact.
     pub rendered_blake3: [u8; 32],
 }
 
-/// The PostgreSQL 18 renderings of 0008 and 0011.
+/// The `PostgreSQL` 18 renderings of 0008 and 0011.
 ///
 /// Measured on `postgres:18` (180006): 0008's manifest with the frozen 0002-0008 chain applied,
 /// then 0011's from its own `DETAIL` with rendered 0008 applied. 0011's manifest covers every
-/// function in the schema, including 0008's assert with its digest literal, so its PostgreSQL 18
+/// function in the schema, including 0008's assert with its digest literal, so its `PostgreSQL` 18
 /// value is only valid after rendered 0008.
 pub const CELL_PG18_RENDERINGS: [CellMigrationRendering; 2] = [
     CellMigrationRendering {
@@ -1519,7 +1519,7 @@ pub const CELL_PG18_RENDERINGS: [CellMigrationRendering; 2] = [
 
 /// The exact SQL to run for `migration` on `major`.
 ///
-/// PostgreSQL 16 gets the frozen bytes. PostgreSQL 18 gets the frozen bytes unless the artifact has
+/// `PostgreSQL` 16 gets the frozen bytes. `PostgreSQL` 18 gets the frozen bytes unless the artifact has
 /// a [`CELL_PG18_RENDERINGS`] entry, in which case the one literal is replaced and the result must
 /// match its pinned digest.
 ///
@@ -1627,7 +1627,7 @@ fn nibble(byte: u8) -> Result<u8, CellSchemaError> {
 /// Every failure this installer/attester can report.
 ///
 /// Variants carry only fixed strings and closed enums. Connection strings, PEM material,
-/// PostgreSQL diagnostics, and parameter values never reach `Display`, `Debug`, or `source`.
+/// `PostgreSQL` diagnostics, and parameter values never reach `Display`, `Debug`, or `source`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CellSchemaError {
     /// An install precondition was not met; nothing was changed.
@@ -2458,7 +2458,7 @@ pub async fn revoke_replaced_function_privileges(
     Ok(issued)
 }
 
-/// Attest the installed cell authority schema against the live PostgreSQL catalog.
+/// Attest the installed cell authority schema against the live `PostgreSQL` catalog.
 ///
 /// # Errors
 ///
@@ -2599,7 +2599,7 @@ async fn assert_migrator_session(client: &Client) -> Result<(), CellSchemaError>
 /// Install is not transaction-safe and cannot be made so: each frozen artifact carries its own
 /// `BEGIN`/`COMMIT`, and every layer install procedure requires `SERIALIZABLE`, which cannot be
 /// entered from inside another transaction. Running it inside a caller's transaction would end that
-/// transaction at the first artifact and commit the caller's uncommitted work with it. PostgreSQL
+/// transaction at the first artifact and commit the caller's uncommitted work with it. `PostgreSQL`
 /// answers "is a transaction open" through `SAVEPOINT`, which raises 25P01 when there is none.
 async fn assert_no_open_transaction(client: &Client) -> Result<(), CellSchemaError> {
     match client.batch_execute(TRANSACTION_PROBE_SAVEPOINT_SQL).await {
@@ -2720,7 +2720,7 @@ async fn call_layer_install(
     };
     let code: String = row
         .try_get(0)
-        .map_err(|_| CellSchemaError::InvalidResponse("install result code"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("install result code"))?;
     match code.as_str() {
         "CREATED" => Ok(LayerInstallOutcome::Created),
         "REPLAY" => Ok(LayerInstallOutcome::Replayed),
@@ -2789,16 +2789,16 @@ fn read_layer_identity(
 ) -> Result<LayerIdentity, CellSchemaError> {
     let revision: Option<String> = row
         .try_get(offset)
-        .map_err(|_| CellSchemaError::InvalidResponse("layer schema revision"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("layer schema revision"))?;
     let digest: Option<String> = row
         .try_get(offset + 1)
-        .map_err(|_| CellSchemaError::InvalidResponse("layer migration digest"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("layer migration digest"))?;
     let install_revision: Option<String> = row
         .try_get(offset + 2)
-        .map_err(|_| CellSchemaError::InvalidResponse("layer install revision"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("layer install revision"))?;
     let installed_at: Option<i64> = row
         .try_get(offset + 3)
-        .map_err(|_| CellSchemaError::InvalidResponse("layer install time"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("layer install time"))?;
 
     let present = usize::from(revision.is_some())
         + usize::from(digest.is_some())
@@ -2842,7 +2842,7 @@ async fn read_catalog_manifest(
     for (index, name) in CELL_CATALOG_MANIFEST_SECTIONS.iter().enumerate() {
         let text: String = row
             .try_get(index)
-            .map_err(|_| CellSchemaError::InvalidResponse("catalog manifest section"))?;
+            .map_err(|_err| CellSchemaError::InvalidResponse("catalog manifest section"))?;
         // Domain-separated by section name. Without it two empty sections digest identically, and
         // a transposed pin between them would be undetectable; the whole-manifest digest frames the
         // name already, so only the per-section values needed this.
@@ -2889,10 +2889,10 @@ async fn assert_no_residual_service_privilege(client: &Client) -> Result<usize, 
         .map_err(CellSchemaError::postgres)?;
     let matched: i64 = row
         .try_get(0)
-        .map_err(|_| CellSchemaError::InvalidResponse("matched signature count"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("matched signature count"))?;
     let residual: i64 = row
         .try_get(1)
-        .map_err(|_| CellSchemaError::InvalidResponse("residual privilege count"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("residual privilege count"))?;
     if usize::try_from(matched).unwrap_or(usize::MAX) != signatures.len() {
         // Every frozen signature must resolve to exactly one live function. If one does not, this
         // check silently inspected nothing, which is worse than reporting drift.
@@ -2943,7 +2943,7 @@ async fn read_retention_state(client: &Client) -> Result<String, CellSchemaError
         .map_err(CellSchemaError::postgres)?;
     let code: String = row
         .try_get(0)
-        .map_err(|_| CellSchemaError::InvalidResponse("retention read result"))?;
+        .map_err(|_err| CellSchemaError::InvalidResponse("retention read result"))?;
     if code != "READ" {
         return Err(CellSchemaError::InvalidResponse("retention read result"));
     }
@@ -3038,5 +3038,5 @@ where
         .await
         .map_err(CellSchemaError::postgres)?;
     row.try_get(0)
-        .map_err(|_| CellSchemaError::InvalidResponse("scalar column"))
+        .map_err(|_err| CellSchemaError::InvalidResponse("scalar column"))
 }

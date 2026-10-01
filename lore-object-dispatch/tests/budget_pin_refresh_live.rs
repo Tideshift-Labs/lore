@@ -2,14 +2,14 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
-//! Live PostgreSQL 16 evidence for CR-034's runtime budget pin re-read: migration 0025's
+//! Live `PostgreSQL` 16 evidence for CR-034's runtime budget pin re-read: migration 0025's
 //! `SECURITY DEFINER` head-read function, and the refresh-and-retry the head read feeds in
 //! `GovernedProviderClient::execute`.
 //!
 //! Pattern of `provider_charge_live.rs`, trimmed to what this delta needs: install through 0025,
 //! publish a first revision, then drive the real `PostgresProviderChargeAuthority` (never a fake)
 //! through a real renewal. Each test in this file runs against its own fresh, disposable
-//! PostgreSQL 16 database -- never the owner's default stack, never slot 50's published budget.
+//! `PostgreSQL` 16 database -- never the owner's default stack, never slot 50's published budget.
 //! See `lorehub/docs/lore-change-requests/cr-034-runtime-budget-pin-re-read.md`.
 
 use std::env;
@@ -411,7 +411,7 @@ async fn live_postgres_expiry_refuses_typed_and_never_enters_the_refresh_branch(
 
 /// Wraps the real `PostgresProviderChargeAuthority` and counts calls to `refresh_budget_pin`
 /// without changing its behavior, so a live test can prove exactly how many times the head was
-/// actually read against real PostgreSQL -- zero on expiry, exactly one on a renewable rejection.
+/// actually read against real `PostgreSQL` -- zero on expiry, exactly one on a renewable rejection.
 struct CountingRefreshAuthority {
     inner: PostgresProviderChargeAuthority,
     refresh_calls: Arc<AtomicU32>,
@@ -461,12 +461,10 @@ fn pool_config(
 ) -> DispatchPoolConfig {
     let without_scheme = base_url
         .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
+        .map_or(base_url, |(_, rest)| rest);
     let host_and_path = without_scheme
         .split_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_scheme);
+        .map_or(without_scheme, |(_, rest)| rest);
     DispatchPoolConfig {
         postgres_url: format!(
             "postgresql://{}@{host_and_path}?sslmode=disable",
@@ -761,8 +759,7 @@ async fn head_read_as(
         Ok(row) => Ok((row.get(0), row.get(1), row.get(2))),
         Err(error) => Err(error
             .code()
-            .map(|code| code.code().to_string())
-            .unwrap_or_else(|| format!("{error:?}"))),
+            .map_or_else(|| format!("{error:?}"), |code| code.code().to_string())),
     };
     client
         .batch_execute("RESET SESSION AUTHORIZATION")
@@ -787,9 +784,7 @@ async fn direct_select_current_configuration_as(client: &Client, role: &str) -> 
     {
         Ok(_) => Ok(()),
         Err(error) => Err(error
-            .code()
-            .map(|code| code.code().to_string())
-            .unwrap_or_else(|| format!("{error:?}"))),
+            .code().map_or_else(|| format!("{error:?}"), |code| code.code().to_string())),
     };
     client
         .batch_execute("RESET SESSION AUTHORIZATION")

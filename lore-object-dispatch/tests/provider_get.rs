@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Public contract for the one unmetered provider operation, GetObject.
+//! Public contract for the one unmetered provider operation, `GetObject`.
 
 use std::future::Future;
 use std::pin::Pin;

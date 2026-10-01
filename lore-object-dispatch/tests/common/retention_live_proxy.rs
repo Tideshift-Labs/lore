@@ -93,7 +93,7 @@ impl RetentionFaultProxy {
                     connection_tasks.push(AbortOnDropHandle::new(lore_base::lore_spawn!(
                         "retention-live-proxy-connection",
                         async move {
-                            let _ = serve_connection(
+                            let _ = Box::pin(serve_connection(
                                 downstream,
                                 &upstream_host,
                                 upstream_port,
@@ -101,7 +101,7 @@ impl RetentionFaultProxy {
                                 connector,
                                 faults,
                                 expected_client_common_name,
-                            )
+                            ))
                             .await;
                         }
                     )));
@@ -237,12 +237,13 @@ fn assert_client_common_name(
                 "downstream client certificate missing",
             )
         })?;
-    let (_, parsed) = x509_parser::parse_x509_certificate(certificate.as_ref()).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "downstream client certificate malformed",
-        )
-    })?;
+    let (_, parsed) =
+        x509_parser::parse_x509_certificate(certificate.as_ref()).map_err(|_err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "downstream client certificate malformed",
+            )
+        })?;
     let common_name = parsed
         .subject()
         .iter_common_name()
@@ -288,7 +289,7 @@ async fn serve_connection(
             "upstream PostgreSQL refused TLS",
         ));
     }
-    let server_name = ServerName::try_from(upstream_host.to_string()).map_err(|_| {
+    let server_name = ServerName::try_from(upstream_host.to_string()).map_err(|_err| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "invalid upstream DNS name",

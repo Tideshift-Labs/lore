@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Source-dark SPOOL_READY snapshot codec contract. It proves canonical database snapshots only,
+//! Source-dark `SPOOL_READY` snapshot codec contract. It proves canonical database snapshots only,
 //! not filesystem writes, fsync, rename, or any transition/coordinator behavior.
 
 use std::path::Path;
@@ -479,10 +479,7 @@ async fn install(client: &tokio_postgres::Client, sql: &str) -> String {
     value
 }
 fn message(error: &tokio_postgres::Error) -> &str {
-    error
-        .as_db_error()
-        .map(|db| db.message())
-        .unwrap_or("untyped")
+    error.as_db_error().map_or("untyped", |db| db.message())
 }
 
 #[tokio::test]

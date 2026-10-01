@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Embedded source-dark atomic PUT SPOOL_READY database mutation artifact.
+//! Embedded source-dark atomic PUT `SPOOL_READY` database mutation artifact.
 //!
 //! Runtime code does not install or call this migration. The database procedure records a
 //! caller assertion that the complete body is already durable at the supplied handle. It cannot
 //! write, fsync, rename, inspect, or otherwise prove the filesystem state itself.
 
-/// Exact PostgreSQL PUT SPOOL_READY mutation migration bytes.
+/// Exact `PostgreSQL` PUT `SPOOL_READY` mutation migration bytes.
 pub const LOCAL_AUTHORITY_PUT_SPOOL_READY_MUTATION_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0017_object_store_dispatch_put_spool_ready_mutation.sql");
 

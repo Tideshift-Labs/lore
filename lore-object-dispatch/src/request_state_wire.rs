@@ -102,16 +102,16 @@ fn writer(
     limits: &RequestStateWireLimits,
 ) -> Result<BoundedCanonicalWriter, RequestStateWireError> {
     BoundedCanonicalWriter::new(limits.max_canonical_row_bytes)
-        .map_err(|_| RequestStateWireError::InvalidLimits)
+        .map_err(|_err| RequestStateWireError::InvalidLimits)
 }
 
 fn text(value: &str, limits: &RequestStateWireLimits) -> Result<(), RequestStateWireError> {
     validate_canonical_text(value, limits.max_identity_bytes)
-        .map_err(|_| RequestStateWireError::InvalidCanonicalText)
+        .map_err(|_err| RequestStateWireError::InvalidCanonicalText)
 }
 
 fn nonnegative(value: i64) -> Result<u64, RequestStateWireError> {
-    u64::try_from(value).map_err(|_| RequestStateWireError::NegativeTime)
+    u64::try_from(value).map_err(|_err| RequestStateWireError::NegativeTime)
 }
 
 fn positive(value: u64) -> Result<u64, RequestStateWireError> {
@@ -125,7 +125,7 @@ fn positive(value: u64) -> Result<u64, RequestStateWireError> {
 fn digest(value: &[u8]) -> Result<[u8; 32], RequestStateWireError> {
     value
         .try_into()
-        .map_err(|_| RequestStateWireError::InvalidDigest)
+        .map_err(|_err| RequestStateWireError::InvalidDigest)
 }
 
 fn finish(
@@ -167,7 +167,7 @@ fn write_framed(
 ) -> Result<(), RequestStateWireError> {
     output
         .bytes(bytes)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)
 }
 
 fn write_optional_framed(
@@ -176,7 +176,7 @@ fn write_optional_framed(
 ) -> Result<(), RequestStateWireError> {
     output
         .u8(u8::from(bytes.is_some()))
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     if let Some(value) = bytes {
         write_framed(output, value)?;
     }
@@ -190,12 +190,12 @@ fn write_optional_text(
 ) -> Result<(), RequestStateWireError> {
     output
         .u8(u8::from(value.is_some()))
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     if let Some(value) = value {
         text(value, limits)?;
         output
             .text(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     Ok(())
 }
@@ -206,11 +206,11 @@ fn write_optional_u64(
 ) -> Result<(), RequestStateWireError> {
     output
         .u8(u8::from(value.is_some()))
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     if let Some(value) = value {
         output
             .u64(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     Ok(())
 }
@@ -222,11 +222,11 @@ fn quota_preimage(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-quota-units-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in [value.bytes, value.rows, value.concurrency] {
         output
             .u64(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     Ok(output.finish())
 }
@@ -238,7 +238,7 @@ fn reservation_preimage(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-reserved-dimension-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in [
         &value.reservation_id,
         &value.physical_dimension_id,
@@ -247,11 +247,11 @@ fn reservation_preimage(
         text(value, limits)?;
         output
             .text(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     output
         .u64(positive(value.units)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     Ok(output.finish())
 }
 
@@ -260,7 +260,7 @@ fn reservations_bytes(
     limits: &RequestStateWireLimits,
 ) -> Result<(Vec<u8>, Vec<ReservedDimensionV1>), RequestStateWireError> {
     let count =
-        u32::try_from(values.len()).map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        u32::try_from(values.len()).map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let mut ids = HashSet::new();
     let mut pairs = HashSet::new();
     let mut canonical = Vec::with_capacity(values.len());
@@ -294,7 +294,7 @@ fn reservations_bytes(
     let mut output = writer(limits)?;
     output
         .u32(count)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in &canonical {
         let complete = complete_child(reservation_preimage(value, limits)?, &[], limits)?;
         write_framed(&mut output, &complete)?;
@@ -315,26 +315,26 @@ fn dispatch_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-dispatch-attempt-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in [&value.provider_attempt_id, &value.provider_grant_id] {
         text(value, limits)?;
         output
             .text(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     output
         .u64(positive(value.provider_grant_fence)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.dispatcher_id, limits)?;
     output
         .text(&value.dispatcher_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(positive(value.dispatcher_lease_generation)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(nonnegative(value.dispatch_started_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_u64(
         &mut output,
         value
@@ -345,7 +345,7 @@ fn dispatch_child(
     text(&value.provider_credential_revision, limits)?;
     output
         .text(&value.provider_credential_revision)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     complete_child(output.finish(), &[], limits)
 }
 
@@ -378,7 +378,7 @@ fn terminal_child(
     RequestStateWireError,
 > {
     let canonical = validate_and_encode_terminal_result(value, &terminal_limits(limits))
-        .map_err(|_| RequestStateWireError::InvalidTerminalResult)?;
+        .map_err(|_err| RequestStateWireError::InvalidTerminalResult)?;
     if value.canonical_result_size != canonical.canonical_result_size()
         || value.canonical_result_blake3.as_ref() != canonical.canonical_result_blake3()
     {
@@ -402,23 +402,23 @@ fn terminal_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-terminal-result-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(tag)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .bytes(canonical.canonical_result_bytes())
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.terminal_result_id, limits)?;
     output
         .text(&value.terminal_result_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .raw(canonical.canonical_result_blake3())
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(canonical.canonical_result_size())
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let complete = complete_child(output.finish(), &[], limits)?;
     let normalized = canonical.result().clone();
     let byte = match selected {
@@ -442,20 +442,20 @@ pub(crate) fn ack_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-result-ack-receipt-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(1)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.terminal_result_id, limits)?;
     output
         .text(&value.terminal_result_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .raw(&digest(&value.ack_fingerprint)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(nonnegative(value.acked_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_u64(
         &mut output,
         value
@@ -480,20 +480,20 @@ pub(crate) fn discard_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-result-discard-receipt-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(1)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.terminal_result_id, limits)?;
     output
         .text(&value.terminal_result_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .raw(&digest(&value.discard_fingerprint)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(nonnegative(value.discarded_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_u64(
         &mut output,
         value
@@ -512,40 +512,40 @@ pub(crate) fn no_dispatch_child(
         return Err(RequestStateWireError::InvalidEnum);
     }
     let proof_timestamp = canonical_uuid_v7_timestamp(&value.proof_id)
-        .map_err(|_| RequestStateWireError::InvalidUuidV7)?;
+        .map_err(|_err| RequestStateWireError::InvalidUuidV7)?;
     if proof_timestamp != nonnegative(value.committed_at_unix_ms)? {
         return Err(RequestStateWireError::InvalidTimeOrder);
     }
     canonical_uuid_v7_timestamp(&value.logical_request_id)
-        .map_err(|_| RequestStateWireError::InvalidUuidV7)?;
+        .map_err(|_err| RequestStateWireError::InvalidUuidV7)?;
     digest(&value.proof_blake3)?;
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-no-dispatch-proof-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.reason as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     // CD-6: the proof commits to the request it describes. This writer and
     // `no_dispatch::canonical_preimage` are two independent implementations of one
     // preimage; the in-crate agreement test is what keeps them from drifting.
     text(&value.logical_request_id, limits)?;
     output
         .text(&value.logical_request_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.proof_id, limits)?;
     output
         .text(&value.proof_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(positive(value.proof_fence)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(nonnegative(value.committed_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(positive(value.authority_epoch)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     complete_child(output.finish(), &value.proof_blake3, limits)
 }
 
@@ -564,18 +564,18 @@ pub(crate) fn purge_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-payload-purge-receipt-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.purge_id, limits)?;
     output
         .text(&value.purge_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.payload_kind as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_text(&mut output, value.terminal_result_id.as_deref(), limits)?;
     output
         .u32(value.disposition as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in [
         value.released_bytes,
         value.released_rows,
@@ -583,23 +583,23 @@ pub(crate) fn purge_child(
     ] {
         output
             .u64(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     output
         .u64(nonnegative(value.purged_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u8(0)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.release_reason as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(value.deleted_partial_temp_bytes)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(value.deleted_partial_temp_files)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let (bytes, result) = finish(&output.finish(), &value.receipt_blake3, limits)?;
     let mut normalized = value.clone();
     normalized.receipt_blake3 = result.to_vec().into();
@@ -678,23 +678,23 @@ fn retention_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-payload-retention-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.payload_kind as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.availability as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_text(&mut output, value.durable_handle.as_deref(), limits)?;
     output
         .u64(value.size)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .bytes(&value.blake3)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(value.purge_state as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_u64(
         &mut output,
         value
@@ -708,10 +708,10 @@ fn retention_child(
     )?;
     output
         .u64(value.partial_temp_bytes)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(value.partial_temp_chunks)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let (bytes, _) = finish(&output.finish(), &[], limits)?;
     let mut normalized = value.clone();
     normalized.purge_receipt = receipt.map(|value| value.1);
@@ -739,17 +739,17 @@ fn quota_state_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-quota-state-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .raw(&reservation_bytes)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in [put, result, metadata] {
         let child = complete_child(quota_preimage(value, limits)?, &[], limits)?;
         write_framed(&mut output, &child)?;
     }
     output
         .u64(positive(value.quota_revision)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let complete = complete_child(output.finish(), &[], limits)?;
     let mut normalized = value.clone();
     normalized.provider_reservations = canonical_reservations;
@@ -766,27 +766,27 @@ fn binding_child(
     let mut output = writer(limits)?;
     output
         .raw(b"object-store-put-submit-binding-v1\0")
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.upload_id, limits)?;
     output
         .text(&value.upload_id)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(positive(value.upload_fence)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     text(&value.durable_body_handle, limits)?;
     output
         .text(&value.durable_body_handle)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(nonnegative(value.reservation_expires_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(nonnegative(value.bound_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(positive(value.binding_fence)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let (bytes, result) = finish(&output.finish(), &value.binding_blake3, limits)?;
     let mut normalized = value.clone();
     normalized.binding_blake3 = result.to_vec().into();
@@ -801,12 +801,7 @@ fn expected_spool(
     retention: &ObjectStorePayloadRetentionV1,
 ) -> Result<ObjectStoreQuotaUnitsV1, RequestStateWireError> {
     match retention.availability {
-        1 => Ok(ObjectStoreQuotaUnitsV1 {
-            bytes: 0,
-            rows: 0,
-            concurrency: 0,
-        }),
-        3 => Ok(ObjectStoreQuotaUnitsV1 {
+        1 | 3 => Ok(ObjectStoreQuotaUnitsV1 {
             bytes: 0,
             rows: 0,
             concurrency: 0,
@@ -1008,9 +1003,9 @@ pub fn validate_and_encode_object_store_request_state(
     validate_limits(limits)?;
     validate_state_algebra(input)?;
     canonical_uuid_v7_timestamp(&input.logical_request_id)
-        .map_err(|_| RequestStateWireError::InvalidUuidV7)?;
+        .map_err(|_err| RequestStateWireError::InvalidUuidV7)?;
     canonical_uuid_v7_timestamp(&input.attempt_id)
-        .map_err(|_| RequestStateWireError::InvalidUuidV7)?;
+        .map_err(|_err| RequestStateWireError::InvalidUuidV7)?;
     for value in [
         &input.protocol_revision,
         &input.provider_boundary_id,
@@ -1159,7 +1154,7 @@ pub fn validate_and_encode_object_store_request_state(
     let mut output = writer(limits)?;
     output
         .raw(STATE_DOMAIN)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     for value in [
         &input.protocol_revision,
         &input.provider_boundary_id,
@@ -1170,7 +1165,7 @@ pub fn validate_and_encode_object_store_request_state(
     ] {
         output
             .text(value)
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     }
     for value in [
         &input.put_reservation_fingerprint,
@@ -1178,22 +1173,22 @@ pub fn validate_and_encode_object_store_request_state(
     ] {
         output
             .u8(u8::from(value.is_some()))
-            .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+            .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
         if let Some(value) = value {
             output
                 .raw(&digest(value)?)
-                .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+                .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
         }
     }
     output
         .u32(input.phase as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .text(&input.allocation_revision)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u64(positive(input.allocation_fence)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_text(&mut output, input.cell_admission_id.as_deref(), limits)?;
     write_optional_u64(
         &mut output,
@@ -1201,7 +1196,7 @@ pub fn validate_and_encode_object_store_request_state(
     )?;
     output
         .raw(&reservations)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_framed(&mut output, dispatch.as_deref())?;
     write_optional_framed(
         &mut output,
@@ -1209,10 +1204,10 @@ pub fn validate_and_encode_object_store_request_state(
     )?;
     output
         .u32(input.terminal_retryability as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(input.result_disposition as u32)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_framed(&mut output, ack.as_deref())?;
     write_optional_framed(&mut output, discard.as_deref())?;
     write_optional_framed(&mut output, no_dispatch.as_deref())?;
@@ -1221,7 +1216,7 @@ pub fn validate_and_encode_object_store_request_state(
     write_framed(&mut output, &quota)?;
     output
         .u64(nonnegative(input.state_committed_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_u64(
         &mut output,
         input
@@ -1231,7 +1226,7 @@ pub fn validate_and_encode_object_store_request_state(
     )?;
     output
         .text(&input.policy_revision)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_optional_framed(
         &mut output,
         binding.as_ref().map(|value| value.0.as_slice()),
@@ -1317,14 +1312,14 @@ pub fn validate_and_encode_object_store_request_receipt(
     let mut output = writer(limits)?;
     output
         .raw(RECEIPT_DOMAIN)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(REQUEST_STATE_RECEIPT_TAG)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_framed(&mut output, state.canonical_bytes())?;
     output
         .u64(nonnegative(input.receipt_committed_at_unix_ms)?)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     let canonical_preimage = output.finish();
     let (canonical_bytes, receipt_blake3) =
         finish(&canonical_preimage, &input.receipt_blake3, limits)?;
@@ -1354,10 +1349,10 @@ pub fn validate_and_encode_object_store_request_outcome(
     let mut output = writer(limits)?;
     output
         .raw(OUTCOME_DOMAIN)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     output
         .u32(REQUEST_STATE_OUTCOME_TAG)
-        .map_err(|_| RequestStateWireError::CanonicalTooLarge)?;
+        .map_err(|_err| RequestStateWireError::CanonicalTooLarge)?;
     write_framed(&mut output, state.canonical_bytes())?;
     let canonical_preimage = output.finish();
     let (canonical_bytes, outcome_blake3) =

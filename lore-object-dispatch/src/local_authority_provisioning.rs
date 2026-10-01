@@ -10,7 +10,7 @@
 pub const LOCAL_AUTHORITY_PROVISIONING_API_REVISION_V1: &str =
     "object-store-dispatch-authority-provisioning-v1";
 
-/// Exact PostgreSQL provisioning migration bytes, embedded for image/provisioning parity only.
+/// Exact `PostgreSQL` provisioning migration bytes, embedded for image/provisioning parity only.
 pub const LOCAL_AUTHORITY_PROVISIONING_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0008_object_store_dispatch_authority_provisioning.sql");
 

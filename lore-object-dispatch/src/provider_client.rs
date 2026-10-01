@@ -42,7 +42,7 @@
 //!
 //! # Fail-closed defaults and runtime construction
 //!
-//! Phase 5 composition explicitly constructs the PostgreSQL charge authority and retry-disabled S3
+//! Phase 5 composition explicitly constructs the `PostgreSQL` charge authority and retry-disabled S3
 //! transport. This module still ships [`UnwiredChargeAuthority`] and [`UnwiredProviderTransport`]
 //! as fail-closed defaults; they reject every call and can never report success. They are guards,
 //! not stubs: a client assembled from them charges nothing and sends nothing. The budget pin a
@@ -85,7 +85,7 @@ pub const PROVIDER_MAX_PART_SIZE_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 pub const PROVIDER_MAX_SINGLE_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Largest number of parts one multipart upload may carry.
 pub const PROVIDER_MAX_MULTIPART_PARTS: u32 = 10_000;
-/// Longest provider-attempt admission window after the attempt UUIDv7 timestamp.
+/// Longest provider-attempt admission window after the attempt `UUIDv7` timestamp.
 pub const PROVIDER_ATTEMPT_DEADLINE_HORIZON_MS: i64 = 5 * 60 * 1_000;
 
 /// The closed set of physical provider attempt classes this cell may issue.
@@ -302,7 +302,7 @@ impl CellProviderBoundary {
         endpoint_host: &str,
     ) -> Result<Self, ProviderClientError> {
         validate_canonical_id(provider_boundary_id)
-            .map_err(|_| ProviderClientError::InvalidProviderBoundaryId)?;
+            .map_err(|_err| ProviderClientError::InvalidProviderBoundaryId)?;
         validate_bucket_name(bucket)?;
         validate_region(region)?;
         validate_endpoint_host(endpoint_host)?;
@@ -558,8 +558,8 @@ pub fn plan_put_object(
         return Ok(PutObjectPlan::SingleShot { body_size });
     }
     let part_count = body_size.div_ceil(limits.part_size_bytes);
-    let part_count =
-        u32::try_from(part_count).map_err(|_| ProviderClientError::MultipartPartCountExceeded)?;
+    let part_count = u32::try_from(part_count)
+        .map_err(|_err| ProviderClientError::MultipartPartCountExceeded)?;
     if part_count > limits.max_parts {
         return Err(ProviderClientError::MultipartPartCountExceeded);
     }
@@ -656,7 +656,7 @@ pub fn bind_durable_put_body(
     }
     let paths = layout
         .derive_paths(key)
-        .map_err(|_| ProviderClientError::InvalidSpoolKey)?;
+        .map_err(|_err| ProviderClientError::InvalidSpoolKey)?;
     let LedgerSpoolView::Ready {
         opaque_handle,
         size,
@@ -681,7 +681,7 @@ pub fn bind_durable_put_body(
 /// Binds CD-3's typed spool-ready result to the PUT body an attempt may send.
 ///
 /// This is a filesystem-free adapter onto [`bind_durable_put_body`]. It reconstructs that
-/// function's layout, PUT key, and ready ledger view, so the same canonical-key, UUIDv7, ready-state,
+/// function's layout, PUT key, and ready ledger view, so the same canonical-key, `UUIDv7`, ready-state,
 /// and derived-handle checks remain authoritative. The ready result's spool-object, upload,
 /// timestamp, ACK, revision, and record fields are outside the existing durable-body proof; this
 /// helper neither treats them as new authority nor silently weakens the proof to accommodate them.
@@ -691,7 +691,7 @@ pub fn bind_durable_put_body_from_ready(
     ready: &PutSpoolReadyOutcome,
 ) -> Result<DurableProviderPutBody, ProviderClientError> {
     let layout =
-        SpoolLayout::new(shared_spool_root).map_err(|_| ProviderClientError::InvalidSpoolKey)?;
+        SpoolLayout::new(shared_spool_root).map_err(|_err| ProviderClientError::InvalidSpoolKey)?;
     let key = SpoolObjectKey {
         provider_boundary_id: provider_boundary_id.to_string(),
         logical_request_id: ready.logical_request_id.to_string(),
@@ -1658,9 +1658,9 @@ impl ProviderAttemptLedger {
         logical_request_id: &str,
     ) -> Result<Self, ProviderClientError> {
         validate_canonical_id(provider_boundary_id)
-            .map_err(|_| ProviderClientError::InvalidProviderBoundaryId)?;
+            .map_err(|_err| ProviderClientError::InvalidProviderBoundaryId)?;
         canonical_uuid_v7_timestamp(logical_request_id)
-            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+            .map_err(|_err| ProviderClientError::InvalidRequestIdentity)?;
         Ok(Self {
             provider_boundary_id: provider_boundary_id.to_string(),
             logical_request_id: logical_request_id.to_string(),
@@ -2203,10 +2203,10 @@ where
                 transport_guard.ledger().record_issued_attempt()?;
                 match outcome {
                     ProviderAttemptOutcome::Decisive => {
-                        transport_guard.ledger().record_decisive_terminal()?
+                        transport_guard.ledger().record_decisive_terminal()?;
                     }
                     ProviderAttemptOutcome::Ambiguous => {
-                        transport_guard.ledger().record_ambiguous()?
+                        transport_guard.ledger().record_ambiguous()?;
                     }
                 }
                 Ok(ProviderAttemptExecution { outcome, response })
@@ -2294,9 +2294,9 @@ where
             return Err(ProviderClientError::ListCapabilityNotGranted);
         }
         canonical_uuid_v7_timestamp(fields.logical_request_id)
-            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+            .map_err(|_err| ProviderClientError::InvalidRequestIdentity)?;
         let attempt_timestamp = canonical_uuid_v7_timestamp(fields.attempt_id)
-            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+            .map_err(|_err| ProviderClientError::InvalidRequestIdentity)?;
         if fields.attempt_ordinal == 0 {
             return Err(ProviderClientError::InvalidAttemptOrdinal);
         }
@@ -2395,9 +2395,9 @@ where
     ) -> Result<ProviderAttemptExecution<T::Response>, ProviderClientError> {
         self.boundary.validate_target(&request.target)?;
         canonical_uuid_v7_timestamp(&request.logical_request_id)
-            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+            .map_err(|_err| ProviderClientError::InvalidRequestIdentity)?;
         canonical_uuid_v7_timestamp(&request.attempt_id)
-            .map_err(|_| ProviderClientError::InvalidRequestIdentity)?;
+            .map_err(|_err| ProviderClientError::InvalidRequestIdentity)?;
         if request.attempt_ordinal == 0 {
             return Err(ProviderClientError::InvalidAttemptOrdinal);
         }
@@ -2485,7 +2485,7 @@ fn validate_grant(
     grant: &ProviderChargeGrant,
 ) -> Result<(), ProviderClientError> {
     canonical_uuid_v7_timestamp(&grant.grant_id)
-        .map_err(|_| ProviderClientError::GrantDoesNotBindAttempt)?;
+        .map_err(|_err| ProviderClientError::GrantDoesNotBindAttempt)?;
     if grant.traffic_class != request.traffic_class
         || grant.attempt_class != request.attempt_class
         || grant.charged_units != request.attempt_units

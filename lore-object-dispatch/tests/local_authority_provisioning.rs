@@ -36,14 +36,14 @@ fn function_body<'a>(sql: &'a str, function_name: &str) -> &'a str {
     let start = sql
         .find(function_name)
         .unwrap_or_else(|| panic!("missing function: {function_name}"));
-    let body_start = sql[start..]
-        .find("AS $$")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing function body: {function_name}"));
-    let body_end = sql[body_start + 5..]
-        .find("\n$$;")
-        .map(|offset| body_start + 5 + offset)
-        .unwrap_or_else(|| panic!("missing function body terminator: {function_name}"));
+    let body_start = sql[start..].find("AS $$").map_or_else(
+        || panic!("missing function body: {function_name}"),
+        |offset| start + offset,
+    );
+    let body_end = sql[body_start + 5..].find("\n$$;").map_or_else(
+        || panic!("missing function body terminator: {function_name}"),
+        |offset| body_start + 5 + offset,
+    );
     &sql[body_start..body_end]
 }
 

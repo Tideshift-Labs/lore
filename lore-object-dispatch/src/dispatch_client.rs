@@ -3,7 +3,7 @@
 
 //! The typed cell-authority client (WP-114 CD-3).
 //!
-//! CR-033 D1 makes the retained PostgreSQL procedures in the cell database *the* dispatch
+//! CR-033 D1 makes the retained `PostgreSQL` procedures in the cell database *the* dispatch
 //! authority. This module is the only typed path to them: 0013's `ReservePut` admission, 0015's
 //! non-final upload progress, 0017's `SPOOL_READY` transition, 0020's maintenance-only participant
 //! enrollment and runtime-only dispatcher registration, and 0019's runtime-callable installed-layer
@@ -23,7 +23,7 @@
 //! and release the pooled session before sleeping. Transport ambiguity around `COMMIT` is resolved
 //! by reconnect plus the operation-specific authoritative read.
 //!
-//! **Redaction.** No connection string, PEM, PostgreSQL diagnostic, parameter value, identifier, or
+//! **Redaction.** No connection string, PEM, `PostgreSQL` diagnostic, parameter value, identifier, or
 //! boundary id reaches `Display`, `Debug`, `Error::source`, tracing, or a detached task's log.
 //!
 //! The opt-in Phase 5 `fragment_provider` composition constructs this client over its one shared
@@ -204,7 +204,7 @@ pub(crate) const DATABASE_IDENTITY_SQL: &str = "SELECT
 
 /// Why a cell-authority call refused, or could not be completed.
 ///
-/// Every variant is a fixed shape. None carries a connection string, a PEM, a PostgreSQL
+/// Every variant is a fixed shape. None carries a connection string, a PEM, a `PostgreSQL`
 /// diagnostic, a parameter value, an identifier, or a boundary id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchAuthorityError {
@@ -226,7 +226,7 @@ pub enum DispatchAuthorityError {
     /// deployment prerequisite, not schema drift and not a caller error.
     #[error("cell authority's BLAKE3 digest provider is unavailable or unusable")]
     DigestProviderUnavailable,
-    /// A supplied UUIDv7's embedded timestamp is outside the window the authority admits against
+    /// A supplied `UUIDv7`'s embedded timestamp is outside the window the authority admits against
     /// its own clock. Distinct from a malformed identifier: the identifier is well formed.
     #[error("supplied identifier's timestamp is outside the cell authority's admission window")]
     IdentifierTimestampOutOfRange,
@@ -293,11 +293,12 @@ impl DispatchAuthorityError {
     pub const fn is_transient(self) -> bool {
         matches!(
             self,
-            Self::Pool(DispatchPoolError::ConnectTimeout)
-                | Self::Pool(DispatchPoolError::ConnectFailed)
-                | Self::Pool(DispatchPoolError::DatabaseIdentityReadFailed)
-                | Self::Pool(DispatchPoolError::PoolExhausted)
-                | Self::OperationTimeout
+            Self::Pool(
+                DispatchPoolError::ConnectTimeout
+                    | DispatchPoolError::ConnectFailed
+                    | DispatchPoolError::DatabaseIdentityReadFailed
+                    | DispatchPoolError::PoolExhausted
+            ) | Self::OperationTimeout
                 | Self::RetryExhausted
                 | Self::AuthorityUnavailable
                 | Self::ConnectionSlotsExhausted
@@ -306,9 +307,9 @@ impl DispatchAuthorityError {
     }
 }
 
-/// Exact physical PostgreSQL database identity, independent of URL spelling or connection role.
+/// Exact physical `PostgreSQL` database identity, independent of URL spelling or connection role.
 ///
-/// `system_identifier` distinguishes PostgreSQL clusters and the database OID distinguishes two
+/// `system_identifier` distinguishes `PostgreSQL` clusters and the database OID distinguishes two
 /// databases inside one cluster. Both fields are private so an invalid zero identity cannot be
 /// constructed without passing through [`Self::new`].
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -344,7 +345,7 @@ impl DispatchDatabaseIdentity {
 
 /// Why physical database identity attestation could not prove co-location.
 ///
-/// No variant carries either identity value, a URL, a role, or a PostgreSQL diagnostic.
+/// No variant carries either identity value, a URL, a role, or a `PostgreSQL` diagnostic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum DispatchDatabaseIdentityError {
     #[error("dispatch database identity could not be read: {0}")]
@@ -773,7 +774,7 @@ impl fmt::Debug for InstalledLayerIdentity {
 /// 0019's runtime-callable readiness signal: every installed layer's identity tuple.
 ///
 /// It answers "is every layer installed at the artifact identity this cell expects, and is D8's
-/// participant constraint the one in force". It does **not** attest the live PostgreSQL catalog;
+/// participant constraint the one in force". It does **not** attest the live `PostgreSQL` catalog;
 /// that is the out-of-band attester's job, and the attester is migrator-only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DispatcherIdentityState {
@@ -806,7 +807,7 @@ impl DispatchRuntimeClient {
     /// Prove that this separately credentialed pool reaches the expected physical database.
     ///
     /// Read-only and never retried. URL equality is intentionally irrelevant: different aliases,
-    /// TLS parameters, and roles are accepted when PostgreSQL reports the same cluster identifier
+    /// TLS parameters, and roles are accepted when `PostgreSQL` reports the same cluster identifier
     /// and database OID.
     pub async fn attest_database_identity(
         &self,
@@ -875,16 +876,16 @@ pub(crate) fn decode_database_identity(
 ) -> Result<DispatchDatabaseIdentity, DispatchDatabaseIdentityError> {
     let system_identifier = row
         .try_get::<_, String>("system_identifier")
-        .map_err(|_| DispatchDatabaseIdentityError::Malformed)?;
+        .map_err(|_err| DispatchDatabaseIdentityError::Malformed)?;
     let parsed_system_identifier = system_identifier
         .parse::<u64>()
-        .map_err(|_| DispatchDatabaseIdentityError::Malformed)?;
+        .map_err(|_err| DispatchDatabaseIdentityError::Malformed)?;
     if parsed_system_identifier.to_string() != system_identifier {
         return Err(DispatchDatabaseIdentityError::Malformed);
     }
     let database_oid = row
         .try_get::<_, u32>("database_oid")
-        .map_err(|_| DispatchDatabaseIdentityError::Malformed)?;
+        .map_err(|_err| DispatchDatabaseIdentityError::Malformed)?;
     DispatchDatabaseIdentity::new(parsed_system_identifier, database_oid)
 }
 
@@ -929,7 +930,7 @@ pub(crate) trait PreparedMutation {
 enum AttemptOutcome<T> {
     /// The transaction committed and the authority's response decoded.
     Committed(DispatchAccepted<T>),
-    /// PostgreSQL proved the transaction aborted for a retryable reason.
+    /// `PostgreSQL` proved the transaction aborted for a retryable reason.
     Retryable,
     /// A refusal, on a transaction that provably did not commit.
     Refused(DispatchAuthorityError),
@@ -1014,19 +1015,18 @@ async fn mutate_once<M: PreparedMutation>(
         mutate_on_lease(pool, prepared, &mut lease, &commit_sent),
     )
     .await;
-    let outcome = match bounded {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            let ambiguous = commit_sent.load(Ordering::SeqCst);
-            // Either way the session was abandoned with a transaction open on it, so it is closed
-            // rather than returned to the pool.
-            lease.poison();
-            return if ambiguous {
-                AttemptOutcome::AmbiguousCommit
-            } else {
-                AttemptOutcome::Refused(DispatchAuthorityError::OperationTimeout)
-            };
-        }
+    let outcome = if let Ok(outcome) = bounded {
+        outcome
+    } else {
+        let ambiguous = commit_sent.load(Ordering::SeqCst);
+        // Either way the session was abandoned with a transaction open on it, so it is closed
+        // rather than returned to the pool.
+        lease.poison();
+        return if ambiguous {
+            AttemptOutcome::AmbiguousCommit
+        } else {
+            AttemptOutcome::Refused(DispatchAuthorityError::OperationTimeout)
+        };
     };
     match outcome {
         // A poisoned connection is closed rather than returned: after an unresolved COMMIT the
@@ -1106,17 +1106,14 @@ pub(crate) async fn read_once(
         read_on_lease(&mut lease, &preamble, statement, params),
     )
     .await;
-    match bounded {
-        Ok(result) => {
-            lease.release().await;
-            result
-        }
-        Err(_) => {
-            // The read transaction was abandoned mid-flight, so its session is closed rather than
-            // returned. A read is never retried, so this is terminal.
-            lease.poison();
-            Err(DispatchAuthorityError::OperationTimeout)
-        }
+    if let Ok(result) = bounded {
+        lease.release().await;
+        result
+    } else {
+        // The read transaction was abandoned mid-flight, so its session is closed rather than
+        // returned. A read is never retried, so this is terminal.
+        lease.poison();
+        Err(DispatchAuthorityError::OperationTimeout)
     }
 }
 
@@ -1162,7 +1159,7 @@ fn classify_precommit<T>(error: &tokio_postgres::Error) -> AttemptOutcome<T> {
 
 /// A failure reported by `COMMIT`.
 ///
-/// A SQLSTATE at `COMMIT` is PostgreSQL proving the transaction aborted, so it keeps its own arm
+/// A SQLSTATE at `COMMIT` is `PostgreSQL` proving the transaction aborted, so it keeps its own arm
 /// rather than being folded into the ambiguous one. Only a `COMMIT` with **no** SQLSTATE - a
 /// transport loss - is ambiguous, and that one is resolved rather than reported.
 fn classify_commit<T>(error: &tokio_postgres::Error) -> AttemptOutcome<T> {
@@ -1239,7 +1236,8 @@ fn refusal_for_condition(message: &str) -> Option<DispatchAuthorityError> {
         | "DISPATCH_PUT_UPLOAD_PROGRESS_INVALID_ARGUMENT"
         | "DISPATCH_PUT_SPOOL_READY_INVALID_ARGUMENT"
         | "DISPATCH_PUT_UPLOAD_PROGRESS_RESULT_INVALID"
-        | "DISPATCH_PUT_SPOOL_READY_RESULT_INVALID" => DispatchAuthorityError::InvalidArgument,
+        | "DISPATCH_PUT_SPOOL_READY_RESULT_INVALID"
+        | "INVALID_UUIDV7" => DispatchAuthorityError::InvalidArgument,
         // The canonical-record helpers the mutations call. The inputs are well formed as SQL but
         // cannot be encoded into a record the schema can store.
         "LOCAL_DISPATCHER_REGISTRATION_RECORD_INVALID"
@@ -1256,7 +1254,6 @@ fn refusal_for_condition(message: &str) -> Option<DispatchAuthorityError> {
         "LOCAL_BLAKE3_PROVIDER_UNAVAILABLE" | "LOCAL_BLAKE3_PROVIDER_INVALID_RESULT" => {
             DispatchAuthorityError::DigestProviderUnavailable
         }
-        "INVALID_UUIDV7" => DispatchAuthorityError::InvalidArgument,
         "UUIDV7_TIMESTAMP_TOO_FAR_IN_FUTURE" => {
             DispatchAuthorityError::IdentifierTimestampOutOfRange
         }
@@ -1357,9 +1354,9 @@ fn disposition_of(
     row: &Row,
     accepted: [&str; 2],
 ) -> Result<DispatchDisposition, DispatchAuthorityError> {
-    let code: &str = row
-        .try_get(0)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("result_code is not text"))?;
+    let code: &str = row.try_get(0).map_err(|_err| {
+        DispatchAuthorityError::InvalidAuthorityResponse("result_code is not text")
+    })?;
     if code == accepted[0] {
         Ok(DispatchDisposition::Applied)
     } else if code == accepted[1] {
@@ -1371,39 +1368,41 @@ fn disposition_of(
 
 pub(crate) fn text(row: &Row, index: usize) -> Result<String, DispatchAuthorityError> {
     row.try_get::<_, String>(index)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a text column"))
+        .map_err(|_err| DispatchAuthorityError::InvalidAuthorityResponse("expected a text column"))
 }
 
 fn uuid(row: &Row, index: usize) -> Result<Uuid, DispatchAuthorityError> {
     row.try_get::<_, Uuid>(index)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a uuid column"))
+        .map_err(|_err| DispatchAuthorityError::InvalidAuthorityResponse("expected a uuid column"))
 }
 
 pub(crate) fn int8(row: &Row, index: usize) -> Result<i64, DispatchAuthorityError> {
-    row.try_get::<_, i64>(index)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a bigint column"))
+    row.try_get::<_, i64>(index).map_err(|_err| {
+        DispatchAuthorityError::InvalidAuthorityResponse("expected a bigint column")
+    })
 }
 
 fn int2(row: &Row, index: usize) -> Result<i16, DispatchAuthorityError> {
-    row.try_get::<_, i16>(index)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a smallint column"))
+    row.try_get::<_, i16>(index).map_err(|_err| {
+        DispatchAuthorityError::InvalidAuthorityResponse("expected a smallint column")
+    })
 }
 
 fn bytes(row: &Row, index: usize) -> Result<Vec<u8>, DispatchAuthorityError> {
     row.try_get::<_, Vec<u8>>(index)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("expected a bytea column"))
+        .map_err(|_err| DispatchAuthorityError::InvalidAuthorityResponse("expected a bytea column"))
 }
 
 fn digest(row: &Row, index: usize) -> Result<[u8; 32], DispatchAuthorityError> {
     let raw = bytes(row, index)?;
-    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_err| {
         DispatchAuthorityError::InvalidAuthorityResponse("expected a 32-byte BLAKE3 digest")
     })
 }
 
 /// The `uint64` domain is transferred as text so no value is narrowed through `bigint`.
 fn uint64(row: &Row, index: usize) -> Result<u64, DispatchAuthorityError> {
-    text(row, index)?.parse().map_err(|_| {
+    text(row, index)?.parse().map_err(|_err| {
         DispatchAuthorityError::InvalidAuthorityResponse("expected a canonical uint64 in text")
     })
 }
@@ -1419,9 +1418,9 @@ pub(crate) fn require(condition: bool, what: &'static str) -> Result<(), Dispatc
 fn decode_dispatcher_identity_state(
     row: &Row,
 ) -> Result<DispatcherIdentityState, DispatchAuthorityError> {
-    let code: &str = row
-        .try_get(0)
-        .map_err(|_| DispatchAuthorityError::InvalidAuthorityResponse("result_code is not text"))?;
+    let code: &str = row.try_get(0).map_err(|_err| {
+        DispatchAuthorityError::InvalidAuthorityResponse("result_code is not text")
+    })?;
     if code != READ_ONLY_RESULT_CODE {
         return Err(DispatchAuthorityError::UnrecognizedResultCode);
     }

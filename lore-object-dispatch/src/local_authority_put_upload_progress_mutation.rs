@@ -7,7 +7,7 @@
 //! prefix that a later filesystem coordinator has already written and fsynced; it cannot prove the
 //! filesystem observation itself.
 
-/// Exact PostgreSQL PUT-upload progress mutation migration bytes.
+/// Exact `PostgreSQL` PUT-upload progress mutation migration bytes.
 pub const LOCAL_AUTHORITY_PUT_UPLOAD_PROGRESS_MUTATION_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0015_object_store_dispatch_put_upload_progress_mutation.sql");
 

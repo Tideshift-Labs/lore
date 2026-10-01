@@ -4,9 +4,9 @@
 //! Embedded source-dark in-flight PUT-upload progress codec artifact.
 //!
 //! Runtime code does not install or call this migration. The SQL codec keeps the durable
-//! reservation record and exact ReservePut replay valid after a non-final body prefix is fsynced.
+//! reservation record and exact `ReservePut` replay valid after a non-final body prefix is fsynced.
 
-/// Exact PostgreSQL PUT-upload progress codec migration bytes.
+/// Exact `PostgreSQL` PUT-upload progress codec migration bytes.
 pub const LOCAL_AUTHORITY_PUT_UPLOAD_PROGRESS_CODEC_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0014_object_store_dispatch_put_upload_progress_codec.sql");
 

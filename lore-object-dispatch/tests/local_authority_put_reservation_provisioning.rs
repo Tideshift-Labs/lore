@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Static contract plus an opt-in PostgreSQL 16 probe for PUT-reservation provisioning.
+//! Static contract plus an opt-in `PostgreSQL` 16 probe for PUT-reservation provisioning.
 //!
 //! The ignored tier requires `LORE_TEST_LOCAL_PUT_RESERVATION_PROVISIONING_PG_URL`, an
 //! administrator URL for a fresh disposable database. It installs the complete 0002/0003/0007-
@@ -58,14 +58,14 @@ fn function_body<'a>(sql: &'a str, signature: &str) -> &'a str {
     let start = sql
         .find(signature)
         .unwrap_or_else(|| panic!("missing function: {signature}"));
-    let body_start = sql[start..]
-        .find("AS $$")
-        .map(|offset| start + offset)
-        .unwrap_or_else(|| panic!("missing body: {signature}"));
-    let body_end = sql[body_start + 5..]
-        .find("\n$$;")
-        .map(|offset| body_start + 5 + offset)
-        .unwrap_or_else(|| panic!("missing body terminator: {signature}"));
+    let body_start = sql[start..].find("AS $$").map_or_else(
+        || panic!("missing body: {signature}"),
+        |offset| start + offset,
+    );
+    let body_end = sql[body_start + 5..].find("\n$$;").map_or_else(
+        || panic!("missing body terminator: {signature}"),
+        |offset| body_start + 5 + offset,
+    );
     &sql[body_start..body_end]
 }
 

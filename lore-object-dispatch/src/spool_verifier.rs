@@ -99,7 +99,7 @@ mod platform {
             let root_path = layout.shared_spool_root();
             let relative_root = root_path
                 .strip_prefix(Path::new("/"))
-                .map_err(|_| SpoolVerificationError::InvalidRoot)?;
+                .map_err(|_err| SpoolVerificationError::InvalidRoot)?;
             if relative_root.as_os_str().is_empty()
                 || relative_root
                     .components()
@@ -108,7 +108,7 @@ mod platform {
                 return Err(SpoolVerificationError::InvalidRoot);
             }
             let filesystem_root = rustix::fs::open("/", ROOT_FLAGS, Mode::empty())
-                .map_err(|_| SpoolVerificationError::RootUnavailable)?;
+                .map_err(|_err| SpoolVerificationError::RootUnavailable)?;
             let root_fd = rustix::fs::openat2(
                 &filesystem_root,
                 relative_root,
@@ -116,9 +116,9 @@ mod platform {
                 Mode::empty(),
                 ROOT_RESOLVE,
             )
-            .map_err(|_| SpoolVerificationError::RootUnavailable)?;
-            let root_stat =
-                rustix::fs::fstat(&root_fd).map_err(|_| SpoolVerificationError::RootUnavailable)?;
+            .map_err(|_err| SpoolVerificationError::RootUnavailable)?;
+            let root_stat = rustix::fs::fstat(&root_fd)
+                .map_err(|_err| SpoolVerificationError::RootUnavailable)?;
             if !FileType::from_raw_mode(root_stat.st_mode).is_dir() {
                 return Err(SpoolVerificationError::InvalidRoot);
             }
@@ -221,7 +221,7 @@ mod platform {
         ) -> Result<PathBuf, SpoolVerificationError> {
             let relative = artifact_path
                 .strip_prefix(&self.root_path)
-                .map_err(|_| SpoolVerificationError::PathBindingMismatch)?;
+                .map_err(|_err| SpoolVerificationError::PathBindingMismatch)?;
             if relative.as_os_str().is_empty()
                 || relative
                     .components()
@@ -251,7 +251,7 @@ mod platform {
                 Err(_) => return Err(SpoolVerificationError::ObservationUnavailable),
             };
             let initial = rustix::fs::fstat(&fd)
-                .map_err(|_| SpoolVerificationError::ObservationUnavailable)?;
+                .map_err(|_err| SpoolVerificationError::ObservationUnavailable)?;
             if initial.st_dev != self.root_device
                 || !FileType::from_raw_mode(initial.st_mode).is_file()
             {
@@ -271,9 +271,9 @@ mod platform {
                 Mode::empty(),
                 ROOT_RESOLVE,
             )
-            .map_err(|_| SpoolVerificationError::RootChanged)?;
+            .map_err(|_err| SpoolVerificationError::RootChanged)?;
             let current =
-                rustix::fs::fstat(&reopened).map_err(|_| SpoolVerificationError::RootChanged)?;
+                rustix::fs::fstat(&reopened).map_err(|_err| SpoolVerificationError::RootChanged)?;
             if current.st_dev != self.root_device || current.st_ino != self.root_inode {
                 return Err(SpoolVerificationError::RootChanged);
             }
@@ -287,13 +287,13 @@ mod platform {
             expected_size: u64,
         ) -> Result<[u8; 32], SpoolVerificationError> {
             let mut hasher = blake3::Hasher::new();
-            let mut buffer = [0_u8; 64 * 1024];
+            let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
             let mut observed_size = 0_u64;
             loop {
                 let read = opened
                     .file
                     .read(&mut buffer)
-                    .map_err(|_| SpoolVerificationError::ObservationUnavailable)?;
+                    .map_err(|_err| SpoolVerificationError::ObservationUnavailable)?;
                 if read == 0 {
                     break;
                 }
@@ -318,7 +318,7 @@ mod platform {
             relative_path: &Path,
         ) -> Result<(), SpoolVerificationError> {
             let after_read = rustix::fs::fstat(&opened.file)
-                .map_err(|_| SpoolVerificationError::ObservationUnavailable)?;
+                .map_err(|_err| SpoolVerificationError::ObservationUnavailable)?;
             let reopened = match self.open_artifact(relative_path)? {
                 OpenedArtifact::Regular(reopened) => reopened,
                 OpenedArtifact::Absent | OpenedArtifact::Unsafe => {
@@ -361,7 +361,7 @@ mod platform {
     }
 
     fn file_size(stat: &Stat) -> Result<u64, SpoolVerificationError> {
-        u64::try_from(stat.st_size).map_err(|_| SpoolVerificationError::InvalidFileSize)
+        u64::try_from(stat.st_size).map_err(|_err| SpoolVerificationError::InvalidFileSize)
     }
 
     fn same_identity(left: &Stat, right: &Stat) -> bool {

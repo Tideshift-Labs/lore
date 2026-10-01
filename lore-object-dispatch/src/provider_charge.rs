@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Dark PostgreSQL implementation of the shared cell-local provider limiter.
+//! Dark `PostgreSQL` implementation of the shared cell-local provider limiter.
 //!
 //! The authority leases from the same dispatch-runtime pool as the typed authority client. It does
 //! not install schema,
@@ -110,7 +110,7 @@ impl PostgresProviderChargeAuthority {
         // Until acquisition is acknowledged the session may already own the lock. An error,
         // timeout, or cancellation must close it, never return it to the pool or guess ownership.
         let acquired = tokio::time::timeout_at(deadline, async {
-            let client = lease.client().map_err(|_| ())?;
+            let client = lease.client().map_err(|_err| ())?;
             // Bound the wait on the server as well: a backend blocked on an advisory lock may
             // not notice a disconnected client until the lock holder exits. A short setup
             // transaction provides SET LOCAL timeouts without leaking session configuration.
@@ -120,16 +120,16 @@ impl PostgresProviderChargeAuthority {
                 .isolation_level(IsolationLevel::ReadCommitted)
                 .start()
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_err| ())?;
             setup
                 .batch_execute(&self.pool.bounded_execution_preamble())
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_err| ())?;
             setup
                 .query_one(CHARGE_BOUNDARY_LOCK_SQL, &[&request.provider_boundary_id()])
                 .await
-                .map_err(|_| ())?;
-            setup.commit().await.map_err(|_| ())?;
+                .map_err(|_err| ())?;
+            setup.commit().await.map_err(|_err| ())?;
             Ok::<(), ()>(())
         })
         .await;
@@ -149,22 +149,21 @@ impl PostgresProviderChargeAuthority {
         // ambiguous. In both cases the timed-out transaction leaves the session unsuitable for
         // reuse, so the lease is retired rather than returned to the shared pool.
         let commit_started = AtomicBool::new(false);
-        let outcome = match tokio::time::timeout_at(
+        let outcome = if let Ok(outcome) = tokio::time::timeout_at(
             deadline,
             charge_on_lease(&self.pool, &mut lease, request, &commit_started),
         )
         .await
         {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                let started = commit_started.load(Ordering::SeqCst);
-                tracing::warn!(
-                    stage = "charge_transaction_timeout",
-                    commit_started = started,
-                    "Provider charge admission refused"
-                );
-                Err(classify_charge_timeout(started))
-            }
+            outcome
+        } else {
+            let started = commit_started.load(Ordering::SeqCst);
+            tracing::warn!(
+                stage = "charge_transaction_timeout",
+                commit_started = started,
+                "Provider charge admission refused"
+            );
+            Err(classify_charge_timeout(started))
         };
         if matches!(outcome, Err(ChargeExecutionError::SessionUnusable(_))) {
             lease.poison();
@@ -173,15 +172,15 @@ impl PostgresProviderChargeAuthority {
             // acknowledged unlock permits reuse. Cleanup shares the original deadline; failure
             // retires the connection without changing the already known accounting outcome.
             let unlocked = tokio::time::timeout_at(deadline, async {
-                let client = lease.client().map_err(|_| ())?;
+                let client = lease.client().map_err(|_err| ())?;
                 let row = client
                     .query_one(
                         CHARGE_BOUNDARY_UNLOCK_SQL,
                         &[&request.provider_boundary_id()],
                     )
                     .await
-                    .map_err(|_| ())?;
-                row.try_get::<_, bool>(0).map_err(|_| ())
+                    .map_err(|_err| ())?;
+                row.try_get::<_, bool>(0).map_err(|_err| ())
             })
             .await;
             if matches!(unlocked, Ok(Ok(true))) {
@@ -203,15 +202,16 @@ async fn charge_on_lease(
     let logical_request_id =
         parse_uuid(request.logical_request_id()).map_err(ChargeExecutionError::Public)?;
     let attempt_id = parse_uuid(request.attempt_id()).map_err(ChargeExecutionError::Public)?;
-    let attempt_ordinal = i32::try_from(request.attempt_ordinal())
-        .map_err(|_| ChargeExecutionError::Public(ProviderChargeError::ConfigurationUnresolved))?;
+    let attempt_ordinal = i32::try_from(request.attempt_ordinal()).map_err(|_err| {
+        ChargeExecutionError::Public(ProviderChargeError::ConfigurationUnresolved)
+    })?;
     let cap_classes: Vec<i16> = request
         .cap_classes()
         .into_iter()
         .map(cap_class_code)
         .collect();
     let preamble = pool.bounded_execution_preamble();
-    let client = lease.client().map_err(|_| {
+    let client = lease.client().map_err(|_err| {
         ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
             ProviderChargeError::AuthorityUnavailable,
         ))
@@ -297,33 +297,37 @@ impl ProviderChargeAuthority for PostgresProviderChargeAuthority {
         for retry_delay in MUTATION_RETRY_SCHEDULE {
             match self.charge_once(request).await {
                 Ok(ChargeAttempt::Granted(grant)) => return Ok(grant),
-                Ok(ChargeAttempt::Refused(error)) => return Err(error),
-                Err(ChargeExecutionError::Retryable) => match retry_delay {
-                    Some(delay) => tokio::time::sleep(delay).await,
-                    None => {
+                Err(ChargeExecutionError::Retryable) => {
+                    if let Some(delay) = retry_delay {
+                        tokio::time::sleep(delay).await
+                    } else {
                         tracing::warn!(
                             stage = "contention_exhausted",
                             "Provider charge admission refused"
                         );
                         return Err(ProviderChargeError::AuthorityUnavailable);
                     }
-                },
+                }
                 Err(ChargeExecutionError::SessionUnusable(
                     SessionUnusableChargeError::Retryable,
-                )) => match retry_delay {
-                    Some(delay) => tokio::time::sleep(delay).await,
-                    None => {
+                )) => {
+                    if let Some(delay) = retry_delay {
+                        tokio::time::sleep(delay).await
+                    } else {
                         tracing::warn!(
                             stage = "contention_exhausted",
                             "Provider charge admission refused"
                         );
                         return Err(ProviderChargeError::AuthorityUnavailable);
                     }
-                },
-                Err(ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
-                    error,
-                ))) => return Err(error),
-                Err(ChargeExecutionError::Public(error)) => return Err(error),
+                }
+                Ok(ChargeAttempt::Refused(error))
+                | Err(
+                    ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(
+                        error,
+                    ))
+                    | ChargeExecutionError::Public(error),
+                ) => return Err(error),
             }
         }
         Err(ProviderChargeError::AuthorityUnavailable)
@@ -376,43 +380,43 @@ impl PostgresProviderChargeAuthority {
         // sufficient for a single STABLE read and, unlike the charge, needs no serializable
         // snapshot: nothing is debited and no CAS is taken.
         let read = tokio::time::timeout_at(head_read_deadline, async {
-            let client = lease.client().map_err(|_| ())?;
+            let client = lease.client().map_err(|_err| ())?;
             let transaction = client
                 .build_transaction()
                 .isolation_level(IsolationLevel::ReadCommitted)
                 .start()
                 .await
-                .map_err(|_| ())?;
-            transaction.batch_execute(&preamble).await.map_err(|_| ())?;
+                .map_err(|_err| ())?;
+            transaction
+                .batch_execute(&preamble)
+                .await
+                .map_err(|_err| ())?;
             let row = transaction
                 .query_one(
                     HEAD_READ_SQL,
                     &[&PROVIDER_CHARGE_API_REVISION_V1, &provider_boundary_id],
                 )
                 .await
-                .map_err(|_| ())?;
+                .map_err(|_err| ())?;
             let decoded = decode_head_read_row(&row);
-            transaction.commit().await.map_err(|_| ())?;
+            transaction.commit().await.map_err(|_err| ())?;
             Ok::<_, ()>(decoded)
         })
         .await;
         let timed_out = read.is_err();
-        match read {
-            Ok(Ok(decoded)) => {
-                lease.release().await;
-                decoded
-            }
+        if let Ok(Ok(decoded)) = read {
+            lease.release().await;
+            decoded
+        } else {
             // A timed-out or failed read leaves the session's transaction state unproven, so the
             // connection is retired rather than returned to the shared pool.
-            Ok(Err(())) | Err(_) => {
-                tracing::warn!(
-                    stage = "head_read",
-                    timed_out,
-                    "Provider budget head read refused"
-                );
-                lease.poison();
-                Err(ProviderChargeError::ConfigurationUnresolved)
-            }
+            tracing::warn!(
+                stage = "head_read",
+                timed_out,
+                "Provider budget head read refused"
+            );
+            lease.poison();
+            Err(ProviderChargeError::ConfigurationUnresolved)
         }
     }
 }
@@ -422,17 +426,17 @@ impl PostgresProviderChargeAuthority {
 fn decode_head_read_row(row: &tokio_postgres::Row) -> Result<BudgetPin, ProviderChargeError> {
     let result_code: &str = row
         .try_get(0)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     if result_code != "HEAD" {
         return Err(ProviderChargeError::ConfigurationUnresolved);
     }
     let revision: String = row
         .try_get(1)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let fence = parse_u64_text(row, 2)?;
     // BudgetPin::new re-runs the same pin grammar every governed charge checks, so a head the cell
     // somehow published outside that grammar is refused here rather than carried into a charge.
-    BudgetPin::new(&revision, fence).map_err(|_| ProviderChargeError::ConfigurationUnresolved)
+    BudgetPin::new(&revision, fence).map_err(|_err| ProviderChargeError::ConfigurationUnresolved)
 }
 
 enum ChargeAttempt {
@@ -469,7 +473,7 @@ fn decode_charge_row(
 ) -> Result<ChargeAttempt, ProviderChargeError> {
     let result_code: &str = row
         .try_get(0)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let refusal = match result_code {
         "BUDGET_PIN_REJECTED" => Some(ProviderChargeError::BudgetPinRejected),
         "BUDGET_EXHAUSTED" => Some(ProviderChargeError::BudgetExhausted),
@@ -488,30 +492,30 @@ fn decode_charge_row(
     }
     let revision: String = row
         .try_get(1)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let fence = parse_u64_text(row, 2)?;
     let grant_id: Uuid = row
         .try_get(3)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let traffic: i16 = row
         .try_get(4)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let attempt: i16 = row
         .try_get(5)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let charged_units = parse_u64_text(row, 6)?;
     let logical_request_id: Uuid = row
         .try_get(7)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let attempt_id: Uuid = row
         .try_get(8)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let attempt_ordinal: i32 = row
         .try_get(9)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     let granted_at_database_unix_ms: i64 = row
         .try_get(10)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     if traffic != traffic_class_code(request.traffic_class())
         || attempt != attempt_class_code(request.attempt_class())
         || attempt_ordinal <= 0
@@ -527,7 +531,7 @@ fn decode_charge_row(
         logical_request_id: logical_request_id.to_string(),
         attempt_id: attempt_id.to_string(),
         attempt_ordinal: u32::try_from(attempt_ordinal)
-            .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?,
+            .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?,
         granted_at_database_unix_ms,
     }))
 }
@@ -538,7 +542,7 @@ fn decode_charge_row(
 pub fn classify_provider_charge_commit<T, E>(
     result: Result<T, E>,
 ) -> Result<T, ProviderChargeError> {
-    result.map_err(|_| ProviderChargeError::AmbiguousCommit)
+    result.map_err(|_err| ProviderChargeError::AmbiguousCommit)
 }
 
 fn classify_charge_timeout(commit_started: bool) -> ChargeExecutionError {
@@ -550,7 +554,7 @@ fn classify_charge_timeout(commit_started: bool) -> ChargeExecutionError {
     ChargeExecutionError::SessionUnusable(SessionUnusableChargeError::Public(error))
 }
 
-/// Classify a SQLSTATE raised by `COMMIT` without discarding the proof that PostgreSQL aborted the
+/// Classify a SQLSTATE raised by `COMMIT` without discarding the proof that `PostgreSQL` aborted the
 /// transaction. Every unrecognized or absent SQLSTATE stays ambiguous.
 fn classify_commit_sqlstate(code: Option<&SqlState>) -> ChargeExecutionError {
     match code {
@@ -623,16 +627,16 @@ async fn rollback_after_failure(
 }
 
 fn parse_uuid(value: &str) -> Result<Uuid, ProviderChargeError> {
-    Uuid::parse_str(value).map_err(|_| ProviderChargeError::ConfigurationUnresolved)
+    Uuid::parse_str(value).map_err(|_err| ProviderChargeError::ConfigurationUnresolved)
 }
 
 fn parse_u64_text(row: &tokio_postgres::Row, index: usize) -> Result<u64, ProviderChargeError> {
     let value: &str = row
         .try_get(index)
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)?;
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)?;
     value
         .parse()
-        .map_err(|_| ProviderChargeError::ConfigurationUnresolved)
+        .map_err(|_err| ProviderChargeError::ConfigurationUnresolved)
 }
 
 const fn traffic_class_code(value: ProviderTrafficClass) -> i16 {

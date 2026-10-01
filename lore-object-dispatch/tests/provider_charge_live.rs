@@ -2,7 +2,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 
-//! Live PostgreSQL 16 evidence for WP-114 CD-4's shared cell-local limiter.
+//! Live `PostgreSQL` 16 evidence for WP-114 CD-4's shared cell-local limiter.
 
 use std::env;
 use std::ops::Deref;
@@ -1243,12 +1243,10 @@ fn pool_config(
 ) -> DispatchPoolConfig {
     let without_scheme = base_url
         .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(base_url);
+        .map_or(base_url, |(_, rest)| rest);
     let host_and_path = without_scheme
         .split_once('@')
-        .map(|(_, rest)| rest)
-        .unwrap_or(without_scheme);
+        .map_or(without_scheme, |(_, rest)| rest);
     DispatchPoolConfig {
         postgres_url: format!(
             "postgresql://{}@{host_and_path}?sslmode=disable",

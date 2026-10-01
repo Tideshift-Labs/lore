@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Live PostgreSQL 16 proof for WP-114 CD-1's out-of-band cell schema installer/attester.
+//! Live `PostgreSQL` 16 proof for WP-114 CD-1's out-of-band cell schema installer/attester.
 //!
 //! Every test here is `#[ignore]` and gated on its own `LORE_TEST_CELL_SCHEMA_*_PG_URL`, which must
 //! name a **fresh disposable** database whose connection authenticates as

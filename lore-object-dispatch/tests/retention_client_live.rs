@@ -3,7 +3,7 @@
 
 //! Explicit live proof for the source-dark retention maintenance client.
 //!
-//! Run through `tests/run-retention-client-live.ps1`. The runner owns a disposable PostgreSQL 16
+//! Run through `tests/run-retention-client-live.ps1`. The runner owns a disposable `PostgreSQL` 16
 //! database, installs the exact retention migrations, and supplies distinct admin and exact
 //! `object_dispatch_retention_maintenance` mTLS identities.
 

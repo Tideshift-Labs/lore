@@ -175,7 +175,7 @@ fn applied_compaction(
         return Err(FullToCompactError::InvalidCompactPlan);
     };
     let bytes = u64::try_from(compact.canonical_bytes().len())
-        .map_err(|_| FullToCompactError::InvalidCompactPlan)?;
+        .map_err(|_err| FullToCompactError::InvalidCompactPlan)?;
     if compact_charge.rows != 1
         || compact_charge.concurrency != 0
         || compact_charge.bytes != bytes
@@ -200,7 +200,7 @@ fn authority_digest(compact: &CanonicalObjectStoreCompactReceipt) -> &[u8; 32] {
 }
 
 fn validate_identity(value: &str) -> Result<(), FullToCompactError> {
-    validate_canonical_text(value, u32::MAX).map_err(|_| FullToCompactError::InvalidIdentity)
+    validate_canonical_text(value, u32::MAX).map_err(|_err| FullToCompactError::InvalidIdentity)
 }
 
 fn validate_ownership(value: &ObjectStoreFullRecordOwnership) -> Result<(), FullToCompactError> {
@@ -236,8 +236,8 @@ fn transfer_fingerprint(
     ownership: &ObjectStoreFullRecordOwnership,
     applied: &AppliedCompaction<'_>,
 ) -> Result<[u8; 32], FullToCompactError> {
-    let mut output =
-        BoundedCanonicalWriter::new(u32::MAX).map_err(|_| FullToCompactError::CanonicalTooLarge)?;
+    let mut output = BoundedCanonicalWriter::new(u32::MAX)
+        .map_err(|_err| FullToCompactError::CanonicalTooLarge)?;
     output
         .raw(INTENT_DOMAIN)
         .and_then(|()| output.text(&ownership.provider_boundary_id))
@@ -253,12 +253,12 @@ fn transfer_fingerprint(
         .and_then(|()| output.u64(applied.compact_charge.rows))
         .and_then(|()| output.u64(applied.compact_charge.bytes))
         .and_then(|()| output.u64(applied.compact_charge.concurrency))
-        .map_err(|_| FullToCompactError::CanonicalTooLarge)?;
+        .map_err(|_err| FullToCompactError::CanonicalTooLarge)?;
     Ok(*blake3::hash(&output.finish()).as_bytes())
 }
 
 fn validate_policy(value: &ObjectStoreFullToCompactPolicy) -> Result<(), FullToCompactError> {
-    validate_identity(&value.policy_revision).map_err(|_| FullToCompactError::InvalidPolicy)?;
+    validate_identity(&value.policy_revision).map_err(|_err| FullToCompactError::InvalidPolicy)?;
     let full_rows = [
         value.max_full_record_rows_global,
         value.max_full_record_rows_per_cell,
@@ -299,7 +299,7 @@ fn validate_counter(
     expected_scope: ObjectStoreFullToCompactScope,
     expected_scope_id: &str,
 ) -> Result<(), FullToCompactError> {
-    validate_identity(&value.scope_id).map_err(|_| FullToCompactError::InvalidCounter)?;
+    validate_identity(&value.scope_id).map_err(|_err| FullToCompactError::InvalidCounter)?;
     if value.scope != expected_scope
         || value.scope_id != expected_scope_id
         || value.counter_revision == 0

@@ -9,7 +9,7 @@
 /// Frozen local dispatch-authority schema contract revision.
 pub const LOCAL_AUTHORITY_SCHEMA_REVISION_V1: &str = "object-store-dispatch-authority-schema-v1";
 
-/// Exact PostgreSQL migration bytes, embedded for later provisioning/image parity only.
+/// Exact `PostgreSQL` migration bytes, embedded for later provisioning/image parity only.
 pub const LOCAL_AUTHORITY_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0007_object_store_dispatch_authority_core.sql");
 

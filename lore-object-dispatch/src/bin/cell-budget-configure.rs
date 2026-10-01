@@ -30,13 +30,14 @@ fn run() -> Result<(), String> {
         "reconcile" => BudgetAction::Reconcile,
         _ => return Err("action must be publish, verify or reconcile".into()),
     };
-    let mut file = std::fs::File::open(path).map_err(|_| "configuration file cannot be opened")?;
+    let mut file =
+        std::fs::File::open(path).map_err(|_err| "configuration file cannot be opened")?;
     let mut bytes = Vec::new();
     std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, 16_385), &mut bytes)
-        .map_err(|_| "configuration file cannot be read")?;
+        .map_err(|_err| "configuration file cannot be read")?;
     let config = LocalBudgetConfiguration::from_json(&bytes).map_err(|e| e.to_string())?;
     let url = std::env::var("LORE_CELL_BUDGET_MAINTENANCE_URL")
-        .map_err(|_| "LORE_CELL_BUDGET_MAINTENANCE_URL is required")?;
+        .map_err(|_err| "LORE_CELL_BUDGET_MAINTENANCE_URL is required")?;
     let tls = match std::env::var("LORE_CELL_BUDGET_CA_PEM") {
         Ok(pem) if !pem.trim().is_empty() => DispatchTlsMode::PinnedRootCa(pem),
         Ok(_) | Err(std::env::VarError::NotPresent) => {
@@ -47,13 +48,13 @@ fn run() -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| "async runtime unavailable")?;
+        .map_err(|_err| "async runtime unavailable")?;
     let receipt = runtime
         .block_on(configure_budget(&config, &url, tls, action))
         .map_err(|e| e.to_string())?;
     println!(
         "{}",
-        serde_json::to_string(&receipt).map_err(|_| "receipt encoding failed")?
+        serde_json::to_string(&receipt).map_err(|_err| "receipt encoding failed")?
     );
     Ok(())
 }

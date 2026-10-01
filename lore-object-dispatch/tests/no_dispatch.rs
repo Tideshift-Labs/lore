@@ -132,7 +132,7 @@ fn no_dispatch_proof_requires_canonical_uuid_timestamp_equal_to_database_commit(
 }
 
 /// WP-114 CD-6: `logical_request_id` is checked for canonicality only. Unlike `proof_id`, its
-/// embedded UUIDv7 timestamp is never compared against `committed_at_unix_ms` -- `fields()` above
+/// embedded `UUIDv7` timestamp is never compared against `committed_at_unix_ms` -- `fields()` above
 /// already uses a deliberately different embedded timestamp, and every other passing test in this
 /// file relies on that not being rejected. This test pins it explicitly so a future change adding
 /// a timestamp-ordering constraint here is caught.
@@ -147,7 +147,7 @@ fn no_dispatch_proof_logical_request_id_has_no_timestamp_ordering_constraint() {
     assert!(build_no_dispatch_proof(zero_timestamp, 1024).is_ok());
 }
 
-/// `logical_request_id` must still be a canonical UUIDv7: empty, non-UUID-shaped, and
+/// `logical_request_id` must still be a canonical `UUIDv7`: empty, non-UUID-shaped, and
 /// non-canonical (wrong case, wrong version/variant nibble) values are all rejected the same way
 /// as an invalid `proof_id` is, just against the new field's own error variant.
 #[test]

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Pure, unwired UploadPut stream identity and rejection-detail contracts.
+//! Pure, unwired `UploadPut` stream identity and rejection-detail contracts.
 
 use std::fmt;
 
@@ -134,12 +134,12 @@ fn validate_identity(
         &identity.upload_id,
     ] {
         validate_canonical_text(value, max_text_bytes)
-            .map_err(|_| UploadContractError::InvalidCanonicalText)?;
+            .map_err(|_err| UploadContractError::InvalidCanonicalText)?;
     }
     canonical_uuid_v7_timestamp(&identity.logical_request_id)
-        .map_err(|_| UploadContractError::InvalidUuidV7)?;
+        .map_err(|_err| UploadContractError::InvalidUuidV7)?;
     canonical_uuid_v7_timestamp(&identity.attempt_id)
-        .map_err(|_| UploadContractError::InvalidUuidV7)?;
+        .map_err(|_err| UploadContractError::InvalidUuidV7)?;
     if identity.upload_fence == 0 {
         return Err(UploadContractError::InvalidUploadFence);
     }
@@ -147,8 +147,8 @@ fn validate_identity(
 }
 
 fn identity_preimage(identity: &UploadPutStreamIdentity) -> Result<Vec<u8>, UploadContractError> {
-    let mut writer =
-        BoundedCanonicalWriter::new(u32::MAX).map_err(|_| UploadContractError::PreimageTooLarge)?;
+    let mut writer = BoundedCanonicalWriter::new(u32::MAX)
+        .map_err(|_err| UploadContractError::PreimageTooLarge)?;
     writer
         .raw(UPLOAD_IDENTITY_DOMAIN)
         .and_then(|()| writer.text(&identity.protocol_revision))
@@ -159,7 +159,7 @@ fn identity_preimage(identity: &UploadPutStreamIdentity) -> Result<Vec<u8>, Uplo
         .and_then(|()| writer.text(&identity.attempt_id))
         .and_then(|()| writer.text(&identity.upload_id))
         .and_then(|()| writer.u64(identity.upload_fence))
-        .map_err(|_| UploadContractError::PreimageTooLarge)?;
+        .map_err(|_err| UploadContractError::PreimageTooLarge)?;
     Ok(writer.finish())
 }
 
@@ -301,7 +301,7 @@ fn rejection_preimage(
         return Err(UploadContractError::InvalidTextMaximum);
     }
     validate_canonical_text(&detail.protocol_revision, max_text_bytes)
-        .map_err(|_| UploadContractError::InvalidCanonicalText)?;
+        .map_err(|_err| UploadContractError::InvalidCanonicalText)?;
     match detail.reason {
         PutUploadStreamRejectReason::IdentityMismatch
             if !(1..=8).contains(&detail.rejected_field_number) =>
@@ -317,8 +317,8 @@ fn rejection_preimage(
         }
         _ => {}
     }
-    let mut writer =
-        BoundedCanonicalWriter::new(u32::MAX).map_err(|_| UploadContractError::PreimageTooLarge)?;
+    let mut writer = BoundedCanonicalWriter::new(u32::MAX)
+        .map_err(|_err| UploadContractError::PreimageTooLarge)?;
     writer
         .raw(UPLOAD_REJECTED_DOMAIN)
         .and_then(|()| writer.text(&detail.protocol_revision))
@@ -326,7 +326,7 @@ fn rejection_preimage(
         .and_then(|()| writer.bytes(&detail.stream_identity_blake3))
         .and_then(|()| writer.u64(detail.rejected_chunk_index))
         .and_then(|()| writer.u32(detail.rejected_field_number))
-        .map_err(|_| UploadContractError::PreimageTooLarge)?;
+        .map_err(|_err| UploadContractError::PreimageTooLarge)?;
     Ok(writer.finish())
 }
 

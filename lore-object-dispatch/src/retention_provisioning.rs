@@ -9,7 +9,7 @@
 /// Frozen provisioning procedure API revision.
 pub const RETENTION_PROVISIONING_API_REVISION_V1: &str = "object-store-retention-provisioning-v1";
 
-/// Exact PostgreSQL provisioning migration bytes, embedded for image/provisioning parity only.
+/// Exact `PostgreSQL` provisioning migration bytes, embedded for image/provisioning parity only.
 pub const RETENTION_PROVISIONING_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0003_object_store_retention_provisioning.sql");
 

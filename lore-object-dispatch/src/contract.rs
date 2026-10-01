@@ -135,7 +135,8 @@ impl BoundedCanonicalWriter {
     }
 
     pub(crate) fn bytes(&mut self, value: &[u8]) -> Result<(), CanonicalPrimitiveError> {
-        let length = u32::try_from(value.len()).map_err(|_| CanonicalPrimitiveError::TooLarge)?;
+        let length =
+            u32::try_from(value.len()).map_err(|_err| CanonicalPrimitiveError::TooLarge)?;
         self.u32(length)?;
         self.raw(value)
     }

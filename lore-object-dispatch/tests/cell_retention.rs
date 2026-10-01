@@ -3,7 +3,7 @@
 
 //! Offline, black-box coverage for WP-114 CD-8's cell-scale retention: [`CellRetentionSettings`]'s
 //! reviewed bounds, [`CellRetentionReadiness`]'s three-backlog progress rule, and
-//! [`CellRetentionClient::new`]'s pool-role guard. No PostgreSQL: `prune_once`/`backlog`/
+//! [`CellRetentionClient::new`]'s pool-role guard. No `PostgreSQL`: `prune_once`/`backlog`/
 //! `read_state` need a real dispatch-runtime pool connection and are proven live instead (see
 //! `tests/run-cell-retention-live.ps1`).
 
@@ -221,7 +221,7 @@ fn a_nonzero_blocked_backlog_is_never_progress_even_when_rows_were_removed() {
     assert_eq!(snapshot.retention_reason, Some(REASON_BLOCKED_BACKLOG));
 }
 
-/// The second of the two ways: a saturated backlog (>= probe_limit) must fail the pass even when
+/// The second of the two ways: a saturated backlog (>= `probe_limit`) must fail the pass even when
 /// rows were removed. Without this, a cell whose arrivals exceed the drain rate reports green on
 /// every tick that happens to remove a full batch, which is every tick.
 #[test]

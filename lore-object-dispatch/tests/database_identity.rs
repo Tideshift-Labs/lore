@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Offline controls for the dispatch pool's physical PostgreSQL identity attestation.
+//! Offline controls for the dispatch pool's physical `PostgreSQL` identity attestation.
 
 use lore_object_dispatch::DispatchDatabaseIdentity;
 use lore_object_dispatch::DispatchDatabaseIdentityError;
@@ -89,7 +89,7 @@ fn malformed_null_and_wrong_shape_rows_fail_through_typed_decode_before_comparis
     assert!(decode.contains("try_get::<_, u32>(\"database_oid\")"));
     assert_eq!(
         decode
-            .matches("map_err(|_| DispatchDatabaseIdentityError::Malformed)")
+            .matches("map_err(|_err| DispatchDatabaseIdentityError::Malformed)")
             .count(),
         3,
     );

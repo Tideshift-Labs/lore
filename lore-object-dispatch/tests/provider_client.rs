@@ -294,7 +294,7 @@ fn new_ledger() -> ProviderAttemptLedger {
 }
 
 /// A grant that binds `request` exactly: every echoed field matches, the grant ID is canonical
-/// UUIDv7, and the database clock is nonnegative.
+/// `UUIDv7`, and the database clock is nonnegative.
 fn binding_grant(request: &ProviderChargeRequest) -> ProviderChargeGrant {
     ProviderChargeGrant {
         grant_id: grant_id(),
@@ -4004,31 +4004,28 @@ fn ledger_state_fingerprint(ledger: &ProviderAttemptLedger) -> (u64, u64, u64, u
 /// ledger's `audit_for` is `Ok` and accepted by the frozen encoder.
 fn assert_mirrors_audit_algebra(ledger: &ProviderAttemptLedger, label: &str) {
     let bound_request_id = ledger.logical_request_id().to_string();
-    match ledger.poisoned() {
-        Some(poison) => {
-            assert_eq!(
-                ledger.audit_for(&bound_request_id),
-                Err(poison),
-                "case: {label}"
-            );
-        }
-        None => {
-            let audit = ledger.audit_for(&bound_request_id).unwrap_or_else(|error| {
-                panic!("case {label}: non-poisoned ledger must audit: {error}")
-            });
-            // ProviderAttemptLedger has no refund method at all, so this must always be false.
-            assert!(!audit.audit().provider_authority_refunded, "case: {label}");
-            validate_and_encode_object_store_provider_attempt_audit(
-                audit.audit(),
-                &compact_receipt_limits(),
+    if let Some(poison) = ledger.poisoned() {
+        assert_eq!(
+            ledger.audit_for(&bound_request_id),
+            Err(poison),
+            "case: {label}"
+        );
+    } else {
+        let audit = ledger.audit_for(&bound_request_id).unwrap_or_else(|error| {
+            panic!("case {label}: non-poisoned ledger must audit: {error}")
+        });
+        // ProviderAttemptLedger has no refund method at all, so this must always be false.
+        assert!(!audit.audit().provider_authority_refunded, "case: {label}");
+        validate_and_encode_object_store_provider_attempt_audit(
+            audit.audit(),
+            &compact_receipt_limits(),
+        )
+        .unwrap_or_else(|error| {
+            panic!(
+                "case {label}: audit must be accepted by the frozen encoder: {error:?}: \
+                     {audit:?}"
             )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "case {label}: audit must be accepted by the frozen encoder: {error:?}: \
-                         {audit:?}"
-                )
-            });
-        }
+        });
     }
 }
 

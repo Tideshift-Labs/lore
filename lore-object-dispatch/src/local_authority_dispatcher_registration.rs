@@ -12,7 +12,7 @@
 //! Runtime code neither installs nor calls this artifact. The future typed CD-3 client must call
 //! the installed procedures and persist the enrolled participant key across process restarts.
 
-/// Exact PostgreSQL dispatcher-registration migration bytes, embedded for provisioning parity.
+/// Exact `PostgreSQL` dispatcher-registration migration bytes, embedded for provisioning parity.
 pub const LOCAL_AUTHORITY_DISPATCHER_REGISTRATION_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0020_object_store_dispatch_dispatcher_registration.sql");
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Static and opt-in PostgreSQL 16 contract for the source-dark atomic ReservePut mutation.
+//! Static and opt-in `PostgreSQL` 16 contract for the source-dark atomic `ReservePut` mutation.
 
 use std::path::Path;
 use std::path::PathBuf;

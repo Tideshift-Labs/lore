@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Static contract plus an opt-in PostgreSQL 16 schema probe for the local PUT reservation edge.
+//! Static contract plus an opt-in `PostgreSQL` 16 schema probe for the local PUT reservation edge.
 //!
 //! The ignored tier requires `LORE_TEST_LOCAL_PUT_RESERVATION_SCHEMA_PG_URL`, an administrator URL
 //! for a fresh disposable database. It installs migrations 0002, 0007, and 0010 itself. The

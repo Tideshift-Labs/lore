@@ -6,7 +6,7 @@
 //! Runtime code neither installs nor calls this migration. A later authoritative mutation uses the
 //! owner-only SQL codec where database-generated admission time and expiry are available.
 
-/// Exact PostgreSQL PUT-reservation lifecycle-record codec migration bytes.
+/// Exact `PostgreSQL` PUT-reservation lifecycle-record codec migration bytes.
 pub const LOCAL_AUTHORITY_PUT_RESERVATION_RECORD_CODEC_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0012_object_store_dispatch_put_reservation_record_codec.sql");
 

@@ -229,7 +229,7 @@ fn validate_limits(limits: &PayloadPurgeCasLimits) -> Result<(), PayloadPurgeErr
 fn writer(limits: &PayloadPurgeCasLimits) -> Result<BoundedCanonicalWriter, PayloadPurgeError> {
     validate_limits(limits)?;
     BoundedCanonicalWriter::new(limits.state.max_canonical_row_bytes)
-        .map_err(|_| PayloadPurgeError::InvalidLimits)
+        .map_err(|_err| PayloadPurgeError::InvalidLimits)
 }
 
 fn write_text(
@@ -238,16 +238,16 @@ fn write_text(
     limits: &PayloadPurgeCasLimits,
 ) -> Result<(), PayloadPurgeError> {
     validate_canonical_text(value, limits.state.max_identity_bytes)
-        .map_err(|_| PayloadPurgeError::InvalidIntent)?;
+        .map_err(|_err| PayloadPurgeError::InvalidIntent)?;
     output
         .text(value)
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)
 }
 
 fn write_time(output: &mut BoundedCanonicalWriter, value: i64) -> Result<(), PayloadPurgeError> {
     output
-        .u64(u64::try_from(value).map_err(|_| PayloadPurgeError::InvalidTime)?)
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)
+        .u64(u64::try_from(value).map_err(|_err| PayloadPurgeError::InvalidTime)?)
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)
 }
 
 fn finish_record(
@@ -284,15 +284,15 @@ fn encoded_intent(
         return Err(PayloadPurgeError::InvalidIntent);
     }
     let logical = decode_canonical_uuid_v7(&value.logical_request_id)
-        .map_err(|_| PayloadPurgeError::InvalidIntent)?;
+        .map_err(|_err| PayloadPurgeError::InvalidIntent)?;
     let attempt = decode_canonical_uuid_v7(&value.attempt_id)
-        .map_err(|_| PayloadPurgeError::InvalidIntent)?;
-    let purge =
-        decode_canonical_uuid_v7(&value.purge_id).map_err(|_| PayloadPurgeError::InvalidIntent)?;
+        .map_err(|_err| PayloadPurgeError::InvalidIntent)?;
+    let purge = decode_canonical_uuid_v7(&value.purge_id)
+        .map_err(|_err| PayloadPurgeError::InvalidIntent)?;
     let mut output = writer(limits)?;
     output
         .raw(INTENT_DOMAIN)
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     for text in [
         &value.protocol_revision,
         &value.provider_boundary_id,
@@ -306,16 +306,16 @@ fn encoded_intent(
         .and_then(|_| output.raw(&attempt))
         .and_then(|_| output.raw(&purge))
         .and_then(|_| output.u32(value.payload_kind as u32))
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     write_text(&mut output, &value.terminal_result_id, limits)?;
     output
         .u32(value.disposition as u32)
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     write_text(&mut output, &value.durable_handle, limits)?;
     output
         .u64(value.payload_size)
         .and_then(|_| output.raw(&value.payload_blake3))
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     write_time(&mut output, value.purge_not_before_unix_ms)?;
     let bytes = output.finish();
     let digest = *blake3::hash(&bytes).as_bytes();
@@ -351,19 +351,19 @@ pub fn validate_and_encode_object_store_payload_purge_reservation(
         .and_then(|_| output.bytes(&value.canonical_intent_bytes))
         .and_then(|_| output.raw(&value.expected_request_state_blake3))
         .and_then(|_| output.u8(u8::from(value.expected_fetch_head_blake3.is_some())))
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     if let Some(digest) = value.expected_fetch_head_blake3 {
         output
             .raw(&digest)
-            .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+            .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     }
     output
         .u8(u8::from(value.reserved_fetch_head_blake3.is_some()))
-        .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+        .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     if let Some(digest) = value.reserved_fetch_head_blake3 {
         output
             .raw(&digest)
-            .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+            .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
     }
     for field in [
         value.reserved_fetch_fence_generation,
@@ -372,11 +372,11 @@ pub fn validate_and_encode_object_store_payload_purge_reservation(
     ] {
         output
             .u8(u8::from(field.is_some()))
-            .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+            .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
         if let Some(field) = field {
             output
                 .u64(field)
-                .map_err(|_| PayloadPurgeError::CanonicalTooLarge)?;
+                .map_err(|_err| PayloadPurgeError::CanonicalTooLarge)?;
         }
     }
     write_time(&mut output, value.reserved_at_unix_ms)?;
@@ -398,7 +398,7 @@ fn checked_state(
     limits: &PayloadPurgeCasLimits,
 ) -> Result<CanonicalObjectStoreRequestState, PayloadPurgeError> {
     let checked = validate_and_encode_object_store_request_state(state.value(), &limits.state)
-        .map_err(|_| PayloadPurgeError::InvalidState)?;
+        .map_err(|_err| PayloadPurgeError::InvalidState)?;
     if checked.canonical_preimage() != state.canonical_preimage()
         || checked.canonical_bytes() != state.canonical_bytes()
         || checked.state_blake3() != state.state_blake3()
@@ -470,7 +470,9 @@ fn selected_payload(
                 .as_ref()
                 .ok_or(PayloadPurgeError::IntentMismatch)?,
         ),
-        _ => return Err(PayloadPurgeError::InvalidIntent),
+        ObjectStorePayloadKindV1::ObjectStorePayloadKindUnspecified => {
+            return Err(PayloadPurgeError::InvalidIntent);
+        }
     };
     if retention.payload_kind != intent.payload_kind as i32
         || retention.durable_handle.as_deref() != Some(intent.durable_handle.as_str())
@@ -521,14 +523,14 @@ fn expected_fetch_key(
             .canonical_result_blake3
             .as_ref()
             .try_into()
-            .map_err(|_| PayloadPurgeError::InvalidFetchProjection)?,
+            .map_err(|_err| PayloadPurgeError::InvalidFetchProjection)?,
         byte_result_handle: byte_result.handle.clone(),
         payload_size: byte_result.size,
         payload_blake3: byte_result
             .blake3
             .as_ref()
             .try_into()
-            .map_err(|_| PayloadPurgeError::InvalidFetchProjection)?,
+            .map_err(|_err| PayloadPurgeError::InvalidFetchProjection)?,
     })
 }
 
@@ -538,7 +540,7 @@ fn checked_fetch_head(
     limits: &PayloadPurgeCasLimits,
 ) -> Result<CanonicalObjectStoreFetchHead, PayloadPurgeError> {
     let checked = validate_and_encode_object_store_fetch_head(head.value(), &limits.fetch)
-        .map_err(|_| PayloadPurgeError::InvalidFetchProjection)?;
+        .map_err(|_err| PayloadPurgeError::InvalidFetchProjection)?;
     if checked.canonical_preimage() != head.canonical_preimage()
         || checked.canonical_bytes() != head.canonical_bytes()
         || checked.head_blake3() != head.head_blake3()
@@ -635,7 +637,9 @@ pub fn decide_object_store_payload_purge_cas(
             }
             None
         }
-        _ => return Err(PayloadPurgeError::InvalidIntent),
+        ObjectStorePayloadKindV1::ObjectStorePayloadKindUnspecified => {
+            return Err(PayloadPurgeError::InvalidIntent);
+        }
     };
     if let Some(existing) = existing.as_ref() {
         if head.is_some() != existing.value().reserved_fetch_head_blake3.is_some() {
@@ -696,7 +700,7 @@ pub fn decide_object_store_payload_purge_cas(
                     input.database_now_unix_ms,
                     &limits.fetch,
                 )
-                .map_err(|_| PayloadPurgeError::InvalidFetchProjection)?
+                .map_err(|_err| PayloadPurgeError::InvalidFetchProjection)?
                 {
                     ObjectStoreFetchPayloadPurgeFenceDecision::DispositionFenceConflict => {
                         return Ok(ObjectStorePayloadPurgeCasDecision::FetchFenceConflict);
@@ -763,7 +767,7 @@ pub fn decide_object_store_payload_purge_cas(
                     input.database_now_unix_ms,
                     &limits.fetch,
                 )
-                .map_err(|_| PayloadPurgeError::InvalidFetchProjection)?,
+                .map_err(|_err| PayloadPurgeError::InvalidFetchProjection)?,
             );
         } else if head.value().state != ObjectStoreFetchHeadState::DiscardCommitted
             || head.value().open_lease_count != 0
@@ -819,7 +823,7 @@ pub fn decide_object_store_payload_purge_cas(
     next.closure_committed_at_unix_ms = Some(input.database_now_unix_ms);
     next.state_blake3 = Default::default();
     let next_state = validate_and_encode_object_store_request_state(&next, &limits.state)
-        .map_err(|_| PayloadPurgeError::InvalidState)?;
+        .map_err(|_err| PayloadPurgeError::InvalidState)?;
     let receipt = match selection.field {
         PayloadField::PutBody => next_state.value().put_body.as_ref(),
         PayloadField::ResultPayload => next_state.value().result_payload.as_ref(),

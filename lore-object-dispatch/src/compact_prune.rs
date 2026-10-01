@@ -115,7 +115,8 @@ pub enum CompactPruneError {
 }
 
 fn validate_identity(value: &str) -> Result<(), CompactPruneError> {
-    validate_canonical_text(value, u32::MAX).map_err(|_| CompactPruneError::InvalidBackupCoverage)
+    validate_canonical_text(value, u32::MAX)
+        .map_err(|_err| CompactPruneError::InvalidBackupCoverage)
 }
 
 fn validate_watermark(value: &ObjectStoreCompactPruneWatermark) -> Result<(), CompactPruneError> {
@@ -162,7 +163,7 @@ fn validate_counter(
     expected_scope_id: &str,
 ) -> Result<(), CompactPruneError> {
     validate_canonical_text(&value.scope_id, u32::MAX)
-        .map_err(|_| CompactPruneError::InvalidCounter)?;
+        .map_err(|_err| CompactPruneError::InvalidCounter)?;
     if value.scope != expected_scope
         || value.scope_id != expected_scope_id
         || value.counter_revision == 0
@@ -213,8 +214,8 @@ fn prune_fingerprint(
     compact_blake3: &[u8; 32],
     compact_bytes: u64,
 ) -> Result<[u8; 32], CompactPruneError> {
-    let mut output =
-        BoundedCanonicalWriter::new(u32::MAX).map_err(|_| CompactPruneError::CanonicalTooLarge)?;
+    let mut output = BoundedCanonicalWriter::new(u32::MAX)
+        .map_err(|_err| CompactPruneError::CanonicalTooLarge)?;
     output
         .raw(INTENT_DOMAIN)
         .and_then(|()| output.u64(compact_sequence))
@@ -222,7 +223,7 @@ fn prune_fingerprint(
         .and_then(|()| output.u64(1))
         .and_then(|()| output.u64(compact_bytes))
         .and_then(|()| output.u64(0))
-        .map_err(|_| CompactPruneError::CanonicalTooLarge)?;
+        .map_err(|_err| CompactPruneError::CanonicalTooLarge)?;
     Ok(*blake3::hash(&output.finish()).as_bytes())
 }
 
@@ -339,7 +340,7 @@ pub fn decide_object_store_compact_prune(
         return Err(CompactPruneError::ChildExceedsGlobal);
     }
     let compact_bytes = u64::try_from(compact.canonical_bytes().len())
-        .map_err(|_| CompactPruneError::CounterOverflow)?;
+        .map_err(|_err| CompactPruneError::CounterOverflow)?;
     let next_counters = ObjectStoreFullToCompactNextCounters {
         global: next_counter(input.global_counter, compact_bytes)?,
         cell: next_counter(input.cell_counter, compact_bytes)?,

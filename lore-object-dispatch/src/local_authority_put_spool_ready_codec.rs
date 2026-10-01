@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Embedded source-dark canonical PUT SPOOL_READY row codec artifact.
+//! Embedded source-dark canonical PUT `SPOOL_READY` row codec artifact.
 //!
 //! Runtime code does not install or call this migration. The SQL codec authenticates the
-//! database row and its state-2 ReservePut replay after a later filesystem coordinator has
+//! database row and its state-2 `ReservePut` replay after a later filesystem coordinator has
 //! supplied durable-handle, body-digest, and ready-clock assertions. It cannot prove them.
 
-/// Exact PostgreSQL PUT SPOOL_READY codec migration bytes.
+/// Exact `PostgreSQL` PUT `SPOOL_READY` codec migration bytes.
 pub const LOCAL_AUTHORITY_PUT_SPOOL_READY_CODEC_MIGRATION_V1: &[u8] =
     include_bytes!("../migrations/0016_object_store_dispatch_put_spool_ready_codec.sql");
 

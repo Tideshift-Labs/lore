@@ -86,7 +86,7 @@ pub fn validate_and_encode_terminal_result(
 ) -> Result<CanonicalTerminalResult, TerminalResultError> {
     validate_limits(limits)?;
     validate_canonical_text(&input.terminal_result_id, limits.max_opaque_value_bytes)
-        .map_err(|_| TerminalResultError::InvalidTerminalResultId)?;
+        .map_err(|_err| TerminalResultError::InvalidTerminalResultId)?;
     let payload = canonicalize_payload(
         input
             .result
@@ -306,7 +306,7 @@ fn canonical_provider_error(
     limits: &TerminalResultLimits,
 ) -> Result<ProviderErrorV1, TerminalResultError> {
     let class = ProviderErrorClassV1::try_from(value.error_class)
-        .map_err(|_| TerminalResultError::InvalidProviderErrorClass)?;
+        .map_err(|_err| TerminalResultError::InvalidProviderErrorClass)?;
     match class {
         ProviderErrorClassV1::ProviderErrorClassUnspecified => {
             return Err(TerminalResultError::InvalidProviderErrorClass);

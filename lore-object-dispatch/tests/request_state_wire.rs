@@ -1160,7 +1160,7 @@ fn state_rejects_terminal_no_dispatch_payload_binding_and_reservation_inconsiste
     purge_before_floor.closure_committed_at_unix_ms = Some(NOW + 5);
 
     assert!(
-        [
+        vec![
             acked_without_receipt,
             discarded_without_receipt,
             available_with_closure,
@@ -1184,10 +1184,10 @@ fn state_rejects_terminal_no_dispatch_payload_binding_and_reservation_inconsiste
 }
 
 /// WP-114 CD-6, request-state side: `validate_state_algebra`'s phase 6|7 branch refuses a nested
-/// no-dispatch proof that is otherwise fully valid -- correct reason, canonical UUIDv7 proof ID, a
+/// no-dispatch proof that is otherwise fully valid -- correct reason, canonical `UUIDv7` proof ID, a
 /// digest that matches its own (mutated) fields, correct timing -- but was minted for a different
-/// request than the state row's own `logical_request_id`. Covers both NoDispatch (phase 6, index
-/// 5) and PreparedExpired (phase 7, index 6).
+/// request than the state row's own `logical_request_id`. Covers both `NoDispatch` (phase 6, index
+/// 5) and `PreparedExpired` (phase 7, index 6).
 #[test]
 fn state_rejects_no_dispatch_proof_minted_for_a_foreign_request() {
     for index in [5usize, 6usize] {

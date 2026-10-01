@@ -4,7 +4,7 @@
 //! Closed configuration for the in-process cell dispatch authority.
 //!
 //! CR-033's revised specification (D1) makes the authority in-process: it runs on the cell's own
-//! PostgreSQL pool, so it configures no listener and no TLS material. What survives is the bounded,
+//! `PostgreSQL` pool, so it configures no listener and no TLS material. What survives is the bounded,
 //! fail-closed parse of the `LORE_OBJECT_DISPATCH_` environment surface and the revision pin that
 //! rejects a stale operator environment instead of silently accepting it.
 //!
@@ -58,10 +58,10 @@ impl CellAuthorityConfig {
             }
             let key = key
                 .into_string()
-                .map_err(|_| CellAuthorityConfigError::NonUnicodeKey)?;
+                .map_err(|_err| CellAuthorityConfigError::NonUnicodeKey)?;
             let value = value
                 .into_string()
-                .map_err(|_| CellAuthorityConfigError::NonUnicodeValue)?;
+                .map_err(|_err| CellAuthorityConfigError::NonUnicodeValue)?;
             prefixed.push((key, value));
         }
         Self::from_prefixed_vars(prefixed)
@@ -81,11 +81,11 @@ impl CellAuthorityConfig {
             }
             let key = key
                 .into_string()
-                .map_err(|_| CellAuthorityConfigError::NonUnicodeKey)?;
+                .map_err(|_err| CellAuthorityConfigError::NonUnicodeKey)?;
             let value = value
                 .into()
                 .into_string()
-                .map_err(|_| CellAuthorityConfigError::NonUnicodeValue)?;
+                .map_err(|_err| CellAuthorityConfigError::NonUnicodeValue)?;
             match key.as_str() {
                 CELL_AUTHORITY_CONFIG_REVISION_ENV => {
                     if revision.replace(value).is_some() {

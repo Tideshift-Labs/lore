@@ -192,7 +192,7 @@ fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_
         1,
     );
     let failure = std::panic::catch_unwind(|| {
-        assert_charge_timeout_wall(&inverted_commit_boundary, POOL_SOURCE)
+        assert_charge_timeout_wall(&inverted_commit_boundary, POOL_SOURCE);
     })
     .expect_err("inverting the COMMIT boundary must fail this proof");
     assert!(
@@ -202,7 +202,7 @@ fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_
     let constant_timeout_phase =
         CHARGE_SOURCE.replacen("commit_started.load(Ordering::SeqCst)", "false", 1);
     let failure = std::panic::catch_unwind(|| {
-        assert_charge_timeout_wall(&constant_timeout_phase, POOL_SOURCE)
+        assert_charge_timeout_wall(&constant_timeout_phase, POOL_SOURCE);
     })
     .expect_err("disconnecting the COMMIT marker from timeout classification must fail this proof");
     assert!(
@@ -216,7 +216,7 @@ fn outer_charge_timeout_distinguishes_precommit_from_commit_started_and_retires_
     );
     assert_ne!(disconnected_classifier, CHARGE_SOURCE);
     let failure = std::panic::catch_unwind(|| {
-        assert_charge_timeout_wall(&disconnected_classifier, POOL_SOURCE)
+        assert_charge_timeout_wall(&disconnected_classifier, POOL_SOURCE);
     })
     .expect_err("a loaded but unused COMMIT marker must fail this proof");
     assert!(
@@ -257,7 +257,7 @@ fn assert_charge_timeout_wall(charge_source: &str, pool_source: &str) {
     assert!(charge_once.contains("let commit_started = AtomicBool::new(false);"));
     assert!(
         charge_once.contains(
-            "Err(_) => {\n                let started = commit_started.load(Ordering::SeqCst);\n                Err(classify_charge_timeout(started))\n            }"
+            "} else {\n            let started = commit_started.load(Ordering::SeqCst);\n            Err(classify_charge_timeout(started))\n        }"
         ),
         "the actual COMMIT marker load must feed timeout classification"
     );

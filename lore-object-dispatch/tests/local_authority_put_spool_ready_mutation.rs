@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! Source-dark atomic SPOOL_READY database mutation contract. The database records the caller's
+//! Source-dark atomic `SPOOL_READY` database mutation contract. The database records the caller's
 //! already-durable assertion; it cannot write, fsync, rename, or inspect filesystem bytes.
 
 use std::path::Path;
@@ -41,9 +41,9 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(dir).expect("dir") {
         let path = entry.expect("entry").path();
         if path.is_dir() {
-            sources(&path, out)
+            sources(&path, out);
         } else if path.extension().is_some_and(|v| v == "rs") {
-            out.push(path)
+            out.push(path);
         }
     }
 }
@@ -249,11 +249,11 @@ fn uuid(ts: u64, tail: &str) -> String {
 }
 fn text(v: &mut Vec<u8>, s: &str) {
     v.extend_from_slice(&(s.len() as u32).to_be_bytes());
-    v.extend_from_slice(s.as_bytes())
+    v.extend_from_slice(s.as_bytes());
 }
 fn bytes(v: &mut Vec<u8>, b: &[u8]) {
     v.extend_from_slice(&(b.len() as u32).to_be_bytes());
-    v.extend_from_slice(b)
+    v.extend_from_slice(b);
 }
 fn done(p: &[u8]) -> Vec<u8> {
     let mut v = p.to_vec();
@@ -266,7 +266,7 @@ fn hex(b: &[u8]) -> String {
 fn quota(size: u64) -> Vec<u8> {
     let mut v = b"object-store-quota-units-v1\0".to_vec();
     for x in [size, 1, 1] {
-        v.extend_from_slice(&x.to_be_bytes())
+        v.extend_from_slice(&x.to_be_bytes());
     }
     v
 }
@@ -327,7 +327,7 @@ fn spool_child(size: u64) -> Vec<u8> {
         &uuid(1001, "0223456789ab"),
         &uuid(1002, "0323456789ab"),
     ] {
-        text(&mut v, s)
+        text(&mut v, s);
     }
     v.extend_from_slice(&7_u64.to_be_bytes());
     text(&mut v, "put/body-final");
@@ -361,7 +361,7 @@ fn row(
         &uuid(1001, "0223456789ab"),
         &uuid(1002, "0323456789ab"),
     ] {
-        text(&mut v, s)
+        text(&mut v, s);
     }
     v.extend_from_slice(&7_u64.to_be_bytes());
     v.extend_from_slice(if ready { &[1, 1, 2, 1] } else { &[1, 1, 1, 1] });
@@ -376,7 +376,7 @@ fn row(
         text(&mut v, "put/body-final");
     }
     for x in [progress.0, progress.1, progress.2] {
-        v.extend_from_slice(&x.to_be_bytes())
+        v.extend_from_slice(&x.to_be_bytes());
     }
     bytes(&mut v, &done(&quota(size)));
     v.extend_from_slice(&1_u64.to_be_bytes());
@@ -384,14 +384,14 @@ fn row(
     v.extend_from_slice(&FP);
     text(&mut v, "allocation-1");
     for x in [5_u64, 3000, 4000, 2000, 1000, 6] {
-        v.extend_from_slice(&x.to_be_bytes())
+        v.extend_from_slice(&x.to_be_bytes());
     }
     bytes(&mut v, ack);
     v.extend_from_slice(digest);
     v.extend_from_slice(&revision.to_be_bytes());
     v.extend_from_slice(&2000_u64.to_be_bytes());
     if ready {
-        v.extend_from_slice(&2000_u64.to_be_bytes())
+        v.extend_from_slice(&2000_u64.to_be_bytes());
     }
     v
 }
@@ -449,12 +449,12 @@ fn final_sql(
 async fn user(c: &tokio_postgres::Client, r: &str) {
     c.batch_execute(&format!("SET SESSION AUTHORIZATION {r}"))
         .await
-        .unwrap()
+        .unwrap();
 }
 async fn reset(c: &tokio_postgres::Client) {
     c.batch_execute("RESET SESSION AUTHORIZATION")
         .await
-        .unwrap()
+        .unwrap();
 }
 async fn serial(
     c: &tokio_postgres::Client,
@@ -474,7 +474,7 @@ async fn install(c: &tokio_postgres::Client, s: &str) -> String {
     v
 }
 fn msg(e: &tokio_postgres::Error) -> &str {
-    e.as_db_error().map(|d| d.message()).unwrap_or("untyped")
+    e.as_db_error().map_or("untyped", |d| d.message())
 }
 
 #[tokio::test]
