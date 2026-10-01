@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Owned TLS exchange endpoint; existing ReBAC policy remains a read-only test double.
+//! Owned TLS exchange endpoint; existing `ReBAC` policy remains a read-only test double.
 use std::convert::Infallible;
 use std::marker::PhantomData;
 use std::sync::Arc;
@@ -201,11 +201,11 @@ where
                 .unwrap()
                 .connect()
                 .await
-                .map_err(|_| tonic::Status::unavailable("owned upstream unavailable"))?;
+                .map_err(|_err| tonic::Status::unavailable("owned upstream unavailable"))?;
             let mut grpc = tonic::client::Grpc::new(channel);
             grpc.ready()
                 .await
-                .map_err(|_| tonic::Status::unavailable("owned upstream not ready"))?;
+                .map_err(|_err| tonic::Status::unavailable("owned upstream not ready"))?;
             grpc.unary(
                 request,
                 http::uri::PathAndQuery::from_static(path),

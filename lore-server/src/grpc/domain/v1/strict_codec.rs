@@ -114,7 +114,7 @@ fn validate_raw_fields(raw: &[u8], rules: &[RawField]) -> Result<(u64, [u64; 64]
     while offset < raw.len() {
         let key = read_raw_varint(raw, &mut offset)?;
         let tag = u32::try_from(key >> 3)
-            .map_err(|_| Status::invalid_argument("protobuf field tag overflows u32"))?;
+            .map_err(|_err| Status::invalid_argument("protobuf field tag overflows u32"))?;
         if tag == 0 || tag > 63 {
             return Err(Status::invalid_argument("invalid protobuf field tag"));
         }
@@ -147,7 +147,7 @@ fn validate_raw_fields(raw: &[u8], rules: &[RawField]) -> Result<(u64, [u64; 64]
                 }
                 let length = read_raw_varint(raw, &mut offset)?;
                 let length = usize::try_from(length)
-                    .map_err(|_| Status::invalid_argument("protobuf length overflows usize"))?;
+                    .map_err(|_err| Status::invalid_argument("protobuf length overflows usize"))?;
                 if length > maximum {
                     return Err(Status::invalid_argument(format!(
                         "protobuf field {tag} exceeds its canonical bound"
@@ -473,7 +473,7 @@ fn validate_binding(
         ));
     }
     let fingerprint_version = i32::try_from(fingerprint_version)
-        .map_err(|_| Status::invalid_argument("fingerprint_version exceeds i32"))?;
+        .map_err(|_err| Status::invalid_argument("fingerprint_version exceeds i32"))?;
     exact_len("fingerprint", fingerprint, DIGEST_LEN)?;
     exact_len(
         "canonical_intent_digest",
@@ -493,7 +493,7 @@ fn validate_binding(
     }
 
     let operation_id = Uuid::from_slice(operation_id)
-        .map_err(|_| Status::invalid_argument("operation_id is not a UUID"))?;
+        .map_err(|_err| Status::invalid_argument("operation_id is not a UUID"))?;
     lore_postgres::domain::receipts::uuid_v7_timestamp(&operation_id)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -555,7 +555,7 @@ pub(super) fn validate_attempt_receipt_get(
         .client_attempt_id
         .as_ref()
         .try_into()
-        .map_err(|_| exact_len_status("client_attempt_id", UUID_LEN))?;
+        .map_err(|_err| exact_len_status("client_attempt_id", UUID_LEN))?;
     let attempt = Uuid::from_bytes(bytes);
     if attempt.get_version_num() != 7 {
         return Err(Status::invalid_argument(
@@ -632,7 +632,7 @@ pub(super) fn validate_verified_stale_finalize(
     )?;
     exact_len("operation_id", &request.operation_id, UUID_LEN)?;
     let operation_id = Uuid::from_slice(&request.operation_id)
-        .map_err(|_| Status::invalid_argument("operation_id is not a UUID"))?;
+        .map_err(|_err| Status::invalid_argument("operation_id is not a UUID"))?;
     lore_postgres::domain::receipts::uuid_v7_timestamp(&operation_id)
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
     bounded_nonempty("method", request.method.as_bytes(), MAX_METHOD_LEN)?;
@@ -748,9 +748,9 @@ pub(super) fn validate_terminal_status_attach(
         ));
     }
     let phase = TerminalStatusAttachPhaseV1::try_from(request.phase)
-        .map_err(|_| Status::invalid_argument("invalid terminal attachment phase"))?;
+        .map_err(|_err| Status::invalid_argument("invalid terminal attachment phase"))?;
     let action = TerminalStatusAttachPhase2ActionV1::try_from(request.phase2_action)
-        .map_err(|_| Status::invalid_argument("invalid terminal attachment action"))?;
+        .map_err(|_err| Status::invalid_argument("invalid terminal attachment action"))?;
     match phase {
         TerminalStatusAttachPhaseV1::Phase1TerminalAck => {
             if action != TerminalStatusAttachPhase2ActionV1::Unspecified
@@ -816,10 +816,12 @@ pub(super) fn validate_terminal_status_attach(
                         ));
                     }
                 }
-                _ => return Err(Status::invalid_argument("Phase 2 action is required")),
+                TerminalStatusAttachPhase2ActionV1::Unspecified => {
+                    return Err(Status::invalid_argument("Phase 2 action is required"));
+                }
             }
         }
-        _ => {
+        TerminalStatusAttachPhaseV1::Unspecified => {
             return Err(Status::invalid_argument(
                 "terminal attachment phase is unspecified",
             ));

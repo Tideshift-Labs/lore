@@ -388,7 +388,7 @@ impl EventRelayWorker {
                     // classification, so it retains rows rather than losing
                     // them.
                     PublishFailure::Terminal(class) => {
-                        if !self.terminal_is_final(class.as_metric_label(), &claimed) {
+                        if !Self::terminal_is_final(class.as_metric_label(), &claimed) {
                             warn!(
                                 event_id = %event_id,
                                 class = class.as_metric_label(),
@@ -473,7 +473,7 @@ impl EventRelayWorker {
     /// same version publish. That belongs to Step C's operator command surface,
     /// which owns dispositions; it is not this loop's decision to make and is
     /// not a weaker form of the rule above.
-    fn terminal_is_final(&self, class_label: &str, claimed: &ClaimedEvent) -> bool {
+    fn terminal_is_final(class_label: &str, claimed: &ClaimedEvent) -> bool {
         let requires_repetition = class_label == TerminalClass::InvalidRequest.as_metric_label()
             || class_label == ACCEPTANCE_OUT_OF_RANGE;
         if !requires_repetition {
@@ -582,7 +582,7 @@ impl EventRelayWorker {
                 // dead-letter the whole backlog, and each of those rows *was*
                 // published, so every dead letter would also be a broker
                 // duplicate.
-                if !self.terminal_is_final(ACCEPTANCE_OUT_OF_RANGE, claimed) {
+                if !Self::terminal_is_final(ACCEPTANCE_OUT_OF_RANGE, claimed) {
                     warn!(
                         event_id = %event_id,
                         detail,
@@ -825,11 +825,11 @@ pub const fn cas_label(outcome: &CasOutcome) -> &'static str {
 /// wrong evidence in the checkpoint vector Step C compares against.
 fn acceptance_record(acceptance: &BrokerAcceptance) -> Result<BrokerAcceptanceRecord, String> {
     let stream_epoch = i64::try_from(acceptance.stream_epoch)
-        .map_err(|_| format!("stream_epoch {} exceeds i64", acceptance.stream_epoch))?;
+        .map_err(|_err| format!("stream_epoch {} exceeds i64", acceptance.stream_epoch))?;
     let broker_sequence = i64::try_from(acceptance.broker_sequence)
-        .map_err(|_| format!("broker_sequence {} exceeds i64", acceptance.broker_sequence))?;
+        .map_err(|_err| format!("broker_sequence {} exceeds i64", acceptance.broker_sequence))?;
     let publisher_contract_version =
-        i32::try_from(acceptance.publisher_contract_version).map_err(|_| {
+        i32::try_from(acceptance.publisher_contract_version).map_err(|_err| {
             format!(
                 "publisher_contract_version {} exceeds i32",
                 acceptance.publisher_contract_version
@@ -964,7 +964,7 @@ mod tests {
     /// The three classes that are properties of the row are terminal on sight.
     #[test]
     fn a_row_specific_terminal_class_is_final_on_the_first_attempt() {
-        let worker = policy_worker();
+        let _worker = policy_worker();
         // A row that has already failed some OTHER way, so a test that passed
         // only because `last_error_class` happened to be `None` would not.
         let previously_failed = claimed_row(3, Some("timeout"));
@@ -975,7 +975,7 @@ mod tests {
             TerminalClass::LocallyRejected,
         ] {
             assert!(
-                worker.terminal_is_final(class.as_metric_label(), &previously_failed),
+                EventRelayWorker::terminal_is_final(class.as_metric_label(), &previously_failed),
                 "{} is a property of the row and is terminal on sight",
                 class.as_metric_label()
             );
@@ -988,18 +988,18 @@ mod tests {
     /// the run.
     #[test]
     fn an_answer_specific_class_is_final_only_after_the_same_class_twice_running() {
-        let worker = policy_worker();
+        let _worker = policy_worker();
 
         for class in [
             TerminalClass::InvalidRequest.as_metric_label(),
             ACCEPTANCE_OUT_OF_RANGE,
         ] {
             assert!(
-                !worker.terminal_is_final(class, &claimed_row(0, None)),
+                !EventRelayWorker::terminal_is_final(class, &claimed_row(0, None)),
                 "{class}: a first rejection must requeue"
             );
             assert!(
-                worker.terminal_is_final(class, &claimed_row(1, Some(class))),
+                EventRelayWorker::terminal_is_final(class, &claimed_row(1, Some(class))),
                 "{class}: a second consecutive rejection is terminal"
             );
         }
@@ -1012,14 +1012,14 @@ mod tests {
     /// partly back, and this is the assertion that catches it.
     #[test]
     fn a_long_run_of_transient_failures_does_not_make_the_first_rejection_terminal() {
-        let worker = policy_worker();
+        let _worker = policy_worker();
         let after_an_outage = claimed_row(500, Some("broker_unavailable"));
         for class in [
             TerminalClass::InvalidRequest.as_metric_label(),
             ACCEPTANCE_OUT_OF_RANGE,
         ] {
             assert!(
-                !worker.terminal_is_final(class, &after_an_outage),
+                !EventRelayWorker::terminal_is_final(class, &after_an_outage),
                 "{class}: 500 transient retries are not 500 rejections"
             );
         }
@@ -1029,12 +1029,12 @@ mod tests {
     /// of either.
     #[test]
     fn alternating_rejection_classes_never_reach_terminal() {
-        let worker = policy_worker();
-        assert!(!worker.terminal_is_final(
+        let _worker = policy_worker();
+        assert!(!EventRelayWorker::terminal_is_final(
             TerminalClass::InvalidRequest.as_metric_label(),
             &claimed_row(9, Some(ACCEPTANCE_OUT_OF_RANGE))
         ));
-        assert!(!worker.terminal_is_final(
+        assert!(!EventRelayWorker::terminal_is_final(
             ACCEPTANCE_OUT_OF_RANGE,
             &claimed_row(9, Some(TerminalClass::InvalidRequest.as_metric_label()))
         ));

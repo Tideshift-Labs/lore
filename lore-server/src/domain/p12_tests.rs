@@ -834,7 +834,7 @@ impl DummyPublicationBytes {
         }
     }
 
-    fn applied_result(&self, repository_generation: i64) -> MutationResult {
+    fn applied_result(repository_generation: i64) -> MutationResult {
         MutationResult {
             outcome: DomainOutcome::Applied,
             repository_generation: Some(repository_generation),
@@ -923,7 +923,7 @@ async fn prepare_admits_carriage_when_enforcement_is_on() {
 async fn commit_with_cell_id_configured_builds_both_pinned_events_in_order() {
     let bytes = dummy_publication_bytes();
     let (governed, captured) = build_governed_repository_create(
-        bytes.applied_result(1),
+        DummyPublicationBytes::applied_result(1),
         Some(bytes.snapshot(1)),
         Some("cell-a"),
     );
@@ -958,8 +958,11 @@ async fn commit_with_cell_id_configured_builds_both_pinned_events_in_order() {
 #[tokio::test]
 async fn commit_with_no_cell_id_configured_builds_no_events() {
     let bytes = dummy_publication_bytes();
-    let (governed, captured) =
-        build_governed_repository_create(bytes.applied_result(1), Some(bytes.snapshot(1)), None);
+    let (governed, captured) = build_governed_repository_create(
+        DummyPublicationBytes::applied_result(1),
+        Some(bytes.snapshot(1)),
+        None,
+    );
 
     governed
         .commit(&bytes.publication())
@@ -986,8 +989,11 @@ async fn commit_reads_back_the_committed_metadata_pointer_rather_than_the_publis
     let committed_metadata_hash = [99u8; 32];
     let mut snapshot = bytes.snapshot(3);
     snapshot.metadata_hash = committed_metadata_hash.to_vec();
-    let (governed, _captured) =
-        build_governed_repository_create(bytes.applied_result(3), Some(snapshot), Some("cell-a"));
+    let (governed, _captured) = build_governed_repository_create(
+        DummyPublicationBytes::applied_result(3),
+        Some(snapshot),
+        Some("cell-a"),
+    );
 
     let outcome = governed
         .commit(&bytes.publication())
@@ -1673,7 +1679,7 @@ async fn create_witness_is_none_for_a_direct_non_mediated_governed_create() {
 
 /// A mediated operation with no claim witness is refused before it ever
 /// becomes a `GovernedRepositoryCreate` -- and therefore before the handler
-/// could reach `repository_create_auth_resource`'s ReBAC callback at all,
+/// could reach `repository_create_auth_resource`'s `ReBAC` callback at all,
 /// since that call site only exists behind a successfully constructed
 /// `GovernedRepositoryCreate`. `context(true)` backs an
 /// `UnreachableDomainStore`: `prepare()` never touches the coordinator on any
@@ -1696,7 +1702,7 @@ async fn prepare_refuses_mediated_scope_without_claim_witness_before_touching_th
 /// The full assembly: a mediated operation with both a mediated scope and a
 /// claim witness admits, and `create_witness()` combines all three
 /// provenances (the verified token, Lore's own validated carriage, and the
-/// claim-witness header) into the exact `GovernedCreateWitness` the ReBAC
+/// claim-witness header) into the exact `GovernedCreateWitness` the `ReBAC`
 /// callback will send. `GovernedCreateWitness` has no `PartialEq`, so every
 /// field is asserted individually rather than compared as a whole value.
 #[tokio::test]
@@ -2070,7 +2076,7 @@ async fn repository_create_auth_resource_ungoverned_already_exists_still_short_c
 // `admit`/`prepare` above.
 // ---------------------------------------------------------------------------
 
-/// A cell can verify a principal, enforce the domain, and still have no ReBAC
+/// A cell can verify a principal, enforce the domain, and still have no `ReBAC`
 /// endpoint configured (`auth_url` and JWT authentication are independent
 /// settings). Without this guard a claimed create on such a cell would skip
 /// the callback entirely and commit a claim nothing ever acknowledged.

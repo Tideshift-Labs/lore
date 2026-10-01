@@ -167,7 +167,7 @@ impl SessionMap {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
                 (active < MAX_CONCURRENT_SESSIONS).then_some(active + 1)
             })
-            .map_err(|_| SessionError::LimitReached)?;
+            .map_err(|_err| SessionError::LimitReached)?;
 
         let correlation_id = if correlation_id.is_empty() {
             uuid::Uuid::new_v4().to_string()

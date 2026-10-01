@@ -428,7 +428,7 @@ pub fn spawn_event_relay(
     } = prepared;
 
     match (receiver.is_some(), receiver_readiness) {
-        (true, Some(handle)) => readiness.attach_durable_receiver(handle).map_err(|_| {
+        (true, Some(handle)) => readiness.attach_durable_receiver(handle).map_err(|_err| {
             anyhow!("The relay readiness handle already carries a durable receiver facet")
         })?,
         (true, None) => {
@@ -466,9 +466,9 @@ pub fn spawn_event_relay(
     // been declared healthy. Attaching twice is a wiring fault, not a
     // recoverable state: two gates over one cell would mean two caches and a
     // coin flip over which verdict a mutation reads.
-    domain
-        .attach_admission(admission.clone())
-        .map_err(|_| anyhow!("The domain coordinator already carries an outbox admission gate"))?;
+    domain.attach_admission(admission.clone()).map_err(|_err| {
+        anyhow!("The domain coordinator already carries an outbox admission gate")
+    })?;
 
     let worker = EventRelayWorker::new(pool, publisher, config, readiness.clone(), source)
         .with_admission(admission.clone());

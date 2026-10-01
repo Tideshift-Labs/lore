@@ -102,7 +102,7 @@ fn required_mode_checks_mutations_and_unknown_paths_without_jwt_exemption() {
     for (path, class) in RPC_INVENTORY {
         match class {
             RpcClass::Read => {
-                admit(CallerCapabilityPolicy::RequireOutcomeUnknownV1, path, &auth).unwrap()
+                admit(CallerCapabilityPolicy::RequireOutcomeUnknownV1, path, &auth).unwrap();
             }
             RpcClass::Mutation => {
                 refused(

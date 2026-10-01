@@ -129,7 +129,7 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
     ) -> Result<VerifyRepositoryOperationAuthorizationResponse, Status> {
         let mut client = grpc_get_rebac_client(self.auth_url.clone())
             .await
-            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+            .map_err(|_err| Status::unavailable("Repository operation verifier unavailable"))?;
         timed!(
             self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
             &self.get_labels_for_operation_context("verify_repository_operation_authorization"),
@@ -148,7 +148,7 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
     ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
         let mut client = grpc_get_rebac_client(self.auth_url.clone())
             .await
-            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+            .map_err(|_err| Status::unavailable("Repository operation verifier unavailable"))?;
         client
             .client
             .claim_repository_operation_stale_finalize_permit(request)
@@ -162,7 +162,7 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
     ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
         let mut client = grpc_get_rebac_client(self.auth_url.clone())
             .await
-            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+            .map_err(|_err| Status::unavailable("Repository operation verifier unavailable"))?;
         client
             .client
             .verify_repository_operation_terminal_status_attach(request)
@@ -176,7 +176,7 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
     ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
         let mut client = grpc_get_rebac_client(self.auth_url.clone())
             .await
-            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+            .map_err(|_err| Status::unavailable("Repository operation verifier unavailable"))?;
         client
             .client
             .verify_repository_operation_proof_namespace_materialize(request)
@@ -190,7 +190,7 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
     ) -> Result<DomainOperationMaintenanceVerificationResponse, Status> {
         let mut client = grpc_get_rebac_client(self.auth_url.clone())
             .await
-            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+            .map_err(|_err| Status::unavailable("Repository operation verifier unavailable"))?;
         client
             .client
             .verify_repository_operation_proof_namespace_retire(request)
@@ -204,7 +204,7 @@ impl RepositoryOperationAuthorizationVerifier for GrpcRepositoryOperationAuthori
     ) -> Result<AuthorizeDirectRepositoryOperationResponse, Status> {
         let mut client = grpc_get_rebac_client(self.auth_url.clone())
             .await
-            .map_err(|_| Status::unavailable("Repository operation verifier unavailable"))?;
+            .map_err(|_err| Status::unavailable("Repository operation verifier unavailable"))?;
         timed!(
             self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
             &self.get_labels_for_operation_context("authorize_direct_repository_operation"),

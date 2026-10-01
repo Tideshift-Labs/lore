@@ -105,7 +105,7 @@ pub fn to_stored(version: &AggregateVersion) -> Result<StoredAggregateVersion, V
         .map(|identity| identity.as_bytes().to_vec())
         .unwrap_or_default();
     StoredAggregateVersion::new(version.ordinal, identity)
-        .map_err(|_| VersionDecodeError::IdentityTooWide)
+        .map_err(|_err| VersionDecodeError::IdentityTooWide)
 }
 
 /// Per-aggregate applied-version state for one receiver generation.

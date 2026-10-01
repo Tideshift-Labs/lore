@@ -259,7 +259,7 @@ impl CellBackfillSource {
         rows.into_iter()
             .map(|row| {
                 let partition: Vec<u8> = row.get("partition");
-                partition.as_slice().try_into().map_err(|_| {
+                partition.as_slice().try_into().map_err(|_err| {
                     DomainError::Internal(format!(
                         "a repository metadata row sits in a {}-byte partition; \
                          a repository identity is 16 bytes",
@@ -399,6 +399,10 @@ impl DomainBackfillSource for CellBackfillSource {
     async fn list_repositories(&self) -> Result<Vec<RepositoryFacts>, DomainError> {
         let mut facts = Vec::new();
         for (repository_id, discovery) in self.repository_ids().await? {
+            // Reason: the `NameMap` and `MetadataRow` (non-`missing`) arms both refuse, but for
+            // unrelated reasons worth keeping as separately commented arms rather than merging
+            // into one pattern clippy can't attach a single rationale to.
+            #[allow(clippy::match_same_arms)]
             match (self.repository_facts(repository_id).await, discovery) {
                 (Ok(one), _) => facts.push(one),
                 // A name-map row points at it, so it is a repository this cell
@@ -571,7 +575,7 @@ impl DomainBackfillSource for CellBackfillSource {
 /// silently truncating or padding it would scope the branch walk to the wrong
 /// repository, which the backfill has no way to notice.
 fn repository_identity(repository_id: &[u8]) -> Result<RepositoryId, DomainError> {
-    let bytes: [u8; 16] = repository_id.try_into().map_err(|_| {
+    let bytes: [u8; 16] = repository_id.try_into().map_err(|_err| {
         DomainError::InvalidInput(format!(
             "repository identity must be 16 bytes, got {}",
             repository_id.len()

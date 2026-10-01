@@ -366,7 +366,7 @@ fn the_removed_inline_branch_push_definition_cannot_return() {
     assert_eq!(PUSH.matches("CanonicalIntent::BranchPush").count(), 1);
 }
 
-/// The ReBAC create callback's proto contract.
+/// The `ReBAC` create callback's proto contract.
 ///
 /// Included as source rather than as a hand-copied field list so the pin below
 /// fails when a field is added to the message and left unpopulated — which is
@@ -586,7 +586,7 @@ fn the_claim_witness_is_mediated_only_and_required_when_mediated() {
 /// WP-116: one method string for a governed create, not two that must agree.
 ///
 /// The regression this pins actually happened, against a live cell. The receipt
-/// binding carried the gRPC path and the ReBAC callback carried the platform
+/// binding carried the gRPC path and the `ReBAC` callback carried the platform
 /// family constant, so the platform's single stored method could satisfy only
 /// one of them: the callback acknowledged and then `ReceiptRow::matches` failed,
 /// and the create died at the coordinator with `ADMISSION_REJECTED_V1` after the
@@ -701,7 +701,7 @@ fn the_governed_delete_seam_binds_its_method_by_construction_too() {
 /// # What went wrong, so the shape is not mistaken for tidiness
 ///
 /// The create seam bound the handler's gRPC path into the receipt while sending
-/// the platform's family constant on the ReBAC callback. The platform stores one
+/// the platform's family constant on the `ReBAC` callback. The platform stores one
 /// method per authorization row and three separate comparisons read it, so no
 /// value satisfied both: a live create passed carriage, passed the callback,
 /// then died at the coordinator with `ADMISSION_REJECTED_V1` after the

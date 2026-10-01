@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Response honesty after a scripted Applied create; transaction durability is covered in PostgreSQL.
+//! Response honesty after a scripted Applied create; transaction durability is covered in `PostgreSQL`.
 use lore_postgres::domain::coordinator::MutationResult;
 use lore_postgres::domain::coordinator::RepositorySnapshot;
 use lore_postgres::domain::errors::DomainError;

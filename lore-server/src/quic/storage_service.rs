@@ -495,11 +495,11 @@ impl QuicService for StorageService {
             ParsedStorageRequest::PutResolved(_) => self.require_write(&context, "PutResolved")?,
             ParsedStorageRequest::Copy(_) => self.require_write(&context, "Copy")?,
             ParsedStorageRequest::MutableStoreOp(_) => {
-                self.require_write(&context, "MutableStore")?
+                self.require_write(&context, "MutableStore")?;
             }
             ParsedStorageRequest::MutableCas(_) => self.require_write(&context, "MutableCas")?,
             ParsedStorageRequest::Verify(verify) if verify.heal != 0 => {
-                self.require_write(&context, "Verify(heal)")?
+                self.require_write(&context, "Verify(heal)")?;
             }
             // Reads (and Verify without heal) are ungated.
             ParsedStorageRequest::Verify(_)

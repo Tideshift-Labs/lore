@@ -907,7 +907,7 @@ impl DomainOperatorContext {
 /// undefined-column error that reads like a code fault. Probing only for the
 /// column would report a cell that has served locks for years as having none —
 /// which is exactly what `--dry-run` did before this: it runs before
-/// `bootstrap`, so on an unmigrated cell it printed "no lore_locks relation"
+/// `bootstrap`, so on an unmigrated cell it printed "no `lore_locks` relation"
 /// while the real run refused on those very rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LegacyLockScope {

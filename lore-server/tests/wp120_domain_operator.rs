@@ -264,7 +264,7 @@ fn lock_fencing_settings_preconditions_accepts_a_fully_configured_cell() {
 /// Each refusal below asserts a keyword unique to its OWN offending
 /// condition, not just that the call returned `Err`. This is what makes the
 /// assertion measure the guard: a transposed check (e.g. reporting the
-/// enforce_write_permission condition while jwk is what's actually missing)
+/// `enforce_write_permission` condition while jwk is what's actually missing)
 /// would produce a message containing a DIFFERENT keyword and fail here, even
 /// though it would still pass a bare `is_err()` check.
 #[test]

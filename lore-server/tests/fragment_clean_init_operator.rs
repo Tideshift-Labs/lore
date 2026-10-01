@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! SERVER-only operator integration on owned PostgreSQL and MinIO fixtures.
+//! SERVER-only operator integration on owned `PostgreSQL` and `MinIO` fixtures.
 //! Uses the actual domain operator and namespace inspector, without a serving process.
 
 use std::time::Duration;

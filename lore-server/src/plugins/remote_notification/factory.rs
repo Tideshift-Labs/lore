@@ -230,18 +230,17 @@ fn build_plugin_with_readiness(
 
     match runtime {
         Some(runtime) if mode.runs_durable_receiver() => {
-            match DurableReceiver::new(config, runtime) {
-                Some(receiver) => {
-                    readiness = Some(receiver.readiness());
-                    receivers.push(match shutdown {
-                        Some(shutdown) => Box::pin(receiver.run_with_shutdown(shutdown)),
-                        None => Box::pin(receiver.run()),
-                    });
-                }
-                None => tracing::warn!(
+            if let Some(receiver) = DurableReceiver::new(config, runtime) {
+                readiness = Some(receiver.readiness());
+                receivers.push(match shutdown {
+                    Some(shutdown) => Box::pin(receiver.run_with_shutdown(shutdown)),
+                    None => Box::pin(receiver.run()),
+                });
+            } else {
+                tracing::warn!(
                     "a durable receiver runtime was supplied but no `[plugins.remote.receiver]` \
-                     is configured; no receiver started"
-                ),
+                 is configured; no receiver started"
+                );
             }
         }
         Some(_) => tracing::warn!(

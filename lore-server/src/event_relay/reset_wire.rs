@@ -32,7 +32,7 @@
 //!
 //! `reset_fingerprint` and `detection_id` are wire facts: they are computed from
 //! the request's own fields and validated **once**, before any durable lookup.
-//! A fingerprint that does not recompute, a detection ID that is not the UUIDv5
+//! A fingerprint that does not recompute, a detection ID that is not the `UUIDv5`
 //! of it, or a fingerprint that is not 32 bytes is `MALFORMED_REPORT_V1` — not a
 //! successor failure and not a stored-record mismatch. Putting the derivation
 //! next to the storage would have invited the opposite order.
@@ -60,7 +60,7 @@ pub const RESET_SCHEMA_VERSION: u32 = 1;
 /// length-prefixed.
 pub const FINGERPRINT_DOMAIN: &[u8] = b"reset-fingerprint-v1\0";
 
-/// UUIDv5 namespace for `detection_id`.
+/// `UUIDv5` namespace for `detection_id`.
 pub const DETECTION_ID_NAMESPACE: Uuid = Uuid::from_u128(0xc6a4_2b98_2d15_5e0f_8a77_7a63_04c9_b4dd);
 
 /// `evidence_id`, at most 64 characters.
@@ -170,7 +170,7 @@ pub struct StreamResetReportV1 {
     /// Exactly 1.
     #[prost(uint32, tag = "1")]
     pub schema_version: u32,
-    /// UUIDv5 of the lowercase hexadecimal fingerprint.
+    /// `UUIDv5` of the lowercase hexadecimal fingerprint.
     #[prost(string, tag = "2")]
     pub detection_id: ::prost::alloc::string::String,
     /// Exactly 32 bytes.
@@ -332,13 +332,13 @@ pub fn reset_fingerprint(
     out
 }
 
-/// The UUIDv5 `detection_id` of a fingerprint.
+/// The `UUIDv5` `detection_id` of a fingerprint.
 ///
 /// The name is the **64-character lowercase hexadecimal** rendering of the
 /// digest, not its raw bytes. Hashing the raw bytes produces a different, wrong
 /// UUID that no fixture would match.
 ///
-/// UUIDv5 is SHA-1 over the namespace bytes followed by the name, with the
+/// `UUIDv5` is SHA-1 over the namespace bytes followed by the name, with the
 /// version and variant bits overwritten. The `uuid` crate is built in this
 /// workspace without its `v5` feature, so the construction is explicit here;
 /// `ring`'s SHA-1 is named `SHA1_FOR_LEGACY_USE_ONLY` because SHA-1 is broken
@@ -624,10 +624,10 @@ mod tests {
             (1, VARINT, |m| m.schema_version = 1),
             (2, LENGTH_DELIMITED, |m| m.detection_id = "d".into()),
             (3, LENGTH_DELIMITED, |m| {
-                m.reset_fingerprint = ::bytes::Bytes::from_static(&[1])
+                m.reset_fingerprint = ::bytes::Bytes::from_static(&[1]);
             }),
             (4, LENGTH_DELIMITED, |m| {
-                m.broker_reset_identity = "b".into()
+                m.broker_reset_identity = "b".into();
             }),
             (5, LENGTH_DELIMITED, |m| m.cell_id = "c".into()),
             (6, VARINT, |m| m.placement_revision = 1),
@@ -636,7 +636,7 @@ mod tests {
             (9, LENGTH_DELIMITED, |m| m.new_stream_identity = "n".into()),
             (10, VARINT, |m| m.new_stream_epoch = 1),
             (11, VARINT, |m| {
-                m.reason_code = ResetReasonV1::StreamEpochAdvanced as i32
+                m.reason_code = ResetReasonV1::StreamEpochAdvanced as i32;
             }),
             (12, VARINT, |m| m.detected_at_unix_ms = 1),
         ];
@@ -659,7 +659,7 @@ mod tests {
             (2, LENGTH_DELIMITED, |m| m.cell_id = "c".into()),
             (3, LENGTH_DELIMITED, |m| m.detection_id = "d".into()),
             (4, LENGTH_DELIMITED, |m| {
-                m.reset_fingerprint = ::bytes::Bytes::from_static(&[1])
+                m.reset_fingerprint = ::bytes::Bytes::from_static(&[1]);
             }),
             (5, VARINT, |m| m.reset_generation = 1),
             (6, LENGTH_DELIMITED, |m| m.evidence_id = "e".into()),

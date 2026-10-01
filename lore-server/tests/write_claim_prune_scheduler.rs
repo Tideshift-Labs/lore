@@ -76,13 +76,13 @@ async fn seed_lifecycle_head(client: &Client, hash: &[u8]) {
 /// values: nothing here reads a real fragment, and none of
 /// `lore_fragment_write_claims`'s columns are foreign keys.
 ///
-/// `state` must be `2` (Decisive) or `4` (NoSend). A Decisive claim is
+/// `state` must be `2` (Decisive) or `4` (`NoSend`). A Decisive claim is
 /// eligible for deletion only when a matching `lore_fragment_epochs` row
 /// exists (`prune_terminal_write_claims`'s plan query `EXISTS` gate) --
 /// this fixture never seeds one, so a Decisive claim here is deliberately
 /// stuck exactly the way an un-copied-evidence row would be in production
 /// (see `fragment_prune.rs`'s own module doc on why the report alone cannot
-/// answer "did the pass make progress"). A NoSend claim needs no such
+/// answer "did the pass make progress"). A `NoSend` claim needs no such
 /// evidence and, given a lifecycle head row for its hash, is prunable.
 async fn seed_terminal_claim(client: &Client, hash: &[u8], seed: u8, state: i16) {
     let logical_request_id = vec![seed; 16];

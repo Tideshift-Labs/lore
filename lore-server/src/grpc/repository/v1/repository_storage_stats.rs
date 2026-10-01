@@ -18,7 +18,7 @@ use crate::grpc::handlers::repository_query::check_repository_query_authorizatio
 ///
 /// Read-only aggregate of what the repository's fragments occupy in the store,
 /// answered straight from the store's own fragment-metadata index. An unknown
-/// repository has no associations and so reports zeroes rather than NOT_FOUND.
+/// repository has no associations and so reports zeroes rather than `NOT_FOUND`.
 ///
 /// Backend-dependent: a store with no repository-keyed access path over its
 /// fragment index reports `NotSupported`, which surfaces as UNIMPLEMENTED. That
@@ -182,6 +182,10 @@ mod tests {
         result: Result<lore_storage::StoreRepositoryStats, lore_storage::StoreError>,
     }
 
+    // Reason: every method but `repository_stats` is deliberately unreachable from these tests
+    // (see the doc comment above) and panics loudly via `unimplemented!()` if the handler ever
+    // calls one by accident - that is this stub's whole reason to exist, not a missing feature.
+    #[allow(clippy::unimplemented)]
     #[async_trait]
     impl ImmutableStore for StatsStubStore {
         async fn query(

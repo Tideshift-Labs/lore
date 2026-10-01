@@ -198,9 +198,9 @@ fn fenced_lock_to_wire(lock: FencedLock) -> Result<lore_proto::lock::Lock, Statu
     let elapsed = lock
         .acquired_at
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map_err(|_| Status::internal("Stored lock timestamp predates the Unix epoch"))?;
+        .map_err(|_err| Status::internal("Stored lock timestamp predates the Unix epoch"))?;
     let seconds = i64::try_from(elapsed.as_secs())
-        .map_err(|_| Status::internal("Stored lock timestamp exceeds the wire range"))?;
+        .map_err(|_err| Status::internal("Stored lock timestamp exceeds the wire range"))?;
     Ok(lore_proto::lock::Lock {
         resource: Some(lore_proto::lock::Resource {
             branch: lock.branch_id.into(),
@@ -212,8 +212,9 @@ fn fenced_lock_to_wire(lock: FencedLock) -> Result<lore_proto::lock::Lock, Statu
         ownership_token: Default::default(),
         locked_at: Some(prost_types::Timestamp {
             seconds,
-            nanos: i32::try_from(elapsed.subsec_nanos())
-                .map_err(|_| Status::internal("Stored lock nanoseconds exceed the wire range"))?,
+            nanos: i32::try_from(elapsed.subsec_nanos()).map_err(|_err| {
+                Status::internal("Stored lock nanoseconds exceed the wire range")
+            })?,
         }),
     })
 }
@@ -249,7 +250,7 @@ pub(crate) fn fenced_lock_to_wire_with_token(
 fn fenced_branch_id(value: &[u8]) -> Result<[u8; 16], Status> {
     value
         .try_into()
-        .map_err(|_| Status::invalid_argument("lock resource branch must be exactly 16 bytes"))
+        .map_err(|_err| Status::invalid_argument("lock resource branch must be exactly 16 bytes"))
 }
 
 /// One wire lock batch, normalised for the fenced coordinator.
@@ -305,7 +306,7 @@ fn fenced_batch(
                 ));
             }
             [] => None,
-            bytes => Some(<[u8; 32]>::try_from(bytes).map_err(|_| {
+            bytes => Some(<[u8; 32]>::try_from(bytes).map_err(|_err| {
                 Status::invalid_argument("lock ownership token must be exactly 32 bytes")
             })?),
         };

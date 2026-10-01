@@ -10,9 +10,9 @@
 //!
 //! # Scope
 //!
-//! Only LIVE_HINT and DURABLE_INVALIDATION envelope encoding through the real
+//! Only `LIVE_HINT` and `DURABLE_INVALIDATION` envelope encoding through the real
 //! `envelope::HintEnvelopeV1::encode`/`envelope::DurableEnvelopeV1::encode`, and the accepted
-//! Publish-result wire shape. SHADOW_OBSERVATION is out of WP-111 Phase 1-2 scope. Most of the
+//! Publish-result wire shape. `SHADOW_OBSERVATION` is out of WP-111 Phase 1-2 scope. Most of the
 //! fixture's `invalid` vectors are already covered by `envelope.rs`'s own unit tests
 //! (`EnvelopeViolation` cases for cell id, zero repository, event-id/idempotency-key width,
 //! class/body mismatch, transport version, width bounds); this file does not duplicate those.

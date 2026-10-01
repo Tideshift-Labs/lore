@@ -59,8 +59,7 @@ pub async fn initialize(
             settings
                 .lock_store
                 .as_ref()
-                .map(|store| store.mode.as_str())
-                .unwrap_or(""),
+                .map_or("", |store| store.mode.as_str()),
         ),
     ] {
         anyhow::ensure!(

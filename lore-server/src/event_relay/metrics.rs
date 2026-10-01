@@ -380,7 +380,7 @@ pub(crate) fn record_receiver_lag_rows(rows: u64) {
 mod tests {
     use super::*;
 
-    /// An OTel counter's recorded value cannot be read back here: the meter
+    /// An `OTel` counter's recorded value cannot be read back here: the meter
     /// lives behind a process-global provider cached in a `OnceLock`, so a test
     /// can prove the classification but never the emitted number. What it CAN
     /// prove is that no label is built by interpolation, which is the property

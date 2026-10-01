@@ -255,7 +255,7 @@ impl EventFields {
 
 /// Computes the `X-Lorehub-Signature` header value
 /// `sha256=<hex( HMAC_SHA256(secret, timestamp + "." + raw_body) )>` over the exact
-/// bytes that will be POSTed. The timestamp is bound into the MAC to limit replay.
+/// bytes that will be `POSTed`. The timestamp is bound into the MAC to limit replay.
 fn sign_event(secret: &str, timestamp: i64, raw_body: &[u8]) -> String {
     let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
     let mut signing_input = Vec::with_capacity(raw_body.len() + 16);
@@ -477,7 +477,7 @@ impl HookFactory for LorehubNotifyHookFactory {
                 let secs = v.as_integer().ok_or_else(|| {
                     HookError::config_error(HOOK_NAME, "'timeout' must be an integer (seconds)")
                 })?;
-                let secs = u64::try_from(secs).map_err(|_| {
+                let secs = u64::try_from(secs).map_err(|_err| {
                     HookError::config_error(HOOK_NAME, "'timeout' must be a positive integer")
                 })?;
                 if secs == 0 {
@@ -541,7 +541,7 @@ mod tests {
 
     use super::*;
 
-    /// A fixed time so payload + event_id are deterministic in tests.
+    /// A fixed time so payload + `event_id` are deterministic in tests.
     fn fixed_time() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 6, 24, 12, 34, 56).unwrap()
     }
@@ -1177,7 +1177,7 @@ mod tests {
     /// `"transport_error"` purely on `reqwest::Error::is_timeout()` — confirm
     /// that predicate actually distinguishes a client-side timeout from a
     /// connection refusal on this reqwest version, since that classification
-    /// itself is only observable through the OTel counter label (untestable
+    /// itself is only observable through the `OTel` counter label (untestable
     /// here, see the gotcha note below), not through `post_handler`'s return
     /// value.
     #[tokio::test]

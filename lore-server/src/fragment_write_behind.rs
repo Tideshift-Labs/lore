@@ -360,26 +360,23 @@ fn record_pass_outcome(
 /// Pure and synchronous, so the rule is testable without a store, a runtime or a
 /// Postgres fixture — the same reason `record_pass_outcome` is.
 fn record_observation(state: &mut State, observation: Option<WriteBehindObservation>, at: Instant) {
-    match observation {
-        Some(value) => {
-            if value.capacity_available {
-                state.capacity_unavailable_since = None;
-            } else {
-                state.capacity_unavailable_since.get_or_insert(at);
-            }
-            if state
-                .observation
-                .as_ref()
-                .is_some_and(|(_, previous)| value.cleanup_backlog < previous.cleanup_backlog)
-            {
-                state.cleanup_progress = state.cleanup_progress.max(Some(at));
-            }
-            state.observation = Some((at, value));
-        }
-        None => {
+    if let Some(value) = observation {
+        if value.capacity_available {
             state.capacity_unavailable_since = None;
-            state.observation = None;
+        } else {
+            state.capacity_unavailable_since.get_or_insert(at);
         }
+        if state
+            .observation
+            .as_ref()
+            .is_some_and(|(_, previous)| value.cleanup_backlog < previous.cleanup_backlog)
+        {
+            state.cleanup_progress = state.cleanup_progress.max(Some(at));
+        }
+        state.observation = Some((at, value));
+    } else {
+        state.capacity_unavailable_since = None;
+        state.observation = None;
     }
 }
 

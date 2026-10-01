@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! CLI-only supported budget publication, derived from clean_init_dispatch.
+//! CLI-only supported budget publication, derived from `clean_init_dispatch`.
 //! The tiny real CLI commit uploads more than seven fragments; this fixture
 //! publishes a bounded 64-unit envelope through the maintenance API.
 //! Existing initializer and RPC fixtures retain their original seven-unit cap.

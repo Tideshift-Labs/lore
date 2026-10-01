@@ -32,7 +32,7 @@ use uuid::Uuid;
 const NAMESPACE_PREFIX: &str = "wp119b";
 
 /// Bytes of the caller's label kept in the schema name. The rest of the budget goes to the
-/// uniqueness suffix; PostgreSQL truncates an identifier at 63 bytes, and silently, which would
+/// uniqueness suffix; `PostgreSQL` truncates an identifier at 63 bytes, and silently, which would
 /// defeat the whole point.
 const MAX_LABEL_BYTES: usize = 12;
 
@@ -80,7 +80,7 @@ impl CaseNamespace {
         &self.pg_url
     }
 
-    /// This namespace's PostgreSQL schema name.
+    /// This namespace's `PostgreSQL` schema name.
     pub fn schema_name(&self) -> &str {
         &self.schema
     }
@@ -110,7 +110,7 @@ impl Drop for CaseNamespace {
     }
 }
 
-/// Mint a schema name that is unique, ordered by creation time, and a valid unquoted PostgreSQL
+/// Mint a schema name that is unique, ordered by creation time, and a valid unquoted `PostgreSQL`
 /// identifier.
 fn mint_schema_name(case_label: &str) -> String {
     let label: String = case_label

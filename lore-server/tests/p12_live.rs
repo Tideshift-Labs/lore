@@ -367,7 +367,7 @@ async fn mutable_rows(
 /// projection rows simply leaves the pre-existing legacy rows untouched.
 /// Deleting first means the "after" snapshot exists only if the governed path
 /// actually recreated it. If `projection()` disagrees with the legacy writer
-/// on any partition, key_type, key, or value -- most notably the
+/// on any partition, `key_type`, key, or value -- most notably the
 /// branch-latest row, which the legacy `compare_and_swap` writer leaves as an
 /// explicit zero-valued row rather than deleting, unlike the other four
 /// `store`-backed rows -- the second snapshot diverges from the first (or is
@@ -606,7 +606,7 @@ async fn governed_create_projection_rows_match_the_legacy_writers_exactly() {
 ///
 /// This test calls the public coordinator with real preflight observations.
 /// It proves projection agreement between governed and legacy deletes; the
-/// handler and metadata-preflight behavior is covered in domain/p12_tests.rs.).
+/// handler and metadata-preflight behavior is covered in `domain/p12_tests.rs`.).
 ///
 /// # Non-vacuity
 ///

@@ -291,7 +291,7 @@ pub fn declares_outcome_unknown(headers: &HeaderMap) -> Result<bool, Status> {
     if values.next().is_some() || value.as_bytes().len() > 1024 {
         return Err(unsupported_client());
     }
-    let value = value.to_str().map_err(|_| unsupported_client())?;
+    let value = value.to_str().map_err(|_err| unsupported_client())?;
     let mut previous: Option<&str> = None;
     let mut declared = false;
     for (index, token) in value.split(',').enumerate() {

@@ -415,7 +415,7 @@ pub fn validate_wire_envelope(envelope: &wire::PrivateEnvelopeV1) -> Result<(), 
     }
 
     let class = wire::DeliveryClassV1::try_from(envelope.delivery_class)
-        .map_err(|_| EnvelopeViolation::ClassBodyMismatch)?;
+        .map_err(|_err| EnvelopeViolation::ClassBodyMismatch)?;
     match (class, envelope.body.as_ref()) {
         (
             wire::DeliveryClassV1::LiveHint | wire::DeliveryClassV1::ShadowObservation,

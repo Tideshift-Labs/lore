@@ -23,7 +23,7 @@
 //!
 //! Under enforcement a governed mutation whose required headers are absent,
 //! duplicated with divergent values, wrong-length, of an unknown fingerprint
-//! version, or not an RFC 9562 UUIDv7 is rejected **before** any authorization
+//! version, or not an RFC 9562 `UUIDv7` is rejected **before** any authorization
 //! side effect, with `INVALID_ARGUMENT`. Nothing is truncated or coerced into a
 //! usable value.
 //!
@@ -49,7 +49,7 @@ use tonic::Status;
 use tonic::metadata::MetadataMap;
 use uuid::Uuid;
 
-/// Caller-chosen RFC 9562 UUIDv7 identifying one governed operation.
+/// Caller-chosen RFC 9562 `UUIDv7` identifying one governed operation.
 pub const OPERATION_ID_KEY: &str = "lore-domain-operation-id-bin";
 /// One version byte followed by exactly that version's fingerprint bytes.
 pub const FINGERPRINT_KEY: &str = "lore-domain-operation-fingerprint-bin";
@@ -188,7 +188,7 @@ const URC_PREFIX: &[u8] = b"urc-";
 /// separate server-only witness evidence and is never a receipt-key input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DomainOperationMetadata {
-    /// RFC 9562 UUIDv7, exactly 16 bytes on the wire.
+    /// RFC 9562 `UUIDv7`, exactly 16 bytes on the wire.
     pub operation_id: Uuid,
     /// Fingerprint schema version, from the leading header byte.
     pub fingerprint_version: i32,
@@ -314,7 +314,7 @@ pub enum DomainOperationMetadataError {
         max: u64,
     },
 
-    /// The operation ID is 16 bytes but is not an RFC 9562 UUIDv7.
+    /// The operation ID is 16 bytes but is not an RFC 9562 `UUIDv7`.
     #[error("domain-operation ID is not an RFC 9562 UUIDv7 (version {version})")]
     NotUuidV7 {
         /// UUID version nibble found.
@@ -502,14 +502,14 @@ pub const MISSING_AUTHN_BEARER_MESSAGE: &str = "Governed mutations require the h
      authenticating with a delegated credential that holds no human authentication token.";
 
 /// Check RFC 9562 version and variant bits. A 16-byte value that is not a
-/// UUIDv7 is rejected rather than accepted as an opaque identifier, because the
+/// `UUIDv7` is rejected rather than accepted as an opaque identifier, because the
 /// receipt state machine classifies REPLAY versus fresh by `uuid_v7_timestamp`,
 /// which is meaningless for any other version.
 fn parse_uuid_v7(bytes: &[u8]) -> Result<Uuid, DomainOperationMetadataError> {
     let array: [u8; OPERATION_ID_LEN] =
         bytes
             .try_into()
-            .map_err(|_| DomainOperationMetadataError::WrongLength {
+            .map_err(|_err| DomainOperationMetadataError::WrongLength {
                 header: OPERATION_ID_KEY,
                 expected: OPERATION_ID_LEN,
                 actual: bytes.len(),
@@ -660,7 +660,7 @@ fn parse_claim_witness(bytes: &[u8]) -> Result<ClaimWitness, DomainOperationMeta
     let value: &[u8; CLAIM_WITNESS_V1_LEN] =
         bytes
             .try_into()
-            .map_err(|_| DomainOperationMetadataError::WrongLength {
+            .map_err(|_err| DomainOperationMetadataError::WrongLength {
                 header: CLAIM_WITNESS_KEY,
                 expected: CLAIM_WITNESS_V1_LEN,
                 actual: bytes.len(),
@@ -731,7 +731,7 @@ fn parse_mediated_scope(bytes: &[u8]) -> Result<MediatedScope, DomainOperationMe
     let mut initiating_principal_namespace = [0u8; MEDIATED_PRINCIPAL_NAMESPACE_V1_LEN];
     initiating_principal_namespace.copy_from_slice(&bytes[17..]);
     scope_key_mediated_namespace(&org_uuid, &initiating_principal_namespace)
-        .map_err(|_| DomainOperationMetadataError::InvalidMediatedPrincipalNamespace)?;
+        .map_err(|_err| DomainOperationMetadataError::InvalidMediatedPrincipalNamespace)?;
     Ok(MediatedScope {
         org_uuid,
         initiating_principal_namespace,
@@ -845,10 +845,10 @@ pub fn scope_key_mediated_namespace(
     let principal_id = principal_namespace
         .strip_prefix(SCOPE_PRINCIPAL_NAMESPACE_V1)
         .ok_or(ScopeKeyError::InvalidPrincipalNamespace)?;
-    let principal_id =
-        std::str::from_utf8(principal_id).map_err(|_| ScopeKeyError::InvalidPrincipalNamespace)?;
+    let principal_id = std::str::from_utf8(principal_id)
+        .map_err(|_err| ScopeKeyError::InvalidPrincipalNamespace)?;
     let parsed =
-        Uuid::parse_str(principal_id).map_err(|_| ScopeKeyError::InvalidPrincipalNamespace)?;
+        Uuid::parse_str(principal_id).map_err(|_err| ScopeKeyError::InvalidPrincipalNamespace)?;
     if parsed.to_string() != principal_id {
         return Err(ScopeKeyError::InvalidPrincipalNamespace);
     }
@@ -903,7 +903,7 @@ fn push_component(
     }
     // Infallible given the bound above, but written as a conversion rather than
     // a cast so a change to the bound cannot silently truncate.
-    let len = u32::try_from(bytes.len()).map_err(|_| ScopeKeyError::WrongLength {
+    let len = u32::try_from(bytes.len()).map_err(|_err| ScopeKeyError::WrongLength {
         component,
         expected: MAX_SCOPE_COMPONENT_LEN,
         actual: bytes.len(),

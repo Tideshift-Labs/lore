@@ -737,6 +737,10 @@ fn maximum_create_preimage_is_exactly_68635_bytes_and_over_limit_refuses() {
 
 #[test]
 fn intent_surface_excludes_authority_and_server_derived_seams() {
+    // Reason: every arm destructures its own variant field-by-field on purpose (that's the
+    // point of this test - a new field on any variant must be named here or the match stops
+    // compiling), so merging same-bodied arms would defeat the exhaustiveness this pins.
+    #[allow(clippy::match_same_arms)]
     fn exhaustively_destructure(intent: CanonicalIntent<'_>) {
         match intent {
             CanonicalIntent::BranchCreate {

@@ -245,8 +245,7 @@ impl EventRelayReadiness {
         metrics::record_backlog(
             backlog
                 .oldest_pending_age
-                .map(|age| age.as_secs_f64())
-                .unwrap_or(0.0),
+                .map_or(0.0, |age| age.as_secs_f64()),
             backlog.pending_count.max(0) as u64,
             backlog.dead_letter_count.max(0) as u64,
         );

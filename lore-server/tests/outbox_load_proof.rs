@@ -15,7 +15,7 @@
 //! [`outbox_drain_rate.rs`](./outbox_drain_rate.rs), which measured one payload
 //! size through an in-process fake and set `ADMISSION_RETRY_DELAY`; this one
 //! measures three sizes through the **real** private gateway and a **real**
-//! JetStream broker, with one and with two relay workers.
+//! `JetStream` broker, with one and with two relay workers.
 //!
 //! # What this proves, and what it does not
 //!
@@ -93,14 +93,14 @@
 //! ```
 //!
 //! The runner is the only supported entry point: every case needs a gateway,
-//! its mTLS material, and a provisioned JetStream stream, and a case whose
+//! its mTLS material, and a provisioned `JetStream` stream, and a case whose
 //! prerequisites are absent prints `[[NOTRUN]]` and returns rather than
 //! passing vacuously.
 //!
 //! # Measured results
 //!
-//! 2026-09-04, Lore fork at `dea3841`. Windows 11, PostgreSQL 16 in
-//! `lorehub-dataplane-test-postgres-1` on `127.0.0.1:11832`, NATS JetStream on
+//! 2026-09-04, Lore fork at `dea3841`. Windows 11, `PostgreSQL` 16 in
+//! `lorehub-dataplane-test-postgres-1` on `127.0.0.1:11832`, NATS `JetStream` on
 //! `127.0.0.1:4222`, the gateway from `lorehub/apps/notification-gateway`, cell
 //! `sfo3-cell-a`, **debug** build, 2,000 rows per size, all on one machine with
 //! other build lanes active. Command:
@@ -469,13 +469,13 @@ fn ms(d: Duration) -> f64 {
 /// drain-rate seed:
 ///
 /// **`salt`.** The idempotency key reaches the broker as the message's dedupe
-/// identity, and this rig publishes into a **long-lived** JetStream stream
+/// identity, and this rig publishes into a **long-lived** `JetStream` stream
 /// that outlives a run. A second run reusing the first run's keys would be
 /// answered from the broker's dedupe window rather than accepted, and the
 /// measured rate would be of deduplication rather than of publication.
 ///
 /// **An incompressible payload.** `payload` is `bytea`, whose storage is
-/// `extended`, so PostgreSQL compresses before it TOASTs. A payload of one
+/// `extended`, so `PostgreSQL` compresses before it TOASTs. A payload of one
 /// repeated byte -- which the drain-rate instrument used, at a width where it
 /// did not matter -- compresses to almost nothing, and then a 64 KiB row costs
 /// the database about what a 1 KiB row costs. That would flatten the size
@@ -960,8 +960,7 @@ fn print_curve(points: &[CurvePoint]) {
             point.elapsed.as_secs_f64(),
             point
                 .oldest_age
-                .map(|a| format!("{:.2}", a.as_secs_f64()))
-                .unwrap_or_else(|| "-".to_string()),
+                .map_or_else(|| "-".to_string(), |a| format!("{:.2}", a.as_secs_f64())),
             point.pending,
             point.backends
         );
@@ -1252,10 +1251,7 @@ async fn readiness_flips_at_the_thirty_second_oldest_unpublished_threshold() {
         println!(
             "{:<18} {:>12.2} {:>12} {:>34}",
             format!("-{seconds}s"),
-            observed
-                .oldest_pending_age
-                .map(|a| a.as_secs_f64())
-                .unwrap_or(0.0),
+            observed.oldest_pending_age.map_or(0.0, |a| a.as_secs_f64()),
             snapshot.relay_ready,
             snapshot.relay_reason.unwrap_or("-")
         );

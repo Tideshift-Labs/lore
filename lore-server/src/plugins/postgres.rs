@@ -173,7 +173,7 @@ pub struct PostgresStoreConfig {
 
 /// S3-compatible object-storage sub-config for immutable fragment objects.
 /// Keys mirror the endpoint/region/bucket/path-style that `lore-aws` exposes so
-/// the same backend can point at DO Spaces, MinIO, or LocalStack.
+/// the same backend can point at DO Spaces, `MinIO`, or `LocalStack`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObjectStoreConfig {
     /// Bucket holding fragment payloads.
@@ -185,7 +185,7 @@ pub struct ObjectStoreConfig {
     #[serde(default)]
     pub region: Option<String>,
     /// Force path-style addressing (required for S3-compatible stores behind
-    /// non-AWS hostnames like MinIO in Docker).
+    /// non-AWS hostnames like `MinIO` in Docker).
     #[serde(default)]
     pub force_path_style: bool,
     /// Slow-operation log threshold in milliseconds.
@@ -470,7 +470,7 @@ fn default_fragment_in_flight_charges() -> u32 {
 /// Thirty seconds: long enough to queue behind a realistic burst, short enough
 /// to stay well inside the attempt-deadline horizon and to not park a read.
 ///
-/// It was briefly 300_000, which was wrong twice over. The horizon is anchored to
+/// It was briefly `300_000`, which was wrong twice over. The horizon is anchored to
 /// the attempt id's own timestamp, minted BEFORE the queue, and the governed
 /// client refuses a deadline beyond `attempt_ts + 300_000` — so a wait at the
 /// horizon makes the shifted deadline invalid and turns a queue into a hard
@@ -1474,7 +1474,7 @@ pub(crate) async fn connect_immutable_store(
     // pinned-CA pool also checks that this URL says `sslmode=require`; a URL
     // using disable, prefer, or any other mode is refused before a connection.
     let dispatch_ca =
-        std::fs::read_to_string(&fragment_provider.dispatch_ca_cert_path).map_err(|_| {
+        std::fs::read_to_string(&fragment_provider.dispatch_ca_cert_path).map_err(|_err| {
             config_error(
                 plugin_name,
                 "enabled fragment_provider could not read dispatch_ca_cert_path",

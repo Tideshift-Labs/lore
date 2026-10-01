@@ -358,8 +358,8 @@ struct RecordingStore {
     prepare_result: Mutex<PrepareResult>,
     receipt_result: Mutex<ReceiptLookup>,
     attempt_receipt_result: Mutex<AttemptReceipt>,
-    /// If set, `attempt_receipt_result` is only returned to a caller whose (verified_issuer,
-    /// authenticated_subject) matches exactly this pair; every other caller reads `NotFound`.
+    /// If set, `attempt_receipt_result` is only returned to a caller whose (`verified_issuer`,
+    /// `authenticated_subject`) matches exactly this pair; every other caller reads `NotFound`.
     /// `None` (the default) answers every caller identically, which is what every test not
     /// concerned with cross-subject isolation wants.
     attempt_receipt_owner: Mutex<Option<(String, String)>>,

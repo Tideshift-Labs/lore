@@ -253,8 +253,9 @@ pub fn map_domain_error_to_status(error: &lore_postgres::domain::DomainError) ->
 
     let status = match error {
         DomainError::InvalidInput(detail) => Status::invalid_argument(detail.clone()),
-        DomainError::NotReady(detail) => Status::failed_precondition(detail.clone()),
-        DomainError::DomainKeyBypass(detail) => Status::failed_precondition(detail.clone()),
+        DomainError::NotReady(detail) | DomainError::DomainKeyBypass(detail) => {
+            Status::failed_precondition(detail.clone())
+        }
         DomainError::PreconditionRejected { reason, .. } => {
             map_domain_rejection_to_status(reason.as_str())
         }
@@ -592,7 +593,7 @@ pub fn has_required_permission(
 /// Enforce a write-path permission. No-op when auth is OFF (no token in
 /// extensions — keeps the auth-disabled dev/CI stack green) or when `enforce`
 /// is false; otherwise the token must carry `permission` for this repository,
-/// else permission_denied. Lorehub's mint stacks role→scopes, so admin/owner
+/// else `permission_denied`. Lorehub's mint stacks role→scopes, so admin/owner
 /// tokens already carry `write`; loreserver stays policy-dumb.
 pub fn require_permission(
     extensions: &Extensions,

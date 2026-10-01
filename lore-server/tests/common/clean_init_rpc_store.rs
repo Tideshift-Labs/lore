@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Test-only ImmutableStore adapter: revision serialization sends actual authenticated storage RPCs.
+//! Test-only `ImmutableStore` adapter: revision serialization sends actual authenticated storage RPCs.
 use std::sync::Arc;
 
 use bytes::Bytes;

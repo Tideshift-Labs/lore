@@ -421,9 +421,10 @@ async fn wait_for_shutdown(
     // timeout configured (graceful drain, unbounded) the deadline arm never
     // fires and we wait for every endpoint to finish on its own.
     let deadline = connection_close_timeout.map(|t| tokio::time::Instant::now() + t);
-    match connection_close_timeout {
-        Some(timeout) => info!("Draining remaining endpoints (timeout: {timeout:?})"),
-        None => info!("Draining remaining endpoints (no timeout: waiting for graceful drain)"),
+    if let Some(timeout) = connection_close_timeout {
+        info!("Draining remaining endpoints (timeout: {timeout:?})")
+    } else {
+        info!("Draining remaining endpoints (no timeout: waiting for graceful drain)")
     }
 
     loop {
@@ -3441,7 +3442,7 @@ mod tests {
         use super::super::wait_for_shutdown;
 
         /// CR-009 default-off regression: `Some(timeout)` — today's behavior
-        /// (`connection_close_timeout_seconds`, unaffected by graceful_drain)
+        /// (`connection_close_timeout_seconds`, unaffected by `graceful_drain`)
         /// — must still force-abort a stuck endpoint once the timeout elapses,
         /// not before and not never.
         #[tokio::test(start_paused = true)]

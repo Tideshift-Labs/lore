@@ -440,6 +440,11 @@ impl ServiceClient for ReplicationStoreClient {
         _failed_request: Self::RequestType,
         error: SendWithReconnectError,
     ) -> Self::ErrorType {
+        // Reason: `SessionRebindRequired` resolves to the same `ConnectionFailed` as
+        // `Disconnected`/`ReconnectFailed`, but for its own reason (below) worth keeping as a
+        // separately commented arm rather than merging into one pattern clippy can't attach a
+        // single rationale to.
+        #[allow(clippy::match_same_arms)]
         match error {
             SendWithReconnectError::PermitAcquire => {
                 ReplicationStoreClientError::ClientSideThrottling

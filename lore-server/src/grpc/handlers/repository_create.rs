@@ -424,7 +424,7 @@ async fn repository_create(
 /// transaction opens, in this order:
 ///
 /// 1. the frozen size, repository-name, and branch-name checks;
-/// 2. the ReBAC `CreateResource` callback, when auth is on;
+/// 2. the `ReBAC` `CreateResource` callback, when auth is on;
 /// 3. both metadata blobs, serialized into the immutable store.
 ///
 /// Only then does the coordinator open its transaction, which writes the
@@ -632,7 +632,7 @@ pub(crate) async fn governed_repository_create(
     Ok((committed, outcome.metadata_hash))
 }
 
-/// Fill tags 3-21 of the ReBAC create callback from the attached claim.
+/// Fill tags 3-21 of the `ReBAC` create callback from the attached claim.
 ///
 /// One assignment per field, in tag order, so the reviewer's job is a
 /// side-by-side read against `rebac_api.proto` rather than a hunt through

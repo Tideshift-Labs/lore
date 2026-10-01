@@ -197,14 +197,14 @@ pub fn map_event(
         .repository_id
         .as_slice()
         .try_into()
-        .map_err(|_| MapFailure::RepositoryIdWidth(record.repository_id.len()))?;
+        .map_err(|_err| MapFailure::RepositoryIdWidth(record.repository_id.len()))?;
     let repository = RepositoryId::from(repository_bytes);
     if repository.is_zero() {
         return Err(MapFailure::ZeroRepository);
     }
 
     let repository_generation = u64::try_from(record.repository_generation)
-        .map_err(|_| MapFailure::NegativeRepositoryGeneration(record.repository_generation))?;
+        .map_err(|_err| MapFailure::NegativeRepositoryGeneration(record.repository_generation))?;
     if repository_generation == 0 {
         return Err(MapFailure::ZeroRepositoryGeneration);
     }
@@ -247,7 +247,7 @@ pub fn map_event(
     };
 
     let payload_version = u32::try_from(record.payload_schema_version)
-        .map_err(|_| MapFailure::NegativePayloadSchemaVersion(record.payload_schema_version))?;
+        .map_err(|_err| MapFailure::NegativePayloadSchemaVersion(record.payload_schema_version))?;
     if record.payload.len() > PAYLOAD_MAX_BYTES {
         return Err(MapFailure::PayloadOverCap(record.payload.len()));
     }

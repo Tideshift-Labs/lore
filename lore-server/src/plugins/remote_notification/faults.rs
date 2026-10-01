@@ -12,7 +12,7 @@
 //!
 //! The consequence was recorded in the two-process harness itself: a genuine
 //! broker-sequence gap needs the broker to skip one delivery to this consumer
-//! while delivering a later one, which a single JetStream durable consumer does
+//! while delivering a later one, which a single `JetStream` durable consumer does
 //! not do under ordinary operation. WP-119 Phase 10's gap/refetch row stayed
 //! OPEN for exactly that reason, and its stand-in case wrote the checkpoint
 //! projection directly rather than making a live receiver observe a real gap.

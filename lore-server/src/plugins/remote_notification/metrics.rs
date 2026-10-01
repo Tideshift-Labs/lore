@@ -200,7 +200,7 @@ pub(crate) fn record_receiver_checkpoint(outcome: &'static str) {
 mod tests {
     use super::*;
 
-    /// An OTel counter's recorded value cannot be read back here: the meter
+    /// An `OTel` counter's recorded value cannot be read back here: the meter
     /// lives behind a process-global `SdkMeterProvider` cached in a `OnceLock`,
     /// so a test can only prove the classification, never the emitted number.
     /// What it CAN prove is that no label is built by interpolation, which is

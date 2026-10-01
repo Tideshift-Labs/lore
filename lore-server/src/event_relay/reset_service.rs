@@ -18,7 +18,7 @@
 //!    this record replays an ack to must outlive a rotation;
 //! 2. **authorization** — that principal must map to the request's own cell;
 //! 3. **derivation** — the fingerprint must recompute from the supplied
-//!    correctness fields and the detection ID must be its UUIDv5. Validated
+//!    correctness fields and the detection ID must be its `UUIDv5`. Validated
 //!    exactly once, here, before any durable lookup: a derivation failure is
 //!    `MALFORMED_REPORT_V1`, never a successor or mismatch failure;
 //! 4. **stored-record comparison** — an exact retry from the same emitter and
@@ -362,11 +362,11 @@ fn validate_and_convert(request: &StreamResetReportV1) -> Result<ResetReport, to
     // is refused explicitly rather than wrapping into a negative epoch that
     // every `>= 1` CHECK would then reject with an unrelated message.
     let old_stream_epoch = i64::try_from(request.old_stream_epoch)
-        .map_err(|_| malformed("old_stream_epoch exceeds the storable range"))?;
+        .map_err(|_err| malformed("old_stream_epoch exceeds the storable range"))?;
     let new_stream_epoch = i64::try_from(request.new_stream_epoch)
-        .map_err(|_| malformed("new_stream_epoch exceeds the storable range"))?;
+        .map_err(|_err| malformed("new_stream_epoch exceeds the storable range"))?;
     let placement_revision = i64::try_from(request.placement_revision)
-        .map_err(|_| malformed("placement_revision exceeds the storable range"))?;
+        .map_err(|_err| malformed("placement_revision exceeds the storable range"))?;
 
     let report = ResetReport {
         detection_id: request.detection_id.clone(),
@@ -708,7 +708,7 @@ mod tests {
         assert!(detail_of(&status).contains("exactly 32 bytes"));
     }
 
-    /// A detection ID that is not the UUIDv5 of the fingerprint is likewise
+    /// A detection ID that is not the `UUIDv5` of the fingerprint is likewise
     /// malformed, even when the fingerprint itself is perfect.
     #[test]
     fn a_detection_id_that_is_not_the_uuid_of_the_fingerprint_is_malformed() {

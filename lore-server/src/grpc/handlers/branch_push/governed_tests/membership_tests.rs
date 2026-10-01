@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Real handler publication against PostgreSQL membership authority. Payload I/O
+//! Real handler publication against `PostgreSQL` membership authority. Payload I/O
 //! uses the real local store; these cases do not claim provider transport proof.
 
 use std::time::Duration;

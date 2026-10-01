@@ -46,6 +46,10 @@ impl Display for ReplicationServiceErrorCode {
 }
 
 impl From<&StoreError> for ReplicationServiceErrorCode {
+    // Reason: `OutcomeUnknown` resolves to the same `Internal` as the merged arm above it, but
+    // for its own reason (below) worth keeping as a separately commented arm rather than merging
+    // into one pattern clippy can't attach a single rationale to.
+    #[allow(clippy::match_same_arms)]
     fn from(err: &StoreError) -> Self {
         match err {
             StoreError::AddressNotFound(_) => ReplicationServiceErrorCode::AddressNotFound,

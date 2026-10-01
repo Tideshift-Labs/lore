@@ -223,7 +223,7 @@ fn exact_echo(
         }
     }
     let authorization_revision = i64::try_from(response.authorization_revision)
-        .map_err(|_| Status::permission_denied("Authorization revision exceeds i64"))?;
+        .map_err(|_err| Status::permission_denied("Authorization revision exceeds i64"))?;
     Ok(AuthorizationWitness {
         authorization_id: response.authorization_id.to_vec(),
         authorization_revision,
@@ -237,14 +237,14 @@ fn exact_echo(
 fn unix_millis(time: SystemTime) -> Result<i64, Status> {
     let duration = time
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| Status::internal("Postgres clock precedes Unix epoch"))?;
+        .map_err(|_err| Status::internal("Postgres clock precedes Unix epoch"))?;
     i64::try_from(duration.as_millis())
-        .map_err(|_| Status::internal("Postgres clock milliseconds exceed i64"))
+        .map_err(|_err| Status::internal("Postgres clock milliseconds exceed i64"))
 }
 
 fn system_time_from_millis(value: i64, field: &'static str) -> Result<SystemTime, Status> {
     let value = u64::try_from(value)
-        .map_err(|_| Status::invalid_argument(format!("{field} must be nonnegative")))?;
+        .map_err(|_err| Status::invalid_argument(format!("{field} must be nonnegative")))?;
     SystemTime::UNIX_EPOCH
         .checked_add(std::time::Duration::from_millis(value))
         .ok_or_else(|| Status::invalid_argument(format!("{field} overflows SystemTime")))
@@ -346,11 +346,11 @@ fn positive_i64(value: u64) -> Result<Option<i64>, Status> {
     }
     i64::try_from(value)
         .map(Some)
-        .map_err(|_| Status::invalid_argument("revision exceeds i64"))
+        .map_err(|_err| Status::invalid_argument("revision exceeds i64"))
 }
 
 fn to_u64(value: i64, field: &'static str) -> Result<u64, Status> {
-    u64::try_from(value).map_err(|_| Status::internal(format!("stored {field} is negative")))
+    u64::try_from(value).map_err(|_err| Status::internal(format!("stored {field} is negative")))
 }
 
 fn proof_namespace_key(
@@ -461,15 +461,13 @@ fn outcome_fields(
         DomainOutcome::NotApplied {
             reason_version,
             reason,
-        } => {
-            Ok((
-                DomainOperationOutcome::NotApplied,
-                Some(u32::try_from(reason_version).map_err(|_| {
-                    Status::internal("Stored NOT_APPLIED reason version is invalid")
-                })?),
-                reason,
-            ))
-        }
+        } => Ok((
+            DomainOperationOutcome::NotApplied,
+            Some(u32::try_from(reason_version).map_err(|_err| {
+                Status::internal("Stored NOT_APPLIED reason version is invalid")
+            })?),
+            reason,
+        )),
     }
 }
 
@@ -923,7 +921,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             verified,
         )?;
         let operation_id = uuid::Uuid::from_slice(&request.operation_id)
-            .map_err(|_| Status::invalid_argument("operation_id is not a UUID"))?;
+            .map_err(|_err| Status::invalid_argument("operation_id is not a UUID"))?;
         let key = receipt_key(
             &token,
             &ValidatedBinding {
@@ -933,7 +931,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 method: request.method.clone(),
                 scope: request.scope.to_vec(),
                 fingerprint_version: i32::try_from(request.fingerprint_version)
-                    .map_err(|_| Status::invalid_argument("fingerprint_version exceeds i32"))?,
+                    .map_err(|_err| Status::invalid_argument("fingerprint_version exceeds i32"))?,
                 fingerprint: request.fingerprint.to_vec(),
                 canonical_intent_digest: request.canonical_intent_digest.to_vec(),
                 authorization_id: request.authorization_id.to_vec(),
@@ -946,14 +944,15 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 method: request.method,
                 scope: request.scope.to_vec(),
                 fingerprint_version: i32::try_from(request.fingerprint_version)
-                    .map_err(|_| Status::invalid_argument("fingerprint_version exceeds i32"))?,
+                    .map_err(|_err| Status::invalid_argument("fingerprint_version exceeds i32"))?,
                 fingerprint: request.fingerprint.to_vec(),
                 canonical_intent_digest: request.canonical_intent_digest.to_vec(),
             },
             witness: AuthorizationWitness {
                 authorization_id: request.authorization_id.to_vec(),
-                authorization_revision: i64::try_from(request.authorization_revision)
-                    .map_err(|_| Status::invalid_argument("authorization revision exceeds i64"))?,
+                authorization_revision: i64::try_from(request.authorization_revision).map_err(
+                    |_err| Status::invalid_argument("authorization revision exceeds i64"),
+                )?,
                 verification_nonce: request.verification_nonce.to_vec(),
                 bound_fields_digest: request.bound_fields_digest.to_vec(),
                 consumed_ticket_sha256: request.consumed_ticket_sha256.to_vec(),
@@ -962,7 +961,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             expected_claim_identity_digest: request.expected_claim_identity_digest.to_vec(),
             stale_finalize_permit: request.stale_finalize_permit.to_vec(),
             stale_finalize_permit_revision: i64::try_from(request.stale_finalize_permit_revision)
-                .map_err(|_| {
+                .map_err(|_err| {
                 Status::invalid_argument("permit revision exceeds i64")
             })?,
             permit_verification_digest: verification_digest,
@@ -998,7 +997,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 stale_finalize_permit_revision: u64::try_from(
                     result.stale_finalize_permit_revision,
                 )
-                .map_err(|_| Status::internal("stored permit revision is negative"))?,
+                .map_err(|_err| Status::internal("stored permit revision is negative"))?,
                 committed_receipt_canonical: Bytes::from(result.committed_receipt_canonical),
                 committed_receipt_sha256: receipt_sha256,
                 stale_finalize_clock_unix_millis: result
@@ -1038,7 +1037,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                     claim_id: request.claim_id.clone(),
                     claim_revision: request.claim_revision,
                     terminal_outcome: u32::try_from(request.terminal_outcome)
-                        .map_err(|_| Status::invalid_argument("terminal outcome is negative"))?,
+                        .map_err(|_err| Status::invalid_argument("terminal outcome is negative"))?,
                     terminal_receipt_sha256: request.terminal_receipt_sha256.clone(),
                     platform_terminal_status_revision: request.platform_terminal_status_revision,
                     acknowledged_at_unix_millis: request.acknowledged_at_unix_millis,
@@ -1083,16 +1082,16 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             verified,
         )?;
         let operation_id = uuid::Uuid::from_slice(&request.operation_id)
-            .map_err(|_| Status::invalid_argument("operation_id is not a UUID"))?;
+            .map_err(|_err| Status::invalid_argument("operation_id is not a UUID"))?;
         let tenant_scope_key = scope_key_mediated_namespace(
             &request.org_uuid,
             &request.initiating_principal_namespace,
         )
         .map_err(|e| Status::invalid_argument(e.to_string()))?;
         let phase = TerminalStatusAttachPhaseV1::try_from(request.phase)
-            .map_err(|_| Status::invalid_argument("invalid terminal attach phase"))?;
+            .map_err(|_err| Status::invalid_argument("invalid terminal attach phase"))?;
         let action = TerminalStatusAttachPhase2ActionV1::try_from(request.phase2_action)
-            .map_err(|_| Status::invalid_argument("invalid terminal attach action"))?;
+            .map_err(|_err| Status::invalid_argument("invalid terminal attach action"))?;
         let input = lore_postgres::domain::maintenance::TerminalStatusAttachInput {
             key: ReceiptKey {
                 verified_issuer: token.issuer,
@@ -1102,10 +1101,10 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             },
             authorization_id: request.authorization_id.to_vec(),
             authorization_revision: i64::try_from(request.authorization_revision)
-                .map_err(|_| Status::invalid_argument("authorization revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("authorization revision exceeds i64"))?,
             claim_id: request.claim_id.to_vec(),
             claim_revision: i64::try_from(request.claim_revision)
-                .map_err(|_| Status::invalid_argument("claim revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("claim revision exceeds i64"))?,
             // Carried in the wire encoding, never translated here. The
             // coordinator owns the one mapping onto the receipt column, and it
             // also digests and stores this value in the wire encoding, so a
@@ -1113,13 +1112,13 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             // in neither place is the defect this type now prevents.
             terminal_outcome: lore_postgres::domain::receipts::WireTerminalOutcome::from_wire(
                 i16::try_from(request.terminal_outcome)
-                    .map_err(|_| Status::invalid_argument("terminal outcome exceeds i16"))?,
+                    .map_err(|_err| Status::invalid_argument("terminal outcome exceeds i16"))?,
             ),
             terminal_receipt_sha256: request.terminal_receipt_sha256.to_vec(),
             platform_terminal_status_revision: i64::try_from(
                 request.platform_terminal_status_revision,
             )
-            .map_err(|_| Status::invalid_argument("terminal status revision exceeds i64"))?,
+            .map_err(|_err| Status::invalid_argument("terminal status revision exceeds i64"))?,
             acknowledged_at: system_time_from_millis(
                 request.acknowledged_at_unix_millis,
                 "acknowledged_at_unix_millis",
@@ -1131,7 +1130,9 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 TerminalStatusAttachPhaseV1::Phase2ReleaseAck => {
                     lore_postgres::domain::maintenance::TerminalStatusAttachPhase::Phase2ReleaseAck
                 }
-                _ => return Err(Status::invalid_argument("phase is unspecified")),
+                TerminalStatusAttachPhaseV1::Unspecified => {
+                    return Err(Status::invalid_argument("phase is unspecified"));
+                }
             },
             action: match action {
                 TerminalStatusAttachPhase2ActionV1::Unspecified => {
@@ -1148,7 +1149,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 }
             },
             reserve_charge_revision: i64::try_from(request.reserve_charge_revision)
-                .map_err(|_| Status::invalid_argument("charge revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("charge revision exceeds i64"))?,
             reserve_charge_nonce: request.reserve_charge_nonce.to_vec(),
             release_tombstone_digest: nonempty(request.release_tombstone_digest.as_ref()),
             active_release_intent_revision: positive_i64(request.active_release_intent_revision)?,
@@ -1156,7 +1157,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             tombstone_reservation_revision: i64::try_from(
                 request.tombstone_reservation_revision,
             )
-            .map_err(|_| Status::invalid_argument("tombstone revision exceeds i64"))?,
+            .map_err(|_err| Status::invalid_argument("tombstone revision exceeds i64"))?,
             tombstone_reservation_nonce: request.tombstone_reservation_nonce.to_vec(),
             final_prune_digest: nonempty(request.final_prune_digest.as_ref()),
             tombstone_release_intent_revision: positive_i64(
@@ -1168,10 +1169,10 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             release_proof_reservation_revision: i64::try_from(
                 request.release_proof_reservation_revision,
             )
-            .map_err(|_| Status::invalid_argument("proof reservation revision exceeds i64"))?,
+            .map_err(|_err| Status::invalid_argument("proof reservation revision exceeds i64"))?,
             release_proof_reservation_nonce: request.release_proof_reservation_nonce.to_vec(),
             completion_marker_sequence: i64::try_from(request.completion_marker_sequence)
-                .map_err(|_| Status::invalid_argument("marker sequence exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("marker sequence exceeds i64"))?,
             expected_completion_marker_digest: nonempty(
                 request.expected_completion_marker_digest.as_ref(),
             ),
@@ -1249,15 +1250,16 @@ impl DomainOperationService for LoreDomainOperationV1Service {
         let input = lore_postgres::domain::maintenance::ProofNamespaceMaterializeInput {
             key,
             protocol_revision: i32::try_from(request.protocol_revision)
-                .map_err(|_| Status::invalid_argument("protocol revision exceeds i32"))?,
+                .map_err(|_err| Status::invalid_argument("protocol revision exceeds i32"))?,
             namespace_epoch: request.namespace_epoch.to_vec(),
             namespace_claim_revision: i64::try_from(request.namespace_claim_revision)
-                .map_err(|_| Status::invalid_argument("claim revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("claim revision exceeds i64"))?,
             namespace_claim_nonce: request.namespace_claim_nonce.to_vec(),
-            platform_capacity_revision: i64::try_from(request.platform_capacity_revision)
-                .map_err(|_| Status::invalid_argument("platform capacity revision exceeds i64"))?,
+            platform_capacity_revision: i64::try_from(request.platform_capacity_revision).map_err(
+                |_err| Status::invalid_argument("platform capacity revision exceeds i64"),
+            )?,
             lore_local_capacity_revision: i64::try_from(request.lore_local_capacity_revision)
-                .map_err(|_| Status::invalid_argument("Lore capacity revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("Lore capacity revision exceeds i64"))?,
             request_digest: request.request_digest.to_vec(),
             verification_digest,
         };
@@ -1352,17 +1354,17 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 &request.initiating_principal_namespace,
             )?,
             protocol_revision: i32::try_from(request.protocol_revision)
-                .map_err(|_| Status::invalid_argument("protocol revision exceeds i32"))?,
+                .map_err(|_err| Status::invalid_argument("protocol revision exceeds i32"))?,
             namespace_epoch: request.namespace_epoch.to_vec(),
             quota_revision: i32::try_from(request.quota_revision)
-                .map_err(|_| Status::invalid_argument("quota revision exceeds i32"))?,
+                .map_err(|_err| Status::invalid_argument("quota revision exceeds i32"))?,
             final_range_set_digest: request.final_range_set_digest.to_vec(),
             final_high_water: i64::try_from(request.final_high_water)
-                .map_err(|_| Status::invalid_argument("final high-water exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("final high-water exceeds i64"))?,
             retirement_fence_generation: i64::try_from(request.retirement_fence_generation)
-                .map_err(|_| Status::invalid_argument("fence generation exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("fence generation exceeds i64"))?,
             retirement_permit_revision: i64::try_from(request.retirement_permit_revision)
-                .map_err(|_| Status::invalid_argument("permit revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("permit revision exceeds i64"))?,
             issued_at: system_time_from_millis(
                 request.issued_at_unix_millis,
                 "issued_at_unix_millis",
@@ -1374,7 +1376,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
             zero_platform_state_digest: request.zero_platform_state_digest.to_vec(),
             request_digest: request.request_digest.to_vec(),
             namespace_claim_revision: i64::try_from(request.namespace_claim_revision)
-                .map_err(|_| Status::invalid_argument("claim revision exceeds i64"))?,
+                .map_err(|_err| Status::invalid_argument("claim revision exceeds i64"))?,
             namespace_claim_nonce: request.namespace_claim_nonce.to_vec(),
             verification_digest,
         };
@@ -1408,7 +1410,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 "fence generation",
             )?,
             quota_revision: u64::try_from(ack.quota_revision)
-                .map_err(|_| Status::internal("stored quota revision is negative"))?,
+                .map_err(|_err| Status::internal("stored quota revision is negative"))?,
             final_range_set_digest: Bytes::from(ack.final_range_set_digest),
             final_high_water: to_u64(ack.final_high_water, "final high-water")?,
             retired_at_unix_millis: ack.retired_at.map(unix_millis).transpose()?,

@@ -221,59 +221,56 @@ pub async fn handler(
             // and appends the classified event, all or nothing. The in-band CAS
             // miss is preserved exactly: a loss is still a successful RPC
             // carrying the pointer that was there.
-            let previous = match &governed {
-                Some(governed) => {
-                    let event = match governed.outbox_cell_id() {
-                        Some(cell_id) => Some(
-                            outbox_builders::repository_metadata_changed(
-                                cell_id,
-                                repository_id.data(),
-                                expected_hash.as_ref(),
-                                new_hash.as_ref(),
-                            )
-                            .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
-                        ),
-                        None => None,
-                    };
-                    let projection = ProjectionWrite {
-                        partition: repository_id.data().to_vec(),
-                        key_type: KeyType::RepositoryMetadata as i16,
-                        key: metadata_key.as_ref().to_vec(),
-                        value: Some(new_hash.as_ref().to_vec()),
-                    };
-                    match governed
-                        .commit(
+            let previous = if let Some(governed) = &governed {
+                let event = match governed.outbox_cell_id() {
+                    Some(cell_id) => Some(
+                        outbox_builders::repository_metadata_changed(
+                            cell_id,
                             repository_id.data(),
-                            None,
                             expected_hash.as_ref(),
                             new_hash.as_ref(),
-                            projection,
-                            event,
                         )
-                        .await?
-                    {
-                        MetadataCasOutcome::Applied => expected_hash,
-                        MetadataCasOutcome::Lost(observed) => Hash::from(observed.as_slice()),
-                    }
+                        .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
+                    ),
+                    None => None,
+                };
+                let projection = ProjectionWrite {
+                    partition: repository_id.data().to_vec(),
+                    key_type: KeyType::RepositoryMetadata as i16,
+                    key: metadata_key.as_ref().to_vec(),
+                    value: Some(new_hash.as_ref().to_vec()),
+                };
+                match governed
+                    .commit(
+                        repository_id.data(),
+                        None,
+                        expected_hash.as_ref(),
+                        new_hash.as_ref(),
+                        projection,
+                        event,
+                    )
+                    .await?
+                {
+                    MetadataCasOutcome::Applied => expected_hash,
+                    MetadataCasOutcome::Lost(observed) => Hash::from(observed.as_slice()),
                 }
-                None => {
-                    let write_token = get_write_token();
-                    repository
-                        .write_mutable_store(&write_token)
-                        .compare_and_swap(
-                            repository_id.into(),
-                            metadata_key,
-                            expected_hash,
-                            new_hash,
-                            KeyType::RepositoryMetadata,
-                        )
-                        .await
-                        .map_err(|err| {
-                            warn_error_to_status(&err, |err| {
-                                Status::internal(format!("failed to update metadata: {err}"))
-                            })
-                        })?
-                }
+            } else {
+                let write_token = get_write_token();
+                repository
+                    .write_mutable_store(&write_token)
+                    .compare_and_swap(
+                        repository_id.into(),
+                        metadata_key,
+                        expected_hash,
+                        new_hash,
+                        KeyType::RepositoryMetadata,
+                    )
+                    .await
+                    .map_err(|err| {
+                        warn_error_to_status(&err, |err| {
+                            Status::internal(format!("failed to update metadata: {err}"))
+                        })
+                    })?
             };
 
             if previous == expected_hash {

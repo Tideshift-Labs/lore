@@ -104,7 +104,7 @@ use crate::event_relay::retry_info;
 /// **Relay progress.** The retry should also arrive after the relay has had
 /// time to change the answer rather than merely to re-report it. Measured
 /// (`cargo test -p lore-server --test outbox_drain_rate -- --ignored
-/// --nocapture`, PostgreSQL 16 on the local dataplane container, 10,000 seeded
+/// --nocapture`, `PostgreSQL` 16 on the local dataplane container, 10,000 seeded
 /// pending rows of 512-byte payload, publishing through WP-111's in-process
 /// `FakeGateway`, debug build):
 ///

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Count public RPC work until its response stream ends or is dropped.
-//! Installed inside CoreHop so a detached handler retains its registration.
+//! Installed inside `CoreHop` so a detached handler retains its registration.
 //! A missing drain state preserves default-off behavior without registration.
 use std::future::Future;
 use std::pin::Pin;

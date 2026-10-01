@@ -60,7 +60,7 @@ pub(crate) fn decode_governed_result(
             "Unsupported branch create receipt response",
         ));
     }
-    let response = BranchCreateResponse::decode(&bytes[1..]).map_err(|_| {
+    let response = BranchCreateResponse::decode(&bytes[1..]).map_err(|_err| {
         crate::domain::branch_create_outcome_unknown("Malformed branch create receipt response")
     })?;
     let branch = response.branch.as_ref().ok_or_else(|| {

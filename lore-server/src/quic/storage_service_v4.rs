@@ -289,7 +289,7 @@ impl QuicService for StorageServiceV4 {
                     Req::MutableStoreOp(_) => self.require_write(&permissions, "MutableStore")?,
                     Req::MutableCas(_) => self.require_write(&permissions, "MutableCas")?,
                     Req::Verify(verify) if verify.heal != 0 => {
-                        self.require_write(&permissions, "Verify(heal)")?
+                        self.require_write(&permissions, "Verify(heal)")?;
                     }
                     // Reads (and Verify without heal) are ungated.
                     Req::Verify(_)
@@ -589,7 +589,7 @@ mod tests {
         }))
     }
 
-    /// Wire-encodes a `MutableStore` command (key + value + key_type), matching
+    /// Wire-encodes a `MutableStore` command (key + value + `key_type`), matching
     /// `MutableStoreOp::parse`'s expected layout — see that type's own
     /// `test_parse`. The specific key/value/type don't matter for the
     /// write-permission-gate tests: a denial never reaches `handle_mutable_store`,
@@ -670,7 +670,7 @@ mod tests {
     /// (Put/Copy/MutableStore/MutableCas/Verify(heal)). Sessions have no
     /// per-request token, so these seed a session directly via
     /// `session_map.start` (white-box: `tests` is a child module of the type
-    /// it's testing, so private fields/session_map are reachable — see the
+    /// it's testing, so private `fields/session_map` are reachable — see the
     /// testing guide's "White-box state via a same-file `#[cfg(test)] mod
     /// tests`" finding) rather than round-tripping a minted JWT through
     /// `AuthorizeStart`, since only the session's snapshotted `permissions`

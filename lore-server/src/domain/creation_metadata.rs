@@ -27,7 +27,7 @@ impl GovernedRepositoryCreate {
         // Enabled Postgres serving composition supplies this concrete store directly. Refuse a
         // wrapping or foreign store instead of silently falling back to an ungoverned upload.
         let raw: Arc<dyn std::any::Any + Send + Sync> = repository.immutable_store();
-        let store = Arc::downcast::<PostgresImmutableStore>(raw).map_err(|_| {
+        let store = Arc::downcast::<PostgresImmutableStore>(raw).map_err(|_err| {
             Status::failed_precondition(
                 "coordinated create requires the configured Postgres immutable store",
             )

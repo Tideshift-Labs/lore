@@ -1,7 +1,7 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! WP118 single real server, clean initialization and authenticated released-shaped RPCs.
-//! ReBAC is a test double; no platform ACL/create-claim or actual released CLI proof.
+//! `ReBAC` is a test double; no platform ACL/create-claim or actual released CLI proof.
 #![allow(dead_code)] // Read-only shared authentication fixtures expose additional case helpers.
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -243,90 +243,87 @@ pub async fn handler(
             // consumer. The pinned set's second open question is whether these
             // two kinds stay distinct at all; if they merge, this branch
             // collapses rather than changing meaning.
-            let previous = match &governed {
-                Some(governed) => {
-                    let event =
-                        match governed.outbox_cell_id() {
-                            Some(cell_id) => {
-                                // Read before the transaction, so the name and tip
-                                // are a preflight observation. They go in the
-                                // payload only; the aggregate version is resolved
-                                // by the coordinator from what it commits.
-                                let branch = governed
-                                    .branch_snapshot(repository_id.data(), branch_id.as_ref())
-                                    .await?
-                                    .ok_or_else(|| {
-                                        Status::not_found(format!("Branch {branch_id} not found"))
-                                    })?;
-                                let built = if protect_changed {
-                                    outbox_builders::branch_protection_changed(
-                                        cell_id,
-                                        repository_id.data(),
-                                        branch_id.as_ref(),
-                                        &branch.name,
-                                        &branch.latest_hash,
-                                        expected_hash.as_ref(),
-                                        new_hash.as_ref(),
-                                        proposed_metadata
-                                            .get_bool(branch::PROTECT)
-                                            .unwrap_or_default(),
-                                    )
-                                } else {
-                                    outbox_builders::branch_metadata_changed(
-                                        cell_id,
-                                        repository_id.data(),
-                                        branch_id.as_ref(),
-                                        &branch.name,
-                                        &branch.latest_hash,
-                                        expected_hash.as_ref(),
-                                        new_hash.as_ref(),
-                                    )
-                                };
-                                Some(built.map_err(|error| {
-                                    crate::grpc::map_domain_error_to_status(&error)
-                                })?)
-                            }
-                            None => None,
+            let previous = if let Some(governed) = &governed {
+                let event = match governed.outbox_cell_id() {
+                    Some(cell_id) => {
+                        // Read before the transaction, so the name and tip
+                        // are a preflight observation. They go in the
+                        // payload only; the aggregate version is resolved
+                        // by the coordinator from what it commits.
+                        let branch = governed
+                            .branch_snapshot(repository_id.data(), branch_id.as_ref())
+                            .await?
+                            .ok_or_else(|| {
+                                Status::not_found(format!("Branch {branch_id} not found"))
+                            })?;
+                        let built = if protect_changed {
+                            outbox_builders::branch_protection_changed(
+                                cell_id,
+                                repository_id.data(),
+                                branch_id.as_ref(),
+                                &branch.name,
+                                &branch.latest_hash,
+                                expected_hash.as_ref(),
+                                new_hash.as_ref(),
+                                proposed_metadata
+                                    .get_bool(branch::PROTECT)
+                                    .unwrap_or_default(),
+                            )
+                        } else {
+                            outbox_builders::branch_metadata_changed(
+                                cell_id,
+                                repository_id.data(),
+                                branch_id.as_ref(),
+                                &branch.name,
+                                &branch.latest_hash,
+                                expected_hash.as_ref(),
+                                new_hash.as_ref(),
+                            )
                         };
-                    let projection = ProjectionWrite {
-                        partition: repository_id.data().to_vec(),
-                        key_type: key_type as i16,
-                        key: metadata_key.as_ref().to_vec(),
-                        value: Some(new_hash.as_ref().to_vec()),
-                    };
-                    match governed
-                        .commit(
-                            repository_id.data(),
-                            Some(branch_id.as_ref()),
-                            expected_hash.as_ref(),
-                            new_hash.as_ref(),
-                            projection,
-                            event,
+                        Some(
+                            built
+                                .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?,
                         )
-                        .await?
-                    {
-                        MetadataCasOutcome::Applied => expected_hash,
-                        MetadataCasOutcome::Lost(observed) => Hash::from(observed.as_slice()),
                     }
+                    None => None,
+                };
+                let projection = ProjectionWrite {
+                    partition: repository_id.data().to_vec(),
+                    key_type: key_type as i16,
+                    key: metadata_key.as_ref().to_vec(),
+                    value: Some(new_hash.as_ref().to_vec()),
+                };
+                match governed
+                    .commit(
+                        repository_id.data(),
+                        Some(branch_id.as_ref()),
+                        expected_hash.as_ref(),
+                        new_hash.as_ref(),
+                        projection,
+                        event,
+                    )
+                    .await?
+                {
+                    MetadataCasOutcome::Applied => expected_hash,
+                    MetadataCasOutcome::Lost(observed) => Hash::from(observed.as_slice()),
                 }
-                None => {
-                    let write_token = get_write_token();
-                    repository
-                        .write_mutable_store(&write_token)
-                        .compare_and_swap(
-                            repository_id,
-                            metadata_key,
-                            expected_hash,
-                            new_hash,
-                            key_type,
-                        )
-                        .await
-                        .map_err(|err| {
-                            warn_error_to_status(&err, |err| {
-                                Status::internal(format!("failed to update metadata: {err}"))
-                            })
-                        })?
-                }
+            } else {
+                let write_token = get_write_token();
+                repository
+                    .write_mutable_store(&write_token)
+                    .compare_and_swap(
+                        repository_id,
+                        metadata_key,
+                        expected_hash,
+                        new_hash,
+                        key_type,
+                    )
+                    .await
+                    .map_err(|err| {
+                        warn_error_to_status(&err, |err| {
+                            Status::internal(format!("failed to update metadata: {err}"))
+                        })
+                    })?
             };
 
             if previous == expected_hash {

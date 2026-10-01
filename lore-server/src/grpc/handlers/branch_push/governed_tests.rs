@@ -1043,7 +1043,7 @@ async fn publish_with_a_configured_cell_id_and_an_advancing_head_builds_the_bran
     assert!(payload_text.contains("main"));
 }
 
-/// The second half of the C1 rule: a configured cell_id does not by itself
+/// The second half of the C1 rule: a configured `cell_id` does not by itself
 /// build an event on a current-head no-op. `publish`'s own match skips the
 /// build in this case (`(Some(_), true) => None`) rather than building one and
 /// relying on the coordinator to drop it -- the coordinator's
@@ -1567,7 +1567,7 @@ async fn prepare_and_build_push_request_with_options(
 /// request's headers and raw body, and notifies `tx` once per request so a
 /// test can `.recv().await` deterministically rather than sleeping and
 /// polling -- the same shape `no_op_push_does_not_repeat_notification_or_post_hook`
-/// (branch_push.rs's own `mod tests`) uses for its `RecordingPostHook`.
+/// (`branch_push.rs`'s own `mod tests`) uses for its `RecordingPostHook`.
 async fn start_recording_stub_receiver(
     tx: mpsc::UnboundedSender<()>,
 ) -> (

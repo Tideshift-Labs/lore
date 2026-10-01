@@ -217,7 +217,7 @@ impl ImmutableStore for MembershipStore {
     }
 
     async fn compact_stop(self: Arc<Self>) {
-        self.inner.clone().compact_stop().await
+        self.inner.clone().compact_stop().await;
     }
 
     fn max_query_batch(&self) -> Option<usize> {

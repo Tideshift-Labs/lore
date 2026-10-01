@@ -67,7 +67,7 @@ pub struct BrokerAcceptance {
     pub stream_identity: String,
     /// The stream epoch that identity was serving.
     pub stream_epoch: u64,
-    /// The JetStream sequence assigned within `(stream_identity, stream_epoch)`.
+    /// The `JetStream` sequence assigned within `(stream_identity, stream_epoch)`.
     pub broker_sequence: u64,
     /// The pinned private contract version the gateway served.
     pub publisher_contract_version: u32,
@@ -167,17 +167,17 @@ pub fn connect_gateway_channel(
 fn tls_config(
     mtls: &MtlsConfig,
 ) -> Result<tonic::transport::ClientTlsConfig, RemoteNotificationError> {
-    let client_cert = std::fs::read(&mtls.client_cert_path).map_err(|_| {
+    let client_cert = std::fs::read(&mtls.client_cert_path).map_err(|_err| {
         RemoteNotificationError::MtlsMaterialUnreadable {
             field: "client_cert_path",
         }
     })?;
-    let client_key = std::fs::read(&mtls.client_key_path).map_err(|_| {
+    let client_key = std::fs::read(&mtls.client_key_path).map_err(|_err| {
         RemoteNotificationError::MtlsMaterialUnreadable {
             field: "client_key_path",
         }
     })?;
-    let trust_roots = std::fs::read(&mtls.trust_roots_path).map_err(|_| {
+    let trust_roots = std::fs::read(&mtls.trust_roots_path).map_err(|_err| {
         RemoteNotificationError::MtlsMaterialUnreadable {
             field: "trust_roots_path",
         }
@@ -439,7 +439,7 @@ pub fn classify_result(
     }
 
     let outcome = wire::PublishOutcomeV1::try_from(result.outcome)
-        .map_err(|_| PublishFailure::NotAccepted(NotAcceptedReason::UnrecognizedOutcome))?;
+        .map_err(|_err| PublishFailure::NotAccepted(NotAcceptedReason::UnrecognizedOutcome))?;
 
     match outcome {
         wire::PublishOutcomeV1::Unspecified => Err(PublishFailure::NotAccepted(

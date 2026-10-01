@@ -153,7 +153,7 @@ pub enum MaintenanceCommand {
 #[derive(Debug, Subcommand)]
 pub enum OutboxCommand {
     /// Report backlog, schema state, membership, and the backlog-derived
-    /// facets. A running relay's live readiness is on its /event_readiness.
+    /// facets. A running relay's live readiness is on its /`event_readiness`.
     Status {
         /// Print one JSON object instead of the human-readable report.
         #[arg(long)]

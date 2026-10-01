@@ -761,7 +761,7 @@ mod tests {
                 r.stream_identity = "a".to_string();
             }),
             ("uint64 stream_epoch = 5;", 5, VARINT, |r| {
-                r.stream_epoch = 1
+                r.stream_epoch = 1;
             }),
             ("uint64 broker_sequence = 6;", 6, VARINT, |r| {
                 r.broker_sequence = 1;

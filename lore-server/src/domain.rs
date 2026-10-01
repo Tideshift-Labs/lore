@@ -916,7 +916,7 @@ impl DomainContext {
             return Err(domain_operation_metadata::missing_authn_bearer());
         };
         let fingerprint_version = u32::try_from(binding.fingerprint_version)
-            .map_err(|_| Status::internal("fingerprint version is not representable"))?;
+            .map_err(|_err| Status::internal("fingerprint version is not representable"))?;
         let request = create_request_with_authorization(
             lore_proto::rebac::AuthorizeDirectRepositoryOperationRequest {
                 verified_issuer: key.verified_issuer.clone(),
@@ -1010,7 +1010,7 @@ fn internal_prepare_fingerprint(
         // components would frame identically — and a fingerprint that is not
         // injective is a receipt key collision. Refusing costs nothing on a
         // path that can never take it.
-        let len = u32::try_from(component.len()).map_err(|_| {
+        let len = u32::try_from(component.len()).map_err(|_err| {
             Status::internal("internal prepare fingerprint component exceeds the frame width")
         })?;
         preimage.extend_from_slice(&len.to_be_bytes());
@@ -1089,7 +1089,7 @@ fn direct_authorization_bound_fields_digest(
     response: &lore_proto::rebac::AuthorizeDirectRepositoryOperationResponse,
 ) -> Result<Vec<u8>, Status> {
     let fingerprint_version = u32::try_from(binding.fingerprint_version)
-        .map_err(|_| Status::internal("fingerprint version is not representable"))?
+        .map_err(|_err| Status::internal("fingerprint version is not representable"))?
         .to_be_bytes();
     let authorization_revision = response.authorization_revision.to_be_bytes();
     let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
@@ -1110,7 +1110,7 @@ fn direct_authorization_bound_fields_digest(
         response.verification_nonce.as_ref(),
     ] {
         let length = u32::try_from(component.len())
-            .map_err(|_| Status::internal("direct authorization field exceeds frame width"))?;
+            .map_err(|_err| Status::internal("direct authorization field exceeds frame width"))?;
         digest.update(&length.to_be_bytes());
         digest.update(component);
     }
@@ -1634,7 +1634,7 @@ pub struct RepositoryCreateOutcome {
 
 /// The one method name a governed repository create is known by.
 ///
-/// It is the receipt binding's method **and** the ReBAC callback's `method`,
+/// It is the receipt binding's method **and** the `ReBAC` callback's `method`,
 /// because the platform has exactly one value for both and cannot satisfy two.
 /// `acknowledgeCreateClaim` compares the callback's method against the
 /// authorization row; the prepare verifier compares the prepare request's method
@@ -1721,7 +1721,7 @@ impl MetadataCasFamily {
     }
 }
 
-/// The complete attached platform claim a governed create hands the ReBAC
+/// The complete attached platform claim a governed create hands the `ReBAC`
 /// `CreateResource` callback.
 ///
 /// Assembled once, at [`GovernedRepositoryCreate::prepare`], from three
@@ -1778,7 +1778,7 @@ pub struct GovernedCreateWitness {
 /// Three outcomes, and the middle one is the whole reason this is a function
 /// rather than an `Option` map:
 ///
-/// - No mediated scope — a direct governed create. `Ok(None)`, and the ReBAC
+/// - No mediated scope — a direct governed create. `Ok(None)`, and the `ReBAC`
 ///   callback keeps resolving through the catalog.
 /// - A mediated scope with no claim witness — refused. The control plane is the
 ///   only caller that reaches this arm, the callback it is about to trigger
@@ -1805,7 +1805,7 @@ fn build_create_witness(
             "mediated governed repository create is missing claim-witness carriage",
         ));
     };
-    let fingerprint_version = u32::try_from(carried.fingerprint_version).map_err(|_| {
+    let fingerprint_version = u32::try_from(carried.fingerprint_version).map_err(|_err| {
         // Unreachable through `validated`, which only ever produces version
         // 1. Refusing rather than casting keeps the wire type conversion an
         // enforced property instead of a silent truncation.
@@ -1999,7 +1999,7 @@ impl GovernedBranchCreate {
         let raw: Arc<dyn std::any::Any + Send + Sync> = repository.immutable_store();
         let store =
             Arc::downcast::<lore_postgres::store::immutable_store::PostgresImmutableStore>(raw)
-                .map_err(|_| {
+                .map_err(|_err| {
                     Status::failed_precondition(
                         "Branch creation requires the configured Postgres immutable store",
                     )
@@ -2090,7 +2090,7 @@ impl GovernedRepositoryCreate {
     ///
     /// `None` is not a degraded governed create: it is a governed create by a
     /// principal that is not the control plane, which has no platform claim and
-    /// whose ReBAC callback must keep resolving through the catalog exactly as
+    /// whose `ReBAC` callback must keep resolving through the catalog exactly as
     /// it does today.
     #[must_use]
     pub fn create_witness(&self) -> Option<&GovernedCreateWitness> {
@@ -2100,7 +2100,7 @@ impl GovernedRepositoryCreate {
     /// Commit the domain rows, every projection row, and both classified
     /// events in one transaction.
     ///
-    /// The immutable-store blob writes and the ReBAC `CreateResource` callback
+    /// The immutable-store blob writes and the `ReBAC` `CreateResource` callback
     /// have already happened by the time this is called, and neither is
     /// reachable from inside the transaction: the coordinator's methods take
     /// plain data and a transaction, with no store handle, auth client, or
@@ -2989,7 +2989,7 @@ pub struct ConfiguredDomainContext {
     /// other immutable-store modes never receive or construct a provider route.
     pub fragment_coordinator: Option<PostgresFragmentCoordinator>,
     /// Physical identity positively shared by the domain, immutable, mutable,
-    /// and lock pools: PostgreSQL system identifier plus database OID.
+    /// and lock pools: `PostgreSQL` system identifier plus database OID.
     ///
     /// The diagnostic database name travels with the value but is not an
     /// identity component for dispatch attestation.
@@ -6662,7 +6662,7 @@ mod tests {
                          precondition failure"
                     );
                 }
-                other => {
+                other @ DomainOutcome::Applied => {
                     panic!("{label}: expected NotApplied(ADMISSION_REJECTED_V1), got {other:?}")
                 }
             }

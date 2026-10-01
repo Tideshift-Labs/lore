@@ -844,7 +844,7 @@ async fn force_unlock_is_refused_for_a_caller_holding_migrate_but_not_owner() {
 /// `ForceUnlock` bar) is refused `PermissionDenied` on `AdminLock`, which
 /// still requires `migrate` unchanged. Together with
 /// `admin_lock_on_behalf_of_another_subject_issues_that_subjects_ownership_token`
-/// (migrate alone succeeds) this pins both halves of AdminLock's gate being
+/// (migrate alone succeeds) this pins both halves of `AdminLock`'s gate being
 /// untouched by RULING A.
 #[tokio::test]
 #[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]

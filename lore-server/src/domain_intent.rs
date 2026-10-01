@@ -138,8 +138,8 @@ fn framed(
     field: &'static str,
     bytes: &[u8],
 ) -> Result<(), CanonicalIntentError> {
-    let len =
-        u32::try_from(bytes.len()).map_err(|_| CanonicalIntentError::FramingOverflow { field })?;
+    let len = u32::try_from(bytes.len())
+        .map_err(|_err| CanonicalIntentError::FramingOverflow { field })?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())

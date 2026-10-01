@@ -609,7 +609,7 @@ impl DurableReceiver {
             .store
             .read_membership()
             .await
-            .map_err(|_| BootstrapFailure::Transient(REASON_STORE_UNAVAILABLE))?;
+            .map_err(|_err| BootstrapFailure::Transient(REASON_STORE_UNAVAILABLE))?;
         let Some(snapshot) = snapshot else {
             return Err(BootstrapFailure::Rejected(format!(
                 "cell {} has no outbox membership state; SCHEMA-119's install has not run here",
@@ -957,10 +957,8 @@ impl DurableReceiver {
             MembershipCas::AlreadyRecorded => {
                 session.ready = true;
             }
-            MembershipCas::PlacementMoved { .. } => {
-                return Err(BootstrapFailure::Retired(REASON_PLACEMENT_MOVED));
-            }
-            MembershipCas::NoCheckpointAtCurrentPlacement => {
+            MembershipCas::PlacementMoved { .. }
+            | MembershipCas::NoCheckpointAtCurrentPlacement => {
                 return Err(BootstrapFailure::Retired(REASON_PLACEMENT_MOVED));
             }
             MembershipCas::VersionConflict { .. } => {

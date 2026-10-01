@@ -54,7 +54,7 @@ pub fn envelope_source() -> EnvelopeSource {
 
 /// A minimal, valid `[plugins.remote]` config -- mirrors
 /// `remote_notification_durable_publish.rs`'s own `minimal_config()`
-/// fixture, kept in sync on cell_id/placement_epoch/producer_instance_id
+/// fixture, kept in sync on `cell_id/placement_epoch/producer_instance_id`
 /// with [`envelope_source`] so a mismatch there cannot masquerade as an
 /// unrelated `MapFailure::CellIdMismatch`-shaped bug in this harness.
 pub fn minimal_remote_notification_config() -> RemoteNotificationConfig {

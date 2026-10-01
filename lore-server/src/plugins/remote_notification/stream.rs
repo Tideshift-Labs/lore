@@ -267,7 +267,7 @@ pub fn status_to_stream_error(status: &tonic::Status, current: &StreamPlacement)
 /// enormous sequence into a small one and let a frontier appear to advance.
 fn narrow(value: u64, field: &'static str) -> Result<i64, StreamError> {
     i64::try_from(value)
-        .map_err(|_| StreamError::Refused(format!("{field} exceeds i64::MAX and is malformed")))
+        .map_err(|_err| StreamError::Refused(format!("{field} exceeds i64::MAX and is malformed")))
 }
 
 /// The durable stream over the gateway's pinned `Consume` and `Ack` methods.
@@ -324,7 +324,7 @@ impl DurableStreamSource for GrpcDurableStream {
         let start = match request.resume_from {
             Some(sequence) => {
                 wire::consume_request_v1::Start::CapturedPosition(wire::CapturedPositionV1 {
-                    start_sequence: u64::try_from(sequence).map_err(|_| {
+                    start_sequence: u64::try_from(sequence).map_err(|_err| {
                         StreamError::Refused("resume position is negative".to_string())
                     })?,
                 })
@@ -335,14 +335,15 @@ impl DurableStreamSource for GrpcDurableStream {
             transport_version: wire::TRANSPORT_VERSION,
             cell_id: self.cell_id.clone(),
             receiver_identity: request.receiver_identity.clone(),
-            membership_generation: u64::try_from(request.membership_generation).map_err(|_| {
-                StreamError::Refused("membership generation is negative".to_string())
-            })?,
+            membership_generation: u64::try_from(request.membership_generation).map_err(
+                |_err| StreamError::Refused("membership generation is negative".to_string()),
+            )?,
             stream_identity: request.placement.stream_identity.clone(),
             stream_epoch: u64::try_from(request.placement.stream_epoch)
-                .map_err(|_| StreamError::Refused("stream epoch is negative".to_string()))?,
-            placement_revision: u64::try_from(request.placement_revision)
-                .map_err(|_| StreamError::Refused("placement revision is negative".to_string()))?,
+                .map_err(|_err| StreamError::Refused("stream epoch is negative".to_string()))?,
+            placement_revision: u64::try_from(request.placement_revision).map_err(|_err| {
+                StreamError::Refused("placement revision is negative".to_string())
+            })?,
             start: Some(start),
         };
 
@@ -504,7 +505,7 @@ impl DurableStreamSource for GrpcDurableStream {
             // which currently acknowledges inside the same step that applies —
             // and that ordering is what makes each outcome class provable, so
             // batching is a deliberate second pass rather than a tweak.
-            acked_sequences: vec![u64::try_from(broker_sequence).map_err(|_| {
+            acked_sequences: vec![u64::try_from(broker_sequence).map_err(|_err| {
                 StreamError::Refused("acknowledged sequence is negative".to_string())
             })?],
             // The frontier, gaps, and poison on this message are the gateway's
