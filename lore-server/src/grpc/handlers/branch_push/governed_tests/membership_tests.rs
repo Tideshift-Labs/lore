@@ -268,7 +268,8 @@ async fn wait_for_blocked_backend(observer: &Client, blocker: i32) -> i32 {
 }
 
 async fn mutation_first(url: &str, v1: bool, change: Change, required: bool) {
-    mutation_first_count(url, v1, change, required, 1).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first_count(url, v1, change, required, 1)).await;
 }
 
 async fn mutation_first_count(url: &str, v1: bool, change: Change, required: bool, count: usize) {
@@ -450,9 +451,10 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
             );
         }
     };
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+    // boxed: future is ~29 KB on the stack
+    let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(push, mutate)
-    })
+    }))
     .await
     .expect("handler watchdog");
     let applied = matches!(change, Change::Fresh);
@@ -485,52 +487,117 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_fresh_addition_after_preflight_publishes_on_first_attempt() {
-    mutation_first(&pg_url().unwrap(), false, Change::Fresh, true).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        false,
+        Change::Fresh,
+        true,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_fresh_addition_after_preflight_publishes_on_first_attempt() {
-    mutation_first(&pg_url().unwrap(), true, Change::Fresh, true).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        true,
+        Change::Fresh,
+        true,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_required_retirement_after_preflight_refuses() {
-    mutation_first(&pg_url().unwrap(), false, Change::Retire, true).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        false,
+        Change::Retire,
+        true,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_unrelated_retirement_after_preflight_refuses() {
-    mutation_first(&pg_url().unwrap(), true, Change::Retire, false).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        true,
+        Change::Retire,
+        false,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_required_rebind_after_preflight_refuses() {
-    mutation_first(&pg_url().unwrap(), false, Change::Rebind, true).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        false,
+        Change::Rebind,
+        true,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_unrelated_rebind_after_preflight_refuses() {
-    mutation_first(&pg_url().unwrap(), true, Change::Rebind, false).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        true,
+        Change::Rebind,
+        false,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_tombstone_recreate_after_preflight_refuses() {
-    mutation_first(&pg_url().unwrap(), true, Change::Recreate, true).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        true,
+        Change::Recreate,
+        true,
+    ))
+    .await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_lifecycle_move_without_complete_proof_refuses() {
-    mutation_first(&pg_url().unwrap(), false, Change::Missing, true).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        false,
+        Change::Missing,
+        true,
+    ))
+    .await;
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_more_than_4096_real_dependencies_allow_fresh_addition() {
-    mutation_first_count(&pg_url().unwrap(), true, Change::Fresh, true, 4097).await;
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first_count(
+        &pg_url().unwrap(),
+        true,
+        Change::Fresh,
+        true,
+        4097,
+    ))
+    .await;
 }
 
 async fn push_first(url: &str, v1: bool, change: Change, required: bool) {
-    push_first_count(url, v1, change, required, 1).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first_count(url, v1, change, required, 1)).await;
 }
 
 async fn push_first_count(url: &str, v1: bool, change: Change, required: bool, count: usize) {
@@ -642,9 +709,10 @@ async fn push_first_count(url: &str, v1: bool, change: Change, required: bool, c
         };
         tokio::join!(mutation, release);
     };
-    let (result, ()) = tokio::time::timeout(Duration::from_secs(30), async {
+    // boxed: future is ~29 KB on the stack
+    let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(30), async {
         tokio::join!(publication, race)
-    })
+    }))
     .await
     .expect("push-first watchdog");
     assert_eq!(result.unwrap(), fixture.revision);
@@ -661,46 +729,54 @@ async fn push_first_count(url: &str, v1: bool, change: Change, required: bool, c
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_publication_blocks_required_retirement_until_commit() {
-    push_first(&pg_url().unwrap(), false, Change::Retire, true).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first(&pg_url().unwrap(), false, Change::Retire, true)).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_publication_blocks_unrelated_rebind_until_commit() {
-    push_first(&pg_url().unwrap(), true, Change::Rebind, false).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first(&pg_url().unwrap(), true, Change::Rebind, false)).await;
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_publication_blocks_unrelated_retirement_until_commit() {
-    push_first(&pg_url().unwrap(), false, Change::Retire, false).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first(&pg_url().unwrap(), false, Change::Retire, false)).await;
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_publication_blocks_required_rebind_until_commit() {
-    push_first(&pg_url().unwrap(), true, Change::Rebind, true).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first(&pg_url().unwrap(), true, Change::Rebind, true)).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v1_publication_blocks_required_recreation_until_commit() {
-    push_first(&pg_url().unwrap(), true, Change::Recreate, true).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first(&pg_url().unwrap(), true, Change::Recreate, true)).await;
 }
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_publication_allows_fresh_addition_after_commit() {
-    push_first(&pg_url().unwrap(), false, Change::Fresh, false).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first(&pg_url().unwrap(), false, Change::Fresh, false)).await;
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn same_repo_bulk_upload_does_not_starve_real_branch_push() {
-    sustained_upload(false).await;
+    // boxed: future is ~63 KB on the stack
+    Box::pin(sustained_upload(false)).await;
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn cross_repo_bulk_upload_does_not_abort_real_branch_push() {
-    sustained_upload(true).await;
+    // boxed: future is ~63 KB on the stack
+    Box::pin(sustained_upload(true)).await;
 }
 
 async fn sustained_upload(cross_repository: bool) {
@@ -785,12 +861,13 @@ async fn sustained_upload(cross_repository: bool) {
     // 60 seconds keeps the watchdog well inside "this never finished" while
     // leaving the workload untouched, so the case still proves what it claims
     // on a loaded machine.
-    let ((), first, second, third) = tokio::time::timeout(
+    // boxed: future is ~62 KB on the stack
+    let ((), first, second, third) = Box::pin(tokio::time::timeout(
         Duration::from_secs(60),
         LORE_CONTEXT.scope(execution, async {
             tokio::join!(pushes, upload(0), upload(1), upload(2))
         }),
-    )
+    ))
     .await
     .expect("100 pushes and ten-second upload window fit the watchdog");
     assert!(started.elapsed() >= Duration::from_secs(10));
@@ -808,7 +885,15 @@ async fn sustained_upload(cross_repository: bool) {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn v0_more_than_4096_real_dependencies_publish_before_fresh_addition() {
-    push_first_count(&pg_url().unwrap(), false, Change::Fresh, false, 4097).await;
+    // boxed: future is ~29 KB on the stack
+    Box::pin(push_first_count(
+        &pg_url().unwrap(),
+        false,
+        Change::Fresh,
+        false,
+        4097,
+    ))
+    .await;
 }
 
 #[tokio::test]
@@ -928,10 +1013,12 @@ async fn rewritten_publication_retains_original_witness(merge: bool) {
         );
         fixture.store.resume.notify_one();
     };
-    let (result, ()) =
-        tokio::time::timeout(Duration::from_secs(30), async { tokio::join!(push, race) })
-            .await
-            .expect("rewrite/merge reaches actual publication");
+    // boxed: future is ~24 KB on the stack
+    let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::join!(push, race)
+    }))
+    .await
+    .expect("rewrite/merge reaches actual publication");
     let error = result.unwrap_err();
     assert_eq!(error.code(), Code::Aborted);
     assert!(error.message().contains("required_fragment_changed"));
@@ -953,13 +1040,15 @@ async fn rewritten_publication_retains_original_witness(merge: bool) {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn revision_number_rewrite_keeps_the_witness_from_before_preflight() {
-    rewritten_publication_retains_original_witness(false).await;
+    // boxed: future is ~25 KB on the stack
+    Box::pin(rewritten_publication_retains_original_witness(false)).await;
 }
 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL required"]
 async fn server_merge_keeps_the_witness_from_before_preflight() {
-    rewritten_publication_retains_original_witness(true).await;
+    // boxed: future is ~25 KB on the stack
+    Box::pin(rewritten_publication_retains_original_witness(true)).await;
 }
 
 fn assert_file_queries(fixture: &Fixture, count: usize) {

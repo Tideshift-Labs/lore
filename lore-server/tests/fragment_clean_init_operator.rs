@@ -104,7 +104,8 @@ async fn operator_requires_explicit_legacy_writer_exclusion_before_connecting() 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn real_loreserver_binary_initializes_and_emits_parseable_json() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let directory = tempfile::tempdir().unwrap();
     let mut config: toml::Value = toml::from_str(include_str!("../config/default.toml")).unwrap();
     config["mutable_store"]["mode"] = "postgres".into();
@@ -168,7 +169,8 @@ async fn real_loreserver_binary_initializes_and_emits_parseable_json() {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn actual_operator_initializes_empty_cell_and_reruns_after_later_upload() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     fixture.assert_dark().await;
     fixture.initialize().await.unwrap();
     let store = fixture.store().await;
@@ -208,7 +210,8 @@ async fn actual_operator_initializes_empty_cell_and_reruns_after_later_upload() 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn object_outside_fragment_keyspace_refuses_and_is_not_deleted() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let s3 = fixture.s3.sdk_client();
     s3.put_object()
         .bucket(&fixture.bucket)
@@ -243,7 +246,8 @@ async fn object_outside_fragment_keyspace_refuses_and_is_not_deleted() {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn incomplete_multipart_upload_refuses_without_aborting_it() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let s3 = fixture.s3.sdk_client();
     let upload = s3
         .create_multipart_upload()
@@ -280,7 +284,8 @@ async fn incomplete_multipart_upload_refuses_without_aborting_it() {
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn enabled_and_suspended_versioning_refuse_even_without_current_objects() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let s3 = fixture.s3.sdk_client();
     for status in [
         BucketVersioningStatus::Enabled,
@@ -313,7 +318,8 @@ async fn enabled_and_suspended_versioning_refuse_even_without_current_objects() 
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn hidden_version_and_delete_marker_are_preserved_when_initialization_refuses() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let s3 = fixture.s3.sdk_client();
     s3.put_bucket_versioning()
         .bucket(&fixture.bucket)
@@ -383,7 +389,8 @@ async fn hidden_version_and_delete_marker_are_preserved_when_initialization_refu
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn actual_operator_upgrades_inactive_v2_schema_and_reruns_exactly() {
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let pool = lore_postgres::pool::build_pool(
         &fixture.url,
         1,
@@ -475,7 +482,8 @@ async fn namespace_provider_failure_preserves_source_distinct_from_refusal() {
 
     use lore_postgres::store::immutable_store::clean_namespace::CleanNamespaceError;
     use lore_postgres::store::immutable_store::clean_namespace::CleanObjectNamespaceInspector;
-    let fixture = Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(Fixture::new()).await;
     let mut object = lore_postgres::store::immutable_store::ObjectStoreSettings {
         bucket: fixture.bucket.clone(),
         endpoint_url: Some(std::env::var("LORE_TEST_S3_ENDPOINT").unwrap()),

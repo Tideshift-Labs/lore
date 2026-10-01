@@ -59,40 +59,61 @@ fn port() -> u16 {
 #[tokio::test]
 #[ignore = "owned PostgreSQL/MinIO and one real loreserver; run run-clean-init-single-server-rpc-live.ps1"]
 async fn clean_initialized_single_server_authenticates_upload_push_read_and_receipt() {
-    tokio::time::timeout(Duration::from_secs(180), run_case(false, 0))
-        .await
-        .expect("single-server RPC proof deadline");
+    // boxed: future is ~29 KB on the stack
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(180),
+        run_case(false, 0),
+    ))
+    .await
+    .expect("single-server RPC proof deadline");
 }
 #[tokio::test]
 #[ignore = "owned PostgreSQL/MinIO and one real loreserver; run run-clean-init-single-server-rpc-live.ps1"]
 async fn clean_initialized_single_server_v0_create_upload_push_read_and_receipt() {
-    tokio::time::timeout(Duration::from_secs(180), run_case(true, 0))
-        .await
-        .expect("single-server v0 proof deadline");
+    // boxed: future is ~29 KB on the stack
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(180),
+        run_case(true, 0),
+    ))
+    .await
+    .expect("single-server v0 proof deadline");
 }
 #[tokio::test]
 #[ignore = "owned RPC fixture; run run-clean-init-single-server-rpc-live.ps1"]
 async fn create_first_metadata_throttle_is_resource_exhausted_without_publication() {
-    tokio::time::timeout(Duration::from_secs(180), run_case(false, 1))
-        .await
-        .unwrap();
+    // boxed: future is ~29 KB on the stack
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(180),
+        run_case(false, 1),
+    ))
+    .await
+    .unwrap();
 }
 #[tokio::test]
 #[ignore = "owned RPC fixture; run run-clean-init-single-server-rpc-live.ps1"]
 async fn create_second_metadata_throttle_is_resource_exhausted_without_publication() {
-    tokio::time::timeout(Duration::from_secs(180), run_case(false, 2))
-        .await
-        .unwrap();
+    // boxed: future is ~29 KB on the stack
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(180),
+        run_case(false, 2),
+    ))
+    .await
+    .unwrap();
 }
 #[tokio::test]
 #[ignore = "owned RPC fixture; run run-clean-init-single-server-rpc-live.ps1"]
 async fn applied_create_replay_missing_metadata_returns_aborted_and_keeps_receipt() {
-    tokio::time::timeout(Duration::from_secs(180), run_case(false, 3))
-        .await
-        .unwrap();
+    // boxed: future is ~29 KB on the stack
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(180),
+        run_case(false, 3),
+    ))
+    .await
+    .unwrap();
 }
 async fn run_case(v0: bool, refusal: u8) {
-    let fixture = fixture::Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(fixture::Fixture::new()).await;
     fixture.initialize().await.unwrap();
     dispatch::install(&fixture.url).await;
     let domain = Arc::new(fixture.store().await);

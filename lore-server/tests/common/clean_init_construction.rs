@@ -21,7 +21,8 @@ mod fixture;
 #[tokio::test]
 #[ignore = "isolated PostgreSQL and owned MinIO required"]
 async fn normal_construction_attests_clean_namespace_before_dispatch_setup() {
-    let fixture = fixture::Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(fixture::Fixture::new()).await;
     fixture.assert_dark().await;
     fixture.initialize().await.unwrap();
     let store = fixture.store().await;
@@ -122,7 +123,8 @@ async fn clean_initialized_normal_provider_upload_query_read_and_grants_are_live
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
     use lore_storage::hash_slice;
-    let fixture = fixture::Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(fixture::Fixture::new()).await;
     fixture.initialize().await.unwrap();
     dispatch::install(&fixture.url).await;
     let domain = fixture.store().await;

@@ -59,12 +59,17 @@ mod actual_cli_process;
 #[tokio::test]
 #[ignore = "owned initialized PostgreSQL/MinIO, real server and CLI; run-clean-init-actual-cli-live.ps1"]
 async fn actual_cli_login_clone_commit_push_and_fresh_clone_readback() {
-    tokio::time::timeout(Duration::from_secs(300), run_cli_case())
-        .await
-        .expect("actual CLI proof deadline");
+    // boxed: future is ~28 KB on the stack
+    Box::pin(tokio::time::timeout(
+        Duration::from_secs(300),
+        run_cli_case(),
+    ))
+    .await
+    .expect("actual CLI proof deadline");
 }
 async fn run_cli_case() {
-    let fixture = fixture::Fixture::new().await;
+    // boxed: future is ~22 KB on the stack
+    let fixture = Box::pin(fixture::Fixture::new()).await;
     fixture.initialize().await.unwrap();
     dispatch::install(&fixture.url).await;
     let domain = Arc::new(fixture.store().await);
