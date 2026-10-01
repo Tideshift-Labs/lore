@@ -182,7 +182,7 @@ async fn install_reset_fence(raw: &Client, cell_id: &str, old_epoch: i64, new_ep
 }
 
 /// Install one reset-generation transition row directly by SQL, at a chosen
-/// `state` ("cleared" or "reset_in_progress") and generation. Unlike
+/// `state` ("cleared" or "`reset_in_progress`") and generation. Unlike
 /// [`install_reset_fence`] (fixed generation 1, always `reset_in_progress`),
 /// this lets a test build a multi-hop chain with a mix of cleared and
 /// in-progress hops. `reset.rs`'s `accept_reset` owns proving the receipt
@@ -1184,7 +1184,7 @@ async fn a_two_hop_cleared_chain_reaps_rows_at_both_superseded_placements() {
 /// including proving a current placement at all -- before the backward chain
 /// walk ever runs, not merely the specific hop it sits on and whatever is
 /// behind it. `A -> B` in progress with `B -> C` cleared is exactly the shape
-/// CR-032's own module doc uses to say "a hop still reset_in_progress ...
+/// CR-032's own module doc uses to say "a hop still `reset_in_progress` ...
 /// blocks the whole chain behind it"; the discriminating fact this test pins
 /// is that "the whole chain" means literally everything reachable from
 /// current, including a hop nominally AHEAD of the break (B), not just what

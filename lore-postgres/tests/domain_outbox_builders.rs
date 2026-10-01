@@ -238,7 +238,7 @@ fn repository_tombstoned_shape() {
     assert!(event.aggregate_identity.is_empty());
 }
 
-/// CR-032 PIN-3's row: obliterated aggregate_version stays the repository
+/// CR-032 PIN-3's row: obliterated `aggregate_version` stays the repository
 /// generation (empty identity) even though the payload names the obliterated
 /// address.
 #[test]
@@ -352,7 +352,7 @@ fn branch_deleted_shape() {
     assert_eq!(event.aggregate_identity, head.to_vec());
 }
 
-/// A branch_id that is not exactly 16 bytes is rejected at build time
+/// A `branch_id` that is not exactly 16 bytes is rejected at build time
 /// (`checked_id_16`), before any transaction opens.
 #[test]
 fn branch_id_not_16_bytes_is_rejected_at_build_time() {

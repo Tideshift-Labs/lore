@@ -4,7 +4,7 @@
 //! Real-Postgres proof for WP-117's fenced lock coordinator.
 //!
 //! Every case is `#[ignore]` and is executed by `run-lock-fencing-live.ps1`,
-//! which gives each exact case a fresh PostgreSQL 16 database.
+//! which gives each exact case a fresh `PostgreSQL` 16 database.
 
 #[path = "active_active_support/barrier.rs"]
 mod barrier;

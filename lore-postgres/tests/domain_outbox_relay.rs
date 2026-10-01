@@ -924,7 +924,7 @@ async fn acceptance_keeps_the_most_recent_retry_class_that_delayed_the_row() {
 /// boot timeout, and deliberately so: measured on postgres:18 on this rig, a
 /// CHECK validation over 2,000,000 narrow rows took 143 ms, so a timeout-based
 /// discriminator needs a table far larger than a test should seed. The case
-/// discriminates on `convalidated` instead, which PostgreSQL sets exactly when
+/// discriminates on `convalidated` instead, which `PostgreSQL` sets exactly when
 /// it scanned the rows, and the control step proves the old spelling sets it.
 const POPULATED_OUTBOX_ROWS: i64 = 50_000;
 
@@ -1335,7 +1335,7 @@ async fn replay_audit_ddl_boots_on_a_populated_outbox_under_the_boot_timeouts() 
 }
 
 /// A cell that already took the validating replay DDL keeps exactly the
-/// constraints it has. The fixed DDL names each constraint the way PostgreSQL
+/// constraints it has. The fixed DDL names each constraint the way `PostgreSQL`
 /// names an inline column CHECK, so its catalog guards find the old ones and
 /// add nothing: no duplicate constraint, and no scan.
 #[tokio::test]

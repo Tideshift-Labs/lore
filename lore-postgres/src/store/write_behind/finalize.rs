@@ -137,7 +137,7 @@ pub(super) fn finalize_blocking(
             .map_err(|error| WriteBehindError::io("staging temp fsync", &error))?;
         #[cfg(feature = "failure_generator")]
         blocking_failpoint(async { crate::domain::fragments::failpoint!("stage.temp.synced") })
-            .map_err(|_| WriteBehindError::Io {
+            .map_err(|_err| WriteBehindError::Io {
                 operation: "staging temp synced failpoint",
                 kind: std::io::ErrorKind::Interrupted,
             })?;
@@ -158,7 +158,7 @@ pub(super) fn finalize_blocking(
         let placed = (|| -> Result<(), WriteBehindError> {
             let mut tries = 1;
             loop {
-                match root.rename_into(&temporary, resolved, &leaf) {
+                match ConfinedRoot::rename_into(&temporary, resolved, &leaf) {
                     Ok(()) => return Ok(()),
                     // Purge removes an empty fan-out directory, so the leaf step 1
                     // synced can be gone by now, and a path might name a newer,
@@ -188,12 +188,12 @@ pub(super) fn finalize_blocking(
         test_faults::after_rename(key)?;
         #[cfg(feature = "failure_generator")]
         blocking_failpoint(async { crate::domain::fragments::failpoint!("stage.final.renamed") })
-            .map_err(|_| WriteBehindError::Io {
+            .map_err(|_err| WriteBehindError::Io {
             operation: "staging final renamed failpoint",
             kind: std::io::ErrorKind::Interrupted,
         })?;
         // Step 5.
-        root.sync_leaf(&leaf, resolved)
+        ConfinedRoot::sync_leaf(&leaf, resolved)
     })();
 
     if outcome.is_err() {

@@ -3,11 +3,11 @@
 // SPDX-License-Identifier: MIT
 //! Postgres-backed immutable store (CR-007): fragment bytes and their authoritative
 //! representation metadata live together in S3-compatible object storage (for example DO
-//! Spaces or MinIO). Postgres holds associations, mutable lifecycle state, and a rebuildable
+//! Spaces or `MinIO`). Postgres holds associations, mutable lifecycle state, and a rebuildable
 //! metering projection.
 //!
 //! The byte path and object-metadata encoding reuse `lore-aws`; Postgres replaces only the
-//! coordination records that the AWS backend keeps in DynamoDB:
+//! coordination records that the AWS backend keeps in `DynamoDB`:
 //!
 //! - `lore_fragments` — one row per `(hash, repository, context)` *association*.
 //!   Existence is a primary-key/prefix lookup (the three [`StoreMatch`] levels
@@ -217,7 +217,7 @@ CREATE TABLE IF NOT EXISTS lore_fragment_metering (
 
 /// Object-storage (S3-compatible) settings for the fragment-byte path. Mirrors
 /// the keys `lore-aws` exposes (endpoint / region / bucket / path-style) so the
-/// same config can point at DO Spaces, MinIO, or LocalStack.
+/// same config can point at DO Spaces, `MinIO`, or `LocalStack`.
 #[derive(Debug, Clone)]
 pub struct ObjectStoreSettings {
     /// Bucket holding fragment payloads (one shared bucket; global dedup).
@@ -227,7 +227,7 @@ pub struct ObjectStoreSettings {
     /// Optional region.
     pub region: Option<String>,
     /// Force path-style addressing — required for S3-compatible stores reached
-    /// by a non-AWS hostname (MinIO in Docker, etc.).
+    /// by a non-AWS hostname (`MinIO` in Docker, etc.).
     pub force_path_style: bool,
     /// Slow-operation log threshold (millis).
     pub slow_operation_threshold_millis: u64,
@@ -922,11 +922,11 @@ impl PostgresImmutableStore {
     fn fragment_from_manifest(manifest: &FragmentManifest) -> Result<Fragment, MissingDiagnostic> {
         Ok(Fragment {
             flags: u32::try_from(manifest.payload_flags)
-                .map_err(|_| MissingDiagnostic::InvalidStructure)?,
+                .map_err(|_err| MissingDiagnostic::InvalidStructure)?,
             size_payload: u32::try_from(manifest.size_payload)
-                .map_err(|_| MissingDiagnostic::InvalidStructure)?,
+                .map_err(|_err| MissingDiagnostic::InvalidStructure)?,
             size_content: u64::try_from(manifest.size_content)
-                .map_err(|_| MissingDiagnostic::InvalidStructure)?,
+                .map_err(|_err| MissingDiagnostic::InvalidStructure)?,
         })
     }
 
@@ -940,7 +940,7 @@ impl PostgresImmutableStore {
         payload: Bytes,
     ) -> Result<(Fragment, Bytes), MissingDiagnostic> {
         lore_storage::validate_fragment_metadata(&fragment)
-            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+            .map_err(|_err| MissingDiagnostic::InvalidStructure)?;
         if lore_storage::validate_fragment_payload(&fragment, payload.len()).is_err() {
             return Err(if payload.len() < fragment.size_payload as usize {
                 MissingDiagnostic::Truncated
@@ -950,7 +950,7 @@ impl PostgresImmutableStore {
         }
         if fragment.flags & FragmentFlags::PayloadFragmented.bits() != 0 {
             lore_storage::validate_fragment_list(&fragment, &payload)
-                .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+                .map_err(|_err| MissingDiagnostic::InvalidStructure)?;
         }
 
         match decodable_encoding(fragment.flags) {
@@ -965,13 +965,13 @@ impl PostgresImmutableStore {
             payload.clone()
         } else {
             lore_storage::decompress(fragment, payload.as_ref())
-                .map_err(|_| MissingDiagnostic::Corrupt)?
+                .map_err(|_err| MissingDiagnostic::Corrupt)?
                 .1
                 .freeze()
         };
         let persisted_flags = fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK);
         let manifest_flags = u32::try_from(manifest.payload_flags)
-            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+            .map_err(|_err| MissingDiagnostic::InvalidStructure)?;
         let decoded_hash = Hash::hash_buffer(decoded.as_ref());
         if manifest.size_payload != i64::from(fragment.size_payload)
             || manifest.size_content != i64::try_from(fragment.size_content).unwrap_or(i64::MAX)
@@ -1054,7 +1054,7 @@ impl PostgresImmutableStore {
                     ) => {
                         let metadata = metadata.into_iter().collect::<HashMap<_, _>>();
                         let fragment = from_object_metadata(Some(&metadata))
-                            .map_err(|_| MissingDiagnostic::InvalidStructure);
+                            .map_err(|_err| MissingDiagnostic::InvalidStructure);
                         match fragment.and_then(|fragment| {
                             Self::validate_candidate(
                                 address.hash,
@@ -1203,12 +1203,12 @@ impl PostgresImmutableStore {
     ) -> Result<Fragment, MissingDiagnostic> {
         let metadata = metadata.into_iter().collect::<HashMap<_, _>>();
         let fragment = from_object_metadata(Some(&metadata))
-            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+            .map_err(|_err| MissingDiagnostic::InvalidStructure)?;
         lore_storage::validate_fragment_metadata(&fragment)
-            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+            .map_err(|_err| MissingDiagnostic::InvalidStructure)?;
 
         let manifest_flags = u32::try_from(manifest.payload_flags)
-            .map_err(|_| MissingDiagnostic::InvalidStructure)?;
+            .map_err(|_err| MissingDiagnostic::InvalidStructure)?;
         let persisted_flags = fragment.flags & (CONTENT_STRUCTURE_MASK | ENCODING_MASK);
         if content_length != u64::from(fragment.size_payload)
             || manifest.size_payload != i64::from(fragment.size_payload)
@@ -1242,7 +1242,7 @@ impl PostgresImmutableStore {
         if manifest.authority == EpochAuthority::Staged {
             return Self::fragment_from_manifest(&manifest)
                 .map(stored_durable)
-                .map_err(|_| Self::not_found(address.hash));
+                .map_err(|_err| Self::not_found(address.hash));
         }
 
         let logical_request_id = uuid::Uuid::now_v7().hyphenated().to_string();
@@ -2188,7 +2188,7 @@ impl PostgresImmutableStore {
                 let execution =
                     tokio::time::timeout(self.io_timeout, admitted.execute(&mut ledger))
                         .await
-                        .map_err(|_| StoreError::from(SlowDown))?
+                        .map_err(|_err| StoreError::from(SlowDown))?
                         .map_err(provider_store_err)?;
                 match (execution.outcome, execution.response) {
                     (ProviderAttemptOutcome::Decisive, FragmentTransportResponse::Deleted) => {}
@@ -2282,7 +2282,7 @@ impl PostgresImmutableStore {
                         .await
                         .map_err(domain_store_err)?
                     {
-                        CommitVerdict::Published => continue,
+                        CommitVerdict::Published => {}
                         CommitVerdict::Fenced | CommitVerdict::Abandoned => {
                             return Err(StoreError::from(SlowDown));
                         }

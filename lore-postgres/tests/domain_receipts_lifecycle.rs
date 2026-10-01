@@ -663,7 +663,7 @@ async fn pg_client(url: &str) -> Client {
     client
 }
 
-/// A UUIDv7 carrying exactly `ts` as its embedded timestamp, so a test can
+/// A `UUIDv7` carrying exactly `ts` as its embedded timestamp, so a test can
 /// place an operation ID at a precise offset from a captured admission clock
 /// without sleeping.
 fn uuid_v7_at(ts: SystemTime) -> Uuid {
@@ -1545,7 +1545,7 @@ async fn prepare_exact_retry_returns_the_same_token() {
     );
 }
 
-/// A retry that changes exactly one of method/scope/fingerprint_version/
+/// A retry that changes exactly one of `method/scope/fingerprint_version`/
 /// fingerprint must return `Mismatch` and must not touch the stored row.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]

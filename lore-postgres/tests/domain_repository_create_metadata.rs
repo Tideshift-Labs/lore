@@ -1,7 +1,7 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! WP118 create metadata witness transaction tests; schema-valid provider observations are fixture-only.
-//! Real provider upload is proved separately by clean_init_single_server_rpc.
+//! Real provider upload is proved separately by `clean_init_single_server_rpc`.
 #[path = "common/delete_observations.rs"]
 mod delete_observations;
 

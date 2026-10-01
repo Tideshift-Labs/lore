@@ -5,7 +5,7 @@
 //!
 //! A single Postgres database per region cell backs all three of loreserver's
 //! *coordination* stores — mutable (branch-tip CAS), immutable lifecycle and
-//! repository associations, and lock — replacing DynamoDB. Immutable fragment
+//! repository associations, and lock — replacing `DynamoDB`. Immutable fragment
 //! bytes and authoritative representation metadata live on S3-compatible
 //! objects (e.g. DO Spaces). Postgres also maintains an exact, rebuildable
 //! metering projection over the associated hashes.

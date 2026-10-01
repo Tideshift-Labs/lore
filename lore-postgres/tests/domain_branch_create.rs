@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! SERVER transaction tests. Each ignored case requires an owned PostgreSQL database.
+//! SERVER transaction tests. Each ignored case requires an owned `PostgreSQL` database.
 
 #[path = "common/delete_observations.rs"]
 mod delete_observations;
@@ -425,13 +425,13 @@ async fn repository_and_first_parent_read_sets_are_exact() {
                 input.parent_metadata = Some(BranchCreateParentMetadata {
                     branch_id: repo.default_branch_id.clone(),
                     metadata_hash: None,
-                })
+                });
             }
             _ => {
                 input.parent_metadata = Some(BranchCreateParentMetadata {
                     branch_id: id(),
                     metadata_hash: Some(vec![4; 32]),
-                })
+                });
             }
         }
         rejected(
@@ -740,7 +740,7 @@ async fn repository_delete_racing_create_never_publishes_after_the_tombstone() {
     }
     match created.outcome {
         DomainOutcome::Applied => {
-            assert_eq!(created.public_result, Some(input.public_result.clone()))
+            assert_eq!(created.public_result, Some(input.public_result.clone()));
         }
         other => {
             rejected(other, TOMBSTONED_V1);

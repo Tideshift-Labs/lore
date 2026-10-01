@@ -341,10 +341,10 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
             // Step 4: atomic rename onto the content-derived identity, into the
             // leaf step 1 synced and still holds. A rename into a leaf a purge
             // removed redoes step 1 before retrying.
-            "root.rename_into(&temporary, resolved, &leaf)",
+            "ConfinedRoot::rename_into(&temporary, resolved, &leaf)",
             "leaf = ensure_parent_retrying(root, resolved)?;",
             // Step 5: the leaf directory entry is durable only after this.
-            "root.sync_leaf(&leaf, resolved)",
+            "ConfinedRoot::sync_leaf(&leaf, resolved)",
         ],
     );
     let retrying = function(&source, "fn ensure_parent_retrying(");

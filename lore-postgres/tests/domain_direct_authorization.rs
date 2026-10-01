@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 //! Direct authorization evidence against disposable Postgres. Run with
-//! LORE_TEST_PG_URL and --ignored. Each test creates its own database.
+//! `LORE_TEST_PG_URL` and --ignored. Each test creates its own database.
 
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::coordinator::DomainTransactionStore;

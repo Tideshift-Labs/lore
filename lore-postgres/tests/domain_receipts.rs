@@ -128,7 +128,7 @@ fn assert_check_violation(err: &tokio_postgres::Error, expected_constraint: &str
 }
 
 /// Positive controls: the three legal row shapes (PREPARED, COMMITTED
-/// APPLIED, COMMITTED NOT_APPLIED) must all be accepted. Kept alongside the
+/// APPLIED, COMMITTED `NOT_APPLIED`) must all be accepted. Kept alongside the
 /// negative cases below so a constraint that is simply too strict (rejecting
 /// everything) cannot masquerade as "the negative cases all pass" — see the
 /// testing guide's note that a negative control alone doesn't prove the

@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Empty database prerequisite setup reused from domain_fragment_clean_init.rs.
+//! Empty database prerequisite setup reused from `domain_fragment_clean_init.rs`.
 
 use async_trait::async_trait;
 use lore_postgres::domain::PostgresDomainStore;

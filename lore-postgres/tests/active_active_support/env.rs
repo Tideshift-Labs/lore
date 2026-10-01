@@ -30,9 +30,9 @@ pub const NOT_RUN_MARKER: &str = "WP109-NOT-RUN:";
 /// Postgres reachable by both coordinator sets. One database per case; the
 /// runner creates and drops it.
 pub const PG_URL_VAR: &str = "LORE_TEST_PG_URL";
-/// S3-compatible endpoint (MinIO locally).
+/// S3-compatible endpoint (`MinIO` locally).
 pub const S3_ENDPOINT_VAR: &str = "LORE_TEST_S3_ENDPOINT";
-/// Region handed to the SDK. Optional; MinIO ignores it.
+/// Region handed to the SDK. Optional; `MinIO` ignores it.
 pub const S3_REGION_VAR: &str = "LORE_TEST_S3_REGION";
 /// Access key. Read by the AWS SDK itself, checked here so a missing
 /// credential is NOT RUN rather than an opaque SDK error mid-race.

@@ -102,7 +102,7 @@ pub const RESET_REASONS: [i32; 5] = [
 /// one would let a detector choose which fence it installs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResetReport {
-    /// UUIDv5 of the lowercase hexadecimal fingerprint.
+    /// `UUIDv5` of the lowercase hexadecimal fingerprint.
     pub detection_id: String,
     /// SHA-256 over the contract's canonical preimage.
     pub reset_fingerprint: [u8; 32],

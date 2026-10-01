@@ -1581,8 +1581,8 @@ struct CompletionReadyOperation {
 /// and the Phase-2 active-release acknowledgement, exactly as
 /// `terminal_phase1_replays_then_atomically_exchanges_receipt_fence_for_tombstone` does inline,
 /// but factored so the D2 sequence-ordering tests below can drive more than one operation through
-/// it and, via `shared_identity`, share one namespace (verified_issuer/authenticated_subject/
-/// tenant_scope_key) across them the way real assignments in one namespace would.
+/// it and, via `shared_identity`, share one namespace (`verified_issuer/authenticated_subject`/
+/// `tenant_scope_key`) across them the way real assignments in one namespace would.
 async fn prepare_operation_ready_for_completion(
     store: &PostgresDomainStore,
     direct: &mut Client,
@@ -2049,7 +2049,7 @@ async fn terminal_phase2_completion_lower_sequence_and_replay_pin_current_behavi
 /// an honest APPLIED attach against a receipt stored APPLIED was always refused -- but
 /// `WIRE_TERMINAL_OUTCOME_APPLIED` (1) and `RECEIPT_OUTCOME_NOT_APPLIED` (1) are the SAME number,
 /// so the same raw compare would have silently ACCEPTED a platform claiming APPLIED against a
-/// receipt this crate had actually committed NOT_APPLIED. That numeric collision, not just the
+/// receipt this crate had actually committed `NOT_APPLIED`. That numeric collision, not just the
 /// refusal, is why the mapping has to be a real function and not a raw integer compare.
 #[test]
 fn wire_terminal_outcome_never_matches_the_receipt_column_raw() {
@@ -2133,7 +2133,7 @@ async fn terminal_attach_accepts_wire_applied_against_stored_applied_receipt() {
     );
 }
 
-/// Companion to the APPLIED acceptance case: wire NOT_APPLIED (2) must resolve to the storage code
+/// Companion to the APPLIED acceptance case: wire `NOT_APPLIED` (2) must resolve to the storage code
 /// `RECEIPT_OUTCOME_NOT_APPLIED` (1) and be accepted against a receipt this rail commits with
 /// `DomainOutcome::NotApplied`.
 #[tokio::test]
@@ -2204,7 +2204,7 @@ async fn terminal_attach_refuses_a_storage_encoded_terminal_outcome() {
     );
 }
 
-/// Two more refusal pins: wire APPLIED against a receipt actually stored NOT_APPLIED must be
+/// Two more refusal pins: wire APPLIED against a receipt actually stored `NOT_APPLIED` must be
 /// Mismatch (the two are genuinely different outcomes, not a coincidental raw-value collision like
 /// the storage-encoding case above), and an out-of-domain wire value (neither 1 nor 2) must be
 /// Mismatch regardless of what the receipt stores, because `WireTerminalOutcome::receipt_outcome()`
@@ -3479,7 +3479,7 @@ async fn completion_retention_persists_each_later_of_arm_and_refuses_early_prune
     }
 }
 
-/// Only this owned test transaction resolves clock_timestamp through a database
+/// Only this owned test transaction resolves `clock_timestamp` through a database
 /// fixture. The shipped coordinator and database defaults keep their real clock.
 #[tokio::test]
 #[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]

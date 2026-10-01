@@ -268,7 +268,7 @@ async fn hidden_retry_case() {
         .await
         .expect("connect owned assertion database");
     let connection = AbortOnDropHandle::new(lore_base::lore_spawn!(async move {
-        connection.await.expect("assertion connection")
+        connection.await.expect("assertion connection");
     }));
     let row = admin.query_one("SELECT (SELECT system_identifier::text FROM pg_control_system()), (SELECT oid FROM pg_database WHERE datname=current_database())", &[]).await.unwrap();
     let identity = FragmentDatabaseIdentity::new(&row.get::<_, String>(0), row.get(1)).unwrap();

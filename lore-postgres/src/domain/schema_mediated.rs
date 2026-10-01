@@ -9,7 +9,7 @@
 //! guess. The lifecycle rows in `schema.rs` stand alone without it.
 //!
 //! **Non-overlap of prune ranges is enforced by the bounded marker-prune merge
-//! transaction, not by an exclusion constraint.** A GiST `EXCLUDE` over
+//! transaction, not by an exclusion constraint.** A `GiST` `EXCLUDE` over
 //! `(namespace..., int8range(start, end))` would need the `btree_gist`
 //! extension, and `CREATE EXTENSION` is not something boot-time DDL may assume
 //! it can run on a managed cell database. The intended design is that every

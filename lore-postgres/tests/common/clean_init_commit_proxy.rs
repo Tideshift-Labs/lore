@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Plaintext test-only PostgreSQL proxy. Drops an actual COMMIT CommandComplete exactly once.
+//! Plaintext test-only `PostgreSQL` proxy. Drops an actual COMMIT `CommandComplete` exactly once.
 //! Adapted from lore-object-dispatch/tests/dispatch_client_live.rs; no production transport hook.
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

@@ -91,7 +91,7 @@ pub(crate) async fn allow_publication(tx: &Transaction<'_>) -> Result<(), Domain
 /// Activate under table locks that drain all prior writes and repository
 /// preflights. An old transaction whose first write comes later sees the
 /// unconditional trigger, even with a pre-activation Repeatable Read snapshot.
-/// This does not rotate provider credentials: ClaimsRequired remains required.
+/// This does not rotate provider credentials: `ClaimsRequired` remains required.
 pub(crate) async fn activate(tx: &Transaction<'_>) -> Result<(), DomainError> {
     tx.batch_execute(
         "LOCK TABLE lore_domain_repositories, lore_domain_branches, lore_mutable, \

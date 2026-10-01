@@ -236,7 +236,7 @@ fn build_lock_event(
     owner_token: &[u8],
 ) -> Result<PendingEvent, DomainError> {
     let namespace = lock_namespace_id(repository_id, branch_id);
-    let fence = u64::try_from(committed_fence).map_err(|_| {
+    let fence = u64::try_from(committed_fence).map_err(|_err| {
         DomainError::Internal(format!(
             "lock outbox aggregate_version ordinal must be non-negative, got {committed_fence}"
         ))
@@ -2107,10 +2107,13 @@ async fn upsert_fenced_lock(
 ) -> Result<(), DomainError> {
     let locked_at = renewed_at
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| DomainError::Internal("database lock clock predates Unix epoch".to_owned()))?
+        .map_err(|_err| {
+            DomainError::Internal("database lock clock predates Unix epoch".to_owned())
+        })?
         .as_millis();
-    let locked_at = i64::try_from(locked_at)
-        .map_err(|_| DomainError::Internal("database lock clock exceeds i64 millis".to_owned()))?;
+    let locked_at = i64::try_from(locked_at).map_err(|_err| {
+        DomainError::Internal("database lock clock exceeds i64 millis".to_owned())
+    })?;
     tx.execute(
         "INSERT INTO lore_locks ( \
              repository, branch, hash, owner, description, locked_at, \
@@ -2404,13 +2407,13 @@ fn lock_binding(
         &lease_duration
             .map(|duration| u64::try_from(duration.as_millis()))
             .transpose()
-            .map_err(|_| DomainError::InvalidInput("lease milliseconds exceed u64".to_owned()))?
+            .map_err(|_err| DomainError::InvalidInput("lease milliseconds exceed u64".to_owned()))?
             .unwrap_or(0)
             .to_be_bytes(),
     );
     body.extend_from_slice(
         &u32::try_from(resources.len())
-            .map_err(|_| DomainError::InvalidInput("too many lock resources".to_owned()))?
+            .map_err(|_err| DomainError::InvalidInput("too many lock resources".to_owned()))?
             .to_be_bytes(),
     );
     for resource in resources {
@@ -2443,7 +2446,7 @@ fn lock_binding(
 fn append_framed(target: &mut Vec<u8>, value: &[u8]) -> Result<(), DomainError> {
     target.extend_from_slice(
         &u32::try_from(value.len())
-            .map_err(|_| DomainError::InvalidInput("lock binding field exceeds u32".to_owned()))?
+            .map_err(|_err| DomainError::InvalidInput("lock binding field exceeds u32".to_owned()))?
             .to_be_bytes(),
     );
     target.extend_from_slice(value);
@@ -2645,7 +2648,9 @@ fn append_result_field(target: &mut Vec<u8>, value: &[u8]) {
 fn append_system_time(target: &mut Vec<u8>, value: SystemTime) -> Result<(), DomainError> {
     let duration = value
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| DomainError::Internal("database lock timestamp predates epoch".to_owned()))?;
+        .map_err(|_err| {
+            DomainError::Internal("database lock timestamp predates epoch".to_owned())
+        })?;
     target.extend_from_slice(&duration.as_secs().to_be_bytes());
     target.extend_from_slice(&duration.subsec_nanos().to_be_bytes());
     Ok(())
@@ -2659,8 +2664,9 @@ pub(crate) fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, D
     }
     let mut reader = ResultReader::new(bytes);
     reader.expect_bytes(b"lock-result-v1\0")?;
-    let count = usize::try_from(reader.u32()?)
-        .map_err(|_| DomainError::Internal("stored lock result count exceeds usize".to_owned()))?;
+    let count = usize::try_from(reader.u32()?).map_err(|_err| {
+        DomainError::Internal("stored lock result count exceeds usize".to_owned())
+    })?;
     if count > MAX_BATCH_RESOURCES {
         return Err(DomainError::Internal(format!(
             "stored lock result count {count} exceeds {MAX_BATCH_RESOURCES}"
@@ -2676,7 +2682,7 @@ pub(crate) fn decode_canonical_result(bytes: &[u8]) -> Result<Vec<FencedLock>, D
         let ownership_token: [u8; 32] = reader
             .exact(32)?
             .try_into()
-            .map_err(|_| DomainError::Internal("stored lock token width changed".to_owned()))?;
+            .map_err(|_err| DomainError::Internal("stored lock token width changed".to_owned()))?;
         let fence = reader.i64()?;
         let repository_lock_generation = reader.i64()?;
         let branch_lock_generation = reader.i64()?;
@@ -2751,21 +2757,21 @@ impl<'a> ResultReader<'a> {
 
     fn u32(&mut self) -> Result<u32, DomainError> {
         Ok(u32::from_be_bytes(self.exact(4)?.try_into().map_err(
-            |_| DomainError::Internal("stored lock u32 is truncated".to_owned()),
+            |_err| DomainError::Internal("stored lock u32 is truncated".to_owned()),
         )?))
     }
 
     fn i64(&mut self) -> Result<i64, DomainError> {
         Ok(i64::from_be_bytes(self.exact(8)?.try_into().map_err(
-            |_| DomainError::Internal("stored lock i64 is truncated".to_owned()),
+            |_err| DomainError::Internal("stored lock i64 is truncated".to_owned()),
         )?))
     }
 
     fn system_time(&mut self) -> Result<SystemTime, DomainError> {
-        let secs = u64::from_be_bytes(self.exact(8)?.try_into().map_err(|_| {
+        let secs = u64::from_be_bytes(self.exact(8)?.try_into().map_err(|_err| {
             DomainError::Internal("stored lock timestamp seconds are truncated".to_owned())
         })?);
-        let nanos = u32::from_be_bytes(self.exact(4)?.try_into().map_err(|_| {
+        let nanos = u32::from_be_bytes(self.exact(4)?.try_into().map_err(|_err| {
             DomainError::Internal("stored lock timestamp nanos are truncated".to_owned())
         })?);
         if nanos >= 1_000_000_000 {
@@ -2780,7 +2786,7 @@ impl<'a> ResultReader<'a> {
 
     fn field(&mut self, max: usize) -> Result<Vec<u8>, DomainError> {
         let len = usize::try_from(self.u32()?)
-            .map_err(|_| DomainError::Internal("stored lock field exceeds usize".to_owned()))?;
+            .map_err(|_err| DomainError::Internal("stored lock field exceeds usize".to_owned()))?;
         if len > max {
             return Err(DomainError::Internal(format!(
                 "stored lock field length {len} exceeds {max}"
@@ -2791,7 +2797,7 @@ impl<'a> ResultReader<'a> {
 
     fn string(&mut self, max: usize) -> Result<String, DomainError> {
         String::from_utf8(self.field(max)?)
-            .map_err(|_| DomainError::Internal("stored lock string is not UTF-8".to_owned()))
+            .map_err(|_err| DomainError::Internal("stored lock string is not UTF-8".to_owned()))
     }
 
     fn is_empty(&self) -> bool {

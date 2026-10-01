@@ -1,6 +1,6 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-//! Database writer cutover. Each ignored case needs its own empty PostgreSQL database.
+//! Database writer cutover. Each ignored case needs its own empty `PostgreSQL` database.
 
 use std::time::Duration;
 

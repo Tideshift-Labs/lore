@@ -6,7 +6,7 @@
 //!
 //! Every case is `#[ignore]` and is executed by
 //! `run-fragment-lifecycle-live.ps1`, which gives each exact case a fresh
-//! PostgreSQL 16 database. Offline pins (DDL, `FragmentWriteClaimKind`,
+//! `PostgreSQL` 16 database. Offline pins (DDL, `FragmentWriteClaimKind`,
 //! the `ready_for_lifecycle` exact-schema-version guardrail) live in
 //! `fragment_write_claim_schema.rs`.
 //!
@@ -36,7 +36,7 @@
 //! an object-key predicate that is not gated by kind. This file tests that
 //! shipped shape.
 //!
-//! # abandon_promotion: settlement is decided by the claim, not the caller
+//! # `abandon_promotion`: settlement is decided by the claim, not the caller
 //!
 //! `commit_promotion`'s `settlement` argument is IGNORED on the
 //! `IoObservation::Unusable` (abandon) path. Abandon settles by the claim's

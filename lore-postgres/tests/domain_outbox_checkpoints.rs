@@ -2032,7 +2032,7 @@ fn load_fixture(test_name: &str, name: &str) -> Option<Value> {
 }
 
 /// The fixture's "one-member-lags-below-the-sequence" case, driven from the
-/// file on disk: two ready receivers at 930 and 910, event broker_sequence
+/// file on disk: two ready receivers at 930 and 910, event `broker_sequence`
 /// 918, expected UNSAFE because the minimum (910) is below the sequence.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]

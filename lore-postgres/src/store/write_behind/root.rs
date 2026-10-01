@@ -194,15 +194,14 @@ impl ConfinedRoot {
         &self,
         path: StageIoPath,
     ) -> Result<OwnedSemaphorePermit, WriteBehindError> {
-        match self.inner.io_capacity.clone().try_acquire_owned() {
-            Ok(permit) => Ok(permit),
-            Err(_) => {
-                crate::metrics::record_stage_io_refusal(&path.refusal_labels());
-                Err(WriteBehindError::Io {
-                    operation: "staging I/O capacity",
-                    kind: std::io::ErrorKind::WouldBlock,
-                })
-            }
+        if let Ok(permit) = self.inner.io_capacity.clone().try_acquire_owned() {
+            Ok(permit)
+        } else {
+            crate::metrics::record_stage_io_refusal(&path.refusal_labels());
+            Err(WriteBehindError::Io {
+                operation: "staging I/O capacity",
+                kind: std::io::ErrorKind::WouldBlock,
+            })
         }
     }
 
@@ -456,7 +455,6 @@ mod platform {
         /// Step 4: rename the synced temporary file into the held leaf.
         /// `NotFound` when the leaf has been removed since `ensure_parent`.
         pub(crate) fn rename_into(
-            &self,
             temporary: &Path,
             resolved: &ResolvedStagedPath,
             leaf: &StagedLeaf,
@@ -474,7 +472,6 @@ mod platform {
 
         /// Step 5: make the renamed entry durable in the held leaf.
         pub(crate) fn sync_leaf(
-            &self,
             leaf: &StagedLeaf,
             resolved: &ResolvedStagedPath,
         ) -> Result<(), WriteBehindError> {
@@ -820,7 +817,6 @@ mod platform {
         }
 
         pub(crate) fn rename_into(
-            &self,
             _temporary: &Path,
             _resolved: &ResolvedStagedPath,
             _leaf: &StagedLeaf,
@@ -829,7 +825,6 @@ mod platform {
         }
 
         pub(crate) fn sync_leaf(
-            &self,
             _leaf: &StagedLeaf,
             _resolved: &ResolvedStagedPath,
         ) -> Result<(), WriteBehindError> {

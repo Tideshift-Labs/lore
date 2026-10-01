@@ -4,7 +4,7 @@
 //! Integration tests for the Postgres-backed immutable store (CR-007).
 //!
 //! Fragment payload metadata and bytes live atomically on the S3-compatible
-//! object (MinIO / LocalStack / DO Spaces). Postgres keeps repository/context
+//! object (`MinIO` / `LocalStack` / DO Spaces). Postgres keeps repository/context
 //! associations, mutable obliteration state, and a rebuildable metering
 //! projection.
 //!

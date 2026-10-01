@@ -1462,42 +1462,39 @@ impl DomainTransactionStore for PostgresDomainStore {
             return Ok(result);
         }
 
-        let (repository_generation, branch_generation) = match branch {
-            Some(branch) => {
-                let branch_generation = next_generation(branch.generation)?;
-                tx.execute(
-                    "UPDATE lore_domain_branches \
-                     SET metadata_hash = $3, generation = $4 \
-                     WHERE repository_id = $1 AND branch_id = $2",
-                    &[
-                        &input.repository_id,
-                        input
-                            .branch_id
-                            .as_ref()
-                            .ok_or_else(|| DomainError::Internal("branch id vanished".into()))?,
-                        &input.new_hash,
-                        &branch_generation,
-                    ],
-                )
-                .await
-                .map_err(|e| DomainError::from_pg("branch metadata cas", e))?;
-                (repository.generation, Some(branch_generation))
-            }
-            None => {
-                let repository_generation = next_generation(repository.generation)?;
-                tx.execute(
-                    "UPDATE lore_domain_repositories \
-                     SET metadata_hash = $2, generation = $3 WHERE repository_id = $1",
-                    &[
-                        &input.repository_id,
-                        &input.new_hash,
-                        &repository_generation,
-                    ],
-                )
-                .await
-                .map_err(|e| DomainError::from_pg("repository metadata cas", e))?;
-                (repository_generation, None)
-            }
+        let (repository_generation, branch_generation) = if let Some(branch) = branch {
+            let branch_generation = next_generation(branch.generation)?;
+            tx.execute(
+                "UPDATE lore_domain_branches \
+                 SET metadata_hash = $3, generation = $4 \
+                 WHERE repository_id = $1 AND branch_id = $2",
+                &[
+                    &input.repository_id,
+                    input
+                        .branch_id
+                        .as_ref()
+                        .ok_or_else(|| DomainError::Internal("branch id vanished".into()))?,
+                    &input.new_hash,
+                    &branch_generation,
+                ],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("branch metadata cas", e))?;
+            (repository.generation, Some(branch_generation))
+        } else {
+            let repository_generation = next_generation(repository.generation)?;
+            tx.execute(
+                "UPDATE lore_domain_repositories \
+                 SET metadata_hash = $2, generation = $3 WHERE repository_id = $1",
+                &[
+                    &input.repository_id,
+                    &input.new_hash,
+                    &repository_generation,
+                ],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("repository metadata cas", e))?;
+            (repository_generation, None)
         };
 
         apply_projection(&tx, &input.projection).await?;

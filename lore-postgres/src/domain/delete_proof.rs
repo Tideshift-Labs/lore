@@ -27,7 +27,7 @@ fn fixed(bytes: &[u8], width: usize) -> Result<(), DomainError> {
 
 fn frame(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), DomainError> {
     let len = u32::try_from(bytes.len())
-        .map_err(|_| DomainError::InvalidInput("delete proof field exceeds u32".into()))?;
+        .map_err(|_err| DomainError::InvalidInput("delete proof field exceeds u32".into()))?;
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(bytes);
     Ok(())
@@ -49,7 +49,7 @@ fn prefix(domain: &[u8], receipt: &DeleteProofReceipt<'_>) -> Result<Vec<u8>, Do
     ] {
         frame(&mut out, bytes)?;
     }
-    let version = u32::try_from(binding.fingerprint_version).map_err(|_| {
+    let version = u32::try_from(binding.fingerprint_version).map_err(|_err| {
         DomainError::InvalidInput("negative delete proof fingerprint version".into())
     })?;
     out.extend_from_slice(&version.to_be_bytes());
@@ -124,5 +124,5 @@ pub(crate) async fn persisted_receipt(
 
 pub(crate) fn generation(value: i64) -> Result<u64, DomainError> {
     u64::try_from(value)
-        .map_err(|_| DomainError::Internal("negative stored delete generation".into()))
+        .map_err(|_err| DomainError::Internal("negative stored delete generation".into()))
 }

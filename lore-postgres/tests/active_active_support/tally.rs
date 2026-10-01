@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-/// SplitMix64. Small, dependency-free, and good enough for identity material;
+/// `SplitMix64`. Small, dependency-free, and good enough for identity material;
 /// nothing here is cryptographic.
 pub struct Identities {
     seed: u64,

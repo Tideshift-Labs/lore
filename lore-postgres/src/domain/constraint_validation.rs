@@ -6,7 +6,7 @@
 //! The boot path adds every constraint on a table that may already hold rows
 //! as `NOT VALID`, because `ensure_schema_online` runs under a 250 ms statement
 //! timeout and a validating `ADD CONSTRAINT` scans the whole table under
-//! ACCESS EXCLUSIVE. PostgreSQL still enforces a `NOT VALID` constraint on every
+//! ACCESS EXCLUSIVE. `PostgreSQL` still enforces a `NOT VALID` constraint on every
 //! insert and update. It skips only the proof over rows that already existed,
 //! and `pg_constraint.convalidated` stays false until something runs
 //! `ALTER TABLE ... VALIDATE CONSTRAINT`. Nothing on the boot path does.
@@ -40,19 +40,19 @@ use crate::domain::errors::DomainError;
 /// What happened to one `NOT VALID` constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationOutcome {
-    /// PostgreSQL scanned the table and marked the constraint validated.
+    /// `PostgreSQL` scanned the table and marked the constraint validated.
     Validated,
     /// An existing row breaks the constraint. It stays `NOT VALID`, and still
     /// binds every new write; the row needs an operator's repair first.
     Violated(String),
     /// The table lock was not granted within the lock timeout.
     LockTimeout,
-    /// PostgreSQL reported `QUERY_CANCELED`. Usually the scan ran past the
+    /// `PostgreSQL` reported `QUERY_CANCELED`. Usually the scan ran past the
     /// statement timeout, but the same SQLSTATE also covers an operator's
     /// manual `pg_cancel_backend`, so this outcome does not claim which one
     /// happened.
     StatementTimeout,
-    /// Any other failure, with PostgreSQL's message.
+    /// Any other failure, with `PostgreSQL`'s message.
     Failed(String),
 }
 
@@ -69,7 +69,7 @@ impl ValidationOutcome {
         }
     }
 
-    /// PostgreSQL's message, when the outcome carries one.
+    /// `PostgreSQL`'s message, when the outcome carries one.
     #[must_use]
     pub fn detail(&self) -> Option<&str> {
         match self {
@@ -200,7 +200,7 @@ pub async fn validate_not_valid_constraints(
     Ok(results)
 }
 
-/// One catalog row, with the statement PostgreSQL quoted for it.
+/// One catalog row, with the statement `PostgreSQL` quoted for it.
 struct PendingConstraint {
     relation: String,
     constraint: String,
@@ -309,8 +309,8 @@ mod tests {
     }
 
     /// A SQLSTATE this run has no other classification for — e.g. the
-    /// table-owner-role gap the runbook now documents (INSUFFICIENT_PRIVILEGE,
-    /// `42501`) — falls through to `Failed` with PostgreSQL's own message
+    /// table-owner-role gap the runbook now documents (`INSUFFICIENT_PRIVILEGE`,
+    /// `42501`) — falls through to `Failed` with `PostgreSQL`'s own message
     /// preserved, rather than being silently dropped or misclassified as one
     /// of the named outcomes.
     #[test]

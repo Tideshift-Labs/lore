@@ -11,10 +11,10 @@
 //! `NOT_APPLIED(reason_version, reason)`. A terminal row is immutable, and
 //! lookup never returns the token.
 //!
-//! **PostgreSQL `clock_timestamp()` is the sole time authority** for every admission,
+//! **`PostgreSQL` `clock_timestamp()` is the sole time authority** for every admission,
 //! expiry, and retention decision an operation makes. A process clock is never
 //! consulted, because two replicas with opposing skew must agree on whether a
-//! given UUIDv7 is stale, in-window, or beyond the horizon. UUIDv7 *syntax* is
+//! given `UUIDv7` is stale, in-window, or beyond the horizon. `UUIDv7` *syntax* is
 //! parsed before database access — that is a wire-format check, not a time
 //! decision.
 //!
@@ -66,12 +66,12 @@ pub const PREPARED_HARD_TTL_EXPIRED_V1: &str = "PREPARED_HARD_TTL_EXPIRED_V1";
 
 /// CR-029 wire tag 10 (`lore.domain.v1.DomainOperationOutcome`): APPLIED.
 ///
-/// The wire enum reserves 0 for `UNSPECIFIED`, so its APPLIED/NOT_APPLIED pair
+/// The wire enum reserves 0 for `UNSPECIFIED`, so its `APPLIED/NOT_APPLIED` pair
 /// is 1/2 while this crate's receipt column stores 0/1
 /// (`schema::RECEIPT_OUTCOME_*`). The two encodings are different bases on
 /// purpose and a raw comparison between them is always wrong.
 pub const WIRE_TERMINAL_OUTCOME_APPLIED: i16 = 1;
-/// CR-029 wire tag 10 (`lore.domain.v1.DomainOperationOutcome`): NOT_APPLIED.
+/// CR-029 wire tag 10 (`lore.domain.v1.DomainOperationOutcome`): `NOT_APPLIED`.
 pub const WIRE_TERMINAL_OUTCOME_NOT_APPLIED: i16 = 2;
 
 /// A terminal outcome still in the CR-029 **wire** encoding.
@@ -80,7 +80,7 @@ pub const WIRE_TERMINAL_OUTCOME_NOT_APPLIED: i16 = 2;
 /// holds a wire value, not a storage code, and must say so in the type. The two
 /// encodings overlap without agreeing, so comparing them raw is wrong in both
 /// directions: wire APPLIED (1) never equals stored APPLIED (0), which refused
-/// every honest attach, and wire APPLIED (1) *does* equal stored NOT_APPLIED
+/// every honest attach, and wire APPLIED (1) *does* equal stored `NOT_APPLIED`
 /// (1), which accepted an attach that disagreed with its own receipt. Keeping
 /// the domains distinct in the type is also what stops a hand-built fixture
 /// from carrying a storage-encoded outcome into an input the gRPC layer could
@@ -99,7 +99,7 @@ pub struct WireTerminalOutcome(i16);
 impl WireTerminalOutcome {
     /// The wire APPLIED tag.
     pub const APPLIED: Self = Self(WIRE_TERMINAL_OUTCOME_APPLIED);
-    /// The wire NOT_APPLIED tag.
+    /// The wire `NOT_APPLIED` tag.
     pub const NOT_APPLIED: Self = Self(WIRE_TERMINAL_OUTCOME_NOT_APPLIED);
 
     /// Wrap a raw wire value.
@@ -146,7 +146,7 @@ pub struct ReceiptKey {
     /// independently of the token's resource list. `urc-*` never appears in it
     /// (CR-029 R-BLOCK-5).
     pub tenant_scope_key: Vec<u8>,
-    /// RFC 9562 UUIDv7, 16 bytes.
+    /// RFC 9562 `UUIDv7`, 16 bytes.
     pub operation_id: Uuid,
 }
 
@@ -219,7 +219,7 @@ pub enum ReceiptLookup {
     NotFound,
 }
 
-/// Extract the RFC 9562 UUIDv7 timestamp.
+/// Extract the RFC 9562 `UUIDv7` timestamp.
 ///
 /// Syntax and version are parsed before database access on purpose: a malformed
 /// or non-v7 key is a wire-format error that must be rejected before prepare,
@@ -692,7 +692,7 @@ async fn classify_existing_prepare(
     let token: [u8; 32] = token
         .as_slice()
         .try_into()
-        .map_err(|_| DomainError::Internal("stored consume token is not 32 bytes".to_owned()))?;
+        .map_err(|_err| DomainError::Internal("stored consume token is not 32 bytes".to_owned()))?;
     Ok(PrepareResult::Prepared {
         token,
         hard_expires_at: row.hard_expires_at,
@@ -1312,7 +1312,7 @@ pub async fn attempt_receipt_get(
     let row = &rows[0];
     let operation_id: Vec<u8> = row.get(1);
     let operation_id = Uuid::from_slice(&operation_id)
-        .map_err(|_| DomainError::Internal("stored operation id is not a UUID".to_owned()))?;
+        .map_err(|_err| DomainError::Internal("stored operation id is not a UUID".to_owned()))?;
     let key = ReceiptKey {
         verified_issuer: verified_issuer.to_owned(),
         authenticated_subject: authenticated_subject.to_owned(),
@@ -1388,7 +1388,7 @@ pub async fn attempt_receipt_get(
     })
 }
 
-/// Internal BranchCreate retry: read terminal evidence without a consume token
+/// Internal `BranchCreate` retry: read terminal evidence without a consume token
 /// or a second platform witness. Never authorizes a fresh mutation.
 pub async fn branch_create_terminal_replay(
     tx: &Transaction<'_>,

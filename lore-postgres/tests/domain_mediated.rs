@@ -13,7 +13,7 @@
 //!   for this key", so what's tested here is the atomicity the code depends
 //!   on: the delete-and-insert either both happen or neither does.
 //! - prune-range non-overlap: the module docs say plainly that this is
-//!   enforced by the namespace row lock in code, not by a GiST `EXCLUDE`
+//!   enforced by the namespace row lock in code, not by a `GiST` `EXCLUDE`
 //!   (which would need `CREATE EXTENSION btree_gist`, unavailable to
 //!   boot-time DDL on a managed cell database), with the unique indexes on
 //!   `start_sequence`/`end_sequence` as a catalog backstop that only catches

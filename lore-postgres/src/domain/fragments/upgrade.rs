@@ -354,7 +354,7 @@ impl PostgresFragmentCoordinator {
     ///
     /// `numbackends` counts every backend on the database whatever its role,
     /// where `pg_stat_activity` hides other roles' sessions from an
-    /// unprivileged caller (CR-038 measured this on PostgreSQL 16). Every
+    /// unprivileged caller (CR-038 measured this on `PostgreSQL` 16). Every
     /// connection this pool holds is this process's, so the pool's size is
     /// subtracted. A backend that is still exiting gets a short bounded wait.
     async fn refuse_other_backends(&self, tx: &Transaction<'_>) -> Result<(), DomainError> {

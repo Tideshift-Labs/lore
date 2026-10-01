@@ -3,7 +3,7 @@
 //! CR-039: real-Postgres proof for `PostgresFragmentCoordinator::upgrade_clean_schema`.
 //!
 //! Every case is `#[ignore]` and executed by `run-fragment-schema-upgrade-live.ps1`,
-//! which gives each exact case a fresh PostgreSQL 16 database. No MinIO/S3 is
+//! which gives each exact case a fresh `PostgreSQL` 16 database. No MinIO/S3 is
 //! required: the upgrade is offline and database-only (no provider I/O).
 //!
 //! The seam fixture ([`revision4_clean_cell`]) follows CR-039's own test-spec

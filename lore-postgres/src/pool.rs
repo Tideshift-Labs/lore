@@ -85,7 +85,7 @@ pub struct TlsConfig {
 /// serializes all `CREATE TABLE/INDEX IF NOT EXISTS` across every store and
 /// every replica: Postgres `IF NOT EXISTS` DDL is *not* concurrency-safe (two
 /// simultaneous runs can fail with "tuple concurrently updated" /
-/// "duplicate key … pg_type"), which bites when multiple loreserver replicas in
+/// "duplicate key … `pg_type`"), which bites when multiple loreserver replicas in
 /// a cell boot at once. The value is arbitrary but must be stable across the
 /// fleet.
 pub(crate) const SCHEMA_LOCK_KEY: i64 = 0x_6C6F_7265_7067; // "lorepg"

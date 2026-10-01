@@ -398,7 +398,7 @@ async fn attest_unversioned_bucket(
         return Err(PostgresFragmentTransportConfigError::BucketVersioningAttemptCount);
     }
     let output =
-        result.map_err(|_| PostgresFragmentTransportConfigError::BucketVersioningProbeFailed)?;
+        result.map_err(|_err| PostgresFragmentTransportConfigError::BucketVersioningProbeFailed)?;
     match output.status() {
         None => Ok(UnversionedBucketAttestation { client, bucket }),
         Some(BucketVersioningStatus::Enabled) => {
@@ -499,11 +499,15 @@ impl FragmentGetPort for PostgresFragmentS3Transport {
 fn sdk_outcome<E, R>(error: &SdkError<E, R>) -> ProviderAttemptOutcome {
     match error {
         SdkError::ServiceError(_) => ProviderAttemptOutcome::Decisive,
-        SdkError::ResponseError(_) => ProviderAttemptOutcome::Ambiguous,
         _ => ProviderAttemptOutcome::Ambiguous,
     }
 }
 
+// Reason: `ResponseError` names the same outcome the wildcard already covers, but it is named
+// on purpose - an HTTP response parsing failure cannot prove whether the conditional PUT reached
+// the provider, so it is ambiguous for its own reason, not by falling through a catch-all.
+// `tests/fragment_transport_source_pins.rs` pins this arm's presence.
+#[allow(clippy::match_same_arms)]
 fn conditional_put_outcome<E, R>(error: &SdkError<E, R>) -> ProviderAttemptOutcome {
     match error {
         SdkError::ServiceError(_) => ProviderAttemptOutcome::Decisive,

@@ -1247,7 +1247,7 @@ async fn branch_delete_missing_repository_leaves_no_row() {
 }
 
 /// A branch under an already-tombstoned repository is refused `NOT_FOUND_V1`
-/// -- the repository's own tombstone already hides it, so branch_delete must
+/// -- the repository's own tombstone already hides it, so `branch_delete` must
 /// not resurrect the branch row to tombstone it a second time.
 #[tokio::test]
 #[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]

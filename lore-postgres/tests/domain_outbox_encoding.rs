@@ -9,7 +9,7 @@
 //! Loads `idempotency-key.json` relative to `CARGO_MANIFEST_DIR` and fails
 //! loudly -- not `#[ignore]`, not a skip -- if the fixture is absent, per the
 //! WP-119 Step A brief: "FAIL if absent, never skip." As of this writing the
-//! fixture exists (fixture_set_version 2, added 2026-09-03, closing blocker
+//! fixture exists (`fixture_set_version` 2, added 2026-09-03, closing blocker
 //! B2), so these tests are expected to run and pass.
 //!
 //! Two independent proofs, not one calling the other and comparing to itself:

@@ -515,7 +515,7 @@ pub struct FragmentManifest {
 /// *exactly* what I captured".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EpochWitness {
-    /// The FragmentId.
+    /// The `FragmentId`.
     pub hash: Vec<u8>,
     /// The exact epoch captured.
     pub epoch: i64,
@@ -530,7 +530,7 @@ pub struct EpochWitness {
 /// One resolved fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentResolution {
-    /// The FragmentId asked about.
+    /// The `FragmentId` asked about.
     pub hash: Vec<u8>,
     /// The verdict.
     pub verdict: FragmentVerdict,
@@ -609,7 +609,7 @@ impl FragmentVerdict {
 /// transaction open" is not expressible rather than merely discouraged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentIntent {
-    /// The FragmentId.
+    /// The `FragmentId`.
     pub hash: Vec<u8>,
     /// The epoch this operation will publish if it wins.
     pub epoch: i64,
@@ -686,7 +686,7 @@ impl FragmentWriteClaimInput {
         }
         let send_timeout_millis = duration_millis("fragment write send timeout", send_timeout)?;
         if send_timeout_millis
-            > i64::try_from(FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS).map_err(|_| {
+            > i64::try_from(FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS).map_err(|_err| {
                 DomainError::Internal(
                     "fragment provider send-timeout maximum exceeds i64".to_owned(),
                 )
@@ -929,7 +929,7 @@ impl FragmentDrainCandidate {
     pub fn original_flags(&self) -> u32 {
         self.original_flags
     }
-    /// The FragmentId.
+    /// The `FragmentId`.
     pub fn hash(&self) -> &[u8] {
         &self.hash
     }
@@ -1020,7 +1020,7 @@ pub struct FragmentWriteClaimPruneReport {
 impl FragmentWriteClaimPruneReport {
     fn new(examined: usize) -> Result<Self, DomainError> {
         Ok(Self {
-            examined: u64::try_from(examined).map_err(|_| {
+            examined: u64::try_from(examined).map_err(|_err| {
                 DomainError::Internal("fragment write claim prune batch exceeds u64".to_owned())
             })?,
             ..Self::default()
@@ -1414,7 +1414,7 @@ pub const REQUIRED_FRAGMENT_PROOF_UNAVAILABLE: &str = "required_fragment_proof_u
 /// A fragment the push requires, at the exact epoch preflight resolved it to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequiredFragment {
-    /// The FragmentId.
+    /// The `FragmentId`.
     pub hash: Vec<u8>,
     /// The epoch preflight saw.
     pub epoch: i64,
@@ -2192,7 +2192,7 @@ impl PostgresFragmentCoordinator {
                     "fragment repository stats column {column}: {error}"
                 ))
             })?;
-            u64::try_from(value).map_err(|_| {
+            u64::try_from(value).map_err(|_err| {
                 DomainError::Internal(format!(
                     "fragment repository stats column {column} is negative"
                 ))
@@ -2279,7 +2279,7 @@ impl PostgresFragmentCoordinator {
                     "fragment metering rebuild count column is invalid: {error}"
                 ))
             })?;
-        let authoritative = u64::try_from(authoritative).map_err(|_| {
+        let authoritative = u64::try_from(authoritative).map_err(|_err| {
             DomainError::Internal("fragment metering rebuild count is negative".to_owned())
         })?;
 
@@ -2325,7 +2325,7 @@ impl PostgresFragmentCoordinator {
                     "fragment metering rebuild stale count column is invalid: {error}"
                 ))
             })?;
-        let stale = u64::try_from(stale).map_err(|_| {
+        let stale = u64::try_from(stale).map_err(|_err| {
             DomainError::Internal("fragment metering rebuild stale count is negative".to_owned())
         })?;
         let removed = tx
@@ -2359,7 +2359,7 @@ impl PostgresFragmentCoordinator {
                     "fragment metering rebuild final count column is invalid: {error}"
                 ))
             })?;
-        let final_count = u64::try_from(final_count).map_err(|_| {
+        let final_count = u64::try_from(final_count).map_err(|_err| {
             DomainError::Internal("fragment metering rebuild final count is negative".to_owned())
         })?;
         if final_count != authoritative {
@@ -2579,7 +2579,7 @@ impl PostgresFragmentCoordinator {
     /// Claim the exact `Missing` epoch, state, and fence for a repair.
     ///
     /// Both explicit repair and put-on-`Missing` come through here: a client
-    /// re-offering bytes whose FragmentId matches a `Missing` head is a
+    /// re-offering bytes whose `FragmentId` matches a `Missing` head is a
     /// first-class repair, which is what preserves today's cheap self-heal
     /// (`store/immutable_store.rs:955-980`) without ever overwriting the legacy
     /// key. The successor takes a greater epoch and its own immutable key.
@@ -2853,13 +2853,13 @@ impl PostgresFragmentCoordinator {
     /// cannot on its own distinguish a drained table from a withheld one.
     /// Prepared, Sending, and Ambiguous are never
     /// selected by age. A Decisive claim is deleted only when its exact target
-    /// digest and size have been copied into durable epoch evidence; NoSend is
+    /// digest and size have been copied into durable epoch evidence; `NoSend` is
     /// safe after terminal retention because it never names a cleanup target.
     ///
     /// # Forward progress
     ///
     /// The plan query anti-joins against active claims, so a hash carrying a
-    /// live barrier contributes its NoSend claims and withholds only its
+    /// live barrier contributes its `NoSend` claims and withholds only its
     /// Decisive ones — exactly the rows the loop would skip. Selection, not
     /// ordering, is what fixes this: the order is by `settled_at`, so without
     /// the anti-join the oldest Decisive rows on one blocked hash win every
@@ -2873,9 +2873,9 @@ impl PostgresFragmentCoordinator {
     /// the locked check that actually gates the delete.
     ///
     /// It sits inside the Decisive arm, not over the whole predicate, because
-    /// the loop exempts NoSend from the barrier. A hash-wide anti-join over
+    /// the loop exempts `NoSend` from the barrier. A hash-wide anti-join over
     /// both arms would be stricter than the loop it feeds: it would stop
-    /// selecting NoSend rows on a barriered hash that the loop would happily
+    /// selecting `NoSend` rows on a barriered hash that the loop would happily
     /// prune, so a hash under continuous write traffic would accumulate them
     /// forever. The plan and the loop must agree on strictness in both
     /// directions.
@@ -3061,7 +3061,7 @@ impl PostgresFragmentCoordinator {
                     // `disposition`, it does not delete), so GC keeps a durable
                     // source that never depended on a claim row. What is removed
                     // here is an incidental handle. No GC package exists yet.
-                    let body_size = i64::try_from(target.body_size).map_err(|_| {
+                    let body_size = i64::try_from(target.body_size).map_err(|_err| {
                         DomainError::Internal(
                             "fragment write cleanup target size exceeds i64".to_owned(),
                         )
@@ -4749,9 +4749,10 @@ impl PostgresFragmentCoordinator {
                     "a staged epoch manifest identity is not 32 bytes".to_owned(),
                 ));
             }
-            let size_payload = u64::try_from(row.get::<_, i64>("size_payload")).map_err(|_| {
-                DomainError::Internal("a staged epoch payload size is negative".to_owned())
-            })?;
+            let size_payload =
+                u64::try_from(row.get::<_, i64>("size_payload")).map_err(|_err| {
+                    DomainError::Internal("a staged epoch payload size is negative".to_owned())
+                })?;
             if size_payload > MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES {
                 return Err(DomainError::Internal(format!(
                     "a staged epoch payload exceeds {MAX_FRAGMENT_WRITE_CLAIM_BODY_BYTES} bytes"
@@ -4760,7 +4761,7 @@ impl PostgresFragmentCoordinator {
             let provider_body_blake3 = row
                 .get::<_, Option<Vec<u8>>>("provider_body_blake3")
                 .map(|digest| {
-                    <[u8; 32]>::try_from(digest.as_slice()).map_err(|_| {
+                    <[u8; 32]>::try_from(digest.as_slice()).map_err(|_err| {
                         DomainError::Internal(
                             "a staged epoch provider body digest is not 32 bytes".to_owned(),
                         )
@@ -4770,7 +4771,7 @@ impl PostgresFragmentCoordinator {
             let provider_body_size = row
                 .get::<_, Option<i64>>("provider_body_size")
                 .map(|size| {
-                    u64::try_from(size).map_err(|_| {
+                    u64::try_from(size).map_err(|_err| {
                         DomainError::Internal(
                             "a staged epoch provider body size is negative".to_owned(),
                         )
@@ -5247,7 +5248,7 @@ impl PostgresFragmentCoordinator {
         let provider_body_size = write_claim
             .map(|(claim, _)| i64::try_from(claim.body_size))
             .transpose()
-            .map_err(|_| {
+            .map_err(|_err| {
                 DomainError::Internal("fragment write claim body size exceeds i64".to_owned())
             })?;
         let provider_claim_fence = write_claim.map(|(claim, _)| claim.fence);
@@ -5511,7 +5512,7 @@ async fn create_write_claim_locked(
     }
 
     sequence.enter(LockClass::Fragments)?;
-    let body_size = i64::try_from(input.body_size).map_err(|_| {
+    let body_size = i64::try_from(input.body_size).map_err(|_err| {
         DomainError::InvalidInput("fragment write claim body size exceeds i64".to_owned())
     })?;
     let source_epoch = lineage.source.map(|source| source.epoch);
@@ -5656,16 +5657,13 @@ async fn write_claim_barrier_locked(
             FragmentWriteClaimState::Decisive | FragmentWriteClaimState::NoSend => None,
         };
         if let Some(horizon) = horizon.filter(|horizon| *horizon > database_now) {
-            blocked_until = Some(
-                blocked_until
-                    .map(|current| current.max(horizon))
-                    .unwrap_or(horizon),
-            );
+            blocked_until = Some(blocked_until.map_or(horizon, |current| current.max(horizon)));
         }
     }
-    Ok(blocked_until
-        .map(FragmentWriteClaimBarrier::BlockedUntil)
-        .unwrap_or(FragmentWriteClaimBarrier::Clear))
+    Ok(blocked_until.map_or(
+        FragmentWriteClaimBarrier::Clear,
+        FragmentWriteClaimBarrier::BlockedUntil,
+    ))
 }
 
 /// Compute one hash's send barrier for the prune loop, and settle any
@@ -5695,7 +5693,7 @@ async fn write_claim_barrier_locked(
 ///
 /// # Why the state list is a SQL literal
 ///
-/// `0, 1, 3` are Prepared, Sending and Ambiguous, and `4` is NoSend. Written as
+/// `0, 1, 3` are Prepared, Sending and Ambiguous, and `4` is `NoSend`. Written as
 /// literals, both statements match `lore_fragment_write_claims_barrier`'s
 /// partial predicate and use it with `hash` as the index condition. Bound as
 /// `$n` parameters, the planner cannot prove partial-index implication, and a
@@ -5756,11 +5754,7 @@ async fn write_claim_barrier_for_prune(
             FragmentWriteClaimState::Decisive | FragmentWriteClaimState::NoSend => None,
         };
         if let Some(horizon) = horizon.filter(|horizon| *horizon > database_now) {
-            blocked_until = Some(
-                blocked_until
-                    .map(|current| current.max(horizon))
-                    .unwrap_or(horizon),
-            );
+            blocked_until = Some(blocked_until.map_or(horizon, |current| current.max(horizon)));
         }
     }
     Ok(blocked_until)
@@ -5804,9 +5798,9 @@ async fn write_claim_inventory_locked(
             FragmentWriteClaimState::Prepared => {
                 if locked.claim.send_not_after > database_now {
                     blocked_until = Some(
-                        blocked_until
-                            .map(|current| current.max(locked.claim.send_not_after))
-                            .unwrap_or(locked.claim.send_not_after),
+                        blocked_until.map_or(locked.claim.send_not_after, |current| {
+                            current.max(locked.claim.send_not_after)
+                        }),
                     );
                 } else {
                     let updated = tx
@@ -5841,9 +5835,9 @@ async fn write_claim_inventory_locked(
                 if locked.claim.hard_not_after > database_now =>
             {
                 blocked_until = Some(
-                    blocked_until
-                        .map(|current| current.max(locked.claim.hard_not_after))
-                        .unwrap_or(locked.claim.hard_not_after),
+                    blocked_until.map_or(locked.claim.hard_not_after, |current| {
+                        current.max(locked.claim.hard_not_after)
+                    }),
                 );
             }
             FragmentWriteClaimState::Sending
@@ -6129,7 +6123,7 @@ async fn capture_obliterate_intent_locked(
                     let body_size = row
                         .get::<_, Option<i64>>("provider_body_size")
                         .map(|value| {
-                            u64::try_from(value).map_err(|_| {
+                            u64::try_from(value).map_err(|_err| {
                                 DomainError::Internal(
                                     "epoch provider body size is negative".to_owned(),
                                 )
@@ -6181,7 +6175,7 @@ async fn capture_obliterate_intent_locked(
             .provider_body_size
             .map(i64::try_from)
             .transpose()
-            .map_err(|_| DomainError::Internal("purge target size exceeds i64".to_owned()))?;
+            .map_err(|_err| DomainError::Internal("purge target size exceeds i64".to_owned()))?;
         let present = tx
             .query_opt(
                 "SELECT 1 FROM lore_fragment_epochs \
@@ -6308,7 +6302,7 @@ async fn published_prepared_claim_matches(
     head: &FragmentHeadLock,
     claim: &FragmentWriteClaim,
 ) -> Result<bool, DomainError> {
-    let body_size = i64::try_from(claim.body_size).map_err(|_| {
+    let body_size = i64::try_from(claim.body_size).map_err(|_err| {
         DomainError::InvalidInput("fragment write claim body size exceeds i64".to_owned())
     })?;
     let row = tx
@@ -6408,17 +6402,11 @@ async fn settle_write_claim_locked(
     let valid_transition = matches!(
         (locked.state, target),
         (
-            FragmentWriteClaimState::Prepared,
+            FragmentWriteClaimState::Prepared | FragmentWriteClaimState::Sending,
             FragmentWriteClaimState::NoSend
         ) | (
             FragmentWriteClaimState::Sending,
-            FragmentWriteClaimState::Decisive
-        ) | (
-            FragmentWriteClaimState::Sending,
-            FragmentWriteClaimState::Ambiguous
-        ) | (
-            FragmentWriteClaimState::Sending,
-            FragmentWriteClaimState::NoSend
+            FragmentWriteClaimState::Decisive | FragmentWriteClaimState::Ambiguous
         )
     );
     if !valid_transition {
@@ -6470,7 +6458,7 @@ fn decode_locked_write_claim(
             authority: EpochAuthority::from_bits(row.get("authority"))?,
             object_key: row.get("object_key"),
             body_blake3,
-            body_size: u64::try_from(body_size).map_err(|_| {
+            body_size: u64::try_from(body_size).map_err(|_err| {
                 DomainError::Internal("fragment write claim has a negative body size".to_owned())
             })?,
             kind: FragmentWriteClaimKind::from_bits(row.get("kind"))?,
@@ -6485,7 +6473,7 @@ fn decode_locked_write_claim(
 }
 
 fn fixed_bytes<const N: usize>(value: Vec<u8>, field: &str) -> Result<[u8; N], DomainError> {
-    value.try_into().map_err(|_| {
+    value.try_into().map_err(|_err| {
         DomainError::Internal(format!(
             "{field} does not have the schema-required {N}-byte width"
         ))
@@ -6793,7 +6781,7 @@ fn duration_millis(context: &str, duration: Duration) -> Result<i64, DomainError
         )));
     }
     i64::try_from(millis)
-        .map_err(|_| DomainError::InvalidInput(format!("{context} exceeds i64 milliseconds")))
+        .map_err(|_err| DomainError::InvalidInput(format!("{context} exceeds i64 milliseconds")))
 }
 
 // `stamp_operation_fence` lived here until WP-115. Its only two callers were
@@ -7131,7 +7119,7 @@ async fn append_lifecycle_summaries(
         return Ok(());
     };
     for advance in advances {
-        let ordinal = u64::try_from(advance.lifecycle_generation).map_err(|_| {
+        let ordinal = u64::try_from(advance.lifecycle_generation).map_err(|_err| {
             DomainError::Internal(format!(
                 "fragment_lifecycle_generation must be non-negative, got {}",
                 advance.lifecycle_generation
@@ -7192,7 +7180,7 @@ async fn append_association_summary(
     let Some(cell_id) = cell_id else {
         return Ok(());
     };
-    let ordinal = u64::try_from(advance.association_generation).map_err(|_| {
+    let ordinal = u64::try_from(advance.association_generation).map_err(|_err| {
         DomainError::Internal(format!(
             "content_association_generation must be non-negative, got {}",
             advance.association_generation

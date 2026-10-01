@@ -417,7 +417,7 @@ fn a_rename_into_a_removed_and_recreated_leaf_is_not_found() {
     let temporary = scratch.0.join("incoming").join("case.tmp");
     std::fs::write(&temporary, b"x").unwrap();
     assert!(matches!(
-        root.rename_into(&temporary, &resolved, &leaf),
+        ConfinedRoot::rename_into(&temporary, &resolved, &leaf),
         Err(WriteBehindError::Io {
             kind: std::io::ErrorKind::NotFound,
             ..

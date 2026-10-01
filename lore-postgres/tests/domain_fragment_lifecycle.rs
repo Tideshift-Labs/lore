@@ -5,7 +5,7 @@
 //! coordinator (`lore-postgres/src/domain/fragments/`).
 //!
 //! Every case is `#[ignore]` and is executed by `run-fragment-lifecycle-live.ps1`,
-//! which gives each exact case a fresh PostgreSQL 16 database. The pure-logic
+//! which gives each exact case a fresh `PostgreSQL` 16 database. The pure-logic
 //! parts (witness matching, key distinctness, readiness fail-closed, state and
 //! diagnostic round trips, the mask partition) are already pinned offline in
 //! `states.rs`, `masks.rs`, and `coordinator.rs`'s own `mod tests` — this file
@@ -311,7 +311,7 @@ async fn direct_write_preserves_preexisting_deletion_and_tombstone_fences() {
 }
 
 /// The fixture trigger pauses INSERT, after each real coordinator has read the absent head.
-/// PostgreSQL must attest both waiters before release. No production failpoint or timed ordering.
+/// `PostgreSQL` must attest both waiters before release. No production failpoint or timed ordering.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn concurrent_absent_direct_writes_cannot_replace_the_first_lineage() {
@@ -1775,7 +1775,7 @@ async fn claim_evidence(direct: &Client, hash: &[u8]) -> ClaimEvidence {
 /// Insert one aged terminal claim sharing `hash`'s durable epoch evidence.
 ///
 /// `authorized_at` is set on both arms: the state CHECK requires it for
-/// Decisive and permits it for NoSend, so one statement serves both.
+/// Decisive and permits it for `NoSend`, so one statement serves both.
 async fn insert_aged_terminal_claim(
     direct: &Client,
     hash: &[u8],
@@ -2278,7 +2278,7 @@ async fn a_candidate_that_loses_its_row_or_its_head_between_plan_and_lock_delete
 /// returns before any delete runs.
 ///
 /// The lever here is the retention window, because it is the only clause a
-/// surviving NoSend row can fall foul of — NoSend is terminal, so no transition
+/// surviving `NoSend` row can fall foul of — `NoSend` is terminal, so no transition
 /// moves its state, and identity is immutable. It is also the clause worth
 /// pinning: a delete that trusted the plan's retention check instead of
 /// re-stating its own would delete a row that is no longer eligible, and the
@@ -2383,13 +2383,13 @@ async fn a_candidate_that_leaves_the_retention_window_under_the_head_lock_is_ref
 /// WP-118: the anti-join must be exactly as strict as the loop it feeds, and no
 /// stricter.
 ///
-/// The loop exempts `NoSend` from the barrier: a NoSend claim records that no
+/// The loop exempts `NoSend` from the barrier: a `NoSend` claim records that no
 /// provider send occurred, so it names no cleanup target and another claim
 /// being in flight on the hash has no bearing on it. A hash-wide anti-join
 /// spanning both arms therefore contradicted the loop — it stopped *selecting*
-/// NoSend rows on a barriered hash that the loop would happily have pruned,
-/// making the exemption near-dead code and letting a hot hash accumulate NoSend
-/// claims forever. Measured on the shipped form: 256 hot NoSend rows selected;
+/// `NoSend` rows on a barriered hash that the loop would happily have pruned,
+/// making the exemption near-dead code and letting a hot hash accumulate `NoSend`
+/// claims forever. Measured on the shipped form: 256 hot `NoSend` rows selected;
 /// on the hash-wide form, 0.
 ///
 /// So the anti-join sits inside the Decisive arm. `NoSend` needs only age;
@@ -2835,7 +2835,7 @@ fn uuid_v7_at(time: SystemTime) -> Uuid {
     ))
 }
 
-/// PostgreSQL `timestamptz` is microsecond-precision; a `SystemTime` with a
+/// `PostgreSQL` `timestamptz` is microsecond-precision; a `SystemTime` with a
 /// sub-microsecond remainder (Windows' `SystemTime::now()` is 100 ns
 /// resolution) would silently lose precision on a round trip through the
 /// database, breaking an exact deadline-equality assertion for a reason that
@@ -3455,7 +3455,7 @@ async fn two_independently_constructed_coordinators_race_one_fresh_head_and_exac
     assert_eq!(b_won, resolved_manifest.object_key == "race/b");
 }
 
-/// A direct-write retry against a persisted PreparingRemote head reuses the
+/// A direct-write retry against a persisted `PreparingRemote` head reuses the
 /// exact witness. Once one copy commits, the late copy is fenced and cannot
 /// publish a second epoch row.
 #[tokio::test]
@@ -5796,8 +5796,7 @@ async fn acquire_staged_leases_refuses_a_lease_id_that_is_not_the_schema_length(
     let release_result = coordinator.release_staged_lease(&short_id).await;
     assert!(
         matches!(release_result, Err(DomainError::InvalidInput(_))),
-        "expected InvalidInput from release_staged_lease for a wrong-length id, got {:?}",
-        release_result
+        "expected InvalidInput from release_staged_lease for a wrong-length id, got {release_result:?}"
     );
 }
 
@@ -9083,7 +9082,7 @@ async fn uploader_hash_set(
 /// unreadable states for at least ten seconds while 100 push validations run.
 /// Lifecycle movement must refuse without a complete membership proof;
 /// captures that remain current may use the scalar fast path.
-/// This local PostgreSQL fixture reports its timing regime and does not model
+/// This local `PostgreSQL` fixture reports its timing regime and does not model
 /// provider latency or the separate fresh-association acceptance scenario.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
@@ -9489,7 +9488,7 @@ const FANOUT_MEASUREMENT_SIZES: [usize; 4] = [1, 64, 512, MAX_LIFECYCLE_GENERATI
 /// The only failure this can express is "the operation did not finish", which
 /// is the no-deadlock claim the measurement makes. It sits far above any
 /// plausible honest duration for one bounded transaction against a local
-/// disposable PostgreSQL, so a slow rig, a cold cache, or a busy Docker host
+/// disposable `PostgreSQL`, so a slow rig, a cold cache, or a busy Docker host
 /// cannot turn a measurement into a flake. Do not tighten it into a threshold:
 /// the numbers this case prints are the output, and no assertion here claims
 /// any particular one of them.
@@ -9892,7 +9891,7 @@ const QUIET_SCALAR_WAIT_BUDGET: Duration = Duration::from_secs(20);
 /// 100 push validations run. Association generation moves, but destructive
 /// membership and lifecycle generations do not, so every validation must use
 /// the scalar fast path without an abort. Timing output characterizes this
-/// local PostgreSQL fixture, not production provider latency.
+/// local `PostgreSQL` fixture, not production provider latency.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn fresh_same_repo_association_traffic_preserves_the_scalar_fast_path() {

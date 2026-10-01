@@ -15,7 +15,7 @@
 //!
 //! - [`env`] panics with a machine-readable marker rather than returning early,
 //!   and the runner reports that marker as **NOT RUN**;
-//! - [`barrier`] proves an interleaving happened by asking PostgreSQL, and
+//! - [`barrier`] proves an interleaving happened by asking `PostgreSQL`, and
 //!   **panics when it cannot** — a barrier that never engaged fails the case
 //!   instead of letting it pass on a race it did not run;
 //! - [`tally`] records winner/loser/unknown/duplicate counts and the seed every

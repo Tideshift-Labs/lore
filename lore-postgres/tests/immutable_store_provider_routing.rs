@@ -451,7 +451,7 @@ fn ambiguous_conditional_put_verifies_once_by_unmetered_get_before_any_remote_or
     );
     assert!(
         std::panic::catch_unwind(|| {
-            assert_verification_uncertainty_fails_closed(&throttled_as_absent)
+            assert_verification_uncertainty_fails_closed(&throttled_as_absent);
         })
         .is_err(),
         "negative control rewriting uncertainty as modeled absence must fail"

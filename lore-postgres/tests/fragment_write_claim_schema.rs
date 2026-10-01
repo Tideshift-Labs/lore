@@ -309,7 +309,7 @@ fn write_claim_kind_round_trips_and_stays_inside_the_two_value_check() {
     assert!(FragmentWriteClaimKind::from_bits(-1).is_err());
 }
 
-/// B4: a cell provisioned at schema_version 3 and never re-migrated must
+/// B4: a cell provisioned at `schema_version` 3 and never re-migrated must
 /// route legacy against a version-4 binary rather than half-enable and fail
 /// at runtime with SQLSTATE 42703 on the first promotion.
 /// `ready_for_lifecycle`'s clean-init arm is the one path this bites --

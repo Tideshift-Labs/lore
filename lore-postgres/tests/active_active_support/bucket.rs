@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
-//! One MinIO bucket per case, shared by both coordinator sets.
+//! One `MinIO` bucket per case, shared by both coordinator sets.
 //!
 //! # Why a bucket and not a key prefix
 //!
@@ -40,7 +40,7 @@ use uuid::Uuid;
 use super::env::ObjectStoreEnv;
 
 /// Build an S3 client against the case's endpoint, path-style addressed the way
-/// MinIO needs.
+/// `MinIO` needs.
 pub async fn s3_client(env: &ObjectStoreEnv) -> S3Impl {
     let builder = Box::pin(
         AwsClientBuilder::builder()
@@ -74,7 +74,7 @@ impl CaseBucket {
     /// Create a bucket named from the case label and a fresh unique suffix.
     ///
     /// The name is lowercase, dot-free, and under 63 bytes, because S3 bucket
-    /// naming is stricter than PostgreSQL identifier naming and MinIO enforces
+    /// naming is stricter than `PostgreSQL` identifier naming and `MinIO` enforces
     /// it.
     ///
     /// The suffix is **not** the case's identity seed, deliberately. Replaying

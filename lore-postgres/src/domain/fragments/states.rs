@@ -9,7 +9,7 @@
 
 use crate::domain::errors::DomainError;
 
-/// Lifecycle state of one FragmentId's current epoch.
+/// Lifecycle state of one `FragmentId`'s current epoch.
 ///
 /// The encodings are a fresh dense range and deliberately do **not** reuse the
 /// legacy `lore_fragment_state` values (`0`, `1`, `256`, `512`), which are

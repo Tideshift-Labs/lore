@@ -549,7 +549,7 @@ pub async fn claim_batch(
         )));
     }
     let lease_secs = lease_seconds(lease)?;
-    let limit_i64 = i64::try_from(limit).map_err(|_| {
+    let limit_i64 = i64::try_from(limit).map_err(|_err| {
         DomainError::InvalidInput(format!("outbox claim limit does not fit in i64: {limit}"))
     })?;
 
@@ -950,7 +950,7 @@ pub async fn dead_letter(
 /// fence reusable: a worker that held generation 1 when the row was
 /// dead-lettered would compare equal against a requeued row a second worker had
 /// just claimed at generation 1, and its acknowledgement would apply. That is
-/// not hypothetical — it was reproduced on PostgreSQL 16.15 against the reset-
+/// not hypothetical — it was reproduced on `PostgreSQL` 16.15 against the reset-
 /// to-zero version of this function, where the fenced-out worker's
 /// `record_broker_accepted` updated one row and returned `Applied`.
 pub async fn requeue_dead_letter(
@@ -1150,7 +1150,7 @@ pub async fn mark_obsolete(
 /// acceptance applies to the requeued row and puts it back to
 /// `broker_accepted` under a void epoch, behind this scan's cursor and
 /// therefore unreachable by this reset and by any later one. Measured on
-/// PostgreSQL 16.15 both ways: without the bump that retry updates one row,
+/// `PostgreSQL` 16.15 both ways: without the bump that retry updates one row,
 /// with it zero.
 ///
 /// **The remaining hole is not closeable here, and this function must not be
@@ -1168,7 +1168,7 @@ pub async fn mark_obsolete(
 ///
 /// **Termination is decided by the SELECT, not by the UPDATE.** The two are
 /// separate statements because plain `FOR UPDATE` re-evaluates a concurrently
-/// updated row (EvalPlanQual) and can drop it from the update's result set. A
+/// updated row (`EvalPlanQual`) and can drop it from the update's result set. A
 /// loop that stopped when the *update* returned nothing would therefore end
 /// early — with rows past the cursor still published under the void epoch —
 /// the first time a whole batch was concurrently touched. The cursor advances
@@ -1463,7 +1463,7 @@ pub(super) fn row_from(row: &Row) -> Result<OutboxRow, DomainError> {
 ///   the whole table is smaller than the index walk. Either way the cost tracks
 ///   the pending ROW count rather than the payload bytes, because
 ///   `octet_length` reads the length from the TOAST pointer without detoasting.
-///   All figures PostgreSQL 16.15.
+///   All figures `PostgreSQL` 16.15.
 /// * `oldest_pending_age` is a `min()` over the leading column of
 ///   `lore_outbox_events_pending_unpublished`, answered from the first live index
 ///   entry rather than by scanning — an `Index Only Scan` under a `Limit`.
@@ -1539,7 +1539,7 @@ pub async fn backlog(client: &impl GenericClient) -> Result<OutboxBacklog, Domai
 /// TODO(WP-119 Step B): CR-032 requires this to be load-tested and the initial
 /// limits revised before production activation. The row and byte probes are
 /// bounded but still O(pending): measured at 19 and 600 shared buffers
-/// respectively for 18,000 pending rows on PostgreSQL 16.15, so a backlog near
+/// respectively for 18,000 pending rows on `PostgreSQL` 16.15, so a backlog near
 /// the one-million-row limit puts the byte probe in the tens of thousands of
 /// buffers. If a load test shows the per-mutation cost matters, cache the
 /// verdict with an explicit bounded staleness rather than widening the limits.

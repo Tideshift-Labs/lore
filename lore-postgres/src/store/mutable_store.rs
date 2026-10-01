@@ -6,7 +6,7 @@
 //! Strongly-consistent single-key CAS on a single-primary Postgres. Store and
 //! compare-and-swap share one per-key transactional advisory lock, so the
 //! observed prior value, conditional mutation, and returned outcome have one
-//! linearization point, mirroring DynamoDB conditional-put semantics (INV-H §3).
+//! linearization point, mirroring `DynamoDB` conditional-put semantics (INV-H §3).
 //! `(partition, key_type, key)` is the primary key; the fragment **bytes** are not
 //! here — this store holds only the mutable key→value (e.g. branch tip) mapping.
 

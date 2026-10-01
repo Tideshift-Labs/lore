@@ -18,7 +18,7 @@ impl PostgresFragmentCoordinator {
         &self.database_identity
     }
 
-    /// Capture an unpublished, synchronously uploaded representation after commit_remote.
+    /// Capture an unpublished, synchronously uploaded representation after `commit_remote`.
     /// This grants no repository read access and owns no database resource on return.
     /// None means a concurrent lifecycle change left no readable Remote witness.
     pub async fn capture_current_readable_epoch(

@@ -632,7 +632,7 @@ async fn retire_receiver_generations(
 ///
 /// `numbackends` counts every backend whatever its role, where
 /// `pg_stat_activity` hides other roles' sessions from an unprivileged caller
-/// (CR-038 measured this on PostgreSQL 16). A backend that is still exiting gets
+/// (CR-038 measured this on `PostgreSQL` 16). A backend that is still exiting gets
 /// a short bounded wait.
 async fn refuse_other_backends(tx: &Transaction<'_>, own_backends: i64) -> Result<(), DomainError> {
     let mut others = 0;

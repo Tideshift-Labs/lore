@@ -306,7 +306,7 @@ impl CommittedOrdinal {
             })?,
             Self::Exact(value) => return Ok(value),
         };
-        u64::try_from(signed).map_err(|_| {
+        u64::try_from(signed).map_err(|_err| {
             DomainError::Internal(format!(
                 "outbox aggregate_version ordinal must be non-negative, got {signed}"
             ))

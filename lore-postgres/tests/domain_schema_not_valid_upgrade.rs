@@ -13,7 +13,7 @@
 //!
 //! Timing is not the discriminator: a scan that overruns 250 ms needs a table
 //! far larger than a test should seed. These cases discriminate on
-//! `pg_constraint.convalidated`, which PostgreSQL sets exactly when it scanned
+//! `pg_constraint.convalidated`, which `PostgreSQL` sets exactly when it scanned
 //! the rows, and a control step proves the old spelling sets it.
 //!
 //! Run via `pwsh -File lore-postgres/tests/run-domain-maintenance-live.ps1`,
@@ -66,7 +66,7 @@ const RECEIPT_CONSTRAINTS: [(&str, &str); 2] = [
 ];
 
 /// The mediated upgrade constraints, by table and name. The column bounds
-/// carry the names PostgreSQL gives an inline column CHECK, cut to 63 bytes.
+/// carry the names `PostgreSQL` gives an inline column CHECK, cut to 63 bytes.
 const MEDIATED_CONSTRAINTS: [(&str, &str); 17] = [
     (
         TOMBSTONES,
@@ -134,7 +134,7 @@ const MEDIATED_CONSTRAINTS: [(&str, &str); 17] = [
 
 /// The two tombstone column bounds the first upgrade spelling omitted, so a
 /// cell that took it has neither. A fresh cell has both from `CREATE TABLE`;
-/// the upgrade DDL adds them `NOT VALID` under the same PostgreSQL names.
+/// the upgrade DDL adds them `NOT VALID` under the same `PostgreSQL` names.
 const DRIFT_CONSTRAINTS: [(&str, &str); 2] = [
     (
         TOMBSTONES,
@@ -369,7 +369,7 @@ async fn assert_named_not_valid(client: &Client, names: &[(&str, &str)], context
     assert_eq!(found, expected, "{context}");
 }
 
-/// Run `update` and require PostgreSQL to refuse it on exactly `constraint`.
+/// Run `update` and require `PostgreSQL` to refuse it on exactly `constraint`.
 async fn assert_refused_by(client: &Client, table: &str, assignment: &str, constraint: &str) {
     let update =
         format!("UPDATE {table} SET {assignment} WHERE ctid = (SELECT ctid FROM {table} LIMIT 1)");
@@ -935,7 +935,7 @@ async fn validate_constraints_proves_each_not_valid_constraint_once() {
 
 /// A fresh cell and a cell that already took the validating mediated DDL each
 /// keep exactly the constraints they have. The column bounds carry the names
-/// PostgreSQL gives an inline column CHECK, so the catalog guards find the
+/// `PostgreSQL` gives an inline column CHECK, so the catalog guards find the
 /// validated originals and add no duplicate.
 #[tokio::test]
 #[ignore = "needs an owned disposable Postgres database; run via run-domain-maintenance-live.ps1"]

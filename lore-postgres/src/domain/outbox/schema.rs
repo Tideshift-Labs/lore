@@ -137,7 +137,7 @@ pub fn is_valid_cell_id(cell_id: &str) -> bool {
     bytes.iter().all(|&b| alphanumeric(b) || b == b'-')
 }
 
-/// `event_kind`, at most 64 UTF-8 bytes (contract, DURABLE_INVALIDATION body).
+/// `event_kind`, at most 64 UTF-8 bytes (contract, `DURABLE_INVALIDATION` body).
 /// The base `CREATE TABLE` declares `event_kind text` with no width CHECK, so
 /// this is enforced in `validate()` only.
 pub const MAX_EVENT_KIND_BYTES: usize = 64;

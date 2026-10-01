@@ -11,7 +11,7 @@
 //! first may complete before the second is polled, and the case still passes,
 //! because "exactly one winner" is trivially true of a serial pair.
 //!
-//! So every barrier here is **attested by PostgreSQL itself** rather than by
+//! So every barrier here is **attested by `PostgreSQL` itself** rather than by
 //! elapsed time. [`wait_for_lock_waiters`] returns only once the server reports
 //! that some other backend is blocked on a heavyweight lock; and it
 //! **panics** if that never happens. A case built on it therefore fails when
@@ -67,7 +67,7 @@ use tokio_postgres::Client;
 /// docs.
 pub const ATTEST_CEILING: Duration = Duration::from_secs(20);
 
-/// How often the attestation asks PostgreSQL. Not a barrier — see module docs.
+/// How often the attestation asks `PostgreSQL`. Not a barrier — see module docs.
 const ATTEST_POLL: Duration = Duration::from_millis(10);
 
 /// Open a connection dedicated to observing `pg_stat_activity`.
@@ -129,10 +129,9 @@ pub async fn wait_for_lock_waiters(observer: &Client, at_least: i64, what: &str)
         if started.elapsed() >= ATTEST_CEILING {
             panic!(
                 "barrier never engaged while {what}: expected at least {at_least} backend(s) \
-                 concurrently blocked on a heavyweight lock within {:?}, observed {observed}. \
+                 concurrently blocked on a heavyweight lock within {ATTEST_CEILING:?}, observed {observed}. \
                  The contenders did not overlap, so any outcome this case would assert is \
-                 about a serial pair",
-                ATTEST_CEILING
+                 about a serial pair"
             );
         }
         tokio::time::sleep(ATTEST_POLL).await;
@@ -190,9 +189,8 @@ pub async fn wait_for_row_share_holders(
         if started.elapsed() >= ATTEST_CEILING {
             panic!(
                 "barrier never engaged while {what}: expected at least {at_least} backend(s) \
-                 holding a RowShareLock on {relation} within {:?}, observed {observed}. The \
-                 claimers did not overlap",
-                ATTEST_CEILING
+                 holding a RowShareLock on {relation} within {ATTEST_CEILING:?}, observed {observed}. The \
+                 claimers did not overlap"
             );
         }
         tokio::time::sleep(ATTEST_POLL).await;

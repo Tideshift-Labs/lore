@@ -664,7 +664,7 @@ async fn crash_between_commit_staged_and_association_recovers_with_exactly_one_f
 }
 
 /// A single first-attempt coordinator sequence binds readable staged bytes.
-/// This is coordinator-seam evidence; the public ImmutableStore route is not exercised.
+/// This is coordinator-seam evidence; the public `ImmutableStore` route is not exercised.
 #[tokio::test]
 #[ignore = "run with LORE_TEST_PG_URL and Unix; see file header"]
 async fn first_attempt_captures_staged_authority_and_binds_the_association() {

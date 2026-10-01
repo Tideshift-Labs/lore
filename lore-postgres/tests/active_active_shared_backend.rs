@@ -6,8 +6,8 @@
 //!
 //! Two independently constructed coordinator/store sets — separate pools,
 //! separate S3 clients, separate coordinator handles — against **one** real
-//! PostgreSQL database and **one** real MinIO bucket. Every case drives a race
-//! between them, releases a barrier that PostgreSQL itself attests, and then
+//! `PostgreSQL` database and **one** real `MinIO` bucket. Every case drives a race
+//! between them, releases a barrier that `PostgreSQL` itself attests, and then
 //! asserts authoritative SQL and object-store state alongside the public
 //! result each caller received.
 //!
@@ -43,7 +43,7 @@
 //! # Namespacing and cleanup
 //!
 //! Each case takes its own `CaseNamespace` schema (shared by both sets, which
-//! is the point) and its own MinIO bucket, records both creations, and records
+//! is the point) and its own `MinIO` bucket, records both creations, and records
 //! the release or a `retained for debug` disposition. The runner supplies the
 //! database arm on top of that.
 //!

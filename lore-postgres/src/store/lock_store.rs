@@ -6,7 +6,7 @@
 //! idempotent-same-owner conditional insert (`ON CONFLICT DO NOTHING`) of all
 //! requested resources in a single transaction (batch-or-nothing); release is
 //! owner-checked with a force bypass. This mirrors the semantics of the
-//! in-process `LocalLockStore` and the DynamoDB store (INV-R §3). There is no
+//! in-process `LocalLockStore` and the `DynamoDB` store (INV-R §3). There is no
 //! TTL/lease — locks persist until explicitly released.
 
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use tokio_postgres::Row;
 use crate::pool::Pool;
 
 /// Self-bootstrapping schema. The `PRIMARY KEY` is the exclusivity constraint;
-/// the three indexes back the supported `LockQuery` filters (the DynamoDB "3
+/// the three indexes back the supported `LockQuery` filters (the `DynamoDB` "3
 /// GSIs" map 1:1 — INV-R §5).
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS lore_locks (

@@ -85,7 +85,7 @@ pub struct TerminalStatusAttachInput {
     pub claim_id: Vec<u8>,
     pub claim_revision: i64,
     /// The platform's terminal outcome **as it arrived on the wire** (CR-029
-    /// tag 10: APPLIED = 1, NOT_APPLIED = 2). It is digested and stored in that
+    /// tag 10: APPLIED = 1, `NOT_APPLIED` = 2). It is digested and stored in that
     /// encoding; only the receipt-column comparison translates it.
     pub terminal_outcome: WireTerminalOutcome,
     pub terminal_receipt_sha256: Vec<u8>,
@@ -245,7 +245,7 @@ pub struct ProofNamespaceRetireAck {
 
 fn append_part(out: &mut Vec<u8>, value: &[u8]) -> Result<(), DomainError> {
     let length = u32::try_from(value.len())
-        .map_err(|_| DomainError::InvalidInput("canonical field exceeds u32".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("canonical field exceeds u32".to_owned()))?;
     out.extend_from_slice(&length.to_be_bytes());
     out.extend_from_slice(value);
     Ok(())
@@ -286,7 +286,7 @@ pub async fn proof_namespace_state_get(
     };
     macro_rules! field {
         ($name:literal, $ty:ty) => {
-            row.try_get::<_, $ty>($name).map_err(|_| corrupt())?
+            row.try_get::<_, $ty>($name).map_err(|_err| corrupt())?
         };
     }
     let epoch = field!("epoch", Vec<u8>);
@@ -351,7 +351,7 @@ pub async fn proof_namespace_state_get(
     for row in &range_rows {
         macro_rules! range_field {
             ($name:literal, $ty:ty) => {
-                row.try_get::<_, $ty>($name).map_err(|_| corrupt())?
+                row.try_get::<_, $ty>($name).map_err(|_err| corrupt())?
             };
         }
         let start = range_field!("start_sequence", i64);
@@ -386,7 +386,7 @@ pub async fn proof_namespace_state_get(
          WHERE verified_issuer=$1 AND authenticated_subject=$2 AND tenant_scope_key=$3 AND namespace_epoch=$4",
         &[&input.key.verified_issuer, &input.key.authenticated_subject, &input.key.tenant_scope_key, &epoch],
     ).await.map_err(|e| DomainError::from_pg("proof namespace snapshot markers", e))?
-        .try_get(0).map_err(|_| corrupt())?;
+        .try_get(0).map_err(|_err| corrupt())?;
     if actual_markers != 0 {
         return Err(corrupt());
     }
@@ -548,13 +548,13 @@ pub fn proof_namespace_final_range_set_digest(
     use ring::digest::SHA256;
 
     let protocol = u64::try_from(protocol_revision)
-        .map_err(|_| DomainError::InvalidInput("negative protocol revision".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative protocol revision".to_owned()))?;
     let quota = u64::try_from(quota_revision)
-        .map_err(|_| DomainError::InvalidInput("negative quota revision".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative quota revision".to_owned()))?;
     let high_water = u64::try_from(final_high_water)
-        .map_err(|_| DomainError::InvalidInput("negative final high-water".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative final high-water".to_owned()))?;
     let range_count = u64::try_from(ranges.len())
-        .map_err(|_| DomainError::InvalidInput("range count exceeds u64".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("range count exceeds u64".to_owned()))?;
     let mut digest = Context::new(&SHA256);
     digest.update(b"domain-marker-final-range-set-v2\0");
     digest.update(tenant_scope_key);
@@ -570,15 +570,15 @@ pub fn proof_namespace_final_range_set_digest(
     }
     for range in ranges {
         let start = u64::try_from(range.start_sequence)
-            .map_err(|_| DomainError::InvalidInput("negative range start".to_owned()))?;
+            .map_err(|_err| DomainError::InvalidInput("negative range start".to_owned()))?;
         let end = u64::try_from(range.end_sequence)
-            .map_err(|_| DomainError::InvalidInput("negative range end".to_owned()))?;
+            .map_err(|_err| DomainError::InvalidInput("negative range end".to_owned()))?;
         let count = end
             .checked_sub(start)
             .and_then(|delta| delta.checked_add(1))
             .ok_or_else(|| DomainError::InvalidInput("invalid range bounds".to_owned()))?;
         let generation = u64::try_from(range.generation)
-            .map_err(|_| DomainError::InvalidInput("negative range generation".to_owned()))?;
+            .map_err(|_err| DomainError::InvalidInput("negative range generation".to_owned()))?;
         for value in [start, end, count, generation] {
             digest.update(&value.to_be_bytes());
         }
@@ -596,13 +596,13 @@ fn proof_range_digest(
     end: i64,
 ) -> Result<Vec<u8>, DomainError> {
     let protocol = u64::try_from(protocol_revision)
-        .map_err(|_| DomainError::InvalidInput("negative protocol revision".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative protocol revision".to_owned()))?;
     let quota = u64::try_from(quota_revision)
-        .map_err(|_| DomainError::InvalidInput("negative quota revision".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative quota revision".to_owned()))?;
     let start = u64::try_from(start)
-        .map_err(|_| DomainError::InvalidInput("negative range start".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative range start".to_owned()))?;
     let end = u64::try_from(end)
-        .map_err(|_| DomainError::InvalidInput("negative range end".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative range end".to_owned()))?;
     let count = end
         .checked_sub(start)
         .and_then(|delta| delta.checked_add(1))
@@ -640,7 +640,7 @@ fn proof_range_byte_charge(key: &ProofNamespaceKey) -> Result<i64, DomainError> 
         .and_then(|value| value.checked_add(fixed))
         .ok_or_else(|| DomainError::Internal("proof range byte charge overflow".to_owned()))?;
     i64::try_from(bytes)
-        .map_err(|_| DomainError::Internal("proof range byte charge exceeds i64".to_owned()))
+        .map_err(|_err| DomainError::Internal("proof range byte charge exceeds i64".to_owned()))
 }
 
 /// Validate stored authority before consuming it as a merge input or release proof.
@@ -656,7 +656,7 @@ fn validated_proof_range(
     let corrupt = || DomainError::Internal("corrupt completion proof range".to_owned());
     macro_rules! field {
         ($name:literal, $ty:ty) => {
-            row.try_get::<_, $ty>($name).map_err(|_| corrupt())?
+            row.try_get::<_, $ty>($name).map_err(|_err| corrupt())?
         };
     }
     let start = field!("start_sequence", i64);
@@ -709,8 +709,9 @@ fn completion_marker_byte_charge(
         .ok_or_else(|| {
             DomainError::Internal("completion marker byte charge overflow".to_owned())
         })?;
-    i64::try_from(bytes)
-        .map_err(|_| DomainError::Internal("completion marker byte charge exceeds i64".to_owned()))
+    i64::try_from(bytes).map_err(|_err| {
+        DomainError::Internal("completion marker byte charge exceeds i64".to_owned())
+    })
 }
 
 fn receipt_binding_matches(row: &tokio_postgres::Row, input: &VerifiedStaleFinalizeInput) -> bool {
@@ -1015,7 +1016,7 @@ pub async fn verified_stale_finalize(
 
     let clock_ms = clock
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| DomainError::Internal("stale finalize clock precedes epoch".to_owned()))?
+        .map_err(|_err| DomainError::Internal("stale finalize clock precedes epoch".to_owned()))?
         .as_millis();
     let canonical = format!(
         "{}:{}:{}",
@@ -1189,7 +1190,7 @@ pub async fn proof_namespace_materialize(
         ));
     }
     let quota_revision = i32::try_from(input.platform_capacity_revision)
-        .map_err(|_| DomainError::InvalidInput("capacity revision exceeds i32".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("capacity revision exceeds i32".to_owned()))?;
     if input.key.org_uuid.len() != 16 {
         return Err(DomainError::InvalidInput(
             "proof namespace organization UUID must be 16 bytes".to_owned(),
@@ -1581,7 +1582,7 @@ pub async fn proof_namespace_retire(
         })
         .collect();
     let range_count = i64::try_from(ranges.len())
-        .map_err(|_| DomainError::Internal("range count exceeds i64".to_owned()))?;
+        .map_err(|_err| DomainError::Internal("range count exceeds i64".to_owned()))?;
     let range_bytes = range_rows.iter().try_fold(0_i64, |total, row| {
         total
             .checked_add(row.get::<_, i64>("byte_charge"))
@@ -1771,16 +1772,16 @@ fn empty_terminal_ack(status: TerminalStatusAttachStatus) -> TerminalStatusAttac
 fn system_time_unix_millis(value: SystemTime) -> Result<i64, DomainError> {
     let millis = value
         .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|_| DomainError::InvalidInput("timestamp precedes Unix epoch".to_owned()))?
+        .map_err(|_err| DomainError::InvalidInput("timestamp precedes Unix epoch".to_owned()))?
         .as_millis();
     i64::try_from(millis)
-        .map_err(|_| DomainError::InvalidInput("timestamp milliseconds exceed i64".to_owned()))
+        .map_err(|_err| DomainError::InvalidInput("timestamp milliseconds exceed i64".to_owned()))
 }
 
 fn system_time_at_wire_millisecond(value: SystemTime) -> Result<SystemTime, DomainError> {
     let millis = system_time_unix_millis(value)?;
     let millis = u64::try_from(millis)
-        .map_err(|_| DomainError::InvalidInput("negative timestamp milliseconds".to_owned()))?;
+        .map_err(|_err| DomainError::InvalidInput("negative timestamp milliseconds".to_owned()))?;
     SystemTime::UNIX_EPOCH
         .checked_add(std::time::Duration::from_millis(millis))
         .ok_or_else(|| DomainError::InvalidInput("timestamp milliseconds overflow".to_owned()))
@@ -2008,8 +2009,9 @@ async fn prune_completion_marker(
     }
     let digest = proof_range_digest(&key, &epoch, protocol_revision, quota_revision, start, end)?;
     let range_bytes = proof_range_byte_charge(&key)?;
-    let range_count = i64::try_from(neighbors.len())
-        .map_err(|_| DomainError::Internal("completion neighbor count exceeds i64".to_owned()))?;
+    let range_count = i64::try_from(neighbors.len()).map_err(|_err| {
+        DomainError::Internal("completion neighbor count exceeds i64".to_owned())
+    })?;
     let fragment_delta = 1_i64
         .checked_sub(range_count)
         .ok_or_else(|| DomainError::Internal("completion fragment delta underflow".to_owned()))?;
