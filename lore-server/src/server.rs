@@ -422,9 +422,9 @@ async fn wait_for_shutdown(
     // fires and we wait for every endpoint to finish on its own.
     let deadline = connection_close_timeout.map(|t| tokio::time::Instant::now() + t);
     if let Some(timeout) = connection_close_timeout {
-        info!("Draining remaining endpoints (timeout: {timeout:?})")
+        info!("Draining remaining endpoints (timeout: {timeout:?})");
     } else {
-        info!("Draining remaining endpoints (no timeout: waiting for graceful drain)")
+        info!("Draining remaining endpoints (no timeout: waiting for graceful drain)");
     }
 
     loop {
