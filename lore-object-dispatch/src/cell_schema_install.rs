@@ -286,8 +286,11 @@ pub enum CellSchemaRevision {
     R26,
     /// The frozen install set, 0002-0027.
     R27,
-    /// `R27` plus forward step 0028, the spool metadata true-up. The current state.
+    /// `R27` plus forward step 0028, the spool metadata true-up.
     R28,
+    /// `R28` plus forward step 0029: superseded spool markers and the cleanup due time. The
+    /// current state.
+    R29,
 }
 
 impl CellSchemaRevision {
@@ -299,6 +302,7 @@ impl CellSchemaRevision {
             Self::R26 => "R26",
             Self::R27 => "R27",
             Self::R28 => "R28",
+            Self::R29 => "R29",
         }
     }
 
@@ -310,12 +314,13 @@ impl CellSchemaRevision {
             Self::R26 => 26,
             Self::R27 => 27,
             Self::R28 => 28,
+            Self::R29 => 29,
         }
     }
 }
 
 /// The state a fully installed or fully upgraded cell must attest as.
-pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R28;
+pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R29;
 
 /// One forward step between two adjacent known states.
 ///
@@ -376,7 +381,7 @@ END $prelude$;";
 /// The forward steps, in order, each from one known state to the next (CR-038 D2 as amended by
 /// the 2026-09-23 addendum). `upgrade` chains them until the cell reaches [`CELL_SCHEMA_CURRENT`].
 /// A cell at a state outside [`CELL_SCHEMA_STATES`] is still refused, never walked forward.
-pub const CELL_FORWARD_STEPS: [CellForwardStep; 3] = [
+pub const CELL_FORWARD_STEPS: [CellForwardStep; 4] = [
     CellForwardStep {
         from: CellSchemaRevision::R25,
         to: CellSchemaRevision::R26,
@@ -398,6 +403,17 @@ pub const CELL_FORWARD_STEPS: [CellForwardStep; 3] = [
             28,
             "0028_object_store_dispatch_drain_metadata_true_up.sql",
             "8c7fa36216f887c046bfe6102e13fe3384e1af492754aeb6f9aee8e93b9c8be2"
+        ),
+        unwrap_frozen_transaction: false,
+        prelude_sql: DRAIN_TABLES_LOCK_SQL,
+    },
+    CellForwardStep {
+        from: CellSchemaRevision::R28,
+        to: CellSchemaRevision::R29,
+        migration: cell_migration!(
+            29,
+            "0029_object_store_dispatch_drain_superseded_markers.sql",
+            "3831d4535dbdeb4ed9c039f953790ea475617ad727886b75b3f92f8e285aea31"
         ),
         unwrap_frozen_transaction: false,
         prelude_sql: DRAIN_TABLES_LOCK_SQL,
@@ -1248,6 +1264,33 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R28: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R28: [u8; 32] =
     hex32("5b5785d20aa33ae0bce288a1317d9a2985be92c36bf159f0ae3172587da12b25");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R29`], `PostgreSQL` 16.
+///
+/// Forward step 0029 adds four custody columns (one generated), swaps the cleanup index, creates
+/// two functions and drops the two they replace, recreates `drain_observe_v1`, and replaces four
+/// bodies. So `relations`, `columns`, `constraints`, `indexes`, `functions`, `function_acls` and
+/// `relation_acls` (it carries column ACL rows) move against the R28 pin. `schema`, `types`,
+/// `default_acls`, `triggers` and `rules_and_policies` do not. Measured 2026-09-30 on
+/// `postgres:16` (160014) from a fresh install.
+pub const CELL_CATALOG_SECTION_BLAKE3_R29: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R28[0],
+    hex32("7aba78986206f482e9baa5c63636ea0cedec7d684f7cbf83c5b36144790fdccf"),
+    hex32("99d4581f96f1938bb71d573918e67694191371af96bff1439704ac8fe3aff45b"),
+    hex32("938cd17c998a176a7f9742c7512e9ca3491f3844bad1743a576fe82afb84b145"),
+    hex32("675cce03de4c19bad2da80b3b272eec868a7f13392b8b103675ef813de285055"),
+    CELL_CATALOG_SECTION_BLAKE3_R28[5],
+    hex32("78a6a9e7c2e64eae58c5da813ccff60355b42efa11c162ac93292ab8fcc13073"),
+    hex32("1fa268434decb0928801e7a72f06d4f1b4cc5447dd4414ead228c5ba506a6578"),
+    hex32("0724503d81f8eb394a93cf5bf7cfb96798e26a141b5b40fb13810ad683784532"),
+    CELL_CATALOG_SECTION_BLAKE3_R28[9],
+    CELL_CATALOG_SECTION_BLAKE3_R28[10],
+    CELL_CATALOG_SECTION_BLAKE3_R28[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R29`] cell, `PostgreSQL` 16.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R29: [u8; 32] =
+    hex32("41f7835f7fabaf7a5d93920d4f3cab8b65a9a13cb59ff41d795d6b76a793c7dc");
+
 /// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 16 (CR-038 addendum).
 ///
 /// Measured 2026-09-23 on `postgres:16` from a fresh 0002-0025 install. The same twelve digests
@@ -1299,7 +1342,7 @@ pub const CELL_CATALOG_MANIFEST_BLAKE3_R26: [u8; 32] =
     hex32("b944ad69c2cd0efc047f54096f4ac17f815a2944efdfe3818b10bcfe7d6bcbdc");
 
 /// Every known state with its pins, oldest first. Attestation classifies against this closed list.
-pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4] = [
+pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 5] = [
     (
         CellSchemaRevision::R25,
         CELL_CATALOG_SECTION_BLAKE3_R25,
@@ -1319,6 +1362,11 @@ pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4
         CellSchemaRevision::R28,
         CELL_CATALOG_SECTION_BLAKE3_R28,
         CELL_CATALOG_MANIFEST_BLAKE3_R28,
+    ),
+    (
+        CellSchemaRevision::R29,
+        CELL_CATALOG_SECTION_BLAKE3_R29,
+        CELL_CATALOG_MANIFEST_BLAKE3_R29,
     ),
 ];
 
@@ -1412,8 +1460,32 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R28_PG18: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R28_PG18: [u8; 32] =
     hex32("1832abe46949ed0c85cebc5a2ec21d4b44fd23f1625c2f70665456f8cd285b13");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R29`], `PostgreSQL` 18.
+///
+/// Measured 2026-09-30 on `postgres:18` (180006) from a fresh install. Against the `PostgreSQL` 16
+/// R29 pin, the same three sections differ as in every state: `constraints`, `functions`,
+/// `relation_acls`.
+pub const CELL_CATALOG_SECTION_BLAKE3_R29_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R29[0],
+    CELL_CATALOG_SECTION_BLAKE3_R29[1],
+    CELL_CATALOG_SECTION_BLAKE3_R29[2],
+    hex32("c6c8b65b2ec02a3ba8a18a4f6a82ab3014c7dee4a99cd6cf08a3bea38a4e201f"),
+    CELL_CATALOG_SECTION_BLAKE3_R29[4],
+    CELL_CATALOG_SECTION_BLAKE3_R29[5],
+    hex32("3415e91e2d66b7205c1a7ed85d6482b78653c71e79de98e705ba2f03ce66f30e"),
+    CELL_CATALOG_SECTION_BLAKE3_R29[7],
+    hex32("b3b2544c31e79ce17f246f987c7067ba9607218579a2513753ff531fb6130b45"),
+    CELL_CATALOG_SECTION_BLAKE3_R29[9],
+    CELL_CATALOG_SECTION_BLAKE3_R29[10],
+    CELL_CATALOG_SECTION_BLAKE3_R29[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R29`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R29_PG18: [u8; 32] =
+    hex32("81a773415c4cbea3a794267a10bec2ab1a24eea03fc7e4fa73b6fb184806b054");
+
 /// One major's closed list of known states: each state with its section pins and manifest pin.
-pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 4];
+pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 5];
 
 /// Every known `PostgreSQL` 18 state with its pins, oldest first.
 pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
@@ -1436,6 +1508,11 @@ pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
         CellSchemaRevision::R28,
         CELL_CATALOG_SECTION_BLAKE3_R28_PG18,
         CELL_CATALOG_MANIFEST_BLAKE3_R28_PG18,
+    ),
+    (
+        CellSchemaRevision::R29,
+        CELL_CATALOG_SECTION_BLAKE3_R29_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R29_PG18,
     ),
 ];
 
@@ -2047,7 +2124,7 @@ pub async fn release_cell_schema_lock(client: &Client) -> Result<(), CellSchemaE
 }
 
 /// Move a cell at any known older state to [`CELL_SCHEMA_CURRENT`] (CR-038 and its 2026-09-23
-/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28.
+/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28 -> R29.
 ///
 /// Offline only: every replica must be stopped. The session guard checks ONCE before each step's
 /// `BEGIN`: it refuses if any other session is connected to the cell database. A session that
@@ -2484,7 +2561,7 @@ async fn attest_known_state(
 ) -> Result<(CellSchemaRevision, CellAttestation), CellSchemaError> {
     assert_migrator_session(client).await?;
     let major = read_server_major(client).await?;
-    assert_revision_marker_known(client).await?;
+    let marker = assert_revision_marker_known(client).await?;
     let layers = read_layer_identities(client).await?;
     for (index, (id, identity)) in layers.iter().enumerate() {
         if *identity == LayerIdentity::Absent {
@@ -2512,6 +2589,7 @@ async fn attest_known_state(
         }
         return Err(CellSchemaError::CatalogDrift("manifest"));
     };
+    assert_revision_marker_matches(marker, schema_revision)?;
 
     let replaced_functions_revoked = assert_no_residual_service_privilege(client).await?;
     let inert_tables_present = assert_inert_state(client).await?;
@@ -2536,12 +2614,13 @@ async fn attest_known_state(
 /// Refuse a cell whose runtime revision marker names a state this build does not know.
 ///
 /// Absence is not an error here: an [`CellSchemaRevision::R27`] cell predates the marker, and the
-/// manifest classification decides what it is. A present marker must name exactly the revision
-/// this build ships; a higher value is a newer installer's cell, a lower one cannot exist.
-async fn assert_revision_marker_known(client: &Client) -> Result<(), CellSchemaError> {
+/// manifest classification decides what it is. A higher value than this build ships is a newer
+/// installer's cell. A lower one is an older known state only if the manifest agrees, which
+/// [`assert_revision_marker_matches`] checks after classification.
+async fn assert_revision_marker_known(client: &Client) -> Result<Option<i32>, CellSchemaError> {
     let present: bool = query_one_value(client, REVISION_MARKER_PRESENT_SQL).await?;
     if !present {
-        return Ok(());
+        return Ok(None);
     }
     // EXECUTE is granted to the runtime role only. Read it as the owner, the same way the layer
     // tuples are read, and never leave the session as the owner.
@@ -2558,10 +2637,25 @@ async fn assert_revision_marker_known(client: &Client) -> Result<(), CellSchemaE
         .map_err(CellSchemaError::postgres)?
         .try_get(0)
         .map_err(|_error| CellSchemaError::InvalidResponse("revision marker"))?;
-    match marker.cmp(&crate::drain_policy::CELL_SCHEMA_REVISION) {
-        std::cmp::Ordering::Equal => Ok(()),
-        std::cmp::Ordering::Greater => Err(CellSchemaError::FutureSchema),
-        std::cmp::Ordering::Less => Err(CellSchemaError::CatalogDrift("revision marker")),
+    if marker > crate::drain_policy::CELL_SCHEMA_REVISION {
+        Err(CellSchemaError::FutureSchema)
+    } else {
+        Ok(Some(marker))
+    }
+}
+
+/// The marker and the manifest must name the same state: no marker before
+/// [`CellSchemaRevision::R28`], which created it, and that state's own number from R28 on.
+fn assert_revision_marker_matches(
+    marker: Option<i32>,
+    revision: CellSchemaRevision,
+) -> Result<(), CellSchemaError> {
+    let expected = (revision.last_migration() >= CellSchemaRevision::R28.last_migration())
+        .then(|| i32::from(revision.last_migration()));
+    if marker == expected {
+        Ok(())
+    } else {
+        Err(CellSchemaError::CatalogDrift("revision marker"))
     }
 }
 
@@ -3039,4 +3133,41 @@ where
         .map_err(CellSchemaError::postgres)?;
     row.try_get(0)
         .map_err(|_err| CellSchemaError::InvalidResponse("scalar column"))
+}
+
+#[cfg(test)]
+mod revision_marker_tests {
+    use super::CellSchemaError;
+    use super::CellSchemaRevision;
+    use super::assert_revision_marker_matches;
+
+    #[test]
+    fn the_marker_must_name_the_state_the_manifest_classified() {
+        for (marker, revision) in [
+            (None, CellSchemaRevision::R25),
+            (None, CellSchemaRevision::R26),
+            (None, CellSchemaRevision::R27),
+            (Some(28), CellSchemaRevision::R28),
+            (Some(29), CellSchemaRevision::R29),
+        ] {
+            assert_eq!(assert_revision_marker_matches(marker, revision), Ok(()));
+        }
+        for (marker, revision) in [
+            // A state from before the marker existed must carry none.
+            (Some(27), CellSchemaRevision::R27),
+            (Some(28), CellSchemaRevision::R27),
+            // From R28 on, the marker is required and must be that state's own number.
+            (None, CellSchemaRevision::R28),
+            (None, CellSchemaRevision::R29),
+            (Some(28), CellSchemaRevision::R29),
+            (Some(29), CellSchemaRevision::R28),
+        ] {
+            assert_eq!(
+                assert_revision_marker_matches(marker, revision),
+                Err(CellSchemaError::CatalogDrift("revision marker")),
+                "marker {marker:?} with manifest state {}",
+                revision.label()
+            );
+        }
+    }
 }

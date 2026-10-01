@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 //! Exact expiry-based spool cleanup. This module has no provider capability.
 
+use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::drain_policy::DrainClient;
@@ -16,6 +17,9 @@ use crate::spool_writer::SpoolWriteError;
 pub struct DrainCleanupIntent {
     spool: Uuid,
     fence: i64,
+    /// Database time of this intent's own claim. Compaction deletes a superseded marker only when
+    /// this claim, which precedes this intent's unlink, came after the marker's fence.
+    scanned_ms: i64,
     key: SpoolObjectKey,
 }
 
@@ -37,6 +41,14 @@ impl DrainCleanupIntent {
 }
 
 impl DrainClient {
+    /// Lease up to `batch` due rows for this caller (migration 0029).
+    ///
+    /// This is the one drain call below `SERIALIZABLE`. It picks rows `FOR UPDATE SKIP LOCKED` and
+    /// leases them for 30 s, so two replicas take disjoint rows. Under `SERIALIZABLE` two such
+    /// scans of one index page read each other's leased rows and abort with 40001, which is the
+    /// head contention the lease removes. `READ COMMITTED` is sound here because the lease is only
+    /// a hint about who scans a row first. Claim, release and compaction stay `SERIALIZABLE` and
+    /// keep every fence and state check, so a wrong or lost lease can only delay a row.
     pub async fn cleanup_candidates(
         &self,
         boundary: &str,
@@ -44,7 +56,8 @@ impl DrainClient {
         batch: u16,
     ) -> Result<Vec<Uuid>, DrainError> {
         let rows = self
-            .query(
+            .query_at(
+                IsolationLevel::ReadCommitted,
                 "SELECT spool FROM object_store_retention.drain_cleanup_candidates_v1($1,$2,$3)",
                 &[&boundary, &cell, &i32::from(batch)],
             )
@@ -54,17 +67,20 @@ impl DrainClient {
             .collect()
     }
 
+    /// A row another replica already deleted reads as [`DrainError::Contended`]: that replica did
+    /// this row's work.
     pub async fn claim_cleanup(&self, spool: Uuid) -> Result<DrainCleanupIntent, DrainError> {
         let rows = self
             .query(
-                "SELECT * FROM object_store_retention.drain_cleanup_claim_v1($1)",
+                "SELECT * FROM object_store_retention.drain_cleanup_claim_v2($1)",
                 &[&spool],
             )
             .await?;
-        let r = rows.first().ok_or(DrainError::Refused)?;
+        let r = rows.first().ok_or(DrainError::Contended)?;
         Ok(DrainCleanupIntent {
             spool,
             fence: r.try_get(3).map_err(|_error| DrainError::Invalid)?,
+            scanned_ms: r.try_get(4).map_err(|_error| DrainError::Invalid)?,
             key: SpoolObjectKey {
                 provider_boundary_id: r.try_get(0).map_err(|_error| DrainError::Invalid)?,
                 logical_request_id: r
@@ -80,6 +96,7 @@ impl DrainClient {
         })
     }
 
+    /// Call only after this intent's unlink finished.
     pub async fn release_cleanup(&self, intent: &DrainCleanupIntent) -> Result<(), DrainError> {
         self.query(
             "SELECT object_store_retention.drain_cleanup_release_v1($1,$2)",
@@ -90,8 +107,8 @@ impl DrainClient {
         // row's next re-scan, so it must not read as a release that committed nothing.
         match self
             .query(
-                "SELECT object_store_retention.drain_cleanup_compact_v1($1)",
-                &[&intent.spool],
+                "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)",
+                &[&intent.spool, &intent.scanned_ms],
             )
             .await
         {

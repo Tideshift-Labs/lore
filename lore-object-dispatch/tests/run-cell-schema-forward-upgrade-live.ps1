@@ -113,7 +113,13 @@ $tests = @(
         }
     },
     # WP-115 ledger row 59: a cleanup claim lost to another replica reads as Contended.
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_CLAIM_RACE_PG_URL'; Name = 'live_a_cleanup_claim_lost_to_another_replica_reads_as_contended'; Database = 'claim_race' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_CLAIM_RACE_PG_URL'; Name = 'live_a_cleanup_claim_lost_to_another_replica_reads_as_contended'; Database = 'claim_race' },
+    # Migration 0029 (WP-115 rows 56 and 66): superseded markers, due time, SKIP LOCKED lease.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_SUPERSEDE_PG_URL'; Name = 'live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap_again'; Database = 'supersede' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_SUPERSEDE_UNDERFLOW_PG_URL'; Name = 'live_superseded_marker_deletion_refuses_a_counter_underflow'; Database = 'supersede_underflow' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_NOT_DUE_PG_URL'; Name = 'live_released_rows_and_markers_are_scanned_only_when_due'; Database = 'not_due' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_LEASE_PG_URL'; Name = 'live_cleanup_claimers_lease_disjoint_rows_and_an_expired_lease_is_retaken'; Database = 'lease' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R28_PG_URL'; Name = 'live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded'; Database = 'r28_upgrade' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

@@ -104,10 +104,10 @@ it's derived from another column rather than a fixed literal.
   the release receipt; without `public.blake3(bytea)` installed, every path through this function —
   including the underflow case — fails with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE` before reaching the
   logic under test.
-- **`drain_cleanup_claim_v1` refuses `DRAIN_CLEANUP_TOO_EARLY` until the reservation's own expiry
-  passes.** A fixture driving reserve→claim→release back-to-back (to simulate load quickly, not a
-  realistic multi-minute TTL) must give the policy/descriptor a short `maximum_ttl_ms` and then sleep
-  past it before claiming — and that window must absorb a *cold* runtime pool's first
+- **`drain_cleanup_claim_v2` (0029; `_v1` before it) refuses `DRAIN_CLEANUP_TOO_EARLY` until the
+  reservation's own expiry passes.** A fixture driving reserve→claim→release back-to-back (to
+  simulate load quickly, not a realistic multi-minute TTL) must give the policy/descriptor a short
+  `maximum_ttl_ms` and then sleep past it before claiming — and that window must absorb a *cold* runtime pool's first
   connect-and-physical-attest round trip (seconds, not milliseconds) if the very first reservation in
   a test uses an unwarmed `DispatchRuntimePool`. Warm the pool once (any cheap call) before the timed
   loop starts, then the per-iteration window only needs to cover normal round-trip time.
@@ -144,10 +144,10 @@ it's derived from another column rather than a fixed literal.
   type actually binds as, then to what the SQL expression needs) works. The existing
   `$3::text::object_store_retention.uint64` idiom used elsewhere in this crate sidesteps the same
   issue by going through text instead.
-- **`drain_cleanup_compact_v1` silently no-ops when there is no matching
-  `object_dispatch_spool_objects` row, unless the seeded policy's own `expires_at_ms` is already in
-  the past.** Its early-return guard is `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`;
-  a `SELECT INTO` (not `STRICT`) that matches zero rows leaves `s.expires_at_unix_ms` NULL, and
+- **`drain_cleanup_compact_v2` (0029; `_v1` before it) silently no-ops on a row no rotation
+  superseded when there is no matching `object_dispatch_spool_objects` row, unless the seeded
+  policy's own `expires_at_ms` is already in the past.** Its early-return guard is
+  `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`; a `SELECT INTO` (not `STRICT`) that matches zero rows leaves `s.expires_at_unix_ms` NULL, and
   `greatest(NULL, far_future)` still evaluates to `far_future` -- every other fixture in this tier
   deliberately seeds a far-future policy expiry specifically to keep compaction a no-op, so a test
   that needs compaction to actually run must seed a PAST `expires_at_ms` instead, not merely omit

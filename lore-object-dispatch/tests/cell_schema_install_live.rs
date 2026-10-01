@@ -455,14 +455,17 @@ async fn live_drain_policy_publication_is_maintenance_only_and_replays_exactly()
         WHERE p.boundary='fixture-boundary' AND p.cell='fixture-cell';
         ANALYZE object_store_retention.drain_spool_custody;
         SET plan_cache_mode=force_generic_plan;").await.unwrap();
-    let migration = include_str!("../migrations/0026_object_store_dispatch_drain_policy.sql");
+    // The candidates selection the current cell runs: 0029's leased pick, `FOR UPDATE SKIP LOCKED`
+    // included, so the plan proven here is the one that takes the row locks.
+    let migration =
+        include_str!("../migrations/0029_object_store_dispatch_drain_superseded_markers.sql");
     let selection = migration
         .split_once(
-            "RETURN QUERY SELECT x.spool_id FROM object_store_retention.drain_spool_custody x",
+            "RETURN QUERY WITH picked AS (\n  SELECT x.spool_id FROM object_store_retention.drain_spool_custody x",
         )
         .unwrap()
         .1
-        .split_once(';')
+        .split_once("\n ), leased AS (")
         .unwrap()
         .0;
     let query =
@@ -486,7 +489,7 @@ async fn live_drain_policy_publication_is_maintenance_only_and_replays_exactly()
         .join("\n");
     println!("generic compact-tombstone cleanup plan:\n{plan}");
     assert!(
-        plan.contains("drain_spool_cleanup"),
+        plan.contains("drain_spool_due"),
         "captured-time generic query must use due-time index: {plan}"
     );
     assert!(
@@ -888,7 +891,8 @@ async fn live_postgres_cell_schema_measure_catalog_manifest() {
     let cell = connect("LORE_TEST_CELL_SCHEMA_MEASURE_PG_URL").await;
     // Optional: measure an older known state, e.g. on a newly supported server major.
     let target = match std::env::var("LORE_TEST_CELL_SCHEMA_MEASURE_TARGET").as_deref() {
-        Err(_) | Ok("R28") => CellSchemaRevision::R28,
+        Err(_) | Ok("R29") => CellSchemaRevision::R29,
+        Ok("R28") => CellSchemaRevision::R28,
         Ok("R25") => CellSchemaRevision::R25,
         Ok("R26") => CellSchemaRevision::R26,
         Ok("R27") => CellSchemaRevision::R27,

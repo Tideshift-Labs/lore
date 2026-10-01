@@ -82,9 +82,9 @@ impl std::fmt::Debug for DrainDescriptor {
     }
 }
 
-/// The cell schema revision this build ships (CR-038). Migration 0028's
+/// The cell schema revision this build ships (CR-038). Migration 0029's
 /// `cell_schema_revision_v1()` returns it; write-behind refuses to start on any other value.
-pub const CELL_SCHEMA_REVISION: i32 = 28;
+pub const CELL_SCHEMA_REVISION: i32 = 29;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DrainError {
@@ -99,7 +99,7 @@ pub enum DrainError {
     #[error("drain authority lost a race for the same row to another session; nothing committed")]
     Contended,
     #[error(
-        "the cell schema predates the spool metadata true-up: stop every replica and run `cell-schema-install upgrade`"
+        "the cell schema is older than this build: stop every replica and run `cell-schema-install upgrade`"
     )]
     SchemaUpgradeRequired,
     #[error("the cell schema revision is not one this build knows; refusing write-behind")]
@@ -291,6 +291,9 @@ pub struct DrainObservation {
     pub spool_files: u64,
     pub cleanup_backlog: u64,
     pub metadata_full: bool,
+    /// Custody rows a policy rotation superseded that still wait for compaction or for their
+    /// post-fence rescan (migration 0029). Each still holds a metadata row.
+    pub superseded_pending: u64,
 }
 
 impl DrainClient {
@@ -327,6 +330,11 @@ impl DrainClient {
             )
             .map_err(|_error| DrainError::Invalid)?,
             metadata_full: r.try_get(3).map_err(|_error| DrainError::Invalid)?,
+            superseded_pending: u64::try_from(
+                r.try_get::<_, i64>(4)
+                    .map_err(|_error| DrainError::Invalid)?,
+            )
+            .map_err(|_error| DrainError::Invalid)?,
         })
     }
 
@@ -334,6 +342,18 @@ impl DrainClient {
     /// preserves the caller's descriptor; no retry creates a replacement identity.
     pub(crate) async fn query(
         &self,
+        sql: &str,
+        values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<Row>, DrainError> {
+        self.query_at(IsolationLevel::Serializable, sql, values)
+            .await
+    }
+
+    /// [`DrainClient::query`] at a chosen isolation level. Only the cleanup candidates lease runs
+    /// below `SERIALIZABLE`; see `drain_spool.rs`.
+    pub(crate) async fn query_at(
+        &self,
+        isolation: IsolationLevel,
         sql: &str,
         values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     ) -> Result<Vec<Row>, DrainError> {
@@ -346,7 +366,7 @@ impl DrainClient {
             let client = lease.client().map_err(|_error| DrainError::Unavailable)?;
             let tx = client
                 .build_transaction()
-                .isolation_level(IsolationLevel::Serializable)
+                .isolation_level(isolation)
                 .start()
                 .await
                 .map_err(|_error| DrainError::Unavailable)?;
@@ -503,10 +523,12 @@ impl DrainClient {
             .ok_or(DrainError::Invalid)?
             .try_get(0)
             .map_err(|_error| DrainError::Invalid)?;
-        if revision == CELL_SCHEMA_REVISION {
-            Ok(())
-        } else {
-            Err(DrainError::SchemaUnknown)
+        // An older marker is a known state `cell-schema-install upgrade` moves forward, so it
+        // names that fix. A newer one is a later installer's cell.
+        match revision.cmp(&CELL_SCHEMA_REVISION) {
+            std::cmp::Ordering::Equal => Ok(()),
+            std::cmp::Ordering::Less => Err(DrainError::SchemaUpgradeRequired),
+            std::cmp::Ordering::Greater => Err(DrainError::SchemaUnknown),
         }
     }
 

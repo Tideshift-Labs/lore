@@ -43,7 +43,7 @@ digests. Use it to (re)measure the pinned constants in `cell_schema_install.rs` 
 migration or the manifest query changes. It is not a gate and reports no PASS.
 
 .PARAMETER MeasureTarget
-With -Measure, the known state to install and measure: R25, R26, R27 or R28 (default R28).
+With -Measure, the known state to install and measure: R25, R26, R27, R28 or R29 (default R29).
 
 .PARAMETER PostgresImage
 The PostgreSQL image to run. Default `postgres:18`. Its major must be 16 or 18, and the server's
@@ -56,8 +56,8 @@ Keeps the container for debugging when the run did not fully pass.
 [CmdletBinding()]
 param(
     [switch]$Measure,
-    [ValidateSet('R25', 'R26', 'R27', 'R28')]
-    [string]$MeasureTarget = 'R28',
+    [ValidateSet('R25', 'R26', 'R27', 'R28', 'R29')]
+    [string]$MeasureTarget = 'R29',
     [string]$PostgresImage = 'postgres:18',
     [switch]$KeepOnFailure
 )

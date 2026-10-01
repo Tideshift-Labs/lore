@@ -1402,6 +1402,7 @@ mod capacity_evidence_tests {
             cleanup_backlog: 0,
             roots_usable: true,
             metadata_full: false,
+            superseded_pending: 0,
             available_bytes: Some(MIN_FREE),
             physical_spool_bytes: Some(100),
             physical_spool_files: Some(10),

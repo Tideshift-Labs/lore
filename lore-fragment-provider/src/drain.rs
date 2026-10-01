@@ -249,6 +249,10 @@ pub struct FragmentDrainObservation {
     pub cleanup_backlog: u64,
     pub roots_usable: bool,
     pub metadata_full: bool,
+    /// Rows a policy rotation superseded that still hold a metadata row (migration 0029). After a
+    /// rotation, a physical spool above its ledger is a late blob that no remaining custody row
+    /// will unlink, so `spool_*_over_ledger` then means a real orphan, not a lagging walk.
+    pub superseded_pending: u64,
     pub available_bytes: Option<u64>,
     pub physical_spool_bytes: Option<u64>,
     pub physical_spool_files: Option<u64>,
@@ -274,6 +278,7 @@ impl FragmentDrainObservation {
             cleanup_backlog: sample.cleanup_backlog,
             roots_usable: available_bytes.is_some(),
             metadata_full: sample.metadata_full,
+            superseded_pending: sample.superseded_pending,
             available_bytes,
             physical_spool_bytes: physical.map(|(inventory, _)| inventory.bytes),
             physical_spool_files: physical.map(|(inventory, _)| inventory.files),
@@ -635,6 +640,7 @@ mod observation_tests {
             spool_files: 10,
             cleanup_backlog: 3,
             metadata_full: false,
+            superseded_pending: 2,
         }
     }
 

@@ -2986,6 +2986,15 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         std::fs::metadata(paths.final_path()).unwrap().len(),
         body.len() as u64
     );
+    // Migration 0029: a marker that no rotation superseded is swept for late bodies once an hour,
+    // not on every pass.
+    assert_eq!(
+        maintenance.cleanup_pass(64).await.unwrap(),
+        0,
+        "a fresh marker is not due"
+    );
+    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", policy.expires_at_ms + 1 + 3_600_001)).await.unwrap();
+    assert!(paths.final_path().is_file());
     assert_eq!(
         maintenance.cleanup_pass(64).await.unwrap(),
         1,
@@ -3000,6 +3009,76 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         "replaying the tombstone is not fresh cleanup progress"
     );
     crate::drain::assert_cleanup_recovers_after_worker_panic(&maintenance).await;
+
+    // Migration 0029 (WP-115 row 56): an offline rotation supersedes the marker. A late body a
+    // stale writer places after the marker's fence is unlinked by the marker's own post-fence
+    // rescan, and only then is the marker deleted with its row and its 1024 bytes.
+    let rotated_at = policy.expires_at_ms + 3_600_010;
+    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {rotated_at}::bigint';
+        CREATE FUNCTION public.stage_policy_rotate_v1(p jsonb, digest bytea, expected_revision text, expected_digest bytea)
+        RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$;")).await.unwrap();
+    let next = DrainPolicy {
+        revision: "drain-test-policy-v2".into(),
+        expires_at_ms: rotated_at + 3_600_000,
+        ..policy.clone()
+    };
+    let rotate = format!(
+        "SELECT object_store_retention.drain_policy_rotate_v1({}::jsonb,decode('{}','hex'),decode('{}','hex'),{},decode('{}','hex'))",
+        quoted(&serde_json::to_string(&next).unwrap()),
+        hex::encode(next.canonical_bytes().unwrap()),
+        hex::encode(next.digest().unwrap()),
+        quoted(&policy.revision),
+        hex::encode(policy_digest)
+    );
+    prime(&admin, "object_dispatch_retention_maintenance", &rotate).await;
+    admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance;BEGIN ISOLATION LEVEL SERIALIZABLE;{rotate};COMMIT;RESET SESSION AUTHORIZATION;")).await.unwrap();
+    async fn marker(admin: &Client, spool: Uuid) -> Option<(bool, i64)> {
+        admin
+            .query_opt(
+                "SELECT superseded, marker_fence_ms FROM object_store_retention.drain_spool_custody WHERE spool_id=$1",
+                &[&spool],
+            )
+            .await
+            .unwrap()
+            .map(|row| (row.get::<_, bool>(0), row.get::<_, i64>(1)))
+    }
+    async fn counters(admin: &Client, cell: &str) -> (i64, i64) {
+        let row = admin
+            .query_one(
+                "SELECT metadata_rows::bigint, metadata_bytes::bigint FROM object_store_retention.drain_policies WHERE cell=$1",
+                &[&cell],
+            )
+            .await
+            .unwrap();
+        (row.get::<_, i64>(0), row.get::<_, i64>(1))
+    }
+    let spool = input.spool_object_id;
+    let fence = i64::try_from(rotated_at).unwrap();
+    assert_eq!(marker(&admin, spool).await, Some((true, fence)));
+    let before = counters(&admin, &policy.cell).await;
+    // A scan time at the fence is not a post-fence rescan and deletes nothing.
+    admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_runtime;BEGIN ISOLATION LEVEL SERIALIZABLE;SELECT object_store_retention.drain_cleanup_compact_v2('{}'::uuid,{fence});COMMIT;RESET SESSION AUTHORIZATION;", input.spool_object_id)).await.unwrap();
+    assert_eq!(marker(&admin, spool).await, Some((true, fence)));
+    // The stale writer's late body lands after the fence.
+    std::fs::create_dir_all(paths.final_path().parent().unwrap()).unwrap();
+    std::fs::write(paths.final_path(), &body).unwrap();
+    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", rotated_at + 5)).await.unwrap();
+    assert_eq!(
+        maintenance.cleanup_pass(64).await.unwrap(),
+        1,
+        "the superseded marker's post-fence rescan unlinked the late body"
+    );
+    assert!(!paths.final_path().exists());
+    assert_eq!(
+        marker(&admin, spool).await,
+        None,
+        "the marker is deleted after its own post-fence unlink"
+    );
+    assert_eq!(
+        counters(&admin, &policy.cell).await,
+        (before.0 - 1, before.1 - 1024),
+        "deletion gives back exactly the marker's row and 1024 bytes"
+    );
     std::fs::remove_dir_all(&root).unwrap();
 }
 
