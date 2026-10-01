@@ -299,7 +299,7 @@ impl ProviderChargeAuthority for PostgresProviderChargeAuthority {
                 Ok(ChargeAttempt::Granted(grant)) => return Ok(grant),
                 Err(ChargeExecutionError::Retryable) => {
                     if let Some(delay) = retry_delay {
-                        tokio::time::sleep(delay).await
+                        tokio::time::sleep(delay).await;
                     } else {
                         tracing::warn!(
                             stage = "contention_exhausted",
@@ -312,7 +312,7 @@ impl ProviderChargeAuthority for PostgresProviderChargeAuthority {
                     SessionUnusableChargeError::Retryable,
                 )) => {
                     if let Some(delay) = retry_delay {
-                        tokio::time::sleep(delay).await
+                        tokio::time::sleep(delay).await;
                     } else {
                         tracing::warn!(
                             stage = "contention_exhausted",
