@@ -2266,6 +2266,145 @@ mod tests {
             .await;
     }
 
+    /// A replica fan-out is detached and nothing awaits it, so its failure is only seen if it is
+    /// logged where it happens. These capture the process-wide log and keep only the lines naming
+    /// this test's replica, so other tests' logging cannot interfere.
+    mod replication_failures_are_logged {
+        use std::sync::Mutex;
+
+        use lore_base::log::LoreLogLevel;
+
+        use super::*;
+
+        static CAPTURED: Mutex<Vec<(LoreLogLevel, String)>> = Mutex::new(Vec::new());
+
+        fn capture(level: LoreLogLevel, _location: &str, message: &str) {
+            CAPTURED.lock().unwrap().push((level, message.to_owned()));
+        }
+
+        fn captured_for(replica: &str) -> Vec<(LoreLogLevel, String)> {
+            let needle = format!("replica '{replica}'");
+            CAPTURED
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, message)| message.contains(&needle))
+                .cloned()
+                .collect()
+        }
+
+        fn store_with_replica(
+            local: TestStore<'static>,
+            replica_name: &str,
+            replica: Arc<TestStore<'static>>,
+        ) -> Arc<lore_revision::store::composite::CompositeStore> {
+            lore_base::log::set_log_callback(Some(capture));
+            lore_base::log::set_log_level(LoreLogLevel::Debug);
+            Arc::new(
+                CompositeStoreBuilder::default()
+                    .with_local("local".to_string(), Arc::new(local))
+                    .expect("Failed add local")
+                    .with_durable("durable".to_string(), Arc::new(TestStore::succeeding()))
+                    .expect("Failed add durable")
+                    .with_replica(replica_name.to_string(), replica, false, true)
+                    .build()
+                    .expect("Failed store build"),
+            )
+        }
+
+        async fn put(store: &Arc<lore_revision::store::composite::CompositeStore>) {
+            store
+                .clone()
+                .put(
+                    random::<RepositoryId>(),
+                    Address {
+                        hash: random::<Hash>(),
+                        context: random::<Context>(),
+                    },
+                    Fragment {
+                        flags: 0,
+                        size_payload: 128,
+                        size_content: 128,
+                    },
+                    Some(Bytes::from(vec![0u8; 128])),
+                    false,
+                )
+                .await
+                .expect("a replica failure must not fail the put");
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        #[tokio::test]
+        async fn a_failed_replica_put_is_logged_at_warn() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let name = format!("put-replica-{}", random::<u64>());
+                    let replica = Arc::new(TestStore::failing());
+                    let store = store_with_replica(
+                        TestStore::succeeding().with_mock_match(StoreMatch::MatchNone),
+                        &name,
+                        replica.clone(),
+                    );
+
+                    put(&store).await;
+
+                    assert_eq!(*replica.invocations.read().unwrap().get("put").unwrap(), 1);
+                    let lines = captured_for(&name);
+                    assert_eq!(lines.len(), 1, "one line per failed fan-out: {lines:?}");
+                    assert_eq!(lines[0].0, LoreLogLevel::Warn);
+                    assert!(lines[0].1.contains("failed put"), "{lines:?}");
+                    assert!(lines[0].1.contains("Mock store failure"), "{lines:?}");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn a_failed_replica_copy_is_logged_at_warn() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let name = format!("copy-replica-{}", random::<u64>());
+                    let replica = Arc::new(TestStore::failing());
+                    let store = store_with_replica(
+                        TestStore::succeeding()
+                            .with_mock_match(StoreMatch::MatchPartition)
+                            .with_mock_durable_match(random::<Context>()),
+                        &name,
+                        replica.clone(),
+                    );
+
+                    put(&store).await;
+
+                    assert_eq!(*replica.invocations.read().unwrap().get("copy").unwrap(), 1);
+                    let lines = captured_for(&name);
+                    assert_eq!(lines.len(), 1, "one line per failed fan-out: {lines:?}");
+                    assert_eq!(lines[0].0, LoreLogLevel::Warn);
+                    assert!(lines[0].1.contains("failed copy"), "{lines:?}");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn a_successful_replica_put_logs_nothing() {
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let name = format!("ok-replica-{}", random::<u64>());
+                    let store = store_with_replica(
+                        TestStore::succeeding().with_mock_match(StoreMatch::MatchNone),
+                        &name,
+                        Arc::new(TestStore::succeeding()),
+                    );
+
+                    put(&store).await;
+
+                    assert!(captured_for(&name).is_empty());
+                })
+                .await;
+        }
+    }
+
     mod inflight_dedup {
         use std::path::Path;
         use std::sync::Arc;

@@ -388,6 +388,7 @@ impl CompositeStoreBuilder {
                     .latency_histogram_ms("topology.refresh.iteration.duration"),
                 counter_get_inflight_receiver: provider.counter("get.inflight.receiver"),
                 counter_local_caching: provider.counter("local.caching_total"),
+                counter_replication: provider.counter("replication_total"),
 
                 provider,
             },
@@ -656,11 +657,15 @@ impl CompositeStore {
         };
         for replica in write_replicas.iter() {
             let replica_store = replica.store();
+            let replica_name = replica.name.clone();
+            let counter = self.instruments.counter_replication.clone();
             let payload = payload.clone();
             lore_spawn!(async move {
-                replica_store
+                let result = replica_store
                     .put(partition, address, fragment, payload, force)
-                    .await
+                    .await;
+                report_replication("put", &replica_name, address, &counter, &result);
+                result
             });
         }
     }
@@ -679,10 +684,14 @@ impl CompositeStore {
         };
         for replica in write_replicas.iter() {
             let replica_store = replica.store();
+            let replica_name = replica.name.clone();
+            let counter = self.instruments.counter_replication.clone();
             lore_spawn!(async move {
-                replica_store
+                let result = replica_store
                     .copy(source_partition, source_address, partition, context, true)
-                    .await
+                    .await;
+                report_replication("copy", &replica_name, source_address, &counter, &result);
+                result
             });
         }
     }
@@ -1334,6 +1343,29 @@ fn count_result<T, E>(context: &'static str, counter: &Counter<u64>, result: &Re
     );
 }
 
+/// Count and log one detached replica fan-out. Nobody awaits it, so this is the only place its
+/// failure is seen. A replica refusing the operation outright is expected (a peer-made replica
+/// cannot carry a copy) and logs at debug; any other failure means the replica missed a write it
+/// was sent, and logs at warn.
+fn report_replication(
+    operation: &'static str,
+    replica: &str,
+    address: Address,
+    counter: &Counter<u64>,
+    result: &Result<(), StoreError>,
+) {
+    count_result(operation, counter, result);
+    match result {
+        Ok(()) => {}
+        Err(error @ StoreError::NotSupported(_)) => {
+            lore_debug!("replica '{replica}' refused {operation} of {address}: {error}");
+        }
+        Err(error) => {
+            lore_warn!("replica '{replica}' failed {operation} of {address}: {error}");
+        }
+    }
+}
+
 static STORE_ATTRIBUTE: LazyLock<KeyValue> = LazyLock::new(|| KeyValue::new("store", "composite"));
 
 #[derive(Debug)]
@@ -1359,4 +1391,5 @@ struct CompositeStoreInstruments {
     topology_refresh_duration: Histogram<f64>,
     counter_get_inflight_receiver: Counter<u64>,
     counter_local_caching: Counter<u64>,
+    counter_replication: Counter<u64>,
 }
