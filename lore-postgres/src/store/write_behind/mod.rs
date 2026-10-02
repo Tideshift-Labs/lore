@@ -63,6 +63,17 @@ pub(crate) use self::root::StageIoPath;
 /// One reserved staging I/O slot. See [`WriteBehindStage::reserve_io`].
 pub(crate) struct StageIoPermit(tokio::sync::OwnedSemaphorePermit);
 
+/// The two slots one staged PUT holds. See [`WriteBehindStage::reserve_put`].
+pub(crate) struct PutReservation {
+    /// Held until the PUT's last database step returns.
+    pub(crate) database: tokio::sync::OwnedSemaphorePermit,
+    /// Moved into the finalizer, which releases it when the file is durable.
+    pub(crate) io: StageIoPermit,
+}
+
+/// The `operation` of a refused [`PutReservation`] database slot.
+pub(crate) const PUT_DATABASE_CAPACITY: &str = "staged PUT database capacity";
+
 /// Whether one staging attempt may still withdraw its preparation.
 ///
 /// The durable-effect boundary is the rename into the staged leaf (finalize
@@ -246,9 +257,14 @@ pub struct WriteBehindSettings {
     /// How often the admission sampler refreshes its snapshot. The sampler
     /// exists so `statvfs` never runs on the PUT path.
     pub sample_interval: Duration,
-    /// How long a PUT waits for a staging I/O slot before it answers
-    /// `SlowDown`. Zero refuses at once, the behaviour before row 76's fix.
+    /// How long a PUT waits for its database and staging I/O slots, together,
+    /// before it answers `SlowDown`. Zero refuses at once, the behaviour before
+    /// row 76's fix.
     pub stage_io_wait: Duration,
+    /// How many staged PUTs may do their database work at once. The composing
+    /// server sets it to one less than the domain pool's size, so the write-
+    /// behind observer always finds a connection. Floored at 1.
+    pub put_database_slots: usize,
 }
 
 /// [`WriteBehindSettings::stage_io_wait`]'s default. Long enough for a burst of
@@ -335,6 +351,8 @@ pub struct WriteBehindStage {
     min_free_bytes: u64,
     hard_limits: (u64, u64),
     stage_io_wait: Duration,
+    /// See [`WriteBehindSettings::put_database_slots`] and [`Self::reserve_put`].
+    put_database: Arc<tokio::sync::Semaphore>,
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -417,6 +435,9 @@ impl WriteBehindStage {
                 settings.watermarks.hard_count,
             ),
             stage_io_wait: settings.stage_io_wait,
+            put_database: Arc::new(tokio::sync::Semaphore::new(
+                settings.put_database_slots.max(1),
+            )),
             sampler,
         }))
     }
@@ -555,6 +576,48 @@ impl WriteBehindStage {
             .io_permit_within(StageIoPath::Put, self.stage_io_wait)
             .await
             .map(StageIoPermit)
+    }
+
+    /// Reserve both slots one staged PUT needs, inside one
+    /// [`WriteBehindSettings::stage_io_wait`] budget.
+    ///
+    /// **Order: the database slot first, then the I/O slot.** The caller holds
+    /// the database slot from before `begin_stage` until after
+    /// `commit_staged` and the witness read, so at most
+    /// `put_database_slots` PUTs use the domain pool at once and the
+    /// observer keeps a connection (row 76: with only the I/O wait, 16 PUTs
+    /// queued on a 3-connection pool and the observer timed out behind them).
+    /// The I/O slot is released when the file is durable, as before.
+    ///
+    /// No deadlock between the two. Every PUT takes them in the same order,
+    /// nothing that holds an I/O slot waits for a database slot (reads,
+    /// purge and the inventory never take one), and both waits end at one
+    /// deadline. A refused I/O slot drops the database slot it already holds.
+    /// There are fewer database slots than I/O slots, so the I/O wait is
+    /// normally immediate.
+    pub(crate) async fn reserve_put(&self) -> Result<PutReservation, WriteBehindError> {
+        let deadline = tokio::time::Instant::now() + self.stage_io_wait;
+        let database = if self.stage_io_wait.is_zero() {
+            self.put_database.clone().try_acquire_owned().ok()
+        } else {
+            tokio::time::timeout_at(deadline, self.put_database.clone().acquire_owned())
+                .await
+                .ok()
+                .and_then(Result::ok)
+        }
+        .ok_or(WriteBehindError::Io {
+            operation: PUT_DATABASE_CAPACITY,
+            kind: ErrorKind::WouldBlock,
+        })?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let io = self
+            .root
+            .io_permit_within(StageIoPath::Put, remaining)
+            .await?;
+        Ok(PutReservation {
+            database,
+            io: StageIoPermit(io),
+        })
     }
 
     /// [`Self::stage`] with a slot from [`Self::reserve_io`]. The rename is

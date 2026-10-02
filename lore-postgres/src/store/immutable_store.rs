@@ -119,6 +119,8 @@ use crate::domain::fragments::decodable_encoding;
 use crate::domain::fragments::read_fragment_write_capability;
 use crate::pool::Pool;
 use crate::store::write_behind::AdmissionSnapshot;
+use crate::store::write_behind::PUT_DATABASE_CAPACITY;
+use crate::store::write_behind::PutReservation;
 use crate::store::write_behind::StageAttempt;
 use crate::store::write_behind::StagedRead;
 use crate::store::write_behind::StagingMode;
@@ -1773,10 +1775,22 @@ impl PostgresImmutableStore {
         Self::validate_put_candidate(address, fragment, &payload, "staged")?;
         // Before `begin_stage`: a capacity refusal after it would leave a live
         // preparation that fences every retry of this hash until it expires.
-        let permit = stage
-            .reserve_io()
-            .await
-            .map_err(|error| counted_refusal(error.store_error(), "io_capacity"))?;
+        // `_database` bounds this PUT's domain-pool work and is held to the
+        // end of this function, past `commit_staged` and the witness read;
+        // `permit` goes to the finalizer. See `WriteBehindStage::reserve_put`.
+        let PutReservation {
+            database: _database,
+            io: permit,
+        } = stage.reserve_put().await.map_err(|error| {
+            let reason = match error {
+                WriteBehindError::Io {
+                    operation: PUT_DATABASE_CAPACITY,
+                    ..
+                } => "database_capacity",
+                _ => "io_capacity",
+            };
+            counted_refusal(error.store_error(), reason)
+        })?;
         // `put_coordinated` chose this route before the wait for a slot.
         // Re-read it, so a stage that began refusing while this PUT queued
         // takes no new preparation. `DirectFallback` still stages: it only
@@ -3379,6 +3393,7 @@ mod tests {
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
+            put_database_slots: 3,
         })
         .unwrap();
         let payload = Bytes::from(format!(

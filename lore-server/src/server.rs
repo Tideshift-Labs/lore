@@ -1317,8 +1317,19 @@ fn postgres_write_behind_settings(
         return Ok(None);
     }
     let immutable_config = resolved_postgres_store_config(settings, "immutable_store")?;
-    plugins::postgres::write_behind_settings(&immutable_config)
-        .map_err(|error| anyhow!("Invalid Postgres write-behind configuration: {error}"))
+    let Some(mut composition) = plugins::postgres::write_behind_settings(&immutable_config)
+        .map_err(|error| anyhow!("Invalid Postgres write-behind configuration: {error}"))?
+    else {
+        return Ok(None);
+    };
+    // Staged PUTs share the domain pool with the observer, and that pool's
+    // size is the mutable store's setting. An enabled tier needs the governed
+    // route, which needs a Postgres mutable store, so the setting exists.
+    let mutable_config = resolved_postgres_store_config(settings, "mutable_store")?;
+    composition.settings.put_database_slots =
+        plugins::postgres::put_database_slots_for(&mutable_config)
+            .map_err(|error| anyhow!("Invalid Postgres mutable store configuration: {error}"))?;
+    Ok(Some(composition))
 }
 
 fn resolved_postgres_store_config(settings: &Settings, store_type: &str) -> Result<toml::Value> {

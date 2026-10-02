@@ -252,6 +252,7 @@ fn open_stage(root: &ScratchRoot) -> std::sync::Arc<WriteBehindStage> {
         drain_stale_after: Duration::from_secs(60),
         sample_interval: Duration::from_secs(3_600),
         stage_io_wait: lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT,
+        put_database_slots: 3,
     })
     .expect("open a healthy staging root")
 }
