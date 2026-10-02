@@ -679,7 +679,7 @@ async fn normalize_selected_files(
                 let value = match entry.value_type {
                     ExactMetadataType::String => PreparedMetadataValue::String(entry.value.clone()),
                     ExactMetadataType::Numeric => {
-                        let parsed = entry.value.parse::<u64>().map_err(|_| {
+                        let parsed = entry.value.parse::<u64>().map_err(|_err| {
                             ExactSelectionError::new(ExactSelectionErrorKind::InvalidInput {
                                 reason: format!("metadata key {} requires a u64 value", entry.key),
                                 paths: vec![path.clone()],
@@ -876,7 +876,7 @@ async fn collect_live_file_metadata(
                 continue;
             }
             let path = if parent_path.is_empty() {
-                name.freeze().to_string()
+                name.freeze()
             } else {
                 format!("{parent_path}/{}", name.freeze())
             };

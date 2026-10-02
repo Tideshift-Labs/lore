@@ -773,11 +773,10 @@ impl RevisionService for StubRevisionService {
                 // reads this value compares it against the branch point it asked for, so echoing
                 // is the only answer that does not fail the caller for a reason the fixture
                 // invented.
-                let latest = body
-                    .stack
-                    .first()
-                    .map(|point| point.revision_signature.clone())
-                    .unwrap_or_else(|| vec![0; 32].into());
+                let latest = body.stack.first().map_or_else(
+                    || vec![0; 32].into(),
+                    |point| point.revision_signature.clone(),
+                );
                 // Restoration keeps the configured metadata. An absent branch gets a
                 // deterministic synthetic hash; this transport fixture has no metadata store.
                 let metadata = match policy.branch_get {

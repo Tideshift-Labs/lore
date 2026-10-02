@@ -246,7 +246,7 @@ mod tests {
                     continue;
                 }
                 let path = if parent_path.is_empty() {
-                    name.freeze().to_string()
+                    name.freeze()
                 } else {
                     format!("{parent_path}/{}", name.freeze())
                 };

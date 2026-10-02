@@ -774,7 +774,7 @@ pub struct LoreGlobalArgs {
     /// must be left empty, since it is read from the token.
     pub access_token: LoreString,
     /// The attempt identity this call's mutations are dispatched under, as a
-    /// hyphenated lowercase UUIDv7. Empty for every caller that does not track
+    /// hyphenated lowercase `UUIDv7`. Empty for every caller that does not track
     /// attempts, which is the CLI and every embedder that has not opted in.
     /// PIN(WP-120, 2026-09-05).
     ///

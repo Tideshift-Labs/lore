@@ -871,6 +871,10 @@ fn crash_worker() {
             _ => false,
         };
         if selected {
+            #[allow(
+                clippy::exit,
+                reason = "this child process simulates a crash at the selected publication point"
+            )]
             std::process::exit(77);
         }
         Ok(())

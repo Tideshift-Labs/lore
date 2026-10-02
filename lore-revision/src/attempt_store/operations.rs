@@ -206,7 +206,7 @@ impl AttemptStore for RepositoryAttemptStore {
         self.update(|document| {
             document
                 .ownership
-                .retain(|held| held.branch != branch || held.resource != resource)
+                .retain(|held| held.branch != branch || held.resource != resource);
         })
         .await
     }
@@ -225,7 +225,7 @@ impl AttemptStore for RepositoryAttemptStore {
         self.update(|document| {
             document
                 .ownership
-                .retain(|held| !cleared.contains(&(held.branch.clone(), held.resource.clone())))
+                .retain(|held| !cleared.contains(&(held.branch.clone(), held.resource.clone())));
         })
         .await
     }
@@ -331,12 +331,12 @@ impl RepositoryAttemptStore {
         let _local = self.write_guard.lock().await;
         let guard = self.guard().await?;
         let document = self.load(&guard)?;
-        self.validate_parents(&document)?;
+        Self::validate_parents(&document)?;
         self.children(&document, false)?;
         Ok(document.parents)
     }
 
-    pub(super) fn validate_parents(&self, document: &StoredDocument) -> Result<(), ProtocolError> {
+    pub(super) fn validate_parents(document: &StoredDocument) -> Result<(), ProtocolError> {
         let mut seen = std::collections::HashSet::new();
         for parent in &document.parents {
             if parent.version != 1
@@ -401,7 +401,7 @@ impl RepositoryAttemptStore {
         let _local = self.write_guard.lock().await;
         let guard = self.guard().await?;
         let mut document = self.load_for_write(&guard)?;
-        self.validate_parents(&document)?;
+        Self::validate_parents(&document)?;
         if document
             .parents
             .iter()
@@ -416,7 +416,7 @@ impl RepositoryAttemptStore {
             ));
         }
         document.parents.push(parent);
-        self.validate_parents(&document)?;
+        Self::validate_parents(&document)?;
         self.store(&guard, &document)
     }
 
@@ -473,7 +473,7 @@ impl RepositoryAttemptStore {
         parent: Uuid,
         children: &[StoredChild],
     ) -> Result<(), ProtocolError> {
-        self.validate_parents(document)?;
+        Self::validate_parents(document)?;
         if children
             .iter()
             .any(|child| child.attempt.state.is_unresolved())
@@ -524,7 +524,7 @@ impl RepositoryAttemptStore {
             repository: namespace
                 .repository
                 .parse()
-                .map_err(|_| ProtocolError::internal("invalid repository identity"))?,
+                .map_err(|_err| ProtocolError::internal("invalid repository identity"))?,
             endpoint: namespace.endpoint.clone(),
             verified_issuer: namespace.issuer.clone(),
             authenticated_subject: namespace.subject.clone(),

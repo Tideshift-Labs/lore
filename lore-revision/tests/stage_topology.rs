@@ -92,7 +92,7 @@ mod tests {
             file.write_all(content).expect("write fixture file");
         }
 
-        fn nested_files(&self, directory: &str) -> Vec<String> {
+        fn nested_files(directory: &str) -> Vec<String> {
             (0..NESTED_FILE_COUNT)
                 .map(|index| format!("{directory}/actor-{index:03}.uasset"))
                 .collect()
@@ -220,7 +220,7 @@ mod tests {
                 }
                 let name = name.freeze();
                 let path = if parent_path.is_empty() {
-                    name.to_string()
+                    name
                 } else {
                     format!("{parent_path}/{name}")
                 };
@@ -323,7 +323,7 @@ mod tests {
         while let Some((_child_id, child, name)) =
             children.next().await.expect("load transitioned child")
         {
-            let name = name.freeze().to_string();
+            let name = name.freeze();
             assert!(child.is_file(), "{path}/{name} must be a file");
             if children_must_be_staged {
                 assert!(child.is_staged(), "{path}/{name} must be staged");
@@ -364,7 +364,7 @@ mod tests {
         fixture.write_file("Content/Bulk/seed.uasset", b"seed\n");
         fixture.stage_and_commit_all("seed ancestor").await;
 
-        let selected = fixture.nested_files("Content/Bulk");
+        let selected = StageFixture::nested_files("Content/Bulk");
         fixture.write_nested_files(&selected, "selected");
         let staged_revision = fixture
             .stage(&selected, stage::StageCaseChange::Error)
@@ -390,7 +390,7 @@ mod tests {
             )
             .await;
 
-        let selected = fixture.nested_files("Content/Bulk");
+        let selected = StageFixture::nested_files("Content/Bulk");
         fixture.write_nested_files(&selected, "selected");
         let staged_revision = fixture
             .stage(&selected, stage::StageCaseChange::Error)
@@ -411,7 +411,7 @@ mod tests {
         fixture.stage_and_commit_all("file ancestor").await;
         std::fs::remove_file(fixture.absolute("Content/Bulk")).expect("remove ancestor file");
 
-        let selected = fixture.nested_files("Content/Bulk");
+        let selected = StageFixture::nested_files("Content/Bulk");
         fixture.write_nested_files(&selected, "selected");
         let staged_revision = fixture
             .stage(&selected, stage::StageCaseChange::Error)
@@ -472,7 +472,7 @@ mod tests {
 
     async fn undelete() {
         let fixture = StageFixture::new().await;
-        let selected = fixture.nested_files("Content/Bulk");
+        let selected = StageFixture::nested_files("Content/Bulk");
         fixture.write_nested_files(&selected, "original");
         fixture.stage_and_commit_all("original files").await;
         std::fs::remove_dir_all(fixture.absolute("Content/Bulk")).expect("remove files");
@@ -500,7 +500,7 @@ mod tests {
         let temporary = fixture.absolute("Content/rename-hop");
         std::fs::rename(fixture.absolute("Content/Bulk"), &temporary).expect("rename to hop");
         std::fs::rename(&temporary, fixture.absolute("Content/bulk")).expect("rename case");
-        let selected = fixture.nested_files("Content/bulk");
+        let selected = StageFixture::nested_files("Content/bulk");
         fixture.write_nested_files(&selected, "selected");
         let staged_revision = fixture
             .stage(&selected, stage::StageCaseChange::Rename)
@@ -558,96 +558,96 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn merge_resolve_theirs_preserves_flags_and_defers_content_address_until_commit() {
-        LORE_CONTEXT
-            .scope(execution(false), async {
-                let fixture = StageFixture::new().await;
-                fixture.write_file("nested/conflict.txt", b"base\n");
-                let base_revision = fixture.stage_and_commit_all("base").await;
+        // boxed: future is ~7 KB on the stack
+        Box::pin(LORE_CONTEXT.scope(execution(false), async {
+            let fixture = StageFixture::new().await;
+            fixture.write_file("nested/conflict.txt", b"base\n");
+            let base_revision = fixture.stage_and_commit_all("base").await;
 
-                let source_branch = fixture.create_branch("source").await;
-                fixture.write_file("nested/conflict.txt", b"theirs\n");
-                let source_revision = fixture.stage_and_commit_all("theirs").await;
-                let source = state_at(&fixture, source_revision).await;
-                let source_node = source
-                    .find_node(fixture.repository.clone(), "nested/conflict.txt")
-                    .await
-                    .expect("load theirs node");
-
-                fixture.switch_to(fixture.main_branch, base_revision).await;
-                fixture.write_file("nested/conflict.txt", b"mine\n");
-                fixture.stage_and_commit_all("mine").await;
-
-                let unresolved_revision = branch::merge::merge_start(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    source_branch,
-                    branch::merge::MergeStartOptions {
-                        message: "merge source".to_string(),
-                        no_commit: true,
-                        scope: branch::merge::MergeScope::MainOnly,
-                    },
-                )
+            let source_branch = fixture.create_branch("source").await;
+            fixture.write_file("nested/conflict.txt", b"theirs\n");
+            let source_revision = fixture.stage_and_commit_all("theirs").await;
+            let source = state_at(&fixture, source_revision).await;
+            let source_node = source
+                .find_node(fixture.repository.clone(), "nested/conflict.txt")
                 .await
-                .expect("start conflicting merge");
-                let unresolved = state_at(&fixture, unresolved_revision).await;
-                let unresolved_node = unresolved
-                    .find_node(fixture.repository.clone(), "nested/conflict.txt")
-                    .await
-                    .expect("load unresolved conflict");
-                assert_eq!(unresolved_node.flags, 3089, "exact unresolved raw flags");
+                .expect("load theirs node");
 
-                branch::merge::merge_resolve_theirs(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    LoreArray::from_vec(vec![LoreString::from(fixture.absolute("nested"))]),
-                )
+            fixture.switch_to(fixture.main_branch, base_revision).await;
+            fixture.write_file("nested/conflict.txt", b"mine\n");
+            fixture.stage_and_commit_all("mine").await;
+
+            let unresolved_revision = branch::merge::merge_start(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                source_branch,
+                branch::merge::MergeStartOptions {
+                    message: "merge source".to_string(),
+                    no_commit: true,
+                    scope: branch::merge::MergeScope::MainOnly,
+                },
+            )
+            .await
+            .expect("start conflicting merge");
+            let unresolved = state_at(&fixture, unresolved_revision).await;
+            let unresolved_node = unresolved
+                .find_node(fixture.repository.clone(), "nested/conflict.txt")
                 .await
-                .expect("resolve conflict with theirs");
-                let resolved_revision =
-                    lore_revision::instance::load_staged_revision(&fixture.repository)
-                        .await
-                        .expect("load resolved staged anchor")
-                        .expect("resolved staged anchor must exist");
-                let resolved = state_at(&fixture, resolved_revision).await;
-                let resolved_node = resolved
-                    .find_node(fixture.repository.clone(), "nested/conflict.txt")
-                    .await
-                    .expect("load resolved conflict");
-                assert_eq!(
-                    collect_files(&fixture, resolved.clone()).await,
-                    BTreeSet::from(["nested/conflict.txt".to_string()]),
-                    "resolved staged tree must contain exactly the conflict file"
-                );
-                assert_eq!(resolved_node.flags, 23601, "exact resolved raw flags");
-                assert_eq!(resolved_node.size, source_node.size, "resolved theirs size");
-                assert_eq!(
-                    resolved_node.address, unresolved_node.address,
-                    "same-type staged resolution deliberately retains the unresolved address"
-                );
-                assert_ne!(
-                    resolved_node.address, source_node.address,
-                    "theirs content address is deferred until commit re-fragments the file"
-                );
+                .expect("load unresolved conflict");
+            assert_eq!(unresolved_node.flags, 3089, "exact unresolved raw flags");
 
-                let committed_revision = fixture.commit("resolve theirs").await;
-                let committed = state_at(&fixture, committed_revision).await;
-                let committed_node = committed
-                    .find_node(fixture.repository.clone(), "nested/conflict.txt")
+            branch::merge::merge_resolve_theirs(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                LoreArray::from_vec(vec![LoreString::from(fixture.absolute("nested"))]),
+            )
+            .await
+            .expect("resolve conflict with theirs");
+            let resolved_revision =
+                lore_revision::instance::load_staged_revision(&fixture.repository)
                     .await
-                    .expect("load committed theirs node");
-                assert_eq!(committed_node.flags, 1, "exact committed raw flags");
-                assert_eq!(committed_node.size, source_node.size);
-                assert_eq!(committed_node.address, source_node.address);
-                assert_eq!(
-                    std::fs::read(fixture.absolute("nested/conflict.txt"))
-                        .expect("read resolved working file"),
-                    b"theirs\n"
-                );
-                assert_eq!(
-                    collect_files(&fixture, committed).await,
-                    BTreeSet::from(["nested/conflict.txt".to_string()])
-                );
-            })
-            .await;
+                    .expect("load resolved staged anchor")
+                    .expect("resolved staged anchor must exist");
+            let resolved = state_at(&fixture, resolved_revision).await;
+            let resolved_node = resolved
+                .find_node(fixture.repository.clone(), "nested/conflict.txt")
+                .await
+                .expect("load resolved conflict");
+            assert_eq!(
+                collect_files(&fixture, resolved.clone()).await,
+                BTreeSet::from(["nested/conflict.txt".to_string()]),
+                "resolved staged tree must contain exactly the conflict file"
+            );
+            assert_eq!(resolved_node.flags, 23601, "exact resolved raw flags");
+            assert_eq!(resolved_node.size, source_node.size, "resolved theirs size");
+            assert_eq!(
+                resolved_node.address, unresolved_node.address,
+                "same-type staged resolution deliberately retains the unresolved address"
+            );
+            assert_ne!(
+                resolved_node.address, source_node.address,
+                "theirs content address is deferred until commit re-fragments the file"
+            );
+
+            let committed_revision = fixture.commit("resolve theirs").await;
+            let committed = state_at(&fixture, committed_revision).await;
+            let committed_node = committed
+                .find_node(fixture.repository.clone(), "nested/conflict.txt")
+                .await
+                .expect("load committed theirs node");
+            assert_eq!(committed_node.flags, 1, "exact committed raw flags");
+            assert_eq!(committed_node.size, source_node.size);
+            assert_eq!(committed_node.address, source_node.address);
+            assert_eq!(
+                std::fs::read(fixture.absolute("nested/conflict.txt"))
+                    .expect("read resolved working file"),
+                b"theirs\n"
+            );
+            assert_eq!(
+                collect_files(&fixture, committed).await,
+                BTreeSet::from(["nested/conflict.txt".to_string()])
+            );
+        }))
+        .await;
     }
 }

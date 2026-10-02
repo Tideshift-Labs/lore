@@ -1,6 +1,6 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
-//! Versioned journal persistence. All child operations hold the root's FSLock.
+//! Versioned journal persistence. All child operations hold the root's `FSLock`.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -469,7 +469,7 @@ impl RepositoryAttemptStore {
         for parent in &mut document.parents {
             parent.id = parse_uuid(&parent.id, "managed parent")?.to_string();
         }
-        self.validate_parents(&document)?;
+        Self::validate_parents(&document)?;
         let mut children = Vec::with_capacity(document.attempts.len());
         for attempt in std::mem::take(&mut document.attempts) {
             let intent = managed.remove(&attempt.attempt_id);
@@ -488,7 +488,7 @@ impl RepositoryAttemptStore {
             } else {
                 "settled"
             };
-            self.write_child_at(
+            Self::write_child_at(
                 &generation
                     .join(directory)
                     .join(format!("{}.json", child.attempt.attempt_id)),
@@ -510,7 +510,7 @@ impl RepositoryAttemptStore {
             .as_deref()
             .ok_or_else(|| ProtocolError::internal("v2 journal generation is missing"))?;
         if Uuid::parse_str(generation)
-            .map_err(|_| ProtocolError::internal("invalid journal generation"))?
+            .map_err(|_err| ProtocolError::internal("invalid journal generation"))?
             .to_string()
             != generation
         {
@@ -521,6 +521,10 @@ impl RepositoryAttemptStore {
             .with_file_name(format!("attempts-v2-{generation}")))
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "the test build reads self.path for phase diagnostics"
+    )]
     fn validate_child(
         &self,
         document: &StoredDocument,
@@ -649,18 +653,18 @@ impl RepositoryAttemptStore {
                 // leaves a terminal pending child and acknowledges no new dispatch.
                 publish(&settled, &pending, false)?;
             }
-            self.write_child_at(&pending, child)
+            Self::write_child_at(&pending, child)
         } else if let Some(path) = existing.path
             && path == pending
         {
-            self.write_child_at(&pending, child)?;
+            Self::write_child_at(&pending, child)?;
             publish(&pending, &settled, false)
         } else {
-            self.write_child_at(&settled, child)
+            Self::write_child_at(&settled, child)
         }
     }
 
-    fn write_child_at(&self, path: &Path, child: &StoredChild) -> Result<(), ProtocolError> {
+    fn write_child_at(path: &Path, child: &StoredChild) -> Result<(), ProtocolError> {
         #[cfg(test)]
         let serialize = phase_diagnostics::start(Some(path), "child_serialize");
         let bytes =
