@@ -246,7 +246,15 @@ pub struct WriteBehindSettings {
     /// How often the admission sampler refreshes its snapshot. The sampler
     /// exists so `statvfs` never runs on the PUT path.
     pub sample_interval: Duration,
+    /// How long a PUT waits for a staging I/O slot before it answers
+    /// `SlowDown`. Zero refuses at once, the behaviour before row 76's fix.
+    pub stage_io_wait: Duration,
 }
+
+/// [`WriteBehindSettings::stage_io_wait`]'s default. Long enough for a burst of
+/// one commit's fragments to drain through the pool, short against the
+/// client's retry backoff, which grows to 10 s.
+pub const DEFAULT_STAGE_IO_WAIT: Duration = Duration::from_secs(1);
 
 /// How staging admission reads one capacity observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +331,7 @@ pub struct WriteBehindStage {
     capacity: std::sync::Mutex<CapacityState>,
     min_free_bytes: u64,
     hard_limits: (u64, u64),
+    stage_io_wait: Duration,
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -404,6 +413,7 @@ impl WriteBehindStage {
                 settings.watermarks.hard_bytes,
                 settings.watermarks.hard_count,
             ),
+            stage_io_wait: settings.stage_io_wait,
             sampler,
         }))
     }
@@ -518,7 +528,7 @@ impl WriteBehindStage {
         object_key: &str,
         payload: &Bytes,
     ) -> Result<(), WriteBehindError> {
-        let permit = self.reserve_io()?;
+        let permit = self.reserve_io().await?;
         self.stage_reserved(
             permit,
             &StageAttempt::default(),
@@ -534,9 +544,14 @@ impl WriteBehindStage {
     ///
     /// Take it before `begin_stage`. A refusal after `begin_stage` leaves a
     /// live `PreparingStage` head that fences every retry of the hash until
-    /// its preparation deadline passes.
-    pub(crate) fn reserve_io(&self) -> Result<StageIoPermit, WriteBehindError> {
-        self.root.try_io_permit(StageIoPath::Put).map(StageIoPermit)
+    /// its preparation deadline passes. Waits up to
+    /// [`WriteBehindSettings::stage_io_wait`] for a slot; a burst then queues
+    /// instead of taking `SlowDown` and the client's retry backoff.
+    pub(crate) async fn reserve_io(&self) -> Result<StageIoPermit, WriteBehindError> {
+        self.root
+            .io_permit_within(StageIoPath::Put, self.stage_io_wait)
+            .await
+            .map(StageIoPermit)
     }
 
     /// [`Self::stage`] with a slot from [`Self::reserve_io`]. The rename is

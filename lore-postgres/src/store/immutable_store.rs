@@ -1597,12 +1597,8 @@ impl PostgresImmutableStore {
             // to a direct write there would mask inaccessible acknowledged data
             // behind apparently healthy writes, which is the worst failure this
             // design can produce, so it refuses too.
-            Some((_, mode @ (StagingMode::Refuse | StagingMode::Unready))) => {
-                return Err(staged_put_refusal(if mode == StagingMode::Refuse {
-                    "mode_refuse"
-                } else {
-                    "mode_unready"
-                }));
+            Some((_, StagingMode::Refuse | StagingMode::Unready)) => {
+                return Err(staged_put_refusal("mode"));
             }
             // D11's fallback, and the no-staging-tier cell: the existing
             // synchronous path, unchanged. It neither loses a write nor
@@ -1779,6 +1775,7 @@ impl PostgresImmutableStore {
         // preparation that fences every retry of this hash until it expires.
         let permit = stage
             .reserve_io()
+            .await
             .map_err(|error| counted_refusal(error.store_error(), "io_capacity"))?;
         let begin = coordinator
             .begin_stage(
@@ -3374,6 +3371,7 @@ mod tests {
             },
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
+            stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
         })
         .unwrap();
         let payload = Bytes::from(format!(

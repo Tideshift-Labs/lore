@@ -50,6 +50,7 @@ use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
+use lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT;
 use lore_postgres::store::write_behind::WriteBehindSettings;
 use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_postgres::store::write_behind::WriteBehindWatermarks;
@@ -371,6 +372,9 @@ pub struct WriteBehindConfig {
     pub drain_stale_after_millis: Option<u64>,
     /// How often the admission sampler refreshes its snapshot.
     pub sample_interval_millis: Option<u64>,
+    /// How long a PUT waits for a staging I/O slot before `SlowDown`. Optional;
+    /// defaults to 1000. Zero refuses at once.
+    pub stage_io_wait_millis: Option<u64>,
     /// Maintenance-published policy identity, shared by every replica.
     pub cell_id: Option<String>,
     pub policy_revision: Option<String>,
@@ -658,6 +662,9 @@ fn enabled_fragment_provider_config(
 /// seconds — is refused rather than honoured for the next eleven days.
 const MAX_WRITE_BEHIND_INTERVAL_MILLIS: u64 = 3_600_000;
 
+/// Upper bound on `stage_io_wait_millis`.
+const MAX_STAGE_IO_WAIT_MILLIS: u64 = 10_000;
+
 fn write_behind_error(name: &str, message: impl Into<String>) -> PluginError {
     let message: String = message.into();
     config_error(name, format!("enabled write_behind {message}"))
@@ -795,6 +802,22 @@ fn validated_write_behind_settings(
         }
     }
 
+    // Optional, unlike the thresholds: it tunes latency, not a safety bound.
+    // Capped well under the client's per-request deadline, so a waiting PUT
+    // still answers `SlowDown` rather than timing out.
+    let stage_io_wait = raw.stage_io_wait_millis.unwrap_or(
+        DEFAULT_STAGE_IO_WAIT
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX),
+    );
+    if stage_io_wait > MAX_STAGE_IO_WAIT_MILLIS {
+        return Err(write_behind_error(
+            name,
+            format!("requires stage_io_wait_millis between 0 and {MAX_STAGE_IO_WAIT_MILLIS}"),
+        ));
+    }
+
     let settings = WriteBehindSettings {
         root,
         watermarks: WriteBehindWatermarks {
@@ -808,6 +831,7 @@ fn validated_write_behind_settings(
         },
         drain_stale_after: Duration::from_millis(drain_stale_after),
         sample_interval: Duration::from_millis(sample_interval),
+        stage_io_wait: Duration::from_millis(stage_io_wait),
     };
     let required_text = |field: &str, value: &Option<String>| {
         value
@@ -3197,6 +3221,39 @@ staging_root = "/var/lib/loreserver/staging"
                 "`{to}` must be refused naming {field} and its bounds; got {error}"
             );
         }
+    }
+
+    /// Row 76: optional, unlike the thresholds, defaulting to the 1 s wait,
+    /// and capped so a unit mistake cannot park PUTs for minutes.
+    #[test]
+    fn stage_io_wait_defaults_to_one_second_and_is_bounded() {
+        let complete = valid_write_behind_block();
+        let wait = |text: &str| {
+            validated_write_behind_settings(PLUGIN_NAME, &raw_write_behind(text))
+                .map(|composition| composition.settings.stage_io_wait)
+        };
+        let with = |millis: u64| {
+            let mutated = complete.replace(
+                "sample_interval_millis = 5000",
+                &format!("sample_interval_millis = 5000\nstage_io_wait_millis = {millis}"),
+            );
+            assert_ne!(
+                mutated, complete,
+                "the fixture must set sample_interval_millis"
+            );
+            mutated
+        };
+        assert_eq!(wait(&complete).unwrap(), Duration::from_secs(1));
+        assert_eq!(wait(&with(0)).unwrap(), Duration::ZERO);
+        assert_eq!(wait(&with(10_000)).unwrap(), Duration::from_secs(10));
+        let error = match wait(&with(10_001)) {
+            Ok(_) => panic!("10001 ms must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("stage_io_wait_millis") && error.contains("between 0 and 10000"),
+            "got {error}"
+        );
     }
 
     /// The inert-wiring refusal. The staged route is reached only from the

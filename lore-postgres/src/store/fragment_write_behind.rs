@@ -119,6 +119,7 @@ mod source_tests {
             },
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
+            stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
         })
         .unwrap();
         let hash = [0xf1; 32];
@@ -230,6 +231,7 @@ mod source_tests {
             },
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
+            stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
         })
         .unwrap();
         for mode in [

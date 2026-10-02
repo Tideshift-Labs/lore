@@ -250,6 +250,7 @@ impl Fixture {
             },
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
+            stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
         })
         .unwrap();
         let s3_config = aws_sdk_s3::config::Builder::new()
@@ -412,6 +413,7 @@ async fn adapter_created_put_publishes_once_and_uses_real_reservation_and_claim(
 /// A put refused for staging I/O capacity must leave no live preparation.
 /// Otherwise every retry of that hash is fenced until `prepare_ttl` runs out,
 /// which turned transient capacity refusals into 30 s commit stalls live.
+/// Every slot stays held here, so the put's wait budget runs out first.
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
 async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retry() {
@@ -477,6 +479,46 @@ async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retr
         .await
         .expect("the retry is admitted at once, not fenced by the refused attempt");
     assert_eq!(retried.state, FragmentLifecycleState::Staged);
+}
+
+/// Row 76: a put that finds every staging I/O slot taken waits for one to free
+/// instead of answering `SlowDown`, whose client backoff grows to 10 s.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_put_waits_for_a_staging_slot_freed_inside_its_budget() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let bytes = Bytes::from("slot wait payload repeated ".repeat(512));
+    let address = Address {
+        context: Context::default(),
+        hash: Hash::from(blake3::hash(&bytes).as_bytes().as_slice()),
+    };
+    let mut permits = std::iter::from_fn(|| {
+        fixture
+            .stage
+            .root()
+            .try_io_permit(crate::store::write_behind::StageIoPath::Put)
+            .ok()
+    })
+    .take(64)
+    .collect::<Vec<_>>();
+    assert!(
+        !permits.is_empty(),
+        "the fixture holds every staging I/O permit"
+    );
+    let put = fixture.store.put_staged(
+        &fixture.handle.coordinator,
+        &fixture.stage,
+        address,
+        raw_fragment(&bytes),
+        bytes.clone(),
+    );
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        permits.pop();
+    };
+    let (staged, ()) = tokio::join!(put, release);
+    let staged = staged.expect("a slot freed inside the wait budget admits the put");
+    assert_eq!(staged.state, FragmentLifecycleState::Staged);
 }
 
 #[tokio::test]

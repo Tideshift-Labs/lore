@@ -190,7 +190,9 @@ $offlineInventory = @(
 # and asserted present-exactly-once in the Linux catalog: this is the direct evidence that the
 # Linux run contained what the Windows run cannot contain.
 $libUnixOnlyOffline = @(
-    'durability_tests::root_clones_share_the_bounded_io_capacity_before_read_or_finalize',
+    'durability_tests::root_clones_share_each_bounded_io_pool_and_puts_cannot_starve_reads',
+    'durability_tests::a_put_waits_for_a_freed_slot_within_its_budget_and_is_refused_after_it',
+    'durability_tests::a_burst_larger_than_the_put_pool_completes_without_a_refusal',
     'durability_tests::cancelled_file_reader_retains_its_io_slot_until_the_blocking_job_finishes',
     'durability_tests::absent_cleanup_requires_the_nearest_parent_fsync_to_complete',
     'durability_tests::open_syncs_root_after_provisioning_both_top_level_directories',
@@ -212,6 +214,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_before_object_effect_keeps_source_and_send_barrier',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retry',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_put_waits_for_a_staging_slot_freed_inside_its_budget',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::pre_rename_failure_withdraws_so_an_immediate_retry_is_admitted',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::a_late_writer_of_a_withdrawn_epoch_is_refused',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::post_rename_failure_does_not_withdraw',

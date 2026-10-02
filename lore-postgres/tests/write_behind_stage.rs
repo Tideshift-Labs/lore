@@ -94,6 +94,7 @@ fn settings(root: PathBuf) -> WriteBehindSettings {
         // already sampled the root synchronously), so with this interval no
         // background sample runs during a case that does not ask for one.
         sample_interval: Duration::from_secs(3_600),
+        stage_io_wait: lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT,
     }
 }
 

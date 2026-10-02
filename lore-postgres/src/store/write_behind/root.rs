@@ -119,7 +119,14 @@ struct RootInner {
     directory: std::fs::File,
     /// Shared by all clones. Each blocking closure owns its permit until its
     /// final syscall completes, even if the async caller stops waiting.
+    /// Reads, purge and the physical inventory use this pool.
     io_capacity: Arc<Semaphore>,
+    /// The put path's own pool, the same size. A put may wait for a slot (see
+    /// [`ConfinedRoot::io_permit_within`]), and a tokio semaphore hands a
+    /// released permit to its queued waiters before any `try_acquire`. One
+    /// shared pool would let a queue of puts starve drain reads, which then
+    /// age into `drain_backpressure_sustained`.
+    put_capacity: Arc<Semaphore>,
 }
 
 /// A proven staging root.
@@ -151,9 +158,10 @@ pub(crate) fn derived_staged_key(hash: &[u8], epoch: i64) -> Result<String, Writ
 
 /// The staging path that asked for an I/O slot.
 ///
-/// Puts, reads, purge and the physical inventory share one bounded slot pool.
-/// A put holds its slot across `begin_stage`, so a slow coordinator can starve
-/// the other paths. The refusal counter carries this label so that shows up.
+/// Reads, purge and the physical inventory share one bounded slot pool; puts
+/// have their own. A put holds its slot across `begin_stage`, so a slow
+/// coordinator slows other puts. The refusal counter carries this label so
+/// that shows up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StageIoPath {
     Put,
@@ -185,7 +193,25 @@ impl StageIoPath {
     }
 }
 
+/// The refusal both permit calls return, counted under `path`.
+fn io_refusal(path: StageIoPath) -> WriteBehindError {
+    crate::metrics::record_stage_io_refusal(&path.refusal_labels());
+    WriteBehindError::Io {
+        operation: "staging I/O capacity",
+        kind: std::io::ErrorKind::WouldBlock,
+    }
+}
+
 impl ConfinedRoot {
+    fn capacity(&self, path: StageIoPath) -> &Arc<Semaphore> {
+        match path {
+            StageIoPath::Put => &self.inner.put_capacity,
+            StageIoPath::Read | StageIoPath::Remove | StageIoPath::Inventory => {
+                &self.inner.io_capacity
+            }
+        }
+    }
+
     /// Refuse excess work before queueing it on Tokio's blocking pool.
     ///
     /// Move this permit into the blocking closure. Keeping it on the awaiting
@@ -194,14 +220,32 @@ impl ConfinedRoot {
         &self,
         path: StageIoPath,
     ) -> Result<OwnedSemaphorePermit, WriteBehindError> {
-        if let Ok(permit) = self.inner.io_capacity.clone().try_acquire_owned() {
-            Ok(permit)
-        } else {
-            crate::metrics::record_stage_io_refusal(&path.refusal_labels());
-            Err(WriteBehindError::Io {
-                operation: "staging I/O capacity",
-                kind: std::io::ErrorKind::WouldBlock,
-            })
+        match self.capacity(path).clone().try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(_) => Err(io_refusal(path)),
+        }
+    }
+
+    /// [`Self::try_io_permit`], but wait up to `wait` for a slot to free.
+    ///
+    /// Row 76: a burst of puts larger than the pool used to refuse the excess
+    /// at once. The client backs off up to 10 s per retry, so a commit then
+    /// landed in waves 10 s apart even though slots freed within milliseconds.
+    /// Waiters queue in arrival order. Dropping the returned future leaves the
+    /// queue and holds no permit. A zero `wait` is [`Self::try_io_permit`].
+    pub(crate) async fn io_permit_within(
+        &self,
+        path: StageIoPath,
+        wait: std::time::Duration,
+    ) -> Result<OwnedSemaphorePermit, WriteBehindError> {
+        if wait.is_zero() {
+            return self.try_io_permit(path);
+        }
+        match tokio::time::timeout(wait, self.capacity(path).clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Ok(permit),
+            // `Err` inside is a closed semaphore, which nothing here does; treat
+            // it as the refusal it would otherwise be.
+            Ok(Err(_)) | Err(_) => Err(io_refusal(path)),
         }
     }
 
@@ -331,9 +375,11 @@ mod platform {
                     device,
                     inode,
                     directory,
-                    // Bounds unfinished reads, finalizers and exact removals,
-                    // including cancelled callers, to sixteen per root handle.
+                    // Bounds unfinished reads and exact removals, and
+                    // separately finalizers, including cancelled callers, to
+                    // sixteen each per root handle.
                     io_capacity: Arc::new(tokio::sync::Semaphore::new(16)),
+                    put_capacity: Arc::new(tokio::sync::Semaphore::new(16)),
                 }),
             };
             root.probe()?;

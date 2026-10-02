@@ -71,18 +71,18 @@ async fn cancelled_file_reader_retains_its_io_slot_until_the_blocking_job_finish
         .unwrap()
         .expect("real blocking read entered");
     let permits = (0..15)
-        .map(|_| root.try_io_permit(StageIoPath::Put).unwrap())
+        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
         .collect::<Vec<_>>();
     reader.abort();
     assert!(reader.await.unwrap_err().is_cancelled());
     assert!(
-        root.try_io_permit(StageIoPath::Put).is_err(),
+        root.try_io_permit(StageIoPath::Read).is_err(),
         "cancelling the waiter cannot free a live blocking job's slot"
     );
     release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(permit) = root.try_io_permit(StageIoPath::Put) {
+            if let Ok(permit) = root.try_io_permit(StageIoPath::Read) {
                 drop(permit);
                 break;
             }
@@ -139,7 +139,7 @@ fn record_completed() -> (Hook, Arc<Mutex<Vec<PathBuf>>>) {
 }
 
 #[tokio::test]
-async fn root_clones_share_the_bounded_io_capacity_before_read_or_finalize() {
+async fn root_clones_share_each_bounded_io_pool_and_puts_cannot_starve_reads() {
     let scratch = Scratch::new();
     let root = ConfinedRoot::open(&scratch.0).unwrap();
     let clone = root.clone();
@@ -149,6 +149,13 @@ async fn root_clones_share_the_bounded_io_capacity_before_read_or_finalize() {
     let mut permits = (0..16)
         .map(|_| root.try_io_permit(StageIoPath::Put).unwrap())
         .collect::<Vec<_>>();
+    assert!(
+        clone.read_regular(&resolved).await.unwrap().is_none(),
+        "a full put pool leaves reads their own slots"
+    );
+    let reads = (0..16)
+        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .collect::<Vec<_>>();
     assert!(matches!(
         clone.read_regular(&resolved).await,
         Err(WriteBehindError::Io {
@@ -156,6 +163,7 @@ async fn root_clones_share_the_bounded_io_capacity_before_read_or_finalize() {
             kind: std::io::ErrorKind::WouldBlock
         })
     ));
+    drop(reads);
     assert!(matches!(
         super::super::finalize::finalize(&clone, &resolved, &bytes::Bytes::from_static(b"blocked"))
             .await,
@@ -171,7 +179,87 @@ async fn root_clones_share_the_bounded_io_capacity_before_read_or_finalize() {
         0
     );
     permits.pop();
-    assert!(clone.read_regular(&resolved).await.unwrap().is_none());
+    super::super::finalize::finalize(&clone, &resolved, &bytes::Bytes::from_static(b"freed"))
+        .await
+        .expect("a freed put slot admits the finalizer");
+    assert_eq!(
+        clone.read_regular(&resolved).await.unwrap().as_deref(),
+        Some(b"freed".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn a_put_waits_for_a_freed_slot_within_its_budget_and_is_refused_after_it() {
+    // Row 76: a burst of puts larger than the pool was refused at once, and the
+    // client's backoff turned each refusal into a 10 s wave.
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let mut held = (0..16)
+        .map(|_| root.try_io_permit(StageIoPath::Put).unwrap())
+        .collect::<Vec<_>>();
+    let waiter_root = root.clone();
+    let waiter = lore_base::lore_spawn!(async move {
+        waiter_root
+            .io_permit_within(StageIoPath::Put, Duration::from_secs(5))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    held.pop();
+    let _granted = tokio::time::timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("the waiter is woken by the freed slot, not by its budget")
+        .unwrap()
+        .expect("a slot freed inside the budget is granted");
+
+    let started = std::time::Instant::now();
+    let refused = root
+        .io_permit_within(StageIoPath::Put, Duration::from_millis(100))
+        .await;
+    assert!(matches!(
+        refused,
+        Err(WriteBehindError::Io {
+            operation: "staging I/O capacity",
+            kind: std::io::ErrorKind::WouldBlock
+        })
+    ));
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert!(
+        root.io_permit_within(StageIoPath::Put, Duration::ZERO)
+            .await
+            .is_err(),
+        "a zero budget refuses at once"
+    );
+}
+
+/// The budget every put in the burst test below gets. A test constant so a
+/// revert check can set it to zero, the behaviour before row 76's fix.
+const BURST_WAIT: Duration = Duration::from_secs(1);
+
+#[tokio::test]
+async fn a_burst_larger_than_the_put_pool_completes_without_a_refusal() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let mut burst = tokio::task::JoinSet::new();
+    for _ in 0..48 {
+        let root = root.clone();
+        lore_base::lore_spawn!(burst, async move {
+            let permit = root.io_permit_within(StageIoPath::Put, BURST_WAIT).await?;
+            // One staged put's slot hold: begin_stage plus the fsyncs.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(permit);
+            Ok::<(), WriteBehindError>(())
+        });
+    }
+    let mut refused = 0;
+    while let Some(result) = burst.join_next().await {
+        if result.unwrap().is_err() {
+            refused += 1;
+        }
+    }
+    assert_eq!(
+        refused, 0,
+        "48 puts over 16 slots, each held 20 ms, fit inside one budget"
+    );
 }
 
 #[test]
