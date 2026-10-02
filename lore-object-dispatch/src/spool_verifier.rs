@@ -42,17 +42,6 @@ pub enum SpoolVerificationError {
     FileChanged,
 }
 
-impl SpoolVerificationError {
-    /// The operating-system error behind an
-    /// [`SpoolVerificationError::ObservationUnavailable`], if this is one.
-    pub fn os_error(&self) -> Option<SpoolOsError> {
-        match self {
-            Self::ObservationUnavailable { os } => Some(*os),
-            _ => None,
-        }
-    }
-}
-
 #[cfg(target_os = "linux")]
 mod platform {
     use std::fs::File;

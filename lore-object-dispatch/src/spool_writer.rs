@@ -127,6 +127,8 @@ pub struct SpoolOsError {
 }
 
 impl SpoolOsError {
+    /// Keeps `error`'s kind and its raw code, which is platform-native (see
+    /// [`Self::raw_os_error`]).
     pub fn from_io(error: &std::io::Error) -> Self {
         Self {
             kind: error.kind(),
@@ -143,6 +145,8 @@ impl SpoolOsError {
         self.kind
     }
 
+    /// The platform-native code: an errno on Linux, a Win32 error code on Windows. Compare it only
+    /// with codes from the same platform.
     pub fn raw_os_error(&self) -> Option<i32> {
         self.raw_os_error
     }
