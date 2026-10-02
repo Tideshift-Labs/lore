@@ -50,7 +50,7 @@ use lore_postgres::store::immutable_store::ObjectStoreSettings;
 use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
-use lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT;
+use lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT_MILLIS;
 use lore_postgres::store::write_behind::WriteBehindSettings;
 use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_postgres::store::write_behind::WriteBehindWatermarks;
@@ -803,14 +803,10 @@ fn validated_write_behind_settings(
     }
 
     // Optional, unlike the thresholds: it tunes latency, not a safety bound.
-    // Capped well under the client's per-request deadline, so a waiting PUT
-    // still answers `SlowDown` rather than timing out.
-    let stage_io_wait = raw.stage_io_wait_millis.unwrap_or(
-        DEFAULT_STAGE_IO_WAIT
-            .as_millis()
-            .try_into()
-            .unwrap_or(u64::MAX),
-    );
+    // Capped so a unit mistake cannot park PUTs for minutes.
+    let stage_io_wait = raw
+        .stage_io_wait_millis
+        .unwrap_or(DEFAULT_STAGE_IO_WAIT_MILLIS);
     if stage_io_wait > MAX_STAGE_IO_WAIT_MILLIS {
         return Err(write_behind_error(
             name,

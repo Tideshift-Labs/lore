@@ -254,7 +254,10 @@ pub struct WriteBehindSettings {
 /// [`WriteBehindSettings::stage_io_wait`]'s default. Long enough for a burst of
 /// one commit's fragments to drain through the pool, short against the
 /// client's retry backoff, which grows to 10 s.
-pub const DEFAULT_STAGE_IO_WAIT: Duration = Duration::from_secs(1);
+pub const DEFAULT_STAGE_IO_WAIT: Duration = Duration::from_millis(DEFAULT_STAGE_IO_WAIT_MILLIS);
+
+/// [`DEFAULT_STAGE_IO_WAIT`] in milliseconds, the unit configuration uses.
+pub const DEFAULT_STAGE_IO_WAIT_MILLIS: u64 = 1_000;
 
 /// How staging admission reads one capacity observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

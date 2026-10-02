@@ -1777,6 +1777,12 @@ impl PostgresImmutableStore {
             .reserve_io()
             .await
             .map_err(|error| counted_refusal(error.store_error(), "io_capacity"))?;
+        // `put_coordinated` chose this route before the wait for a slot.
+        // Re-read it, so a stage that left `Stage` while this PUT queued takes
+        // no new preparation; the client's retry takes the current route.
+        if stage.mode() != StagingMode::Stage {
+            return Err(staged_put_refusal("mode"));
+        }
         let begin = coordinator
             .begin_stage(
                 address.hash.data(),

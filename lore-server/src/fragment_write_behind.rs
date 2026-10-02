@@ -358,12 +358,13 @@ fn record_pass_outcome(
 /// that is genuinely full never recovers, so it still reaches 503 one budget
 /// later.
 ///
-/// **A failed observation keeps the run; a failure run of `stale_after` or
-/// longer clears it.** A short failure run is the same claim as the last good
-/// observation, which still stands (below), so it cannot restart the budget:
-/// clearing on every failure let a full stage stay hidden from readiness for as
-/// long as `observe()` failed once per `stale_after`. A long failure run has
-/// already answered `observation_unknown`, and keeping the run across it would
+/// **A failed observation keeps the run; a failure run that let the last good
+/// observation reach `stale_after` clears it.** A short failure run is the same
+/// claim as the last good observation, which still stands (below), so it cannot
+/// restart the budget: clearing on every failure let a full stage stay hidden
+/// from readiness for as long as `observe()` failed once per `stale_after`. A
+/// long failure run has already answered `observation_unknown`, and keeping the
+/// run across it would
 /// meet the first sample after recovery with the budget spent. One database
 /// stall reaches every replica, so the next ordinary transient disagreement
 /// would then eject every replica at once. So that run starts again.
@@ -419,7 +420,15 @@ fn record_observation(
         state.progress = state
             .progress
             .map(|progress| progress.checked_add(blind).map_or(at, |end| end.min(at)));
-        if blind >= stale_after {
+        // The clock `observation_unknown` read during the gap: the age of the
+        // last good observation, not the failure run, which starts up to one
+        // interval later and, for a timed-out attempt, is recorded only when
+        // the attempt ends.
+        if state
+            .observation
+            .as_ref()
+            .is_some_and(|(previous, _)| at.saturating_duration_since(*previous) >= stale_after)
+        {
             state.capacity_unavailable_since = None;
         }
     }
@@ -2334,6 +2343,31 @@ mod tests {
             "after a 5 s failure run the run restarts from this sample"
         );
         assert_eq!(reason(&state), None, "a fresh budget must elapse first");
+    }
+
+    #[test]
+    fn the_restart_reads_the_last_good_observations_age_not_the_failure_runs_length() {
+        // Independent review of d8c4a7a8: failures at -4 s and -2 s are a 4 s
+        // run, but the last good observation was 6 s old at -0, so
+        // `observation_unknown` already answered and the run must restart.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            now - Duration::from_secs(20),
+        );
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            now - Duration::from_secs(6),
+        );
+        for seconds in [4, 2] {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
+        record_observation(&mut state, Some(capacity_observation(false)), now);
+        assert_eq!(state.capacity_unavailable_since, Some(now));
+        assert_eq!(reason(&state), None);
     }
 
     #[test]
