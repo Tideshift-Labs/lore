@@ -14,6 +14,8 @@ use anyhow::bail;
 use lore_base::lore_spawn;
 use lore_postgres::store::fragment_write_behind::CapacityEvidence;
 use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
+use lore_postgres::store::fragment_write_behind::ObserveStep;
+use lore_postgres::store::fragment_write_behind::ObserveTrace;
 use lore_postgres::store::fragment_write_behind::WriteBehindActivity;
 use lore_postgres::store::fragment_write_behind::WriteBehindObservation;
 use lore_postgres::store::write_behind::StagingMode;
@@ -22,6 +24,7 @@ use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Gauge;
+use opentelemetry::metrics::Histogram;
 use serde::Serialize;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -43,6 +46,8 @@ struct Instruments {
     cleanup_not_progressing: Gauge<u64>,
     pending: Gauge<u64>,
     usage: Gauge<u64>,
+    /// Each `observe()` step's duration, by `step` and `outcome`.
+    observe_step_ms: Histogram<f64>,
 }
 fn instruments() -> &'static Instruments {
     static INSTRUMENTS: OnceLock<Instruments> = OnceLock::new();
@@ -60,6 +65,7 @@ fn instruments() -> &'static Instruments {
                 .u64_gauge(provider.scope_name("pending_files"))
                 .build(),
             usage: meter.u64_gauge(provider.scope_name("usage_bytes")).build(),
+            observe_step_ms: provider.latency_histogram_ms("observe_step"),
         }
     })
 }
@@ -128,6 +134,10 @@ struct State {
     /// Recording when the run began is what lets a transient disagreement clear
     /// without ever reaching the readiness verdict.
     capacity_unavailable_since: Option<Instant>,
+    /// When the current unbroken run of failed observations began. `None` once
+    /// an observation succeeds. The observer was blind for this run, so see
+    /// `record_observation` for what that time does and does not count against.
+    observation_failed_since: Option<Instant>,
     stopped: bool,
 }
 
@@ -355,7 +365,23 @@ fn record_pass_outcome(
 /// identically — is followed by an instant all-replica ejection on the very next
 /// ordinary transient disagreement. That is the failure this change exists to
 /// remove. Clearing costs one extra budget before a genuinely full stage ages
-/// out, and `observation_unknown` answers 503 throughout the gap regardless.
+/// out.
+///
+/// **A failed observation is not an unknown one yet (row 76).** It keeps the
+/// last good observation, which ages out over `stale_after` like every other
+/// transient condition, so `observation_unknown` answers 503 only once the
+/// failures have outlived the budget. A one-tick `observe()` stall used to answer
+/// 503 at once, and when it met a peer's own 503 the cell had no ready replica.
+///
+/// **Blind time is not drain time.** Drain progress is credited only by this
+/// replica's own promotions or a fresh observation showing nothing pending, and
+/// `pending_files` is cell-wide. During a run of failed observations nothing can
+/// credit it, so the first good observation after a long run found the clock
+/// already past `stale_after` and answered `drain_not_progressing` at once. So
+/// the first good observation after a run extends the progress clock by the
+/// length of the run, capped at now. It is extended, not reset: age the clock
+/// had before the run survives it, so a wedged drain behind flapping
+/// observations still ages out.
 ///
 /// **A cell-wide cleanup backlog that fell since the last sample is cleanup
 /// progress.** A pass reports progress only for a body it unlinked, so a release
@@ -369,23 +395,166 @@ fn record_pass_outcome(
 /// Pure and synchronous, so the rule is testable without a store, a runtime or a
 /// Postgres fixture — the same reason `record_pass_outcome` is.
 fn record_observation(state: &mut State, observation: Option<WriteBehindObservation>, at: Instant) {
-    if let Some(value) = observation {
-        if value.capacity_available {
-            state.capacity_unavailable_since = None;
-        } else {
-            state.capacity_unavailable_since.get_or_insert(at);
-        }
-        if state
+    let Some(value) = observation else {
+        state.capacity_unavailable_since = None;
+        state.observation_failed_since.get_or_insert(at);
+        return;
+    };
+    let after_gap = state.observation_failed_since.take();
+    if let Some(failed_since) = after_gap {
+        let blind = at.saturating_duration_since(failed_since);
+        state.progress = state
+            .progress
+            .map(|progress| progress.checked_add(blind).map_or(at, |end| end.min(at)));
+    }
+    if value.capacity_available {
+        state.capacity_unavailable_since = None;
+    } else {
+        state.capacity_unavailable_since.get_or_insert(at);
+    }
+    if after_gap.is_none()
+        && state
             .observation
             .as_ref()
             .is_some_and(|(_, previous)| value.cleanup_backlog < previous.cleanup_backlog)
-        {
-            state.cleanup_progress = state.cleanup_progress.max(Some(at));
+    {
+        state.cleanup_progress = state.cleanup_progress.max(Some(at));
+    }
+    state.observation = Some((at, value));
+}
+
+/// How one `observe()` attempt ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObserveOutcome {
+    Ok,
+    Failed,
+    TimedOut,
+}
+
+impl ObserveOutcome {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Failed => "error",
+            Self::TimedOut => "timeout",
         }
-        state.observation = Some((at, value));
-    } else {
-        state.capacity_unavailable_since = None;
-        state.observation = None;
+    }
+}
+
+/// Each step of one attempt with its duration. A step that never returned is
+/// timed up to `now` and flagged, so a timeout names the step it was waiting on.
+fn step_timings(trace: &ObserveTrace, now: Instant) -> Vec<(ObserveStep, Duration, bool)> {
+    let mut steps: Vec<_> = trace
+        .completed
+        .iter()
+        .map(|(step, elapsed)| (*step, *elapsed, false))
+        .collect();
+    if let Some((step, started)) = trace.in_flight {
+        steps.push((step, now.saturating_duration_since(started), true));
+    }
+    steps
+}
+
+fn format_steps(steps: &[(ObserveStep, Duration, bool)]) -> String {
+    steps
+        .iter()
+        .map(|(step, elapsed, in_flight)| {
+            let suffix = if *in_flight { "(in_flight)" } else { "" };
+            format!("{}={}ms{suffix}", step.name(), millis(*elapsed))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether an attempt deserves a warning: it did not succeed, a step took at
+/// least `threshold`, or the attempt started at least two intervals after the
+/// previous one (the observer itself was late, not a step).
+fn observe_attempt_is_slow(
+    outcome: ObserveOutcome,
+    steps: &[(ObserveStep, Duration, bool)],
+    threshold: Duration,
+    since_last_attempt: Option<Duration>,
+    interval: Duration,
+) -> bool {
+    outcome != ObserveOutcome::Ok
+        || steps.iter().any(|(_, elapsed, _)| *elapsed >= threshold)
+        || since_last_attempt.is_some_and(|gap| gap >= interval * 2)
+}
+
+/// At most one warning per `every`, counting what it held back.
+#[derive(Default)]
+struct WarnLimiter {
+    last: Option<Instant>,
+    suppressed: u64,
+}
+
+impl WarnLimiter {
+    /// `Some(warnings held back since the last one)` when a warning may be
+    /// logged at `at`, else `None`.
+    fn allow(&mut self, at: Instant, every: Duration) -> Option<u64> {
+        if self
+            .last
+            .is_some_and(|last| at.saturating_duration_since(last) < every)
+        {
+            self.suppressed += 1;
+            None
+        } else {
+            self.last = Some(at);
+            Some(std::mem::take(&mut self.suppressed))
+        }
+    }
+}
+
+const OBSERVE_WARN_EVERY: Duration = Duration::from_secs(10);
+
+/// Log and record one attempt's step timings: debug always, a rate-limited warn
+/// when the attempt was slow, and one histogram sample per step.
+fn report_observe_attempt(
+    trace: &ObserveTrace,
+    outcome: ObserveOutcome,
+    error: Option<&str>,
+    since_last_attempt: Option<Duration>,
+    interval: Duration,
+    limiter: &mut WarnLimiter,
+) {
+    let now = Instant::now();
+    let steps = step_timings(trace, now);
+    for (step, elapsed, in_flight) in &steps {
+        let step_outcome = if *in_flight {
+            ObserveOutcome::TimedOut.name()
+        } else if trace.failed == Some(*step) {
+            ObserveOutcome::Failed.name()
+        } else {
+            ObserveOutcome::Ok.name()
+        };
+        instruments().observe_step_ms.record(
+            elapsed.as_secs_f64() * 1000.0,
+            &[
+                KeyValue::new("step", step.name()),
+                KeyValue::new("outcome", step_outcome),
+            ],
+        );
+    }
+    let formatted = format_steps(&steps);
+    let since_last_attempt_ms = since_last_attempt.map(millis);
+    debug!(
+        outcome = outcome.name(),
+        steps = %formatted,
+        ?since_last_attempt_ms,
+        error,
+        "write-behind observe timing"
+    );
+    if observe_attempt_is_slow(outcome, &steps, interval / 2, since_last_attempt, interval)
+        && let Some(suppressed) = limiter.allow(now, OBSERVE_WARN_EVERY)
+    {
+        warn!(
+            outcome = outcome.name(),
+            steps = %formatted,
+            ?since_last_attempt_ms,
+            error,
+            suppressed,
+            "write-behind observe slow or failed"
+        );
     }
 }
 
@@ -648,16 +817,33 @@ pub(crate) fn configure_fragment_write_behind(
     lore_spawn!(endpoints, async move {
         let mut ticks = tokio::time::interval(settings.observer_interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut limiter = WarnLimiter::default();
+        let mut previous_attempt: Option<Instant> = None;
         loop {
             tokio::select! { biased;
                 _ = observer_shutdown.wait_for(|value| *value) => break,
                 _ = ticks.tick() => {}
             }
             handle.note_observation_unknown();
+            let attempt = Instant::now();
             let result = tokio::select! { biased;
                 _ = observer_shutdown.wait_for(|value| *value) => break,
                 result = tokio::time::timeout(settings.observer_interval, handle.observe()) => result,
             };
+            let (outcome, error) = match &result {
+                Ok(Ok(_)) => (ObserveOutcome::Ok, None),
+                Ok(Err(error)) => (ObserveOutcome::Failed, Some(error.to_string())),
+                Err(_) => (ObserveOutcome::TimedOut, None),
+            };
+            report_observe_attempt(
+                &handle.observe_trace(),
+                outcome,
+                error.as_deref(),
+                previous_attempt.map(|previous| attempt.saturating_duration_since(previous)),
+                settings.observer_interval,
+                &mut limiter,
+            );
+            previous_attempt = Some(attempt);
             if let Ok(Ok(observation)) = result {
                 instruments().pending.record(observation.pending_files, &[]);
                 instruments()
@@ -693,7 +879,12 @@ pub(crate) fn configure_fragment_write_behind(
                     record_observation(&mut state, None, Instant::now());
                 }
                 handle.note_observation_unknown();
-                handle.note_worker_stopped();
+                // Inside the budget the last good observation still stands, so the
+                // drain heartbeat is left to age out over the same `stale_after`
+                // rather than dropped at once.
+                if !observer_readiness.snapshot().ready {
+                    handle.note_worker_stopped();
+                }
             }
             let snapshot = observer_readiness.snapshot();
             instruments().ready.record(
@@ -1079,6 +1270,174 @@ mod tests {
         record_observation(&mut state, Some(backlog_observation(10)), now);
         assert_eq!(state.cleanup_progress, Some(old));
         assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
+    }
+
+    // --- Row 76: a failed observation ages out; a gap does not spend drain budget --
+
+    fn pending_observation(pending_files: u64) -> WriteBehindObservation {
+        WriteBehindObservation {
+            pending_files,
+            ..healthy_observation()
+        }
+    }
+
+    #[test]
+    fn a_failed_observation_keeps_the_last_good_one_until_it_is_stale() {
+        // Row 76: a 1-sample `observe()` failure on one replica answered 503 at once, at the
+        // same second a peer was unready, so both replicas were out of the balancer.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        record_observation(
+            &mut state,
+            Some(healthy_observation()),
+            now - Duration::from_secs(1),
+        );
+        record_observation(&mut state, None, now);
+        assert_eq!(
+            reason(&state),
+            None,
+            "a failure inside the stale_after budget keeps the last good observation"
+        );
+        assert!(state.observation.is_some());
+    }
+
+    #[test]
+    fn a_run_of_failed_observations_ages_out_at_stale_after() {
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let last_good = now - Duration::from_millis(4_500);
+        record_observation(&mut state, Some(healthy_observation()), last_good);
+        for seconds in (0..4).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
+        assert_eq!(reason(&state), None, "4.5 s old is inside the 5 s budget");
+
+        let mut state = healthy_state(now);
+        let last_good = now - Duration::from_millis(5_500);
+        record_observation(&mut state, Some(healthy_observation()), last_good);
+        for seconds in (0..5).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
+        assert_eq!(
+            reason(&state),
+            Some("observation_unknown"),
+            "a failure run longer than the budget still answers 503"
+        );
+    }
+
+    #[test]
+    fn the_first_observation_after_a_gap_does_not_report_drain_not_progressing() {
+        // Row 76: the dual 503s were one replica's first sample after a 10-12 s gap. Its
+        // progress clock aged through the gap, when nothing could credit it, and the first
+        // observation with cell-wide pending files > 0 answered `drain_not_progressing`.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let last_good = now - Duration::from_secs(12);
+        record_observation(&mut state, Some(healthy_observation()), last_good);
+        state.progress = Some(last_good);
+        for seconds in (0..=11).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
+        assert_eq!(reason(&state), Some("observation_unknown"));
+        record_observation(&mut state, Some(pending_observation(39)), now);
+        assert_eq!(
+            reason(&state),
+            None,
+            "the time the observer was blind does not count against the drain"
+        );
+    }
+
+    #[test]
+    fn a_gap_extends_the_drain_clock_by_the_blind_time_only() {
+        // Extended, not reset: progress that was already old before the gap stays old, so a
+        // wedged drain behind flapping observations still ages out.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let last_good = now - Duration::from_secs(5);
+        record_observation(&mut state, Some(healthy_observation()), last_good);
+        state.progress = Some(now - Duration::from_secs(10));
+        for seconds in (0..=4).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
+        record_observation(&mut state, Some(pending_observation(3)), now);
+        assert_eq!(
+            reason(&state),
+            Some("drain_not_progressing"),
+            "5 s of pre-gap age survives a 4 s gap"
+        );
+    }
+
+    #[test]
+    fn consecutive_good_observations_never_move_the_drain_clock() {
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let old = now - Duration::from_secs(30);
+        state.progress = Some(old);
+        for seconds in (0..=10).rev() {
+            record_observation(
+                &mut state,
+                Some(pending_observation(3)),
+                now - Duration::from_secs(seconds),
+            );
+        }
+        assert_eq!(state.progress, Some(old));
+        assert_eq!(reason(&state), Some("drain_not_progressing"));
+    }
+
+    #[test]
+    fn step_timings_name_the_step_a_timeout_was_waiting_on() {
+        let now = Instant::now();
+        let trace = ObserveTrace {
+            completed: vec![
+                (ObserveStep::PhysicalInventory, Duration::from_millis(2)),
+                (ObserveStep::StagePolicy, Duration::from_millis(15)),
+            ],
+            in_flight: Some((ObserveStep::StageLedger, now - Duration::from_millis(980))),
+            failed: None,
+        };
+        let steps = step_timings(&trace, now);
+        assert_eq!(steps.len(), 3);
+        assert_eq!(
+            steps[2],
+            (ObserveStep::StageLedger, Duration::from_millis(980), true)
+        );
+        assert_eq!(
+            format_steps(&steps),
+            "physical_inventory=2ms stage_policy=15ms stage_ledger=980ms(in_flight)"
+        );
+    }
+
+    #[test]
+    fn an_attempt_is_slow_when_it_fails_a_step_is_long_or_the_observer_is_late() {
+        let interval = Duration::from_secs(1);
+        let threshold = interval / 2;
+        let fast = [(ObserveStep::StageLedger, Duration::from_millis(40), false)];
+        let long = [(ObserveStep::SpoolObserve, Duration::from_millis(600), false)];
+        let on_time = Some(interval);
+        let slow = |outcome, steps: &[_], since| {
+            observe_attempt_is_slow(outcome, steps, threshold, since, interval)
+        };
+        assert!(!slow(ObserveOutcome::Ok, &fast, on_time));
+        assert!(!slow(ObserveOutcome::Ok, &fast, None));
+        assert!(slow(ObserveOutcome::Failed, &fast, on_time));
+        assert!(slow(ObserveOutcome::TimedOut, &fast, on_time));
+        assert!(slow(ObserveOutcome::Ok, &long, on_time));
+        assert!(slow(ObserveOutcome::Ok, &fast, Some(interval * 3)));
+    }
+
+    #[test]
+    fn the_warn_limiter_allows_one_per_window_and_counts_the_rest() {
+        let start = Instant::now();
+        let every = Duration::from_secs(10);
+        let mut limiter = WarnLimiter::default();
+        assert_eq!(limiter.allow(start, every), Some(0));
+        assert_eq!(limiter.allow(start + Duration::from_secs(1), every), None);
+        assert_eq!(limiter.allow(start + Duration::from_secs(9), every), None);
+        assert_eq!(
+            limiter.allow(start + Duration::from_secs(10), every),
+            Some(2)
+        );
+        assert_eq!(limiter.allow(start + Duration::from_secs(11), every), None);
     }
 
     // --- CR-035: write-behind backpressure is not unreadiness --------------
@@ -1791,7 +2150,7 @@ mod tests {
         // spent -- a cell-wide `observe()` blip hits every replica
         // identically, so the very next ordinary transient disagreement
         // produced an instant all-replica ejection. `observation_unknown`
-        // still answers 503 throughout the gap, so nothing is unguarded.
+        // still answers 503 once the gap outlives the budget (row 76), so nothing is unguarded.
         let now = Instant::now();
         // Already well past the 5s budget by the time the gap closes below --
         // if this age survived the gap, `capacity_unavailable` would reappear
@@ -1819,8 +2178,8 @@ mod tests {
         // A gap: the observer could not take an observation this tick.
         record_observation(&mut state, None, now);
         assert!(
-            state.observation.is_none(),
-            "a missing observation clears the last observation"
+            state.observation.is_some(),
+            "a missing observation keeps the last good one until it is stale"
         );
         assert_eq!(
             state.capacity_unavailable_since, None,
@@ -1828,9 +2187,8 @@ mod tests {
         );
         assert_eq!(
             reason(&state),
-            Some("observation_unknown"),
-            "observation_unknown still covers the gap itself, ahead of \
-             capacity_unavailable in priority order"
+            None,
+            "inside the budget, a failed observation is neither unknown nor unavailable"
         );
 
         // The gap closes with a fresh false sample. This starts a NEW run;

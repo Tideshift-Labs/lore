@@ -28,6 +28,46 @@ use crate::store::write_behind::cleanup::StageFileScanner;
 #[path = "fragment_write_behind_adapter_tests.rs"]
 mod adapter_tests;
 
+#[cfg(test)]
+mod observe_trace_tests {
+    use super::*;
+
+    #[test]
+    fn a_trace_records_completed_steps_in_order_and_names_the_failed_one() {
+        let now = Instant::now();
+        let mut trace = ObserveTrace::default();
+        trace.begin(ObserveStep::PhysicalInventory, now);
+        trace.end(
+            ObserveStep::PhysicalInventory,
+            Duration::from_millis(3),
+            true,
+        );
+        trace.begin(ObserveStep::StagePolicy, now);
+        trace.end(ObserveStep::StagePolicy, Duration::from_millis(40), false);
+        assert_eq!(
+            trace,
+            ObserveTrace {
+                completed: vec![
+                    (ObserveStep::PhysicalInventory, Duration::from_millis(3)),
+                    (ObserveStep::StagePolicy, Duration::from_millis(40)),
+                ],
+                in_flight: None,
+                failed: Some(ObserveStep::StagePolicy),
+            }
+        );
+    }
+
+    #[test]
+    fn a_step_that_never_returned_stays_in_flight() {
+        let now = Instant::now();
+        let mut trace = ObserveTrace::default();
+        trace.begin(ObserveStep::StageLedger, now);
+        assert_eq!(trace.in_flight, Some((ObserveStep::StageLedger, now)));
+        assert!(trace.completed.is_empty());
+        assert_eq!(trace.failed, None);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod source_tests {
     use uuid::Uuid;
@@ -397,6 +437,64 @@ impl Default for PhysicalInventory {
     }
 }
 
+/// One sub-step of [`FragmentWriteBehindHandle::observe`], in call order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObserveStep {
+    /// Collect the finished stage walk step and issue the next one.
+    PhysicalInventory,
+    /// Re-read the pinned stage policy.
+    StagePolicy,
+    /// The stage ledger read.
+    StageLedger,
+    /// The spool observation, which waits for one spool walk step.
+    SpoolObserve,
+    /// Bind the latest completed stage walk to the ledger read.
+    BindInventory,
+}
+
+impl ObserveStep {
+    /// The name used in logs and as the metric attribute.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::PhysicalInventory => "physical_inventory",
+            Self::StagePolicy => "stage_policy",
+            Self::StageLedger => "stage_ledger",
+            Self::SpoolObserve => "spool_observe",
+            Self::BindInventory => "bind_inventory",
+        }
+    }
+}
+
+/// Step timings of the latest `observe()` attempt.
+///
+/// Kept on the handle, not returned, so a caller whose deadline cancelled the
+/// attempt can still read which step it was waiting on and for how long.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ObserveTrace {
+    /// Steps that returned, in order, with how long each took.
+    pub completed: Vec<(ObserveStep, Duration)>,
+    /// The step that started and has not returned: still running, or its
+    /// future was dropped by a caller's deadline.
+    pub in_flight: Option<(ObserveStep, Instant)>,
+    /// The step that returned an error.
+    pub failed: Option<ObserveStep>,
+}
+
+impl ObserveTrace {
+    fn begin(&mut self, step: ObserveStep, at: Instant) {
+        self.in_flight = Some((step, at));
+    }
+
+    fn end(&mut self, step: ObserveStep, elapsed: Duration, ok: bool) {
+        self.in_flight = None;
+        self.completed.push((step, elapsed));
+        if !ok {
+            self.failed = Some(step);
+        }
+    }
+}
+
 pub struct WriteBehindObservation {
     pub pending_files: u64,
     pub pending_bytes: u64,
@@ -562,6 +660,7 @@ pub struct FragmentWriteBehindHandle {
     cleanup: Mutex<CleanupState>,
     inventory: Mutex<PhysicalInventory>,
     activity: std::sync::Mutex<WriteBehindActivity>,
+    observe_trace: std::sync::Mutex<ObserveTrace>,
 }
 
 impl PostgresImmutableStore {
@@ -627,6 +726,7 @@ impl PostgresImmutableStore {
             }),
             inventory: Mutex::new(PhysicalInventory::default()),
             activity: std::sync::Mutex::new(WriteBehindActivity::default()),
+            observe_trace: std::sync::Mutex::new(ObserveTrace::default()),
         }))
     }
 }
@@ -756,32 +856,76 @@ impl FragmentWriteBehindHandle {
         self.stage.note_observation_unknown();
     }
 
+    /// Step timings of the latest `observe()` attempt, including one a caller's
+    /// deadline cancelled.
+    pub fn observe_trace(&self) -> ObserveTrace {
+        self.observe_trace
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn with_trace(&self, update: impl FnOnce(&mut ObserveTrace)) {
+        update(
+            &mut self
+                .observe_trace
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
+    }
+
+    /// Run one `observe()` step and record how long it took. A step whose
+    /// future is dropped stays `in_flight`.
+    async fn observe_step<T>(
+        &self,
+        step: ObserveStep,
+        future: impl std::future::Future<Output = Result<T, StoreError>>,
+    ) -> Result<T, StoreError> {
+        let started = Instant::now();
+        self.with_trace(|trace| trace.begin(step, started));
+        let result = future.await;
+        self.with_trace(|trace| trace.end(step, started.elapsed(), result.is_ok()));
+        result
+    }
+
     pub async fn observe(&self) -> Result<WriteBehindObservation, StoreError> {
+        self.with_trace(|trace| *trace = ObserveTrace::default());
         self.stage.note_observation_unknown();
-        self.physical_inventory().await?;
-        self.coordinator
-            .verify_stage_policy(
-                &self.policy.cell_id,
-                &self.policy.revision,
-                &self.policy.digest,
-            )
-            .await
-            .map_err(domain_store_err)?;
+        self.observe_step(ObserveStep::PhysicalInventory, self.physical_inventory())
+            .await?;
+        self.observe_step(ObserveStep::StagePolicy, async {
+            self.coordinator
+                .verify_stage_policy(
+                    &self.policy.cell_id,
+                    &self.policy.revision,
+                    &self.policy.digest,
+                )
+                .await
+                .map_err(domain_store_err)
+        })
+        .await?;
         let observation = self
-            .coordinator
-            .observe_stage()
-            .await
-            .map_err(domain_store_err)?;
+            .observe_step(ObserveStep::StageLedger, async {
+                self.coordinator
+                    .observe_stage()
+                    .await
+                    .map_err(domain_store_err)
+            })
+            .await?;
         let spool = self
-            .maintenance
-            .observe()
-            .await
-            .map_err(provider_store_err)?;
+            .observe_step(ObserveStep::SpoolObserve, async {
+                self.maintenance.observe().await.map_err(provider_store_err)
+            })
+            .await?;
         let charged_bytes = positive(observation.resident_bytes)?;
         let charged_files = positive(observation.resident_files)?;
         let bound = self
-            .bind_stage_inventory((charged_bytes, charged_files))
-            .await;
+            .observe_step(ObserveStep::BindInventory, async {
+                Ok(self
+                    .bind_stage_inventory((charged_bytes, charged_files))
+                    .await)
+            })
+            .await?;
         let stage_physical = bound.map(|(walk, _)| walk);
         let capacity = CapacityEvidence::evaluate(
             observation.metadata_full,
