@@ -1778,9 +1778,10 @@ impl PostgresImmutableStore {
             .await
             .map_err(|error| counted_refusal(error.store_error(), "io_capacity"))?;
         // `put_coordinated` chose this route before the wait for a slot.
-        // Re-read it, so a stage that left `Stage` while this PUT queued takes
-        // no new preparation; the client's retry takes the current route.
-        if stage.mode() != StagingMode::Stage {
+        // Re-read it, so a stage that began refusing while this PUT queued
+        // takes no new preparation. `DirectFallback` still stages: it only
+        // prefers direct writes, and staging is no less safe than before.
+        if matches!(stage.mode(), StagingMode::Refuse | StagingMode::Unready) {
             return Err(staged_put_refusal("mode"));
         }
         let begin = coordinator
