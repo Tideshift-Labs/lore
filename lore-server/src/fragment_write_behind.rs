@@ -143,9 +143,10 @@ pub struct Snapshot {
     pub mode: &'static str,
     pub ready: bool,
     pub reason: Option<&'static str>,
-    /// A slow condition that does not fail readiness: `ready` can be true while
-    /// this is set. See `degraded_reason`.
-    pub degraded: Option<&'static str>,
+    /// Slow conditions that do not fail readiness: `ready` can be true while
+    /// this is non-empty. A list, like `CapacityDetail.failing`, so a second
+    /// condition does not change its shape. See `degraded_reason`.
+    pub degraded: Vec<&'static str>,
     pub worker_age_millis: Option<u64>,
     pub observation_age_millis: Option<u64>,
     pub pending_bytes: Option<u64>,
@@ -458,6 +459,14 @@ fn degraded_reason(state: &State, cleanup_stale_after: Duration) -> Option<&'sta
     }
 }
 
+/// Record 1 on `gauge` while `degraded` names `cleanup_not_progressing`, else 0.
+fn record_cleanup_not_progressing(gauge: &Gauge<u64>, degraded: &[&'static str]) {
+    gauge.record(
+        u64::from(degraded.contains(&"cleanup_not_progressing")),
+        &[],
+    );
+}
+
 /// Merge completed per-item activity without extending any timestamp merely
 /// because the observer ran. A wedged next operation still ages out naturally.
 fn refresh_activity(state: &mut State, activity: WriteBehindActivity) {
@@ -484,7 +493,9 @@ impl FragmentWriteBehindReadiness {
             },
             ready: reason.is_none(),
             reason,
-            degraded: degraded_reason(&state, self.cleanup_stale_after),
+            degraded: degraded_reason(&state, self.cleanup_stale_after)
+                .into_iter()
+                .collect(),
             worker_age_millis: worker_age.map(millis),
             observation_age_millis: observation_age.map(millis),
             pending_bytes: observation.map(|value| value.pending_bytes),
@@ -692,9 +703,9 @@ pub(crate) fn configure_fragment_write_behind(
                     snapshot.reason.unwrap_or("healthy"),
                 )],
             );
-            instruments().cleanup_not_progressing.record(
-                u64::from(snapshot.degraded == Some("cleanup_not_progressing")),
-                &[],
+            record_cleanup_not_progressing(
+                &instruments().cleanup_not_progressing,
+                &snapshot.degraded,
             );
         }
         handle.note_worker_stopped();
@@ -931,6 +942,66 @@ mod tests {
         record_observation(&mut state, Some(backlog_observation(0)), now);
         state.cleanup_progress = Some(old);
         assert_eq!(degraded(&state), None);
+    }
+
+    /// The gauge the observer records each pass, read back from a meter of this test's own rather
+    /// than the process-wide one the instruments use.
+    #[test]
+    fn the_cleanup_not_progressing_gauge_follows_the_degraded_field() {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+        use opentelemetry_sdk::metrics::SdkMeterProvider;
+        use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+        use opentelemetry_sdk::metrics::data::MetricData;
+
+        let exporter = InMemoryMetricExporter::default();
+        let provider = SdkMeterProvider::builder()
+            .with_periodic_exporter(exporter.clone())
+            .build();
+        let gauge = provider
+            .meter("test")
+            .u64_gauge("cleanup_not_progressing")
+            .build();
+        let value = || {
+            provider.force_flush().expect("flush the test meter");
+            let metrics = exporter.get_finished_metrics().expect("read metrics");
+            let resource = metrics.last().expect("one export per flush");
+            let metric = resource
+                .scope_metrics()
+                .flat_map(|scope| scope.metrics())
+                .next()
+                .expect("the gauge was recorded");
+            match metric.data() {
+                AggregatedMetrics::U64(MetricData::Gauge(gauge)) => {
+                    gauge.data_points().next().expect("one data point").value()
+                }
+                data => panic!("expected a u64 gauge, got {data:?}"),
+            }
+        };
+        let degraded_now = |state: &State| -> Vec<&'static str> {
+            degraded_reason(state, Duration::from_secs(15))
+                .into_iter()
+                .collect()
+        };
+
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        state.cleanup_progress = Some(now - Duration::from_secs(600));
+        record_observation(&mut state, Some(backlog_observation(654)), now);
+        let degraded = degraded_now(&state);
+        assert_eq!(degraded, ["cleanup_not_progressing"]);
+        record_cleanup_not_progressing(&gauge, &degraded);
+        assert_eq!(value(), 1);
+
+        state.cleanup_progress = Some(now);
+        let degraded = degraded_now(&state);
+        assert!(degraded.is_empty());
+        record_cleanup_not_progressing(&gauge, &degraded);
+        assert_eq!(value(), 0);
+
+        // Only that name sets it: another degraded condition leaves it at 0.
+        record_cleanup_not_progressing(&gauge, &["some_other_condition"]);
+        assert_eq!(value(), 0);
     }
 
     #[test]
