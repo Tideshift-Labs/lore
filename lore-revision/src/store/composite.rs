@@ -5,6 +5,8 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use opentelemetry::metrics::Gauge;
@@ -15,6 +17,7 @@ mod topology_refresh;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::log::LoreLogLevel;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
@@ -83,6 +86,9 @@ pub struct ReplicationTarget {
     target: Arc<dyn ImmutableStore>,
     name: String,
     peer_info: Option<PeerInfo>,
+    /// Whether the last fan-out this replica finished failed, so a replica that keeps failing
+    /// warns once when it starts and once when it recovers rather than on every write.
+    failing: Arc<AtomicBool>,
 }
 
 impl Debug for ReplicationTarget {
@@ -102,6 +108,7 @@ impl ReplicationTarget {
             target,
             name,
             peer_info: Some(peer_info),
+            failing: Default::default(),
         }
     }
 
@@ -278,6 +285,7 @@ impl CompositeStoreBuilder {
             target: target.clone(),
             name: name.clone(),
             peer_info: None,
+            failing: Default::default(),
         };
         if read {
             lore_debug!("Adding target {name} to read replicas");
@@ -388,7 +396,7 @@ impl CompositeStoreBuilder {
                     .latency_histogram_ms("topology.refresh.iteration.duration"),
                 counter_get_inflight_receiver: provider.counter("get.inflight.receiver"),
                 counter_local_caching: provider.counter("local.caching_total"),
-                counter_replication: provider.counter("replication_total"),
+                counter_replication: provider.counter("replication.fanout_total"),
 
                 provider,
             },
@@ -658,13 +666,14 @@ impl CompositeStore {
         for replica in write_replicas.iter() {
             let replica_store = replica.store();
             let replica_name = replica.name.clone();
+            let failing = replica.failing.clone();
             let counter = self.instruments.counter_replication.clone();
             let payload = payload.clone();
             lore_spawn!(async move {
                 let result = replica_store
                     .put(partition, address, fragment, payload, force)
                     .await;
-                report_replication("put", &replica_name, address, &counter, &result);
+                report_replication("put", &replica_name, address, &failing, &counter, &result);
                 result
             });
         }
@@ -685,12 +694,20 @@ impl CompositeStore {
         for replica in write_replicas.iter() {
             let replica_store = replica.store();
             let replica_name = replica.name.clone();
+            let failing = replica.failing.clone();
             let counter = self.instruments.counter_replication.clone();
             lore_spawn!(async move {
                 let result = replica_store
                     .copy(source_partition, source_address, partition, context, true)
                     .await;
-                report_replication("copy", &replica_name, source_address, &counter, &result);
+                report_replication(
+                    "copy",
+                    &replica_name,
+                    source_address,
+                    &failing,
+                    &counter,
+                    &result,
+                );
                 result
             });
         }
@@ -1344,24 +1361,40 @@ fn count_result<T, E>(context: &'static str, counter: &Counter<u64>, result: &Re
 }
 
 /// Count and log one detached replica fan-out. Nobody awaits it, so this is the only place its
-/// failure is seen. A replica refusing the operation outright is expected (a peer-made replica
-/// cannot carry a copy) and logs at debug; any other failure means the replica missed a write it
-/// was sent, and logs at warn.
+/// failure is seen. The counter carries the rate, so the log only marks a change of state: a
+/// replica that starts failing warns, a failure while it is already failing logs at debug, and its
+/// first success after that warns that it recovered. A replica refusing the operation outright is
+/// expected (a peer-made replica cannot carry a copy), logs at debug and leaves the state alone.
+///
+/// Returns the level it logged at, if any.
 fn report_replication(
     operation: &'static str,
     replica: &str,
     address: Address,
+    failing: &AtomicBool,
     counter: &Counter<u64>,
     result: &Result<(), StoreError>,
-) {
+) -> Option<LoreLogLevel> {
     count_result(operation, counter, result);
     match result {
-        Ok(()) => {}
+        Ok(()) => {
+            if !failing.swap(false, Ordering::Relaxed) {
+                return None;
+            }
+            lore_warn!("replica '{replica}' recovered: {operation} of {address} succeeded");
+            Some(LoreLogLevel::Warn)
+        }
         Err(error @ StoreError::NotSupported(_)) => {
             lore_debug!("replica '{replica}' refused {operation} of {address}: {error}");
+            Some(LoreLogLevel::Debug)
         }
         Err(error) => {
+            if failing.swap(true, Ordering::Relaxed) {
+                lore_debug!("replica '{replica}' still failing: {operation} of {address}: {error}");
+                return Some(LoreLogLevel::Debug);
+            }
             lore_warn!("replica '{replica}' failed {operation} of {address}: {error}");
+            Some(LoreLogLevel::Warn)
         }
     }
 }
@@ -1392,4 +1425,137 @@ struct CompositeStoreInstruments {
     counter_get_inflight_receiver: Counter<u64>,
     counter_local_caching: Counter<u64>,
     counter_replication: Counter<u64>,
+}
+
+#[cfg(test)]
+mod report_replication_tests {
+    use opentelemetry::Value;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+
+    use super::*;
+
+    /// A counter on a meter of its own, so the counts read back are this test's alone rather than
+    /// the process-wide provider's.
+    struct RecordedCounter {
+        provider: SdkMeterProvider,
+        exporter: InMemoryMetricExporter,
+        counter: Counter<u64>,
+    }
+
+    impl RecordedCounter {
+        fn new() -> Self {
+            let exporter = InMemoryMetricExporter::default();
+            let provider = SdkMeterProvider::builder()
+                .with_periodic_exporter(exporter.clone())
+                .build();
+            let counter = provider.meter("test").u64_counter("fanout").build();
+            Self {
+                provider,
+                exporter,
+                counter,
+            }
+        }
+
+        fn count(&self, success: bool) -> u64 {
+            self.provider.force_flush().expect("flush the test meter");
+            let metrics = self.exporter.get_finished_metrics().expect("read metrics");
+            let Some(last) = metrics.last() else {
+                return 0;
+            };
+            last.scope_metrics()
+                .flat_map(|scope| scope.metrics())
+                .map(|metric| match metric.data() {
+                    AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                        .data_points()
+                        .filter(|point| {
+                            point.attributes().any(|attribute| {
+                                attribute.key.as_str() == METRICS_SUCCESS_ATTRIBUTE_NAME
+                                    && attribute.value == Value::Bool(success)
+                            })
+                        })
+                        .map(|point| point.value())
+                        .sum::<u64>(),
+                    data => panic!("expected a u64 sum, got {data:?}"),
+                })
+                .sum()
+        }
+    }
+
+    fn report(
+        failing: &AtomicBool,
+        counter: &RecordedCounter,
+        result: Result<(), StoreError>,
+    ) -> Option<LoreLogLevel> {
+        report_replication(
+            "put",
+            "replica",
+            Address::default(),
+            failing,
+            &counter.counter,
+            &result,
+        )
+    }
+
+    fn failure() -> Result<(), StoreError> {
+        Err(StoreError::internal("replica down"))
+    }
+
+    fn refusal() -> Result<(), StoreError> {
+        Err(StoreError::from(crate::errors::NotSupported {
+            operation: "copy".to_string(),
+        }))
+    }
+
+    #[test]
+    fn a_persistent_failure_warns_only_when_the_state_changes() {
+        let failing = AtomicBool::new(false);
+        let counter = RecordedCounter::new();
+
+        assert_eq!(report(&failing, &counter, Ok(())), None);
+        assert_eq!(
+            report(&failing, &counter, failure()),
+            Some(LoreLogLevel::Warn)
+        );
+        assert_eq!(
+            report(&failing, &counter, failure()),
+            Some(LoreLogLevel::Debug)
+        );
+        assert_eq!(
+            report(&failing, &counter, failure()),
+            Some(LoreLogLevel::Debug)
+        );
+        assert_eq!(report(&failing, &counter, Ok(())), Some(LoreLogLevel::Warn));
+        assert_eq!(report(&failing, &counter, Ok(())), None);
+
+        assert_eq!(counter.count(true), 3);
+        assert_eq!(counter.count(false), 3);
+    }
+
+    #[test]
+    fn a_refusal_logs_at_debug_and_leaves_the_state_alone() {
+        let failing = AtomicBool::new(false);
+        let counter = RecordedCounter::new();
+
+        assert_eq!(
+            report(&failing, &counter, refusal()),
+            Some(LoreLogLevel::Debug)
+        );
+        assert!(!failing.load(Ordering::Relaxed));
+        assert_eq!(
+            report(&failing, &counter, failure()),
+            Some(LoreLogLevel::Warn)
+        );
+        assert_eq!(
+            report(&failing, &counter, refusal()),
+            Some(LoreLogLevel::Debug)
+        );
+        assert!(failing.load(Ordering::Relaxed));
+
+        assert_eq!(counter.count(true), 0);
+        assert_eq!(counter.count(false), 3);
+    }
 }

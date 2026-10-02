@@ -81,6 +81,8 @@ lore-storage = { workspace = true }
 # `lore-transport` dependency above for `cargo test`, the same way `lore` and `loreserver` already
 # pick the feature up on a workspace-wide `--all-targets` build (see the type's own doc comment).
 lore-transport = { workspace = true, features = ["test_seams"] }
+# An in-memory meter, so a counter test reads only its own counts.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 serde_json = { workspace = true }
 serde = { workspace = true }
 tempfile = "3"

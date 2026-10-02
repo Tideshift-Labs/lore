@@ -2971,6 +2971,7 @@ dependencies = [
  "md-5",
  "open",
  "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "prost-types",
  "quinn",

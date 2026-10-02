@@ -47,6 +47,8 @@ mod tests {
         compare_and_swap_result: Option<Hash>,
         get_immutable_result: Option<StoreGetData>,
         max_query_batch: Option<usize>,
+        /// Errors the next puts return, in order, before `succeed` decides again.
+        put_errors: std::sync::Mutex<std::collections::VecDeque<StoreError>>,
     }
 
     impl TestStore<'_> {
@@ -89,6 +91,11 @@ mod tests {
         fn with_mock_durable_match(mut self, context: Context) -> Self {
             self.match_context = Some(context);
             self.match_durable = true;
+            self
+        }
+
+        fn with_put_errors(self, errors: impl IntoIterator<Item = StoreError>) -> Self {
+            self.put_errors.lock().unwrap().extend(errors);
             self
         }
 
@@ -249,6 +256,9 @@ mod tests {
         ) -> Result<(), StoreError> {
             self.track_invocation("put");
 
+            if let Some(error) = self.put_errors.lock().unwrap().pop_front() {
+                return Err(error);
+            }
             if self.succeed {
                 Ok(())
             } else {
@@ -2268,18 +2278,55 @@ mod tests {
 
     /// A replica fan-out is detached and nothing awaits it, so its failure is only seen if it is
     /// logged where it happens. These capture the process-wide log and keep only the lines naming
-    /// this test's replica, so other tests' logging cannot interfere.
+    /// this test's replica, so other tests' logging cannot interfere. That a healthy success logs
+    /// nothing is pinned beside `report_replication` instead: absence cannot be waited for here.
     mod replication_failures_are_logged {
         use std::sync::Mutex;
+        use std::sync::PoisonError;
+        use std::time::Duration;
+        use std::time::Instant;
 
         use lore_base::log::LoreLogLevel;
+        use lore_storage::errors::NotSupported;
 
         use super::*;
 
         static CAPTURED: Mutex<Vec<(LoreLogLevel, String)>> = Mutex::new(Vec::new());
 
+        /// How many tests hold the capture, and the level to put back when the last one ends.
+        static HOLDERS: Mutex<(usize, LoreLogLevel)> = Mutex::new((0, LoreLogLevel::None));
+
         fn capture(level: LoreLogLevel, _location: &str, message: &str) {
             CAPTURED.lock().unwrap().push((level, message.to_owned()));
+        }
+
+        /// Debug logging into [`capture`] while held. The level and the callback are process-wide
+        /// and these tests overlap, so the first holder saves the level and the last one restores
+        /// it and clears the callback; nothing else in this binary sets either.
+        struct CaptureLogs;
+
+        impl CaptureLogs {
+            fn start() -> Self {
+                let mut holders = HOLDERS.lock().unwrap_or_else(PoisonError::into_inner);
+                if holders.0 == 0 {
+                    holders.1 = lore_base::log::log_level();
+                    lore_base::log::set_log_callback(Some(capture));
+                    lore_base::log::set_log_level(LoreLogLevel::Debug);
+                }
+                holders.0 += 1;
+                CaptureLogs
+            }
+        }
+
+        impl Drop for CaptureLogs {
+            fn drop(&mut self) {
+                let mut holders = HOLDERS.lock().unwrap_or_else(PoisonError::into_inner);
+                holders.0 -= 1;
+                if holders.0 == 0 {
+                    lore_base::log::set_log_callback(None);
+                    lore_base::log::set_log_level(holders.1);
+                }
+            }
         }
 
         fn captured_for(replica: &str) -> Vec<(LoreLogLevel, String)> {
@@ -2293,13 +2340,24 @@ mod tests {
                 .collect()
         }
 
+        /// The replica's lines once there are `count` of them, or whatever is there after ten
+        /// seconds. The fan-out is detached, so its report lands some time after the put returns.
+        async fn wait_for_lines(replica: &str, count: usize) -> Vec<(LoreLogLevel, String)> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let lines = captured_for(replica);
+                if lines.len() >= count || Instant::now() >= deadline {
+                    return lines;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
         fn store_with_replica(
             local: TestStore<'static>,
             replica_name: &str,
             replica: Arc<TestStore<'static>>,
         ) -> Arc<lore_revision::store::composite::CompositeStore> {
-            lore_base::log::set_log_callback(Some(capture));
-            lore_base::log::set_log_level(LoreLogLevel::Debug);
             Arc::new(
                 CompositeStoreBuilder::default()
                     .with_local("local".to_string(), Arc::new(local))
@@ -2331,11 +2389,11 @@ mod tests {
                 )
                 .await
                 .expect("a replica failure must not fail the put");
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
 
         #[tokio::test]
         async fn a_failed_replica_put_is_logged_at_warn() {
+            let _logs = CaptureLogs::start();
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -2349,8 +2407,8 @@ mod tests {
 
                     put(&store).await;
 
+                    let lines = wait_for_lines(&name, 1).await;
                     assert_eq!(*replica.invocations.read().unwrap().get("put").unwrap(), 1);
-                    let lines = captured_for(&name);
                     assert_eq!(lines.len(), 1, "one line per failed fan-out: {lines:?}");
                     assert_eq!(lines[0].0, LoreLogLevel::Warn);
                     assert!(lines[0].1.contains("failed put"), "{lines:?}");
@@ -2361,6 +2419,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_failed_replica_copy_is_logged_at_warn() {
+            let _logs = CaptureLogs::start();
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -2376,8 +2435,8 @@ mod tests {
 
                     put(&store).await;
 
+                    let lines = wait_for_lines(&name, 1).await;
                     assert_eq!(*replica.invocations.read().unwrap().get("copy").unwrap(), 1);
-                    let lines = captured_for(&name);
                     assert_eq!(lines.len(), 1, "one line per failed fan-out: {lines:?}");
                     assert_eq!(lines[0].0, LoreLogLevel::Warn);
                     assert!(lines[0].1.contains("failed copy"), "{lines:?}");
@@ -2385,21 +2444,78 @@ mod tests {
                 .await;
         }
 
+        /// Each put waits for the previous report, so the fan-outs finish in the order sent.
         #[tokio::test]
-        async fn a_successful_replica_put_logs_nothing() {
+        async fn a_persistently_failing_replica_warns_when_it_starts_and_when_it_recovers() {
+            let _logs = CaptureLogs::start();
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let name = format!("ok-replica-{}", random::<u64>());
+                    let name = format!("flapping-replica-{}", random::<u64>());
+                    let replica = Arc::new(TestStore::succeeding().with_put_errors([
+                        StoreError::internal("Mock store failure"),
+                        StoreError::internal("Mock store failure"),
+                    ]));
                     let store = store_with_replica(
                         TestStore::succeeding().with_mock_match(StoreMatch::MatchNone),
                         &name,
-                        Arc::new(TestStore::succeeding()),
+                        replica,
                     );
 
-                    put(&store).await;
+                    for count in 1..=3 {
+                        put(&store).await;
+                        wait_for_lines(&name, count).await;
+                    }
 
-                    assert!(captured_for(&name).is_empty());
+                    let lines = captured_for(&name);
+                    let levels: Vec<_> = lines.iter().map(|(level, _)| *level).collect();
+                    assert_eq!(
+                        levels,
+                        [LoreLogLevel::Warn, LoreLogLevel::Debug, LoreLogLevel::Warn],
+                        "{lines:?}"
+                    );
+                    assert!(lines[0].1.contains("failed put"), "{lines:?}");
+                    assert!(lines[1].1.contains("still failing"), "{lines:?}");
+                    assert!(lines[2].1.contains("recovered"), "{lines:?}");
+                })
+                .await;
+        }
+
+        /// The failure after the refusal still warns, so the refusal did not mark the replica as
+        /// failing.
+        #[tokio::test]
+        async fn a_refusing_replica_logs_at_debug_not_warn() {
+            let _logs = CaptureLogs::start();
+            let execution = setup_test_execution();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let name = format!("refusing-replica-{}", random::<u64>());
+                    let replica = Arc::new(TestStore::succeeding().with_put_errors([
+                        StoreError::from(NotSupported {
+                            operation: "put".to_string(),
+                        }),
+                        StoreError::internal("Mock store failure"),
+                    ]));
+                    let store = store_with_replica(
+                        TestStore::succeeding().with_mock_match(StoreMatch::MatchNone),
+                        &name,
+                        replica,
+                    );
+
+                    for count in 1..=2 {
+                        put(&store).await;
+                        wait_for_lines(&name, count).await;
+                    }
+
+                    let lines = captured_for(&name);
+                    let levels: Vec<_> = lines.iter().map(|(level, _)| *level).collect();
+                    assert_eq!(
+                        levels,
+                        [LoreLogLevel::Debug, LoreLogLevel::Warn],
+                        "{lines:?}"
+                    );
+                    assert!(lines[0].1.contains("refused put"), "{lines:?}");
+                    assert!(lines[1].1.contains("failed put"), "{lines:?}");
                 })
                 .await;
         }
