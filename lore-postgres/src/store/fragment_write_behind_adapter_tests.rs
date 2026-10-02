@@ -251,7 +251,6 @@ impl Fixture {
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
-            put_database_slots: 3,
         })
         .unwrap();
         let s3_config = aws_sdk_s3::config::Builder::new()
@@ -480,60 +479,6 @@ async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retr
         .await
         .expect("the retry is admitted at once, not fenced by the refused attempt");
     assert_eq!(retried.state, FragmentLifecycleState::Staged);
-}
-
-/// Row 76: a staged put needs one of `put_database_slots` before its first
-/// database step. With every one held it is refused after its wait budget,
-/// having written nothing, and the next put after a slot frees is admitted.
-#[tokio::test]
-#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
-async fn adapter_put_waits_for_a_database_slot_and_is_refused_without_one() {
-    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
-    let bytes = Bytes::from("database slot payload repeated ".repeat(512));
-    let address = Address {
-        context: Context::default(),
-        hash: Hash::from(blake3::hash(&bytes).as_bytes().as_slice()),
-    };
-    let mut held = Vec::new();
-    for _ in 0..3 {
-        held.push(fixture.stage.reserve_put().await.unwrap());
-    }
-    let started = std::time::Instant::now();
-    let refused = fixture
-        .store
-        .put_staged(
-            &fixture.handle.coordinator,
-            &fixture.stage,
-            address,
-            raw_fragment(&bytes),
-            bytes.clone(),
-        )
-        .await;
-    assert!(matches!(&refused, Err(error) if error.is_slow_down()));
-    assert!(started.elapsed() >= Duration::from_millis(900));
-    let rows: i64 = fixture
-        .admin
-        .query_one(
-            "SELECT count(*) FROM lore_fragment_lifecycle WHERE hash=$1",
-            &[&address.hash.data().as_slice()],
-        )
-        .await
-        .unwrap()
-        .get(0);
-    assert_eq!(rows, 0, "a put refused its database slot begins nothing");
-    held.pop();
-    let staged = fixture
-        .store
-        .put_staged(
-            &fixture.handle.coordinator,
-            &fixture.stage,
-            address,
-            raw_fragment(&bytes),
-            bytes,
-        )
-        .await
-        .expect("a freed database slot admits the put");
-    assert_eq!(staged.state, FragmentLifecycleState::Staged);
 }
 
 /// Row 76: a put that finds every staging I/O slot taken waits for one to free

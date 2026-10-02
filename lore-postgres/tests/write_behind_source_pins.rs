@@ -366,32 +366,3 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
         "step 5 syncs the held leaf descriptor"
     );
 }
-
-/// Row 76: `put_staged` holds its database slot from before `begin_stage`
-/// until its last database step. A `_` pattern (rather than a named `_database`
-/// binding) or an early `drop` releases the slot at once and silently lifts the
-/// bound, and no live test can tell the difference without a timing race.
-#[test]
-fn put_staged_holds_its_database_slot_through_commit_and_witness() {
-    let source = read_source("src/store/immutable_store.rs");
-    let put_staged = function(&source, "async fn put_staged(");
-    // Negatives first, so one revert cannot pass by aborting on a positive.
-    assert!(
-        !put_staged.contains("database: _,") && !put_staged.contains("database: _ }"),
-        "a `_` pattern drops the database slot immediately"
-    );
-    assert!(
-        !put_staged.contains("drop(_database"),
-        "the database slot must not be released before the function returns"
-    );
-    assert_order(
-        put_staged,
-        &[
-            "database: _database",
-            "stage.reserve_put().await",
-            ".begin_stage(",
-            ".commit_staged(",
-            ".capture_current_readable_epoch_for_authority(",
-        ],
-    );
-}

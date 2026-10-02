@@ -828,10 +828,6 @@ fn validated_write_behind_settings(
         drain_stale_after: Duration::from_millis(drain_stale_after),
         sample_interval: Duration::from_millis(sample_interval),
         stage_io_wait: Duration::from_millis(stage_io_wait),
-        // The domain pool's size is the mutable store's setting, not this
-        // block's. Composition replaces this floor with
-        // `put_database_slots_for` before the stage opens.
-        put_database_slots: 1,
     };
     let required_text = |field: &str, value: &Option<String>| {
         value
@@ -1173,22 +1169,6 @@ pub(crate) fn fragment_provider_enabled(config: &toml::Value) -> Result<bool, Pl
         .fragment_provider
         .as_ref()
         .is_some_and(|fragment_provider| fragment_provider.enabled))
-}
-
-/// How many staged PUTs may do database work at once: one less than the
-/// mutable store's `domain_pool_max`, floored at 1, so the write-behind
-/// observer, which reads through the same pool, always finds a connection.
-/// Row 76: with no bound, 16 PUTs queued on a 3-connection dev pool and the
-/// observer's 1 s attempts timed out behind them.
-pub(crate) fn put_database_slots_for(mutable_config: &toml::Value) -> Result<usize, PluginError> {
-    let mutable = parse_config(PLUGIN_NAME, mutable_config)?;
-    Ok(put_database_slots(mutable.domain_pool_max))
-}
-
-fn put_database_slots(domain_pool_max: u32) -> usize {
-    usize::try_from(domain_pool_max.saturating_sub(1))
-        .unwrap_or(usize::MAX)
-        .max(1)
 }
 
 /// Resolve the exact maxima of every Postgres pool an enabled fragment route
@@ -3269,28 +3249,6 @@ staging_root = "/var/lib/loreserver/staging"
         assert!(
             error.contains("stage_io_wait_millis") && error.contains("between 0 and 10000"),
             "got {error}"
-        );
-    }
-
-    /// Row 76: staged PUTs get one less than the domain pool, read from the
-    /// mutable store's own configuration (default 4), never a fixed number.
-    #[test]
-    fn put_database_slots_leave_one_domain_connection_for_the_observer() {
-        for (domain_pool_max, slots) in [(0, 1), (1, 1), (2, 1), (3, 2), (4, 3), (20, 19)] {
-            assert_eq!(
-                put_database_slots(domain_pool_max),
-                slots,
-                "domain_pool_max {domain_pool_max}"
-            );
-        }
-        let configured = |text: &str| {
-            put_database_slots_for(&toml::from_str(text).expect("fixture parses"))
-                .expect("fixture is a valid mutable store config")
-        };
-        assert_eq!(configured("url = \"postgres://localhost/lore\""), 3);
-        assert_eq!(
-            configured("url = \"postgres://localhost/lore\"\ndomain_pool_max = 3"),
-            2
         );
     }
 
