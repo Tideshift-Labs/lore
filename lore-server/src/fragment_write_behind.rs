@@ -39,6 +39,8 @@ struct Instruments {
     promoted: Counter<u64>,
     cleaned: Counter<u64>,
     ready: Gauge<u64>,
+    /// 1 while cleanup is degraded (`Snapshot.degraded`); never a readiness input.
+    cleanup_not_progressing: Gauge<u64>,
     pending: Gauge<u64>,
     usage: Gauge<u64>,
 }
@@ -51,6 +53,9 @@ fn instruments() -> &'static Instruments {
             promoted: meter.u64_counter(provider.scope_name("promoted")).build(),
             cleaned: meter.u64_counter(provider.scope_name("cleaned")).build(),
             ready: meter.u64_gauge(provider.scope_name("ready")).build(),
+            cleanup_not_progressing: meter
+                .u64_gauge(provider.scope_name("cleanup_not_progressing"))
+                .build(),
             pending: meter
                 .u64_gauge(provider.scope_name("pending_files"))
                 .build(),
@@ -138,6 +143,9 @@ pub struct Snapshot {
     pub mode: &'static str,
     pub ready: bool,
     pub reason: Option<&'static str>,
+    /// A slow condition that does not fail readiness: `ready` can be true while
+    /// this is set. See `degraded_reason`.
+    pub degraded: Option<&'static str>,
     pub worker_age_millis: Option<u64>,
     pub observation_age_millis: Option<u64>,
     pub pending_bytes: Option<u64>,
@@ -422,7 +430,24 @@ fn readiness_reason(
         .is_some_and(|at| at.elapsed() >= cleanup_stale_after)
     {
         Some("cleanup_backpressure_sustained")
-    } else if observation.is_some_and(|value| value.cleanup_backlog > 0)
+    } else {
+        None
+    }
+}
+
+/// A slow condition that is reported but does not fail readiness.
+///
+/// **A slow cell-wide cleanup is not unreadiness (INV-FT, row 71).** The backlog
+/// is shared by the cell, so the verdict is the same on every replica: failing
+/// readiness on it ejects all of them at once, and taking a replica out of the
+/// load balancer does not speed cleanup up. Spool exhaustion from slow cleanup
+/// is already gated by `capacity_unavailable`, and a cleanup loop that cannot
+/// run still fails readiness through `cleanup_stale` and
+/// `cleanup_backpressure_sustained`. So this is a snapshot field and a metric,
+/// never a 503 or `direct_fallback`.
+fn degraded_reason(state: &State, cleanup_stale_after: Duration) -> Option<&'static str> {
+    let observation = state.observation.as_ref().map(|(_, value)| value);
+    if observation.is_some_and(|value| value.cleanup_backlog > 0)
         && state
             .cleanup_progress
             .is_none_or(|at| at.elapsed() >= cleanup_stale_after)
@@ -459,6 +484,7 @@ impl FragmentWriteBehindReadiness {
             },
             ready: reason.is_none(),
             reason,
+            degraded: degraded_reason(&state, self.cleanup_stale_after),
             worker_age_millis: worker_age.map(millis),
             observation_age_millis: observation_age.map(millis),
             pending_bytes: observation.map(|value| value.pending_bytes),
@@ -666,6 +692,10 @@ pub(crate) fn configure_fragment_write_behind(
                     snapshot.reason.unwrap_or("healthy"),
                 )],
             );
+            instruments().cleanup_not_progressing.record(
+                u64::from(snapshot.degraded == Some("cleanup_not_progressing")),
+                &[],
+            );
         }
         handle.note_worker_stopped();
         Ok(())
@@ -724,6 +754,10 @@ mod tests {
 
     fn reason(state: &State) -> Option<&'static str> {
         readiness_reason(state, Duration::from_secs(5), Duration::from_secs(15))
+    }
+
+    fn degraded(state: &State) -> Option<&'static str> {
+        degraded_reason(state, Duration::from_secs(15))
     }
 
     #[test]
@@ -869,9 +903,57 @@ mod tests {
 
         record_observation(&mut state, Some(capacity_observation(true)), now);
         state.observation.as_mut().unwrap().1.cleanup_backlog = 1;
-        assert_eq!(reason(&state), Some("cleanup_not_progressing"));
+        assert_eq!(
+            reason(&state),
+            None,
+            "a slow cell-wide cleanup is degraded, not unready"
+        );
+        assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
         state.cleanup_progress = Some(now);
         assert_eq!(reason(&state), None);
+        assert_eq!(degraded(&state), None);
+    }
+
+    // --- Row 71: cleanup_not_progressing is degraded, not unready ----------
+
+    #[test]
+    fn cleanup_not_progressing_never_fails_readiness_and_is_reported_as_degraded() {
+        // INV-FT: the backlog is cell-wide, so failing readiness on it ejects every replica at
+        // once while slow cleanup is the only effect (row 2: 106 of 471 dual-503 rounds).
+        let now = Instant::now();
+        let old = now - Duration::from_secs(600);
+        let mut state = healthy_state(now);
+        state.cleanup_progress = Some(old);
+        record_observation(&mut state, Some(backlog_observation(654)), now);
+        assert_eq!(reason(&state), None);
+        assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
+        // No backlog, no degraded signal, however old the progress clock.
+        record_observation(&mut state, Some(backlog_observation(0)), now);
+        state.cleanup_progress = Some(old);
+        assert_eq!(degraded(&state), None);
+    }
+
+    #[test]
+    fn the_cleanup_signals_that_stay_readiness_failing_still_fail_readiness() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(30);
+
+        let mut state = healthy_state(now);
+        state.cleanup = Some(old);
+        assert_eq!(reason(&state), Some("cleanup_stale"));
+
+        let mut state = healthy_state(now);
+        state.cleanup_backpressure_since = Some(old);
+        assert_eq!(reason(&state), Some("cleanup_backpressure_sustained"));
+
+        // A readiness failure outranks the degraded field: an unready replica reports its
+        // reason, and the degraded field still says what else is slow.
+        let mut state = healthy_state(now);
+        state.cleanup = Some(old);
+        state.cleanup_progress = Some(old);
+        record_observation(&mut state, Some(backlog_observation(10)), now);
+        assert_eq!(reason(&state), Some("cleanup_stale"));
+        assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
     }
 
     // --- A falling cell-wide cleanup backlog is cleanup progress -----------
@@ -894,10 +976,10 @@ mod tests {
         let mut state = healthy_state(now);
         state.cleanup_progress = Some(old);
         record_observation(&mut state, Some(backlog_observation(654)), now);
-        assert_eq!(reason(&state), Some("cleanup_not_progressing"));
+        assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
         record_observation(&mut state, Some(backlog_observation(643)), now);
         assert_eq!(state.cleanup_progress, Some(now));
-        assert_eq!(reason(&state), None);
+        assert_eq!(degraded(&state), None);
     }
 
     #[test]
@@ -910,7 +992,7 @@ mod tests {
             record_observation(&mut state, Some(backlog_observation(654)), now);
             record_observation(&mut state, Some(backlog_observation(next)), now);
             assert_eq!(state.cleanup_progress, Some(old), "backlog {next}");
-            assert_eq!(reason(&state), Some("cleanup_not_progressing"));
+            assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
         }
     }
 
@@ -925,7 +1007,7 @@ mod tests {
         record_observation(&mut state, None, now);
         record_observation(&mut state, Some(backlog_observation(10)), now);
         assert_eq!(state.cleanup_progress, Some(old));
-        assert_eq!(reason(&state), Some("cleanup_not_progressing"));
+        assert_eq!(degraded(&state), Some("cleanup_not_progressing"));
     }
 
     // --- CR-035: write-behind backpressure is not unreadiness --------------
