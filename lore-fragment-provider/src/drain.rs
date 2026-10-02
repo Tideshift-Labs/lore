@@ -357,27 +357,24 @@ impl FragmentDrainMaintenanceHandle {
                 before,
             ));
         }
-        let (available_bytes, step, before) = match state.task.as_mut() {
-            Some((task, before)) => {
-                let before = *before;
-                // A step that never finished has no OS error to report, so it is named here before
-                // it is recorded as a failed step: the RootUnavailable it maps to would otherwise
-                // read as a missing spool root rather than a panic or a cancellation.
-                let (available_bytes, step) = task.await.unwrap_or_else(|error| {
-                    let how = if error.is_panic() {
-                        "panicked"
-                    } else {
-                        "was cancelled"
-                    };
-                    lore_base::lore_warn!("drain spool physical walk step {how}: {error}");
-                    (None, Err(SpoolWriteError::RootUnavailable))
-                });
-                (available_bytes, step, before)
-            }
-            None => {
-                lore_base::lore_warn!("drain spool physical walk step was not in flight");
-                (None, Err(SpoolWriteError::RootUnavailable), None)
-            }
+        let (available_bytes, step, before) = if let Some((task, before)) = state.task.as_mut() {
+            let before = *before;
+            // A step that never finished has no OS error to report, so it is named here before
+            // it is recorded as a failed step: the RootUnavailable it maps to would otherwise
+            // read as a missing spool root rather than a panic or a cancellation.
+            let (available_bytes, step) = task.await.unwrap_or_else(|error| {
+                let how = if error.is_panic() {
+                    "panicked"
+                } else {
+                    "was cancelled"
+                };
+                lore_base::lore_warn!("drain spool physical walk step {how}: {error}");
+                (None, Err(SpoolWriteError::RootUnavailable))
+            });
+            (available_bytes, step, before)
+        } else {
+            lore_base::lore_warn!("drain spool physical walk step was not in flight");
+            (None, Err(SpoolWriteError::RootUnavailable), None)
         };
         state.task = None;
         record_spool_step(&mut state.walk, before, step);
