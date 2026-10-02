@@ -235,6 +235,7 @@ fn record_capacity_observation(
     state: &mut State,
     observation: WriteBehindObservation,
     at: Instant,
+    stale_after: Duration,
 ) -> Option<(bool, CapacityDetail)> {
     let previous = state
         .observation
@@ -242,7 +243,7 @@ fn record_capacity_observation(
         .map(|(_, value)| value.capacity_available);
     let transition = capacity_transition(previous, observation.capacity_available)
         .map(|available| (available, CapacityDetail::from(&observation.capacity)));
-    record_observation(state, Some(observation), at);
+    record_observation(state, Some(observation), at, stale_after);
     transition
 }
 
@@ -357,15 +358,15 @@ fn record_pass_outcome(
 /// that is genuinely full never recovers, so it still reaches 503 one budget
 /// later.
 ///
-/// An observation that could not be taken CLEARS the run. Not knowing is not
-/// evidence that room returned, but it is equally not evidence that the stage is
-/// full, and the two mistakes are not symmetric. Keeping the run across a gap
-/// means the first sample after recovery arrives with the budget already spent,
-/// so a cell-wide `observe()` blip — one database stall reaches every replica
-/// identically — is followed by an instant all-replica ejection on the very next
-/// ordinary transient disagreement. That is the failure this change exists to
-/// remove. Clearing costs one extra budget before a genuinely full stage ages
-/// out.
+/// **A failed observation keeps the run; a failure run of `stale_after` or
+/// longer clears it.** A short failure run is the same claim as the last good
+/// observation, which still stands (below), so it cannot restart the budget:
+/// clearing on every failure let a full stage stay hidden from readiness for as
+/// long as `observe()` failed once per `stale_after`. A long failure run has
+/// already answered `observation_unknown`, and keeping the run across it would
+/// meet the first sample after recovery with the budget spent. One database
+/// stall reaches every replica, so the next ordinary transient disagreement
+/// would then eject every replica at once. So that run starts again.
 ///
 /// **A failed observation is not an unknown one yet (row 76).** It keeps the
 /// last good observation, which ages out over `stale_after` like every other
@@ -383,6 +384,14 @@ fn record_pass_outcome(
 /// had before the run survives it, so a wedged drain behind flapping
 /// observations still ages out.
 ///
+/// It ages out late, and this is the bound. In the worst case observations fail
+/// for just under `stale_after` between single good ones. Each such cycle lasts
+/// about `stale_after` and ages the clock by about one observer interval, so a
+/// wedged drain reads ready for about `stale_after² / interval` before
+/// `drain_not_progressing` (5 s and 1 s: 25 s, not 5 s). The test
+/// `a_wedged_drain_behind_flapping_observations_ages_out_at_stale_after_squared_over_interval`
+/// pins it.
+///
 /// **A cell-wide cleanup backlog that fell since the last sample is cleanup
 /// progress.** A pass reports progress only for a body it unlinked, so a release
 /// that finishes a row whose body an earlier, lost release already unlinked
@@ -394,9 +403,13 @@ fn record_pass_outcome(
 ///
 /// Pure and synchronous, so the rule is testable without a store, a runtime or a
 /// Postgres fixture — the same reason `record_pass_outcome` is.
-fn record_observation(state: &mut State, observation: Option<WriteBehindObservation>, at: Instant) {
+fn record_observation(
+    state: &mut State,
+    observation: Option<WriteBehindObservation>,
+    at: Instant,
+    stale_after: Duration,
+) {
     let Some(value) = observation else {
-        state.capacity_unavailable_since = None;
         state.observation_failed_since.get_or_insert(at);
         return;
     };
@@ -406,6 +419,9 @@ fn record_observation(state: &mut State, observation: Option<WriteBehindObservat
         state.progress = state
             .progress
             .map(|progress| progress.checked_add(blind).map_or(at, |end| end.min(at)));
+        if blind >= stale_after {
+            state.capacity_unavailable_since = None;
+        }
     }
     if value.capacity_available {
         state.capacity_unavailable_since = None;
@@ -691,6 +707,36 @@ impl FragmentWriteBehindReadiness {
     }
 }
 
+/// What one observer attempt does to the store's drain heartbeat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeartbeatAction {
+    Beat,
+    /// Neither beat nor stop: the heartbeat ages out over `stale_after` alone.
+    Keep,
+    Stop,
+}
+
+/// An unready replica stops its heartbeat at once, and a good observation on a
+/// ready one beats it. A failed observation on a replica that is still ready
+/// keeps it (row 76): inside the budget the last good observation still
+/// stands, so dropping the heartbeat would send PUTs to `DirectFallback` for a
+/// one-tick blip, and beating it would claim an observation nobody took.
+fn heartbeat_action(observed: bool, ready: bool) -> HeartbeatAction {
+    match (observed, ready) {
+        (_, false) => HeartbeatAction::Stop,
+        (true, true) => HeartbeatAction::Beat,
+        (false, true) => HeartbeatAction::Keep,
+    }
+}
+
+fn apply_heartbeat(handle: &FragmentWriteBehindHandle, action: HeartbeatAction) {
+    match action {
+        HeartbeatAction::Beat => handle.note_drain_heartbeat(),
+        HeartbeatAction::Keep => {}
+        HeartbeatAction::Stop => handle.note_worker_stopped(),
+    }
+}
+
 struct StopGuard(
     Arc<FragmentWriteBehindHandle>,
     Arc<FragmentWriteBehindReadiness>,
@@ -860,31 +906,33 @@ pub(crate) fn configure_fragment_write_behind(
                         .state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    record_capacity_observation(&mut state, observation, Instant::now())
+                    record_capacity_observation(
+                        &mut state,
+                        observation,
+                        Instant::now(),
+                        settings.stale_after,
+                    )
                 };
                 if let Some((available, detail)) = transition {
                     log_capacity_transition(available, &detail);
                 }
-                if observer_readiness.snapshot().ready {
-                    handle.note_drain_heartbeat();
-                } else {
-                    handle.note_worker_stopped();
-                }
+                apply_heartbeat(
+                    &handle,
+                    heartbeat_action(true, observer_readiness.snapshot().ready),
+                );
             } else {
                 {
                     let mut state = observer_readiness
                         .state
                         .lock()
                         .unwrap_or_else(|error| error.into_inner());
-                    record_observation(&mut state, None, Instant::now());
+                    record_observation(&mut state, None, Instant::now(), settings.stale_after);
                 }
                 handle.note_observation_unknown();
-                // Inside the budget the last good observation still stands, so the
-                // drain heartbeat is left to age out over the same `stale_after`
-                // rather than dropped at once.
-                if !observer_readiness.snapshot().ready {
-                    handle.note_worker_stopped();
-                }
+                apply_heartbeat(
+                    &handle,
+                    heartbeat_action(false, observer_readiness.snapshot().ready),
+                );
             }
             let snapshot = observer_readiness.snapshot();
             instruments().ready.record(
@@ -960,6 +1008,16 @@ mod tests {
 
     fn degraded(state: &State) -> Option<&'static str> {
         degraded_reason(state, Duration::from_secs(15))
+    }
+
+    /// `super::record_observation` at the 5 s budget `reason()` reads with.
+    /// Shadows the glob import for every test in this module.
+    fn record_observation(
+        state: &mut State,
+        observation: Option<WriteBehindObservation>,
+        at: Instant,
+    ) {
+        super::record_observation(state, observation, at, Duration::from_secs(5));
     }
 
     #[test]
@@ -1382,6 +1440,80 @@ mod tests {
         }
         assert_eq!(state.progress, Some(old));
         assert_eq!(reason(&state), Some("drain_not_progressing"));
+    }
+
+    /// A drain that never progresses after `start`, observed by a replica whose
+    /// `observe()` fails 4 ticks of every 5 (1 s ticks, the 5 s budget).
+    fn flapping_drain(cycles: u64) -> State {
+        let now = Instant::now();
+        let start = now - Duration::from_secs(5 * cycles);
+        let mut state = healthy_state(now);
+        record_observation(&mut state, Some(pending_observation(3)), start);
+        state.progress = Some(start);
+        for cycle in 0..cycles {
+            let base = start + Duration::from_secs(5 * cycle);
+            for second in 1..=4 {
+                record_observation(&mut state, None, base + Duration::from_secs(second));
+            }
+            record_observation(
+                &mut state,
+                Some(pending_observation(3)),
+                base + Duration::from_secs(5),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn a_wedged_drain_behind_flapping_observations_ages_out_at_stale_after_squared_over_interval() {
+        // Each 5 s cycle credits 4 s of blind time, so the clock ages 1 s per
+        // cycle: stale_after / interval cycles of stale_after each.
+        assert_eq!(
+            reason(&flapping_drain(4)),
+            None,
+            "20 s after the wedge the drain clock reads only 4 s old"
+        );
+        assert_eq!(
+            reason(&flapping_drain(5)),
+            Some("drain_not_progressing"),
+            "it ages out at 25 s = 5 s * 5 s / 1 s"
+        );
+    }
+
+    #[test]
+    fn a_failed_observation_keeps_the_drain_heartbeat_until_the_replica_is_unready() {
+        // Row 76: the observer used to stop the heartbeat on any failed
+        // observation, which sent PUTs to direct fallback for a one-tick blip.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        record_observation(
+            &mut state,
+            Some(healthy_observation()),
+            now - Duration::from_secs(1),
+        );
+        record_observation(&mut state, None, now);
+        assert_eq!(
+            heartbeat_action(false, reason(&state).is_none()),
+            HeartbeatAction::Keep,
+            "inside the budget a failure neither beats nor stops the heartbeat"
+        );
+
+        let mut state = healthy_state(now);
+        record_observation(
+            &mut state,
+            Some(healthy_observation()),
+            now - Duration::from_secs(6),
+        );
+        for seconds in (0..=5).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
+        assert_eq!(
+            heartbeat_action(false, reason(&state).is_none()),
+            HeartbeatAction::Stop,
+            "a failure run past the budget stops it"
+        );
+        assert_eq!(heartbeat_action(true, true), HeartbeatAction::Beat);
+        assert_eq!(heartbeat_action(true, false), HeartbeatAction::Stop);
     }
 
     #[test]
@@ -2012,7 +2144,12 @@ mod tests {
                 },
                 ..capacity_observation(available)
             };
-            transitions.push(record_capacity_observation(&mut state, observation, now));
+            transitions.push(record_capacity_observation(
+                &mut state,
+                observation,
+                now,
+                Duration::from_secs(5),
+            ));
         }
         let flips: Vec<(usize, bool, Vec<&'static str>)> = transitions
             .into_iter()
@@ -2141,70 +2278,86 @@ mod tests {
     }
 
     #[test]
-    fn a_none_sample_clears_the_run_so_a_fresh_budget_must_elapse_before_capacity_unavailable_reappears()
-     {
-        // Revised rule (independent review, post-dating the test this
-        // replaces): a missing observation CLEARS `capacity_unavailable_since`
-        // rather than leaving it anchored. Keeping the run across a gap meant
-        // the first sample after recovery arrived with its budget already
-        // spent -- a cell-wide `observe()` blip hits every replica
-        // identically, so the very next ordinary transient disagreement
-        // produced an instant all-replica ejection. `observation_unknown`
-        // still answers 503 once the gap outlives the budget (row 76), so nothing is unguarded.
+    fn a_full_stage_behind_intermittent_observe_failures_still_reports_capacity_unavailable() {
+        // Review of row 76's fix: a failed observation used to CLEAR the run.
+        // Once failures stopped answering 503 at once, a stage that never had
+        // room stayed ready for as long as `observe()` failed at least once per
+        // budget, because each failure restarted it.
         let now = Instant::now();
-        // Already well past the 5s budget by the time the gap closes below --
-        // if this age survived the gap, `capacity_unavailable` would reappear
-        // the instant the gap closes instead of needing a fresh budget.
-        let start_of_run = now - Duration::from_secs(20);
         let mut state = healthy_state(now);
-
-        record_observation(&mut state, Some(capacity_observation(false)), start_of_run);
-        // Refresh the observation itself (without disturbing the anchored
-        // run) so the sanity check below is not masked by
-        // `observation_unknown` -- same two-call pattern as
-        // `capacity_unavailable_since_records_the_start_of_the_run_not_the_latest_false_sample`.
-        record_observation(
-            &mut state,
-            Some(capacity_observation(false)),
-            now - Duration::from_secs(1),
+        for seconds in (0..=6u64).rev() {
+            let at = now - Duration::from_secs(seconds);
+            let observation = (seconds % 2 == 0).then(|| capacity_observation(false));
+            record_observation(&mut state, observation, at);
+        }
+        assert_eq!(
+            state.capacity_unavailable_since,
+            Some(now - Duration::from_secs(6)),
+            "a short failure run keeps the run's start"
         );
-        assert_eq!(state.capacity_unavailable_since, Some(start_of_run));
         assert_eq!(
             reason(&state),
             Some("capacity_unavailable"),
-            "sanity: this run is already old enough to report, before the gap"
+            "6 s without room is past the 5 s budget, whatever failed in between"
         );
+    }
 
-        // A gap: the observer could not take an observation this tick.
-        record_observation(&mut state, None, now);
-        assert!(
-            state.observation.is_some(),
-            "a missing observation keeps the last good one until it is stale"
+    #[test]
+    fn a_failure_run_of_stale_after_or_longer_restarts_the_capacity_run() {
+        // A failure run that long has already answered `observation_unknown`.
+        // Keeping the run across it would meet the first sample after recovery
+        // with the budget spent. One database stall reaches every replica, so
+        // the next ordinary transient disagreement would eject every replica.
+        let now = Instant::now();
+        let start_of_run = now - Duration::from_secs(20);
+        let mut state = healthy_state(now);
+        record_observation(&mut state, Some(capacity_observation(false)), start_of_run);
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            now - Duration::from_secs(6),
         );
+        for seconds in (1..=5u64).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
         assert_eq!(
-            state.capacity_unavailable_since, None,
-            "a missing observation clears the run, it does not just mask it"
+            state.capacity_unavailable_since,
+            Some(start_of_run),
+            "failures alone never clear the run"
         );
-        assert_eq!(
-            reason(&state),
-            None,
-            "inside the budget, a failed observation is neither unknown nor unavailable"
-        );
+        assert_eq!(reason(&state), Some("observation_unknown"));
 
-        // The gap closes with a fresh false sample. This starts a NEW run;
-        // it must not resume the pre-gap one.
         record_observation(&mut state, Some(capacity_observation(false)), now);
         assert_eq!(
             state.capacity_unavailable_since,
             Some(now),
-            "the run restarts from this sample, not from the pre-gap start_of_run"
+            "after a 5 s failure run the run restarts from this sample"
         );
+        assert_eq!(reason(&state), None, "a fresh budget must elapse first");
+    }
+
+    #[test]
+    fn a_failure_run_shorter_than_stale_after_keeps_the_capacity_run() {
+        let now = Instant::now();
+        let start_of_run = now - Duration::from_secs(20);
+        let mut state = healthy_state(now);
+        record_observation(&mut state, Some(capacity_observation(false)), start_of_run);
+        record_observation(
+            &mut state,
+            Some(capacity_observation(false)),
+            now - Duration::from_secs(4),
+        );
+        for seconds in (1..=3u64).rev() {
+            record_observation(&mut state, None, now - Duration::from_secs(seconds));
+        }
         assert_eq!(
             reason(&state),
-            None,
-            "a fresh budget must elapse before capacity_unavailable reappears -- \
-             the pre-gap age must not carry over the gap and fire immediately"
+            Some("capacity_unavailable"),
+            "inside the budget the last good observation stands, and it had no room"
         );
+        record_observation(&mut state, Some(capacity_observation(false)), now);
+        assert_eq!(state.capacity_unavailable_since, Some(start_of_run));
+        assert_eq!(reason(&state), Some("capacity_unavailable"));
     }
 
     #[test]
