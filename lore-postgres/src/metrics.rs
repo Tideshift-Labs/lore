@@ -103,6 +103,17 @@ pub(crate) fn record_stage_io_refusal(labels: &[KeyValue]) {
         .add(1, labels);
 }
 
+/// Count one write-behind fragment PUT answered `SlowDown`, labelled
+/// `reason=<label>` with the refusal site. Separates a staging I/O slot refusal
+/// from a fenced head, a lost commit or a transient database failure, which all
+/// reach the client as the same retryable status.
+pub(crate) fn record_staged_put_refusal(reason: &'static str) {
+    static REFUSALS: OnceLock<Counter<u64>> = OnceLock::new();
+    REFUSALS
+        .get_or_init(|| PostgresStoreInstrumentProvider.counter("staged_put_refusals"))
+        .add(1, &[KeyValue::new("reason", reason)]);
+}
+
 /// CR-032 relay instruments (WP-119 Step A).
 ///
 /// Deliberately **unlabelled**. CR-032 prohibits repository, event, actor, and

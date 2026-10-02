@@ -1597,8 +1597,12 @@ impl PostgresImmutableStore {
             // to a direct write there would mask inaccessible acknowledged data
             // behind apparently healthy writes, which is the worst failure this
             // design can produce, so it refuses too.
-            Some((_, StagingMode::Refuse | StagingMode::Unready)) => {
-                return Err(StoreError::from(SlowDown));
+            Some((_, mode @ (StagingMode::Refuse | StagingMode::Unready))) => {
+                return Err(staged_put_refusal(if mode == StagingMode::Refuse {
+                    "mode_refuse"
+                } else {
+                    "mode_unready"
+                }));
             }
             // D11's fallback, and the no-staging-tier cell: the existing
             // synchronous path, unchanged. It neither loses a write nor
@@ -1773,7 +1777,9 @@ impl PostgresImmutableStore {
         Self::validate_put_candidate(address, fragment, &payload, "staged")?;
         // Before `begin_stage`: a capacity refusal after it would leave a live
         // preparation that fences every retry of this hash until it expires.
-        let permit = stage.reserve_io().map_err(|error| error.store_error())?;
+        let permit = stage
+            .reserve_io()
+            .map_err(|error| counted_refusal(error.store_error(), "io_capacity"))?;
         let begin = coordinator
             .begin_stage(
                 address.hash.data(),
@@ -1783,7 +1789,7 @@ impl PostgresImmutableStore {
                 },
             )
             .await
-            .map_err(domain_store_err)?;
+            .map_err(|error| counted_refusal(domain_store_err(error), "coordinator"))?;
         let intent = match begin {
             BeginOutcome::AlreadyReadable(witness) => return Ok(*witness),
             // Retryable backpressure, not an error, on both arms. `Fenced`
@@ -1791,8 +1797,9 @@ impl PostgresImmutableStore {
             // write-claim barrier in its UNION form, `WriteClaimBlocked` can
             // now also mean an unresolved claim at the same legacy hash key,
             // which is likewise a condition a later attempt clears.
-            BeginOutcome::Fenced(_) | BeginOutcome::WriteClaimBlocked { .. } => {
-                return Err(StoreError::from(SlowDown));
+            BeginOutcome::Fenced(_) => return Err(staged_put_refusal("fenced")),
+            BeginOutcome::WriteClaimBlocked { .. } => {
+                return Err(staged_put_refusal("write_claim_blocked"));
             }
             BeginOutcome::Admitted(intent) => intent,
         };
@@ -1842,12 +1849,12 @@ impl PostgresImmutableStore {
             // is withdrawn instead; after it, it is left for the prepare
             // deadline and fenced cleanup.
             withdraw_preparation(coordinator, &attempt, &intent).await;
-            return Err(error.store_error());
+            return Err(counted_refusal(error.store_error(), "stage_io"));
         }
         match coordinator
             .commit_staged(&intent, IoObservation::Valid(manifest.clone()))
             .await
-            .map_err(domain_store_err)?
+            .map_err(|error| counted_refusal(domain_store_err(error), "coordinator"))?
         {
             CommitVerdict::Published => {}
             // The staged file stays on disk and stays valid. It is not
@@ -1855,7 +1862,7 @@ impl PostgresImmutableStore {
             // and a file whose commit lost a race is indistinguishable from one
             // whose commit is still in flight on another replica.
             CommitVerdict::Fenced | CommitVerdict::Abandoned => {
-                return Err(StoreError::from(SlowDown));
+                return Err(staged_put_refusal("commit_lost"));
             }
         }
         let witness = coordinator
@@ -1864,12 +1871,12 @@ impl PostgresImmutableStore {
                 EpochAuthority::Staged,
             )
             .await
-            .map_err(domain_store_err)?
-            .ok_or_else(|| StoreError::from(SlowDown))?;
+            .map_err(|error| counted_refusal(domain_store_err(error), "coordinator"))?
+            .ok_or_else(|| staged_put_refusal("witness"))?;
         if witness.epoch != intent.epoch
             || witness.manifest_id.as_ref() != Some(&manifest.manifest_id)
         {
-            return Err(StoreError::from(SlowDown));
+            return Err(staged_put_refusal("witness"));
         }
         Ok(witness)
     }
@@ -2354,6 +2361,20 @@ impl PostgresImmutableStore {
 fn metadata_store_err(stage: &'static str, error: StoreError) -> StoreError {
     if matches!(&error, StoreError::SlowDown(_)) {
         tracing::warn!(stage, "Fragment metadata store admission refused");
+    }
+    error
+}
+
+/// A write-behind PUT refusal: `SlowDown`, counted under `reason`.
+fn staged_put_refusal(reason: &'static str) -> StoreError {
+    crate::metrics::record_staged_put_refusal(reason);
+    StoreError::from(SlowDown)
+}
+
+/// Count `error` under `reason` when it is a `SlowDown`, and return it as is.
+fn counted_refusal(error: StoreError, reason: &'static str) -> StoreError {
+    if error.is_slow_down() {
+        crate::metrics::record_staged_put_refusal(reason);
     }
     error
 }
