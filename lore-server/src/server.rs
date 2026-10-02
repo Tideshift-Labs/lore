@@ -2739,8 +2739,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let shutdown_rx = _shutdown_rx.clone();
             let drain_state = drain_state.clone();
 
+            // The main store only fills the slot. Verify is the one operation
+            // that reads it, and it refuses anything but a local store (row 72).
             let local_immutable_store = local_store().unwrap_or_else(|| {
-                warn!("No local store available for gRPC server, operations requiring local store will route to the main store");
+                warn!("No local store available for gRPC server, Verify will be refused unless the main store is local");
                 immutable_store.clone()
             });
 
@@ -2859,8 +2861,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             /// being processed in parallel per connection
             const DEFAULT_PROCESS_LIMIT: usize = 500;
 
+            // As for the gRPC server: only Verify reads this slot, and it
+            // refuses anything but a local store (row 72).
             let local_immutable_store = local_store().unwrap_or_else(|| {
-                warn!("No local store available for public QUIC server, operations requiring local store will route to the main store");
+                warn!("No local store available for public QUIC server, Verify will be refused unless the main store is local");
                 immutable_store.clone()
             });
 

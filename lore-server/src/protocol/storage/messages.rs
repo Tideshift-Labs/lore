@@ -93,6 +93,11 @@ pub enum MessageHandleError {
     HandlerTimeout,
     #[error("Session Limit Reached")]
     SessionLimitReached,
+    /// A local-only operation on a server with no local store. Answering it from
+    /// the main store would turn a local-cache operation into durable-store
+    /// traffic, so it is refused and named (row 72).
+    #[error("{0} is not supported: this server has no local store")]
+    LocalStoreUnavailable(&'static str),
 }
 
 impl From<StoreError> for MessageHandleError {

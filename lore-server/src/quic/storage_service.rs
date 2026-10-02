@@ -372,6 +372,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::InvalidFragment => "InvalidFragment",
         MessageHandleError::HandlerTimeout => "HandlerTimeout",
         MessageHandleError::SessionLimitReached => "SessionLimitReached",
+        MessageHandleError::LocalStoreUnavailable(_) => "LocalStoreUnavailable",
     }
 }
 
@@ -394,6 +395,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::HashFailed
         | MessageHandleError::InvalidFragment
         | MessageHandleError::SessionLimitReached
+        | MessageHandleError::LocalStoreUnavailable(_)
         | MessageHandleError::OutcomeUnknown => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError

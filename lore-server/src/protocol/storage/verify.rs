@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::any::Any;
 use std::fmt;
@@ -74,12 +75,14 @@ pub async fn handle_verify(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            // A server with no local store passes its main store here. Verify
+            // reads the local pack files, so anything else is refused, named.
             let concrete_local_store: Arc<LocalImmutableStore> =
                 {
                     let any_store: Arc<dyn Any + Send + Sync> = local_store;
                     any_store
                         .downcast::<LocalImmutableStore>()
-                        .map_err(|_err| MessageHandleError::StoreFailure)?
+                        .map_err(|_err| MessageHandleError::LocalStoreUnavailable("Verify"))?
                 };
 
             match concrete_local_store
@@ -260,6 +263,47 @@ mod tests {
                 }
             })
             .await;
+    }
+
+    /// Row 72. The public QUIC services (urc/0.2 and v4) reach Verify through
+    /// this handler. Given the main store in the local store's place, it is
+    /// refused as not supported, not reported as an internal store failure.
+    #[tokio::test]
+    async fn test_handle_refuses_a_non_local_store() {
+        use crate::quic::storage_service::is_internal_error;
+        use crate::quic::storage_service::message_handle_error_to_label;
+        use crate::store::grpc_replica::GrpcReplica;
+        use crate::store::grpc_replica::ReplicationClient;
+
+        let non_local: Arc<dyn ImmutableStore> =
+            Arc::new(GrpcReplica::new(ReplicationClient::default()));
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(random::<RepositoryId>());
+        let message = Verify {
+            address: Address {
+                hash: random(),
+                context: random(),
+            },
+            heal: 1,
+        };
+
+        let execution = setup_test_execution();
+        let error = LORE_CONTEXT
+            .scope(execution, message.handle(context_map, non_local))
+            .await
+            .expect_err("a non-local store cannot verify");
+        assert_eq!(
+            message_handle_error_to_label(&error),
+            "LocalStoreUnavailable"
+        );
+        assert!(
+            error.to_string().contains("Verify") && error.to_string().contains("no local store"),
+            "{error}"
+        );
+        assert!(
+            !is_internal_error(&error),
+            "a refusal is configuration, not a fault"
+        );
     }
 
     #[tokio::test]

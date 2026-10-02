@@ -184,6 +184,10 @@ pub fn map_message_handle_error_to_status(
             Code::Unavailable,
             message.unwrap_or_else(|| "Session limit reached".into()),
         ),
+        MessageHandleError::LocalStoreUnavailable(_) => (
+            Code::Unimplemented,
+            message.unwrap_or_else(|| error.to_string()),
+        ),
     };
 
     let mut status = Status::with_details(code, message, details.unwrap_or_default());
