@@ -18,6 +18,7 @@ use crate::spool::SpoolLayout;
 use crate::spool::SpoolPaths;
 use crate::spool::SpoolRecoveryDecision;
 use crate::spool::VerifiedFileObservation;
+use crate::spool_writer::SpoolOsError;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum SpoolVerificationError {
@@ -34,11 +35,22 @@ pub enum SpoolVerificationError {
     #[error("expected spool body size is invalid")]
     InvalidExpectedSize,
     #[error("shared spool observation is unavailable")]
-    ObservationUnavailable,
+    ObservationUnavailable { os: SpoolOsError },
     #[error("shared spool file size is invalid")]
     InvalidFileSize,
     #[error("shared spool file changed during observation")]
     FileChanged,
+}
+
+impl SpoolVerificationError {
+    /// The operating-system error behind an
+    /// [`SpoolVerificationError::ObservationUnavailable`], if this is one.
+    pub fn os_error(&self) -> Option<SpoolOsError> {
+        match self {
+            Self::ObservationUnavailable { os } => Some(*os),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -59,6 +71,7 @@ mod platform {
 
     use super::LedgerSpoolView;
     use super::SpoolLayout;
+    use super::SpoolOsError;
     use super::SpoolPaths;
     use super::SpoolRecoveryDecision;
     use super::SpoolVerificationError;
@@ -248,10 +261,9 @@ mod platform {
                 Err(Errno::LOOP | Errno::XDEV | Errno::NOTDIR) => {
                     return Ok(OpenedArtifact::Unsafe);
                 }
-                Err(_) => return Err(SpoolVerificationError::ObservationUnavailable),
+                Err(errno) => return Err(unavailable(errno)),
             };
-            let initial = rustix::fs::fstat(&fd)
-                .map_err(|_err| SpoolVerificationError::ObservationUnavailable)?;
+            let initial = rustix::fs::fstat(&fd).map_err(unavailable)?;
             if initial.st_dev != self.root_device
                 || !FileType::from_raw_mode(initial.st_mode).is_file()
             {
@@ -290,10 +302,11 @@ mod platform {
             let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
             let mut observed_size = 0_u64;
             loop {
-                let read = opened
-                    .file
-                    .read(&mut buffer)
-                    .map_err(|_err| SpoolVerificationError::ObservationUnavailable)?;
+                let read = opened.file.read(&mut buffer).map_err(|error| {
+                    SpoolVerificationError::ObservationUnavailable {
+                        os: SpoolOsError::from_io(&error),
+                    }
+                })?;
                 if read == 0 {
                     break;
                 }
@@ -317,8 +330,7 @@ mod platform {
             opened: OpenedRegular,
             relative_path: &Path,
         ) -> Result<(), SpoolVerificationError> {
-            let after_read = rustix::fs::fstat(&opened.file)
-                .map_err(|_err| SpoolVerificationError::ObservationUnavailable)?;
+            let after_read = rustix::fs::fstat(&opened.file).map_err(unavailable)?;
             let reopened = match self.open_artifact(relative_path)? {
                 OpenedArtifact::Regular(reopened) => reopened,
                 OpenedArtifact::Absent | OpenedArtifact::Unsafe => {
@@ -358,6 +370,12 @@ mod platform {
     struct OpenedRegular {
         file: File,
         initial: Stat,
+    }
+
+    fn unavailable(errno: Errno) -> SpoolVerificationError {
+        SpoolVerificationError::ObservationUnavailable {
+            os: SpoolOsError::from_errno(errno),
+        }
     }
 
     fn file_size(stat: &Stat) -> Result<u64, SpoolVerificationError> {

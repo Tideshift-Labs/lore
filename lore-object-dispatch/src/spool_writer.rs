@@ -96,7 +96,65 @@ pub enum SpoolWriteError {
     #[error("shared spool path resolves to an unsafe or non-regular entry")]
     UnsafeOrNonRegular,
     #[error("shared spool write failed at {operation}")]
-    Io { operation: &'static str },
+    Io {
+        operation: &'static str,
+        os: SpoolOsError,
+    },
+}
+
+impl SpoolWriteError {
+    /// The operating-system error behind an [`SpoolWriteError::Io`], if this is one.
+    pub fn os_error(&self) -> Option<SpoolOsError> {
+        match self {
+            Self::Io { os, .. } => Some(*os),
+            _ => None,
+        }
+    }
+}
+
+/// The operating-system error behind a spool I/O failure, small enough to keep
+/// [`SpoolWriteError`] and `SpoolVerificationError` `Copy` and `Eq`.
+///
+/// The variants carrying it used to drop the `std::io::Error` or `Errno` they
+/// were mapped from, leaving an operator "write failed at part fsync" and no
+/// errno. `std::io::Error` is neither `Copy` nor `Eq`; its kind and raw code
+/// are, and they are what a diagnosis needs. The carrying variants' `Display`
+/// text is unchanged, so a caller that logs the failure appends this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpoolOsError {
+    kind: std::io::ErrorKind,
+    raw_os_error: Option<i32>,
+}
+
+impl SpoolOsError {
+    pub fn from_io(error: &std::io::Error) -> Self {
+        Self {
+            kind: error.kind(),
+            raw_os_error: error.raw_os_error(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_errno(errno: rustix::io::Errno) -> Self {
+        Self::from_io(&std::io::Error::from_raw_os_error(errno.raw_os_error()))
+    }
+
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+
+    pub fn raw_os_error(&self) -> Option<i32> {
+        self.raw_os_error
+    }
+}
+
+impl fmt::Display for SpoolOsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.raw_os_error {
+            Some(code) => write!(formatter, "{} (os error {code})", self.kind),
+            None => write!(formatter, "{}", self.kind),
+        }
+    }
 }
 
 /// What one durable spool placement produced.
@@ -184,6 +242,7 @@ mod platform {
     use super::SpoolInventoryStep;
     use super::SpoolLayout;
     use super::SpoolObjectKey;
+    use super::SpoolOsError;
     use super::SpoolPhysicalInventory;
     use super::SpoolWriteError;
     use super::SpoolWriteReceipt;
@@ -200,7 +259,27 @@ mod platform {
     /// attempt recreates it.
     const DIRECTORY_REMOVED: SpoolWriteError = SpoolWriteError::Io {
         operation: "placement directory removed",
+        os: SpoolOsError {
+            kind: std::io::ErrorKind::NotFound,
+            raw_os_error: Some(Errno::NOENT.raw_os_error()),
+        },
     };
+
+    impl SpoolWriteError {
+        fn errno(operation: &'static str, errno: Errno) -> Self {
+            Self::Io {
+                operation,
+                os: SpoolOsError::from_errno(errno),
+            }
+        }
+
+        fn std_io(operation: &'static str, error: &std::io::Error) -> Self {
+            Self::Io {
+                operation,
+                os: SpoolOsError::from_io(error),
+            }
+        }
+    }
 
     const ROOT_RESOLVE: ResolveFlags = ResolveFlags::NO_MAGICLINKS
         .union(ResolveFlags::NO_SYMLINKS)
@@ -438,22 +517,18 @@ mod platform {
             (&mut file)
                 .take(self.maximum_body_bytes + 1)
                 .read_to_end(&mut found)
-                .map_err(|_error| SpoolWriteError::Io {
-                    operation: "reconcile read",
-                })?;
+                .map_err(|error| SpoolWriteError::std_io("reconcile read", &error))?;
             if found != body {
                 return Err(SpoolWriteError::InvalidBodySize);
             }
-            file.sync_all().map_err(|_error| SpoolWriteError::Io {
-                operation: "reconcile fsync",
-            })?;
+            file.sync_all()
+                .map_err(|error| SpoolWriteError::std_io("reconcile fsync", &error))?;
             let parent = relative
                 .parent()
                 .ok_or(SpoolWriteError::PathBindingMismatch)?;
             let directory = self.ensure_directory_chain(parent)?;
-            rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
-                operation: "reconcile directory fsync",
-            })?;
+            rustix::fs::fsync(&directory)
+                .map_err(|errno| SpoolWriteError::errno("reconcile directory fsync", errno))?;
             self.assert_configured_root_stable()?;
             Ok(SpoolWriteReceipt {
                 opaque_handle: paths.opaque_handle().to_owned(),
@@ -498,8 +573,8 @@ mod platform {
                     Err(Errno::NOENT) => {
                         // Absence is durable only after the nearest surviving
                         // parent is synced, including a peer's uncommitted unlink.
-                        rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
-                            operation: "purge missing directory fsync",
+                        rustix::fs::fsync(&directory).map_err(|errno| {
+                            SpoolWriteError::errno("purge missing directory fsync", errno)
                         })?;
                         self.assert_configured_root_stable()?;
                         return Ok(false);
@@ -515,16 +590,11 @@ mod platform {
                 match rustix::fs::unlinkat(&directory, name, rustix::fs::AtFlags::empty()) {
                     Ok(()) => removed = true,
                     Err(Errno::NOENT) => {}
-                    Err(_) => {
-                        return Err(SpoolWriteError::Io {
-                            operation: "purge unlink",
-                        });
-                    }
+                    Err(errno) => return Err(SpoolWriteError::errno("purge unlink", errno)),
                 }
             }
-            rustix::fs::fsync(&directory).map_err(|_error| SpoolWriteError::Io {
-                operation: "purge directory fsync",
-            })?;
+            rustix::fs::fsync(&directory)
+                .map_err(|errno| SpoolWriteError::errno("purge directory fsync", errno))?;
             remove_empty_parents(&chain);
             self.assert_configured_root_stable()?;
             Ok(removed)
@@ -709,11 +779,7 @@ mod platform {
                 Err(Errno::LOOP | Errno::XDEV | Errno::NOTDIR) => {
                     return Err(SpoolWriteError::UnsafeOrNonRegular);
                 }
-                Err(_) => {
-                    return Err(SpoolWriteError::Io {
-                        operation: "blob probe",
-                    });
-                }
+                Err(errno) => return Err(SpoolWriteError::errno("blob probe", errno)),
             }
 
             // Step 2. `O_EXCL`: an attempt identity is used once, so an existing
@@ -734,36 +800,26 @@ mod platform {
                 Err(Errno::LOOP | Errno::XDEV | Errno::NOTDIR) => {
                     return Err(SpoolWriteError::UnsafeOrNonRegular);
                 }
-                Err(_) => {
-                    return Err(SpoolWriteError::Io {
-                        operation: "part create",
-                    });
-                }
+                Err(errno) => return Err(SpoolWriteError::errno("part create", errno)),
             };
             let mut part = File::from(part_fd);
-            part.write_all(body).map_err(|_err| SpoolWriteError::Io {
-                operation: "part write",
-            })?;
+            part.write_all(body)
+                .map_err(|error| SpoolWriteError::std_io("part write", &error))?;
             // Step 3. Contents and metadata, because the rename publishes both.
-            part.sync_all().map_err(|_err| SpoolWriteError::Io {
-                operation: "part fsync",
-            })?;
+            part.sync_all()
+                .map_err(|error| SpoolWriteError::std_io("part fsync", &error))?;
             drop(part);
 
             // Step 4. Both sides are one component in the leaf descriptor, so
             // the rename cannot leave it and is atomic within the one filesystem
             // `NO_XDEV` has already held every open to. The leaf holds the part
             // file now, so no purge can remove it.
-            rustix::fs::renameat(directory_fd, part_name, directory_fd, blob_name).map_err(
-                |_err| SpoolWriteError::Io {
-                    operation: "part rename",
-                },
-            )?;
+            rustix::fs::renameat(directory_fd, part_name, directory_fd, blob_name)
+                .map_err(|errno| SpoolWriteError::errno("part rename", errno))?;
 
             // Step 5.
-            rustix::fs::fsync(directory_fd).map_err(|_err| SpoolWriteError::Io {
-                operation: "leaf directory fsync",
-            })
+            rustix::fs::fsync(directory_fd)
+                .map_err(|errno| SpoolWriteError::errno("leaf directory fsync", errno))
         }
 
         /// Create every level of `relative` below the root, fsyncing each
@@ -778,9 +834,7 @@ mod platform {
             let mut parent = self
                 .root_fd
                 .try_clone()
-                .map_err(|_err| SpoolWriteError::Io {
-                    operation: "root descriptor clone",
-                })?;
+                .map_err(|error| SpoolWriteError::std_io("root descriptor clone", &error))?;
             for component in relative.components() {
                 let Component::Normal(name) = component else {
                     return Err(SpoolWriteError::PathBindingMismatch);
@@ -792,11 +846,7 @@ mod platform {
                     Ok(()) | Err(Errno::EXIST) => {}
                     // The parent opened on the previous level has been purged.
                     Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
-                    Err(_) => {
-                        return Err(SpoolWriteError::Io {
-                            operation: "fanout create",
-                        });
-                    }
+                    Err(errno) => return Err(SpoolWriteError::errno("fanout create", errno)),
                 }
                 let child = match rustix::fs::openat2(
                     &parent,
@@ -811,18 +861,12 @@ mod platform {
                     }
                     // Created or found by the mkdirat above, then purged.
                     Err(Errno::NOENT) => return Err(DIRECTORY_REMOVED),
-                    Err(_) => {
-                        return Err(SpoolWriteError::Io {
-                            operation: "fanout open",
-                        });
-                    }
+                    Err(errno) => return Err(SpoolWriteError::errno("fanout open", errno)),
                 };
-                rustix::fs::fsync(&parent).map_err(|_err| SpoolWriteError::Io {
-                    operation: "fanout parent fsync",
-                })?;
-                let stat = rustix::fs::fstat(&child).map_err(|_err| SpoolWriteError::Io {
-                    operation: "fanout stat",
-                })?;
+                rustix::fs::fsync(&parent)
+                    .map_err(|errno| SpoolWriteError::errno("fanout parent fsync", errno))?;
+                let stat = rustix::fs::fstat(&child)
+                    .map_err(|errno| SpoolWriteError::errno("fanout stat", errno))?;
                 if stat.st_dev != self.root_device {
                     return Err(SpoolWriteError::UnsafeOrNonRegular);
                 }
@@ -1022,14 +1066,38 @@ mod platform {
 
 pub use platform::ExportedLinuxSpoolWriter as LinuxSpoolWriter;
 
+#[cfg(test)]
+mod os_error_tests {
+    use super::SpoolOsError;
+
+    #[test]
+    fn an_os_error_keeps_its_kind_and_code() {
+        let source = std::io::Error::from_raw_os_error(2);
+        let os = SpoolOsError::from_io(&source);
+        assert_eq!(os.kind(), source.kind());
+        assert_eq!(os.raw_os_error(), Some(2));
+        assert_eq!(os.to_string(), format!("{} (os error 2)", source.kind()));
+    }
+
+    #[test]
+    fn an_error_without_a_code_reports_only_its_kind() {
+        let os = SpoolOsError::from_io(&std::io::Error::other("synthetic"));
+        assert_eq!(os.raw_os_error(), None);
+        assert_eq!(os.to_string(), std::io::ErrorKind::Other.to_string());
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod purge_tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use rustix::io::Errno;
+
     use super::LinuxSpoolWriter;
     use super::MAX_SPOOL_BODY_BYTES;
+    use super::SpoolWriteError;
     use crate::spool::SpoolLayout;
     use crate::spool::SpoolObjectKey;
     use crate::spool::SpoolObjectKind;
@@ -1162,6 +1230,68 @@ mod purge_tests {
         result.expect("the write redoes step 1 and places the body");
         assert_eq!(attempts.get(), 2, "the first attempt's leaf was removed");
         assert_eq!(fs::read(paths.final_path()).unwrap(), b"body");
+    }
+
+    /// A failed syscall keeps its OS error for the operator, while the
+    /// `Display` text stays what it was. A directory where the body belongs
+    /// makes the purge's `unlinkat` fail with `EISDIR`, even as root.
+    #[test]
+    fn a_failed_unlink_keeps_its_os_error() {
+        let root = test_root("unlink-errno");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let key = key(1, 1);
+        let paths = layout.derive_paths(&key).unwrap();
+        fs::create_dir_all(paths.final_path()).unwrap();
+
+        let error = writer
+            .purge_put_body(&layout, &key)
+            .expect_err("unlinking a directory must fail");
+
+        assert!(matches!(
+            error,
+            SpoolWriteError::Io {
+                operation: "purge unlink",
+                ..
+            }
+        ));
+        let os = error.os_error().expect("the OS error is kept");
+        assert_eq!(os.kind(), std::io::ErrorKind::IsADirectory);
+        assert_eq!(os.raw_os_error(), Some(Errno::ISDIR.raw_os_error()));
+        assert_eq!(
+            error.to_string(),
+            "shared spool write failed at purge unlink"
+        );
+        assert_eq!(
+            os.to_string(),
+            format!("is a directory (os error {})", Errno::ISDIR.raw_os_error())
+        );
+    }
+
+    /// The retried placement failure keeps its `ENOENT` once retries run out.
+    #[test]
+    fn a_placement_directory_removed_on_every_attempt_reports_enoent() {
+        let root = test_root("removed-every-attempt");
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        let key = key(1, 1);
+        let paths = layout.derive_paths(&key).unwrap();
+        let request = paths.final_path().parent().unwrap().to_path_buf();
+        super::platform::before_place::install(move || fs::remove_dir(&request).unwrap());
+        let result = writer.write_put_body(&layout, &key, b"body");
+        super::platform::before_place::clear();
+
+        let error = result.expect_err("every attempt lost its leaf");
+        assert!(matches!(
+            error,
+            SpoolWriteError::Io {
+                operation: "placement directory removed",
+                ..
+            }
+        ));
+        let os = error.os_error().expect("the OS error is kept");
+        assert_eq!(os.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(os.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
     }
 
     /// Smoke only: a purger racing a writer in the same directory. The window is

@@ -96,7 +96,7 @@ impl FragmentDrainReservation {
             }
             result => result,
         }
-        .map_err(|_error| FragmentProviderError::DrainSpoolIo)?;
+        .map_err(spool_io("drain spool body write failed"))?;
         Ok(FragmentDrainWriteReceipt(receipt))
     }
 
@@ -105,6 +105,22 @@ impl FragmentDrainReservation {
             revision: self.descriptor.allocation_revision.clone(),
             fence: self.descriptor.allocation_fence,
         }
+    }
+}
+
+/// Map a spool filesystem failure onto the seam's closed error, logging what that error cannot
+/// carry: which operation failed and the OS error behind it.
+fn spool_io(context: &'static str) -> impl FnOnce(SpoolWriteError) -> FragmentProviderError {
+    move |error| {
+        log_spool_failure(context, error);
+        FragmentProviderError::DrainSpoolIo
+    }
+}
+
+fn log_spool_failure(context: &'static str, error: SpoolWriteError) {
+    match error.os_error() {
+        Some(os) => lore_base::lore_warn!("{context}: {error}: {os}"),
+        None => lore_base::lore_warn!("{context}: {error}"),
     }
 }
 
@@ -213,7 +229,10 @@ fn record_spool_step(
 ) {
     match step {
         Ok(step) => bound.record_step(before, step.started, step.completed),
-        Err(_) => bound.record_failure(),
+        Err(error) => {
+            log_spool_failure("drain spool physical walk step failed", error);
+            bound.record_failure();
+        }
     }
 }
 
@@ -414,7 +433,7 @@ impl FragmentDrainMaintenanceHandle {
             *pending = Some(lore_base::lore_spawn_blocking!(move || {
                 let removed = intent
                     .unlink_with_writer(&layout, &writer)
-                    .map_err(|_error| FragmentProviderError::DrainSpoolIo)?;
+                    .map_err(spool_io("drain spool cleanup unlink failed"))?;
                 Ok((intent, removed))
             }));
             let result = match pending.as_mut() {
@@ -514,7 +533,7 @@ impl FragmentProviderEntry {
             ))
             .await
             .map_err(|_error| FragmentProviderError::DrainSpoolIo)?
-            .map_err(|_error| FragmentProviderError::DrainSpoolIo)?,
+            .map_err(spool_io("drain spool writer open failed"))?,
         );
         let maintenance = FragmentDrainMaintenanceHandle {
             client,
