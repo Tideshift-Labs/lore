@@ -641,8 +641,10 @@ const RECONCILING_PREDICATES: [&str; 4] = [
 /// Most promotions one drain pass runs at once, whatever the configuration.
 pub const MAX_DRAIN_CONCURRENCY: usize = 8;
 
-/// The default concurrency is the smaller of this and the shared domain pool.
-const DEFAULT_DRAIN_CONCURRENCY: usize = 4;
+/// The default is one promotion at a time. Parallel promotions drained the
+/// spool faster but added foreground commit/push latency on the shared domain
+/// pool (row 77), so they are opt-in through `[write_behind] worker_concurrency`.
+pub const DEFAULT_DRAIN_CONCURRENCY: usize = 1;
 
 /// The keyset cursor and the per-hash retry cooldown. Locked only for short
 /// bookkeeping, never across a promotion (row 77).
@@ -763,9 +765,6 @@ impl PostgresImmutableStore {
             .await
             .map_err(provider_store_err)?;
         let scanner = Arc::new(std::sync::Mutex::new(StageFileScanner::default()));
-        let drain_concurrency = coordinator
-            .shared_pool_size()
-            .clamp(1, DEFAULT_DRAIN_CONCURRENCY);
         Ok(Arc::new(FragmentWriteBehindHandle {
             coordinator: coordinator.clone(),
             observer,
@@ -784,7 +783,7 @@ impl PostgresImmutableStore {
             slots: (0..MAX_DRAIN_CONCURRENCY)
                 .map(|_| Arc::new(Mutex::new(DrainSlot::default())))
                 .collect(),
-            drain_concurrency: std::sync::atomic::AtomicUsize::new(drain_concurrency),
+            drain_concurrency: std::sync::atomic::AtomicUsize::new(DEFAULT_DRAIN_CONCURRENCY),
             cleanup: Mutex::new(CleanupState {
                 cursor: None,
                 scanner,
@@ -1038,8 +1037,8 @@ impl FragmentWriteBehindHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Override the default drain concurrency, which is the smaller of 4 and
-    /// the shared domain pool. Clamped to `1..=MAX_DRAIN_CONCURRENCY`.
+    /// Override the default drain concurrency
+    /// ([`DEFAULT_DRAIN_CONCURRENCY`]). Clamped to `1..=MAX_DRAIN_CONCURRENCY`.
     pub fn set_drain_concurrency(&self, concurrency: usize) {
         self.drain_concurrency.store(
             concurrency.clamp(1, MAX_DRAIN_CONCURRENCY),

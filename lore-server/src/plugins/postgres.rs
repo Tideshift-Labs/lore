@@ -382,8 +382,8 @@ pub struct WriteBehindConfig {
     pub policy_digest: Option<String>,
     pub worker_interval_millis: Option<u64>,
     pub worker_batch: Option<u32>,
-    /// How many promotions one drain pass runs at once. Optional; defaults to
-    /// the smaller of 4 and the shared domain pool.
+    /// How many promotions one drain pass runs at once, 1 to 8. Optional;
+    /// defaults to 1.
     pub worker_concurrency: Option<usize>,
     pub observer_interval_millis: Option<u64>,
     pub cleanup_interval_millis: Option<u64>,

@@ -327,11 +327,6 @@ impl PostgresFragmentCoordinator {
         self
     }
 
-    /// The most connections this coordinator's pool opens.
-    pub(crate) fn shared_pool_size(&self) -> usize {
-        self.pool.status().max_size
-    }
-
     /// A clone that runs every method on one connection, checked out now and
     /// returned to the pool when the clone is dropped.
     ///
