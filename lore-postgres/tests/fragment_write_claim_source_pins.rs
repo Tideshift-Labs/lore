@@ -661,6 +661,76 @@ fn direct_put_claim_is_authorized_immediately_before_the_bounded_send() {
     assert!(issue.contains("authorized.send_budget(),"));
 }
 
+fn write_behind_source() -> String {
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/store/fragment_write_behind.rs"
+    ))
+    .expect("write-behind source")
+}
+
+/// Row 79: the promotion path's sibling of the direct-PUT pin above. No domain
+/// connection is held across the promotion's spool or provider I/O:
+/// `begin_promotion`, `authorize_write_claim` and `commit_promotion` each take
+/// their own short checkout (`86abc85e`, replacing row 77's held connection).
+/// The spool reserve, write and ready steps make no domain call, and nothing
+/// between authorization and the provider send may take a database resource.
+#[test]
+fn promotion_holds_no_domain_connection_across_spool_or_provider_io() {
+    let source = write_behind_source();
+    assert!(
+        !source.contains("holding_connection"),
+        "a held domain connection would sit idle across the spool I/O"
+    );
+    let promote = function(&source, "async fn promote(");
+    assert_order(
+        promote,
+        &[
+            ".begin_promotion(&verified.source, input)",
+            "self.send_promotion(&intent, &verified, slot)",
+            ".commit_promotion(",
+        ],
+    );
+
+    let send = function(&source, "async fn send_promotion(");
+    assert_order(
+        send,
+        &[
+            ".reserve_spool(&mut plan)",
+            ".write_body(&bytes)",
+            ".mark_spool_ready(&reservation, &receipt)",
+            ".authorize_write_claim(claim)",
+            ".attempt_drain(&mut ledger, request, &ready, &body.bytes)",
+        ],
+    );
+    let authorize = send
+        .find(".authorize_write_claim(claim)")
+        .expect("authorize");
+    let spool = &send[..authorize];
+    let coordinator_call = spool
+        .rfind("self\n            .coordinator")
+        .expect("authorize receiver");
+    assert!(
+        !spool[..coordinator_call].contains("coordinator"),
+        "the spool reserve, write and ready steps must make no domain call"
+    );
+    let authorized = authorize + ".authorize_write_claim(claim)".len();
+    let attempt = send
+        .find(".attempt_drain(&mut ledger, request, &ready, &body.bytes)")
+        .expect("provider send");
+    for forbidden in [
+        "checkout()",
+        ".transaction()",
+        "lock_fragment_head",
+        "coordinator",
+    ] {
+        assert!(
+            !send[authorized..attempt].contains(forbidden),
+            "database resource crossed the promotion's provider send boundary through {forbidden}"
+        );
+    }
+}
+
 #[test]
 fn every_coordinated_direct_put_claims_before_provider_io_while_get_stays_unmetered() {
     let source = immutable_store_source();
