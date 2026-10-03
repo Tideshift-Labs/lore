@@ -440,7 +440,7 @@ impl OperatorContext {
         }
     }
 
-    async fn client(&self) -> Result<lore_postgres::pool::Client> {
+    async fn client(&self) -> Result<lore_postgres::pool::PooledClient> {
         self.pool
             .get()
             .await

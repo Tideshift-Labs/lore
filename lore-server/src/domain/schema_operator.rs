@@ -85,10 +85,10 @@ pub async fn run(command: &SchemaCommand, settings: &Settings) -> Result<()> {
                 .get()
                 .await
                 .map_err(|error| anyhow!("Failed to check out an operator connection: {error}"))?;
-            // The pooled client reaches `tokio_postgres::Client` through two
+            // The pooled client reaches `tokio_postgres::Client` through three
             // `Deref` hops, and a generic `GenericClient` bound will not walk
             // them; this crate does not name `tokio_postgres` outside tests.
-            let client = &**client;
+            let client = &***client;
             if *dry_run {
                 let pending = list_not_valid_constraints(client)
                     .await

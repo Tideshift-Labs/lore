@@ -10,6 +10,7 @@ mod error;
 mod metrics;
 pub mod observe;
 mod pool_acquire;
+mod pool_checkout_site;
 pub mod timer;
 
 pub mod drop_record;
@@ -28,6 +29,7 @@ use opentelemetry::metrics::Gauge;
 use opentelemetry::metrics::Histogram;
 use opentelemetry::metrics::Meter;
 pub use pool_acquire::*;
+pub use pool_checkout_site::*;
 use smallvec::SmallVec;
 pub use timer::*;
 

@@ -173,7 +173,7 @@ async fn run_case(v0: bool, refusal: u8) {
     );
     let pool = lore_postgres::pool::build_pool(&fixture.url, 1, &Default::default()).unwrap();
     let authority = pool.get().await.unwrap();
-    lore_postgres::domain::outbox::stamp_cutover(&**authority, "wp118-single-rpc")
+    lore_postgres::domain::outbox::stamp_cutover(&***authority, "wp118-single-rpc")
         .await
         .unwrap();
     let pg: tokio_postgres::Config = fixture.url.parse().unwrap();

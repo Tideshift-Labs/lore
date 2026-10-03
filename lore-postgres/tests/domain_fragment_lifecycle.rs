@@ -4775,7 +4775,10 @@ async fn an_absent_fragment_schema_routes_legacy_but_a_partial_one_is_refused() 
 /// one -- a real push transaction supplies it, so a test does too.
 async fn own_transaction_client(url: &str) -> deadpool_postgres::Client {
     let pool = build_pool(url, 4, &TlsConfig::default()).expect("build push-witness pool");
-    pool.get().await.expect("checkout push-witness connection")
+    pool.get()
+        .await
+        .expect("checkout push-witness connection")
+        .into_inner()
 }
 
 /// P1-2 item 1a: `revalidate_push_witness`'s `Unchanged` verdict, reached when

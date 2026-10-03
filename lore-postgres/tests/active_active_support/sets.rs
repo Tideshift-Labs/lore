@@ -102,9 +102,13 @@ impl CoordinatorSet {
 
     /// Check out one of this set's pooled connections.
     pub async fn checkout(&self) -> deadpool_postgres::Client {
-        self.pool.get().await.unwrap_or_else(|error| {
-            panic!("set {}: checkout pooled connection: {error}", self.label)
-        })
+        self.pool
+            .get()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("set {}: checkout pooled connection: {error}", self.label)
+            })
+            .into_inner()
     }
 
     /// A raw connection owned by this set, for the module functions bound on

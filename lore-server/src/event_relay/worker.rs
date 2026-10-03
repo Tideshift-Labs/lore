@@ -287,7 +287,7 @@ impl EventRelayWorker {
                 return;
             }
         };
-        match relay::backlog(&**client).await {
+        match relay::backlog(&***client).await {
             // A failed probe records nothing, so the previous observation ages
             // out and the facet fails closed. Recording a fabricated healthy
             // observation here would be the one way to make the readiness
@@ -525,7 +525,7 @@ impl EventRelayWorker {
             }
         };
         let outcome = relay::renew_claim(
-            &**client,
+            &***client,
             claimed.event.event_id,
             claimed.claim_generation,
             &self.config.owner,
@@ -623,7 +623,7 @@ impl EventRelayWorker {
             }
         };
 
-        match relay::record_broker_accepted(&**client, event_id, claim_generation, &record).await {
+        match relay::record_broker_accepted(&***client, event_id, claim_generation, &record).await {
             Ok(CasOutcome::Applied) => {
                 metrics::record_cas_outcome(metrics::CAS_ACCEPT, metrics::CAS_APPLIED);
                 RowOutcome::Accepted
@@ -685,7 +685,7 @@ impl EventRelayWorker {
         };
 
         match relay::release_for_retry(
-            &**client,
+            &***client,
             claimed.event.event_id,
             claimed.claim_generation,
             error_class,

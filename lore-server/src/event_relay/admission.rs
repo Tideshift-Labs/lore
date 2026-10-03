@@ -272,7 +272,7 @@ impl OutboxAdmission {
             .get()
             .await
             .map_err(|e| DomainError::Transient(format!("outbox admission pool: {e}")))?;
-        relay::admission_check(&**client, &self.limits).await
+        relay::admission_check(&***client, &self.limits).await
     }
 
     /// Take a fresh verdict and publish it to the cache.

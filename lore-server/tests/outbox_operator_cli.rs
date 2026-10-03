@@ -96,7 +96,10 @@ async fn pg_client(url: &str) -> Client {
 
 async fn deadpool_client(url: &str) -> lore_postgres::pool::Client {
     let pool = build_pool(url, 8, &TlsConfig::default()).expect("build deadpool pool");
-    pool.get().await.expect("checkout deadpool connection")
+    pool.get()
+        .await
+        .expect("checkout deadpool connection")
+        .into_inner()
 }
 
 fn rand_repository_id() -> [u8; 16] {

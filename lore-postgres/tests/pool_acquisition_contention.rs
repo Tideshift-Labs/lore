@@ -277,3 +277,98 @@ async fn pool_acquisition_p95_separates_queue_wait_from_work_under_controlled_co
         "the baseline phase must never queue; it had one connection per caller"
     );
 }
+
+/// WP-115 row 79: each checkout is counted against the source line that took
+/// it, with its own wait and hold, so a contended pool can say *who* contends
+/// it. One connection, three call sites: a long holder, a waiter queued behind
+/// it, and a short holder used three times.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs a real Postgres in LORE_TEST_PG_URL"]
+async fn per_site_checkouts_record_their_own_wait_and_hold() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping the per-site checkout case");
+        return;
+    };
+    let pool = Arc::new(
+        build_pool_named(&url, 1, &TlsConfig::default(), "row79_sites")
+            .expect("building a pool is lazy and must succeed"),
+    );
+    warm(&pool, 1).await;
+    let long_hold = Duration::from_millis(80);
+
+    let long_line = line!() + 1;
+    let long = pool.get().await.expect("long holder checkout");
+    let waiter_pool = Arc::clone(&pool);
+    let waiter_line = line!() + 2;
+    let waiter = lore_base::lore_spawn!(async move {
+        let client = waiter_pool.get().await.expect("waiter checkout");
+        drop(client);
+    });
+    tokio::time::sleep(long_hold).await;
+    drop(long);
+    waiter.await.expect("the waiter task must not panic");
+
+    let short_line = line!() + 2;
+    for _ in 0..3 {
+        let short = pool.get().await.expect("short holder checkout");
+        short
+            .query_one("SELECT 1", &[])
+            .await
+            .expect("a trivial query on the short holder");
+    }
+
+    let sites = pool.checkout_sites();
+    for site in &sites {
+        println!(
+            "ROW79-SITE {} acquired={} holds={} wait_mean_ms={:?} hold_mean_ms={:?} hold_max_ms={:.3}",
+            site.site(),
+            site.acquired(),
+            site.holds(),
+            site.wait_mean_ms(),
+            site.hold_mean_ms(),
+            site.hold_max_ms(),
+        );
+    }
+    let find = |line: u32| {
+        sites
+            .iter()
+            .find(|site| site.site().line() == line)
+            .unwrap_or_else(|| panic!("no site for line {line}: {sites:?}"))
+    };
+    let (long, waiter, short) = (find(long_line), find(waiter_line), find(short_line));
+    assert_eq!(sites.len(), 3, "exactly three call sites took connections");
+    // Most checkouts first: the short holder's loop leads.
+    assert_eq!(sites[0].site().line(), short_line);
+    for (site, count) in [(long, 1), (waiter, 1), (short, 3)] {
+        assert_eq!(
+            (
+                site.acquired(),
+                site.holds(),
+                site.failed(),
+                site.abandoned()
+            ),
+            (count, count, 0, 0),
+            "{site:?}"
+        );
+        assert!(
+            site.site()
+                .file()
+                .ends_with("pool_acquisition_contention.rs")
+        );
+    }
+    let long_hold_ms = long_hold.as_secs_f64() * 1000.0;
+    assert!(
+        long.hold_mean_ms().expect("long hold") >= long_hold_ms,
+        "the long holder held its connection for the whole sleep: {long:?}"
+    );
+    assert!(
+        waiter.wait_mean_ms().expect("waiter wait") >= long_hold_ms * 0.5,
+        "the waiter queued behind the long holder: {waiter:?}"
+    );
+    assert!(
+        short.hold_max_ms() < long_hold_ms,
+        "a short holder's hold is its own, not the long holder's: {short:?}"
+    );
+    // The per-pool tally saw the same five checkouts.
+    assert_eq!(pool.acquire_snapshot().acquired(), 5);
+}

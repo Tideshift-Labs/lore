@@ -270,11 +270,19 @@ impl PostgresDomainStore {
         }
     }
 
-    async fn checkout(&self) -> Result<deadpool_postgres::Client, DomainError> {
-        self.pool()
-            .get()
-            .await
-            .map_err(|e| DomainError::from_pool("domain coordinator pool", e))
+    /// `#[track_caller]`, so the checkout is attributed to the method that
+    /// asked for it (row 79).
+    #[track_caller]
+    fn checkout(
+        &self,
+    ) -> impl std::future::Future<Output = Result<crate::pool::PooledClient, DomainError>> + Send + '_
+    {
+        let checkout = self.pool().get();
+        async move {
+            checkout
+                .await
+                .map_err(|e| DomainError::from_pool("domain coordinator pool", e))
+        }
     }
 }
 

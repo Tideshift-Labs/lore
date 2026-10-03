@@ -81,7 +81,10 @@ async fn pg_client(url: &str) -> Client {
 /// `requeue_unsafe_for_epoch_reset`).
 async fn deadpool_client(url: &str) -> deadpool_postgres::Client {
     let pool = build_pool(url, 4, &TlsConfig::default()).expect("build deadpool pool");
-    pool.get().await.expect("checkout deadpool connection")
+    pool.get()
+        .await
+        .expect("checkout deadpool connection")
+        .into_inner()
 }
 
 fn rand_repository_id() -> [u8; 16] {

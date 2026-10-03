@@ -218,7 +218,7 @@ async fn read_and_check(pool: &Pool) -> Result<OutboxSchemaState, StartupRefusal
         .get()
         .await
         .map_err(|e| StartupRefusal::Probe(format!("relay pool: {e}")))?;
-    let state = relay::schema_state(&**client)
+    let state = relay::schema_state(&***client)
         .await
         .map_err(|e| StartupRefusal::Probe(e.to_string()))?
         .ok_or(StartupRefusal::SchemaStateAbsent)?;

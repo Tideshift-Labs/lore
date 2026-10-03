@@ -212,14 +212,14 @@ pub struct PostgresFragmentCoordinator {
     outbox_cell_id: Option<String>,
     /// The one connection every method of a [`Self::holding_connection`] clone
     /// runs on, or `None` for a coordinator that checks out per method.
-    held: Option<Arc<tokio::sync::Mutex<crate::pool::Client>>>,
+    held: Option<Arc<tokio::sync::Mutex<crate::pool::PooledClient>>>,
 }
 
 /// The connection one coordinator method runs on: its own checkout, or the
 /// connection a [`PostgresFragmentCoordinator::holding_connection`] clone holds.
 enum CoordinatorClient {
-    Pooled(Box<crate::pool::Client>),
-    Held(tokio::sync::OwnedMutexGuard<crate::pool::Client>),
+    Pooled(Box<crate::pool::PooledClient>),
+    Held(tokio::sync::OwnedMutexGuard<crate::pool::PooledClient>),
 }
 
 impl std::ops::Deref for CoordinatorClient {
@@ -246,7 +246,7 @@ impl std::ops::DerefMut for CoordinatorClient {
 impl PostgresFragmentCoordinator {
     /// Check out one connection of this coordinator's pool, for a test that
     /// needs the pool exhausted.
-    pub(crate) async fn checkout_for_test(&self) -> crate::pool::Client {
+    pub(crate) async fn checkout_for_test(&self) -> crate::pool::PooledClient {
         self.pool.get().await.expect("test checkout")
     }
 
@@ -5525,23 +5525,31 @@ impl PostgresFragmentCoordinator {
         Ok(CommitVerdict::Published)
     }
 
-    async fn checkout(&self) -> Result<CoordinatorClient, DomainError> {
-        if let Some(held) = &self.held {
-            return held
-                .clone()
-                .try_lock_owned()
-                .map(CoordinatorClient::Held)
-                .map_err(|_busy| {
-                    DomainError::Internal(
-                        "the held fragment coordinator connection is already in use".to_owned(),
-                    )
-                });
+    /// `#[track_caller]`, with the site taken before the first `.await`, so a
+    /// pooled checkout is attributed to the method that asked for it (row 79).
+    #[track_caller]
+    fn checkout(
+        &self,
+    ) -> impl std::future::Future<Output = Result<CoordinatorClient, DomainError>> + Send + '_ {
+        let site = crate::pool::CheckoutSite::caller();
+        async move {
+            if let Some(held) = &self.held {
+                return held
+                    .clone()
+                    .try_lock_owned()
+                    .map(CoordinatorClient::Held)
+                    .map_err(|_busy| {
+                        DomainError::Internal(
+                            "the held fragment coordinator connection is already in use".to_owned(),
+                        )
+                    });
+            }
+            self.pool
+                .get_at(site)
+                .await
+                .map(|client| CoordinatorClient::Pooled(Box::new(client)))
+                .map_err(|error| DomainError::from_pool("fragment coordinator pool", error))
         }
-        self.pool
-            .get()
-            .await
-            .map(|client| CoordinatorClient::Pooled(Box::new(client)))
-            .map_err(|error| DomainError::from_pool("fragment coordinator pool", error))
     }
 }
 

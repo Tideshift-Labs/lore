@@ -33,8 +33,10 @@
 //! each store can surface `SlowDown` (clients back off and retry) instead of a
 //! hard `internal` error, mirroring how `lore-aws` maps throttling/timeouts.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 /// The pool and pooled-client types this crate's stores and domain APIs take,
 /// re-exported so a consumer crate can name them without declaring its own
@@ -52,9 +54,12 @@ use deadpool_postgres::ManagerConfig;
 pub use deadpool_postgres::PoolError;
 use deadpool_postgres::RecyclingMethod;
 pub use deadpool_postgres::Status;
+pub use lore_telemetry::CheckoutSite;
+pub use lore_telemetry::CheckoutSiteSnapshot;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::PoolAcquireMetrics;
 use lore_telemetry::PoolAcquireSnapshot;
+use lore_telemetry::PoolCheckoutSiteMetrics;
 use rustls::ClientConfig;
 use rustls::DigitallySignedStruct;
 use rustls::RootCertStore;
@@ -162,7 +167,7 @@ async fn ensure_schema_online_inner(pool: &Pool, ddl: &str) -> Result<(), Online
     let mut client = pool.get().await?;
     for statement in statements {
         let step = SchemaStep::parse(&statement)?;
-        if step.complete(&**client).await? {
+        if step.complete(&***client).await? {
             continue;
         }
         let tx = client
@@ -436,6 +441,69 @@ impl InstrumentProvider for PostgresPoolInstrumentProvider {
 pub struct Pool {
     inner: deadpool_postgres::Pool,
     acquire: Arc<PoolAcquireMetrics>,
+    sites: Arc<PoolCheckoutSiteMetrics>,
+}
+
+/// A checked-out connection that records, when it is returned, how long its
+/// [`CheckoutSite`] held it (WP-115 row 79).
+///
+/// It dereferences to [`Client`], so it is used exactly like one: a function
+/// that takes `&Client` or `&mut Client` accepts `&pooled` or `&mut pooled`.
+/// The hold is recorded on drop, and by [`PooledClient::into_inner`] for the
+/// rare caller that needs the bare deadpool client.
+pub struct PooledClient {
+    client: Client,
+    hold: HoldGuard,
+}
+
+struct HoldGuard {
+    sites: Arc<PoolCheckoutSiteMetrics>,
+    site: CheckoutSite,
+    since: Instant,
+}
+
+impl Drop for HoldGuard {
+    fn drop(&mut self) {
+        self.sites.record_hold(self.site, self.since.elapsed());
+    }
+}
+
+impl PooledClient {
+    /// The site that checked this connection out.
+    pub fn site(&self) -> CheckoutSite {
+        self.hold.site
+    }
+
+    /// The bare deadpool client. The hold is recorded as ending now, although
+    /// the connection returns to the pool only when the client drops.
+    pub fn into_inner(self) -> Client {
+        let Self { client, hold } = self;
+        drop(hold);
+        client
+    }
+}
+
+impl std::ops::Deref for PooledClient {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        &self.client
+    }
+}
+
+impl std::ops::DerefMut for PooledClient {
+    fn deref_mut(&mut self) -> &mut Client {
+        &mut self.client
+    }
+}
+
+impl std::fmt::Debug for PooledClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PooledClient")
+            .field("site", &self.hold.site)
+            .finish_non_exhaustive()
+    }
 }
 
 impl std::fmt::Debug for Pool {
@@ -456,8 +524,49 @@ impl Pool {
     /// `operation_duration` records, and **not** the instantaneous queue depth
     /// `pool_waiting` records; a gate stated as a p95 on the wait can be
     /// answered from this and from neither of those.
-    pub async fn get(&self) -> Result<Client, PoolError> {
-        self.acquire.measure(self.inner.get()).await
+    ///
+    /// The checkout is also attributed to the caller's source location
+    /// ([`Pool::checkout_sites`]). A helper that wraps this must itself be
+    /// `#[track_caller]` and call it before its first `.await` (or call
+    /// [`Pool::get_at`] with a site captured that way); otherwise every caller
+    /// of the helper is attributed to the helper's one line.
+    #[track_caller]
+    pub fn get(&self) -> impl Future<Output = Result<PooledClient, PoolError>> + Send + '_ {
+        self.get_at(CheckoutSite::caller())
+    }
+
+    /// [`Pool::get`], attributed to `site`.
+    ///
+    /// The checkout future is boxed. Every coordinator method embeds one, and
+    /// the two measuring layers plus the deadpool checkout pushed several call
+    /// chains over `clippy::large_futures`; one allocation per checkout is
+    /// small beside the database round trip it precedes.
+    pub fn get_at(
+        &self,
+        site: CheckoutSite,
+    ) -> impl Future<Output = Result<PooledClient, PoolError>> + Send + '_ {
+        Box::pin(async move {
+            let client = self
+                .sites
+                .measure(site, self.acquire.measure(self.inner.get()))
+                .await?;
+            Ok(PooledClient {
+                client,
+                hold: HoldGuard {
+                    sites: Arc::clone(&self.sites),
+                    site,
+                    since: Instant::now(),
+                },
+            })
+        })
+    }
+
+    /// Per-site checkout counts, waits and holds, in-process. The same
+    /// measurements leave over OTLP as `pool_checkout_wait_duration` and
+    /// `pool_checkout_hold_duration`, labelled `pool`, `code.filepath` and
+    /// `code.lineno`.
+    pub fn checkout_sites(&self) -> Vec<CheckoutSiteSnapshot> {
+        self.sites.snapshot()
     }
 
     /// Current pool saturation, forwarded unchanged.
@@ -535,6 +644,10 @@ fn named_pool(inner: deadpool_postgres::Pool, name: &'static str) -> Pool {
     Pool {
         inner,
         acquire: Arc::new(PoolAcquireMetrics::new(
+            &PostgresPoolInstrumentProvider,
+            name,
+        )),
+        sites: Arc::new(PoolCheckoutSiteMetrics::new(
             &PostgresPoolInstrumentProvider,
             name,
         )),
@@ -926,5 +1039,54 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A pool whose every checkout fails fast: nothing listens on port 1.
+    fn unreachable_pool() -> super::Pool {
+        super::build_pool_named(
+            "postgres://lore@127.0.0.1:1/none?connect_timeout=2",
+            1,
+            &super::TlsConfig::default(),
+            "row79-test",
+        )
+        .expect("build pool")
+    }
+
+    /// The shape the coordinators' `checkout` helpers use.
+    #[track_caller]
+    fn helper_checkout(
+        pool: &super::Pool,
+    ) -> impl std::future::Future<Output = Result<super::PooledClient, super::PoolError>> + '_ {
+        let site = super::CheckoutSite::caller();
+        async move { pool.get_at(site).await }
+    }
+
+    #[tokio::test]
+    async fn a_checkout_is_attributed_to_the_line_that_asked_for_it() {
+        let pool = unreachable_pool();
+        let direct_line = line!() + 1;
+        assert!(pool.get().await.is_err());
+        let helper_line = line!() + 1;
+        assert!(helper_checkout(&pool).await.is_err());
+        assert!(helper_checkout(&pool).await.is_err());
+
+        let sites = pool.checkout_sites();
+        let lines: Vec<(u32, u64)> = sites
+            .iter()
+            .map(|site| {
+                assert!(site.site().file().ends_with("pool.rs"), "{:?}", site.site());
+                assert_eq!((site.acquired(), site.abandoned()), (0, 0));
+                (site.site().line(), site.failed())
+            })
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines.contains(&(direct_line, 1)), "{lines:?}");
+        assert!(lines.contains(&(helper_line, 1)), "{lines:?}");
+        assert!(
+            !lines.iter().any(|(line, _)| *line < direct_line),
+            "{lines:?}"
+        );
+        // The per-pool tally still sees every checkout.
+        assert_eq!(pool.acquire_snapshot().failed(), 3);
     }
 }

@@ -227,7 +227,7 @@ impl ReceiverStore for PostgresReceiverStore {
     async fn read_membership(&self) -> Result<Option<MembershipSnapshot>, ReceiverStoreError> {
         let client = self.pool.get().await.map_err(pool_error)?;
         lore_postgres::domain::outbox::membership::read_membership_snapshot(
-            &**client,
+            &***client,
             &self.cell_id,
         )
         .await
@@ -258,7 +258,7 @@ impl ReceiverStore for PostgresReceiverStore {
     ) -> Result<MembershipCas, ReceiverStoreError> {
         let client = self.pool.get().await.map_err(pool_error)?;
         lore_postgres::domain::outbox::membership::record_capture(
-            &**client,
+            &***client,
             &self.cell_id,
             receiver_identity,
             membership_generation,
@@ -275,7 +275,7 @@ impl ReceiverStore for PostgresReceiverStore {
     ) -> Result<MembershipCas, ReceiverStoreError> {
         let client = self.pool.get().await.map_err(pool_error)?;
         lore_postgres::domain::outbox::membership::record_baseline(
-            &**client,
+            &***client,
             &self.cell_id,
             receiver_identity,
             membership_generation,
@@ -337,7 +337,7 @@ impl ReceiverStore for PostgresReceiverStore {
     ) -> Result<Option<CheckpointRecord>, ReceiverStoreError> {
         let client = self.pool.get().await.map_err(pool_error)?;
         lore_postgres::domain::outbox::checkpoint::read_checkpoint(
-            &**client,
+            &***client,
             stream_identity,
             stream_epoch,
             receiver_identity,

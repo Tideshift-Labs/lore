@@ -188,12 +188,19 @@ async fn bootstrap_cell(
     stream_epoch: i64,
 ) -> i64 {
     let client = pool.get().await.expect("checkout pool client");
-    membership::ensure_membership_state(&**client, cell_id)
+    membership::ensure_membership_state(&***client, cell_id)
         .await
         .expect("ensure membership state row");
-    match membership::set_current_placement(&**client, cell_id, stream_identity, stream_epoch, 1, 1)
-        .await
-        .expect("set current placement")
+    match membership::set_current_placement(
+        &***client,
+        cell_id,
+        stream_identity,
+        stream_epoch,
+        1,
+        1,
+    )
+    .await
+    .expect("set current placement")
     {
         MembershipCas::Applied {
             membership_version, ..
@@ -297,7 +304,7 @@ async fn the_bootstrap_reaches_readiness_with_a_real_postgres_projection() {
     assert!(member.ready_at.is_some());
 
     let client = pool.get().await.expect("checkout pool client");
-    let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+    let record = checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
         .await
         .expect("read checkpoint")
         .expect("the bootstrap persisted a checkpoint before claiming readiness");
@@ -395,7 +402,7 @@ async fn steady_state_applied_duplicate_stale_and_refetch_persist_the_real_check
     );
 
     let client = pool.get().await.expect("checkout pool client");
-    let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+    let record = checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
         .await
         .expect("read checkpoint")
         .expect("a checkpoint was persisted");
@@ -558,7 +565,7 @@ async fn a_placement_move_observed_at_the_readiness_cas_retires_and_a_fresh_gene
     // compare-and-set to ready.
     let client = pool.get().await.expect("checkout pool client");
     let moved =
-        membership::set_current_placement(&**client, CELL, "DURABLE-sfo3-cell-a-r2", 9, 2, v1)
+        membership::set_current_placement(&***client, CELL, "DURABLE-sfo3-cell-a-r2", 9, 2, v1)
             .await
             .expect("placement moves");
     assert!(matches!(moved, MembershipCas::Applied { .. }));
@@ -741,7 +748,7 @@ async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpoi
     // its frontier checkpointed at 5.
     {
         let client = pool.get().await.expect("checkout pool client");
-        let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+        let record = checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
             .await
             .expect("read checkpoint")
             .expect("the first generation persisted a checkpoint before stopping");
@@ -838,7 +845,7 @@ async fn a_restart_after_readiness_resumes_the_same_generation_past_the_checkpoi
     );
 
     let client = pool.get().await.expect("checkout pool client");
-    let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+    let record = checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
         .await
         .expect("read checkpoint")
         .expect("a checkpoint was persisted");
@@ -970,7 +977,7 @@ async fn a_restart_after_capture_but_before_baseline_resumes_from_the_captured_p
     assert_eq!(captured.start_sequence, 900);
 
     let client = pool.get().await.expect("checkout pool client");
-    let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, gen1)
+    let record = checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, gen1)
         .await
         .expect("read checkpoint")
         .expect("the resumed bootstrap persisted a checkpoint before claiming readiness");
@@ -1047,7 +1054,7 @@ async fn a_captured_generation_whose_placement_moved_is_not_resumed_and_a_fresh_
     // The placement moves before any restart is attempted.
     let client = pool.get().await.expect("checkout pool client");
     let moved =
-        membership::set_current_placement(&**client, CELL, "DURABLE-sfo3-cell-a-r2", 9, 2, v1)
+        membership::set_current_placement(&***client, CELL, "DURABLE-sfo3-cell-a-r2", 9, 2, v1)
             .await
             .expect("placement moves");
     assert!(matches!(moved, MembershipCas::Applied { .. }));
@@ -1204,7 +1211,7 @@ async fn a_persisted_checkpoint_with_a_blocker_is_not_resumed_and_a_fresh_genera
     );
     {
         let client = pool.get().await.expect("checkout pool client");
-        let record = checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+        let record = checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
             .await
             .expect("read checkpoint")
             .expect("a checkpoint with the unresolved gap was persisted");
@@ -1262,7 +1269,7 @@ async fn a_persisted_checkpoint_with_a_blocker_is_not_resumed_and_a_fresh_genera
     // carrying its gap), and generation 2 has its own clean one.
     let client = pool.get().await.expect("checkout pool client");
     let stale_record =
-        checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
+        checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 1)
             .await
             .expect("read checkpoint")
             .expect("generation 1's checkpoint is untouched");
@@ -1272,7 +1279,7 @@ async fn a_persisted_checkpoint_with_a_blocker_is_not_resumed_and_a_fresh_genera
         vec![lore_postgres::domain::outbox::SequenceGap { from: 3, to: 3 }]
     );
     let fresh_record =
-        checkpoint::read_checkpoint(&**client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 2)
+        checkpoint::read_checkpoint(&***client, "DURABLE-sfo3-cell-a", 8, IDENTITY, 2)
             .await
             .expect("read checkpoint")
             .expect("generation 2 persisted its own checkpoint before claiming readiness");
