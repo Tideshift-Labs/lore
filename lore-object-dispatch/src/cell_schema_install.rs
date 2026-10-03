@@ -1984,13 +1984,21 @@ const SCHEMA_LOCK_TRY_SQL: &str = "SELECT pg_catalog.pg_try_advisory_lock($1)";
 
 const SCHEMA_LOCK_RELEASE_SQL: &str = "SELECT pg_catalog.pg_advisory_unlock($1)";
 
-// Every other backend connected to the cell database, whatever its role. Not `pg_stat_activity`:
-// measured on PostgreSQL 16, a role without `pg_read_all_stats` does not see other roles' rows there
-// at all, so a role filter over it counts zero with a replica connected. `numbackends` is visible to
-// every role. It is deliberately broader than the dispatch roles: a replica's store pools connect to
-// this same database, and "every replica stopped" means none of them is connected.
-const ACTIVE_SERVICE_SESSIONS_SQL: &str = "SELECT (numbackends - 1)::bigint
-     FROM pg_catalog.pg_stat_database WHERE datname = pg_catalog.current_database()";
+// Every other session that logged in to the cell database, whatever its role. It is deliberately
+// broader than the dispatch roles: a replica's store pools connect to this same database, and
+// "every replica stopped" means none of them is connected.
+//
+// Not `numbackends` (WP-115 row 78): that counts every backend attached to the database, autovacuum
+// workers included, so a worker that visited the cell mid-upgrade refused it as `ReplicasActive`
+// (the forward-upgrade tier failed one full run in two that way). A role without
+// `pg_read_all_stats` still sees one `pg_stat_activity` row per backend with its `datname`, `pid`
+// and `usesysid`, but `backend_type`, `state` and `query` are NULL for another role's session
+// (measured on PostgreSQL 16.14 and 18.6), so a `backend_type` filter would count a replica as
+// zero. `usesysid` is the visible discriminator: every login session carries one, idle or not, and
+// an autovacuum worker carries none.
+const ACTIVE_SERVICE_SESSIONS_SQL: &str = "SELECT count(*)::bigint FROM pg_catalog.pg_stat_activity
+     WHERE datname = pg_catalog.current_database() AND pid <> pg_catalog.pg_backend_pid()
+       AND usesysid IS NOT NULL";
 
 const REVISION_MARKER_PRESENT_SQL: &str = "SELECT pg_catalog.to_regprocedure(
        'object_store_retention.cell_schema_revision_v1()') IS NOT NULL";
@@ -3248,5 +3256,27 @@ mod revision_marker_tests {
                 revision.label()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod active_session_tests {
+    use super::ACTIVE_SERVICE_SESSIONS_SQL;
+
+    /// Row 78: the replicas-stopped check counts login sessions, not backends. `numbackends`
+    /// counted autovacuum workers; `backend_type` is NULL for another role's session when the
+    /// caller lacks `pg_read_all_stats`, so filtering on it would count a replica as zero.
+    #[test]
+    fn the_session_check_counts_login_sessions_by_a_column_every_role_can_see() {
+        let sql = ACTIVE_SERVICE_SESSIONS_SQL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(sql.contains("FROM pg_catalog.pg_stat_activity"), "{sql}");
+        assert!(sql.contains("usesysid IS NOT NULL"), "{sql}");
+        assert!(sql.contains("pid <> pg_catalog.pg_backend_pid()"), "{sql}");
+        assert!(!sql.contains("numbackends"), "{sql}");
+        assert!(!sql.contains("backend_type"), "{sql}");
+        assert!(!sql.contains("state"), "{sql}");
     }
 }

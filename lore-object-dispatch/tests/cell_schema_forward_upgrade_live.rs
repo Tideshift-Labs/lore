@@ -1145,6 +1145,16 @@ async fn live_upgrade_refuses_unknown_states_future_markers_and_active_replicas(
     );
     drop(_observer);
     drop(_observer_task);
+    // Row 78: the check reads `pg_stat_activity` and skips backends without a login role
+    // (autovacuum). Any login session still counts, a superuser's included, idle or not.
+    wait_until_exclusive(&fresh_migrator).await;
+    let superuser = admin_at(fresh_base_url.clone()).await;
+    assert_eq!(
+        upgrade_cell_schema(&fresh_migrator).await,
+        Err(CellSchemaError::ReplicasActive),
+        "an idle superuser session on the cell database must refuse the offline upgrade too"
+    );
+    drop(superuser);
     // The refused attempt must not have moved the cell: it is still R27, upgradable.
     wait_until_exclusive(&fresh_migrator).await;
     upgrade_cell_schema(&fresh_migrator)

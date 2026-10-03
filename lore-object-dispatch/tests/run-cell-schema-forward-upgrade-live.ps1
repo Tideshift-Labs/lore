@@ -47,7 +47,10 @@ Keeps the container for debugging when the run did not fully pass.
 [CmdletBinding()]
 param(
     [string]$PostgresImage = '',
-    [switch]$KeepOnFailure
+    [switch]$KeepOnFailure,
+    # Run only these cases (exact names), e.g. to repeat one flaky case. The catalog check still
+    # covers every case. Pass several through -Command, not -File (see the lore-postgres skill).
+    [string[]]$OnlyCase = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -241,6 +244,13 @@ function Build-PostgresBlake3Image {
 
 try {
     Assert-CatalogMatchesKnownTests
+    if ($OnlyCase.Count -gt 0) {
+        $unknownCases = @($OnlyCase | Where-Object { $name = $_; -not @($tests | Where-Object { $_.Name -eq $name }) })
+        if ($unknownCases.Count -gt 0) {
+            throw "unknown -OnlyCase value(s): [$($unknownCases -join ',')]"
+        }
+        $tests = @($tests | Where-Object { $OnlyCase -contains $_.Name })
+    }
     Assert-NoCollidingContainer
     Build-PostgresBlake3Image
 
