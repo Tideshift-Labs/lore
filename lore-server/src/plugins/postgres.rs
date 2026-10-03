@@ -1558,21 +1558,41 @@ pub(crate) async fn connect_immutable_store(
 /// whole point is that a domain transaction writes its domain rows and the
 /// affected `lore_mutable` rows in **one** Postgres transaction — which is only
 /// atomic if they are in one database.
+///
+/// `reserve_observer` keeps one of the `domain_pool_max` connections for the
+/// write-behind observer
+/// ([`PostgresDomainStore::connect_reserving_observer`]); the process holds the
+/// same number of domain connections either way. It is refused here, before
+/// any connection opens, when `domain_pool_max` is below 2.
 pub(crate) async fn connect_domain_store(
     config: &toml::Value,
+    reserve_observer: bool,
 ) -> Result<PostgresDomainStore, PluginError> {
     let plugin_name = PLUGIN_NAME;
     let cfg = parse_config(plugin_name, config)?;
+    if reserve_observer {
+        lore_postgres::domain::observer_shared_pool_max(cfg.domain_pool_max).map_err(
+            |message| {
+                PluginError::from(PluginConfigError {
+                    plugin_name: plugin_name.to_string(),
+                    message,
+                })
+            },
+        )?;
+    }
     let tls = build_tls(plugin_name, &cfg)?;
 
-    PostgresDomainStore::connect(&cfg.url, cfg.domain_pool_max, &tls)
-        .await
-        .map_err(|e| {
-            PluginError::from(PluginInitError {
-                plugin_name: plugin_name.to_string(),
-                message: format!("Failed to create Postgres domain store: {e}"),
-            })
+    let connected = if reserve_observer {
+        PostgresDomainStore::connect_reserving_observer(&cfg.url, cfg.domain_pool_max, &tls).await
+    } else {
+        PostgresDomainStore::connect(&cfg.url, cfg.domain_pool_max, &tls).await
+    };
+    connected.map_err(|e| {
+        PluginError::from(PluginInitError {
+            plugin_name: plugin_name.to_string(),
+            message: format!("Failed to create Postgres domain store: {e}"),
         })
+    })
 }
 
 /// Build the concrete Postgres mutable store from the plugin configuration.
@@ -3250,6 +3270,28 @@ staging_root = "/var/lib/loreserver/staging"
             error.contains("stage_io_wait_millis") && error.contains("between 0 and 10000"),
             "got {error}"
         );
+    }
+
+    /// Row 76: write-behind reserves one domain connection for its observer,
+    /// so a `domain_pool_max` below 2 would leave nothing for everything else.
+    /// Refused by name before any connection is attempted (the URL here
+    /// reaches nothing).
+    #[tokio::test]
+    async fn reserving_the_observer_connection_refuses_a_domain_pool_below_two() {
+        for pool_max in [0, 1] {
+            let config: toml::Value = toml::from_str(&format!(
+                "url = \"postgres://unreachable.invalid/lore\"\ndomain_pool_max = {pool_max}"
+            ))
+            .expect("fixture parses");
+            let error = match connect_domain_store(&config, true).await {
+                Ok(_) => panic!("domain_pool_max {pool_max} must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("domain_pool_max") && error.contains("2 or more"),
+                "got {error}"
+            );
+        }
     }
 
     /// The inert-wiring refusal. The staged route is reached only from the

@@ -211,6 +211,15 @@ pub struct PostgresFragmentCoordinator {
     outbox_cell_id: Option<String>,
 }
 
+#[cfg(all(test, unix))]
+impl PostgresFragmentCoordinator {
+    /// Check out one connection of this coordinator's pool, for a test that
+    /// needs the pool exhausted.
+    pub(crate) async fn checkout_for_test(&self) -> crate::pool::Client {
+        self.pool.get().await.expect("test checkout")
+    }
+}
+
 impl PostgresFragmentCoordinator {
     /// Stamp the trusted cell identity on the summary events this coordinator
     /// appends.
@@ -235,6 +244,20 @@ impl PostgresDomainStore {
             database_identity: self.identity().as_marker(),
             outbox_cell_id: None,
         }
+    }
+
+    /// A coordinator on the connection reserved for the write-behind
+    /// observer, or `None` when the store was not built with
+    /// [`PostgresDomainStore::connect_reserving_observer`]. Give it only to
+    /// the observer's reads: anything else that checks out through it takes
+    /// the connection the reservation exists to keep free.
+    pub fn fragment_observer_coordinator(&self) -> Option<PostgresFragmentCoordinator> {
+        self.observer_pool()
+            .map(|pool| PostgresFragmentCoordinator {
+                pool: pool.clone(),
+                database_identity: self.identity().as_marker(),
+                outbox_cell_id: None,
+            })
     }
 }
 

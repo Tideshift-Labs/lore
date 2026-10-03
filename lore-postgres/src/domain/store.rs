@@ -37,6 +37,9 @@ pub struct PostgresDomainStore {
     /// [`assert_same_database`] so a misconfigured cell cannot run its domain
     /// transactions against a different database from its mutable store.
     identity: DatabaseIdentity,
+    /// One connection kept out of `pool` for the write-behind observer's
+    /// database reads. See [`Self::connect_reserving_observer`].
+    observer_pool: Option<Pool>,
 }
 
 /// A value that is equal for two pools if and only if they address the same
@@ -107,7 +110,48 @@ impl PostgresDomainStore {
         pool_max: u32,
         tls: &crate::pool::TlsConfig,
     ) -> Result<Self, String> {
-        let pool = crate::pool::build_pool_named(url, pool_max, tls, "domain")?;
+        Self::connect_with(url, pool_max, tls, false).await
+    }
+
+    /// [`Self::connect`], with one of the `pool_max` connections reserved for
+    /// the write-behind observer ([`Self::fragment_observer_coordinator`]).
+    ///
+    /// Row 76: the observer's policy and ledger reads queued behind PUTs,
+    /// drain, cleanup and staged reads on the shared domain pool. Each missed
+    /// its 1 s budget, and a run of misses answered `observation_unknown` on
+    /// every replica at once. A connection no other caller can take keeps the
+    /// observer answering under any load.
+    ///
+    /// The budget is unchanged: the shared pool opens `pool_max - 1`
+    /// connections and the observer pool opens 1, so the process still holds
+    /// at most `pool_max` domain connections, which is what the six-slot
+    /// process budget (`FragmentProcessPoolInventory`) counts. The cost is one
+    /// connection less for everything else.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a `pool_max` below 2, which would leave the shared pool empty,
+    /// and an observer pool that reaches a different database.
+    pub async fn connect_reserving_observer(
+        url: &str,
+        pool_max: u32,
+        tls: &crate::pool::TlsConfig,
+    ) -> Result<Self, String> {
+        Self::connect_with(url, pool_max, tls, true).await
+    }
+
+    async fn connect_with(
+        url: &str,
+        pool_max: u32,
+        tls: &crate::pool::TlsConfig,
+        reserve_observer: bool,
+    ) -> Result<Self, String> {
+        let shared_max = if reserve_observer {
+            observer_shared_pool_max(pool_max)?
+        } else {
+            pool_max
+        };
+        let pool = crate::pool::build_pool_named(url, shared_max, tls, "domain")?;
         // Skip completed DDL and commit each missing statement before the next
         // one. Replica joins must not retain schema locks across live writes.
         crate::pool::ensure_schema_online(&pool, schema::SCHEMA).await?;
@@ -130,10 +174,23 @@ impl PostgresDomainStore {
             .await
             .map_err(|e| format!("postgres domain store identity: {e}"))?;
 
+        let observer_pool = if reserve_observer {
+            let observer = crate::pool::build_pool_named(url, 1, tls, "domain_observer")?;
+            let observed = read_database_identity(&observer)
+                .await
+                .map_err(|e| format!("postgres domain observer identity: {e}"))?;
+            if observed != identity {
+                return Err("postgres domain observer pool reached a different database".to_owned());
+            }
+            Some(observer)
+        } else {
+            None
+        };
         let store = Self {
             pool,
             instruments: crate::metrics::Instruments::new("domain"),
             identity,
+            observer_pool,
         };
         store
             .ensure_state_rows()
@@ -312,12 +369,29 @@ impl PostgresDomainStore {
         &self.pool
     }
 
+    pub(crate) fn observer_pool(&self) -> Option<&Pool> {
+        self.observer_pool.as_ref()
+    }
+
     /// Shared instruments. One histogram keyed by `{store, operation}`, so the
     /// label set stays low-cardinality: `operation` is a fixed, closed set of
     /// method names, never a repository or branch identity.
     pub(crate) fn instruments(&self) -> &crate::metrics::Instruments {
         &self.instruments
     }
+}
+
+/// The shared domain pool's size when one connection is reserved for the
+/// write-behind observer: `pool_max - 1`, refusing a `pool_max` below 2.
+pub fn observer_shared_pool_max(pool_max: u32) -> Result<u32, String> {
+    if pool_max < 2 {
+        return Err(format!(
+            "domain_pool_max is {pool_max}, but write-behind reserves one domain connection \
+             for its observer and needs at least one more for everything else: set \
+             domain_pool_max to 2 or more"
+        ));
+    }
+    Ok(pool_max - 1)
 }
 
 /// Read one pool's database identity.
@@ -340,4 +414,22 @@ pub async fn read_database_identity(pool: &Pool) -> Result<DatabaseIdentity, Dom
         database_oid: row.get("database_oid"),
         database_name: row.get("database_name"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::observer_shared_pool_max;
+
+    #[test]
+    fn reserving_the_observer_connection_leaves_the_rest_shared_and_refuses_below_two() {
+        assert_eq!(observer_shared_pool_max(2), Ok(1));
+        assert_eq!(observer_shared_pool_max(4), Ok(3));
+        for pool_max in [0, 1] {
+            let error = observer_shared_pool_max(pool_max).expect_err("below 2 is refused");
+            assert!(
+                error.contains("domain_pool_max") && error.contains("2 or more"),
+                "the refusal names the setting and the floor: {error}"
+            );
+        }
+    }
 }

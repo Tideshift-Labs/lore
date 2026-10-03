@@ -2988,6 +2988,10 @@ pub struct ConfiguredDomainContext {
     /// Server composition passes this only to the Postgres immutable store;
     /// other immutable-store modes never receive or construct a provider route.
     pub fragment_coordinator: Option<PostgresFragmentCoordinator>,
+    /// The write-behind observer's coordinator, on the one domain connection
+    /// reserved for it. `Some` exactly when write-behind is enabled. Compose it
+    /// into the write-behind handle and nothing else.
+    pub fragment_observer_coordinator: Option<PostgresFragmentCoordinator>,
     /// Physical identity positively shared by the domain, immutable, mutable,
     /// and lock pools: `PostgreSQL` system identifier plus database OID.
     ///
@@ -3002,6 +3006,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
             context: None,
             mutable_enforcement: None,
             fragment_coordinator: None,
+            fragment_observer_coordinator: None,
             database_identity: None,
         });
     }
@@ -3015,7 +3020,11 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     };
 
     info!("Creating CR-029 domain coordinator via the Postgres plugin configuration");
-    let store = connect_domain_store(&domain_config)
+    // Row 76: an enabled write-behind tier reserves one of the domain pool's
+    // connections for its observer, so its reads never queue behind PUTs,
+    // drain and staged reads.
+    let reserve_observer = crate::server::postgres_write_behind_settings(settings)?.is_some();
+    let store = connect_domain_store(&domain_config, reserve_observer)
         .await
         .map_err(|e| anyhow!("Failed to create the Postgres domain coordinator: {e}"))?;
 
@@ -3103,6 +3112,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     // CR-032 summaries that the governed repository seam stamps on its rows, so
     // it is resolved once, here, and handed to both. Under `live_only` it gets
     // none, which is that coordinator's existing "append nothing" state.
+    let observer_coordinator = store.fragment_observer_coordinator();
     let fragment_coordinator =
         store
             .fragment_coordinator()
@@ -3164,6 +3174,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),
         fragment_coordinator: Some(fragment_coordinator),
+        fragment_observer_coordinator: observer_coordinator,
         database_identity: Some(database_identity),
     })
 }

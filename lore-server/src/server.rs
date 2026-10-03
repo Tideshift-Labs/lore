@@ -1171,6 +1171,7 @@ async fn configure_immutable_store_via_plugin(
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
     fragment_activation: Option<plugins::postgres::FragmentProviderActivation>,
+    write_behind_observer: Option<lore_postgres::domain::fragments::PostgresFragmentCoordinator>,
 ) -> Result<(
     Arc<dyn ImmutableStore>,
     Option<FragmentCellRetentionHandle>,
@@ -1283,6 +1284,11 @@ async fn configure_immutable_store_via_plugin(
                                 config.cell_id,
                                 config.policy_revision,
                                 config.policy_digest,
+                                write_behind_observer.ok_or_else(|| {
+                                    anyhow!(
+                                        "write-behind requires the domain connection reserved for its observer"
+                                    )
+                                })?,
                             )
                             .await
                             .map_err(|error| {
@@ -1310,7 +1316,7 @@ async fn configure_immutable_store_via_plugin(
 /// Reads the same resolved immutable-store configuration as the two scheduler
 /// settings readers above, because the `write_behind` block lives beside
 /// `fragment_provider` and its enablement is decided in the same place.
-fn postgres_write_behind_settings(
+pub(crate) fn postgres_write_behind_settings(
     settings: &Settings,
 ) -> Result<Option<plugins::postgres::WriteBehindComposition>> {
     if settings.immutable_store.mode != "postgres" {
@@ -2442,6 +2448,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     &settings,
                     topology.clone(),
                     Some(fragment_activation),
+                    configured_domain.fragment_observer_coordinator.clone(),
                 )
                 .await?;
             (
@@ -2456,6 +2463,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     &plugin_registry,
                     &settings,
                     topology.clone(),
+                    None,
                     None,
                 )
                 .await?;

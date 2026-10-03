@@ -215,6 +215,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retry',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_put_waits_for_a_staging_slot_freed_inside_its_budget',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observe_answers_with_every_shared_domain_connection_held',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::pre_rename_failure_withdraws_so_an_immediate_retry_is_admitted',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::a_late_writer_of_a_withdrawn_epoch_is_refused',
     'store::immutable_store::fragment_write_behind::adapter_tests::withdraw_tests::post_rename_failure_does_not_withdraw',

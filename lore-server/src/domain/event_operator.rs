@@ -70,7 +70,7 @@ pub async fn initialize(
             .ok_or_else(|| anyhow!("missing Postgres configuration for {store_type}"))?;
         configs.push((store_type, config));
     }
-    let store = connect_domain_store(&configs[0].1)
+    let store = connect_domain_store(&configs[0].1, false)
         .await
         .map_err(|e| anyhow!("{e}"))?;
     for (label, config) in &configs {

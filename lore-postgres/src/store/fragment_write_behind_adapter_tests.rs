@@ -154,10 +154,15 @@ impl Fixture {
         );
         let setup: serde_json::Value = serde_json::from_slice(&setup.stdout).expect("fixture JSON");
         let url = std::env::var("LORE_TEST_PG_URL").expect("fresh disposable PostgreSQL URL");
-        let domain = PostgresDomainStore::connect(&url, 1, &TlsConfig::default())
-            .await
-            .unwrap();
+        // One shared domain connection, as before, plus the observer's own.
+        let domain =
+            PostgresDomainStore::connect_reserving_observer(&url, 2, &TlsConfig::default())
+                .await
+                .unwrap();
         let coordinator = domain.fragment_coordinator();
+        let observer = domain
+            .fragment_observer_coordinator()
+            .expect("a reserving store has an observer coordinator");
         coordinator.bootstrap().await.unwrap();
         let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
             .await
@@ -288,6 +293,7 @@ impl Fixture {
                 "adapter-cell".into(),
                 "adapter-policy-v1".into(),
                 digest,
+                observer,
             )
             .await
             .unwrap();
@@ -479,6 +485,23 @@ async fn adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retr
         .await
         .expect("the retry is admitted at once, not fenced by the refused attempt");
     assert_eq!(retried.state, FragmentLifecycleState::Staged);
+}
+
+/// Row 76: the observer's policy and ledger reads use the domain connection
+/// reserved for it. With every shared domain connection held, `observe()`
+/// still answers; before the reservation it queued behind them and missed its
+/// 1 s budget.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_observe_answers_with_every_shared_domain_connection_held() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    // The fixture's shared domain pool has one connection; hold it.
+    let held = fixture.handle.coordinator.checkout_for_test().await;
+    let observed = tokio::time::timeout(Duration::from_secs(2), fixture.handle.observe())
+        .await
+        .expect("observe() must not wait for the shared domain pool");
+    observed.expect("observe() succeeds on its reserved connection");
+    drop(held);
 }
 
 /// Row 76: a put that finds every staging I/O slot taken waits for one to free

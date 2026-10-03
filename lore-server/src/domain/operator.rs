@@ -447,7 +447,7 @@ impl DomainOperatorContext {
                     )
                 })?;
 
-        let store = connect_domain_store(&plugin_config)
+        let store = connect_domain_store(&plugin_config, false)
             .await
             .map_err(|error| anyhow!("Failed to open the Postgres domain coordinator: {error}"))?;
 

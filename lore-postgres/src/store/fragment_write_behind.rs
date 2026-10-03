@@ -651,6 +651,10 @@ struct DrainState {
 
 pub struct FragmentWriteBehindHandle {
     coordinator: PostgresFragmentCoordinator,
+    /// The observer's own coordinator, on the domain connection reserved for
+    /// it ([`crate::domain::PostgresDomainStore::fragment_observer_coordinator`]).
+    /// Only `observe()`'s policy and ledger reads use it.
+    observer: PostgresFragmentCoordinator,
     provider: Arc<FragmentProviderEntry>,
     stage: Arc<WriteBehindStage>,
     drain: FragmentDrainCapability,
@@ -672,6 +676,7 @@ impl PostgresImmutableStore {
         cell_id: String,
         revision: String,
         digest: [u8; 32],
+        observer: PostgresFragmentCoordinator,
     ) -> Result<Arc<FragmentWriteBehindHandle>, StoreError> {
         let FragmentLifecycleRoute::Coordinated {
             coordinator,
@@ -707,6 +712,7 @@ impl PostgresImmutableStore {
         let scanner = Arc::new(std::sync::Mutex::new(StageFileScanner::default()));
         Ok(Arc::new(FragmentWriteBehindHandle {
             coordinator: coordinator.clone(),
+            observer,
             provider: provider.clone(),
             stage,
             drain,
@@ -895,8 +901,10 @@ impl FragmentWriteBehindHandle {
         self.stage.note_observation_unknown();
         self.observe_step(ObserveStep::PhysicalInventory, self.physical_inventory())
             .await?;
+        // Both database reads go to the reserved observer connection, never the
+        // shared domain pool (row 76).
         self.observe_step(ObserveStep::StagePolicy, async {
-            self.coordinator
+            self.observer
                 .verify_stage_policy(
                     &self.policy.cell_id,
                     &self.policy.revision,
@@ -908,7 +916,7 @@ impl FragmentWriteBehindHandle {
         .await?;
         let observation = self
             .observe_step(ObserveStep::StageLedger, async {
-                self.coordinator
+                self.observer
                     .observe_stage()
                     .await
                     .map_err(domain_store_err)
