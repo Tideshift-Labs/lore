@@ -25,7 +25,7 @@ const SQLSTATE_SERIALIZATION_FAILURE: &str = "40001";
 const SQLSTATE_DEADLOCK_DETECTED: &str = "40P01";
 
 /// Typed failure of a domain-coordinator method.
-#[derive(Debug, thiserror::Error, PartialEq)]
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
 pub enum DomainError {
     /// A caller-supplied value violates a frozen bound before any database work
     /// happens. Never retryable, never a partial write.

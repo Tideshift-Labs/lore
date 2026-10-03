@@ -116,6 +116,9 @@ $inventory = @(
             'write_claim_head_lock_precedes_claim_insert_and_moved_lineage_refuses_send',
             'write_claim_acl_denies_public_and_retains_owner_access',
             'resolver_returns_the_identical_verdict_whether_asked_singly_or_batched',
+            # WP-115 row 79 (INV-FU): the resolve batcher shares checkouts across
+            # concurrent single-hash resolves without changing any caller's verdict.
+            'concurrent_single_hash_resolves_share_checkouts_and_answer_as_they_do_alone',
             'stale_association_rejection_comes_from_repository_tombstone_not_generation_drift',
             'a_positive_read_requires_both_a_live_association_and_a_readable_current_epoch',
             'a_blocked_io_phase_does_not_hold_the_one_connection_pool',

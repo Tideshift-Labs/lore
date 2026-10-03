@@ -59,6 +59,8 @@
 use std::collections::BTreeMap;
 #[path = "creation.rs"]
 mod creation;
+#[path = "resolve_batch.rs"]
+mod resolve_batch;
 #[path = "stage_custody.rs"]
 mod stage_custody;
 use std::collections::BTreeSet;
@@ -213,6 +215,9 @@ pub struct PostgresFragmentCoordinator {
     /// The one connection every method of a [`Self::holding_connection`] clone
     /// runs on, or `None` for a coordinator that checks out per method.
     held: Option<Arc<tokio::sync::Mutex<crate::pool::PooledClient>>>,
+    /// Coalesces concurrent small resolves into one statement (row 79).
+    /// Shared by every clone, so one batch can serve all of them.
+    resolver: Arc<resolve_batch::ResolveBatcher<resolve_batch::PooledResolver>>,
 }
 
 /// The connection one coordinator method runs on: its own checkout, or the
@@ -319,6 +324,24 @@ impl FragmentStageObserver {
 }
 
 impl PostgresFragmentCoordinator {
+    fn on_pool(pool: &Pool, database_identity: String) -> Self {
+        Self {
+            pool: pool.clone(),
+            database_identity,
+            outbox_cell_id: None,
+            held: None,
+            resolver: Arc::new(resolve_batch::ResolveBatcher::new(
+                resolve_batch::PooledResolver::new(pool.clone()),
+            )),
+        }
+    }
+
+    /// Per-site checkout counts, waits and holds of this coordinator's pool
+    /// ([`Pool::checkout_sites`]), for diagnostics and tests.
+    pub fn pool_checkout_sites(&self) -> Vec<crate::pool::CheckoutSiteSnapshot> {
+        self.pool.checkout_sites()
+    }
+
     /// Stamp the trusted cell identity on the summary events this coordinator
     /// appends.
     #[must_use]
@@ -367,12 +390,7 @@ impl PostgresDomainStore {
     /// participate in one lock order, and F-032-3 is only a total order if both
     /// run against one database.
     pub fn fragment_coordinator(&self) -> PostgresFragmentCoordinator {
-        PostgresFragmentCoordinator {
-            pool: self.pool().clone(),
-            database_identity: self.identity().as_marker(),
-            outbox_cell_id: None,
-            held: None,
-        }
+        PostgresFragmentCoordinator::on_pool(self.pool(), self.identity().as_marker())
     }
 
     /// The write-behind observer's reads on the connection reserved for it,
@@ -381,12 +399,7 @@ impl PostgresDomainStore {
     /// [`DomainPoolLayout::Shared`]: crate::domain::DomainPoolLayout::Shared
     pub fn fragment_stage_observer(&self) -> Option<FragmentStageObserver> {
         self.observer_pool().map(|pool| FragmentStageObserver {
-            coordinator: PostgresFragmentCoordinator {
-                pool: pool.clone(),
-                database_identity: self.identity().as_marker(),
-                outbox_cell_id: None,
-                held: None,
-            },
+            coordinator: PostgresFragmentCoordinator::on_pool(pool, self.identity().as_marker()),
         })
     }
 }
@@ -2550,6 +2563,10 @@ impl PostgresFragmentCoordinator {
         Ok(authoritative)
     }
 
+    /// Every resolve runs here. A small call on a pooled coordinator joins the
+    /// resolve batcher, which answers concurrent calls for one repository from
+    /// one statement and one checkout (row 79). A held coordinator and a call
+    /// at the batch bound run alone, exactly as before.
     async fn resolve_scoped(
         &self,
         repository_id: &[u8],
@@ -2558,18 +2575,40 @@ impl PostgresFragmentCoordinator {
         if requested.is_empty() {
             return Ok(Vec::new());
         }
-        let hashes = requested
-            .iter()
-            .map(|request| request.hash.as_slice())
-            .collect::<Vec<_>>();
-        let contexts = requested
-            .iter()
-            .map(|request| request.context.as_slice())
-            .collect::<Vec<_>>();
+        if self.held.is_none() && requested.len() < resolve_batch::MAX_RESOLVE_BATCH_HASHES {
+            return self
+                .resolver
+                .resolve(repository_id, requested.to_vec())
+                .await;
+        }
         let client = self.checkout().await?;
-        let rows = client
-            .query(
-                "WITH requested AS ( \
+        run_resolve_statement(&client, repository_id, requested)
+            .await?
+            .into_iter()
+            .collect()
+    }
+}
+
+/// The resolver statement for `requested`, on `client`: one answer per
+/// request, in request order. A row that fails to decode is an error for its
+/// own request only, so a batch of several callers can isolate it; a caller
+/// asking alone fails on its first such row, as it always has.
+async fn run_resolve_statement(
+    client: &deadpool_postgres::ClientWrapper,
+    repository_id: &[u8],
+    requested: &[FragmentQueryRequest],
+) -> Result<Vec<Result<ScopedFragmentResolution, DomainError>>, DomainError> {
+    let hashes = requested
+        .iter()
+        .map(|request| request.hash.as_slice())
+        .collect::<Vec<_>>();
+    let contexts = requested
+        .iter()
+        .map(|request| request.context.as_slice())
+        .collect::<Vec<_>>();
+    let rows = client
+        .query(
+            "WITH requested AS ( \
                      SELECT request.hash, request.context, request.ordinality \
                        FROM unnest($2::bytea[], $3::bytea[]) WITH ORDINALITY \
                             AS request(hash, context, ordinality) \
@@ -2609,74 +2648,77 @@ impl PostgresFragmentCoordinator {
                            e.manifest_id, e.size_payload, e.size_content, e.decoded_hash, \
                            e.payload_flags \
                   ORDER BY request.ordinality",
-                &[
-                    &repository_id,
-                    &hashes,
-                    &contexts,
-                    &schema::ASSOCIATION_LIVE,
-                    &STATE_LIVE,
-                    &schema::DISPOSITION_CURRENT_ELIGIBLE,
-                    &FragmentLifecycleState::readable_bits().as_slice(),
-                ],
-            )
-            .await
-            .map_err(|error| DomainError::from_pg("fragment resolve", error))?;
+            &[
+                &repository_id,
+                &hashes,
+                &contexts,
+                &schema::ASSOCIATION_LIVE,
+                &STATE_LIVE,
+                &schema::DISPOSITION_CURRENT_ELIGIBLE,
+                &FragmentLifecycleState::readable_bits().as_slice(),
+            ],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg("fragment resolve", error))?;
 
-        let mut readable: BTreeMap<i64, (bool, FragmentVerdict)> = BTreeMap::new();
-        for row in rows {
-            let hash: Vec<u8> = row.get("hash");
-            let state = FragmentLifecycleState::from_bits(row.get("state"))?;
-            let authority = EpochAuthority::from_bits(row.get("authority"))?;
-            let manifest_id: Vec<u8> = row.get("manifest_id");
-            readable.insert(
-                row.get("ordinality"),
-                (
-                    row.get("exact_context_readable"),
-                    FragmentVerdict::Readable {
-                        witness: EpochWitness {
-                            hash,
-                            epoch: row.get("current_epoch"),
-                            state,
-                            manifest_id: Some(manifest_id.clone()),
-                            fence: row.get("last_fence"),
-                        },
-                        manifest: FragmentManifest {
-                            authority,
-                            object_key: row.get("object_key"),
-                            manifest_id,
-                            size_payload: row.get("size_payload"),
-                            size_content: row.get("size_content"),
-                            decoded_hash: row.get("decoded_hash"),
-                            payload_flags: row.get("payload_flags"),
-                        },
-                        association_epoch: row.get("association_epoch"),
-                    },
-                ),
-            );
-        }
-
-        // Answer in the caller's order, with a verdict for every hash asked
-        // about. A missing row is `Absent`, indistinguishable from a fenced or
-        // tombstoned one on purpose.
-        Ok(requested
-            .iter()
-            .enumerate()
-            .map(|(index, request)| {
-                let ordinal = i64::try_from(index + 1).unwrap_or(i64::MAX);
-                let (exact_context_readable, verdict) = readable
-                    .remove(&ordinal)
-                    .unwrap_or((false, FragmentVerdict::Absent));
-                ScopedFragmentResolution {
-                    resolution: FragmentResolution {
-                        hash: request.hash.clone(),
-                        verdict,
-                    },
-                    exact_context_readable,
-                }
-            })
-            .collect())
+    let mut readable: BTreeMap<i64, Result<(bool, FragmentVerdict), DomainError>> = BTreeMap::new();
+    for row in rows {
+        readable.insert(row.get("ordinality"), decode_resolve_row(&row));
     }
 
+    // Answer in the caller's order, with a verdict for every hash asked
+    // about. A missing row is `Absent`, indistinguishable from a fenced or
+    // tombstoned one on purpose.
+    Ok(requested
+        .iter()
+        .enumerate()
+        .map(|(index, request)| {
+            let ordinal = i64::try_from(index + 1).unwrap_or(i64::MAX);
+            let (exact_context_readable, verdict) = readable
+                .remove(&ordinal)
+                .unwrap_or(Ok((false, FragmentVerdict::Absent)))?;
+            Ok(ScopedFragmentResolution {
+                resolution: FragmentResolution {
+                    hash: request.hash.clone(),
+                    verdict,
+                },
+                exact_context_readable,
+            })
+        })
+        .collect())
+}
+
+/// One resolver row as `(exact_context_readable, verdict)`.
+fn decode_resolve_row(row: &tokio_postgres::Row) -> Result<(bool, FragmentVerdict), DomainError> {
+    let hash: Vec<u8> = row.get("hash");
+    let state = FragmentLifecycleState::from_bits(row.get("state"))?;
+    let authority = EpochAuthority::from_bits(row.get("authority"))?;
+    let manifest_id: Vec<u8> = row.get("manifest_id");
+    Ok((
+        row.get("exact_context_readable"),
+        FragmentVerdict::Readable {
+            witness: EpochWitness {
+                hash,
+                epoch: row.get("current_epoch"),
+                state,
+                manifest_id: Some(manifest_id.clone()),
+                fence: row.get("last_fence"),
+            },
+            manifest: FragmentManifest {
+                authority,
+                object_key: row.get("object_key"),
+                manifest_id,
+                size_payload: row.get("size_payload"),
+                size_content: row.get("size_content"),
+                decoded_hash: row.get("decoded_hash"),
+                payload_flags: row.get("payload_flags"),
+            },
+            association_epoch: row.get("association_epoch"),
+        },
+    ))
+}
+
+impl PostgresFragmentCoordinator {
     // -----------------------------------------------------------------------
     // Begin/commit pairs
     // -----------------------------------------------------------------------

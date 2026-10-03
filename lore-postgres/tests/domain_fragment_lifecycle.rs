@@ -3061,6 +3061,132 @@ async fn resolver_returns_the_identical_verdict_whether_asked_singly_or_batched(
     expect_absent(&batched[1]);
 }
 
+/// Row 79 (INV-FU): concurrent single-hash resolves share checkouts. Each one
+/// used to check out its own connection, so N concurrent resolves made N
+/// checkouts. With the resolve batcher they queue while the pool is busy and
+/// the next free connection answers all of them in one statement, and every
+/// caller still gets exactly the verdict it gets when it asks alone.
+///
+/// The one-connection pool is held busy by a resolve blocked on a table lock
+/// taken from a separate connection, so the other resolves are queued when
+/// it frees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn concurrent_single_hash_resolves_share_checkouts_and_answer_as_they_do_alone() {
+    let Some(url) = pg_url() else {
+        panic!("runner must set LORE_TEST_PG_URL")
+    };
+    let store = store_with_pool(&url, 1).await;
+    let coordinator = store.fragment_coordinator();
+    let left = create_repository(&store).await;
+    let right = create_repository(&store).await;
+    let (context, other_context) = (random_context(), random_context());
+
+    let mut published = Vec::new();
+    for (seed, repository) in [(0x71_u8, left), (0x72, right)] {
+        let hash = random_hash();
+        let BeginOutcome::Admitted(intent) = coordinator
+            .begin_direct_write(&hash, &legacy_key(&hash))
+            .await
+            .expect("begin readable")
+        else {
+            panic!("a fresh hash must admit a direct write");
+        };
+        coordinator
+            .commit_remote(
+                &intent,
+                IoObservation::Valid(manifest(
+                    &format!("resolve-batch/{seed:02x}"),
+                    seed,
+                    EpochAuthority::Remote,
+                )),
+            )
+            .await
+            .expect("commit readable");
+        coordinator
+            .create_association(&hash, &repository, &context)
+            .await
+            .expect("associate readable");
+        published.push(hash);
+    }
+    let absent = random_hash();
+    let shapes = [
+        (left, context.clone(), published[0].clone()),
+        (left, other_context.clone(), published[0].clone()),
+        (left, context.clone(), absent.clone()),
+        (left, context.clone(), published[1].clone()),
+        (right, context.clone(), published[1].clone()),
+        (right, other_context.clone(), published[0].clone()),
+    ];
+    let asked = (0..48)
+        .map(|index| shapes[index % shapes.len()].clone())
+        .collect::<Vec<_>>();
+
+    let mut alone = Vec::new();
+    for (repository, context, hash) in &asked {
+        alone.push(
+            coordinator
+                .resolve(repository, context, std::slice::from_ref(hash))
+                .await
+                .expect("resolve alone"),
+        );
+    }
+    let readable = alone
+        .iter()
+        .filter(|answer| matches!(answer[0].verdict, FragmentVerdict::Readable { .. }))
+        .count();
+    assert_eq!(
+        readable, 16,
+        "the fixture must mix readable and absent answers"
+    );
+
+    let checkouts = |coordinator: &PostgresFragmentCoordinator| -> u64 {
+        coordinator
+            .pool_checkout_sites()
+            .iter()
+            .map(|site| site.acquired())
+            .sum()
+    };
+    let mut locker = own_transaction_client(&url).await;
+    let lock = locker.transaction().await.expect("begin lock transaction");
+    lock.batch_execute("LOCK TABLE lore_fragment_lifecycle IN ACCESS EXCLUSIVE MODE")
+        .await
+        .expect("lock the lifecycle table");
+    let before = checkouts(&coordinator);
+    let waiters = asked
+        .iter()
+        .cloned()
+        .map(|(repository, context, hash)| {
+            let coordinator = coordinator.clone();
+            lore_base::lore_spawn!(async move {
+                coordinator
+                    .resolve(&repository, &context, std::slice::from_ref(&hash))
+                    .await
+            })
+        })
+        .collect::<Vec<_>>();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    lock.commit().await.expect("release the lifecycle table");
+
+    for (index, waiter) in waiters.into_iter().enumerate() {
+        let together = waiter
+            .await
+            .expect("join resolve")
+            .expect("concurrent resolve");
+        assert_eq!(
+            together, alone[index],
+            "request {index} must answer as it does alone"
+        );
+    }
+    let made = checkouts(&coordinator) - before;
+    println!("{} concurrent resolves made {made} checkouts", asked.len());
+    assert!(
+        made <= (asked.len() / 4) as u64,
+        "{} concurrent resolves made {made} checkouts; batching must share them",
+        asked.len()
+    );
+}
+
 /// Item 2, corrected against the reviewed contract: `resolve`'s
 /// repository-generation clause is `<=`, not `=` (an ordinary metadata CAS
 /// bumping `lore_domain_repositories.generation` must not fence an existing

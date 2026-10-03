@@ -151,7 +151,7 @@ fn dispatch_dependency_guard_rejects_regular_build_target_and_workspace_aliases(
 /// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 13] = [
+const SCANNED_FILES: [&str; 14] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -159,6 +159,7 @@ const SCANNED_FILES: [&str; 13] = [
     "masks.rs",
     "membership.rs",
     "mod.rs",
+    "resolve_batch.rs",
     "schema.rs",
     "stage_custody.rs",
     "stage_rotation_schema.rs",
@@ -169,7 +170,7 @@ const SCANNED_FILES: [&str; 13] = [
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
-const PACKAGE_FILES: [&str; 14] = [
+const PACKAGE_FILES: [&str; 15] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -178,6 +179,7 @@ const PACKAGE_FILES: [&str; 14] = [
     "membership.rs",
     "mod.rs",
     "provider.rs",
+    "resolve_batch.rs",
     "schema.rs",
     "stage_custody.rs",
     "stage_rotation_schema.rs",
@@ -332,7 +334,7 @@ fn the_scanned_file_list_is_what_the_package_compiles() {
         .collect();
     declared.push("mod.rs".to_string());
     let coordinator_source = strip_line_comments(&read("coordinator.rs"));
-    for sibling in ["creation", "stage_custody"] {
+    for sibling in ["creation", "resolve_batch", "stage_custody"] {
         let declaration = format!("mod {sibling};");
         assert_eq!(
             coordinator_source
@@ -616,7 +618,7 @@ fn the_package_splices_in_no_source_from_outside_itself() {
         let mut source = strip_line_comments(&read(file));
         if file == "coordinator.rs" {
             // This sibling is explicitly included in PACKAGE_FILES and scanned above.
-            for sibling in ["creation.rs", "stage_custody.rs"] {
+            for sibling in ["creation.rs", "resolve_batch.rs", "stage_custody.rs"] {
                 let local_module = format!("#[path = \"{sibling}\"]");
                 assert_eq!(source.matches(&local_module).count(), 1);
                 source = source.replace(&local_module, "");
