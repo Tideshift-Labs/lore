@@ -166,6 +166,13 @@ fn stored_state_shape_and_barrier_index_match_the_closed_typed_vocabulary() {
         include_str!("../migrations/0004_fragment_stage_policy_rotation.sql"),
     ] {
         let compact: String = rotation_schema.split_whitespace().collect();
+        assert!(compact.contains("SETschema_version=6"));
+    }
+    for charge_schema in [
+        include_str!("../src/domain/fragments/stage_charge_schema.rs"),
+        include_str!("../migrations/0009_fragment_stage_charge_counters.sql"),
+    ] {
+        let compact: String = charge_schema.split_whitespace().collect();
         assert!(compact.contains(&format!("SETschema_version={FRAGMENT_SCHEMA_VERSION}")));
     }
 

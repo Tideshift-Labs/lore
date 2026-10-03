@@ -168,6 +168,7 @@ impl PostgresFragmentCoordinator {
                     .query_one(
                         "SELECT count(*) = 1 AND COALESCE(bool_and(singleton \
                      AND live_bytes = 0 AND live_files = 0 \
+                     AND charged_bytes = 0 AND charged_files = 0 \
                      AND metadata_bytes = 0 AND metadata_rows = 0), false) \
                      FROM lore_fragment_stage_usage",
                         &[],

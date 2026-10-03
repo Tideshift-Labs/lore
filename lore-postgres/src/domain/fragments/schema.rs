@@ -28,7 +28,7 @@
 /// Current server-only fragment lifecycle schema revision. Recorded in
 /// `lore_fragment_schema_state.schema_version`; a server whose compiled value is
 /// below the stored value refuses to enable lifecycle routing.
-pub const FRAGMENT_SCHEMA_VERSION: i64 = 6;
+pub const FRAGMENT_SCHEMA_VERSION: i64 = 7;
 
 /// The revision `migrations/0001_init.sql` alone installs.
 ///
@@ -560,6 +560,10 @@ mod tests {
             raised_schema_version(
                 super::super::stage_rotation_schema::STAGE_POLICY_ROTATION_SCHEMA
             ),
+            6
+        );
+        assert_eq!(
+            raised_schema_version(super::super::stage_charge_schema::STAGE_CHARGE_COUNTER_SCHEMA),
             FRAGMENT_SCHEMA_VERSION
         );
     }
@@ -592,10 +596,12 @@ mod tests {
         let raise = format!("SET schema_version = {FRAGMENT_SCHEMA_VERSION}");
         let stage = include_str!("../../../migrations/0003_fragment_stage_custody.sql");
         assert_eq!(raised_schema_version(stage), 5);
-        let follow_on = include_str!("../../../migrations/0004_fragment_stage_policy_rotation.sql");
+        let rotation = include_str!("../../../migrations/0004_fragment_stage_policy_rotation.sql");
+        assert_eq!(raised_schema_version(rotation), 6);
+        let follow_on = include_str!("../../../migrations/0009_fragment_stage_charge_counters.sql");
         assert!(
             raised_schema_version(follow_on) == FRAGMENT_SCHEMA_VERSION,
-            "migrations/0004_fragment_stage_policy_rotation.sql must raise the stored revision \
+            "migrations/0009_fragment_stage_charge_counters.sql must raise the stored revision \
              with `{raise}`; without it an out-of-band-provisioned cell installs the columns and \
              is then refused by the exact-revision gate with no visible cause"
         );

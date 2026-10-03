@@ -1094,7 +1094,7 @@ fn strip_sql_line_comments(source: &str) -> String {
 fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
     assert_eq!(
         CELL_FORWARD_STEPS.len(),
-        4,
+        5,
         "a new forward step must extend this sweep, not bypass it"
     );
     for step in CELL_FORWARD_STEPS {
@@ -1224,10 +1224,11 @@ fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
             (CellSchemaRevision::R26, CellSchemaRevision::R27),
             (CellSchemaRevision::R27, CellSchemaRevision::R28),
             (CellSchemaRevision::R28, CellSchemaRevision::R29),
+            (CellSchemaRevision::R29, CellSchemaRevision::R30),
         ]
     );
     assert_eq!(
-        CELL_FORWARD_STEPS[3].to,
+        CELL_FORWARD_STEPS[4].to,
         lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT
     );
 }

@@ -1600,9 +1600,9 @@ impl PostgresFragmentCoordinator {
         let needs_upgrade = super::upgrade::clean_cell_needs_upgrade(&probe).await?;
         drop(probe);
         if let Some(version) = needs_upgrade
-            && version != super::upgrade::PRE_STAGE_SCHEMA_VERSION
+            && !super::upgrade::UPGRADABLE_SCHEMA_VERSIONS.contains(&version)
         {
-            // CR-039's upgrade accepts only revision 4. Any other lower
+            // CR-039's upgrade accepts only revisions 4 and 6. Any other lower
             // revision on a clean cell is a state no supported path produced.
             return Err(DomainError::NotReady(format!(
                 "this clean-initialized cell's fragment schema is revision {version}, which no \
@@ -1635,6 +1635,14 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(|error| DomainError::Internal(format!("stage rotation bootstrap: {error}")))?;
+        crate::pool::ensure_schema(
+            &self.pool,
+            super::stage_charge_schema::STAGE_CHARGE_COUNTER_SCHEMA,
+        )
+        .await
+        .map_err(|error| {
+            DomainError::Internal(format!("stage charge counter bootstrap: {error}"))
+        })?;
         let client = self.checkout().await?;
         client
             .execute(

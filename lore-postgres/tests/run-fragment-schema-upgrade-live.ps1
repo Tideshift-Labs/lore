@@ -73,6 +73,8 @@ $inventory = @(
             'a_database_identity_mismatch_is_refused_by_name',
             'a_live_lock_holder_refuses_while_another_session_is_connected',
             'bootstrap_on_a_revision_4_clean_cell_returns_the_remedy_and_writes_nothing',
+            'a_revision_6_cell_upgrades_with_its_stage_rows_untouched_and_counters_from_zero',
+            'a_revision_6_catalog_with_one_charge_column_is_refused_as_an_unknown_state',
             'a_fresh_cell_and_an_upgraded_cell_have_an_identical_fragment_catalog',
             'an_idle_connected_session_refuses_the_upgrade_and_leaves_the_cell_at_revision_4',
             'a_v4_catalog_missing_two_known_indexes_is_refused_naming_both',
@@ -91,7 +93,7 @@ $inventory = @(
         )
     }
     # WP-115 ledger row 62: the NOWAIT backstop needs a pause between the backend count and the
-    # table locks, so it compiles only with `failure_generator`. That build also lists the 21
+    # table locks, so it compiles only with `failure_generator`. That build also lists the 23
     # cases above, hence not `Exact`: this entry checks only that its own case exists.
     [pscustomobject]@{
         Package  = 'lore-postgres'

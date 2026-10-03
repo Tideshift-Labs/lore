@@ -1093,14 +1093,18 @@ async fn live_upgrade_refuses_unknown_states_future_markers_and_active_replicas(
         .await
         .expect("real upgrade to current");
     let fixture = admin_at(base_url).await;
-    fixture
-        .client
-        .batch_execute(
+    let marker_sql = |revision: i32| {
+        format!(
             "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
              CREATE OR REPLACE FUNCTION object_store_retention.cell_schema_revision_v1() RETURNS integer
-             LANGUAGE sql IMMUTABLE SET search_path=pg_catalog AS $$ SELECT 30 $$;
-             COMMIT;",
+             LANGUAGE sql IMMUTABLE SET search_path=pg_catalog AS $$ SELECT {revision} $$;
+             COMMIT;"
         )
+    };
+    let current = lore_object_dispatch::drain_policy::CELL_SCHEMA_REVISION;
+    fixture
+        .client
+        .batch_execute(&marker_sql(current + 1))
         .await
         .expect("plant a future marker");
     assert_eq!(
@@ -1113,12 +1117,7 @@ async fn live_upgrade_refuses_unknown_states_future_markers_and_active_replicas(
     );
     fixture
         .client
-        .batch_execute(
-            "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
-             CREATE OR REPLACE FUNCTION object_store_retention.cell_schema_revision_v1() RETURNS integer
-             LANGUAGE sql IMMUTABLE SET search_path=pg_catalog AS $$ SELECT 29 $$;
-             COMMIT;",
-        )
+        .batch_execute(&marker_sql(current))
         .await
         .expect("restore the real marker");
     attest_cell_schema(&migrator)
@@ -4176,5 +4175,139 @@ async fn live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded() {
             .unwrap()
             .is_empty(),
         "an upgraded released row under a live policy is not due"
+    );
+}
+
+// R29 -> R30 (WP-115 row 78): an R30 binary refuses an R29 cell and names the upgrade. The
+// upgrade keeps the R29 row charged and starts the running charge counters at zero. From then on
+// each reservation adds its body size and one file to them, a replayed reservation adds nothing,
+// and a release lowers only the ledger.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database with a real BLAKE3 provider"]
+async fn live_r29_cell_is_refused_then_upgrades_and_counts_every_charge() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R29_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R29)
+        .await
+        .expect("install a real R29 cell");
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R29))
+    );
+    let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
+    install_blake3_provider(&fixture.client).await;
+    let now = now_ms(&fixture.client).await;
+    let allocation = publish_budget(
+        &fixture.client,
+        "r29-boundary",
+        "r29-cell",
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    let policy = drain_policy(
+        "r29-boundary",
+        "r29-cell",
+        "r29-service",
+        "r29-policy-v1",
+        u64::try_from(now + 3_600_000).unwrap(),
+        16_384 * 8,
+        8,
+    );
+    publish_drain_policy(&fixture.client, &policy).await;
+    let client = DrainClient::new(Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    ));
+    assert_eq!(
+        client.verify_schema_revision().await,
+        Err(DrainError::SchemaUpgradeRequired),
+        "an R30 binary must refuse an R29 cell and name the upgrade"
+    );
+    // One live reservation through the R29 procedure itself.
+    let digest = policy.digest().unwrap();
+    let held = synthetic_descriptor(
+        0,
+        &policy,
+        &digest,
+        &allocation,
+        now_ms(&fixture.client).await,
+    );
+    client.reserve(&held).await.expect("R29 reservation");
+    drop(client);
+
+    let base_url = fixture.base_url.clone();
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    let report = upgrade_cell_schema(&migrator)
+        .await
+        .expect("upgrade R29 to R30");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R29)
+    );
+    assert_eq!(report.attestation.schema_revision, CellSchemaRevision::R30);
+
+    let fixture = admin_at(base_url.clone()).await;
+    let client = drain_client(&base_url, identity).await;
+    let observed = client.observe("r29-boundary", "r29-cell").await.unwrap();
+    assert_eq!(
+        (observed.spool_bytes, observed.spool_files),
+        (held.body_size, 1),
+        "the R29 row stays charged"
+    );
+    assert_eq!(
+        (observed.charged_bytes, observed.charged_files),
+        (0, 0),
+        "the counters start at zero"
+    );
+
+    let fresh = synthetic_descriptor(
+        1,
+        &policy,
+        &digest,
+        &allocation,
+        now_ms(&fixture.client).await,
+    );
+    client.reserve(&fresh).await.expect("R30 reservation");
+    let charged = client.observe("r29-boundary", "r29-cell").await.unwrap();
+    assert_eq!(
+        (charged.spool_bytes, charged.spool_files),
+        (held.body_size + fresh.body_size, 2)
+    );
+    assert_eq!(
+        (charged.charged_bytes, charged.charged_files),
+        (fresh.body_size, 1),
+        "a reservation adds exactly what it charged the ledger"
+    );
+    client
+        .reserve(&fresh)
+        .await
+        .expect("a replayed reservation");
+    let replayed = client.observe("r29-boundary", "r29-cell").await.unwrap();
+    assert_eq!(
+        (replayed.charged_bytes, replayed.charged_files),
+        (fresh.body_size, 1),
+        "a replay charges nothing, so it adds nothing"
+    );
+
+    tokio::time::sleep(Duration::from_millis(policy.maximum_ttl_ms + 500)).await;
+    let intent = client
+        .claim_cleanup(held.spool_object_id)
+        .await
+        .expect("claim the R29 row");
+    client.release_cleanup(&intent).await.expect("release it");
+    let released = client.observe("r29-boundary", "r29-cell").await.unwrap();
+    assert_eq!(
+        (released.spool_bytes, released.spool_files),
+        (fresh.body_size, 1),
+        "a release lowers the ledger"
+    );
+    assert_eq!(
+        (released.charged_bytes, released.charged_files),
+        (fresh.body_size, 1),
+        "a release never lowers the counters"
     );
 }

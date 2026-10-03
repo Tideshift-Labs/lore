@@ -168,6 +168,8 @@ async fn used_or_missing_stage_counter_seed_refuses_clean_initialization() {
     for column in [
         "live_bytes",
         "live_files",
+        "charged_bytes",
+        "charged_files",
         "metadata_bytes",
         "metadata_rows",
     ] {

@@ -52,6 +52,11 @@ async fn race_capacity(bytes: i64, files: i64) {
     assert_eq!([&left, &right].iter().filter(|r| r.is_err()).count(), 1);
     let usage = first.observe_stage().await.unwrap();
     assert_eq!((usage.resident_bytes, usage.resident_files), (128, 1));
+    assert_eq!(
+        (usage.charged_bytes, usage.charged_files),
+        (128, 1),
+        "the refused reservation charged nothing"
+    );
     assert_eq!((usage.metadata_bytes, usage.metadata_rows), (1024, 1));
 }
 
@@ -136,6 +141,56 @@ async fn already_readable_replay_does_not_reserve_capacity_twice() {
             usage.metadata_rows
         ),
         (128, 1, 1)
+    );
+    assert_eq!(
+        (usage.charged_bytes, usage.charged_files),
+        (128, 1),
+        "a replay charges nothing, so the counters do not move"
+    );
+}
+
+/// Row 78: the charge counters add exactly what each reservation adds to the
+/// ledger and never fall. A withdrawn and cleaned reservation gives its ledger
+/// charge back and leaves the counters where they were.
+#[tokio::test]
+#[ignore = "requires owned live PostgreSQL"]
+async fn stage_charge_counters_only_grow() {
+    let (url, store) = store().await;
+    let coordinator = store.fragment_coordinator();
+    stage_policy::initialize(&url, &coordinator).await;
+    let fresh = coordinator.observe_stage().await.unwrap();
+    assert_eq!((fresh.charged_bytes, fresh.charged_files), (0, 0));
+    let BeginOutcome::Admitted(first) =
+        coordinator.begin_stage(&[6; 32], input(128)).await.unwrap()
+    else {
+        panic!("first stage admitted")
+    };
+    let BeginOutcome::Admitted(_second) =
+        coordinator.begin_stage(&[7; 32], input(64)).await.unwrap()
+    else {
+        panic!("second stage admitted")
+    };
+    let charged = coordinator.observe_stage().await.unwrap();
+    assert_eq!((charged.resident_bytes, charged.resident_files), (192, 2));
+    assert_eq!((charged.charged_bytes, charged.charged_files), (192, 2));
+
+    assert!(coordinator.withdraw_stage(&first).await.unwrap());
+    let cleanup = coordinator
+        .begin_stage_cleanup(&[6; 32], first.epoch)
+        .await
+        .unwrap()
+        .expect("a withdrawn reservation is cleaned");
+    coordinator.commit_stage_cleanup(&cleanup).await.unwrap();
+    let released = coordinator.observe_stage().await.unwrap();
+    assert_eq!(
+        (released.resident_bytes, released.resident_files),
+        (64, 1),
+        "the release gives the ledger charge back"
+    );
+    assert_eq!(
+        (released.charged_bytes, released.charged_files),
+        (192, 2),
+        "a release never lowers the counters"
     );
 }
 

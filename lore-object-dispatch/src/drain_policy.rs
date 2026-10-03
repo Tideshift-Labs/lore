@@ -82,9 +82,9 @@ impl std::fmt::Debug for DrainDescriptor {
     }
 }
 
-/// The cell schema revision this build ships (CR-038). Migration 0029's
+/// The cell schema revision this build ships (CR-038). Migration 0030's
 /// `cell_schema_revision_v1()` returns it; write-behind refuses to start on any other value.
-pub const CELL_SCHEMA_REVISION: i32 = 29;
+pub const CELL_SCHEMA_REVISION: i32 = 30;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DrainError {
@@ -307,6 +307,10 @@ pub struct DrainObservation {
     /// Custody rows a policy rotation superseded that still wait for compaction or for their
     /// post-fence rescan (migration 0029). Each still holds a metadata row.
     pub superseded_pending: u64,
+    /// Every byte and file a reservation ever charged to the spool ledger (migration 0030). They
+    /// only grow, so their growth between two reads is what was charged in between.
+    pub charged_bytes: u64,
+    pub charged_files: u64,
 }
 
 impl DrainClient {
@@ -348,6 +352,16 @@ impl DrainClient {
                     .map_err(|_error| DrainError::Invalid)?,
             )
             .map_err(|_error| DrainError::Invalid)?,
+            charged_bytes: r
+                .try_get::<_, &str>(5)
+                .map_err(|_error| DrainError::Invalid)?
+                .parse()
+                .map_err(|_error| DrainError::Invalid)?,
+            charged_files: r
+                .try_get::<_, &str>(6)
+                .map_err(|_error| DrainError::Invalid)?
+                .parse()
+                .map_err(|_error| DrainError::Invalid)?,
         })
     }
 

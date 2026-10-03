@@ -88,6 +88,7 @@ pub mod masks;
 pub mod membership;
 pub mod provider;
 pub mod schema;
+pub mod stage_charge_schema;
 pub mod stage_rotation_schema;
 pub mod stage_schema;
 pub mod states;

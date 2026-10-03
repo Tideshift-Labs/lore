@@ -8,9 +8,9 @@
 //!
 //! The seam fixture ([`revision4_clean_cell`]) follows CR-039's own test-spec
 //! guidance: initialize a real clean cell through the production
-//! `initialize_empty` API (reaching revision 6), then, as the fixture owner
-//! with the permanent fence disabled, drop the revision-5/6 objects and roll
-//! `schema_version` back to 4. The fixture asserts its own resulting catalog
+//! `initialize_empty` API (reaching the compiled revision), then, as the
+//! fixture owner with the permanent fence disabled, drop the revision-5/6/7
+//! objects and roll `schema_version` back to 4. The fixture asserts its own resulting catalog
 //! shape before returning, so every case here starts from a database that
 //! provably matches a real `dae71dfc` clean cell, not merely "some database
 //! missing a few tables".
@@ -236,10 +236,10 @@ impl DomainBackfillSource for EmptySource {
 }
 
 /// Build a real clean cell through the production cutover and
-/// `initialize_empty` path, reaching revision 6. Installs the legacy
+/// `initialize_empty` path, reaching the compiled revision. Installs the legacy
 /// `lore_mutable`/CR-007 tables `DomainBackfill` reads from first, the same
 /// prerequisite `domain_fragment_clean_init.rs` needs.
-async fn revision6_clean_cell(url: &str) -> (PostgresDomainStore, Client) {
+async fn current_clean_cell(url: &str) -> (PostgresDomainStore, Client) {
     let direct = client(url).await;
     direct
         .batch_execute(include_str!("../migrations/0001_init.sql"))
@@ -282,12 +282,31 @@ async fn revision6_clean_cell(url: &str) -> (PostgresDomainStore, Client) {
     (store, direct)
 }
 
-/// [`revision6_clean_cell`], then downgraded in place to the exact
+/// [`current_clean_cell`], then downgraded in place to the exact revision-6
+/// shape a cell built before row 78 has: as the fixture owner, with the
+/// permanent fence disabled, drop the stage charge counters and roll
+/// `schema_version` back to 6.
+async fn downgrade_to_revision6(direct: &Client) {
+    direct
+        .batch_execute(
+            "ALTER TABLE lore_fragment_schema_state DISABLE TRIGGER lore_clean_state_permanent; \
+             ALTER TABLE lore_fragment_stage_usage \
+                 DROP CONSTRAINT lore_fragment_stage_usage_charged_nonnegative, \
+                 DROP COLUMN charged_bytes, DROP COLUMN charged_files; \
+             UPDATE lore_fragment_schema_state SET schema_version = 6, updated_at = clock_timestamp() \
+                 WHERE id = 1; \
+             ALTER TABLE lore_fragment_schema_state ENABLE ALWAYS TRIGGER lore_clean_state_permanent;",
+        )
+        .await
+        .unwrap();
+}
+
+/// [`current_clean_cell`], then downgraded in place to the exact
 /// revision-4 shape a `dae71dfc` cell has: as the fixture owner, with the
-/// permanent fence disabled, drop the stage-5/6 objects and roll
+/// permanent fence disabled, drop the stage-5/6/7 objects and roll
 /// `schema_version` back. Asserts the resulting catalog before returning.
 async fn revision4_clean_cell(url: &str) -> (PostgresDomainStore, Client) {
-    let (store, direct) = revision6_clean_cell(url).await;
+    let (store, direct) = current_clean_cell(url).await;
     direct
         .batch_execute(
             "ALTER TABLE lore_fragment_schema_state DISABLE TRIGGER lore_clean_state_permanent; \
@@ -307,7 +326,7 @@ async fn revision4_clean_cell(url: &str) -> (PostgresDomainStore, Client) {
     (store, direct)
 }
 
-/// A store whose fragment schema reached revision 6 by ordinary bootstrap,
+/// A store whose fragment schema reached the compiled revision by ordinary bootstrap,
 /// but was never clean-initialized. Used only for the non-clean refusal case.
 async fn store_without_clean_init(url: &str) -> PostgresDomainStore {
     // The legacy `lore_fragment_state`/`lore_fragment_metering` tables must
@@ -1159,6 +1178,133 @@ async fn bootstrap_on_a_revision_4_clean_cell_returns_the_remedy_and_writes_noth
 }
 
 // ---------------------------------------------------------------------------
+// Revision 6 -> 7 (WP-115 row 78): the stage charge counters.
+// ---------------------------------------------------------------------------
+
+async fn stage_rows(direct: &Client) -> (i64, i64, i64, i64, i64, String) {
+    let row = direct
+        .query_one(
+            "SELECT u.live_bytes, u.live_files, u.metadata_bytes, u.metadata_rows, \
+                    (SELECT count(*) FROM lore_fragment_stage_custody), \
+                    (SELECT string_agg(to_jsonb(p)::text, ',') FROM lore_fragment_stage_policy p) \
+               FROM lore_fragment_stage_usage u",
+            &[],
+        )
+        .await
+        .unwrap();
+    (
+        row.get(0),
+        row.get(1),
+        row.get(2),
+        row.get(3),
+        row.get(4),
+        row.get(5),
+    )
+}
+
+/// A revision-6 cell holding a live stage reservation: bootstrap names the
+/// remedy and writes nothing; the upgrade adds only the two counters, starting
+/// at zero, and leaves every stage row and schema-state column but
+/// `schema_version` as it was. The next reservation then counts.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn a_revision_6_cell_upgrades_with_its_stage_rows_untouched_and_counters_from_zero() {
+    let url = pg_url();
+    let (store, direct) = current_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+    stage_policy::initialize(&url, &coordinator).await;
+    let BeginOutcome::Admitted(_held) = coordinator
+        .begin_stage(
+            &random_hash(),
+            StageReservationInput {
+                size_payload: 128,
+                original_flags: 0,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    downgrade_to_revision6(&direct).await;
+
+    let error = coordinator.bootstrap().await.unwrap_err();
+    let DomainError::NotReady(message) = error else {
+        panic!("expected NotReady, got {error:?}")
+    };
+    assert!(message.contains("upgrade-fragments --confirm-replicas-stopped"));
+    assert!(message.contains("revision 6"));
+
+    let state_before = schema_state_snapshot(&direct).await;
+    assert_eq!(state_before.0, 6);
+    let stage_before = stage_rows(&direct).await;
+    assert_eq!(
+        (stage_before.0, stage_before.1, stage_before.4),
+        (128, 1, 1)
+    );
+    let triggers_before = fragment_trigger_snapshot(&direct).await;
+
+    let direct = expect_upgraded(&coordinator, direct, &url, 6).await;
+
+    let (version_after, rest_after) = schema_state_snapshot(&direct).await;
+    assert_eq!(version_after, schema::FRAGMENT_SCHEMA_VERSION);
+    assert_eq!(
+        rest_after, state_before.1,
+        "only schema_version may have changed"
+    );
+    assert_eq!(fragment_trigger_snapshot(&direct).await, triggers_before);
+    assert_eq!(
+        stage_rows(&direct).await,
+        stage_before,
+        "no stage row may have changed"
+    );
+    let usage = coordinator.observe_stage().await.unwrap();
+    assert_eq!((usage.charged_bytes, usage.charged_files), (0, 0));
+    assert!(coordinator.readiness().await.unwrap().ready_for_lifecycle());
+
+    let BeginOutcome::Admitted(_next) = coordinator
+        .begin_stage(
+            &random_hash(),
+            StageReservationInput {
+                size_payload: 64,
+                original_flags: 0,
+            },
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("a fresh hash must admit a stage begin");
+    };
+    let usage = coordinator.observe_stage().await.unwrap();
+    assert_eq!((usage.resident_bytes, usage.resident_files), (192, 2));
+    assert_eq!((usage.charged_bytes, usage.charged_files), (64, 1));
+
+    let _direct = expect_already_current(&coordinator, direct, &url).await;
+}
+
+/// One counter column without the other is no supported revision.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-schema-upgrade-live.ps1"]
+async fn a_revision_6_catalog_with_one_charge_column_is_refused_as_an_unknown_state() {
+    let url = pg_url();
+    let (store, direct) = current_clean_cell(&url).await;
+    let coordinator = store.fragment_coordinator();
+    downgrade_to_revision6(&direct).await;
+    direct
+        .batch_execute(
+            "ALTER TABLE lore_fragment_stage_usage ADD COLUMN charged_bytes bigint NOT NULL DEFAULT 0",
+        )
+        .await
+        .unwrap();
+    let direct = assert_refused_dropping(&coordinator, direct, &url, "unknown catalog state").await;
+    let (version, _) = schema_state_snapshot(&direct).await;
+    assert_eq!(
+        version, 6,
+        "a refused upgrade must not touch the recorded version"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Fresh == upgraded.
 // ---------------------------------------------------------------------------
 
@@ -1179,7 +1325,7 @@ async fn a_fresh_cell_and_an_upgraded_cell_have_an_identical_fragment_catalog() 
     // so an upgraded cell (which went through clean-init before the
     // downgrade) would trivially mismatch a merely-bootstrapped one on
     // triggers alone. The fair comparison is clean cell vs clean cell.
-    let (_fresh_store, fresh_direct) = revision6_clean_cell(&fresh_url).await;
+    let (_fresh_store, fresh_direct) = current_clean_cell(&fresh_url).await;
     let fresh_fingerprint = fragment_catalog_fingerprint(&fresh_direct).await;
 
     // A raw `assert_eq!` on these strings produces an unreadable full-catalog

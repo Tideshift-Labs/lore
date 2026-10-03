@@ -52,6 +52,9 @@ const MIGRATIONS_0007: &str = include_str!("../migrations/0007_outbox_retirement
 /// WP-115 row 68's retirement basis column. The boot path applies the same file
 /// through `OUTBOX_RETIREMENT_BASIS_SCHEMA`.
 const MIGRATIONS_0008: &str = include_str!("../migrations/0008_outbox_retirement_basis.sql");
+/// WP-115 row 78's stage charge counters. The boot path applies the same DDL
+/// through `STAGE_CHARGE_COUNTER_SCHEMA`.
+const MIGRATIONS_0009: &str = include_str!("../migrations/0009_fragment_stage_charge_counters.sql");
 
 /// The relations that prove `migrations/0001_init.sql` (or the isolated test
 /// fixture) ran here. `lore_locks` is excluded because it also pre-dates
@@ -356,6 +359,10 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .batch_execute(MIGRATIONS_0008)
         .await
         .expect("apply outbox retirement basis migration");
+    migration_client
+        .batch_execute(MIGRATIONS_0009)
+        .await
+        .expect("apply stage charge counter migration");
 
     // Production boot order: the domain coordinator is built before the lock
     // store plugin connects (`server.rs`), so nothing has created `lore_locks`
@@ -823,6 +830,10 @@ async fn a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readines
         .batch_execute(MIGRATIONS_0004)
         .await
         .expect("apply stage policy rotation migration");
+    client
+        .batch_execute(MIGRATIONS_0009)
+        .await
+        .expect("apply stage charge counter migration");
     let after_series: i64 = client
         .query_one(
             "SELECT schema_version FROM lore_fragment_schema_state WHERE id = 1",
@@ -834,7 +845,7 @@ async fn a_cell_migrated_from_0001_alone_reaches_the_schema_version_the_readines
     assert_eq!(
         after_series,
         fragment_schema::FRAGMENT_SCHEMA_VERSION,
-        "a cell migrated from 0001 through 0004 must end at the schema_version \
+        "a cell migrated through 0004 and 0009 must end at the schema_version \
          ready_for_lifecycle's clean-init arm requires ({}), or every such cell enables lifecycle \
          routing never again",
         fragment_schema::FRAGMENT_SCHEMA_VERSION

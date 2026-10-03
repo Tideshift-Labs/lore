@@ -107,6 +107,8 @@ async fn fresh_event_initialization_refuses_used_or_missing_stage_usage() {
     for column in [
         "live_bytes",
         "live_files",
+        "charged_bytes",
+        "charged_files",
         "metadata_bytes",
         "metadata_rows",
     ] {

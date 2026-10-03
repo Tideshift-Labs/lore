@@ -102,8 +102,9 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   same shape `lore-transport`/`lore-revision` use their own `test_seams` for.
 - **CR-039 clean-cell fragment schema forward upgrade [SERVER, `lore-postgres/src/domain/fragments/upgrade.rs`]**:
   `PostgresFragmentCoordinator::upgrade_clean_schema` moves an exact revision-4 clean cell to
-  revision 6 (WP-122's stage custody schema) in one transaction; `AlreadyCurrent` on an exact
-  revision-6 cell; every other catalog state refused by name; `bootstrap()` refuses a behind clean
+  revision 7 (WP-122's stage custody schema plus WP-115 row 78's stage charge counters), or an
+  exact revision-6 cell to 7 (the counters only), in one transaction; `AlreadyCurrent` on an exact
+  revision-7 cell; every other catalog state refused by name; `bootstrap()` refuses a behind clean
   cell before any DDL, naming the `loreserver domain upgrade-fragments --confirm-replicas-stopped`
   remedy. Postgres-only, no MinIO/S3 (the upgrade is offline and database-only). Offline: unit tests
   in `upgrade.rs` itself pin the relation-list partition and that the stage DDL creates every object

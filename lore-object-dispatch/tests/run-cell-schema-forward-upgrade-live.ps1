@@ -120,7 +120,9 @@ $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_NOT_DUE_PG_URL'; Name = 'live_released_rows_and_markers_are_scanned_only_when_due'; Database = 'not_due' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_UNLEASE_PG_URL'; Name = 'live_a_contended_claim_clears_its_lease_so_a_peer_retakes_the_row_at_once'; Database = 'unlease' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_LEASE_PG_URL'; Name = 'live_cleanup_claimers_lease_disjoint_rows_and_an_expired_lease_is_retaken'; Database = 'lease' },
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R28_PG_URL'; Name = 'live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded'; Database = 'r28_upgrade' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R28_PG_URL'; Name = 'live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded'; Database = 'r28_upgrade' },
+    # Migration 0030 (WP-115 row 78): running spool charge counters.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R29_PG_URL'; Name = 'live_r29_cell_is_refused_then_upgrades_and_counts_every_charge'; Database = 'r29_upgrade' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

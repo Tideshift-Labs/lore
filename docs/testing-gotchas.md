@@ -208,7 +208,7 @@ BLAKE3-capable container.
 
 ## CR-039 fragment-schema-upgrade fixture gotchas
 
-Building a revision-4 clean-cell fixture by clean-initializing (reaching revision 6) then
+Building a revision-4 clean-cell fixture by clean-initializing (reaching the compiled revision) then
 downgrading in place, rather than replaying `dae71dfc` DDL, hits three independent traps —
 each one made `upgrade_clean_schema` return a *different* refusal than the one the case meant
 to exercise, not a compile or connection error, so each needed its own repro to place:

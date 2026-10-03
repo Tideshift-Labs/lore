@@ -241,6 +241,7 @@ pub use drain::FragmentDrainReservationInput;
 pub use drain::FragmentDrainReservationPlan;
 pub use drain::FragmentDrainWriteReceipt;
 pub use drain::WalkLedgerBound;
+pub use drain::WalkLedgerRead;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 // ---------------------------------------------------------------------------
 // The re-export boundary — read the rule before adding to it

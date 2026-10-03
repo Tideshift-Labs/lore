@@ -789,6 +789,79 @@ mod tests {
         );
     }
 
+    /// WP-115 row 78, end to end at the admission level: a walk bound by the
+    /// charge counters (`lore_fragment_provider::WalkLedgerBound`) feeding the
+    /// same capacity run staging admission keeps. One observation per second,
+    /// a 5 s budget, a ledger steady at 100 files.
+    ///
+    /// Turnover: each walk counts 5 files more than any read held (released
+    /// after the walk counted them, or charged before the walk reached them),
+    /// while 10 are charged and 10 released per second. Before row 78 the
+    /// counters did not exist and that refused staging after 5 s; now it never
+    /// does. A real orphan, one file no reservation charged, still refuses once
+    /// its run outlives the budget, and not before.
+    #[test]
+    fn turnover_never_refuses_staging_and_an_orphan_refuses_within_budget() {
+        use lore_fragment_provider::WalkLedgerBound;
+        use lore_fragment_provider::WalkLedgerRead;
+
+        let admission = staging_admission();
+        let budget = Duration::from_secs(5);
+        let start = Instant::now();
+        // `charge_per_tick` charged and as many released each second; each
+        // walk counts `walk` files. Returns the first second staging refused.
+        let run = |charge_per_tick: u64, walk: u64, counters: bool| {
+            let mut bound = WalkLedgerBound::<u64>::default();
+            let mut capacity = CapacityState::default();
+            let mut charged = 1_000;
+            bound.record_ledger(WalkLedgerRead {
+                live: (0, 100),
+                charged: (0, charged),
+            });
+            for tick in 1..=12_u64 {
+                let before = bound.last_ledger();
+                bound.record_step(before, true, Some(walk));
+                if counters {
+                    charged += charge_per_tick;
+                }
+                bound.record_ledger(WalkLedgerRead {
+                    live: (0, 100),
+                    charged: (0, charged),
+                });
+                let (physical, (_, files)) = bound.current().expect("a bound walk");
+                let at = start + Duration::from_secs(tick);
+                let verdict = if physical > files {
+                    CapacityVerdict::Reconciling
+                } else {
+                    CapacityVerdict::Available
+                };
+                capacity.note(verdict, at);
+                if staging_mode(&admission, true, false, capacity.refuses(at, budget))
+                    == StagingMode::Refuse
+                {
+                    return Some(tick);
+                }
+            }
+            None
+        };
+        assert_eq!(
+            run(10, 105, false),
+            Some(6),
+            "without the counters, turnover alone refused staging past the budget"
+        );
+        assert_eq!(run(10, 105, true), None, "turnover never refuses");
+        assert_eq!(
+            run(0, 101, true),
+            Some(6),
+            "an orphan with no charge in its window refuses once its run outlives the budget"
+        );
+        assert_eq!(
+            run(10, 111, true),
+            Some(6),
+            "an orphan larger than one walk's charges refuses under load too"
+        );
+    }
+
     /// A hard sample inside a reconciling run keeps the run's start, so the
     /// reconciling samples after it do not get a fresh budget.
     #[test]

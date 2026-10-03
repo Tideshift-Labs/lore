@@ -129,8 +129,18 @@ type CleanupTask = tokio::task::JoinHandle<
 >;
 type PhysicalSpoolSample = (Option<u64>, Result<SpoolInventoryStep, SpoolWriteError>);
 type ObservationTask = tokio::task::JoinHandle<PhysicalSpoolSample>;
-/// Spool ledger bytes and files, as one `drain_observe_v1` read reported them.
+/// Spool ledger bytes and files: a walk's bound.
 type SpoolLedger = (u64, u64);
+
+/// One ledger read: the live bytes and files, and the running counters of every byte and file
+/// ever charged, taken in one statement (WP-115 row 78).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WalkLedgerRead {
+    /// Bytes and files charged and not yet released.
+    pub live: (u64, u64),
+    /// Bytes and files ever charged. They only grow.
+    pub charged: (u64, u64),
+}
 
 /// A completed walk older than this is not reported, as before.
 const PHYSICAL_SPOOL_MAX_AGE: Duration = Duration::from_secs(300);
@@ -144,11 +154,18 @@ const PHYSICAL_SPOOL_MAX_AGE: Duration = Duration::from_secs(300);
 /// walk counted a body lowers that read, and a body placed after the read raises
 /// the walk. The 2026-09-28 live check saw spool walks 0 to 2 s old over ledger.
 ///
-/// The bound is the larger of the ledger read before the walk started and the
-/// first ledger read after it completed, per component. It covers a window that
-/// only grew and a window that only shrank. A window with both charges and
-/// releases can still exceed both reads; readiness and staging give that a time
-/// budget rather than treating one sample as unavailability.
+/// Neither read alone bounds a window with both charges and releases: the walk
+/// can count a body released before the read after it and a body charged after
+/// the read before it. Row 77's faster drain made that the steady state, and
+/// both replicas refused staging on `spool_*_over_ledger` past the budget. So
+/// each read also carries the running counters of every byte and file ever
+/// charged (row 78), and the bound is the ledger read before the walk started
+/// plus what was charged until the first read after it completed, per
+/// component, never below that later read. Only bytes no reservation charged
+/// exceed it. The slack an orphan can hide in is what the walk did not count
+/// of that bound: bodies charged in its window, and bodies live at its start
+/// that were released before the walk reached them (the second was slack
+/// before row 78 too). A walk with no turnover in its window has no slack.
 ///
 /// The caller must keep the order this relies on: `before` is a read taken
 /// before the step was issued, and `record_ledger` is called only with a read
@@ -158,11 +175,11 @@ const PHYSICAL_SPOOL_MAX_AGE: Duration = Duration::from_secs(300);
 #[derive(Debug)]
 pub struct WalkLedgerBound<W> {
     /// The latest ledger read. Every step recorded so far was issued before it.
-    last_ledger: Option<(u64, u64)>,
+    last_ledger: Option<WalkLedgerRead>,
     /// The ledger read before the walk in progress started, when known.
-    walk_start: Option<(u64, u64)>,
+    walk_start: Option<WalkLedgerRead>,
     /// A completed walk still waiting for the first ledger read after it.
-    unbound: Option<(W, Option<(u64, u64)>)>,
+    unbound: Option<(W, Option<WalkLedgerRead>)>,
     /// The latest completed walk and the ledger bound it is compared with.
     bound: Option<(W, (u64, u64))>,
 }
@@ -180,13 +197,18 @@ impl<W> Default for WalkLedgerBound<W> {
 
 impl<W: Copy> WalkLedgerBound<W> {
     /// The latest ledger read, to pass as `before` for the next step.
-    pub fn last_ledger(&self) -> Option<(u64, u64)> {
+    pub fn last_ledger(&self) -> Option<WalkLedgerRead> {
         self.last_ledger
     }
 
     /// Record one walk step. `before` is the latest ledger read when the step
     /// was issued, which precedes everything the step walked.
-    pub fn record_step(&mut self, before: Option<(u64, u64)>, started: bool, completed: Option<W>) {
+    pub fn record_step(
+        &mut self,
+        before: Option<WalkLedgerRead>,
+        started: bool,
+        completed: Option<W>,
+    ) {
         if started {
             self.walk_start = before;
         }
@@ -204,13 +226,10 @@ impl<W: Copy> WalkLedgerBound<W> {
     }
 
     /// Record a ledger read taken after every step recorded so far.
-    pub fn record_ledger(&mut self, ledger: (u64, u64)) {
+    pub fn record_ledger(&mut self, ledger: WalkLedgerRead) {
         self.last_ledger = Some(ledger);
         if let Some((walk, start)) = self.unbound.take() {
-            let bound = start.map_or(ledger, |(bytes, files)| {
-                (bytes.max(ledger.0), files.max(ledger.1))
-            });
-            self.bound = Some((walk, bound));
+            self.bound = Some((walk, walk_bound(start, ledger)));
         }
     }
 
@@ -220,11 +239,32 @@ impl<W: Copy> WalkLedgerBound<W> {
     }
 }
 
+/// The ledger a completed walk must not exceed, per component (row 78).
+///
+/// Every body the walk counted was either live at `start` or charged between
+/// `start` and `after`, so `start.live` plus the growth of the charge counters
+/// bounds the walk however many bodies were released meanwhile. The bound never
+/// falls below either live read, so a counter that did not move (or went
+/// backwards) leaves it where the two reads alone put it.
+fn walk_bound(start: Option<WalkLedgerRead>, after: WalkLedgerRead) -> (u64, u64) {
+    let Some(start) = start else {
+        return after.live;
+    };
+    let component = |start_live: u64, start_charged: u64, after_live: u64, after_charged: u64| {
+        let charged = after_charged.saturating_sub(start_charged);
+        after_live.max(start_live.saturating_add(charged))
+    };
+    (
+        component(start.live.0, start.charged.0, after.live.0, after.charged.0),
+        component(start.live.1, start.charged.1, after.live.1, after.charged.1),
+    )
+}
+
 type SpoolWalkBound = WalkLedgerBound<SpoolPhysicalInventory>;
 
 fn record_spool_step(
     bound: &mut SpoolWalkBound,
-    before: Option<SpoolLedger>,
+    before: Option<WalkLedgerRead>,
     step: Result<SpoolInventoryStep, SpoolWriteError>,
 ) {
     match step {
@@ -245,8 +285,16 @@ fn current_spool_walk(bound: &SpoolWalkBound) -> Option<(SpoolPhysicalInventory,
 #[derive(Default)]
 struct SpoolObservationState {
     /// The step in flight and the latest ledger read when it was issued.
-    task: Option<(ObservationTask, Option<SpoolLedger>)>,
+    task: Option<(ObservationTask, Option<WalkLedgerRead>)>,
     walk: SpoolWalkBound,
+}
+
+/// The spool ledger and its running charge counters, as one `drain_observe_v1` read reported them.
+fn spool_ledger_read(sample: &DrainObservation) -> WalkLedgerRead {
+    WalkLedgerRead {
+        live: (sample.spool_bytes, sample.spool_files),
+        charged: (sample.charged_bytes, sample.charged_files),
+    }
 }
 
 pub struct FragmentDrainMaintenanceHandle {
@@ -341,9 +389,7 @@ impl FragmentDrainMaintenanceHandle {
             if state.walk.last_ledger().is_none() {
                 // The first walk needs a read before it starts too.
                 let sample = self.read_ledger().await?;
-                state
-                    .walk
-                    .record_ledger((sample.spool_bytes, sample.spool_files));
+                state.walk.record_ledger(spool_ledger_read(&sample));
             }
             let writer = self.writer.clone();
             let before = state.walk.last_ledger();
@@ -379,9 +425,7 @@ impl FragmentDrainMaintenanceHandle {
         state.task = None;
         record_spool_step(&mut state.walk, before, step);
         let sample = self.read_ledger().await?;
-        state
-            .walk
-            .record_ledger((sample.spool_bytes, sample.spool_files));
+        state.walk.record_ledger(spool_ledger_read(&sample));
         Ok(FragmentDrainObservation::assemble(
             &sample,
             available_bytes,
@@ -706,7 +750,33 @@ mod observation_tests {
             cleanup_backlog: 3,
             metadata_full: false,
             superseded_pending: 2,
+            charged_bytes: 900,
+            charged_files: 90,
         }
+    }
+
+    #[test]
+    fn a_spool_read_carries_the_ledger_and_the_charge_counters() {
+        assert_eq!(
+            spool_ledger_read(&ledger()),
+            WalkLedgerRead {
+                live: (100, 10),
+                charged: (900, 90),
+            }
+        );
+    }
+
+    /// A read whose charge counters did not move: before row 78 every read
+    /// looked like this to the bound.
+    fn flat(bytes: u64, files: u64) -> WalkLedgerRead {
+        WalkLedgerRead {
+            live: (bytes, files),
+            charged: (0, 0),
+        }
+    }
+
+    fn read(live: (u64, u64), charged: (u64, u64)) -> WalkLedgerRead {
+        WalkLedgerRead { live, charged }
     }
 
     #[test]
@@ -767,15 +837,15 @@ mod observation_tests {
     #[test]
     fn a_release_burst_after_the_walk_is_bounded_by_the_ledger_before_it() {
         let mut bound = SpoolWalkBound::default();
-        bound.record_ledger((8_750_269, 118));
-        record_spool_step(&mut bound, Some((8_750_269, 118)), Ok(step(true, None)));
-        bound.record_ledger((8_750_269, 118));
+        bound.record_ledger(flat(8_750_269, 118));
+        record_spool_step(&mut bound, Some(flat(8_750_269, 118)), Ok(step(true, None)));
+        bound.record_ledger(flat(8_750_269, 118));
         record_spool_step(
             &mut bound,
-            Some((8_750_269, 118)),
+            Some(flat(8_750_269, 118)),
             Ok(step(false, Some(walk(8_750_269, 118)))),
         );
-        bound.record_ledger((8_492_370, 116));
+        bound.record_ledger(flat(8_492_370, 116));
         let (inventory, ledger) = bound.current().expect("bound walk");
         assert_eq!((inventory.bytes, inventory.files), (8_750_269, 118));
         assert_eq!(ledger, (8_750_269, 118));
@@ -786,10 +856,10 @@ mod observation_tests {
     #[test]
     fn a_body_placed_during_the_walk_is_bounded_by_the_ledger_after_it() {
         let mut bound = SpoolWalkBound::default();
-        bound.record_ledger((100, 10));
+        bound.record_ledger(flat(100, 10));
         record_spool_step(
             &mut bound,
-            Some((100, 10)),
+            Some(flat(100, 10)),
             Ok(step(true, Some(walk(110, 11)))),
         );
         assert_eq!(
@@ -797,7 +867,7 @@ mod observation_tests {
             None,
             "unbound until a read after completion"
         );
-        bound.record_ledger((110, 11));
+        bound.record_ledger(flat(110, 11));
         let (_, ledger) = bound.current().expect("bound walk");
         assert_eq!(ledger, (110, 11));
     }
@@ -807,9 +877,9 @@ mod observation_tests {
     #[test]
     fn each_component_takes_the_larger_side() {
         let mut bound = SpoolWalkBound::default();
-        record_spool_step(&mut bound, Some((200, 5)), Ok(step(true, None)));
+        record_spool_step(&mut bound, Some(flat(200, 5)), Ok(step(true, None)));
         record_spool_step(&mut bound, None, Ok(step(false, Some(walk(0, 0)))));
-        bound.record_ledger((150, 9));
+        bound.record_ledger(flat(150, 9));
         assert_eq!(bound.current().expect("bound").1, (200, 9));
     }
 
@@ -818,7 +888,7 @@ mod observation_tests {
     fn a_walk_with_no_earlier_read_is_bounded_by_the_read_after_it() {
         let mut bound = SpoolWalkBound::default();
         record_spool_step(&mut bound, None, Ok(step(true, Some(walk(7, 1)))));
-        bound.record_ledger((5, 1));
+        bound.record_ledger(flat(5, 1));
         assert_eq!(bound.current().expect("bound").1, (5, 1));
     }
 
@@ -828,13 +898,17 @@ mod observation_tests {
         let mut bound = SpoolWalkBound::default();
         record_spool_step(
             &mut bound,
-            Some((500, 50)),
+            Some(flat(500, 50)),
             Ok(step(true, Some(walk(1, 1)))),
         );
-        bound.record_ledger((10, 1));
+        bound.record_ledger(flat(10, 1));
         assert_eq!(bound.current().expect("first").1, (500, 50));
-        record_spool_step(&mut bound, Some((10, 1)), Ok(step(true, Some(walk(2, 1)))));
-        bound.record_ledger((20, 2));
+        record_spool_step(
+            &mut bound,
+            Some(flat(10, 1)),
+            Ok(step(true, Some(walk(2, 1)))),
+        );
+        bound.record_ledger(flat(20, 2));
         assert_eq!(bound.current().expect("second").1, (20, 2));
     }
 
@@ -842,16 +916,130 @@ mod observation_tests {
     #[test]
     fn a_failed_step_drops_every_walk() {
         let mut bound = SpoolWalkBound::default();
-        record_spool_step(&mut bound, Some((1, 1)), Ok(step(true, Some(walk(1, 1)))));
-        bound.record_ledger((1, 1));
         record_spool_step(
             &mut bound,
-            Some((1, 1)),
+            Some(flat(1, 1)),
+            Ok(step(true, Some(walk(1, 1)))),
+        );
+        bound.record_ledger(flat(1, 1));
+        record_spool_step(
+            &mut bound,
+            Some(flat(1, 1)),
             Err(SpoolWriteError::RootUnavailable),
         );
-        bound.record_ledger((1, 1));
+        bound.record_ledger(flat(1, 1));
         assert_eq!(bound.current(), None);
-        assert_eq!(bound.last_ledger, Some((1, 1)));
+        assert_eq!(bound.last_ledger, Some(flat(1, 1)));
+    }
+
+    // Row 78: deterministic interleavings of reserve, place, promote and
+    // release against one walk. Each body is 10 bytes. A reservation charges
+    // the ledger and both counters before its body is placed; a release gives
+    // the ledger back after the body is unlinked.
+
+    /// The row 77 shape. The walk counts bodies A and B early, then cleanup
+    /// unlinks and releases both; meanwhile C and D are reserved and placed
+    /// where the walk has not reached yet, and the walk counts them too. The
+    /// walk saw 4 bodies; no single read ever held more than 2.
+    #[test]
+    fn turnover_inside_one_walk_is_bounded_by_the_charges_it_saw() {
+        let mut bound = SpoolWalkBound::default();
+        // A and B live; 2 ever charged.
+        let before = read((20, 2), (20, 2));
+        bound.record_ledger(before);
+        record_spool_step(&mut bound, Some(before), Ok(step(true, None)));
+        // C and D charged (4 ever), A and B released: 2 live.
+        let middle = read((20, 2), (40, 4));
+        bound.record_ledger(middle);
+        record_spool_step(&mut bound, Some(middle), Ok(step(false, Some(walk(40, 4)))));
+        bound.record_ledger(middle);
+        let (inventory, ledger) = bound.current().expect("bound walk");
+        assert_eq!((inventory.bytes, inventory.files), (40, 4));
+        assert!(
+            inventory.bytes <= ledger.0 && inventory.files <= ledger.1,
+            "a walk of charged bodies only must fit its bound: walk (40, 4), bound {ledger:?}"
+        );
+        assert_eq!(ledger, (40, 4));
+    }
+
+    /// The same turnover inside a single-step walk, bound by the previous
+    /// tick's read and the read right after the step.
+    #[test]
+    fn turnover_inside_a_single_step_walk_is_bounded_too() {
+        let mut bound = SpoolWalkBound::default();
+        let before = read((100, 10), (500, 50));
+        bound.record_ledger(before);
+        // 3 charged and placed, 3 released, during the step: 13 counted.
+        record_spool_step(
+            &mut bound,
+            Some(before),
+            Ok(step(true, Some(walk(130, 13)))),
+        );
+        bound.record_ledger(read((100, 10), (530, 53)));
+        assert_eq!(bound.current().expect("bound").1, (130, 13));
+    }
+
+    /// A real orphan: bytes no reservation ever charged. With no charge in
+    /// the window the bound is the ledger, and the orphan exceeds it.
+    #[test]
+    fn an_orphan_with_no_charge_in_the_window_exceeds_the_bound() {
+        let mut bound = SpoolWalkBound::default();
+        let quiet = read((100, 10), (500, 50));
+        bound.record_ledger(quiet);
+        record_spool_step(&mut bound, Some(quiet), Ok(step(true, Some(walk(110, 11)))));
+        bound.record_ledger(quiet);
+        let (inventory, ledger) = bound.current().expect("bound");
+        assert_eq!(ledger, (100, 10));
+        assert!(inventory.bytes > ledger.0 && inventory.files > ledger.1);
+    }
+
+    /// An orphan can hide in a walk's turnover slack: here 3 bodies charged
+    /// and 3 released inside the walk's window. The next walk with no
+    /// turnover in its window exposes it.
+    #[test]
+    fn an_orphan_hidden_by_turnover_shows_in_the_next_quiet_walk() {
+        let mut bound = SpoolWalkBound::default();
+        // 10 live bodies plus one orphan; 3 charged and 3 released in the walk.
+        let before = read((100, 10), (500, 50));
+        bound.record_ledger(before);
+        record_spool_step(
+            &mut bound,
+            Some(before),
+            Ok(step(true, Some(walk(110, 11)))),
+        );
+        let after = read((100, 10), (530, 53));
+        bound.record_ledger(after);
+        let (inventory, ledger) = bound.current().expect("first walk");
+        assert!(inventory.files <= ledger.1, "masked by 3 charges");
+        // Load stops: the next walk's window has no charge.
+        record_spool_step(&mut bound, Some(after), Ok(step(true, Some(walk(110, 11)))));
+        bound.record_ledger(after);
+        let (inventory, ledger) = bound.current().expect("second walk");
+        assert_eq!(ledger, (100, 10));
+        assert!(inventory.bytes > ledger.0 && inventory.files > ledger.1);
+    }
+
+    /// The bound never falls below either read, so it is never tighter than
+    /// before row 78, even if a counter went backwards (a cell restored from
+    /// a backup, say).
+    #[test]
+    fn a_counter_that_went_backwards_keeps_the_larger_read() {
+        let mut bound = SpoolWalkBound::default();
+        let before = read((200, 20), (900, 90));
+        record_spool_step(&mut bound, Some(before), Ok(step(true, Some(walk(0, 0)))));
+        bound.record_ledger(read((150, 25), (100, 10)));
+        assert_eq!(bound.current().expect("bound").1, (200, 25));
+    }
+
+    /// Bytes and files are bound separately: charges of one never widen the
+    /// other.
+    #[test]
+    fn each_component_uses_its_own_charges() {
+        let mut bound = SpoolWalkBound::default();
+        let before = read((100, 10), (500, 50));
+        record_spool_step(&mut bound, Some(before), Ok(step(true, Some(walk(0, 0)))));
+        bound.record_ledger(read((100, 10), (540, 50)));
+        assert_eq!(bound.current().expect("bound").1, (140, 10));
     }
 }
 

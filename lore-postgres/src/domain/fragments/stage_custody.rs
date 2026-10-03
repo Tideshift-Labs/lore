@@ -30,6 +30,11 @@ pub struct StageObservation {
     pub pending_files: i64,
     pub resident_bytes: i64,
     pub resident_files: i64,
+    /// Every byte and file a reservation ever charged to `resident_*` (row 78).
+    /// They only grow, so their growth between two reads is what was charged
+    /// in between.
+    pub charged_bytes: i64,
+    pub charged_files: i64,
     pub metadata_bytes: i64,
     pub metadata_rows: i64,
     pub cleanup_backlog: i64,
@@ -74,6 +79,7 @@ pub(super) async fn reserve_stage_locked(
     let charged = tx.execute(
         "UPDATE lore_fragment_stage_usage AS u SET \
          live_bytes=u.live_bytes+$1, live_files=u.live_files+1, \
+         charged_bytes=u.charged_bytes+$1, charged_files=u.charged_files+1, \
          metadata_bytes=u.metadata_bytes+$2, metadata_rows=u.metadata_rows+1 \
          FROM lore_fragment_stage_policy AS p \
          WHERE u.singleton AND p.singleton \
@@ -195,7 +201,7 @@ impl PostgresFragmentCoordinator {
     pub async fn observe_stage(&self) -> Result<StageObservation, DomainError> {
         let client = self.checkout().await?;
         let row=client.query_one(
-            "SELECT u.live_bytes,u.live_files,u.metadata_bytes,u.metadata_rows, \
+            "SELECT u.live_bytes,u.live_files,u.charged_bytes,u.charged_files,u.metadata_bytes,u.metadata_rows, \
              (u.metadata_bytes > p.max_metadata_bytes-1024 OR u.metadata_rows >= p.max_metadata_rows) AS metadata_full, \
              (SELECT count(*) FROM lore_fragment_lifecycle WHERE state=3)::bigint AS pending_files, \
              (SELECT coalesce(sum(e.size_payload),0)::bigint FROM lore_fragment_lifecycle l \
@@ -212,6 +218,8 @@ impl PostgresFragmentCoordinator {
             pending_files: row.get("pending_files"),
             resident_bytes: row.get("live_bytes"),
             resident_files: row.get("live_files"),
+            charged_bytes: row.get("charged_bytes"),
+            charged_files: row.get("charged_files"),
             metadata_bytes: row.get("metadata_bytes"),
             metadata_rows: row.get("metadata_rows"),
             cleanup_backlog: row.get("cleanup_backlog"),

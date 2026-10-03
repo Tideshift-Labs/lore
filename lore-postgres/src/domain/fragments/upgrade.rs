@@ -21,10 +21,15 @@
 //!    definition, enablement and function body;
 //! 3. disable only `lore_clean_state_permanent`, apply the same stage DDL a
 //!    fresh cell runs, and re-enable the trigger `ALWAYS`;
-//! 4. prove that only `schema_version` moved (4 -> 6), that every trigger is
+//! 4. prove that only `schema_version` moved (4 -> 7), that every trigger is
 //!    exactly as before, that the stage objects exist with a fresh cell's
 //!    seed, that clean readiness still holds, and that no other backend
 //!    connected meanwhile; then commit.
+//!
+//! Row 78 adds a second supported start, revision 6. Its step applies only the
+//! two stage charge counter columns (revision 7) and proves that the stage
+//! usage, policy and custody rows are otherwise unchanged and the counters
+//! start at zero.
 //!
 //! The trigger disable is transactional and never visible to another session.
 //! It needs table ownership, which can already drop the trigger, so the fence
@@ -39,6 +44,7 @@ use tokio_postgres::error::SqlState;
 use super::coordinator::PostgresFragmentCoordinator;
 use super::initialization;
 use super::schema;
+use super::stage_charge_schema::STAGE_CHARGE_COUNTER_SCHEMA;
 use super::stage_rotation_schema::STAGE_POLICY_ROTATION_SCHEMA;
 use super::stage_schema::STAGE_CUSTODY_SCHEMA;
 use super::states::FragmentLifecycleState;
@@ -47,6 +53,17 @@ use crate::domain::fragments::failpoint;
 
 /// The revision a clean cell initialized before WP-122's stage custody holds.
 pub const PRE_STAGE_SCHEMA_VERSION: i64 = 4;
+
+/// The revision a clean cell initialized before row 78's stage charge counters
+/// holds. Its upgrade adds only the two counter columns.
+pub const PRE_CHARGE_SCHEMA_VERSION: i64 = 6;
+
+/// The revisions a clean cell may be upgraded from.
+pub const UPGRADABLE_SCHEMA_VERSIONS: [i64; 2] =
+    [PRE_STAGE_SCHEMA_VERSION, PRE_CHARGE_SCHEMA_VERSION];
+
+/// The stage usage columns revision 7 adds.
+const CHARGE_COLUMNS: [&str; 2] = ["charged_bytes", "charged_files"];
 
 /// The relations a revision-4 cell has. The rest of
 /// [`schema::FRAGMENT_SCHEMA_RELATIONS`] is [`STAGE_RELATIONS`].
@@ -148,11 +165,41 @@ struct StageCatalog {
     classes: Vec<String>,
     stage_functions: i64,
     rotation_columns: i64,
+    charge_columns: i64,
     promotion_claim_columns: i64,
     promotion_shape: bool,
 }
 
+/// Which supported revision a clean cell's catalog is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CatalogRevision {
+    PreStage,
+    PreCharge,
+    Current,
+}
+
+impl CatalogRevision {
+    fn version(self) -> i64 {
+        match self {
+            Self::PreStage => PRE_STAGE_SCHEMA_VERSION,
+            Self::PreCharge => PRE_CHARGE_SCHEMA_VERSION,
+            Self::Current => schema::FRAGMENT_SCHEMA_VERSION,
+        }
+    }
+}
+
 impl StageCatalog {
+    fn revision(&self) -> Option<CatalogRevision> {
+        if self.is_current() {
+            Some(CatalogRevision::Current)
+        } else if self.is_pre_charge() {
+            Some(CatalogRevision::PreCharge)
+        } else if self.is_pre_stage() {
+            Some(CatalogRevision::PreStage)
+        } else {
+            None
+        }
+    }
     fn expected(current: bool) -> Vec<String> {
         let mut names: Vec<String> = PRE_STAGE_CLASSES.iter().map(|s| (*s).to_owned()).collect();
         if current {
@@ -168,6 +215,17 @@ impl StageCatalog {
             && self.promotion_shape
             && self.stage_functions == 0
             && self.rotation_columns == 0
+            && self.charge_columns == 0
+    }
+
+    /// Revision 6: every stage object, without the charge counters.
+    fn is_pre_charge(&self) -> bool {
+        self.classes == Self::expected(true)
+            && self.promotion_claim_columns == 3
+            && self.promotion_shape
+            && self.stage_functions == STAGE_FUNCTIONS.len() as i64
+            && self.rotation_columns == 2
+            && self.charge_columns == 0
     }
 
     fn is_current(&self) -> bool {
@@ -176,6 +234,7 @@ impl StageCatalog {
             && self.promotion_shape
             && self.stage_functions == STAGE_FUNCTIONS.len() as i64
             && self.rotation_columns == 2
+            && self.charge_columns == CHARGE_COLUMNS.len() as i64
     }
 
     /// Name what separates this catalog from the nearer supported revision.
@@ -196,8 +255,8 @@ impl StageCatalog {
             .collect();
         format!(
             "compared with revision {}: missing {missing:?}, unexpected {unexpected:?}, \
-             stage functions {}/3, rotation columns {}/2, promotion claim columns {}/3, \
-             promotion shape constraint {}",
+             stage functions {}/3, rotation columns {}/2, charge columns {}/2, promotion claim \
+             columns {}/3, promotion shape constraint {}",
             if has_stage {
                 schema::FRAGMENT_SCHEMA_VERSION
             } else {
@@ -205,6 +264,7 @@ impl StageCatalog {
             },
             self.stage_functions,
             self.rotation_columns,
+            self.charge_columns,
             self.promotion_claim_columns,
             self.promotion_shape
         )
@@ -228,7 +288,8 @@ fn pg(context: &'static str) -> impl FnOnce(tokio_postgres::Error) -> DomainErro
 }
 
 impl PostgresFragmentCoordinator {
-    /// Upgrade a clean-initialized revision-4 cell to the compiled revision.
+    /// Upgrade a clean-initialized revision-4 or revision-6 cell to the
+    /// compiled revision.
     ///
     /// The caller must stop every replica first. The upgrade refuses while any
     /// backend outside this coordinator's own pool is connected to the cell
@@ -256,18 +317,18 @@ impl PostgresFragmentCoordinator {
         self.refuse_other_backends(&tx).await?;
 
         let before = stage_catalog(&tx).await?;
-        let current = before.is_current();
-        if !current && !before.is_pre_stage() {
+        let Some(revision) = before.revision() else {
             return Err(DomainError::NotReady(format!(
                 "fragment schema upgrade refuses an unknown catalog state ({}); only an exact \
-                 revision-{PRE_STAGE_SCHEMA_VERSION} or revision-{} clean cell is supported",
+                 revision-{PRE_STAGE_SCHEMA_VERSION}, revision-{PRE_CHARGE_SCHEMA_VERSION} or \
+                 revision-{} clean cell is supported",
                 before.describe(),
                 schema::FRAGMENT_SCHEMA_VERSION
             )));
-        }
+        };
         let mut locked: Vec<&str> = PRE_STAGE_RELATIONS.to_vec();
         locked.extend(["lore_fragment_state", "lore_fragment_metering"]);
-        if current {
+        if revision != CatalogRevision::PreStage {
             locked.extend(STAGE_RELATIONS);
         }
         let lock = format!(
@@ -297,24 +358,23 @@ impl PostgresFragmentCoordinator {
             .map_err(pg("fragment schema upgrade version"))?
             .get(0);
         self.refuse_unclean(&tx).await?;
-        if current {
-            if version != schema::FRAGMENT_SCHEMA_VERSION {
-                return Err(DomainError::NotReady(format!(
-                    "fragment schema upgrade refuses a revision-{} catalog recording \
-                     schema_version {version}",
-                    schema::FRAGMENT_SCHEMA_VERSION
-                )));
-            }
+        if version != revision.version() {
+            return Err(DomainError::NotReady(format!(
+                "fragment schema upgrade refuses a revision-{} catalog recording \
+                 schema_version {version}",
+                revision.version()
+            )));
+        }
+        if revision == CatalogRevision::Current {
             // Read-only. The transaction rolls back on drop.
             return Ok(FragmentSchemaUpgradeOutcome::AlreadyCurrent);
         }
-        if version != PRE_STAGE_SCHEMA_VERSION {
-            return Err(DomainError::NotReady(format!(
-                "fragment schema upgrade refuses a revision-{PRE_STAGE_SCHEMA_VERSION} catalog \
-                 recording schema_version {version}"
-            )));
-        }
-        refuse_staged_work(&tx).await?;
+        let stage_before = if revision == CatalogRevision::PreStage {
+            refuse_staged_work(&tx).await?;
+            None
+        } else {
+            Some(stage_snapshot(&tx).await?)
+        };
         let triggers_before = trigger_snapshot(&tx).await?;
 
         tx.batch_execute(
@@ -322,22 +382,33 @@ impl PostgresFragmentCoordinator {
         )
         .await
         .map_err(pg("fragment schema upgrade fence lift"))?;
-        tx.batch_execute(STAGE_CUSTODY_SCHEMA)
+        if revision == CatalogRevision::PreStage {
+            tx.batch_execute(STAGE_CUSTODY_SCHEMA)
+                .await
+                .map_err(pg("fragment schema upgrade stage custody DDL"))?;
+            tx.batch_execute(STAGE_POLICY_ROTATION_SCHEMA)
+                .await
+                .map_err(pg("fragment schema upgrade stage rotation DDL"))?;
+        }
+        tx.batch_execute(STAGE_CHARGE_COUNTER_SCHEMA)
             .await
-            .map_err(pg("fragment schema upgrade stage custody DDL"))?;
-        tx.batch_execute(STAGE_POLICY_ROTATION_SCHEMA)
-            .await
-            .map_err(pg("fragment schema upgrade stage rotation DDL"))?;
+            .map_err(pg("fragment schema upgrade stage charge counter DDL"))?;
         tx.batch_execute(
             "ALTER TABLE lore_fragment_schema_state ENABLE ALWAYS TRIGGER lore_clean_state_permanent",
         )
         .await
         .map_err(pg("fragment schema upgrade fence restore"))?;
 
-        verify_upgraded(&tx, &state_before, &triggers_before).await?;
+        verify_upgraded(
+            &tx,
+            &state_before,
+            &triggers_before,
+            stage_before.as_deref(),
+        )
+        .await?;
         self.refuse_unclean(&tx).await?;
         // A replica that connected during the step is blocked on our locks now
-        // and would write revision-6 tables with an old binary after commit.
+        // and would write current-revision tables with an old binary after commit.
         self.refuse_other_backends(&tx).await?;
         tx.commit().await.map_err(|e| {
             DomainError::OutcomeUnknown(format!(
@@ -345,7 +416,7 @@ impl PostgresFragmentCoordinator {
             ))
         })?;
         Ok(FragmentSchemaUpgradeOutcome::Upgraded {
-            from_version: PRE_STAGE_SCHEMA_VERSION,
+            from_version: revision.version(),
         })
     }
 
@@ -472,8 +543,10 @@ async fn stage_catalog(tx: &Transaction<'_>) -> Result<StageCatalog, DomainError
                  AND NOT attisdropped)::bigint, \
                EXISTS (SELECT 1 FROM pg_constraint \
                  WHERE conrelid = to_regclass('lore_fragment_write_claims') \
-                   AND conname = 'lore_fragment_write_claim_promotion_shape' AND convalidated)",
-            &[&STAGE_FUNCTIONS.as_slice()],
+                   AND conname = 'lore_fragment_write_claim_promotion_shape' AND convalidated), \
+               (SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('lore_fragment_stage_usage') \
+                 AND attname = ANY($2) AND attnum > 0 AND NOT attisdropped)::bigint",
+            &[&STAGE_FUNCTIONS.as_slice(), &CHARGE_COLUMNS.as_slice()],
         )
         .await
         .map_err(pg("fragment schema upgrade catalog"))?;
@@ -483,9 +556,30 @@ async fn stage_catalog(tx: &Transaction<'_>) -> Result<StageCatalog, DomainError
         classes,
         stage_functions: row.get(1),
         rotation_columns: row.get(2),
+        charge_columns: row.get(5),
         promotion_claim_columns: row.get(3),
         promotion_shape: row.get(4),
     })
+}
+
+/// A revision-6 cell's stage rows: the usage row without the columns the step
+/// adds, every policy row, and a digest of every custody row. The step adds two
+/// columns and must change nothing else.
+async fn stage_snapshot(tx: &Transaction<'_>) -> Result<String, DomainError> {
+    let charge = CHARGE_COLUMNS.as_slice();
+    tx.query_one(
+        "SELECT COALESCE((SELECT string_agg((to_jsonb(u) - $1::text[])::text, ',') \
+                            FROM lore_fragment_stage_usage u), '') || '|' || \
+                COALESCE((SELECT string_agg(to_jsonb(p)::text, ',' ORDER BY p.singleton) \
+                            FROM lore_fragment_stage_policy p), '') || '|' || \
+                (SELECT count(*)::text || ':' || \
+                        COALESCE(md5(string_agg(to_jsonb(c)::text, ',' ORDER BY c.hash, c.epoch)), '') \
+                   FROM lore_fragment_stage_custody c)",
+        &[&charge],
+    )
+    .await
+    .map(|row| row.get(0))
+    .map_err(pg("fragment schema upgrade stage snapshot"))
 }
 
 /// Every column of the singleton except `schema_version`, as canonical jsonb
@@ -553,10 +647,13 @@ async fn refuse_staged_work(tx: &Transaction<'_>) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// `stage_before` is a revision-6 cell's [`stage_snapshot`]; `None` for a
+/// revision-4 cell, whose stage tables must hold a fresh cell's seed.
 async fn verify_upgraded(
     tx: &Transaction<'_>,
     state_before: &str,
     triggers_before: &str,
+    stage_before: Option<&str>,
 ) -> Result<(), DomainError> {
     let fail = |what: &str| {
         Err(DomainError::Internal(format!(
@@ -587,6 +684,24 @@ async fn verify_upgraded(
             schema::FRAGMENT_SCHEMA_VERSION,
             after.describe()
         ));
+    }
+    let counters_zero: bool = tx
+        .query_one(
+            "SELECT count(*) = 1 AND COALESCE(bool_and(charged_bytes = 0 AND charged_files = 0), false) \
+               FROM lore_fragment_stage_usage",
+            &[],
+        )
+        .await
+        .map_err(pg("fragment schema upgrade verify counters"))?
+        .get(0);
+    if !counters_zero {
+        return fail("the stage charge counters do not start at zero");
+    }
+    if let Some(stage_before) = stage_before {
+        if stage_snapshot(tx).await? != stage_before {
+            return fail("a stage usage, policy or custody row changed");
+        }
+        return Ok(());
     }
     let seeded: bool = tx
         .query_one(
@@ -648,6 +763,53 @@ mod tests {
         {
             assert!(ddl.contains(name), "{name} is not created by the stage DDL");
         }
-        assert_eq!(schema::FRAGMENT_SCHEMA_VERSION, 6);
+        for column in CHARGE_COLUMNS {
+            assert!(
+                STAGE_CHARGE_COUNTER_SCHEMA.contains(&format!("ADD COLUMN IF NOT EXISTS {column}")),
+                "{column} is not added by the charge counter DDL"
+            );
+        }
+        assert_eq!(schema::FRAGMENT_SCHEMA_VERSION, 7);
+        assert_eq!(
+            UPGRADABLE_SCHEMA_VERSIONS,
+            [PRE_STAGE_SCHEMA_VERSION, PRE_CHARGE_SCHEMA_VERSION]
+        );
+    }
+
+    fn catalog(revision: CatalogRevision) -> StageCatalog {
+        let staged = revision != CatalogRevision::PreStage;
+        StageCatalog {
+            classes: StageCatalog::expected(staged),
+            stage_functions: if staged { 3 } else { 0 },
+            rotation_columns: if staged { 2 } else { 0 },
+            charge_columns: if revision == CatalogRevision::Current {
+                2
+            } else {
+                0
+            },
+            promotion_claim_columns: 3,
+            promotion_shape: true,
+        }
+    }
+
+    #[test]
+    fn the_classifier_names_each_supported_revision_and_nothing_between() {
+        for revision in [
+            CatalogRevision::PreStage,
+            CatalogRevision::PreCharge,
+            CatalogRevision::Current,
+        ] {
+            assert_eq!(catalog(revision).revision(), Some(revision));
+        }
+        // One counter column without the other is no supported revision.
+        let mut half = catalog(CatalogRevision::Current);
+        half.charge_columns = 1;
+        assert_eq!(half.revision(), None);
+        // Counters on a cell without the stage tables are no supported revision.
+        let mut early = catalog(CatalogRevision::PreStage);
+        early.charge_columns = 2;
+        assert_eq!(early.revision(), None);
+        assert_eq!(CatalogRevision::PreCharge.version(), 6);
+        assert_eq!(CatalogRevision::Current.version(), 7);
     }
 }

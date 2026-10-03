@@ -416,7 +416,11 @@ type StageInventoryTask = tokio::task::JoinHandle<Result<(StageFileScanner, bool
 
 /// The step in flight, whether it starts a walk, and the latest stage ledger
 /// read when it was issued.
-type PendingStageStep = (StageInventoryTask, bool, Option<(u64, u64)>);
+type PendingStageStep = (
+    StageInventoryTask,
+    bool,
+    Option<lore_fragment_provider::WalkLedgerRead>,
+);
 
 /// A completed stage walk older than this is not compared, as before.
 const STAGE_PHYSICAL_MAX_AGE: Duration = Duration::from_secs(300);
@@ -899,7 +903,7 @@ impl FragmentWriteBehindHandle {
     /// and return the latest completed walk with the ledger it must not exceed.
     async fn bind_stage_inventory(
         &self,
-        ledger: (u64, u64),
+        ledger: lore_fragment_provider::WalkLedgerRead,
     ) -> Option<(StagePhysical, (u64, u64))> {
         let mut state = self.inventory.lock().await;
         state.walk.record_ledger(ledger);
@@ -987,11 +991,16 @@ impl FragmentWriteBehindHandle {
             .await?;
         let charged_bytes = positive(observation.resident_bytes)?;
         let charged_files = positive(observation.resident_files)?;
+        let ledger = lore_fragment_provider::WalkLedgerRead {
+            live: (charged_bytes, charged_files),
+            charged: (
+                positive(observation.charged_bytes)?,
+                positive(observation.charged_files)?,
+            ),
+        };
         let bound = self
             .observe_step(ObserveStep::BindInventory, async {
-                Ok(self
-                    .bind_stage_inventory((charged_bytes, charged_files))
-                    .await)
+                Ok(self.bind_stage_inventory(ledger).await)
             })
             .await?;
         let stage_physical = bound.map(|(walk, _)| walk);

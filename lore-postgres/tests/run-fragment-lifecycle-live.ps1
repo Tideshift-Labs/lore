@@ -72,6 +72,7 @@ $inventory = @(
             'two_replicas_cannot_overbook_the_last_stage_file',
             'missing_policy_refuses_stage_without_leaving_custody_or_usage',
             'already_readable_replay_does_not_reserve_capacity_twice',
+            'stage_charge_counters_only_grow',
             'stage_policy_identity_must_match_the_published_cell_revision_and_digest'
         )
     }
