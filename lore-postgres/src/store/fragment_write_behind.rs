@@ -18,6 +18,7 @@ use super::*;
 use crate::domain::fragments::EpochWitness;
 use crate::domain::fragments::FragmentDrainCandidate;
 use crate::domain::fragments::FragmentDrainCandidateBatch;
+use crate::domain::fragments::FragmentStageObserver;
 use crate::domain::fragments::StageCleanupIntent;
 use crate::domain::fragments::states::FragmentLifecycleState;
 use crate::store::write_behind::CapacityVerdict;
@@ -651,10 +652,10 @@ struct DrainState {
 
 pub struct FragmentWriteBehindHandle {
     coordinator: PostgresFragmentCoordinator,
-    /// The observer's own coordinator, on the domain connection reserved for
-    /// it ([`crate::domain::PostgresDomainStore::fragment_observer_coordinator`]).
-    /// Only `observe()`'s policy and ledger reads use it.
-    observer: PostgresFragmentCoordinator,
+    /// The observer's two reads, on the domain connection reserved for it
+    /// ([`crate::domain::PostgresDomainStore::fragment_stage_observer`]).
+    /// Only `observe()` uses it.
+    observer: FragmentStageObserver,
     provider: Arc<FragmentProviderEntry>,
     stage: Arc<WriteBehindStage>,
     drain: FragmentDrainCapability,
@@ -676,7 +677,7 @@ impl PostgresImmutableStore {
         cell_id: String,
         revision: String,
         digest: [u8; 32],
-        observer: PostgresFragmentCoordinator,
+        observer: FragmentStageObserver,
     ) -> Result<Arc<FragmentWriteBehindHandle>, StoreError> {
         let FragmentLifecycleRoute::Coordinated {
             coordinator,

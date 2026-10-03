@@ -159,6 +159,7 @@ pub use coordinator::FragmentQueryMatch;
 pub use coordinator::FragmentQueryRequest;
 pub use coordinator::FragmentRepositoryStats;
 pub use coordinator::FragmentResolution;
+pub use coordinator::FragmentStageObserver;
 pub use coordinator::FragmentVerdict;
 pub use coordinator::FragmentWriteCapability;
 pub use coordinator::FragmentWriteCapabilityCutover;

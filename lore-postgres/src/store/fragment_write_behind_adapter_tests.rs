@@ -25,10 +25,15 @@ use lore_fragment_provider::ProviderCapabilities;
 use uuid::Uuid;
 
 use super::*;
+use crate::domain::DomainPoolLayout;
 use crate::domain::PostgresDomainStore;
 use crate::pool::TlsConfig;
 use crate::store::write_behind::WriteBehindSettings;
 use crate::store::write_behind::WriteBehindWatermarks;
+
+/// The observer interval the fixture's reserved connection is bounded by: the
+/// server's default.
+const OBSERVE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug)]
 enum PutResult {
@@ -155,14 +160,20 @@ impl Fixture {
         let setup: serde_json::Value = serde_json::from_slice(&setup.stdout).expect("fixture JSON");
         let url = std::env::var("LORE_TEST_PG_URL").expect("fresh disposable PostgreSQL URL");
         // One shared domain connection, as before, plus the observer's own.
-        let domain =
-            PostgresDomainStore::connect_reserving_observer(&url, 2, &TlsConfig::default())
-                .await
-                .unwrap();
+        let domain = PostgresDomainStore::connect_with_layout(
+            &url,
+            2,
+            &TlsConfig::default(),
+            DomainPoolLayout::ReserveObserver {
+                observe_interval: OBSERVE_INTERVAL,
+            },
+        )
+        .await
+        .unwrap();
         let coordinator = domain.fragment_coordinator();
         let observer = domain
-            .fragment_observer_coordinator()
-            .expect("a reserving store has an observer coordinator");
+            .fragment_stage_observer()
+            .expect("a reserving store has a stage observer");
         coordinator.bootstrap().await.unwrap();
         let (admin, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
             .await
@@ -497,11 +508,101 @@ async fn adapter_observe_answers_with_every_shared_domain_connection_held() {
     let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
     // The fixture's shared domain pool has one connection; hold it.
     let held = fixture.handle.coordinator.checkout_for_test().await;
+    let shared_checkouts = fixture.handle.coordinator.acquired_for_test();
     let observed = tokio::time::timeout(Duration::from_secs(2), fixture.handle.observe())
         .await
         .expect("observe() must not wait for the shared domain pool");
     observed.expect("observe() succeeds on its reserved connection");
+    assert_eq!(
+        fixture.handle.coordinator.acquired_for_test(),
+        shared_checkouts,
+        "observe() took no shared domain connection"
+    );
     drop(held);
+}
+
+/// Row 76 review: the reserved connection cancels a statement just under the
+/// observer interval, so a read the observer gave up on cannot run into the
+/// next attempt. The shared pool keeps the server default.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_observer_connection_times_out_statements_inside_the_interval() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    assert_eq!(
+        fixture.handle.observer.statement_timeout_for_test().await,
+        "900ms"
+    );
+    assert_eq!(
+        fixture
+            .handle
+            .coordinator
+            .statement_timeout_for_test()
+            .await,
+        "0"
+    );
+}
+
+/// Row 76 review: a read blocked on the server (here behind an exclusive lock
+/// on the policy table) fails the observation at the statement timeout and
+/// does not wedge later attempts. The attempt the observer abandons leaves its
+/// read running on the one connection; the next attempt's health check finds
+/// that connection busy and replaces it. Without the statement timeout and the
+/// health check, every later attempt queued behind the blocked read forever.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_observe_fails_inside_its_budget_on_a_blocked_read_and_recovers() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture
+        .handle
+        .observe()
+        .await
+        .expect("baseline observation");
+    fixture
+        .admin
+        .batch_execute("BEGIN; LOCK TABLE lore_fragment_stage_policy IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let abandoned =
+        tokio::time::timeout(Duration::from_millis(200), fixture.handle.observe()).await;
+    assert!(abandoned.is_err(), "the policy read blocks behind the lock");
+    let blocked = tokio::time::timeout(OBSERVE_INTERVAL * 2, fixture.handle.observe())
+        .await
+        .expect("a blocked read ends at the statement timeout, not never");
+    assert!(blocked.is_err(), "a blocked read is a failed observation");
+    fixture.admin.batch_execute("ROLLBACK").await.unwrap();
+    tokio::time::timeout(OBSERVE_INTERVAL, fixture.handle.observe())
+        .await
+        .expect("observe() answers inside its budget once the lock is gone")
+        .expect("observe() succeeds once the lock is gone");
+}
+
+/// Row 76 review: a terminated observer backend costs at most the attempt that
+/// finds it. That attempt answers inside the budget either way, and the next
+/// one succeeds on a replacement connection.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_observe_recovers_after_its_backend_is_terminated() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let terminated_pid = fixture.handle.observer.backend_pid_for_test().await;
+    let terminated: bool = fixture
+        .admin
+        .query_one("SELECT pg_terminate_backend($1)", &[&terminated_pid])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(terminated, "the observer backend was terminated");
+    let _either = tokio::time::timeout(OBSERVE_INTERVAL, fixture.handle.observe())
+        .await
+        .expect("the attempt that finds the dead connection answers inside the budget");
+    tokio::time::timeout(OBSERVE_INTERVAL, fixture.handle.observe())
+        .await
+        .expect("the next attempt answers inside the budget")
+        .expect("the next attempt succeeds on a replacement connection");
+    assert_ne!(
+        fixture.handle.observer.backend_pid_for_test().await,
+        terminated_pid,
+        "the dead connection was replaced"
+    );
 }
 
 /// Row 76: a put that finds every staging I/O slot taken waits for one to free

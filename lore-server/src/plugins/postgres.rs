@@ -29,6 +29,7 @@ use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_object_dispatch::cell_retention::CellRetentionSettings;
 use lore_postgres::domain::DatabaseIdentity;
+pub(crate) use lore_postgres::domain::DomainPoolLayout;
 use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::fragments::BudgetPin;
 use lore_postgres::domain::fragments::CellProviderBoundary;
@@ -1559,18 +1560,18 @@ pub(crate) async fn connect_immutable_store(
 /// affected `lore_mutable` rows in **one** Postgres transaction — which is only
 /// atomic if they are in one database.
 ///
-/// `reserve_observer` keeps one of the `domain_pool_max` connections for the
-/// write-behind observer
-/// ([`PostgresDomainStore::connect_reserving_observer`]); the process holds the
-/// same number of domain connections either way. It is refused here, before
-/// any connection opens, when `domain_pool_max` is below 2.
+/// [`DomainPoolLayout::ReserveObserver`] keeps one of the `domain_pool_max`
+/// connections for the write-behind observer
+/// ([`PostgresDomainStore::connect_with_layout`]); the process holds the same
+/// number of domain connections either way. It is refused here, before any
+/// connection opens, when `domain_pool_max` is below 2.
 pub(crate) async fn connect_domain_store(
     config: &toml::Value,
-    reserve_observer: bool,
+    layout: DomainPoolLayout,
 ) -> Result<PostgresDomainStore, PluginError> {
     let plugin_name = PLUGIN_NAME;
     let cfg = parse_config(plugin_name, config)?;
-    if reserve_observer {
+    if let DomainPoolLayout::ReserveObserver { .. } = layout {
         lore_postgres::domain::observer_shared_pool_max(cfg.domain_pool_max).map_err(
             |message| {
                 PluginError::from(PluginConfigError {
@@ -1582,17 +1583,14 @@ pub(crate) async fn connect_domain_store(
     }
     let tls = build_tls(plugin_name, &cfg)?;
 
-    let connected = if reserve_observer {
-        PostgresDomainStore::connect_reserving_observer(&cfg.url, cfg.domain_pool_max, &tls).await
-    } else {
-        PostgresDomainStore::connect(&cfg.url, cfg.domain_pool_max, &tls).await
-    };
-    connected.map_err(|e| {
-        PluginError::from(PluginInitError {
-            plugin_name: plugin_name.to_string(),
-            message: format!("Failed to create Postgres domain store: {e}"),
+    PostgresDomainStore::connect_with_layout(&cfg.url, cfg.domain_pool_max, &tls, layout)
+        .await
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Postgres domain store: {e}"),
+            })
         })
-    })
 }
 
 /// Build the concrete Postgres mutable store from the plugin configuration.
@@ -3283,7 +3281,10 @@ staging_root = "/var/lib/loreserver/staging"
                 "url = \"postgres://unreachable.invalid/lore\"\ndomain_pool_max = {pool_max}"
             ))
             .expect("fixture parses");
-            let error = match connect_domain_store(&config, true).await {
+            let layout = DomainPoolLayout::ReserveObserver {
+                observe_interval: std::time::Duration::from_secs(1),
+            };
+            let error = match connect_domain_store(&config, layout).await {
                 Ok(_) => panic!("domain_pool_max {pool_max} must be refused"),
                 Err(error) => error.to_string(),
             };

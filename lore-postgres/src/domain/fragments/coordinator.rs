@@ -218,6 +218,73 @@ impl PostgresFragmentCoordinator {
     pub(crate) async fn checkout_for_test(&self) -> crate::pool::Client {
         self.pool.get().await.expect("test checkout")
     }
+
+    /// Checkouts this coordinator's pool has handed out so far.
+    pub(crate) fn acquired_for_test(&self) -> u64 {
+        self.pool.acquire_snapshot().acquired()
+    }
+
+    /// This pool's `statement_timeout`, as `SHOW` prints it.
+    pub(crate) async fn statement_timeout_for_test(&self) -> String {
+        let client = self.checkout_for_test().await;
+        client
+            .query_one("SHOW statement_timeout", &[])
+            .await
+            .expect("show statement_timeout")
+            .get(0)
+    }
+}
+
+/// The write-behind observer's view of the fragment coordinator, on the one
+/// domain connection reserved for it
+/// ([`PostgresDomainStore::fragment_stage_observer`]).
+///
+/// It exposes the observer's two reads and nothing else, so no other caller
+/// can be handed the reserved connection by mistake: that would take the
+/// connection the reservation exists to keep free (row 76). The wrapped
+/// coordinator is private for the same reason.
+#[derive(Clone)]
+pub struct FragmentStageObserver {
+    coordinator: PostgresFragmentCoordinator,
+}
+
+impl FragmentStageObserver {
+    /// [`PostgresFragmentCoordinator::verify_stage_policy`] on the reserved
+    /// connection.
+    pub async fn verify_stage_policy(
+        &self,
+        cell: &str,
+        revision: &str,
+        digest: &[u8; 32],
+    ) -> Result<(), DomainError> {
+        self.coordinator
+            .verify_stage_policy(cell, revision, digest)
+            .await
+    }
+
+    /// [`PostgresFragmentCoordinator::observe_stage`] on the reserved
+    /// connection.
+    pub async fn observe_stage(&self) -> Result<StageObservation, DomainError> {
+        self.coordinator.observe_stage().await
+    }
+}
+
+#[cfg(all(test, unix))]
+impl FragmentStageObserver {
+    /// The reserved connection's backend process id.
+    pub(crate) async fn backend_pid_for_test(&self) -> i32 {
+        let client = self.coordinator.checkout_for_test().await;
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .expect("backend pid")
+            .get(0)
+    }
+
+    /// The reserved connection's `statement_timeout`, as `SHOW` prints it.
+    pub(crate) async fn statement_timeout_for_test(&self) -> String {
+        self.coordinator.statement_timeout_for_test().await
+    }
 }
 
 impl PostgresFragmentCoordinator {
@@ -246,18 +313,18 @@ impl PostgresDomainStore {
         }
     }
 
-    /// A coordinator on the connection reserved for the write-behind
-    /// observer, or `None` when the store was not built with
-    /// [`PostgresDomainStore::connect_reserving_observer`]. Give it only to
-    /// the observer's reads: anything else that checks out through it takes
-    /// the connection the reservation exists to keep free.
-    pub fn fragment_observer_coordinator(&self) -> Option<PostgresFragmentCoordinator> {
-        self.observer_pool()
-            .map(|pool| PostgresFragmentCoordinator {
+    /// The write-behind observer's reads on the connection reserved for it,
+    /// or `None` when the store was built with [`DomainPoolLayout::Shared`].
+    ///
+    /// [`DomainPoolLayout::Shared`]: crate::domain::DomainPoolLayout::Shared
+    pub fn fragment_stage_observer(&self) -> Option<FragmentStageObserver> {
+        self.observer_pool().map(|pool| FragmentStageObserver {
+            coordinator: PostgresFragmentCoordinator {
                 pool: pool.clone(),
                 database_identity: self.identity().as_marker(),
                 outbox_cell_id: None,
-            })
+            },
+        })
     }
 }
 

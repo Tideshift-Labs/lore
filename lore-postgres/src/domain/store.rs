@@ -38,8 +38,23 @@ pub struct PostgresDomainStore {
     /// transactions against a different database from its mutable store.
     identity: DatabaseIdentity,
     /// One connection kept out of `pool` for the write-behind observer's
-    /// database reads. See [`Self::connect_reserving_observer`].
+    /// database reads. See [`Self::connect_with_layout`].
     observer_pool: Option<Pool>,
+}
+
+/// How [`PostgresDomainStore::connect_with_layout`] lays out the domain
+/// connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainPoolLayout {
+    /// Every connection in one shared pool.
+    Shared,
+    /// One connection reserved for the write-behind observer, whose reads must
+    /// answer inside `observe_interval`, and the rest shared.
+    ReserveObserver {
+        /// The observer's interval, which is also its per-attempt budget. The
+        /// reserved pool's statement and checkout timeouts derive from it.
+        observe_interval: std::time::Duration,
+    },
 }
 
 /// A value that is equal for two pools if and only if they address the same
@@ -110,11 +125,15 @@ impl PostgresDomainStore {
         pool_max: u32,
         tls: &crate::pool::TlsConfig,
     ) -> Result<Self, String> {
-        Self::connect_with(url, pool_max, tls, false).await
+        Self::connect_with_layout(url, pool_max, tls, DomainPoolLayout::Shared).await
     }
 
-    /// [`Self::connect`], with one of the `pool_max` connections reserved for
-    /// the write-behind observer ([`Self::fragment_observer_coordinator`]).
+    /// [`Self::connect`], with the domain connections laid out as `layout`
+    /// says.
+    ///
+    /// With [`DomainPoolLayout::ReserveObserver`], one of the `pool_max`
+    /// connections is reserved for the write-behind observer
+    /// ([`Self::fragment_stage_observer`]).
     ///
     /// Row 76: the observer's policy and ledger reads queued behind PUTs,
     /// drain, cleanup and staged reads on the shared domain pool. Each missed
@@ -126,30 +145,22 @@ impl PostgresDomainStore {
     /// connections and the observer pool opens 1, so the process still holds
     /// at most `pool_max` domain connections, which is what the six-slot
     /// process budget (`FragmentProcessPoolInventory`) counts. The cost is one
-    /// connection less for everything else.
+    /// connection less for everything else. The observer pool's timeouts are
+    /// [`crate::pool::build_observer_pool`]'s.
     ///
     /// # Errors
     ///
-    /// Refuses a `pool_max` below 2, which would leave the shared pool empty,
-    /// and an observer pool that reaches a different database.
-    pub async fn connect_reserving_observer(
+    /// Refuses a reserving `pool_max` below 2, which would leave the shared
+    /// pool empty, and an observer pool that reaches a different database.
+    pub async fn connect_with_layout(
         url: &str,
         pool_max: u32,
         tls: &crate::pool::TlsConfig,
+        layout: DomainPoolLayout,
     ) -> Result<Self, String> {
-        Self::connect_with(url, pool_max, tls, true).await
-    }
-
-    async fn connect_with(
-        url: &str,
-        pool_max: u32,
-        tls: &crate::pool::TlsConfig,
-        reserve_observer: bool,
-    ) -> Result<Self, String> {
-        let shared_max = if reserve_observer {
-            observer_shared_pool_max(pool_max)?
-        } else {
-            pool_max
+        let shared_max = match layout {
+            DomainPoolLayout::Shared => pool_max,
+            DomainPoolLayout::ReserveObserver { .. } => observer_shared_pool_max(pool_max)?,
         };
         let pool = crate::pool::build_pool_named(url, shared_max, tls, "domain")?;
         // Skip completed DDL and commit each missing statement before the next
@@ -174,17 +185,20 @@ impl PostgresDomainStore {
             .await
             .map_err(|e| format!("postgres domain store identity: {e}"))?;
 
-        let observer_pool = if reserve_observer {
-            let observer = crate::pool::build_pool_named(url, 1, tls, "domain_observer")?;
-            let observed = read_database_identity(&observer)
-                .await
-                .map_err(|e| format!("postgres domain observer identity: {e}"))?;
-            if observed != identity {
-                return Err("postgres domain observer pool reached a different database".to_owned());
+        let observer_pool = match layout {
+            DomainPoolLayout::Shared => None,
+            DomainPoolLayout::ReserveObserver { observe_interval } => {
+                let observer = crate::pool::build_observer_pool(url, tls, observe_interval)?;
+                let observed = read_database_identity(&observer)
+                    .await
+                    .map_err(|e| format!("postgres domain observer identity: {e}"))?;
+                if observed != identity {
+                    return Err(
+                        "postgres domain observer pool reached a different database".to_owned()
+                    );
+                }
+                Some(observer)
             }
-            Some(observer)
-        } else {
-            None
         };
         let store = Self {
             pool,

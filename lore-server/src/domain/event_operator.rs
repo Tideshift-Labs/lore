@@ -7,6 +7,7 @@ use lore_postgres::domain::outbox::initialization::FreshEventInitialization;
 use lore_postgres::domain::outbox::initialization::FreshEventInitializationOutcome;
 use lore_postgres::domain::outbox::initialization::initialize_empty;
 
+use crate::plugins::postgres::DomainPoolLayout;
 use crate::plugins::postgres::assert_domain_store_colocated;
 use crate::plugins::postgres::connect_domain_store;
 use crate::plugins::postgres::connect_relay_pool;
@@ -70,7 +71,7 @@ pub async fn initialize(
             .ok_or_else(|| anyhow!("missing Postgres configuration for {store_type}"))?;
         configs.push((store_type, config));
     }
-    let store = connect_domain_store(&configs[0].1, false)
+    let store = connect_domain_store(&configs[0].1, DomainPoolLayout::Shared)
         .await
         .map_err(|e| anyhow!("{e}"))?;
     for (label, config) in &configs {

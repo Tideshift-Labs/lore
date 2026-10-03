@@ -8,6 +8,7 @@ use lore_postgres::domain::fragments::initialization::CleanCellInitialization;
 use lore_postgres::domain::fragments::initialization::CleanCellInitializationOutcome;
 use lore_postgres::domain::fragments::upgrade::FragmentSchemaUpgradeOutcome;
 
+use crate::plugins::postgres::DomainPoolLayout;
 use crate::plugins::postgres::assert_domain_store_colocated;
 use crate::plugins::postgres::connect_clean_namespace_inspector;
 use crate::plugins::postgres::connect_domain_store;
@@ -42,7 +43,7 @@ pub async fn upgrade(
             .ok_or_else(|| anyhow!("missing Postgres configuration for {store_type}"))?;
         configs.push((store_type, config));
     }
-    let store = connect_domain_store(&configs[0].1, false)
+    let store = connect_domain_store(&configs[0].1, DomainPoolLayout::Shared)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     for (label, config) in &configs {
@@ -109,7 +110,7 @@ pub async fn initialize(
             .ok_or_else(|| anyhow!("missing Postgres configuration for {store_type}"))?;
         configs.push((store_type, config));
     }
-    let store = connect_domain_store(&configs[0].1, false)
+    let store = connect_domain_store(&configs[0].1, DomainPoolLayout::Shared)
         .await
         .map_err(|error| anyhow!("{error}"))?;
     for (label, config) in &configs {

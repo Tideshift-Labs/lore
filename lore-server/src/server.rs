@@ -1171,7 +1171,7 @@ async fn configure_immutable_store_via_plugin(
     settings: &Settings,
     topology: Option<Arc<dyn Topology + Send + Sync>>,
     fragment_activation: Option<plugins::postgres::FragmentProviderActivation>,
-    write_behind_observer: Option<lore_postgres::domain::fragments::PostgresFragmentCoordinator>,
+    write_behind_observer: Option<lore_postgres::domain::fragments::FragmentStageObserver>,
 ) -> Result<(
     Arc<dyn ImmutableStore>,
     Option<FragmentCellRetentionHandle>,
@@ -2448,7 +2448,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     &settings,
                     topology.clone(),
                     Some(fragment_activation),
-                    configured_domain.fragment_observer_coordinator.clone(),
+                    configured_domain.fragment_stage_observer.clone(),
                 )
                 .await?;
             (

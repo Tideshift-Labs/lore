@@ -38,6 +38,7 @@ use lore_base::types::Hash;
 use lore_base::types::KeyType;
 use lore_base::types::RepositoryId;
 use lore_postgres::domain::DatabaseIdentity;
+use lore_postgres::domain::DomainPoolLayout;
 use lore_postgres::domain::DomainSchemaState;
 use lore_postgres::domain::bypass::DomainEnforcement;
 use lore_postgres::domain::coordinator::BranchDeleteInput;
@@ -53,6 +54,7 @@ use lore_postgres::domain::coordinator::ProjectionWrite;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::coordinator::RepositoryDeleteInput;
 use lore_postgres::domain::errors::DomainOutcome;
+use lore_postgres::domain::fragments::FragmentStageObserver;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::locks::LockFencingReadiness;
 use lore_postgres::domain::locks::PostgresLockCoordinator;
@@ -2988,10 +2990,10 @@ pub struct ConfiguredDomainContext {
     /// Server composition passes this only to the Postgres immutable store;
     /// other immutable-store modes never receive or construct a provider route.
     pub fragment_coordinator: Option<PostgresFragmentCoordinator>,
-    /// The write-behind observer's coordinator, on the one domain connection
-    /// reserved for it. `Some` exactly when write-behind is enabled. Compose it
-    /// into the write-behind handle and nothing else.
-    pub fragment_observer_coordinator: Option<PostgresFragmentCoordinator>,
+    /// The write-behind observer's two reads, on the one domain connection
+    /// reserved for it. `Some` exactly when write-behind is enabled. The type
+    /// exposes nothing else, so nothing else can take that connection.
+    pub fragment_stage_observer: Option<FragmentStageObserver>,
     /// Physical identity positively shared by the domain, immutable, mutable,
     /// and lock pools: `PostgreSQL` system identifier plus database OID.
     ///
@@ -3006,7 +3008,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
             context: None,
             mutable_enforcement: None,
             fragment_coordinator: None,
-            fragment_observer_coordinator: None,
+            fragment_stage_observer: None,
             database_identity: None,
         });
     }
@@ -3023,8 +3025,13 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     // Row 76: an enabled write-behind tier reserves one of the domain pool's
     // connections for its observer, so its reads never queue behind PUTs,
     // drain and staged reads.
-    let reserve_observer = crate::server::postgres_write_behind_settings(settings)?.is_some();
-    let store = connect_domain_store(&domain_config, reserve_observer)
+    let layout = match crate::server::postgres_write_behind_settings(settings)? {
+        Some(write_behind) => DomainPoolLayout::ReserveObserver {
+            observe_interval: write_behind.runtime.observer_interval(),
+        },
+        None => DomainPoolLayout::Shared,
+    };
+    let store = connect_domain_store(&domain_config, layout)
         .await
         .map_err(|e| anyhow!("Failed to create the Postgres domain coordinator: {e}"))?;
 
@@ -3112,7 +3119,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
     // CR-032 summaries that the governed repository seam stamps on its rows, so
     // it is resolved once, here, and handed to both. Under `live_only` it gets
     // none, which is that coordinator's existing "append nothing" state.
-    let observer_coordinator = store.fragment_observer_coordinator();
+    let stage_observer = store.fragment_stage_observer();
     let fragment_coordinator =
         store
             .fragment_coordinator()
@@ -3174,7 +3181,7 @@ pub async fn configure_domain_context(settings: &Settings) -> Result<ConfiguredD
         context: Some(Arc::new(context)),
         mutable_enforcement: Some(mutable_enforcement),
         fragment_coordinator: Some(fragment_coordinator),
-        fragment_observer_coordinator: observer_coordinator,
+        fragment_stage_observer: stage_observer,
         database_identity: Some(database_identity),
     })
 }

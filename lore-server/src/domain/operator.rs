@@ -96,6 +96,7 @@ use serde_json::json;
 
 use crate::domain::backfill_source::CellBackfillSource;
 use crate::domain::lock_fencing_settings_preconditions;
+use crate::plugins::postgres::DomainPoolLayout;
 use crate::plugins::postgres::assert_domain_store_colocated;
 use crate::plugins::postgres::connect_domain_store;
 use crate::plugins::postgres::connect_immutable_store;
@@ -447,7 +448,7 @@ impl DomainOperatorContext {
                     )
                 })?;
 
-        let store = connect_domain_store(&plugin_config, false)
+        let store = connect_domain_store(&plugin_config, DomainPoolLayout::Shared)
             .await
             .map_err(|error| anyhow!("Failed to open the Postgres domain coordinator: {error}"))?;
 

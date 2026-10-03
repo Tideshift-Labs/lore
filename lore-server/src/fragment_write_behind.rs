@@ -112,6 +112,11 @@ impl FragmentWriteBehindSettings {
             cleanup_batch,
         })
     }
+
+    /// How often the observer runs, which is also each attempt's budget.
+    pub(crate) fn observer_interval(&self) -> Duration {
+        self.observer_interval
+    }
 }
 
 #[derive(Default)]
@@ -134,6 +139,9 @@ struct State {
     /// Recording when the run began is what lets a transient disagreement clear
     /// without ever reaching the readiness verdict.
     capacity_unavailable_since: Option<Instant>,
+    /// Whether the current `capacity_unavailable_since` run began at the first
+    /// good observation after a stale gap. See `record_observation`.
+    capacity_run_began_after_stale_gap: bool,
     /// When the current unbroken run of failed observations began. `None` once
     /// an observation succeeds. The observer was blind for this run, so see
     /// `record_observation` for what that time does and does not count against.
@@ -369,6 +377,17 @@ fn record_pass_outcome(
 /// stall reaches every replica, so the next ordinary transient disagreement
 /// would then eject every replica at once. So that run starts again.
 ///
+/// **A run that began right after a stale gap survives the next one (row 76
+/// review).** Restarting at every stale gap hid a full stage whose good
+/// observations all arrived at least `stale_after` apart: each restarted the
+/// run, so it alternated `observation_unknown` and ready and never answered
+/// `capacity_unavailable`. So a run that began at the first good observation
+/// after a stale gap, and has seen no room since, is kept across the next stale
+/// gap. The stall-then-recovery case above is unchanged: its run began before
+/// the stall and still restarts. The cost: two stale gaps in a row, each
+/// followed by a transient disagreement with no sample showing room in between,
+/// answer `capacity_unavailable` at once.
+///
 /// **A failed observation is not an unknown one yet (row 76).** It keeps the
 /// last good observation, which ages out over `stale_after` like every other
 /// transient condition, so `observation_unknown` answers 503 only once the
@@ -415,6 +434,7 @@ fn record_observation(
         return;
     };
     let after_gap = state.observation_failed_since.take();
+    let mut after_stale_gap = false;
     if let Some(failed_since) = after_gap {
         let blind = at.saturating_duration_since(failed_since);
         state.progress = state
@@ -424,18 +444,20 @@ fn record_observation(
         // last good observation, not the failure run, which starts up to one
         // interval later and, for a timed-out attempt, is recorded only when
         // the attempt ends.
-        if state
+        after_stale_gap = state
             .observation
             .as_ref()
-            .is_some_and(|(previous, _)| at.saturating_duration_since(*previous) >= stale_after)
-        {
+            .is_some_and(|(previous, _)| at.saturating_duration_since(*previous) >= stale_after);
+        if after_stale_gap && !state.capacity_run_began_after_stale_gap {
             state.capacity_unavailable_since = None;
         }
     }
     if value.capacity_available {
         state.capacity_unavailable_since = None;
-    } else {
-        state.capacity_unavailable_since.get_or_insert(at);
+        state.capacity_run_began_after_stale_gap = false;
+    } else if state.capacity_unavailable_since.is_none() {
+        state.capacity_unavailable_since = Some(at);
+        state.capacity_run_began_after_stale_gap = after_stale_gap;
     }
     if after_gap.is_none()
         && state
@@ -2366,6 +2388,60 @@ mod tests {
             record_observation(&mut state, None, now - Duration::from_secs(seconds));
         }
         record_observation(&mut state, Some(capacity_observation(false)), now);
+        assert_eq!(state.capacity_unavailable_since, Some(now));
+        assert_eq!(reason(&state), None);
+    }
+
+    /// One good observation after `failures` seconds of failed ones, ending at
+    /// `at`.
+    fn observe_after_failures(
+        state: &mut State,
+        at: Instant,
+        failures: u64,
+        observation: WriteBehindObservation,
+    ) {
+        for seconds in (1..=failures).rev() {
+            record_observation(state, None, at - Duration::from_secs(seconds));
+        }
+        record_observation(state, Some(observation), at);
+    }
+
+    #[test]
+    fn a_full_stage_seen_only_between_stale_gaps_still_reaches_capacity_unavailable() {
+        // Row 76 review: good observations 6 s apart, each after a failure run
+        // long enough to answer `observation_unknown`. Each restarted the run,
+        // so a full stage alternated `observation_unknown` and ready and never
+        // answered `capacity_unavailable`.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        for cycle in (0..=3u64).rev() {
+            let at = now - Duration::from_secs(cycle * 6);
+            observe_after_failures(&mut state, at, 5, capacity_observation(false));
+        }
+        assert_eq!(
+            state.capacity_unavailable_since,
+            Some(now - Duration::from_secs(12)),
+            "the run restarted after the first stale gap survives the next ones"
+        );
+        assert_eq!(reason(&state), Some("capacity_unavailable"));
+    }
+
+    #[test]
+    fn a_room_sample_after_a_stale_gap_ends_the_carry() {
+        // The carry is for a run that began right after a stale gap and saw no
+        // room since. A sample with room ends that run, and a later run that
+        // began on an ordinary sample restarts at the next stale gap as before.
+        let now = Instant::now();
+        let mut state = healthy_state(now);
+        let at = now - Duration::from_secs(18);
+        observe_after_failures(&mut state, at, 5, capacity_observation(false));
+        let at = now - Duration::from_secs(12);
+        observe_after_failures(&mut state, at, 5, capacity_observation(false));
+        let at = now - Duration::from_secs(11);
+        record_observation(&mut state, Some(capacity_observation(true)), at);
+        let at = now - Duration::from_secs(6);
+        record_observation(&mut state, Some(capacity_observation(false)), at);
+        observe_after_failures(&mut state, now, 5, capacity_observation(false));
         assert_eq!(state.capacity_unavailable_since, Some(now));
         assert_eq!(reason(&state), None);
     }

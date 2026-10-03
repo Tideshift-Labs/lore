@@ -34,6 +34,7 @@
 //! hard `internal` error, mirroring how `lore-aws` maps throttling/timeouts.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 /// The pool and pooled-client types this crate's stores and domain APIs take,
 /// re-exported so a consumer crate can name them without declaring its own
@@ -506,28 +507,120 @@ pub fn build_pool_named(
     tls: &TlsConfig,
     name: &'static str,
 ) -> Result<Pool, String> {
-    let pg_config = url
-        .parse::<tokio_postgres::Config>()
-        .map_err(|e| format!("invalid postgres url: {e}"))?;
-    let connector = make_tls(tls)?;
-    let manager = Manager::from_config(
-        pg_config,
-        connector,
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
+    let manager = build_manager(url, tls, RecyclingMethod::Fast)?;
     let inner = deadpool_postgres::Pool::builder(manager)
         .max_size(pool_max as usize)
         .build()
         .map_err(|e| format!("failed to build postgres pool: {e}"))?;
-    Ok(Pool {
+    Ok(named_pool(inner, name))
+}
+
+fn build_manager(
+    url: &str,
+    tls: &TlsConfig,
+    recycling_method: RecyclingMethod,
+) -> Result<Manager, String> {
+    let pg_config = url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|e| format!("invalid postgres url: {e}"))?;
+    let connector = make_tls(tls)?;
+    Ok(Manager::from_config(
+        pg_config,
+        connector,
+        ManagerConfig { recycling_method },
+    ))
+}
+
+fn named_pool(inner: deadpool_postgres::Pool, name: &'static str) -> Pool {
+    Pool {
         inner,
         acquire: Arc::new(PoolAcquireMetrics::new(
             &PostgresPoolInstrumentProvider,
             name,
         )),
-    })
+    }
+}
+
+/// The bounds on the write-behind observer's reserved connection, derived from
+/// the observer's interval (its per-attempt budget).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObserverPoolTimeouts {
+    /// The session `statement_timeout`: nine tenths of the interval. A read
+    /// the observer gave up on is cancelled by the server soon after, so it
+    /// cannot hold the one connection into the next attempt.
+    pub statement: Duration,
+    /// How long a checkout waits for the connection. The observer runs one
+    /// attempt at a time, so this only bounds a misuse.
+    pub wait: Duration,
+    /// How long opening a replacement connection may take.
+    pub create: Duration,
+    /// How long the health check on a returned connection may take before the
+    /// connection is dropped and replaced.
+    pub recycle: Duration,
+}
+
+impl ObserverPoolTimeouts {
+    /// The bounds for an observer that runs every `interval`.
+    pub fn for_interval(interval: Duration) -> Self {
+        let floor = Duration::from_millis(1);
+        let statement = (interval * 9 / 10).max(floor);
+        Self {
+            statement,
+            wait: statement,
+            create: (statement / 2).max(floor),
+            recycle: (statement / 4).max(floor),
+        }
+    }
+}
+
+/// Build the one-connection pool reserved for the write-behind observer (row
+/// 76), labelled `domain_observer`.
+///
+/// It differs from [`build_pool_named`] in three ways, all so a bad connection
+/// costs one observation and not every later one:
+///
+/// - Each new connection sets a session `statement_timeout` just under
+///   `observe_interval` ([`ObserverPoolTimeouts::statement`]). The observer
+///   drops a read it timed out on, but the server keeps running it; without
+///   the timeout, the next attempt queues behind that read on the same
+///   connection. It is set with `SET` after connecting, not as a startup
+///   option, so it also works through a session-mode pooler.
+/// - The connection is health-checked on every checkout
+///   ([`RecyclingMethod::Verified`]), under a recycle timeout. A half-open or
+///   still-busy connection fails the check and is replaced.
+/// - Checkout wait and connect have timeouts, so a checkout fails instead of
+///   waiting forever.
+///
+/// Every failure surfaces as an error to the observer, which answers it as a
+/// failed observation (fail closed). Nothing falls back to the shared pool.
+pub fn build_observer_pool(
+    url: &str,
+    tls: &TlsConfig,
+    observe_interval: Duration,
+) -> Result<Pool, String> {
+    let timeouts = ObserverPoolTimeouts::for_interval(observe_interval);
+    let manager = build_manager(url, tls, RecyclingMethod::Verified)?;
+    let set_timeout = format!("SET statement_timeout = {}", timeouts.statement.as_millis());
+    let inner = deadpool_postgres::Pool::builder(manager)
+        .max_size(1)
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .wait_timeout(Some(timeouts.wait))
+        .create_timeout(Some(timeouts.create))
+        .recycle_timeout(Some(timeouts.recycle))
+        .post_create(deadpool_postgres::Hook::async_fn(
+            move |client, _metrics| {
+                let set_timeout = set_timeout.clone();
+                Box::pin(async move {
+                    client
+                        .batch_execute(&set_timeout)
+                        .await
+                        .map_err(deadpool_postgres::HookError::Backend)
+                })
+            },
+        ))
+        .build()
+        .map_err(|e| format!("failed to build postgres observer pool: {e}"))?;
+    Ok(named_pool(inner, "domain_observer"))
 }
 
 fn make_tls(tls: &TlsConfig) -> Result<MakeRustlsConnect, String> {
@@ -800,5 +893,38 @@ mod tests {
             !sqlstate_is_transient(""),
             "empty string must not be transient"
         );
+    }
+
+    #[test]
+    fn observer_pool_bounds_stay_inside_the_observe_interval() {
+        use std::time::Duration;
+
+        use super::ObserverPoolTimeouts;
+
+        let millis = Duration::from_millis;
+        assert_eq!(
+            ObserverPoolTimeouts::for_interval(millis(1_000)),
+            ObserverPoolTimeouts {
+                statement: millis(900),
+                wait: millis(900),
+                create: millis(450),
+                recycle: millis(225),
+            }
+        );
+        for interval in [1, 2, 10, 1_000, 60_000].map(millis) {
+            let bounds = ObserverPoolTimeouts::for_interval(interval);
+            for bound in [bounds.statement, bounds.wait, bounds.create, bounds.recycle] {
+                assert!(
+                    bound >= millis(1),
+                    "a zero bound means no timeout: {bounds:?}"
+                );
+            }
+            if interval >= millis(10) {
+                assert!(
+                    bounds.statement < interval,
+                    "a read must be cancelled before the next attempt: {bounds:?}"
+                );
+            }
+        }
     }
 }

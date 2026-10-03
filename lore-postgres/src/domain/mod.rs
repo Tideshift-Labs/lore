@@ -64,6 +64,7 @@ pub mod store;
 pub use errors::DomainError;
 pub use errors::DomainOutcome;
 pub use store::DatabaseIdentity;
+pub use store::DomainPoolLayout;
 pub use store::DomainSchemaState;
 pub use store::PostgresDomainStore;
 pub use store::observer_shared_pool_max;
