@@ -212,39 +212,9 @@ pub struct PostgresFragmentCoordinator {
     /// still performs every lifecycle mutation and simply produces no outbox
     /// rows, matching what the governed repository seam does.
     outbox_cell_id: Option<String>,
-    /// The one connection every method of a [`Self::holding_connection`] clone
-    /// runs on, or `None` for a coordinator that checks out per method.
-    held: Option<Arc<tokio::sync::Mutex<crate::pool::PooledClient>>>,
     /// Coalesces concurrent small resolves into one statement (row 79).
     /// Shared by every clone, so one batch can serve all of them.
     resolver: Arc<resolve_batch::ResolveBatcher<resolve_batch::PooledResolver>>,
-}
-
-/// The connection one coordinator method runs on: its own checkout, or the
-/// connection a [`PostgresFragmentCoordinator::holding_connection`] clone holds.
-enum CoordinatorClient {
-    Pooled(Box<crate::pool::PooledClient>),
-    Held(tokio::sync::OwnedMutexGuard<crate::pool::PooledClient>),
-}
-
-impl std::ops::Deref for CoordinatorClient {
-    type Target = deadpool_postgres::ClientWrapper;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Pooled(client) => client,
-            Self::Held(client) => client,
-        }
-    }
-}
-
-impl std::ops::DerefMut for CoordinatorClient {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        match self {
-            Self::Pooled(client) => client,
-            Self::Held(client) => client,
-        }
-    }
 }
 
 #[cfg(all(test, unix))]
@@ -329,7 +299,6 @@ impl PostgresFragmentCoordinator {
             pool: pool.clone(),
             database_identity,
             outbox_cell_id: None,
-            held: None,
             resolver: Arc::new(resolve_batch::ResolveBatcher::new(
                 resolve_batch::PooledResolver::new(pool.clone()),
             )),
@@ -348,36 +317,6 @@ impl PostgresFragmentCoordinator {
     pub fn with_outbox_cell_id(mut self, cell_id: Option<String>) -> Self {
         self.outbox_cell_id = cell_id;
         self
-    }
-
-    /// A clone that runs every method on one connection, checked out now and
-    /// returned to the pool when the clone is dropped.
-    ///
-    /// For a caller that makes several short transactions in a row, such as one
-    /// fragment promotion (row 77): one pool wait instead of one per step. Each
-    /// method still commits its own transaction, so no row lock or transaction
-    /// outlives the method. Only the idle connection is held, and it is held
-    /// across whatever I/O the caller does between methods. This is the one
-    /// exception to the module's "connection released before I/O" shape, and it
-    /// costs the pool that connection for the caller's whole sequence.
-    ///
-    /// Methods on one holding clone run one at a time. A second concurrent
-    /// call, or a method that nests another, is refused rather than queued.
-    /// Methods that use the pool directly instead of `checkout` (none on the
-    /// promotion path) still take their own connection.
-    pub(crate) async fn holding_connection(&self) -> Result<Self, DomainError> {
-        let client = self.checkout().await?;
-        let client = match client {
-            CoordinatorClient::Pooled(client) => *client,
-            CoordinatorClient::Held(_) => {
-                return Err(DomainError::Internal(
-                    "fragment coordinator already holds a connection".to_owned(),
-                ));
-            }
-        };
-        let mut held = self.clone();
-        held.held = Some(Arc::new(tokio::sync::Mutex::new(client)));
-        Ok(held)
     }
 }
 
@@ -2563,10 +2502,9 @@ impl PostgresFragmentCoordinator {
         Ok(authoritative)
     }
 
-    /// Every resolve runs here. A small call on a pooled coordinator joins the
-    /// resolve batcher, which answers concurrent calls for one repository from
-    /// one statement and one checkout (row 79). A held coordinator and a call
-    /// at the batch bound run alone, exactly as before.
+    /// Every resolve runs here. A small call joins the resolve batcher, which
+    /// answers concurrent calls for one repository from one statement and one
+    /// checkout (row 79). A call at the batch bound runs alone, as before.
     async fn resolve_scoped(
         &self,
         repository_id: &[u8],
@@ -2575,7 +2513,7 @@ impl PostgresFragmentCoordinator {
         if requested.is_empty() {
             return Ok(Vec::new());
         }
-        if self.held.is_none() && requested.len() < resolve_batch::MAX_RESOLVE_BATCH_HASHES {
+        if requested.len() < resolve_batch::MAX_RESOLVE_BATCH_HASHES {
             return self
                 .resolver
                 .resolve(repository_id, requested.to_vec())
@@ -5572,24 +5510,13 @@ impl PostgresFragmentCoordinator {
     #[track_caller]
     fn checkout(
         &self,
-    ) -> impl std::future::Future<Output = Result<CoordinatorClient, DomainError>> + Send + '_ {
+    ) -> impl std::future::Future<Output = Result<crate::pool::PooledClient, DomainError>> + Send + '_
+    {
         let site = crate::pool::CheckoutSite::caller();
         async move {
-            if let Some(held) = &self.held {
-                return held
-                    .clone()
-                    .try_lock_owned()
-                    .map(CoordinatorClient::Held)
-                    .map_err(|_busy| {
-                        DomainError::Internal(
-                            "the held fragment coordinator connection is already in use".to_owned(),
-                        )
-                    });
-            }
             self.pool
                 .get_at(site)
                 .await
-                .map(|client| CoordinatorClient::Pooled(Box::new(client)))
                 .map_err(|error| DomainError::from_pool("fragment coordinator pool", error))
         }
     }

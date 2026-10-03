@@ -451,20 +451,21 @@ async fn adapter_created_put_publishes_once_and_uses_real_reservation_and_claim(
     assert_eq!(rows, 1, "one accepted physical reservation");
 }
 
-/// Row 77: a promotion makes two shared domain checkouts, not three. One
-/// connection carries `begin_promotion` and `authorize_write_claim`, and is
-/// released before the provider PUT (the stalled-PUT case below pins that);
-/// `commit_promotion` takes the second. The pass's candidate read is the third.
+/// Row 79: a promotion holds no domain connection across its spool reserve,
+/// write and ready steps. `begin_promotion`, `authorize_write_claim` and
+/// `commit_promotion` each take their own short checkout, so a promotion makes
+/// three; row 77's held connection made two and sat idle through the spool
+/// I/O. The pass's candidate read is the fourth.
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
-async fn adapter_promotion_makes_two_domain_checkouts() {
+async fn adapter_promotion_checks_out_separately_for_begin_authorize_and_commit() {
     let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
     let before = fixture.handle.coordinator.acquired_for_test();
     assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 1);
     assert_eq!(
         fixture.handle.coordinator.acquired_for_test() - before,
-        3,
-        "one candidate read plus two promotion checkouts"
+        4,
+        "one candidate read plus three promotion checkouts"
     );
     assert_eq!(
         fixture.current().await.state,

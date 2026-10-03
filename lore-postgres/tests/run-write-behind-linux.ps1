@@ -213,7 +213,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_before_object_effect_keeps_source_and_send_barrier',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_created_put_publishes_once_and_uses_real_reservation_and_claim',
-    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_promotion_makes_two_domain_checkouts',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_promotion_checks_out_separately_for_begin_authorize_and_commit',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_parallel_drain_respects_its_concurrency_bound',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_parallel_drain_promotes_each_fragment_once',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_parallel_drain_records_no_progress_when_every_send_fails',
