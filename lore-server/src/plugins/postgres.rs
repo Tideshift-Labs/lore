@@ -382,6 +382,9 @@ pub struct WriteBehindConfig {
     pub policy_digest: Option<String>,
     pub worker_interval_millis: Option<u64>,
     pub worker_batch: Option<u32>,
+    /// How many promotions one drain pass runs at once. Optional; defaults to
+    /// the smaller of 4 and the shared domain pool.
+    pub worker_concurrency: Option<usize>,
     pub observer_interval_millis: Option<u64>,
     pub cleanup_interval_millis: Option<u64>,
     pub cleanup_batch: Option<u32>,
@@ -868,6 +871,7 @@ fn validated_write_behind_settings(
         raw.cleanup_interval_millis.unwrap_or(5_000),
         raw.cleanup_batch.unwrap_or(64),
     )
+    .and_then(|runtime| runtime.with_worker_concurrency(raw.worker_concurrency))
     .map_err(|error| write_behind_error(name, error.to_string()))?;
     Ok(WriteBehindComposition {
         settings,

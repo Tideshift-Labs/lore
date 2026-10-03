@@ -14,6 +14,7 @@ use anyhow::bail;
 use lore_base::lore_spawn;
 use lore_postgres::store::fragment_write_behind::CapacityEvidence;
 use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
+use lore_postgres::store::fragment_write_behind::MAX_DRAIN_CONCURRENCY;
 use lore_postgres::store::fragment_write_behind::ObserveStep;
 use lore_postgres::store::fragment_write_behind::ObserveTrace;
 use lore_postgres::store::fragment_write_behind::WriteBehindActivity;
@@ -74,6 +75,8 @@ fn instruments() -> &'static Instruments {
 pub(crate) struct FragmentWriteBehindSettings {
     worker_interval: Duration,
     worker_batch: u32,
+    /// `None` keeps the handle's default (row 77).
+    worker_concurrency: Option<usize>,
     observer_interval: Duration,
     stale_after: Duration,
     cleanup_interval: Duration,
@@ -106,11 +109,22 @@ impl FragmentWriteBehindSettings {
         Ok(Self {
             worker_interval: Duration::from_millis(worker),
             worker_batch: batch,
+            worker_concurrency: None,
             observer_interval: Duration::from_millis(observer),
             stale_after: Duration::from_millis(stale),
             cleanup_interval: Duration::from_millis(cleanup),
             cleanup_batch,
         })
+    }
+
+    /// Set how many promotions one drain pass runs at once, or keep the
+    /// handle's default with `None`.
+    pub(crate) fn with_worker_concurrency(mut self, concurrency: Option<usize>) -> Result<Self> {
+        if concurrency.is_some_and(|value| !(1..=MAX_DRAIN_CONCURRENCY).contains(&value)) {
+            bail!("write-behind worker_concurrency must be between 1 and {MAX_DRAIN_CONCURRENCY}");
+        }
+        self.worker_concurrency = concurrency;
+        Ok(self)
     }
 
     /// How often the observer runs, which is also each attempt's budget.
@@ -795,6 +809,9 @@ pub(crate) fn configure_fragment_write_behind(
         (Some(handle), Some(settings)) => (handle, settings),
         _ => bail!("write-behind runtime composition is incomplete"),
     };
+    if let Some(concurrency) = settings.worker_concurrency {
+        handle.set_drain_concurrency(concurrency);
+    }
     let readiness = Arc::new(FragmentWriteBehindReadiness {
         handle: handle.clone(),
         state: Mutex::new(State::default()),
@@ -987,6 +1004,26 @@ pub(crate) fn configure_fragment_write_behind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_concurrency_is_optional_and_bounded() {
+        let settings = || FragmentWriteBehindSettings::new(1000, 64, 1000, 5000, 5000, 64).unwrap();
+        assert_eq!(settings().worker_concurrency, None);
+        for value in [1, MAX_DRAIN_CONCURRENCY] {
+            let set = settings().with_worker_concurrency(Some(value)).unwrap();
+            assert_eq!(set.worker_concurrency, Some(value));
+        }
+        assert_eq!(
+            settings()
+                .with_worker_concurrency(None)
+                .unwrap()
+                .worker_concurrency,
+            None
+        );
+        for value in [0, MAX_DRAIN_CONCURRENCY + 1] {
+            assert!(settings().with_worker_concurrency(Some(value)).is_err());
+        }
+    }
 
     #[test]
     fn bounded_scheduler_settings_require_room_for_fresh_observations() {

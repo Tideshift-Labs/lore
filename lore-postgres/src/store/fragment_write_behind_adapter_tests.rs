@@ -50,6 +50,12 @@ struct Port {
     remote: FragmentGetResponse,
     puts: Arc<AtomicUsize>,
     gets: Arc<AtomicUsize>,
+    /// More fragments a test staged beside `body`.
+    extra_bodies: Arc<std::sync::Mutex<Vec<Bytes>>>,
+    /// How long each PUT stays in flight, in milliseconds.
+    put_delay_ms: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
 }
 
 impl FragmentTransportPort for Port {
@@ -69,13 +75,27 @@ impl FragmentDirectPutPort for Port {
         request: FragmentDirectPutRequest<'a>,
     ) -> Pin<Box<dyn Future<Output = FragmentTransportExchange> + Send + 'a>> {
         Box::pin(async move {
-            assert_eq!(
-                request.body(),
-                Some(self.body.as_ref()),
+            let body = request.body().expect("a drain PUT carries a body");
+            let staged = body == self.body.as_ref()
+                || self
+                    .extra_bodies
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|extra| extra.as_ref() == body);
+            assert!(
+                staged,
                 "transport sees exactly the validated durable source"
             );
-            assert_eq!(request.blake3(), Some(blake3::hash(&self.body).as_bytes()));
+            assert_eq!(request.blake3(), Some(blake3::hash(body).as_bytes()));
             self.puts.fetch_add(1, Ordering::SeqCst);
+            let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_in_flight.fetch_max(in_flight, Ordering::SeqCst);
+            let delay = self.put_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
             let (outcome, response) = match self.result {
                 PutResult::Created => (
                     ProviderAttemptOutcome::Decisive,
@@ -202,6 +222,10 @@ impl Fixture {
             remote,
             puts: Arc::new(AtomicUsize::new(0)),
             gets: Arc::new(AtomicUsize::new(0)),
+            extra_bodies: Arc::new(std::sync::Mutex::new(Vec::new())),
+            put_delay_ms: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: Arc::new(AtomicUsize::new(0)),
         };
         let provider = Arc::new(
             FragmentProviderEntry::connect(
@@ -446,6 +470,147 @@ async fn adapter_promotion_makes_two_domain_checkouts() {
         fixture.current().await.state,
         FragmentLifecycleState::Remote
     );
+}
+
+impl Fixture {
+    /// Stage `count` more distinct fragments beside the fixture's own, and let
+    /// the port accept their bodies.
+    async fn stage_more(&self, tag: &str, count: usize) -> Vec<Address> {
+        let mut addresses = Vec::new();
+        for ordinal in 0..count {
+            let bytes = Bytes::from(format!("{tag} payload {ordinal} repeated ").repeat(512));
+            let address = Address {
+                context: Context::default(),
+                hash: Hash::from(blake3::hash(&bytes).as_bytes().as_slice()),
+            };
+            self.port.extra_bodies.lock().unwrap().push(bytes.clone());
+            let staged = self
+                .store
+                .put_staged(
+                    &self.handle.coordinator,
+                    &self.stage,
+                    address,
+                    raw_fragment(&bytes),
+                    bytes,
+                )
+                .await
+                .unwrap();
+            assert_eq!(staged.state, FragmentLifecycleState::Staged);
+            addresses.push(address);
+        }
+        addresses
+    }
+
+    async fn state_of(&self, address: Address) -> FragmentLifecycleState {
+        self.handle
+            .coordinator
+            .capture_current_readable_epoch(address.hash.data())
+            .await
+            .unwrap()
+            .map_or(FragmentLifecycleState::Staged, |witness| witness.state)
+    }
+}
+
+/// Row 77: a pass runs at most `drain_concurrency` promotions at once, and
+/// does run that many. The fixture's provider admits two PUTs at once, so a
+/// bound of 1 that the pass ignored would show 2 here.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_parallel_drain_respects_its_concurrency_bound() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture.port.put_delay_ms.store(300, Ordering::SeqCst);
+    let first = fixture.stage_more("serial", 2).await;
+    fixture.handle.set_drain_concurrency(1);
+    assert_eq!(fixture.handle.drain_concurrency(), 1);
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 3);
+    assert_eq!(fixture.port.max_in_flight.load(Ordering::SeqCst), 1);
+
+    fixture.port.max_in_flight.store(0, Ordering::SeqCst);
+    let second = fixture.stage_more("parallel", 4).await;
+    fixture.handle.set_drain_concurrency(2);
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 4);
+    assert_eq!(
+        fixture.port.max_in_flight.load(Ordering::SeqCst),
+        2,
+        "two promotions were in their PUT at once"
+    );
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 7);
+    for address in first.into_iter().chain(second) {
+        assert_eq!(
+            fixture.state_of(address).await,
+            FragmentLifecycleState::Remote
+        );
+    }
+    // Out of range is clamped, never zero.
+    fixture.handle.set_drain_concurrency(0);
+    assert_eq!(fixture.handle.drain_concurrency(), 1);
+    fixture.handle.set_drain_concurrency(usize::MAX);
+    assert_eq!(fixture.handle.drain_concurrency(), MAX_DRAIN_CONCURRENCY);
+}
+
+/// Row 77: parallel promotion never sends one fragment twice, even when two
+/// passes are started at once on one handle.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_parallel_drain_promotes_each_fragment_once() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture.port.put_delay_ms.store(100, Ordering::SeqCst);
+    let staged = fixture.stage_more("once", 5).await;
+    fixture.handle.set_drain_concurrency(4);
+    let before = Instant::now();
+    let (left, right) = tokio::join!(fixture.handle.drain_pass(8), fixture.handle.drain_pass(8));
+    assert_eq!(left.unwrap() + right.unwrap(), 6);
+    let activity = fixture.handle.activity();
+    assert!(activity.drain_progress.is_some_and(|at| at >= before));
+    assert!(activity.drain_loop >= activity.drain_progress);
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 6);
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 0);
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 6);
+    for address in staged {
+        assert_eq!(
+            fixture.state_of(address).await,
+            FragmentLifecycleState::Remote
+        );
+    }
+    let claims: i64 = fixture
+        .admin
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_write_claims WHERE state = 2",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(claims, 6, "one decisive claim per fragment");
+}
+
+/// Row 77: under parallelism the drain still records progress only when a
+/// promotion publishes (the case above checks that it does). A pass whose
+/// sends all fail leaves the progress clock alone and returns 0, which is
+/// what the server's `drain_not_progressing` accounting reads.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_parallel_drain_records_no_progress_when_every_send_fails() {
+    let fixture = Fixture::open(
+        PutResult::Ambiguous,
+        FragmentGetResponse::NotFound,
+        payload(),
+    )
+    .await;
+    fixture.stage_more("failing", 3).await;
+    fixture.handle.set_drain_concurrency(4);
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 0);
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 4);
+    assert!(
+        fixture.handle.activity().drain_progress.is_none(),
+        "no publication, no progress"
+    );
+    // Each failed hash cools down; the next pass sends nothing and still
+    // records no progress.
+    assert_eq!(fixture.handle.state.lock().await.cooldown.len(), 4);
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 0);
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 4);
+    assert!(fixture.handle.activity().drain_progress.is_none());
 }
 
 /// A put refused for staging I/O capacity must leave no live preparation.

@@ -638,9 +638,23 @@ const RECONCILING_PREDICATES: [&str; 4] = [
     "spool_files_over_ledger",
 ];
 
+/// Most promotions one drain pass runs at once, whatever the configuration.
+pub const MAX_DRAIN_CONCURRENCY: usize = 8;
+
+/// The default concurrency is the smaller of this and the shared domain pool.
+const DEFAULT_DRAIN_CONCURRENCY: usize = 4;
+
+/// The keyset cursor and the per-hash retry cooldown. Locked only for short
+/// bookkeeping, never across a promotion (row 77).
 struct DrainState {
     cursor: Vec<u8>,
     cooldown: BTreeMap<Vec<u8>, (Instant, u32)>,
+}
+
+/// One concurrent promotion's retained file tasks. A promotion holds its slot
+/// for its whole run.
+#[derive(Default)]
+struct DrainSlot {
     // A cancelled wait never forgets an unfinished syscall or starts another.
     writer: Option<
         tokio::task::JoinHandle<
@@ -649,6 +663,38 @@ struct DrainState {
     >,
     reader: Option<tokio::task::JoinHandle<Result<VerifiedStagedBody, StoreError>>>,
 }
+
+impl DrainSlot {
+    /// Collect the retained tasks that finished. False while one still runs:
+    /// the slot starts no promotion until its syscall returns.
+    async fn settle(&mut self) -> bool {
+        if let Some(reader) = self.reader.as_mut() {
+            if !reader.is_finished() {
+                return false;
+            }
+            let _ = reader.await;
+            self.reader = None;
+        }
+        if let Some(writer) = self.writer.as_mut() {
+            if !writer.is_finished() {
+                return false;
+            }
+            let _ = writer.await;
+            self.writer = None;
+        }
+        true
+    }
+
+    /// Whether a timed-out file task is still retained here.
+    fn retains_task(&self) -> bool {
+        self.reader.is_some() || self.writer.is_some()
+    }
+}
+
+type HeldDrainSlot = tokio::sync::OwnedMutexGuard<DrainSlot>;
+
+type JoinedPromotion =
+    Result<(Vec<u8>, Result<bool, StoreError>, HeldDrainSlot), tokio::task::JoinError>;
 
 pub struct FragmentWriteBehindHandle {
     coordinator: PostgresFragmentCoordinator,
@@ -663,7 +709,13 @@ pub struct FragmentWriteBehindHandle {
     policy: FragmentDrainPolicyPin,
     send_timeout: Duration,
     late_effect_bound: Duration,
+    /// Held for one whole drain pass, so passes never overlap.
+    pass: Mutex<()>,
     state: Mutex<DrainState>,
+    /// [`MAX_DRAIN_CONCURRENCY`] slots; a pass uses the first
+    /// [`Self::drain_concurrency`] of them.
+    slots: Vec<Arc<Mutex<DrainSlot>>>,
+    drain_concurrency: std::sync::atomic::AtomicUsize,
     cleanup: Mutex<CleanupState>,
     inventory: Mutex<PhysicalInventory>,
     activity: std::sync::Mutex<WriteBehindActivity>,
@@ -711,6 +763,9 @@ impl PostgresImmutableStore {
             .await
             .map_err(provider_store_err)?;
         let scanner = Arc::new(std::sync::Mutex::new(StageFileScanner::default()));
+        let drain_concurrency = coordinator
+            .shared_pool_size()
+            .clamp(1, DEFAULT_DRAIN_CONCURRENCY);
         Ok(Arc::new(FragmentWriteBehindHandle {
             coordinator: coordinator.clone(),
             observer,
@@ -721,12 +776,15 @@ impl PostgresImmutableStore {
             policy,
             send_timeout: self.io_timeout,
             late_effect_bound: *late_effect_bound,
+            pass: Mutex::new(()),
             state: Mutex::new(DrainState {
                 cursor: Vec::new(),
                 cooldown: BTreeMap::new(),
-                writer: None,
-                reader: None,
             }),
+            slots: (0..MAX_DRAIN_CONCURRENCY)
+                .map(|_| Arc::new(Mutex::new(DrainSlot::default())))
+                .collect(),
+            drain_concurrency: std::sync::atomic::AtomicUsize::new(drain_concurrency),
             cleanup: Mutex::new(CleanupState {
                 cursor: None,
                 scanner,
@@ -974,98 +1032,170 @@ impl FragmentWriteBehindHandle {
         })
     }
 
-    pub async fn drain_pass(&self, batch: u32) -> Result<u32, StoreError> {
-        let mut state = self.state.lock().await;
-        if let Some(reader) = state.reader.as_mut() {
-            if !reader.is_finished() {
-                return Err(StoreError::from(SlowDown));
+    /// How many promotions one drain pass runs at once.
+    pub fn drain_concurrency(&self) -> usize {
+        self.drain_concurrency
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Override the default drain concurrency, which is the smaller of 4 and
+    /// the shared domain pool. Clamped to `1..=MAX_DRAIN_CONCURRENCY`.
+    pub fn set_drain_concurrency(&self, concurrency: usize) {
+        self.drain_concurrency.store(
+            concurrency.clamp(1, MAX_DRAIN_CONCURRENCY),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Promote up to `batch` staged fragments, at most
+    /// [`Self::drain_concurrency`] at once (row 77).
+    ///
+    /// Each promotion runs in its own task on its own slot. The cursor and
+    /// cooldown lock is taken only for bookkeeping, never across a promotion.
+    /// Candidates in one batch are distinct hashes, and passes never overlap,
+    /// so one replica never runs two promotions of one fragment; across
+    /// replicas the claim barrier and the promotion fence still decide.
+    /// Cancelling the pass aborts its tasks; a slot keeps any file task that
+    /// was still running, and the next pass will not reuse that slot until the
+    /// task returns.
+    pub async fn drain_pass(self: &Arc<Self>, batch: u32) -> Result<u32, StoreError> {
+        let _pass = self.pass.lock().await;
+        let mut free = Vec::new();
+        for slot in self.slots.iter().take(self.drain_concurrency()) {
+            // A locked slot belongs to a task of a cancelled pass that is still
+            // being torn down. A slot whose file task outlived its wait keeps the
+            // sole handle until the syscall returns; its claim expires in SQL.
+            let Ok(mut slot) =
+                tokio::time::timeout(self.send_timeout, slot.clone().lock_owned()).await
+            else {
+                continue;
+            };
+            if slot.settle().await {
+                free.push(slot);
             }
-            let _ = reader.await;
-            state.reader = None;
         }
-        // A prior task may have been cancelled while the filesystem was blocked.
-        // Keep its sole handle until completion; its old claim expires in SQL.
-        if let Some(writer) = state.writer.as_mut() {
-            if !writer.is_finished() {
-                return Err(StoreError::from(SlowDown));
-            }
-            let _ = writer.await;
-            state.writer = None;
+        if free.is_empty() {
+            return Err(StoreError::from(SlowDown));
         }
         let bound = FragmentDrainCandidateBatch::new(batch).map_err(domain_store_err)?;
+        let cursor = self.state.lock().await.cursor.clone();
         let mut candidates = self
             .coordinator
-            .staged_drain_candidates_after(bound, &state.cursor)
+            .staged_drain_candidates_after(bound, &cursor)
             .await
             .map_err(domain_store_err)?;
-        if candidates.is_empty() && !state.cursor.is_empty() {
-            state.cursor.clear();
+        if candidates.is_empty() && !cursor.is_empty() {
+            self.state.lock().await.cursor.clear();
             candidates = self
                 .coordinator
                 .staged_drain_candidates_after(bound, &[])
                 .await
                 .map_err(domain_store_err)?;
         }
+        {
+            let now = Instant::now();
+            self.state.lock().await.cooldown.retain(|_, (until, _)| {
+                now.saturating_duration_since(*until) < Duration::from_secs(300)
+            });
+        }
         let mut promoted = 0;
-        let now = Instant::now();
-        state.cooldown.retain(|_, (until, _)| {
-            now.saturating_duration_since(*until) < Duration::from_secs(300)
-        });
+        let mut running = tokio::task::JoinSet::new();
         for source in candidates {
-            state.cursor = source.hash().to_vec();
-            if state
-                .cooldown
-                .get(source.hash())
-                .is_some_and(|(until, _)| *until > Instant::now())
-            {
-                continue;
-            }
             let hash = source.hash().to_vec();
-            match self.promote(source, &mut state).await {
-                Ok(true) => {
-                    promoted += 1;
-                    self.record_drain_activity(true);
-                    state.cooldown.remove(&hash);
-                }
-                Ok(false) => self.record_drain_activity(false),
-                Err(error) => {
-                    // Bounded memory; the keyset still advances when cooling down.
-                    if state.cooldown.len() >= 1024 {
-                        state.cooldown.clear();
-                    }
-                    let tries = state
-                        .cooldown
-                        .get(&hash)
-                        .map_or(1, |(_, n)| n.saturating_add(1));
-                    let delay = Duration::from_secs((1u64 << tries.min(5)).min(30));
-                    state.cooldown.insert(hash, (Instant::now() + delay, tries));
-                    tracing::warn!("fragment promotion deferred: {error}");
-                    if state.writer.is_some() || state.reader.is_some() {
-                        break;
-                    }
+            {
+                let mut state = self.state.lock().await;
+                state.cursor = hash.clone();
+                if state
+                    .cooldown
+                    .get(&hash)
+                    .is_some_and(|(until, _)| *until > Instant::now())
+                {
+                    continue;
                 }
             }
+            while free.is_empty() {
+                let Some(joined) = running.join_next().await else {
+                    break;
+                };
+                self.settle_promotion(joined, &mut promoted, &mut free)
+                    .await;
+            }
+            // Every slot retains a file task that has not returned.
+            let Some(slot) = free.pop() else {
+                break;
+            };
+            let handle = self.clone();
+            lore_base::lore_spawn!(running, async move {
+                let mut slot = slot;
+                let result = handle.promote(source, &mut slot).await;
+                (hash, result, slot)
+            });
+        }
+        while let Some(joined) = running.join_next().await {
+            self.settle_promotion(joined, &mut promoted, &mut free)
+                .await;
         }
         Ok(promoted)
+    }
+
+    /// Account for one finished promotion and return its slot to the pass.
+    async fn settle_promotion(
+        &self,
+        joined: JoinedPromotion,
+        promoted: &mut u32,
+        free: &mut Vec<HeldDrainSlot>,
+    ) {
+        let Ok((hash, result, slot)) = joined else {
+            // A panicked promotion: its slot guard is gone with it.
+            self.record_drain_activity(false);
+            tracing::warn!("fragment promotion task failed");
+            return;
+        };
+        match result {
+            Ok(true) => {
+                *promoted += 1;
+                self.record_drain_activity(true);
+                self.state.lock().await.cooldown.remove(&hash);
+            }
+            Ok(false) => self.record_drain_activity(false),
+            Err(error) => {
+                let mut state = self.state.lock().await;
+                // Bounded memory; the keyset still advances when cooling down.
+                if state.cooldown.len() >= 1024 {
+                    state.cooldown.clear();
+                }
+                let tries = state
+                    .cooldown
+                    .get(&hash)
+                    .map_or(1, |(_, n)| n.saturating_add(1));
+                let delay = Duration::from_secs((1u64 << tries.min(5)).min(30));
+                state.cooldown.insert(hash, (Instant::now() + delay, tries));
+                tracing::warn!("fragment promotion deferred: {error}");
+            }
+        }
+        // A slot still holding a timed-out file task sits out the rest of the pass.
+        if !slot.retains_task() {
+            free.push(slot);
+        }
     }
 
     async fn verify_source(
         &self,
         source: FragmentDrainCandidate,
-        state: &mut DrainState,
+        slot: &mut DrainSlot,
     ) -> Result<VerifiedStagedBody, StoreError> {
         let coordinator = self.coordinator.clone();
         let stage = self.stage.clone();
-        state.reader = Some(lore_base::lore_spawn!("fragment-drain-read", async move {
+        slot.reader = Some(lore_base::lore_spawn!("fragment-drain-read", async move {
             Self::verify_staged_source(&coordinator, &stage, source).await
         }));
-        let reader = state
+        let reader = slot
             .reader
             .as_mut()
             .ok_or_else(|| StoreError::internal("source reader missing"))?;
         match tokio::time::timeout(self.send_timeout, reader).await {
             Ok(result) => {
-                state.reader = None;
+                slot.reader = None;
                 result.map_err(|_error| StoreError::from(SlowDown))?
             }
             Err(_) => Err(StoreError::from(SlowDown)),
@@ -1152,10 +1282,10 @@ impl FragmentWriteBehindHandle {
     async fn promote(
         &self,
         source: FragmentDrainCandidate,
-        state: &mut DrainState,
+        slot: &mut DrainSlot,
     ) -> Result<bool, StoreError> {
         crate::domain::fragments::failpoint!("drain.source.entry").map_err(domain_store_err)?;
-        let verified = self.verify_source(source, state).await?;
+        let verified = self.verify_source(source, slot).await?;
         let logical = uuid::Uuid::now_v7();
         let attempt = uuid::Uuid::now_v7();
         let input = FragmentWriteClaimInput::new(
@@ -1183,7 +1313,7 @@ impl FragmentWriteBehindHandle {
             BeginOutcome::Admitted(intent) => intent,
             _ => return Ok(false),
         };
-        let result = self.send_promotion(&intent, &verified, held, state).await;
+        let result = self.send_promotion(&intent, &verified, held, slot).await;
         match result {
             Ok((manifest, settlement)) => {
                 let committed = self
@@ -1233,7 +1363,7 @@ impl FragmentWriteBehindHandle {
         intent: &crate::domain::fragments::FragmentIntent,
         body: &VerifiedStagedBody,
         held: PostgresFragmentCoordinator,
-        state: &mut DrainState,
+        slot: &mut DrainSlot,
     ) -> Result<(FragmentManifest, FragmentWriteSettlement), StoreError> {
         let claim = intent
             .write_claim()
@@ -1284,18 +1414,18 @@ impl FragmentWriteBehindHandle {
         // identifiers from the exact accepted descriptor.
         let reservation = Arc::new(reservation);
         let writer_reservation = reservation.clone();
-        state.writer = Some(lore_base::lore_spawn_blocking!(
+        slot.writer = Some(lore_base::lore_spawn_blocking!(
             "fragment-drain-spool",
             move || writer_reservation.write_body(&bytes)
         ));
-        let handle = state
+        let handle = slot
             .writer
             .as_mut()
             .ok_or_else(|| StoreError::internal("spool writer missing"))?;
         let written = tokio::time::timeout(self.send_timeout, handle).await;
         let receipt = match written {
             Ok(joined) => {
-                state.writer = None;
+                slot.writer = None;
                 joined
                     .map_err(|_error| StoreError::from(SlowDown))?
                     .map_err(provider_store_err)?
