@@ -427,6 +427,27 @@ async fn adapter_created_put_publishes_once_and_uses_real_reservation_and_claim(
     assert_eq!(rows, 1, "one accepted physical reservation");
 }
 
+/// Row 77: a promotion makes two shared domain checkouts, not three. One
+/// connection carries `begin_promotion` and `authorize_write_claim`, and is
+/// released before the provider PUT (the stalled-PUT case below pins that);
+/// `commit_promotion` takes the second. The pass's candidate read is the third.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_promotion_makes_two_domain_checkouts() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let before = fixture.handle.coordinator.acquired_for_test();
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 1);
+    assert_eq!(
+        fixture.handle.coordinator.acquired_for_test() - before,
+        3,
+        "one candidate read plus two promotion checkouts"
+    );
+    assert_eq!(
+        fixture.current().await.state,
+        FragmentLifecycleState::Remote
+    );
+}
+
 /// A put refused for staging I/O capacity must leave no live preparation.
 /// Otherwise every retry of that hash is fenced until `prepare_ttl` runs out,
 /// which turned transient capacity refusals into 30 s commit stalls live.

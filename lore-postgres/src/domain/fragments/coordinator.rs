@@ -62,6 +62,7 @@ mod creation;
 #[path = "stage_custody.rs"]
 mod stage_custody;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -209,6 +210,36 @@ pub struct PostgresFragmentCoordinator {
     /// still performs every lifecycle mutation and simply produces no outbox
     /// rows, matching what the governed repository seam does.
     outbox_cell_id: Option<String>,
+    /// The one connection every method of a [`Self::holding_connection`] clone
+    /// runs on, or `None` for a coordinator that checks out per method.
+    held: Option<Arc<tokio::sync::Mutex<crate::pool::Client>>>,
+}
+
+/// The connection one coordinator method runs on: its own checkout, or the
+/// connection a [`PostgresFragmentCoordinator::holding_connection`] clone holds.
+enum CoordinatorClient {
+    Pooled(Box<crate::pool::Client>),
+    Held(tokio::sync::OwnedMutexGuard<crate::pool::Client>),
+}
+
+impl std::ops::Deref for CoordinatorClient {
+    type Target = deadpool_postgres::ClientWrapper;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Pooled(client) => client,
+            Self::Held(client) => client,
+        }
+    }
+}
+
+impl std::ops::DerefMut for CoordinatorClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Pooled(client) => client,
+            Self::Held(client) => client,
+        }
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -295,6 +326,36 @@ impl PostgresFragmentCoordinator {
         self.outbox_cell_id = cell_id;
         self
     }
+
+    /// A clone that runs every method on one connection, checked out now and
+    /// returned to the pool when the clone is dropped.
+    ///
+    /// For a caller that makes several short transactions in a row, such as one
+    /// fragment promotion (row 77): one pool wait instead of one per step. Each
+    /// method still commits its own transaction, so no row lock or transaction
+    /// outlives the method. Only the idle connection is held, and it is held
+    /// across whatever I/O the caller does between methods. This is the one
+    /// exception to the module's "connection released before I/O" shape, and it
+    /// costs the pool that connection for the caller's whole sequence.
+    ///
+    /// Methods on one holding clone run one at a time. A second concurrent
+    /// call, or a method that nests another, is refused rather than queued.
+    /// Methods that use the pool directly instead of `checkout` (none on the
+    /// promotion path) still take their own connection.
+    pub(crate) async fn holding_connection(&self) -> Result<Self, DomainError> {
+        let client = self.checkout().await?;
+        let client = match client {
+            CoordinatorClient::Pooled(client) => *client,
+            CoordinatorClient::Held(_) => {
+                return Err(DomainError::Internal(
+                    "fragment coordinator already holds a connection".to_owned(),
+                ));
+            }
+        };
+        let mut held = self.clone();
+        held.held = Some(Arc::new(tokio::sync::Mutex::new(client)));
+        Ok(held)
+    }
 }
 
 impl PostgresDomainStore {
@@ -310,6 +371,7 @@ impl PostgresDomainStore {
             pool: self.pool().clone(),
             database_identity: self.identity().as_marker(),
             outbox_cell_id: None,
+            held: None,
         }
     }
 
@@ -323,6 +385,7 @@ impl PostgresDomainStore {
                 pool: pool.clone(),
                 database_identity: self.identity().as_marker(),
                 outbox_cell_id: None,
+                held: None,
             },
         })
     }
@@ -5462,10 +5525,22 @@ impl PostgresFragmentCoordinator {
         Ok(CommitVerdict::Published)
     }
 
-    async fn checkout(&self) -> Result<deadpool_postgres::Client, DomainError> {
+    async fn checkout(&self) -> Result<CoordinatorClient, DomainError> {
+        if let Some(held) = &self.held {
+            return held
+                .clone()
+                .try_lock_owned()
+                .map(CoordinatorClient::Held)
+                .map_err(|_busy| {
+                    DomainError::Internal(
+                        "the held fragment coordinator connection is already in use".to_owned(),
+                    )
+                });
+        }
         self.pool
             .get()
             .await
+            .map(|client| CoordinatorClient::Pooled(Box::new(client)))
             .map_err(|error| DomainError::from_pool("fragment coordinator pool", error))
     }
 }
@@ -7293,7 +7368,7 @@ async fn append_association_summary(
 }
 
 async fn fragment_schema_presence(
-    client: &deadpool_postgres::Client,
+    client: &deadpool_postgres::ClientWrapper,
 ) -> Result<FragmentSchemaPresence, DomainError> {
     let present: i64 = client
         .query_one(
@@ -7314,7 +7389,7 @@ async fn fragment_schema_presence(
 }
 
 async fn repository_generation_columns_present(
-    client: &deadpool_postgres::Client,
+    client: &deadpool_postgres::ClientWrapper,
 ) -> Result<bool, DomainError> {
     let present: i64 = client
         .query_one(

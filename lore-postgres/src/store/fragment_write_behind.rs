@@ -1167,8 +1167,15 @@ impl FragmentWriteBehindHandle {
             self.late_effect_bound,
         )
         .map_err(domain_store_err)?;
-        let intent = match self
+        // Row 77: begin and authorize run on one connection, so the promotion
+        // waits for the shared domain pool twice rather than three times.
+        // `send_promotion` releases it before the provider PUT.
+        let held = self
             .coordinator
+            .holding_connection()
+            .await
+            .map_err(domain_store_err)?;
+        let intent = match held
             .begin_promotion(&verified.source, input)
             .await
             .map_err(domain_store_err)?
@@ -1176,7 +1183,7 @@ impl FragmentWriteBehindHandle {
             BeginOutcome::Admitted(intent) => intent,
             _ => return Ok(false),
         };
-        let result = self.send_promotion(&intent, &verified, state).await;
+        let result = self.send_promotion(&intent, &verified, held, state).await;
         match result {
             Ok((manifest, settlement)) => {
                 let committed = self
@@ -1225,6 +1232,7 @@ impl FragmentWriteBehindHandle {
         &self,
         intent: &crate::domain::fragments::FragmentIntent,
         body: &VerifiedStagedBody,
+        held: PostgresFragmentCoordinator,
         state: &mut DrainState,
     ) -> Result<(FragmentManifest, FragmentWriteSettlement), StoreError> {
         let claim = intent
@@ -1303,11 +1311,13 @@ impl FragmentWriteBehindHandle {
         let mut ledger =
             FragmentAttemptLedger::new(self.provider.boundary().provider_boundary_id(), &logical)
                 .map_err(provider_store_err)?;
-        let authorized = self
-            .coordinator
+        let authorized = held
             .authorize_write_claim(claim)
             .await
             .map_err(domain_store_err)?;
+        // Never across the provider PUT: a stalled send must not keep a shared
+        // domain connection.
+        drop(held);
         let request = FragmentDrainAttempt {
             logical_request_id: logical,
             attempt_id: uuid::Uuid::from_bytes(*claim.attempt_id()).to_string(),
