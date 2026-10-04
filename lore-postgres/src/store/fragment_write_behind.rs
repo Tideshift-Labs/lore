@@ -69,6 +69,22 @@ mod observe_trace_tests {
     }
 }
 
+#[cfg(test)]
+mod drain_concurrency_tests {
+    use super::*;
+
+    #[test]
+    fn the_default_is_the_smaller_of_four_and_the_shared_pool() {
+        assert_eq!(default_drain_concurrency(0), 1);
+        assert_eq!(default_drain_concurrency(1), 1);
+        assert_eq!(default_drain_concurrency(2), 2);
+        assert_eq!(default_drain_concurrency(3), 3);
+        assert_eq!(default_drain_concurrency(4), 4);
+        assert_eq!(default_drain_concurrency(16), 4);
+        const { assert!(DEFAULT_DRAIN_CONCURRENCY <= MAX_DRAIN_CONCURRENCY) };
+    }
+}
+
 #[cfg(all(test, unix))]
 mod source_tests {
     use uuid::Uuid;
@@ -645,10 +661,18 @@ const RECONCILING_PREDICATES: [&str; 4] = [
 /// Most promotions one drain pass runs at once, whatever the configuration.
 pub const MAX_DRAIN_CONCURRENCY: usize = 8;
 
-/// The default is one promotion at a time. Parallel promotions drained the
-/// spool faster but added foreground commit/push latency on the shared domain
-/// pool (row 77), so they are opt-in through `[write_behind] worker_concurrency`.
-pub const DEFAULT_DRAIN_CONCURRENCY: usize = 1;
+/// The default concurrency is the smaller of this and the shared domain pool.
+/// Row 77 had set it to 1; rows 78 and 79 removed the capacity refusals and
+/// the domain pool wait that made parallel promotions costly.
+/// `[write_behind] worker_concurrency` overrides it.
+pub const DEFAULT_DRAIN_CONCURRENCY: usize = 4;
+
+/// The drain concurrency a new handle starts with, for a shared domain pool
+/// of `shared_pool` connections: never more promotions than the pool has
+/// connections, never fewer than one.
+pub fn default_drain_concurrency(shared_pool: usize) -> usize {
+    shared_pool.clamp(1, DEFAULT_DRAIN_CONCURRENCY)
+}
 
 /// The keyset cursor and the per-hash retry cooldown. Locked only for short
 /// bookkeeping, never across a promotion (row 77).
@@ -769,6 +793,7 @@ impl PostgresImmutableStore {
             .await
             .map_err(provider_store_err)?;
         let scanner = Arc::new(std::sync::Mutex::new(StageFileScanner::default()));
+        let drain_concurrency = default_drain_concurrency(coordinator.shared_pool_size());
         Ok(Arc::new(FragmentWriteBehindHandle {
             coordinator: coordinator.clone(),
             observer,
@@ -787,7 +812,7 @@ impl PostgresImmutableStore {
             slots: (0..MAX_DRAIN_CONCURRENCY)
                 .map(|_| Arc::new(Mutex::new(DrainSlot::default())))
                 .collect(),
-            drain_concurrency: std::sync::atomic::AtomicUsize::new(DEFAULT_DRAIN_CONCURRENCY),
+            drain_concurrency: std::sync::atomic::AtomicUsize::new(drain_concurrency),
             cleanup: Mutex::new(CleanupState {
                 cursor: None,
                 scanner,
@@ -1046,8 +1071,9 @@ impl FragmentWriteBehindHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Override the default drain concurrency
-    /// ([`DEFAULT_DRAIN_CONCURRENCY`]). Clamped to `1..=MAX_DRAIN_CONCURRENCY`.
+    /// Override the default drain concurrency, which is the smaller of
+    /// [`DEFAULT_DRAIN_CONCURRENCY`] and the shared domain pool. Clamped to
+    /// `1..=MAX_DRAIN_CONCURRENCY`.
     pub fn set_drain_concurrency(&self, concurrency: usize) {
         self.drain_concurrency.store(
             concurrency.clamp(1, MAX_DRAIN_CONCURRENCY),

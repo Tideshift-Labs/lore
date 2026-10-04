@@ -311,6 +311,12 @@ impl PostgresFragmentCoordinator {
         self.pool.checkout_sites()
     }
 
+    /// The most connections this coordinator's pool opens. On a split layout
+    /// this is the shared domain pool, without the observer's connection.
+    pub(crate) fn shared_pool_size(&self) -> usize {
+        self.pool.status().max_size
+    }
+
     /// Stamp the trusted cell identity on the summary events this coordinator
     /// appends.
     #[must_use]

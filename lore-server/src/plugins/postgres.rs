@@ -383,7 +383,7 @@ pub struct WriteBehindConfig {
     pub worker_interval_millis: Option<u64>,
     pub worker_batch: Option<u32>,
     /// How many promotions one drain pass runs at once, 1 to 8. Optional;
-    /// defaults to 1.
+    /// defaults to the smaller of 4 and the shared domain pool.
     pub worker_concurrency: Option<usize>,
     pub observer_interval_millis: Option<u64>,
     pub cleanup_interval_millis: Option<u64>,

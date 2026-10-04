@@ -521,7 +521,8 @@ async fn adapter_parallel_drain_respects_its_concurrency_bound() {
     let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
     fixture.port.put_delay_ms.store(300, Ordering::SeqCst);
     let first = fixture.stage_more("serial", 2).await;
-    // The default is serial; parallel promotion is opt-in.
+    // The default is the smaller of 4 and the shared domain pool, which is
+    // one connection in this fixture, so a fresh handle is serial.
     assert_eq!(fixture.handle.drain_concurrency(), 1);
     assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 3);
     assert_eq!(fixture.port.max_in_flight.load(Ordering::SeqCst), 1);
