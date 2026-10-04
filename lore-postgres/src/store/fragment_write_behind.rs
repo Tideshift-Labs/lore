@@ -74,13 +74,9 @@ mod drain_concurrency_tests {
     use super::*;
 
     #[test]
-    fn the_default_is_the_smaller_of_four_and_the_shared_pool() {
-        assert_eq!(default_drain_concurrency(0), 1);
-        assert_eq!(default_drain_concurrency(1), 1);
-        assert_eq!(default_drain_concurrency(2), 2);
-        assert_eq!(default_drain_concurrency(3), 3);
-        assert_eq!(default_drain_concurrency(4), 4);
-        assert_eq!(default_drain_concurrency(16), 4);
+    fn the_default_is_a_fixed_four_regardless_of_pool_size() {
+        assert_eq!(default_drain_concurrency(), 4);
+        assert_eq!(default_drain_concurrency(), DEFAULT_DRAIN_CONCURRENCY);
         const { assert!(DEFAULT_DRAIN_CONCURRENCY <= MAX_DRAIN_CONCURRENCY) };
     }
 }
@@ -661,17 +657,18 @@ const RECONCILING_PREDICATES: [&str; 4] = [
 /// Most promotions one drain pass runs at once, whatever the configuration.
 pub const MAX_DRAIN_CONCURRENCY: usize = 8;
 
-/// The default concurrency is the smaller of this and the shared domain pool.
-/// Row 77 had set it to 1; rows 78 and 79 removed the capacity refusals and
-/// the domain pool wait that made parallel promotions costly.
-/// `[write_behind] worker_concurrency` overrides it.
+/// The default drain concurrency. Row 77 had set it to 1; rows 78 and 79
+/// removed the capacity refusals and the domain pool wait that made parallel
+/// promotions costly. An A/B on row 80's evidence (fixed 4 vs. a shared-pool
+/// clamp, both reaching 4 on this fixture) showed no capacity refusals and
+/// materially better throughput at a fixed 4, so KV ruled the default fixed
+/// regardless of pool size. `[write_behind] worker_concurrency` overrides it.
 pub const DEFAULT_DRAIN_CONCURRENCY: usize = 4;
 
-/// The drain concurrency a new handle starts with, for a shared domain pool
-/// of `shared_pool` connections: never more promotions than the pool has
-/// connections, never fewer than one.
-pub fn default_drain_concurrency(shared_pool: usize) -> usize {
-    shared_pool.clamp(1, DEFAULT_DRAIN_CONCURRENCY)
+/// The drain concurrency a new handle starts with: always
+/// [`DEFAULT_DRAIN_CONCURRENCY`], independent of pool size (row 80).
+pub fn default_drain_concurrency() -> usize {
+    DEFAULT_DRAIN_CONCURRENCY
 }
 
 /// The keyset cursor and the per-hash retry cooldown. Locked only for short
@@ -793,7 +790,7 @@ impl PostgresImmutableStore {
             .await
             .map_err(provider_store_err)?;
         let scanner = Arc::new(std::sync::Mutex::new(StageFileScanner::default()));
-        let drain_concurrency = default_drain_concurrency(coordinator.shared_pool_size());
+        let drain_concurrency = default_drain_concurrency();
         Ok(Arc::new(FragmentWriteBehindHandle {
             coordinator: coordinator.clone(),
             observer,
@@ -1071,9 +1068,9 @@ impl FragmentWriteBehindHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Override the default drain concurrency, which is the smaller of
-    /// [`DEFAULT_DRAIN_CONCURRENCY`] and the shared domain pool. Clamped to
-    /// `1..=MAX_DRAIN_CONCURRENCY`.
+    /// Override the default drain concurrency
+    /// ([`DEFAULT_DRAIN_CONCURRENCY`], fixed regardless of pool size).
+    /// Clamped to `1..=MAX_DRAIN_CONCURRENCY`.
     pub fn set_drain_concurrency(&self, concurrency: usize) {
         self.drain_concurrency.store(
             concurrency.clamp(1, MAX_DRAIN_CONCURRENCY),
