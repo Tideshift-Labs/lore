@@ -1996,7 +1996,12 @@ const SCHEMA_LOCK_RELEASE_SQL: &str = "SELECT pg_catalog.pg_advisory_unlock($1)"
 // (measured on PostgreSQL 16.14 and 18.6), so a `backend_type` filter would count a replica as
 // zero. `usesysid` is the visible discriminator: every login session carries one, idle or not, and
 // an autovacuum worker carries none.
-const ACTIVE_SERVICE_SESSIONS_SQL: &str = "SELECT count(*)::bigint FROM pg_catalog.pg_stat_activity
+//
+// `pub` (not `pub(crate)`) on purpose: the forward-upgrade live test's `wait_until_exclusive`
+// polls this exact query rather than a separately maintained stand-in, and an integration test
+// binary is a separate crate that cannot see a `pub(crate)` item.
+pub const ACTIVE_SERVICE_SESSIONS_SQL: &str =
+    "SELECT count(*)::bigint FROM pg_catalog.pg_stat_activity
      WHERE datname = pg_catalog.current_database() AND pid <> pg_catalog.pg_backend_pid()
        AND usesysid IS NOT NULL";
 
@@ -3278,5 +3283,17 @@ mod active_session_tests {
         assert!(!sql.contains("numbackends"), "{sql}");
         assert!(!sql.contains("backend_type"), "{sql}");
         assert!(!sql.contains("state"), "{sql}");
+    }
+
+    /// Row 78 follow-up: pins the autovacuum exclusion by name, not just by implication, so the
+    /// property `live_the_active_service_session_guard_ignores_a_real_autovacuum_worker` exists to
+    /// prove stays checked even on a run where that bounded live wait never caught a real worker.
+    /// An autovacuum worker is a background process, not a login session, so PostgreSQL gives it
+    /// no owning role and its `usesysid` reads NULL (measured on PostgreSQL 16.14 and 18.6, same
+    /// as the `backend_type` measurement above). `usesysid IS NOT NULL` is therefore not an
+    /// incidental filter -- it is precisely the predicate an autovacuum worker's row fails.
+    #[test]
+    fn the_usesysid_filter_is_what_excludes_an_autovacuum_worker_specifically() {
+        assert!(ACTIVE_SERVICE_SESSIONS_SQL.contains("usesysid IS NOT NULL"));
     }
 }

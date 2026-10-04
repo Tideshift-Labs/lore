@@ -125,7 +125,10 @@ $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_LEASE_PG_URL'; Name = 'live_cleanup_claimers_lease_disjoint_rows_and_an_expired_lease_is_retaken'; Database = 'lease' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R28_PG_URL'; Name = 'live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded'; Database = 'r28_upgrade' },
     # Migration 0030 (WP-115 row 78): running spool charge counters.
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R29_PG_URL'; Name = 'live_r29_cell_is_refused_then_upgrades_and_counts_every_charge'; Database = 'r29_upgrade' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R29_PG_URL'; Name = 'live_r29_cell_is_refused_then_upgrades_and_counts_every_charge'; Database = 'r29_upgrade' },
+    # Row 78 follow-up: the usesysid filter excludes a REAL autovacuum worker, not just a
+    # manufactured NULL-backend_type row.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_AUTOVACUUM_PG_URL'; Name = 'live_the_active_service_session_guard_ignores_a_real_autovacuum_worker'; Database = 'autovacuum_excluded' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

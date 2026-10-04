@@ -37,6 +37,7 @@ use lore_object_dispatch::DispatchTlsMode;
 use lore_object_dispatch::PutStreamIdentity;
 use lore_object_dispatch::ReservePutQuotaScope;
 use lore_object_dispatch::ReservePutRequest;
+use lore_object_dispatch::cell_schema_install::ACTIVE_SERVICE_SESSIONS_SQL;
 use lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT;
 use lore_object_dispatch::cell_schema_install::CellSchemaError;
 use lore_object_dispatch::cell_schema_install::CellSchemaRevision;
@@ -144,22 +145,25 @@ END
 $$;";
 
 /// Poll until no OTHER session is connected to the cell database, from the migrator connection's
-/// own point of view (the same query `upgrade_cell_schema`'s D4 check runs). A real R27->current
-/// upgrade call refuses outright (`ReplicasActive`) while any other session -- including this
-/// fixture's own admin/superuser connection or a runtime pool's pooled connection -- is still
-/// open, so every test must explicitly drop every other handle and wait here before its first
-/// real upgrade call. A call already at the current state skips this check entirely (D4 only
-/// gates the one state transition), so recovery/no-op upgrade calls need no such wait.
+/// own point of view -- the EXACT query `upgrade_cell_schema`'s D4 check runs
+/// (`ACTIVE_SERVICE_SESSIONS_SQL`), not a stricter stand-in. A real R27->current upgrade call
+/// refuses outright (`ReplicasActive`) while any other session -- including this fixture's own
+/// admin/superuser connection or a runtime pool's pooled connection -- is still open, so every
+/// test must explicitly drop every other handle and wait here before its first real upgrade call.
+/// A call already at the current state skips this check entirely (D4 only gates the one state
+/// transition), so recovery/no-op upgrade calls need no such wait.
+///
+/// Row 78 follow-up: this used to poll `numbackends`, which (unlike the product query) counts
+/// every backend attached to the database, autovacuum workers included. That made it stricter
+/// than the gate it is standing in for, so it could stall waiting for an autovacuum worker the
+/// real guard would have ignored. Mirroring `ACTIVE_SERVICE_SESSIONS_SQL` exactly keeps this
+/// helper honest about what the product actually waits on.
 async fn wait_until_exclusive(migrator: &tokio_postgres::Client) {
     for _ in 0..100 {
         let others: i64 = migrator
-            .query_one(
-                "SELECT (numbackends - 1)::bigint FROM pg_catalog.pg_stat_database \
-                 WHERE datname = pg_catalog.current_database()",
-                &[],
-            )
+            .query_one(ACTIVE_SERVICE_SESSIONS_SQL, &[])
             .await
-            .expect("read backend count")
+            .expect("read active service session count")
             .get(0);
         if others <= 0 {
             return;
@@ -1138,6 +1142,27 @@ async fn live_upgrade_refuses_unknown_states_future_markers_and_active_replicas(
     wait_until_exclusive(&fresh_migrator).await;
     let (_observer, _observer_task) =
         connect_as(&fresh_base_url, "object_dispatch_retention_runtime").await;
+    // Row 78: why the check filters on `usesysid`. The migrator has no `pg_read_all_stats`, so it
+    // sees the runtime role's session with its `usesysid` but with `backend_type` NULL: a
+    // `backend_type = 'client backend'` filter would count this replica as zero.
+    let observer_pid: i32 = _observer
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("observer pid")
+        .get(0);
+    let seen = fresh_migrator
+        .query_one(
+            "SELECT usesysid IS NOT NULL, backend_type IS NULL FROM pg_catalog.pg_stat_activity \
+             WHERE pid = $1",
+            &[&observer_pid],
+        )
+        .await
+        .expect("the migrator sees one row for the observer");
+    assert_eq!(
+        (seen.get::<_, bool>(0), seen.get::<_, bool>(1)),
+        (true, true),
+        "the migrator must see another role's usesysid but not its backend_type"
+    );
     assert_eq!(
         upgrade_cell_schema(&fresh_migrator).await,
         Err(CellSchemaError::ReplicasActive),
@@ -4320,4 +4345,135 @@ async fn live_r29_cell_is_refused_then_upgrades_and_counts_every_charge() {
         (fresh.body_size, 1),
         "a release never lowers the counters"
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// Row 78 follow-up: the usesysid filter must exclude a REAL autovacuum worker, not just the
+// manufactured NULL-backend_type row `live_upgrade_refuses_unknown_states_future_markers_and_active_replicas`
+// exercises. This test is deliberately pass-either-way on whether it catches one: forcing the
+// autovacuum launcher onto a sub-naptime schedule is still scheduling it does, not us, so a flaky
+// FAIL here would say nothing about the guard. See the unit pin in `active_session_tests` for the
+// unconditional half of this property.
+// -------------------------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 database"]
+async fn live_the_active_service_session_guard_ignores_a_real_autovacuum_worker() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_AUTOVACUUM_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+
+    // `autovacuum_naptime` is PGC_SIGHUP -- there is no per-database knob, only a cluster-wide
+    // one via `ALTER SYSTEM` + reload. This disposable cluster is this one ps1 run's alone, and
+    // the value is restored below before this test returns either way.
+    fixture
+        .client
+        .batch_execute("ALTER SYSTEM SET autovacuum_naptime = '1s';")
+        .await
+        .expect("lower autovacuum_naptime for this disposable cluster");
+    fixture
+        .client
+        .query_one("SELECT pg_catalog.pg_reload_conf()", &[])
+        .await
+        .expect("reload the lowered autovacuum_naptime");
+
+    // A table tuned to want vacuuming on its very first dead tuple, then given 2,000 of them.
+    fixture
+        .client
+        .batch_execute(
+            "BEGIN;
+             CREATE TABLE autovacuum_probe (id integer, payload text);
+             ALTER TABLE autovacuum_probe SET (
+                 autovacuum_vacuum_threshold = 1,
+                 autovacuum_vacuum_scale_factor = 0,
+                 autovacuum_vacuum_cost_delay = 0,
+                 autovacuum_vacuum_insert_threshold = 1,
+                 autovacuum_vacuum_insert_scale_factor = 0
+             );
+             INSERT INTO autovacuum_probe SELECT generate_series(1, 2000), 'churn';
+             DELETE FROM autovacuum_probe;
+             COMMIT;",
+        )
+        .await
+        .expect("plant dead tuples an aggressive autovacuum config must notice immediately");
+
+    // Poll as the superuser (full `pg_stat_activity` visibility, so `backend_type` is never
+    // hidden here the way row 78's own finding says it is for another role's session). A real
+    // autovacuum worker is often short-lived, so `usesysid` and the guard's own enumeration are
+    // both captured in the SAME iteration that first observes the pid, never in a later
+    // round-trip: the first cut of this test read `usesysid` in a follow-up query gated behind
+    // the `ALTER SYSTEM RESET` below, and the worker had already finished and disconnected by
+    // then, turning a legitimate exclusion into a `RowCount` panic instead.
+    let mut observed: Option<(i32, bool, bool)> = None;
+    for _ in 0..150 {
+        let row = fixture
+            .client
+            .query_opt(
+                "SELECT pid, usesysid IS NULL FROM pg_catalog.pg_stat_activity \
+                 WHERE datname = pg_catalog.current_database() \
+                   AND backend_type = 'autovacuum worker' \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .expect("poll for an autovacuum worker");
+        if let Some(row) = row {
+            let pid: i32 = row.get(0);
+            let no_usesysid: bool = row.get(1);
+            // The guard's own enumeration, run exactly as the migrator role runs it in
+            // production, captured in this same beat.
+            let counted_pids: Vec<i32> = migrator
+                .query(
+                    "SELECT pid FROM pg_catalog.pg_stat_activity \
+                     WHERE datname = pg_catalog.current_database() \
+                       AND pid <> pg_catalog.pg_backend_pid() AND usesysid IS NOT NULL",
+                    &[],
+                )
+                .await
+                .expect("enumerate the sessions the guard's own predicate counts")
+                .into_iter()
+                .map(|counted_row| counted_row.get(0))
+                .collect();
+            observed = Some((pid, no_usesysid, counted_pids.contains(&pid)));
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Restore the cluster-wide setting before any assertion that could panic: later tests in this
+    // same disposable container must not inherit a lowered naptime.
+    fixture
+        .client
+        .batch_execute("ALTER SYSTEM RESET autovacuum_naptime;")
+        .await
+        .expect("restore autovacuum_naptime for later tests in this container");
+    fixture
+        .client
+        .query_one("SELECT pg_catalog.pg_reload_conf()", &[])
+        .await
+        .expect("reload the restored autovacuum_naptime");
+
+    let Some((autovacuum_pid, no_usesysid, counted_by_guard)) = observed else {
+        eprintln!(
+            "live_the_active_service_session_guard_ignores_a_real_autovacuum_worker: no \
+             autovacuum worker observed inside the bounded wait; the unit pin in \
+             active_session_tests covers this property unconditionally"
+        );
+        return;
+    };
+
+    assert!(
+        no_usesysid,
+        "an autovacuum worker must carry no usesysid, or the guard's filter would count it"
+    );
+    assert!(
+        !counted_by_guard,
+        "the active-service-session guard must not count a real autovacuum worker ({autovacuum_pid})"
+    );
+
+    fixture
+        .client
+        .batch_execute("DROP TABLE autovacuum_probe;")
+        .await
+        .expect("clean up the probe table");
 }
