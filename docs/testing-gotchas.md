@@ -30,6 +30,12 @@ Durable, recurring testing lessons grouped by topic.
   makes `tokio::time::sleep` resolve without any wall-clock wait, which would make the assertion
   trivially true regardless of whether the wrapper timed anything; use a real, unpaused clock instead.
   See `lore-telemetry/src/pool_acquire.rs`'s `measure_records_the_actual_wait_not_a_zero_duration`.
+- **In-process race with a `pause` failpoint**: symptom: a second race case in the same test process
+  never pauses. Cause: `LORE_FRAGMENT_FAILPOINTS`/`_DIR` are read once per process. Do: one case per
+  process (`--exact`), the runner supplies both env vars per case, the test asserts them (no silent
+  skip), arms `<anchor>.hold` BEFORE starting the operation, and drives the race inside
+  `tokio::join!(operation, async { wait .reached; race; remove .hold })` (no spawn needed; the
+  paused GET holds no DB resource). Reference: `lore-postgres/src/store/fragment_write_behind_staged_read_tests.rs`.
 
 ## Fixtures and white-box seams
 
@@ -39,6 +45,11 @@ Durable, recurring testing lessons grouped by topic.
 - **Mock state**: Use `Arc`-backed counters/maps for shared observation.
 - **Thin wrappers**: Test wrappers directly to catch dropped/delegated arguments.
 - **Cross-repo fixtures**: For paths like `../../lorehub/...`, skip gracefully if the sibling repo is absent, but panic if the path is explicitly requested but missing.
+- **Asserting "this path took no pool checkout"**: `Pool::checkout_sites()` keys by source
+  `file:line`, not by name. Find the line at test time (`include_str!` the source, locate
+  `async fn <name>(`, take the first `self.checkout()` after it, assert exactly one header match) and
+  compare before/after deltas. Always add a positive control that the same probe sees the leased/slow
+  path take exactly one, or a stale line reads as a passing "zero".
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
 
 ## Postgres & Database Testing

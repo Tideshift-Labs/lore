@@ -235,6 +235,8 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_timeout_reads_back_without_repeating_the_put',
     'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry',
+    'store::immutable_store::fragment_write_behind::adapter_tests::staged_read_tests::unleased_staged_get_takes_no_reader_lease_and_a_leased_pass_still_does',
+    'store::immutable_store::fragment_write_behind::adapter_tests::staged_read_tests::remote_head_get_is_unaffected_by_the_unleased_path',
     'store::immutable_store::fragment_write_behind::source_tests::orphan_temp_cleanup_is_confined_and_replayed_without_double_refund',
     'store::immutable_store::fragment_write_behind::source_tests::source_validation_round_trips_raw_lz4_zstd_and_refuses_corrupt_or_missing_bytes'
 )
@@ -243,6 +245,18 @@ $publicationLossCase = 'store::immutable_store::fragment_write_behind::adapter_t
 $stageCrashCase = 'stage_crash_tests::actual_process_crashes_preserve_committed_stages_and_reclaim_unpublished_residue'
 $cleanupLossCase = 'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_fault_tests::cleanup_lost_ack_and_obliterate_reconcile_one_stage_capacity_release'
 $activeKillCase = 'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::killed_active_promotion_is_barriered_then_a_peer_sends_with_a_new_fence'
+
+# WP-115 row 80 idea 1: the lease-free staged GET races. Each pauses the GET at the
+# `staged_read.unleased.resolved` anchor, so each needs `failure_generator` and its OWN process:
+# the failpoint config is read once per process, and the hold/reached files are keyed by anchor.
+$stagedReadRacePrefix = 'store::immutable_store::fragment_write_behind::adapter_tests::staged_read_tests::race::'
+$stagedReadRaceCases = @(
+    "${stagedReadRacePrefix}promote_then_cleanup_under_a_paused_unleased_get_falls_back_to_the_remote_epoch",
+    "${stagedReadRacePrefix}obliterate_under_a_paused_unleased_get_is_not_found_and_never_missing",
+    "${stagedReadRacePrefix}genuinely_lost_staged_file_is_not_found_and_published_missing_without_a_lease",
+    "${stagedReadRacePrefix}fenced_fallback_onto_a_restaged_epoch_takes_exactly_one_lease_pair"
+)
+$stagedReadFailpointDir = '/tmp/lore-staged-read-failpoints'
 
 # Named live Postgres cases. Non-exact inventories select their cases from a broader target.
 $liveInventory = @(
@@ -583,7 +597,7 @@ try {
         $adapterPrefix = 'store::immutable_store::fragment_write_behind::adapter_tests::'
         $featureCatalog = @(Get-Catalog -Kind 'lib' -IgnoredOnly -Features @('failure_generator'))
         $actual = @($featureCatalog | Where-Object { $_.StartsWith($adapterPrefix) } | Sort-Object)
-        $expected = @(@($libUnixOnlyLive | Where-Object { $_.StartsWith($adapterPrefix) }) + @($publicationLossCase, $cleanupLossCase, $activeKillCase) | Sort-Object)
+        $expected = @(@($libUnixOnlyLive | Where-Object { $_.StartsWith($adapterPrefix) }) + @($publicationLossCase, $cleanupLossCase, $activeKillCase) + $stagedReadRaceCases | Sort-Object)
         if (@(Compare-Object $expected $actual).Count -ne 0) {
             throw "feature-enabled adapter catalog differs from the runner inventory: expected=[$($expected -join ', ')] actual=[$($actual -join ', ')]"
         }
@@ -749,6 +763,9 @@ try {
         Add-Result -Target 'lib (failure_generator)' -Case $publicationLossCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
         Add-Result -Target 'lib (failure_generator)' -Case $cleanupLossCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
         Add-Result -Target 'lib (failure_generator)' -Case $activeKillCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
+        foreach ($case in $stagedReadRaceCases) {
+            Add-Result -Target 'lib (failure_generator)' -Case $case -Status 'NOT RUN' -Note '-SkipLive' -NonGating
+        }
         Add-Result -Target 'write_behind_staging_lifecycle (failure_generator)' -Case $stageCrashCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
         Add-Result -Target 'lore-fragment-provider lib' -Case $providerLiveCase -Status 'NOT RUN' -Note '-SkipLive' -NonGating
         foreach ($target in $liveInventory) {
@@ -828,6 +845,9 @@ try {
             [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $publicationLossCase }
             [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $cleanupLossCase }
             [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $activeKillCase }
+            foreach ($case in $stagedReadRaceCases) {
+                [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'lib'; Target = 'lib'; Case = $case }
+            }
             [pscustomobject]@{ Package = 'lore-postgres'; Kind = 'test'; Target = 'write_behind_staging_lifecycle'; Case = $stageCrashCase }
             [pscustomobject]@{ Package = 'lore-fragment-provider'; Kind = 'lib'; Target = 'lib'; Case = $providerLiveCase }
             foreach ($target in $liveInventory) {
@@ -851,7 +871,7 @@ try {
             Write-Host "Running $($entry.Target)::$($entry.Case) ..."
             try {
                 $targetArgs = if ($entry.Kind -eq 'lib') { @('--lib') } else { @('--test', $entry.Target) }
-                $featureArgs = if ($entry.Case -in @($publicationLossCase, $stageCrashCase, $cleanupLossCase, $activeKillCase)) { @('--features', 'failure_generator') } else { @() }
+                $featureArgs = if ($entry.Case -in (@($publicationLossCase, $stageCrashCase, $cleanupLossCase, $activeKillCase) + $stagedReadRaceCases)) { @('--features', 'failure_generator') } else { @() }
                 $command = @('cargo', 'test', '-p', $entry.Package) + $targetArgs + $featureArgs + @(
                     '--', '--ignored', '--exact', $entry.Case, '--test-threads=1', '--nocapture'
                 )
@@ -864,6 +884,10 @@ try {
                 }
                 if ($entry.Case -eq $cleanupLossCase) {
                     $environmentPairs += 'LORE_FRAGMENT_FAILPOINTS=stage.cleanup.settled=unknown'
+                }
+                if ($entry.Case -in $stagedReadRaceCases) {
+                    $environmentPairs += 'LORE_FRAGMENT_FAILPOINTS=staged_read.unleased.resolved=pause'
+                    $environmentPairs += "LORE_FRAGMENT_FAILPOINT_DIR=$stagedReadFailpointDir"
                 }
                 $run = Invoke-InContainer -Command $command -EnvironmentPairs $environmentPairs
             }

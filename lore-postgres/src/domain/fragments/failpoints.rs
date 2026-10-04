@@ -115,6 +115,11 @@ const ANCHORS: &[(&str, &str)] = &[
         "WP-122 process loss after staging rename, before directory durability or publication; no database resource held",
     ),
     (
+        "staged_read.unleased.resolved",
+        "WP-115 row 80: a lease-free staged GET between its resolve and its read, racing a \
+         promotion plus stage cleanup or an obliterate purge of that epoch; no database resource held",
+    ),
+    (
         "drain.source.entry",
         "WP-122 two-replica ACK before promotion and accepting-process loss; no database or provider resource held",
     ),
@@ -413,6 +418,7 @@ impl Action {
 /// told a harness author nothing about what is on either side of it.
 /// Staging also names temporary-file fsync and final-file rename boundaries.
 /// Repository creation binds metadata inside its publication transaction.
+/// `.resolved` is the lease-free staged GET's point between resolve and read.
 #[cfg(test)]
 const WINDOW_SUFFIXES: &[&str] = &[
     ".entry",
@@ -428,6 +434,7 @@ const WINDOW_SUFFIXES: &[&str] = &[
     ".synced",
     ".renamed",
     ".metadata_bound",
+    ".resolved",
 ];
 
 /// Whether an anchor names a window that is past its commit, and so can carry
@@ -712,6 +719,7 @@ mod tests {
             ".synced",
             ".renamed",
             ".metadata_bound",
+            ".resolved",
         ] {
             assert!(!is_post_commit(&format!("some.anchor{suffix}")));
         }

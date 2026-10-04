@@ -969,13 +969,136 @@ impl PostgresImmutableStore {
         Ok(())
     }
 
-    async fn load_coordinated(
+    /// [`Self::mark_coordinated_missing`], keeping the verdict.
+    ///
+    /// The unleased staged read needs it: `Fenced` there means the head moved
+    /// between its resolve and its read, so the miss is evidence about a stale
+    /// epoch, not about the fragment. That must become a leased re-read, never a
+    /// client-visible `NotFound`.
+    async fn mark_coordinated_missing_verdict(
+        coordinator: &PostgresFragmentCoordinator,
+        witness: &crate::domain::fragments::EpochWitness,
+        diagnostic: MissingDiagnostic,
+    ) -> Result<CommitVerdict, StoreError> {
+        coordinator
+            .mark_missing(witness, diagnostic)
+            .await
+            .map_err(domain_store_err)
+    }
+
+    /// The coordinated GET: an optimistic lease-free staged read first, then at
+    /// most one leased pass (WP-115 ledger row 80, idea 1).
+    ///
+    /// A staged reader lease costs two domain-pool checkouts (an eight-statement
+    /// acquire transaction and an autocommit release). It protects one thing:
+    /// a purge unlinking the staged file while a reader is between its resolve
+    /// and its read. Both purgers move the head first — stage cleanup refuses a
+    /// current readable epoch, and obliterate commits `Deleting*` before it
+    /// purges — so a miss caused by either race reaches `mark_missing` with a
+    /// stale witness and comes back `Fenced`. That `Fenced` is the fallback
+    /// trigger, and the leased pass starts from a fresh resolve. Bytes the
+    /// unleased path does read are still hash-validated and still pass the
+    /// post-read resolve, so it can never serve a head that moved.
+    async fn load_coordinated_optimistic(
         &self,
         coordinator: &PostgresFragmentCoordinator,
         provider: &FragmentProviderEntry,
         repository: Context,
         address: Address,
     ) -> Result<(Fragment, Bytes), StoreError> {
+        match self
+            .load_coordinated(
+                coordinator,
+                provider,
+                repository,
+                address,
+                StagedReadMode::Unleased,
+            )
+            .await?
+        {
+            CoordinatedLoad::Loaded(loaded) => Ok(loaded),
+            CoordinatedLoad::RetryLeased => {
+                tracing::debug!("unleased staged read fenced; retrying under a reader lease");
+                match self
+                    .load_coordinated(
+                        coordinator,
+                        provider,
+                        repository,
+                        address,
+                        StagedReadMode::Leased,
+                    )
+                    .await?
+                {
+                    CoordinatedLoad::Loaded(loaded) => Ok(loaded),
+                    CoordinatedLoad::RetryLeased => Err(StoreError::internal(
+                        "a leased staged read asked for a leased retry",
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Read a `Staged` epoch without a reader lease.
+    ///
+    /// Returns [`CoordinatedLoad::RetryLeased`] only when the read missed (absent
+    /// or invalid bytes) AND `mark_missing` was fenced by a moved head. A miss
+    /// against an unmoved head is a genuine loss and is published as `Missing`
+    /// exactly as the leased path does. An unavailable root stays `SlowDown`.
+    async fn read_staged_unleased(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        witness: &crate::domain::fragments::EpochWitness,
+        manifest: &FragmentManifest,
+        address: Address,
+    ) -> Result<CoordinatedLoad, StoreError> {
+        // The race seam: between the resolve that produced `witness` and the
+        // staged read. A test pauses here, promotes or obliterates and purges
+        // the epoch, then releases.
+        crate::domain::fragments::failpoint!("staged_read.unleased.resolved")
+            .map_err(domain_store_err)?;
+        let staged = match self.write_behind.as_ref() {
+            Some(stage) => match tokio::time::timeout(
+                self.io_timeout,
+                stage.read_staged(&witness.hash, witness.epoch, &manifest.object_key),
+            )
+            .await
+            {
+                Ok(staged) => staged,
+                Err(_) => return Err(StoreError::from(SlowDown)),
+            },
+            // See the leased arm: no staging tier is not evidence of absence.
+            None => return Err(StoreError::from(SlowDown)),
+        };
+        let result = match staged {
+            StagedRead::Found(bytes) => {
+                Self::fragment_from_manifest(manifest).and_then(|fragment| {
+                    Self::validate_candidate(address.hash, manifest, fragment, bytes)
+                })
+            }
+            StagedRead::Absent => Err(MissingDiagnostic::Absent),
+            StagedRead::Unavailable(_) => return Err(StoreError::from(SlowDown)),
+        };
+        match result {
+            Ok(loaded) => Ok(CoordinatedLoad::Loaded(loaded)),
+            Err(diagnostic) => {
+                match Self::mark_coordinated_missing_verdict(coordinator, witness, diagnostic)
+                    .await?
+                {
+                    CommitVerdict::Fenced => Ok(CoordinatedLoad::RetryLeased),
+                    _ => Err(Self::not_found(address.hash)),
+                }
+            }
+        }
+    }
+
+    async fn load_coordinated(
+        &self,
+        coordinator: &PostgresFragmentCoordinator,
+        provider: &FragmentProviderEntry,
+        repository: Context,
+        address: Address,
+        mode: StagedReadMode,
+    ) -> Result<CoordinatedLoad, StoreError> {
         let resolution = Self::resolve_one(coordinator, repository, address).await?;
         let captured_verdict = resolution.verdict.clone();
         let FragmentVerdict::Readable {
@@ -1048,6 +1171,15 @@ impl PostgresImmutableStore {
                             "fragment provider GET did not return a readable response",
                         ));
                     }
+                }
+            }
+            EpochAuthority::Staged if mode == StagedReadMode::Unleased => {
+                match self
+                    .read_staged_unleased(coordinator, &witness, &manifest, address)
+                    .await?
+                {
+                    CoordinatedLoad::Loaded(loaded) => loaded,
+                    CoordinatedLoad::RetryLeased => return Ok(CoordinatedLoad::RetryLeased),
                 }
             }
             EpochAuthority::Staged => {
@@ -1132,7 +1264,7 @@ impl PostgresImmutableStore {
         if revalidated.verdict != captured_verdict {
             return Err(StoreError::from(SlowDown));
         }
-        Ok(loaded)
+        Ok(CoordinatedLoad::Loaded(loaded))
     }
 
     fn provider_deadline_unix_ms(&self) -> Result<i64, StoreError> {
@@ -2383,6 +2515,24 @@ fn counted_refusal(error: StoreError, reason: &'static str) -> StoreError {
     error
 }
 
+/// Whether a coordinated GET may read a `Staged` epoch without a reader lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StagedReadMode {
+    /// Optimistic: no lease; a fenced miss asks for a leased pass.
+    Unleased,
+    /// Today's protected read: acquire, read, release.
+    Leased,
+}
+
+/// One pass of [`PostgresImmutableStore::load_coordinated`].
+enum CoordinatedLoad {
+    /// Validated bytes that also passed the post-read resolve.
+    Loaded((Fragment, Bytes)),
+    /// An unleased staged miss was fenced by a moved head. Never returned by a
+    /// [`StagedReadMode::Leased`] pass.
+    RetryLeased,
+}
+
 /// Map a query/execute error; transient failures become `SlowDown` so clients
 /// retry rather than treat them as permanent (A2).
 fn domain_store_err(error: crate::domain::errors::DomainError) -> StoreError {
@@ -2688,7 +2838,7 @@ impl ImmutableStore for PostgresImmutableStore {
         } = &self.fragment_route
         {
             let (fragment, payload) = self
-                .load_coordinated(coordinator, provider, repository, address)
+                .load_coordinated_optimistic(coordinator, provider, repository, address)
                 .await?;
             return Ok(StoreGetData {
                 fragment,

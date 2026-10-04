@@ -1122,6 +1122,9 @@ mod cleanup_fault_tests;
 #[path = "fragment_write_behind_progress_tests.rs"]
 mod progress_tests;
 
+#[path = "fragment_write_behind_staged_read_tests.rs"]
+mod staged_read_tests;
+
 #[path = "fragment_write_behind_withdraw_tests.rs"]
 mod withdraw_tests;
 
