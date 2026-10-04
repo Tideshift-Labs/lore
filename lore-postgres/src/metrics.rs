@@ -114,6 +114,24 @@ pub(crate) fn record_staged_put_refusal(reason: &'static str) {
         .add(1, &[KeyValue::new("reason", reason)]);
 }
 
+/// Count one `begin_promotion` return on the write-behind drain, labelled
+/// `outcome`, `reason` and `head_state` (see
+/// `domain::fragments::begin_outcome_labels`). Splits the non-admitted begins,
+/// which the drain otherwise drops silently, by cause.
+pub(crate) fn record_promotion_begin_outcome(labels: crate::domain::fragments::BeginOutcomeLabels) {
+    static OUTCOMES: OnceLock<Counter<u64>> = OnceLock::new();
+    OUTCOMES
+        .get_or_init(|| PostgresStoreInstrumentProvider.counter("promotion_begin_outcomes"))
+        .add(
+            1,
+            &[
+                KeyValue::new("outcome", labels.outcome),
+                KeyValue::new("reason", labels.reason),
+                KeyValue::new("head_state", labels.head_state),
+            ],
+        );
+}
+
 /// CR-032 relay instruments (WP-119 Step A).
 ///
 /// Deliberately **unlabelled**. CR-032 prohibits repository, event, actor, and

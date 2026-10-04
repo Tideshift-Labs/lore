@@ -1417,7 +1417,7 @@ pub enum BeginOutcome {
     AlreadyReadable(Box<EpochWitness>),
     /// The head is inside a deletion sequence or tombstoned, so no new
     /// representation may be published against it.
-    Fenced(String),
+    Fenced(FenceReason),
     /// A prior attempt on the same exact head can still have a late effect.
     WriteClaimBlocked { hard_not_after: SystemTime },
 }
@@ -3369,10 +3369,10 @@ impl PostgresFragmentCoordinator {
         };
         failpoint!("promotion.begin.locked")?;
         if head.state != FragmentLifecycleState::Staged {
-            return Ok(BeginOutcome::Fenced(format!(
-                "promotion requires a Staged head; this one is {}",
-                head.state.label()
-            )));
+            return Ok(BeginOutcome::Fenced(
+                // "promotion requires a Staged head; this one is <state>"
+                FenceReason::PromotionHeadNotStaged(head.state),
+            ));
         }
         // Validation happened outside SQL. Bind that exact observation before
         // allocating a successor or creating any provider-send authority.
@@ -3381,7 +3381,7 @@ impl PostgresFragmentCoordinator {
             || head.manifest_id.as_deref() != Some(source.manifest_id.as_slice())
         {
             return Ok(BeginOutcome::Fenced(
-                "staged source changed after validation".to_owned(),
+                FenceReason::PromotionSourceChanged, // "staged source changed after validation"
             ));
         }
         let exact_source = tx.query_opt(
@@ -3398,7 +3398,7 @@ impl PostgresFragmentCoordinator {
         ).await.map_err(|error| DomainError::from_pg("promotion source binding", error))?;
         if exact_source.is_none() {
             return Ok(BeginOutcome::Fenced(
-                "staged representation changed after validation".to_owned(),
+                FenceReason::PromotionRepresentationChanged, // the exact epoch row moved
             ));
         }
         // The exact staged witness, read off the head this transaction holds
@@ -5020,10 +5020,10 @@ impl PostgresFragmentCoordinator {
                         && head.active_operation.as_deref()
                             == Some(DIRECT_WRITE_REPAIR_OPERATION.as_slice()) => {}
                 Some(head) => {
-                    return Ok(Some(BeginOutcome::Fenced(format!(
-                        "repair requires a Missing lineage; this head is {}",
-                        head.state.label()
-                    ))));
+                    return Ok(Some(BeginOutcome::Fenced(
+                        // "repair requires a Missing lineage; this head is <state>"
+                        FenceReason::RepairHeadNotMissing(head.state),
+                    )));
                 }
             }
         }
@@ -5039,7 +5039,7 @@ impl PostgresFragmentCoordinator {
                     .map_err(|e| DomainError::from_pg("stage preparation owner", e))?;
                 if live.is_some() {
                     return Ok(Some(BeginOutcome::Fenced(
-                        "stage preparation is still live".into(),
+                        FenceReason::StagePreparationLive, // "stage preparation is still live"
                     )));
                 }
             }
@@ -5057,10 +5057,10 @@ impl PostgresFragmentCoordinator {
                 ))));
             }
             if head.state.is_deleting() || head.state == FragmentLifecycleState::Tombstoned {
-                return Ok(Some(BeginOutcome::Fenced(format!(
-                    "the head is {} and cannot accept a new representation",
-                    head.state.label()
-                ))));
+                return Ok(Some(BeginOutcome::Fenced(
+                    // "the head is <state> and cannot accept a new representation"
+                    FenceReason::HeadDeletingOrTombstoned(head.state),
+                )));
             }
             if authority == EpochAuthority::Remote
                 && head.state == FragmentLifecycleState::PreparingRemote
@@ -7435,6 +7435,153 @@ fn classify_commit(
     }
 }
 
+// Placed after every coordinator method on purpose: the domain checkout
+// counter labels each site by `file:line`, so new items above the methods
+// would move every site label and break comparison with earlier load runs.
+
+/// Why a `begin_*` call answered [`BeginOutcome::Fenced`].
+///
+/// A closed set, so a metric can label by it without unbounded cardinality.
+/// The variants that carry a [`FragmentLifecycleState`] carry the head state
+/// as observed under its lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FenceReason {
+    /// `begin_promotion` found a head that is no longer `Staged`.
+    PromotionHeadNotStaged(FragmentLifecycleState),
+    /// `begin_promotion`'s head moved (epoch, fence or manifest) after the
+    /// caller validated the staged source.
+    PromotionSourceChanged,
+    /// `begin_promotion`'s exact staged epoch row or custody row no longer
+    /// matches the validated source.
+    PromotionRepresentationChanged,
+    /// A repair publication found a head that is not a `Missing` lineage.
+    RepairHeadNotMissing(FragmentLifecycleState),
+    /// A publication found a `PreparingStage` head whose preparation is live.
+    StagePreparationLive,
+    /// A publication found a deleting or tombstoned head.
+    HeadDeletingOrTombstoned(FragmentLifecycleState),
+}
+
+impl FenceReason {
+    /// Static, bounded metric label for the reason.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::PromotionHeadNotStaged(_) => "promotion_head_not_staged",
+            Self::PromotionSourceChanged => "promotion_source_changed",
+            Self::PromotionRepresentationChanged => "promotion_representation_changed",
+            Self::RepairHeadNotMissing(_) => "repair_head_not_missing",
+            Self::StagePreparationLive => "stage_preparation_live",
+            Self::HeadDeletingOrTombstoned(_) => "head_deleting_or_tombstoned",
+        }
+    }
+
+    /// The head state the fence observed, where the reason records one.
+    pub fn head_state(self) -> Option<FragmentLifecycleState> {
+        match self {
+            Self::PromotionHeadNotStaged(state)
+            | Self::RepairHeadNotMissing(state)
+            | Self::HeadDeletingOrTombstoned(state) => Some(state),
+            Self::PromotionSourceChanged
+            | Self::PromotionRepresentationChanged
+            | Self::StagePreparationLive => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FenceReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PromotionHeadNotStaged(state) => write!(
+                f,
+                "promotion requires a Staged head; this one is {}",
+                state.label()
+            ),
+            Self::PromotionSourceChanged => f.write_str("staged source changed after validation"),
+            Self::PromotionRepresentationChanged => {
+                f.write_str("staged representation changed after validation")
+            }
+            Self::RepairHeadNotMissing(state) => write!(
+                f,
+                "repair requires a Missing lineage; this head is {}",
+                state.label()
+            ),
+            Self::StagePreparationLive => f.write_str("stage preparation is still live"),
+            Self::HeadDeletingOrTombstoned(state) => write!(
+                f,
+                "the head is {} and cannot accept a new representation",
+                state.label()
+            ),
+        }
+    }
+}
+
+/// Bounded metric labels for one promotion begin. Only the write-behind
+/// drain's `promote()` path is counted; the publication begins in
+/// `immutable_store` are not. Every field is a static string from a closed
+/// set; no hash, id or free text reaches a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BeginOutcomeLabels {
+    /// `admitted`, `already_readable`, `fenced`, `write_claim_blocked` or
+    /// `error`.
+    pub outcome: &'static str,
+    /// [`FenceReason::label`] for `fenced`, the error class for `error`, and
+    /// `none` otherwise.
+    pub reason: &'static str,
+    /// [`FragmentLifecycleState::label`] where the outcome observed one, else
+    /// `none`.
+    pub head_state: &'static str,
+}
+
+/// Label one promotion begin from the drain's `promote()` path for the
+/// begin-outcome counter. Publication begins in `immutable_store` are not
+/// counted. Pure.
+pub fn begin_outcome_labels(result: Result<&BeginOutcome, &DomainError>) -> BeginOutcomeLabels {
+    const NONE: &str = "none";
+    match result {
+        Ok(BeginOutcome::Admitted(_)) => BeginOutcomeLabels {
+            outcome: "admitted",
+            reason: NONE,
+            head_state: NONE,
+        },
+        Ok(BeginOutcome::AlreadyReadable(witness)) => BeginOutcomeLabels {
+            outcome: "already_readable",
+            reason: NONE,
+            head_state: witness.state.label(),
+        },
+        Ok(BeginOutcome::Fenced(reason)) => BeginOutcomeLabels {
+            outcome: "fenced",
+            reason: reason.label(),
+            head_state: reason
+                .head_state()
+                .map_or(NONE, FragmentLifecycleState::label),
+        },
+        Ok(BeginOutcome::WriteClaimBlocked { .. }) => BeginOutcomeLabels {
+            outcome: "write_claim_blocked",
+            reason: NONE,
+            head_state: NONE,
+        },
+        Err(error) => BeginOutcomeLabels {
+            outcome: "error",
+            reason: match error {
+                DomainError::PreconditionRejected { reason, .. }
+                    if reason == "fragment_head_absent" =>
+                {
+                    "head_absent"
+                }
+                DomainError::PreconditionRejected { .. } => "precondition_rejected",
+                DomainError::InvalidInput(_) => "invalid_input",
+                DomainError::NotReady(_) => "not_ready",
+                DomainError::DomainKeyBypass(_) => "domain_key_bypass",
+                DomainError::Contention(_) => "contention",
+                DomainError::Transient(_) => "transient",
+                DomainError::OutcomeUnknown(_) => "outcome_unknown",
+                DomainError::Internal(_) => "internal",
+            },
+            head_state: NONE,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7807,5 +7954,222 @@ mod tests {
             reasons.len(),
             "{reasons:?} are not distinct"
         );
+    }
+}
+
+#[cfg(test)]
+mod begin_outcome_label_tests {
+    use super::*;
+
+    const ALL_STATES: [FragmentLifecycleState; 8] = [
+        FragmentLifecycleState::PreparingStage,
+        FragmentLifecycleState::PreparingRemote,
+        FragmentLifecycleState::Staged,
+        FragmentLifecycleState::Remote,
+        FragmentLifecycleState::DeletingChildren,
+        FragmentLifecycleState::DeletingPayload,
+        FragmentLifecycleState::Missing,
+        FragmentLifecycleState::Tombstoned,
+    ];
+
+    fn witness(state: FragmentLifecycleState) -> EpochWitness {
+        EpochWitness {
+            hash: vec![7u8; 32],
+            epoch: 3,
+            state,
+            manifest_id: Some(vec![9u8; 32]),
+            fence: 5,
+        }
+    }
+
+    fn admitted() -> BeginOutcome {
+        BeginOutcome::Admitted(Box::new(FragmentIntent {
+            hash: vec![7u8; 32],
+            epoch: 4,
+            fence: 6,
+            object_key: "key".to_owned(),
+            authority: EpochAuthority::Remote,
+            direct_write_kind: None,
+            write_claim: None,
+            captured: None,
+        }))
+    }
+
+    fn every_fence_reason() -> Vec<FenceReason> {
+        let mut reasons = vec![
+            FenceReason::PromotionSourceChanged,
+            FenceReason::PromotionRepresentationChanged,
+            FenceReason::StagePreparationLive,
+        ];
+        for state in ALL_STATES {
+            reasons.push(FenceReason::PromotionHeadNotStaged(state));
+            reasons.push(FenceReason::RepairHeadNotMissing(state));
+            reasons.push(FenceReason::HeadDeletingOrTombstoned(state));
+        }
+        reasons
+    }
+
+    fn label(outcome: &BeginOutcome) -> BeginOutcomeLabels {
+        begin_outcome_labels(Ok(outcome))
+    }
+
+    #[test]
+    fn each_non_error_outcome_maps_to_its_documented_literal() {
+        let admitted = label(&admitted());
+        assert_eq!(admitted.outcome, "admitted");
+        assert_eq!(admitted.reason, "none");
+        assert_eq!(admitted.head_state, "none");
+
+        let readable = label(&BeginOutcome::AlreadyReadable(Box::new(witness(
+            FragmentLifecycleState::Remote,
+        ))));
+        assert_eq!(readable.outcome, "already_readable");
+        assert_eq!(readable.reason, "none");
+        assert_eq!(readable.head_state, "Remote");
+
+        let blocked = label(&BeginOutcome::WriteClaimBlocked {
+            hard_not_after: SystemTime::UNIX_EPOCH,
+        });
+        assert_eq!(blocked.outcome, "write_claim_blocked");
+        assert_eq!(blocked.reason, "none");
+        assert_eq!(blocked.head_state, "none");
+
+        let fenced = label(&BeginOutcome::Fenced(FenceReason::PromotionSourceChanged));
+        assert_eq!(fenced.outcome, "fenced");
+        assert_eq!(fenced.reason, "promotion_source_changed");
+        assert_eq!(fenced.head_state, "none");
+    }
+
+    #[test]
+    fn outcome_labels_are_distinct_per_variant() {
+        let outcomes = [
+            label(&admitted()).outcome,
+            label(&BeginOutcome::AlreadyReadable(Box::new(witness(
+                FragmentLifecycleState::Staged,
+            ))))
+            .outcome,
+            label(&BeginOutcome::Fenced(FenceReason::StagePreparationLive)).outcome,
+            label(&BeginOutcome::WriteClaimBlocked {
+                hard_not_after: SystemTime::UNIX_EPOCH,
+            })
+            .outcome,
+            begin_outcome_labels(Err(&DomainError::Internal(String::new()))).outcome,
+        ];
+        let distinct: BTreeSet<&str> = outcomes.into_iter().collect();
+        assert_eq!(distinct.len(), outcomes.len(), "{outcomes:?}");
+        assert_eq!(
+            distinct,
+            BTreeSet::from([
+                "admitted",
+                "already_readable",
+                "fenced",
+                "write_claim_blocked",
+                "error",
+            ])
+        );
+    }
+
+    #[test]
+    fn fence_reason_labels_are_the_exact_documented_set() {
+        let mut seen = BTreeSet::new();
+        for reason in every_fence_reason() {
+            let labels = label(&BeginOutcome::Fenced(reason));
+            assert_eq!(labels.outcome, "fenced");
+            assert!(!labels.reason.is_empty(), "{reason:?} has an empty label");
+            assert!(!labels.head_state.is_empty(), "{reason:?} head_state empty");
+            assert_eq!(labels.reason, reason.label());
+            seen.insert(labels.reason);
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from([
+                "promotion_head_not_staged",
+                "promotion_source_changed",
+                "promotion_representation_changed",
+                "repair_head_not_missing",
+                "stage_preparation_live",
+                "head_deleting_or_tombstoned",
+            ])
+        );
+    }
+
+    #[test]
+    fn fence_reason_head_state_is_carried_only_where_observed() {
+        for state in ALL_STATES {
+            for reason in [
+                FenceReason::PromotionHeadNotStaged(state),
+                FenceReason::RepairHeadNotMissing(state),
+                FenceReason::HeadDeletingOrTombstoned(state),
+            ] {
+                assert_eq!(
+                    label(&BeginOutcome::Fenced(reason)).head_state,
+                    state.label()
+                );
+            }
+        }
+        for reason in [
+            FenceReason::PromotionSourceChanged,
+            FenceReason::PromotionRepresentationChanged,
+            FenceReason::StagePreparationLive,
+        ] {
+            assert_eq!(label(&BeginOutcome::Fenced(reason)).head_state, "none");
+        }
+    }
+
+    #[test]
+    fn already_readable_head_state_covers_every_lifecycle_state() {
+        let mut seen = BTreeSet::new();
+        for state in ALL_STATES {
+            let labels = label(&BeginOutcome::AlreadyReadable(Box::new(witness(state))));
+            assert!(!labels.head_state.is_empty());
+            seen.insert(labels.head_state);
+        }
+        assert_eq!(
+            seen.len(),
+            ALL_STATES.len(),
+            "state labels must be distinct"
+        );
+    }
+
+    #[test]
+    fn every_domain_error_maps_to_a_distinct_error_reason() {
+        let cases: [(DomainError, &str); 9] = [
+            (
+                DomainError::PreconditionRejected {
+                    reason: "fragment_head_absent".to_owned(),
+                    reason_version: 1,
+                },
+                "head_absent",
+            ),
+            (
+                DomainError::PreconditionRejected {
+                    reason: "anything_else".to_owned(),
+                    reason_version: 1,
+                },
+                "precondition_rejected",
+            ),
+            (DomainError::InvalidInput(String::new()), "invalid_input"),
+            (DomainError::NotReady(String::new()), "not_ready"),
+            (
+                DomainError::DomainKeyBypass(String::new()),
+                "domain_key_bypass",
+            ),
+            (DomainError::Contention(String::new()), "contention"),
+            (DomainError::Transient(String::new()), "transient"),
+            (
+                DomainError::OutcomeUnknown(String::new()),
+                "outcome_unknown",
+            ),
+            (DomainError::Internal(String::new()), "internal"),
+        ];
+        let mut seen = BTreeSet::new();
+        for (error, expected) in &cases {
+            let labels = begin_outcome_labels(Err(error));
+            assert_eq!(labels.outcome, "error");
+            assert_eq!(labels.reason, *expected, "{error:?}");
+            assert_eq!(labels.head_state, "none");
+            seen.insert(labels.reason);
+        }
+        assert_eq!(seen.len(), cases.len(), "error reasons must be distinct");
     }
 }

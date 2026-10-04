@@ -1332,12 +1332,16 @@ impl FragmentWriteBehindHandle {
         // domain connection is held across the spool reserve, write and ready
         // steps between begin and authorize (row 79: holding one there cost
         // 27% of the shared domain pool's time).
-        let intent = match self
+        let begun = self
             .coordinator
             .begin_promotion(&verified.source, input)
-            .await
-            .map_err(domain_store_err)?
-        {
+            .await;
+        // Observation only: every return is counted by cause, and the
+        // non-admitted arm still returns `Ok(false)` as before.
+        crate::metrics::record_promotion_begin_outcome(
+            crate::domain::fragments::begin_outcome_labels(begun.as_ref()),
+        );
+        let intent = match begun.map_err(domain_store_err)? {
             BeginOutcome::Admitted(intent) => intent,
             _ => return Ok(false),
         };

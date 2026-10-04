@@ -141,8 +141,10 @@ macro_rules! failpoint {
 }
 
 pub use coordinator::BeginOutcome;
+pub use coordinator::BeginOutcomeLabels;
 pub use coordinator::CommitVerdict;
 pub use coordinator::EpochWitness;
+pub use coordinator::FenceReason;
 pub use coordinator::FragmentBackfillCursorAdvance;
 pub use coordinator::FragmentDrainCandidate;
 pub use coordinator::FragmentDrainCandidateBatch;
@@ -192,6 +194,7 @@ pub use coordinator::StageCleanupIntent;
 pub use coordinator::StageObservation;
 pub use coordinator::StageReservationInput;
 pub use coordinator::StagedReaderLease;
+pub use coordinator::begin_outcome_labels;
 pub use coordinator::read_fragment_write_capability;
 pub(crate) use failpoint;
 pub use masks::CONTENT_STRUCTURE_MASK;
