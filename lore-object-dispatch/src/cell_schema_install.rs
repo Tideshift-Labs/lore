@@ -3288,8 +3288,8 @@ mod active_session_tests {
     /// Row 78 follow-up: pins the autovacuum exclusion by name, not just by implication, so the
     /// property `live_the_active_service_session_guard_ignores_a_real_autovacuum_worker` exists to
     /// prove stays checked even on a run where that bounded live wait never caught a real worker.
-    /// An autovacuum worker is a background process, not a login session, so PostgreSQL gives it
-    /// no owning role and its `usesysid` reads NULL (measured on PostgreSQL 16.14 and 18.6, same
+    /// An autovacuum worker is a background process, not a login session, so `PostgreSQL` gives it
+    /// no owning role and its `usesysid` reads NULL (measured on `PostgreSQL` 16.14 and 18.6, same
     /// as the `backend_type` measurement above). `usesysid IS NOT NULL` is therefore not an
     /// incidental filter -- it is precisely the predicate an autovacuum worker's row fails.
     #[test]
