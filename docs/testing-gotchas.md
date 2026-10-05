@@ -51,6 +51,13 @@ Durable, recurring testing lessons grouped by topic.
   compare before/after deltas. Always add a positive control that the same probe sees the leased/slow
   path take exactly one, or a stale line reads as a passing "zero".
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
+- **Closed metric-label sets**: pin the exact literal list in `ALL` order, then pin the real call
+  sites, not just a hand-written table. For SQL-keyed labels (`drain_procedure_label`),
+  `include_str!` the client sources, cut at `#[cfg(test)]`, and assert every `"SELECT ...
+  object_store_retention."` literal maps to a specific label, so a `_v3` rename cannot fall into the
+  catch-all bucket. A `tokio_postgres::Error` is unconstructible in a unit test; test the pure
+  `code`/`message` functions and pin the shared message literal by source scan. A test-only
+  `match` over a cause enum trips clippy `match_same_arms` if two arms share a body: merge them.
 
 ## Postgres & Database Testing
 

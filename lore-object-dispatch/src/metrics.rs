@@ -79,6 +79,22 @@ impl Default for DispatchMetrics {
     }
 }
 
+/// Count one failed drain authority call, labelled `procedure` and `cause`. Both labels are closed
+/// sets: [`crate::drain_policy::drain_procedure_label`] and
+/// [`crate::drain_policy::DrainFailureCause::label`].
+pub(crate) fn record_drain_authority_failure(procedure: &'static str, cause: &'static str) {
+    static FAILURES: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
+    FAILURES
+        .get_or_init(|| DispatchInstrumentProvider.counter("drain_authority_failures"))
+        .add(
+            1,
+            &[
+                KeyValue::new("procedure", procedure),
+                KeyValue::new("cause", cause),
+            ],
+        );
+}
+
 impl DispatchMetricRecorder for DispatchMetrics {
     fn record_source_dark_rejection(&self, operation: DispatchOperation) {
         self.operation_rejections.add(

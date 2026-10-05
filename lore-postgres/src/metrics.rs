@@ -154,6 +154,19 @@ pub(crate) fn record_promotion_begin_outcome(labels: crate::domain::fragments::B
         );
 }
 
+/// Count one admitted drain promotion abandoned with `(Unusable, NoSend)`, labelled `stage` (the
+/// failed send step, `store::fragment_write_behind::abandon_stage_label`) and `cause` (a closed
+/// provider diagnostic, `timeout`, `join`, or `none`). Both are static strings from closed sets.
+pub(crate) fn record_promotion_abandon_cause(stage: &'static str, cause: &'static str) {
+    static ABANDONS: OnceLock<Counter<u64>> = OnceLock::new();
+    ABANDONS
+        .get_or_init(|| PostgresStoreInstrumentProvider.counter("promotion_abandon_causes"))
+        .add(
+            1,
+            &[KeyValue::new("stage", stage), KeyValue::new("cause", cause)],
+        );
+}
+
 /// CR-032 relay instruments (WP-119 Step A).
 ///
 /// Deliberately **unlabelled**. CR-032 prohibits repository, event, actor, and

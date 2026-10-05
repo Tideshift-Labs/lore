@@ -1021,7 +1021,7 @@ impl DrainSlot {
 type HeldDrainSlot = tokio::sync::OwnedMutexGuard<DrainSlot>;
 
 type JoinedPromotion =
-    Result<(Vec<u8>, Result<bool, StoreError>, HeldDrainSlot), tokio::task::JoinError>;
+    Result<(Vec<u8>, Result<bool, PromotionDeferred>, HeldDrainSlot), tokio::task::JoinError>;
 
 pub struct FragmentWriteBehindHandle {
     coordinator: PostgresFragmentCoordinator,
@@ -1495,7 +1495,7 @@ impl FragmentWriteBehindHandle {
                 self.state.lock().await.cooldown.remove(&hash);
             }
             Ok(false) => self.record_drain_activity(false),
-            Err(error) => {
+            Err(deferred) => {
                 let mut state = self.state.lock().await;
                 // Bounded memory; the keyset still advances when cooling down.
                 if state.cooldown.len() >= 1024 {
@@ -1507,7 +1507,12 @@ impl FragmentWriteBehindHandle {
                     .map_or(1, |(_, n)| n.saturating_add(1));
                 let delay = Duration::from_secs((1u64 << tries.min(5)).min(30));
                 state.cooldown.insert(hash, (Instant::now() + delay, tries));
-                tracing::warn!("fragment promotion deferred: {error}");
+                tracing::warn!(
+                    stage = deferred.stage,
+                    cause = deferred.cause,
+                    "fragment promotion deferred: {}",
+                    deferred.error
+                );
             }
         }
         // A slot still holding a timed-out file task sits out the rest of the pass.
@@ -1620,9 +1625,14 @@ impl FragmentWriteBehindHandle {
         &self,
         source: FragmentDrainCandidate,
         slot: &mut DrainSlot,
-    ) -> Result<bool, StoreError> {
-        crate::domain::fragments::failpoint!("drain.source.entry").map_err(domain_store_err)?;
-        let verified = self.verify_source(source, slot).await?;
+    ) -> Result<bool, PromotionDeferred> {
+        crate::domain::fragments::failpoint!("drain.source.entry")
+            .map_err(domain_store_err)
+            .map_err(PromotionDeferred::at(DEFERRED_STAGE_VERIFY_SOURCE))?;
+        let verified = self
+            .verify_source(source, slot)
+            .await
+            .map_err(PromotionDeferred::at(DEFERRED_STAGE_VERIFY_SOURCE))?;
         let logical = uuid::Uuid::now_v7();
         let attempt = uuid::Uuid::now_v7();
         let input = FragmentWriteClaimInput::new(
@@ -1633,7 +1643,8 @@ impl FragmentWriteBehindHandle {
             self.send_timeout,
             self.late_effect_bound,
         )
-        .map_err(domain_store_err)?;
+        .map_err(domain_store_err)
+        .map_err(PromotionDeferred::at(DEFERRED_STAGE_BEGIN))?;
         // Begin, authorize and commit each take their own short checkout. No
         // domain connection is held across the spool reserve, write and ready
         // steps between begin and authorize (row 79: holding one there cost
@@ -1647,7 +1658,10 @@ impl FragmentWriteBehindHandle {
         crate::metrics::record_promotion_begin_outcome(
             crate::domain::fragments::begin_outcome_labels(begun.as_ref()),
         );
-        let intent = match begun.map_err(domain_store_err)? {
+        let intent = match begun
+            .map_err(domain_store_err)
+            .map_err(PromotionDeferred::at(DEFERRED_STAGE_BEGIN))?
+        {
             BeginOutcome::Admitted(intent) => intent,
             _ => return Ok(false),
         };
@@ -1668,19 +1682,28 @@ impl FragmentWriteBehindHandle {
                             .coordinator
                             .capture_current_readable_epoch(&intent.hash)
                             .await
-                            .map_err(domain_store_err)?;
+                            .map_err(domain_store_err)
+                            .map_err(PromotionDeferred::at(DEFERRED_STAGE_COMMIT))?;
                         if current.is_some_and(|w| {
                             w.epoch == intent.epoch
                                 && w.manifest_id.as_ref() == Some(&manifest.manifest_id)
                         }) {
                             Ok(true)
                         } else {
-                            Err(domain_store_err(error))
+                            Err(PromotionDeferred::at(DEFERRED_STAGE_COMMIT)(
+                                domain_store_err(error),
+                            ))
                         }
                     }
                 }
             }
-            Err(error) => {
+            Err(failure) => {
+                // Observation only: counted once per abandon decision, before
+                // the commit that records it, so a failed commit still counts.
+                crate::metrics::record_promotion_abandon_cause(
+                    abandon_stage_label(failure.stage),
+                    failure.cause,
+                );
                 // Coordinator distinguishes Prepared/NoSend from Sending and
                 // preserves the late-effect barrier for ambiguous attempts.
                 self.coordinator
@@ -1690,8 +1713,16 @@ impl FragmentWriteBehindHandle {
                         FragmentWriteSettlement::NoSend,
                     )
                     .await
-                    .map_err(domain_store_err)?;
-                Err(error)
+                    .map_err(|error| PromotionDeferred {
+                        stage: abandon_stage_label(failure.stage),
+                        cause: failure.cause,
+                        error: domain_store_err(error),
+                    })?;
+                Err(PromotionDeferred {
+                    stage: abandon_stage_label(failure.stage),
+                    cause: failure.cause,
+                    error: failure.error,
+                })
             }
         }
     }
@@ -1701,31 +1732,37 @@ impl FragmentWriteBehindHandle {
         intent: &crate::domain::fragments::FragmentIntent,
         body: &VerifiedStagedBody,
         slot: &mut DrainSlot,
-    ) -> Result<(FragmentManifest, FragmentWriteSettlement), StoreError> {
-        let claim = intent
-            .write_claim()
-            .ok_or_else(|| StoreError::internal("promotion claim missing"))?;
-        let mut plan = FragmentDrainReservationPlan::new(FragmentDrainReservationInput {
-            logical_request_id: uuid::Uuid::from_bytes(*claim.logical_request_id()),
-            attempt_id: uuid::Uuid::from_bytes(*claim.attempt_id()),
-            upload_id: uuid::Uuid::now_v7(),
-            spool_object_id: uuid::Uuid::now_v7(),
-            upload_fence: positive(claim.fence())?,
-            source_hash: body.address.hash.to_string(),
-            source_epoch: positive(body.source.epoch())?,
-            source_manifest: body
-                .source
-                .manifest_id()
-                .try_into()
-                .map_err(|_error| StoreError::internal("source manifest width"))?,
-            remote_epoch: positive(intent.epoch)?,
-            remote_fence: positive(intent.fence)?,
-            object_key: intent.object_key.clone(),
-            body_digest: *claim.body_blake3(),
-            body_size: claim.body_size(),
-            send_not_after_ms: system_time_millis(claim.send_not_after())?,
-            hard_not_after_ms: system_time_millis(claim.hard_not_after())?,
-        });
+    ) -> Result<(FragmentManifest, FragmentWriteSettlement), PromotionFailure> {
+        use PromotionAbandonStage as Stage;
+        let plan_input = || -> Result<_, StoreError> {
+            let claim = intent
+                .write_claim()
+                .ok_or_else(|| StoreError::internal("promotion claim missing"))?;
+            let input = FragmentDrainReservationInput {
+                logical_request_id: uuid::Uuid::from_bytes(*claim.logical_request_id()),
+                attempt_id: uuid::Uuid::from_bytes(*claim.attempt_id()),
+                upload_id: uuid::Uuid::now_v7(),
+                spool_object_id: uuid::Uuid::now_v7(),
+                upload_fence: positive(claim.fence())?,
+                source_hash: body.address.hash.to_string(),
+                source_epoch: positive(body.source.epoch())?,
+                source_manifest: body
+                    .source
+                    .manifest_id()
+                    .try_into()
+                    .map_err(|_error| StoreError::internal("source manifest width"))?,
+                remote_epoch: positive(intent.epoch)?,
+                remote_fence: positive(intent.fence)?,
+                object_key: intent.object_key.clone(),
+                body_digest: *claim.body_blake3(),
+                body_size: claim.body_size(),
+                send_not_after_ms: system_time_millis(claim.send_not_after())?,
+                hard_not_after_ms: system_time_millis(claim.hard_not_after())?,
+            };
+            Ok((claim, input))
+        };
+        let (claim, input) = plan_input().map_err(PromotionFailure::store(Stage::Plan))?;
+        let mut plan = FragmentDrainReservationPlan::new(input);
         let mut reservation_result = self.drain.reserve_spool(&mut plan).await;
         for _ in 0..2 {
             if !matches!(
@@ -1744,7 +1781,8 @@ impl FragmentWriteBehindHandle {
             // database outcomes. A retry must not mint another quota identity.
             reservation_result = self.drain.reserve_spool(&mut plan).await;
         }
-        let reservation = reservation_result.map_err(provider_store_err)?;
+        let reservation =
+            reservation_result.map_err(PromotionFailure::provider(Stage::ReserveSpool))?;
         let budget_pin = reservation.budget_pin().clone();
         let bytes = body.bytes.clone();
         // The reservation is retained with the receipt so ready derives all
@@ -1758,36 +1796,45 @@ impl FragmentWriteBehindHandle {
         let handle = slot
             .writer
             .as_mut()
-            .ok_or_else(|| StoreError::internal("spool writer missing"))?;
+            .ok_or_else(|| StoreError::internal("spool writer missing"))
+            .map_err(PromotionFailure::store(Stage::WriteBody))?;
         let written = tokio::time::timeout(self.send_timeout, handle).await;
         let receipt = match written {
             Ok(joined) => {
                 slot.writer = None;
                 joined
-                    .map_err(|_error| StoreError::from(SlowDown))?
-                    .map_err(provider_store_err)?
+                    .map_err(|_error| {
+                        PromotionFailure::slow_down(Stage::WriteBody, ABANDON_CAUSE_JOIN)
+                    })?
+                    .map_err(PromotionFailure::provider(Stage::WriteBody))?
             }
-            Err(_) => return Err(StoreError::from(SlowDown)),
+            Err(_) => {
+                return Err(PromotionFailure::slow_down(
+                    Stage::WriteBody,
+                    ABANDON_CAUSE_TIMEOUT,
+                ));
+            }
         };
         let ready = self
             .drain
             .mark_spool_ready(&reservation, &receipt)
             .await
-            .map_err(provider_store_err)?;
+            .map_err(PromotionFailure::provider(Stage::MarkSpoolReady))?;
         let logical = uuid::Uuid::from_bytes(*claim.logical_request_id()).to_string();
         let mut ledger =
             FragmentAttemptLedger::new(self.provider.boundary().provider_boundary_id(), &logical)
-                .map_err(provider_store_err)?;
+                .map_err(PromotionFailure::provider(Stage::Ledger))?;
         let authorized = self
             .coordinator
             .authorize_write_claim(claim)
             .await
-            .map_err(domain_store_err)?;
+            .map_err(PromotionFailure::domain(Stage::Authorize))?;
         let request = FragmentDrainAttempt {
             logical_request_id: logical,
             attempt_id: uuid::Uuid::from_bytes(*claim.attempt_id()).to_string(),
             attempt_ordinal: 1,
-            deadline_unix_ms: system_time_millis(claim.send_not_after())?,
+            deadline_unix_ms: system_time_millis(claim.send_not_after())
+                .map_err(PromotionFailure::store(Stage::AttemptDrain))?,
             budget_pin,
             object_key: intent.object_key.clone(),
             metadata: to_object_metadata(&body.fragment).into_iter().collect(),
@@ -1814,7 +1861,7 @@ impl FragmentWriteBehindHandle {
             {
                 (FragmentWriteSettlement::Ambiguous, false)
             }
-            Ok(Err(error)) => return Err(provider_store_err(error)),
+            Ok(Err(error)) => return Err(PromotionFailure::provider(Stage::AttemptDrain)(error)),
             Err(_) => (FragmentWriteSettlement::Ambiguous, false),
         };
         if created && settlement == FragmentWriteSettlement::Decisive {
@@ -1825,7 +1872,8 @@ impl FragmentWriteBehindHandle {
                     body.fragment,
                     &body.bytes,
                     EpochAuthority::Remote,
-                )?,
+                )
+                .map_err(PromotionFailure::store(Stage::AttemptDrain))?,
                 settlement,
             ));
         }
@@ -1845,39 +1893,45 @@ impl FragmentWriteBehindHandle {
             ),
         )
         .await
-        .map_err(|_error| StoreError::from(SlowDown))?
-        .map_err(provider_store_err)?;
+        .map_err(|_error| PromotionFailure::slow_down(Stage::AdoptionGet, ABANDON_CAUSE_TIMEOUT))?
+        .map_err(PromotionFailure::provider(Stage::AdoptionGet))?;
         if let (ProviderAttemptOutcome::Decisive, FragmentGetResponse::Found { bytes, metadata }) =
             (remote.outcome, remote.response)
         {
-            let metadata = metadata.into_iter().collect();
-            let fragment = from_object_metadata(Some(&metadata))
-                .map_err(|_error| StoreError::internal("remote metadata invalid"))?;
-            let bytes = Bytes::from(bytes);
-            PostgresImmutableStore::validate_put_candidate(
-                body.address,
-                fragment,
-                &bytes,
-                "promotion adoption",
-            )?;
-            if fragment.size_content != body.fragment.size_content
-                || fragment.flags & CONTENT_STRUCTURE_MASK
-                    != body.fragment.flags & CONTENT_STRUCTURE_MASK
-            {
-                return Err(StoreError::internal("remote fragment semantics conflict"));
-            }
-            return Ok((
+            let adopt = || -> Result<_, StoreError> {
+                let metadata = metadata.into_iter().collect();
+                let fragment = from_object_metadata(Some(&metadata))
+                    .map_err(|_error| StoreError::internal("remote metadata invalid"))?;
+                let bytes = Bytes::from(bytes);
+                PostgresImmutableStore::validate_put_candidate(
+                    body.address,
+                    fragment,
+                    &bytes,
+                    "promotion adoption",
+                )?;
+                if fragment.size_content != body.fragment.size_content
+                    || fragment.flags & CONTENT_STRUCTURE_MASK
+                        != body.fragment.flags & CONTENT_STRUCTURE_MASK
+                {
+                    return Err(StoreError::internal("remote fragment semantics conflict"));
+                }
                 PostgresImmutableStore::key_manifest(
                     &intent.object_key,
                     body.address,
                     fragment,
                     &bytes,
                     EpochAuthority::Remote,
-                )?,
+                )
+            };
+            return Ok((
+                adopt().map_err(PromotionFailure::store(Stage::AdoptionValidate))?,
                 settlement,
             ));
         }
-        Err(StoreError::from(SlowDown))
+        Err(PromotionFailure::slow_down(
+            Stage::Final,
+            ABANDON_CAUSE_NONE,
+        ))
     }
 
     pub async fn cleanup_pass(&self, batch: u32) -> Result<u32, StoreError> {
@@ -2012,6 +2066,303 @@ impl FragmentWriteBehindHandle {
 
 fn positive(value: i64) -> Result<u64, StoreError> {
     u64::try_from(value).map_err(|_error| StoreError::internal("negative write-behind observation"))
+}
+
+/// The step of an admitted promotion's send that failed. Every such failure is abandoned with
+/// `(Unusable, NoSend)` and counted on `promotion_abandon_causes{stage, cause}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PromotionAbandonStage {
+    /// Building the reservation input from the claim, before any spool call.
+    Plan,
+    ReserveSpool,
+    WriteBody,
+    MarkSpoolReady,
+    Ledger,
+    Authorize,
+    AttemptDrain,
+    AdoptionGet,
+    /// The adopted remote representation failed validation or conflicts with the staged one.
+    AdoptionValidate,
+    /// The adoption read found no decisive representation to publish.
+    Final,
+}
+
+impl PromotionAbandonStage {
+    /// Every stage, for tests that pin the closed label set.
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Plan,
+        Self::ReserveSpool,
+        Self::WriteBody,
+        Self::MarkSpoolReady,
+        Self::Ledger,
+        Self::Authorize,
+        Self::AttemptDrain,
+        Self::AdoptionGet,
+        Self::AdoptionValidate,
+        Self::Final,
+    ];
+}
+
+/// The closed `stage` label for one abandon stage.
+pub(crate) const fn abandon_stage_label(stage: PromotionAbandonStage) -> &'static str {
+    match stage {
+        PromotionAbandonStage::Plan => "plan",
+        PromotionAbandonStage::ReserveSpool => "reserve_spool",
+        PromotionAbandonStage::WriteBody => "write_body",
+        PromotionAbandonStage::MarkSpoolReady => "mark_spool_ready",
+        PromotionAbandonStage::Ledger => "ledger",
+        PromotionAbandonStage::Authorize => "authorize",
+        PromotionAbandonStage::AttemptDrain => "attempt_drain",
+        PromotionAbandonStage::AdoptionGet => "adoption_get",
+        PromotionAbandonStage::AdoptionValidate => "adoption_validate",
+        PromotionAbandonStage::Final => "final",
+    }
+}
+
+/// The `cause` label when the failing step had no provider diagnostic.
+pub(crate) const ABANDON_CAUSE_NONE: &str = "none";
+/// The step's own bounded wait elapsed.
+pub(crate) const ABANDON_CAUSE_TIMEOUT: &str = "timeout";
+/// The step's blocking task panicked or was cancelled.
+pub(crate) const ABANDON_CAUSE_JOIN: &str = "join";
+
+/// The closed `cause` label for a provider seam failure. See
+/// [`lore_fragment_provider::FragmentProviderError::diagnostic_label`].
+pub(crate) fn abandon_provider_cause(
+    error: &lore_fragment_provider::FragmentProviderError,
+) -> &'static str {
+    error.diagnostic_label()
+}
+
+/// The `stage` field of a "promotion deferred" warn whose failure came before or after the
+/// send, not from an abandon stage. Log fields only; never a counter label.
+pub(crate) const DEFERRED_STAGE_VERIFY_SOURCE: &str = "verify_source";
+pub(crate) const DEFERRED_STAGE_BEGIN: &str = "begin";
+pub(crate) const DEFERRED_STAGE_COMMIT: &str = "commit";
+
+/// Why one promotion was deferred, as the drain's "promotion deferred" warn reports it. `stage`
+/// and `cause` are closed static labels; `error` is what the drain returned before they existed.
+#[derive(Debug)]
+pub(crate) struct PromotionDeferred {
+    stage: &'static str,
+    cause: &'static str,
+    error: StoreError,
+}
+
+impl PromotionDeferred {
+    fn at(stage: &'static str) -> impl FnOnce(StoreError) -> Self {
+        move |error| Self {
+            stage,
+            cause: ABANDON_CAUSE_NONE,
+            error,
+        }
+    }
+}
+
+/// One failed step of an admitted promotion's send, with its closed labels. The error is what
+/// the drain returned before these labels existed.
+#[derive(Debug)]
+pub(crate) struct PromotionFailure {
+    stage: PromotionAbandonStage,
+    cause: &'static str,
+    error: StoreError,
+}
+
+impl PromotionFailure {
+    fn store(stage: PromotionAbandonStage) -> impl FnOnce(StoreError) -> Self {
+        move |error| Self {
+            stage,
+            cause: ABANDON_CAUSE_NONE,
+            error,
+        }
+    }
+
+    fn provider(
+        stage: PromotionAbandonStage,
+    ) -> impl FnOnce(lore_fragment_provider::FragmentProviderError) -> Self {
+        move |error| Self {
+            stage,
+            cause: abandon_provider_cause(&error),
+            error: provider_store_err(error),
+        }
+    }
+
+    fn domain(
+        stage: PromotionAbandonStage,
+    ) -> impl FnOnce(crate::domain::errors::DomainError) -> Self {
+        move |error| Self {
+            stage,
+            cause: ABANDON_CAUSE_NONE,
+            error: domain_store_err(error),
+        }
+    }
+
+    fn slow_down(stage: PromotionAbandonStage, cause: &'static str) -> Self {
+        Self {
+            stage,
+            cause,
+            error: StoreError::from(SlowDown),
+        }
+    }
+}
+
+#[cfg(test)]
+mod abandon_label_tests {
+    use super::ABANDON_CAUSE_JOIN;
+    use super::ABANDON_CAUSE_NONE;
+    use super::ABANDON_CAUSE_TIMEOUT;
+    use super::PromotionAbandonStage;
+    use super::abandon_provider_cause;
+    use super::abandon_stage_label;
+
+    #[test]
+    fn abandon_stage_labels_are_distinct_static_snake_case() {
+        let labels: Vec<&str> = PromotionAbandonStage::ALL
+            .into_iter()
+            .map(abandon_stage_label)
+            .collect();
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "duplicate stage label in {labels:?}"
+        );
+        for label in labels {
+            assert!(
+                !label.is_empty() && label.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{label} is not a closed snake_case label"
+            );
+        }
+    }
+
+    #[test]
+    fn abandon_stage_set_is_exactly_the_ten_documented_labels() {
+        let mut labels: Vec<&str> = PromotionAbandonStage::ALL
+            .into_iter()
+            .map(abandon_stage_label)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "plan",
+                "reserve_spool",
+                "write_body",
+                "mark_spool_ready",
+                "ledger",
+                "authorize",
+                "attempt_drain",
+                "adoption_get",
+                "adoption_validate",
+                "final",
+            ]
+        );
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), 10);
+        // ALL has no repeated variant, so ten distinct entries cover the ten-variant enum.
+        for (i, a) in PromotionAbandonStage::ALL.iter().enumerate() {
+            for b in &PromotionAbandonStage::ALL[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        // The exhaustive match in `abandon_stage_label` is what forces a new variant here; count
+        // the enum's variants from source so `ALL` cannot lag it.
+        let source = include_str!("fragment_write_behind.rs");
+        let body = source
+            .split("pub(crate) enum PromotionAbandonStage {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .unwrap_or("");
+        let variants = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && line.ends_with(','))
+            .count();
+        assert_eq!(variants, PromotionAbandonStage::ALL.len());
+    }
+
+    #[test]
+    fn abandon_provider_cause_for_a_drain_error_is_the_drain_diagnostic() {
+        use lore_fragment_provider::FragmentDrainAuthorityError as Drain;
+        use lore_fragment_provider::FragmentProviderError;
+        use lore_fragment_provider::drain_diagnostic;
+        for error in [
+            Drain::Contended,
+            Drain::Refused,
+            Drain::Unavailable,
+            Drain::Invalid,
+            Drain::MetadataUnderflow,
+            Drain::SchemaUpgradeRequired,
+            Drain::SchemaUnknown,
+        ] {
+            assert_eq!(
+                abandon_provider_cause(&FragmentProviderError::DrainAuthority(error)),
+                drain_diagnostic(&error),
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            abandon_provider_cause(&FragmentProviderError::DrainAuthority(Drain::Contended)),
+            "drain_contended"
+        );
+        assert_eq!(
+            abandon_provider_cause(&FragmentProviderError::DrainSpoolIo),
+            "drain_spool_io"
+        );
+        assert_eq!(
+            abandon_provider_cause(&FragmentProviderError::InvalidInFlightPutBound),
+            "none"
+        );
+    }
+
+    #[test]
+    fn local_abandon_causes_are_distinct_from_each_other_and_every_provider_label() {
+        use lore_fragment_provider::FragmentDrainAuthorityError as Drain;
+        use lore_fragment_provider::FragmentProviderError;
+        assert_eq!(ABANDON_CAUSE_NONE, "none");
+        assert_eq!(ABANDON_CAUSE_TIMEOUT, "timeout");
+        assert_eq!(ABANDON_CAUSE_JOIN, "join");
+        let local = [
+            ABANDON_CAUSE_NONE,
+            ABANDON_CAUSE_TIMEOUT,
+            ABANDON_CAUSE_JOIN,
+        ];
+        let providers = [
+            FragmentProviderError::PutAdmissionTimedOut,
+            FragmentProviderError::PutAdmissionClosed,
+            FragmentProviderError::ChargeAdmissionTimedOut,
+            FragmentProviderError::ChargeAdmissionClosed,
+            FragmentProviderError::DrainSpoolIo,
+            FragmentProviderError::DrainAuthority(Drain::Contended),
+            FragmentProviderError::DrainAuthority(Drain::Refused),
+            FragmentProviderError::DrainAuthority(Drain::Unavailable),
+            FragmentProviderError::DrainAuthority(Drain::Invalid),
+            FragmentProviderError::DrainAuthority(Drain::MetadataUnderflow),
+            FragmentProviderError::DrainAuthority(Drain::SchemaUpgradeRequired),
+            FragmentProviderError::DrainAuthority(Drain::SchemaUnknown),
+        ];
+        for (i, a) in local.iter().enumerate() {
+            for b in &local[i + 1..] {
+                assert_ne!(a, b);
+            }
+            for provider in &providers {
+                let label = abandon_provider_cause(provider);
+                // "none" is the one deliberate overlap: both mean "no diagnostic".
+                if *a != ABANDON_CAUSE_NONE {
+                    assert_ne!(*a, label, "{provider:?} collides with a local cause");
+                }
+            }
+        }
+        // Every non-none provider label is distinct from the stage labels too, so a dashboard
+        // grouping by either label never mixes the two axes.
+        for stage in PromotionAbandonStage::ALL {
+            let stage_label = abandon_stage_label(stage);
+            assert!(!local.contains(&stage_label), "{stage_label}");
+        }
+    }
 }
 
 #[cfg(test)]

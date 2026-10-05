@@ -144,6 +144,140 @@ fn commit_error(code: Option<&SqlState>) -> DrainError {
     }
 }
 
+/// Why one drain authority call failed, finer than [`DrainError`].
+///
+/// Observation only. [`DrainError`] stays the contract every caller matches on; this closed set is
+/// recorded on `lore.object_dispatch.drain_authority_failures{procedure, cause}` at the one place
+/// the SQLSTATE, the raised message and the failing step are still known
+/// ([`DrainClient::query_at`]). Every label is a static string from this enum, never SQL text,
+/// a message, or an identifier.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DrainFailureCause {
+    /// The dispatch pool gave no connection. Reaches the caller as `Unavailable`.
+    PoolAcquire,
+    /// The leased session failed before the statement: client, `BEGIN`, or the timeout preamble.
+    /// Reaches the caller as `Unavailable`.
+    Session,
+    /// The whole bounded operation outlived the pool's operation timeout. `Unavailable`.
+    OperationTimeout,
+    /// The statement lost a race (40001, 55P03, 40P01). `Contended`.
+    Contended,
+    /// SQLSTATE 53000 raised as `DISPATCH_RESERVE_PUT_CAPACITY_EXHAUSTED` (migration 0013). `Refused`.
+    RefusedPutCapacity,
+    /// SQLSTATE 53000 raised as `DRAIN_METADATA_CAPACITY` (migrations 0026/0030). `Refused`.
+    RefusedMetadataCapacity,
+    /// SQLSTATE 53000 under any other message. `Refused`.
+    RefusedCapacityOther,
+    /// SQLSTATE 57014: the `SET LOCAL statement_timeout` fired. `Refused`.
+    RefusedStatementTimeout,
+    /// Any other SQLSTATE, a raised authority refusal included. `Refused`.
+    RefusedOther,
+    /// `DRAIN_METADATA_UNDERFLOW`. `MetadataUnderflow`.
+    MetadataUnderflow,
+    /// The statement failed with no SQLSTATE, so its outcome is unknown. `Unavailable`.
+    StatementUnknown,
+    /// `COMMIT` lost a race and rolled back. `Contended`.
+    CommitContended,
+    /// `COMMIT` failed otherwise and may have committed. `Unavailable`.
+    CommitUnknown,
+}
+
+impl DrainFailureCause {
+    pub const ALL: [Self; 13] = [
+        Self::PoolAcquire,
+        Self::Session,
+        Self::OperationTimeout,
+        Self::Contended,
+        Self::RefusedPutCapacity,
+        Self::RefusedMetadataCapacity,
+        Self::RefusedCapacityOther,
+        Self::RefusedStatementTimeout,
+        Self::RefusedOther,
+        Self::MetadataUnderflow,
+        Self::StatementUnknown,
+        Self::CommitContended,
+        Self::CommitUnknown,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::PoolAcquire => "unavailable_pool",
+            Self::Session => "unavailable_session",
+            Self::OperationTimeout => "unavailable_timeout",
+            Self::Contended => "contended",
+            Self::RefusedPutCapacity => "refused_put_capacity",
+            Self::RefusedMetadataCapacity => "refused_metadata_capacity",
+            Self::RefusedCapacityOther => "refused_capacity_other",
+            Self::RefusedStatementTimeout => "refused_statement_timeout",
+            Self::RefusedOther => "refused_other",
+            Self::MetadataUnderflow => "metadata_underflow",
+            Self::StatementUnknown => "unavailable_statement",
+            Self::CommitContended => "commit_contended",
+            Self::CommitUnknown => "commit_unknown",
+        }
+    }
+}
+
+/// The cause of a failed statement, from its SQLSTATE and raised message. Mirrors
+/// [`statement_error_of`]: the [`DrainError`] each cause documents is exactly what that function
+/// returns for the same inputs.
+pub fn statement_failure_cause(
+    code: Option<&SqlState>,
+    message: Option<&str>,
+) -> DrainFailureCause {
+    if message == Some("DRAIN_METADATA_UNDERFLOW") {
+        return DrainFailureCause::MetadataUnderflow;
+    }
+    match code {
+        None => DrainFailureCause::StatementUnknown,
+        Some(code) if is_contention(code) => DrainFailureCause::Contended,
+        Some(code) if *code == SqlState::INSUFFICIENT_RESOURCES => match message {
+            Some("DISPATCH_RESERVE_PUT_CAPACITY_EXHAUSTED") => {
+                DrainFailureCause::RefusedPutCapacity
+            }
+            Some("DRAIN_METADATA_CAPACITY") => DrainFailureCause::RefusedMetadataCapacity,
+            _ => DrainFailureCause::RefusedCapacityOther,
+        },
+        Some(code) if *code == SqlState::QUERY_CANCELED => {
+            DrainFailureCause::RefusedStatementTimeout
+        }
+        Some(_) => DrainFailureCause::RefusedOther,
+    }
+}
+
+/// The cause of a failed `COMMIT`. Mirrors [`commit_error`].
+pub fn commit_failure_cause(code: Option<&SqlState>) -> DrainFailureCause {
+    match code {
+        Some(code) if is_contention(code) => DrainFailureCause::CommitContended,
+        _ => DrainFailureCause::CommitUnknown,
+    }
+}
+
+/// A closed label for the authority procedure a drain statement calls. Matched against this
+/// crate's own static SQL, so the label set is the arms below.
+pub fn drain_procedure_label(sql: &str) -> &'static str {
+    const PROCEDURES: [(&str, &str); 14] = [
+        ("drain_reserve_v1", "reserve"),
+        ("drain_policy_read_v1", "policy_read"),
+        ("drain_check_ready_v1", "check_ready"),
+        ("drain_observe_v1", "observe"),
+        ("drain_cleanup_candidates_v1", "cleanup_candidates"),
+        ("drain_cleanup_claim_v2", "cleanup_claim"),
+        ("drain_cleanup_unlease_v1", "cleanup_unlease"),
+        ("drain_cleanup_release_v1", "cleanup_release"),
+        ("drain_cleanup_compact_v2", "cleanup_compact"),
+        ("drain_policy_publish_v1", "policy_publish"),
+        ("drain_policy_verify_v1", "policy_verify"),
+        ("drain_policy_rotate_v1", "policy_rotate"),
+        ("cell_schema_revision_v1", "schema_revision"),
+        ("drain_", "other_drain"),
+    ];
+    PROCEDURES
+        .iter()
+        .find(|(needle, _)| sql.contains(needle))
+        .map_or("other", |(_, label)| label)
+}
+
 fn framed(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), DrainError> {
     let len = u32::try_from(bytes.len()).map_err(|_error| DrainError::Invalid)?;
     out.extend_from_slice(&len.to_be_bytes());
@@ -384,27 +518,39 @@ impl DrainClient {
         sql: &str,
         values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     ) -> Result<Vec<Row>, DrainError> {
-        let mut lease = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|_error| DrainError::Unavailable)?;
+        let failed = |cause: DrainFailureCause, error: DrainError| {
+            crate::metrics::record_drain_authority_failure(
+                drain_procedure_label(sql),
+                cause.label(),
+            );
+            error
+        };
+        let mut lease =
+            self.pool.acquire().await.map_err(|_error| {
+                failed(DrainFailureCause::PoolAcquire, DrainError::Unavailable)
+            })?;
         let operation = tokio::time::timeout(self.pool.operation_timeout(), async {
-            let client = lease.client().map_err(|_error| DrainError::Unavailable)?;
+            let session = || failed(DrainFailureCause::Session, DrainError::Unavailable);
+            let client = lease.client().map_err(|_error| session())?;
             let tx = client
                 .build_transaction()
                 .isolation_level(isolation)
                 .start()
                 .await
-                .map_err(|_error| DrainError::Unavailable)?;
+                .map_err(|_error| session())?;
             tx.batch_execute(&self.pool.bounded_execution_preamble())
                 .await
-                .map_err(|_error| DrainError::Unavailable)?;
-            let rows = tx
-                .query(sql, values)
+                .map_err(|_error| session())?;
+            let rows = tx.query(sql, values).await.map_err(|e| {
+                let message = e.as_db_error().map(|db| db.message());
+                failed(
+                    statement_failure_cause(e.code(), message),
+                    statement_error_of(&e),
+                )
+            })?;
+            tx.commit()
                 .await
-                .map_err(|e| statement_error_of(&e))?;
-            tx.commit().await.map_err(|e| commit_error(e.code()))?;
+                .map_err(|e| failed(commit_failure_cause(e.code()), commit_error(e.code())))?;
             Ok(rows)
         })
         .await;
@@ -419,7 +565,10 @@ impl DrainClient {
             }
             Err(_) => {
                 lease.poison();
-                Err(DrainError::Unavailable)
+                Err(failed(
+                    DrainFailureCause::OperationTimeout,
+                    DrainError::Unavailable,
+                ))
             }
         }
     }
@@ -699,5 +848,333 @@ mod tests {
         }
         assert_eq!(statement_error(None), DrainError::Unavailable);
         assert_eq!(commit_error(None), DrainError::Unavailable);
+    }
+
+    const PUT_CAPACITY: &str = "DISPATCH_RESERVE_PUT_CAPACITY_EXHAUSTED";
+    const METADATA_CAPACITY: &str = "DRAIN_METADATA_CAPACITY";
+    const UNDERFLOW: &str = "DRAIN_METADATA_UNDERFLOW";
+
+    /// The `DrainError` each cause documents on its own doc comment.
+    fn documented_error(cause: DrainFailureCause) -> DrainError {
+        use DrainFailureCause as C;
+        match cause {
+            C::PoolAcquire
+            | C::Session
+            | C::OperationTimeout
+            | C::StatementUnknown
+            | C::CommitUnknown => DrainError::Unavailable,
+            C::Contended | C::CommitContended => DrainError::Contended,
+            C::RefusedPutCapacity
+            | C::RefusedMetadataCapacity
+            | C::RefusedCapacityOther
+            | C::RefusedStatementTimeout
+            | C::RefusedOther => DrainError::Refused,
+            C::MetadataUnderflow => DrainError::MetadataUnderflow,
+        }
+    }
+
+    #[test]
+    fn drain_failure_cause_labels_are_thirteen_distinct_exact_literals() {
+        let expected = [
+            "unavailable_pool",
+            "unavailable_session",
+            "unavailable_timeout",
+            "contended",
+            "refused_put_capacity",
+            "refused_metadata_capacity",
+            "refused_capacity_other",
+            "refused_statement_timeout",
+            "refused_other",
+            "metadata_underflow",
+            "unavailable_statement",
+            "commit_contended",
+            "commit_unknown",
+        ];
+        assert_eq!(DrainFailureCause::ALL.len(), 13);
+        let labels: Vec<&str> = DrainFailureCause::ALL.iter().map(|c| c.label()).collect();
+        assert_eq!(labels, expected, "ALL order and labels are pinned");
+        let mut unique = labels.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 13, "labels must be distinct");
+        // ALL covers every variant exactly once: no duplicates by value.
+        for (i, a) in DrainFailureCause::ALL.iter().enumerate() {
+            for b in &DrainFailureCause::ALL[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
+
+    /// Every branch of `statement_failure_cause`, with the `DrainError` the live
+    /// `statement_error` returns for the same SQLSTATE where the message does not decide it.
+    #[test]
+    fn statement_failure_cause_table_covers_every_branch() {
+        use DrainFailureCause as C;
+        let serial = SqlState::T_R_SERIALIZATION_FAILURE;
+        let lock = SqlState::LOCK_NOT_AVAILABLE;
+        let dead = SqlState::T_R_DEADLOCK_DETECTED;
+        let capacity = SqlState::INSUFFICIENT_RESOURCES;
+        let cancel = SqlState::QUERY_CANCELED;
+        let raise = SqlState::RAISE_EXCEPTION;
+        let table: [(Option<&SqlState>, Option<&str>, DrainFailureCause); 16] = [
+            // The underflow message wins over every code, including none and contention.
+            (None, Some(UNDERFLOW), C::MetadataUnderflow),
+            (Some(&raise), Some(UNDERFLOW), C::MetadataUnderflow),
+            (Some(&serial), Some(UNDERFLOW), C::MetadataUnderflow),
+            (Some(&capacity), Some(UNDERFLOW), C::MetadataUnderflow),
+            // No code: outcome unknown, whatever the message.
+            (None, None, C::StatementUnknown),
+            (None, Some(PUT_CAPACITY), C::StatementUnknown),
+            // Contention, message ignored.
+            (Some(&serial), None, C::Contended),
+            (Some(&lock), Some("anything"), C::Contended),
+            (Some(&dead), Some(PUT_CAPACITY), C::Contended),
+            // 53000 splits by message.
+            (Some(&capacity), Some(PUT_CAPACITY), C::RefusedPutCapacity),
+            (
+                Some(&capacity),
+                Some(METADATA_CAPACITY),
+                C::RefusedMetadataCapacity,
+            ),
+            (
+                Some(&capacity),
+                Some("OTHER_CAPACITY"),
+                C::RefusedCapacityOther,
+            ),
+            (Some(&capacity), None, C::RefusedCapacityOther),
+            // A message that only contains the exact one does not match.
+            (
+                Some(&capacity),
+                Some("DRAIN_METADATA_CAPACITY "),
+                C::RefusedCapacityOther,
+            ),
+            // Statement timeout and everything else.
+            (
+                Some(&cancel),
+                Some(PUT_CAPACITY),
+                C::RefusedStatementTimeout,
+            ),
+            (Some(&raise), Some(PUT_CAPACITY), C::RefusedOther),
+        ];
+        for (code, message, expected) in table {
+            assert_eq!(
+                statement_failure_cause(code, message),
+                expected,
+                "code {:?} message {message:?}",
+                code.map(SqlState::code)
+            );
+        }
+    }
+
+    #[test]
+    fn commit_failure_cause_splits_contention_from_unknown() {
+        for code in [
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::LOCK_NOT_AVAILABLE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+        ] {
+            assert_eq!(
+                commit_failure_cause(Some(&code)),
+                DrainFailureCause::CommitContended
+            );
+        }
+        for code in [SqlState::RAISE_EXCEPTION, SqlState::QUERY_CANCELED] {
+            assert_eq!(
+                commit_failure_cause(Some(&code)),
+                DrainFailureCause::CommitUnknown
+            );
+        }
+        assert_eq!(commit_failure_cause(None), DrainFailureCause::CommitUnknown);
+    }
+
+    /// The cause a statement or commit failure is recorded under documents the `DrainError` the
+    /// caller receives. `statement_error_of` needs a real `tokio_postgres::Error` (unconstructible
+    /// here), so it is compared through its two parts: `statement_error` for the SQLSTATE and the
+    /// underflow literal, pinned by source scan, for the message.
+    #[test]
+    fn recorded_cause_agrees_with_the_drain_error_the_caller_gets() {
+        let codes = [
+            None,
+            Some(SqlState::T_R_SERIALIZATION_FAILURE),
+            Some(SqlState::LOCK_NOT_AVAILABLE),
+            Some(SqlState::T_R_DEADLOCK_DETECTED),
+            Some(SqlState::INSUFFICIENT_RESOURCES),
+            Some(SqlState::QUERY_CANCELED),
+            Some(SqlState::RAISE_EXCEPTION),
+            Some(SqlState::NO_DATA_FOUND),
+        ];
+        let messages = [
+            None,
+            Some(PUT_CAPACITY),
+            Some(METADATA_CAPACITY),
+            Some("OTHER"),
+        ];
+        for code in &codes {
+            for message in messages {
+                let cause = statement_failure_cause(code.as_ref(), message);
+                assert_eq!(
+                    documented_error(cause),
+                    statement_error(code.as_ref()),
+                    "statement code {:?} message {message:?} cause {}",
+                    code.as_ref().map(SqlState::code),
+                    cause.label()
+                );
+            }
+            let cause = commit_failure_cause(code.as_ref());
+            assert_eq!(
+                documented_error(cause),
+                commit_error(code.as_ref()),
+                "commit code {:?} cause {}",
+                code.as_ref().map(SqlState::code),
+                cause.label()
+            );
+        }
+        // The message arm: both the cause and the live error key on the same exact literal.
+        assert_eq!(
+            documented_error(statement_failure_cause(None, Some(UNDERFLOW))),
+            DrainError::MetadataUnderflow
+        );
+        let source = include_str!("drain_policy.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            production.contains("db.message() == \"DRAIN_METADATA_UNDERFLOW\""),
+            "statement_error_of must keep keying on the underflow message the cause also keys on"
+        );
+        assert!(production.contains("message == Some(\"DRAIN_METADATA_UNDERFLOW\")"));
+    }
+
+    /// The raised messages the 53000 split keys on must still be what the migrations raise.
+    #[test]
+    fn capacity_split_messages_match_the_migrations() {
+        for (file, message) in [
+            (
+                include_str!("../migrations/0013_object_store_dispatch_reserve_put_mutation.sql"),
+                PUT_CAPACITY,
+            ),
+            (
+                include_str!("../migrations/0026_object_store_dispatch_drain_policy.sql"),
+                METADATA_CAPACITY,
+            ),
+            (
+                include_str!("../migrations/0030_object_store_dispatch_drain_charge_counters.sql"),
+                METADATA_CAPACITY,
+            ),
+            (
+                include_str!("../migrations/0028_object_store_dispatch_drain_metadata_true_up.sql"),
+                UNDERFLOW,
+            ),
+        ] {
+            assert!(
+                file.contains(&format!("RAISE EXCEPTION '{message}'")),
+                "{message} is no longer raised by its migration"
+            );
+        }
+    }
+
+    #[test]
+    fn drain_procedure_label_names_each_documented_procedure() {
+        let table = [
+            (
+                "SELECT object_store_retention.drain_reserve_v1($1::text::jsonb,$2,$3)",
+                "reserve",
+            ),
+            (
+                "SELECT * FROM object_store_retention.drain_policy_read_v1($1,$2,$3,$4)",
+                "policy_read",
+            ),
+            (
+                "SELECT * FROM object_store_retention.drain_check_ready_v1($1,$2,$3,$4,$5)",
+                "check_ready",
+            ),
+            (
+                "SELECT * FROM object_store_retention.drain_observe_v1($1,$2)",
+                "observe",
+            ),
+            (
+                "SELECT spool FROM object_store_retention.drain_cleanup_candidates_v1($1,$2,$3)",
+                "cleanup_candidates",
+            ),
+            (
+                "SELECT * FROM object_store_retention.drain_cleanup_claim_v2($1)",
+                "cleanup_claim",
+            ),
+            (
+                "SELECT object_store_retention.drain_cleanup_unlease_v1($1)",
+                "cleanup_unlease",
+            ),
+            (
+                "SELECT object_store_retention.drain_cleanup_release_v1($1,$2)",
+                "cleanup_release",
+            ),
+            (
+                "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)",
+                "cleanup_compact",
+            ),
+            (
+                "SELECT object_store_retention.drain_policy_publish_v1($1::text::jsonb,$2,$3)",
+                "policy_publish",
+            ),
+            (
+                "SELECT object_store_retention.drain_policy_verify_v1($1::text::jsonb,$2,$3)",
+                "policy_verify",
+            ),
+            (
+                "SELECT object_store_retention.drain_policy_rotate_v1($1::text::jsonb,$2,$3,$4,$5)",
+                "policy_rotate",
+            ),
+            (
+                "SELECT object_store_retention.cell_schema_revision_v1()",
+                "schema_revision",
+            ),
+            // A drain procedure this table does not know falls to the drain bucket, then other.
+            (
+                "SELECT object_store_retention.drain_future_v9($1)",
+                "other_drain",
+            ),
+            ("SELECT 1", "other"),
+            ("", "other"),
+        ];
+        for (sql, label) in table {
+            assert_eq!(drain_procedure_label(sql), label, "{sql}");
+        }
+    }
+
+    /// Every real SQL literal in the drain client and the spool cleanup client that calls a drain
+    /// procedure must get a specific label, so a renamed procedure (`_v3`) cannot silently fall
+    /// into `other_drain` and merge two procedures' failure counts.
+    #[test]
+    fn every_real_drain_sql_literal_gets_a_specific_procedure_label() {
+        let mut checked = 0usize;
+        for source in [
+            include_str!("drain_policy.rs"),
+            include_str!("drain_spool.rs"),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for line in production.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                let Some(start) = trimmed.find("\"SELECT ") else {
+                    continue;
+                };
+                let rest = &trimmed[start + 1..];
+                let Some(end) = rest.find('"') else { continue };
+                let sql = &rest[..end];
+                if !sql.contains("object_store_retention.") {
+                    continue;
+                }
+                let label = drain_procedure_label(sql);
+                assert!(
+                    label != "other" && label != "other_drain",
+                    "drain SQL has no specific procedure label: {sql}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 12,
+            "expected the real call sites, found {checked}"
+        );
     }
 }

@@ -356,6 +356,84 @@ fn write_behind_boot_seeds_the_drain_cursor_randomly() {
     );
 }
 
+/// The abandon decision is counted once, and before the commit that records it, so a failed
+/// abandon commit still shows up on `promotion_abandon_causes`. A second record site (or one
+/// moved after the commit) would double-count or drop exactly the failures this counter exists
+/// to explain.
+#[test]
+fn promote_counts_each_abandon_once_and_before_the_no_send_commit() {
+    let source = read_source("src/store/fragment_write_behind.rs");
+    assert_eq!(
+        source.matches("record_promotion_abandon_cause(").count(),
+        1,
+        "exactly one call site may record promotion_abandon_causes"
+    );
+    let promote = function(&source, "async fn promote(");
+    assert_eq!(
+        promote.matches("record_promotion_abandon_cause(").count(),
+        1,
+        "the single record site is the abandon arm of promote()"
+    );
+    let arm = promote
+        .find("Err(failure) =>")
+        .map(|start| &promote[start..])
+        .expect("promote() must keep an `Err(failure)` abandon arm");
+    assert!(
+        arm.contains("record_promotion_abandon_cause("),
+        "the record call must sit inside the abandon arm"
+    );
+    // Negatives first: nothing before the arm may record, and the commit that follows is NoSend.
+    assert!(
+        !promote[..promote.len() - arm.len()].contains("record_promotion_abandon_cause("),
+        "the record call must not precede the abandon arm"
+    );
+    assert_order(
+        arm,
+        &[
+            "record_promotion_abandon_cause(",
+            "abandon_stage_label(failure.stage)",
+            "failure.cause",
+            ".commit_promotion(",
+            "FragmentWriteSettlement::NoSend",
+        ],
+    );
+    // The first commit_promotion in the arm is the NoSend one, so "before commit_promotion("
+    // is "before the NoSend commit".
+    let record = arm.find("record_promotion_abandon_cause(").expect("record");
+    let commit = arm.find(".commit_promotion(").expect("commit");
+    let no_send = arm.find("FragmentWriteSettlement::NoSend").expect("NoSend");
+    assert!(record < commit && commit < no_send);
+}
+
+/// The drain's "promotion deferred" warn is what an operator reads; it must keep the closed
+/// `stage` and `cause` fields beside the unchanged message text.
+#[test]
+fn promotion_deferred_warn_carries_structured_stage_and_cause() {
+    let source = read_source("src/store/fragment_write_behind.rs");
+    let text_at = source
+        .find("fragment promotion deferred")
+        .expect("the `fragment promotion deferred` warn must still exist");
+    assert_eq!(
+        source.matches("fragment promotion deferred").count(),
+        1,
+        "one warn site"
+    );
+    let start = text_at.saturating_sub(250);
+    let window = &source[start..text_at];
+    assert!(
+        window.contains("tracing::warn!("),
+        "the text must be a tracing::warn! message"
+    );
+    assert!(
+        window.contains("stage = deferred.stage"),
+        "missing structured stage field"
+    );
+    assert!(
+        window.contains("cause = deferred.cause"),
+        "missing structured cause field"
+    );
+}
+
 /// Durable finalization ordering, structural half. No userspace test can prove
 /// bytes survive a real power loss; what a source pin CAN prove is that the
 /// operations ADR-00027 requires before the authoritative `Staged` commit

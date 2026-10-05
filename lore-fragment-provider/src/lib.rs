@@ -604,7 +604,35 @@ pub enum FragmentProviderDisposition {
     Internal,
 }
 
+/// A closed, static label for one drain authority error. Never contains request data.
+///
+/// Exhaustive with **no wildcard**, so a variant added to [`FragmentDrainAuthorityError`] fails
+/// this build rather than sharing another variant's label. The SQLSTATE behind `Refused`,
+/// `Unavailable` and `Contended` is not carried this far; its finer split is counted where it is
+/// known, on `lore.object_dispatch.drain_authority_failures{procedure, cause}`.
+pub fn drain_diagnostic(error: &FragmentDrainAuthorityError) -> &'static str {
+    match error {
+        FragmentDrainAuthorityError::Contended => "drain_contended",
+        FragmentDrainAuthorityError::Refused => "drain_refused",
+        FragmentDrainAuthorityError::Unavailable => "drain_unavailable",
+        FragmentDrainAuthorityError::Invalid => "drain_invalid",
+        FragmentDrainAuthorityError::MetadataUnderflow => "drain_metadata_underflow",
+        FragmentDrainAuthorityError::SchemaUpgradeRequired => "drain_schema_upgrade_required",
+        FragmentDrainAuthorityError::SchemaUnknown => "drain_schema_unknown",
+    }
+}
+
 impl FragmentProviderError {
+    /// A closed diagnostic for any failure: [`Self::transient_diagnostic`] when it has one, the
+    /// drain authority label for a non-retryable drain error, and `"none"` otherwise. Never
+    /// contains request data.
+    pub fn diagnostic_label(&self) -> &'static str {
+        match self {
+            Self::DrainAuthority(error) => drain_diagnostic(error),
+            _ => self.transient_diagnostic().unwrap_or("none"),
+        }
+    }
+
     /// A closed diagnostic for retryable refusals. Never contains request data.
     pub fn transient_diagnostic(&self) -> Option<&'static str> {
         match self {
@@ -624,6 +652,15 @@ impl FragmentProviderError {
             {
                 Some("drain_spool_ready_transient")
             }
+            // Same derivation as the arm above. Every drain authority error the seam classifies
+            // retryable reaches the caller as one `SlowDown` message, so this label is the only
+            // thing that tells a lost row race from a refusal or a lost database.
+            Self::DrainAuthority(error)
+                if self.disposition() == FragmentProviderDisposition::Transient =>
+            {
+                Some(drain_diagnostic(error))
+            }
+            Self::DrainSpoolIo => Some("drain_spool_io"),
             Self::Provider(ProviderClientError::ChargeRefused(refusal)) => match refusal {
                 ProviderChargeError::BudgetExhausted => Some("charge_budget_exhausted"),
                 ProviderChargeError::ClassCapExhausted => Some("charge_class_cap_exhausted"),

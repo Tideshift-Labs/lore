@@ -1673,6 +1673,97 @@ fn charge_admission_refusals_carry_their_own_transient_diagnostic() {
     );
 }
 
+/// The closed label set `drain_authority` failures expose, one per `DrainError`. The two schema
+/// errors are deployment faults: they keep a label for `diagnostic_label` but stay out of the
+/// retryable `transient_diagnostic` set.
+const DRAIN_DIAGNOSTIC_TABLE: [(FragmentDrainAuthorityError, &str, bool); 7] = [
+    (
+        FragmentDrainAuthorityError::Contended,
+        "drain_contended",
+        true,
+    ),
+    (FragmentDrainAuthorityError::Refused, "drain_refused", true),
+    (
+        FragmentDrainAuthorityError::Unavailable,
+        "drain_unavailable",
+        true,
+    ),
+    (FragmentDrainAuthorityError::Invalid, "drain_invalid", true),
+    (
+        FragmentDrainAuthorityError::MetadataUnderflow,
+        "drain_metadata_underflow",
+        true,
+    ),
+    (
+        FragmentDrainAuthorityError::SchemaUpgradeRequired,
+        "drain_schema_upgrade_required",
+        false,
+    ),
+    (
+        FragmentDrainAuthorityError::SchemaUnknown,
+        "drain_schema_unknown",
+        false,
+    ),
+];
+
+#[test]
+fn drain_diagnostic_maps_every_variant_to_its_exact_label_and_the_set_is_closed() {
+    let mut labels = Vec::new();
+    for (error, expected, _retryable) in DRAIN_DIAGNOSTIC_TABLE {
+        assert_eq!(drain_diagnostic(&error), expected, "{error:?}");
+        labels.push(expected);
+    }
+    labels.sort_unstable();
+    labels.dedup();
+    assert_eq!(labels.len(), 7, "the seven documented labels are distinct");
+    assert!(labels.iter().all(|label| label.starts_with("drain_")));
+}
+
+#[test]
+fn transient_diagnostic_exposes_drain_labels_only_for_transient_dispositions() {
+    for (error, expected, retryable) in DRAIN_DIAGNOSTIC_TABLE {
+        let wrapped = FragmentProviderError::DrainAuthority(error);
+        assert_eq!(
+            wrapped.disposition() == FragmentProviderDisposition::Transient,
+            retryable,
+            "{error:?}: the table's retryable column must follow disposition()"
+        );
+        let expected_transient = retryable.then_some(expected);
+        assert_eq!(
+            wrapped.transient_diagnostic(),
+            expected_transient,
+            "{error:?}"
+        );
+        // The abandon cause label never loses the drain label, retryable or not.
+        assert_eq!(wrapped.diagnostic_label(), expected, "{error:?}");
+    }
+}
+
+#[test]
+fn drain_spool_io_has_its_own_transient_diagnostic() {
+    assert_eq!(
+        FragmentProviderError::DrainSpoolIo.transient_diagnostic(),
+        Some("drain_spool_io"),
+    );
+    assert_eq!(
+        FragmentProviderError::DrainSpoolIo.diagnostic_label(),
+        "drain_spool_io"
+    );
+}
+
+#[test]
+fn diagnostic_label_falls_back_to_none_without_a_transient_diagnostic() {
+    // `InvalidInFlightPutBound` is a non-drain error that has no transient diagnostic.
+    let error = FragmentProviderError::InvalidInFlightPutBound;
+    assert_eq!(error.transient_diagnostic(), None);
+    assert_eq!(error.diagnostic_label(), "none");
+    // A non-drain error that does have one keeps it.
+    assert_eq!(
+        FragmentProviderError::PutAdmissionTimedOut.diagnostic_label(),
+        "put_admission_timeout"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Property 5: the cell's own region and nothing else
 // -----------------------------------------------------------------------
