@@ -519,6 +519,8 @@ try {
         '--env', 'CARGO_TARGET_DIR=/cargo-target',
         '--env', 'CARGO_HOME=/cargo-home',
         '--env', 'CARGO_BUILD_JOBS=2',
+        # WSL pipes core_pattern to its own collector (limit 0 is ignored for a pipe, 1 makes the kernel skip it); crash-recovery cases abort on purpose.
+        '--ulimit', 'core=1:1',
         '--workdir', '/src',
         $imageTag, 'sleep', 'infinity'
     )

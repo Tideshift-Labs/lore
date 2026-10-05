@@ -349,6 +349,7 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
 4. **Execution**: Run detached, poll `docker inspect` for status, then remove.
 5. **Fixture manifests**: If a test runs `cargo check --offline` on a fixture crate, prefetch it with `cargo fetch --manifest-path <fixture>/Cargo.toml` first.
 6. **Port allocation**: Avoid `bind(0)` when both TCP and UDP ports are needed; Windows has disjoint UDP/TCP reservations. Sample randomly instead.
+7. **Deliberate aborts fill C: under WSL**: WSL 2.7.3 pipes every core dump (Docker containers included) to its own collector, writing a ~6.8 GB dump per abort to `%LOCALAPPDATA%\Temp\wsl-crashes` (default keeps 10; 53 GB in two runs killed Docker Desktop). `ulimit -c 0` is IGNORED when `core_pattern` is a pipe; a limit of 1 makes the kernel skip the piped dump. An entrypoint `ulimit` does not reach `docker exec` children, so set it on the container: `docker run --ulimit core=1:1`. `run-write-behind-linux.ps1` does this for its build container. Check `wsl-crashes` is empty after any run whose tests abort on purpose (failpoint crash-recovery). Host fallback: `.wslconfig` `[wsl2] maxCrashDumpCount=-1`.
 
 ## Async timing tests in `lore-postgres`
 
