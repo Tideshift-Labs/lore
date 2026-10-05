@@ -1059,7 +1059,7 @@ impl PostgresImmutableStore {
         let staged = match self.write_behind.as_ref() {
             Some(stage) => match tokio::time::timeout(
                 self.io_timeout,
-                stage.read_staged(&witness.hash, witness.epoch, &manifest.object_key),
+                stage.read_staged_foreground(&witness.hash, witness.epoch, &manifest.object_key),
             )
             .await
             {
@@ -1210,7 +1210,11 @@ impl PostgresImmutableStore {
                     Some(stage) => {
                         match tokio::time::timeout(
                             self.io_timeout,
-                            stage.read_staged(&witness.hash, witness.epoch, &manifest.object_key),
+                            stage.read_staged_foreground(
+                                &witness.hash,
+                                witness.epoch,
+                                &manifest.object_key,
+                            ),
                         )
                         .await
                         {
@@ -3529,6 +3533,7 @@ mod tests {
             drain_stale_after: Duration::from_secs(60),
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
+            stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
         })
         .unwrap();
         let payload = Bytes::from(format!(

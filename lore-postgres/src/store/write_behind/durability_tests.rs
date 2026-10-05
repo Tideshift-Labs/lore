@@ -71,18 +71,18 @@ async fn cancelled_file_reader_retains_its_io_slot_until_the_blocking_job_finish
         .unwrap()
         .expect("real blocking read entered");
     let permits = (0..15)
-        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .map(|_| root.try_io_permit(StageIoPath::DrainRead).unwrap())
         .collect::<Vec<_>>();
     reader.abort();
     assert!(reader.await.unwrap_err().is_cancelled());
     assert!(
-        root.try_io_permit(StageIoPath::Read).is_err(),
+        root.try_io_permit(StageIoPath::DrainRead).is_err(),
         "cancelling the waiter cannot free a live blocking job's slot"
     );
     release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(permit) = root.try_io_permit(StageIoPath::Read) {
+            if let Ok(permit) = root.try_io_permit(StageIoPath::DrainRead) {
                 drop(permit);
                 break;
             }
@@ -154,7 +154,7 @@ async fn root_clones_share_each_bounded_io_pool_and_puts_cannot_starve_reads() {
         "a full put pool leaves reads their own slots"
     );
     let reads = (0..16)
-        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .map(|_| root.try_io_permit(StageIoPath::DrainRead).unwrap())
         .collect::<Vec<_>>();
     assert!(matches!(
         clone.read_regular(&resolved).await,
@@ -259,6 +259,198 @@ async fn a_burst_larger_than_the_put_pool_completes_without_a_refusal() {
     assert_eq!(
         refused, 0,
         "48 puts over 16 slots, each held 20 ms, fit inside one budget"
+    );
+}
+
+fn is_capacity_refusal<T>(result: &Result<T, WriteBehindError>) -> bool {
+    matches!(
+        result,
+        Err(WriteBehindError::Io {
+            operation: "staging I/O capacity",
+            kind: std::io::ErrorKind::WouldBlock
+        })
+    )
+}
+
+fn staged_fixture(root: &ConfinedRoot, byte: u8) -> super::ResolvedStagedPath {
+    let hash = [byte; 32];
+    let key = derived_staged_key(&hash, 1).unwrap();
+    root.resolve(&hash, 1, &key).unwrap()
+}
+
+#[tokio::test]
+async fn a_get_read_with_a_free_pool_acquires_at_once_and_never_waits_for_its_budget() {
+    // Row 80 follow-up (a): a free slot is granted immediately, even with a
+    // budget far longer than the assertion's bound.
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_fixture(&root, 0x50);
+    let started = std::time::Instant::now();
+    let read = root
+        .read_regular_within(&resolved, Duration::from_secs(10))
+        .await;
+    assert!(
+        read.unwrap().is_none(),
+        "an absent staged file is a real ENOENT, not a refusal"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a free pool must not consume the budget"
+    );
+}
+
+#[tokio::test]
+async fn a_get_read_waits_for_a_slot_freed_inside_its_budget_and_is_then_served() {
+    // (b): the pool is full, a slot frees inside the budget, the read waits and
+    // then succeeds rather than being refused.
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_fixture(&root, 0x51);
+    let mut held = (0..super::STAGE_IO_SLOTS)
+        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        is_capacity_refusal(&root.try_io_permit(StageIoPath::Read)),
+        "the GET pool is full"
+    );
+    let reader_root = root.clone();
+    let reader_path = resolved.clone();
+    let started = std::time::Instant::now();
+    let reader = lore_base::lore_spawn!(async move {
+        reader_root
+            .read_regular_within(&reader_path, Duration::from_secs(5))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !reader.is_finished(),
+        "the read waits while the pool is full"
+    );
+    held.pop();
+    let served = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("the waiter is woken by the freed slot, not by its budget")
+        .unwrap();
+    assert!(
+        served
+            .expect("a slot freed inside the budget is granted")
+            .is_none(),
+        "served: the absent file reads as ENOENT"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "the read really waited"
+    );
+}
+
+#[tokio::test]
+async fn a_get_read_on_a_pool_that_stays_full_is_refused_after_its_budget_as_capacity() {
+    // (c): saturated past the bound. The refusal is the capacity `Io`, which
+    // `store_error` maps to `SlowDown` (pinned in `write_behind::tests`), never
+    // `Ok(None)` (which would read as NotFound) or a structural error.
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_fixture(&root, 0x52);
+    let _held = (0..super::STAGE_IO_SLOTS)
+        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let refused = root
+        .read_regular_within(&resolved, Duration::from_millis(100))
+        .await;
+    assert!(is_capacity_refusal(&refused), "got {refused:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(100),
+        "refused only after the whole budget"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "and not long after it"
+    );
+    assert!(matches!(
+        refused.unwrap_err().store_error(),
+        lore_storage::immutable_store::StoreError::SlowDown(_)
+    ));
+}
+
+#[tokio::test]
+async fn a_zero_read_wait_refuses_at_once_like_the_old_try_acquire() {
+    // (d): zero means no wait, matching the put precedent.
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_fixture(&root, 0x53);
+    assert!(
+        root.read_regular_within(&resolved, Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none(),
+        "zero still serves when a slot is free"
+    );
+    let _held = (0..super::STAGE_IO_SLOTS)
+        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let refused = root.read_regular_within(&resolved, Duration::ZERO).await;
+    assert!(is_capacity_refusal(&refused), "got {refused:?}");
+    assert!(
+        started.elapsed() < Duration::from_millis(50),
+        "zero must not wait"
+    );
+}
+
+#[tokio::test]
+async fn waiting_gets_cannot_starve_the_drain_read_pool_or_puts() {
+    // (e): the implementation's policy is a SEPARATE pool for GET reads. A
+    // queue of waiting GETs therefore never takes a slot the drain's
+    // `try_acquire` (promotion and cleanup reads, purge, inventory) or a put
+    // needs, and a saturated drain pool never refuses a GET.
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let resolved = staged_fixture(&root, 0x54);
+    let get_slots = (0..super::STAGE_IO_SLOTS)
+        .map(|_| root.try_io_permit(StageIoPath::Read).unwrap())
+        .collect::<Vec<_>>();
+    // Queue several GETs on the full GET pool.
+    let mut waiting = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let root = root.clone();
+        lore_base::lore_spawn!(waiting, async move {
+            root.io_permit_within(StageIoPath::Read, Duration::from_secs(10))
+                .await
+                .map(drop)
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The drain read, remove, inventory and put pools are untouched by the queue.
+    for path in [
+        StageIoPath::DrainRead,
+        StageIoPath::Remove,
+        StageIoPath::Inventory,
+        StageIoPath::Put,
+    ] {
+        let _slot = root
+            .try_io_permit(path)
+            .unwrap_or_else(|error| panic!("{path:?} was starved by waiting GETs: {error:?}"));
+    }
+    assert!(
+        root.read_regular(&resolved).await.unwrap().is_none(),
+        "a drain read is served while GETs queue"
+    );
+    // The reverse: a full drain pool does not refuse a GET.
+    drop(get_slots);
+    while let Some(result) = waiting.join_next().await {
+        result.unwrap().expect("queued GETs drain once slots free");
+    }
+    let _drain = (0..super::STAGE_IO_SLOTS)
+        .map(|_| root.try_io_permit(StageIoPath::DrainRead).unwrap())
+        .collect::<Vec<_>>();
+    assert!(is_capacity_refusal(&root.read_regular(&resolved).await));
+    assert!(
+        root.read_regular_within(&resolved, Duration::ZERO)
+            .await
+            .unwrap()
+            .is_none(),
+        "a saturated drain pool leaves GETs their own slots"
     );
 }
 

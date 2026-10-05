@@ -103,6 +103,27 @@ pub(crate) fn record_stage_io_refusal(labels: &[KeyValue]) {
         .add(1, labels);
 }
 
+/// Record how long one bounded staging I/O slot wait took, in milliseconds,
+/// labelled `path` and `outcome` (`granted` or `refused`). Only calls with a
+/// nonzero wait budget record; an immediate refusal is in
+/// [`record_stage_io_refusal`] alone.
+pub(crate) fn record_stage_io_wait(
+    path: &'static str,
+    outcome: &'static str,
+    waited: std::time::Duration,
+) {
+    static WAITS: OnceLock<Histogram<f64>> = OnceLock::new();
+    WAITS
+        .get_or_init(|| PostgresStoreInstrumentProvider.latency_histogram_ms("stage_io_wait"))
+        .record(
+            waited.as_secs_f64() * 1000.0,
+            &[
+                KeyValue::new("path", path),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
+}
+
 /// Count one write-behind fragment PUT answered `SlowDown`, labelled
 /// `reason=<label>` with the refusal site. Separates a staging I/O slot refusal
 /// from a fenced head, a lost commit or a transient database failure, which all

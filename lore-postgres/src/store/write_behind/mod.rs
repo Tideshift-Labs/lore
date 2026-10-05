@@ -249,7 +249,20 @@ pub struct WriteBehindSettings {
     /// How long a PUT waits for a staging I/O slot before it answers
     /// `SlowDown`. Zero refuses at once, the behaviour before row 76's fix.
     pub stage_io_wait: Duration,
+    /// How long a foreground GET waits for a staged-read I/O slot before it
+    /// answers `SlowDown`. Zero refuses at once, the behaviour before row 80's
+    /// follow-up. Drain and cleanup reads never wait.
+    pub stage_read_wait: Duration,
 }
+
+/// [`WriteBehindSettings::stage_read_wait`]'s default. About one mean GET
+/// handler time under row 80's load (0.26 s), and far under the store's
+/// 30 s staged-read timeout and the server's 50 s handler deadline. A slot is
+/// held for one bounded file read, so a full pool frees many slots inside it.
+pub const DEFAULT_STAGE_READ_WAIT: Duration = Duration::from_millis(DEFAULT_STAGE_READ_WAIT_MILLIS);
+
+/// [`DEFAULT_STAGE_READ_WAIT`] in milliseconds, the unit configuration uses.
+pub const DEFAULT_STAGE_READ_WAIT_MILLIS: u64 = 250;
 
 /// [`WriteBehindSettings::stage_io_wait`]'s default. Long enough for a burst of
 /// one commit's fragments to drain through the pool, short against the
@@ -335,6 +348,7 @@ pub struct WriteBehindStage {
     min_free_bytes: u64,
     hard_limits: (u64, u64),
     stage_io_wait: Duration,
+    stage_read_wait: Duration,
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -417,6 +431,7 @@ impl WriteBehindStage {
                 settings.watermarks.hard_count,
             ),
             stage_io_wait: settings.stage_io_wait,
+            stage_read_wait: settings.stage_read_wait,
             sampler,
         }))
     }
@@ -575,16 +590,46 @@ impl WriteBehindStage {
         finalize::finalize_reserved(permit.0, attempt.clone(), &self.root, &resolved, payload).await
     }
 
-    /// Read one staged fragment's bytes.
+    /// Read one staged fragment's bytes for the drain or cleanup.
     ///
-    /// Never returns [`StagedRead::Absent`] for an unavailable root; see this
-    /// module's header for why that distinction is load-bearing.
+    /// Takes a slot from the shared pool or answers
+    /// [`StagedRead::Unavailable`] at once. Never returns
+    /// [`StagedRead::Absent`] for an unavailable root; see this module's header
+    /// for why that distinction is load-bearing.
     pub async fn read_staged(&self, hash: &[u8], epoch: i64, object_key: &str) -> StagedRead {
         let resolved = match self.root.resolve(hash, epoch, object_key) {
             Ok(resolved) => resolved,
             Err(error) => return StagedRead::Unavailable(error),
         };
-        match self.root.read_regular(&resolved).await {
+        Self::staged_read(self.root.read_regular(&resolved).await)
+    }
+
+    /// [`Self::read_staged`] for a foreground GET.
+    ///
+    /// Takes a slot from the GET pool, waiting up to
+    /// [`WriteBehindSettings::stage_read_wait`]. A timeout is
+    /// [`StagedRead::Unavailable`], which the store answers `SlowDown`. The
+    /// GET pool is separate from the drain's, so waiting GETs cannot take
+    /// slots a promotion or purge needs.
+    pub async fn read_staged_foreground(
+        &self,
+        hash: &[u8],
+        epoch: i64,
+        object_key: &str,
+    ) -> StagedRead {
+        let resolved = match self.root.resolve(hash, epoch, object_key) {
+            Ok(resolved) => resolved,
+            Err(error) => return StagedRead::Unavailable(error),
+        };
+        Self::staged_read(
+            self.root
+                .read_regular_within(&resolved, self.stage_read_wait)
+                .await,
+        )
+    }
+
+    fn staged_read(read: Result<Option<Bytes>, WriteBehindError>) -> StagedRead {
+        match read {
             Ok(Some(bytes)) => StagedRead::Found(bytes),
             // An `ENOENT` is decisive absence only because `read_regular`
             // revalidates the root's device first. Without that check this arm
@@ -706,6 +751,33 @@ mod tests {
             }
             AdmissionSample::Reachable { free_bytes: 42 }
         })
+    }
+
+    /// Row 80 follow-up (c): a GET whose slot wait times out arrives here as the
+    /// capacity `Io` refusal. It must reach the store as `Unavailable`, which
+    /// the store answers `SlowDown`, and never as `Absent` (`NotFound`) or a
+    /// structural `Internal` error.
+    #[test]
+    fn a_capacity_refusal_on_a_staged_read_is_unavailable_and_slow_down_not_absent() {
+        let refusal = || WriteBehindError::Io {
+            operation: "staging I/O capacity",
+            kind: std::io::ErrorKind::WouldBlock,
+        };
+        match WriteBehindStage::staged_read(Err(refusal())) {
+            StagedRead::Unavailable(error) => {
+                assert!(error.store_error().is_slow_down(), "capacity is retryable");
+            }
+            StagedRead::Absent => panic!("a refused read must never read as absence"),
+            StagedRead::Found(_) => panic!("a refused read found bytes"),
+        }
+        assert!(matches!(
+            WriteBehindStage::staged_read(Ok(None)),
+            StagedRead::Absent
+        ));
+        assert!(matches!(
+            WriteBehindStage::staged_read(Ok(Some(Bytes::from_static(b"x")))),
+            StagedRead::Found(_)
+        ));
     }
 
     fn staging_admission() -> Admission {

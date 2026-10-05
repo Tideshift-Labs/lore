@@ -52,6 +52,7 @@ use lore_postgres::store::immutable_store::PostgresImmutableStore;
 use lore_postgres::store::lock_store::PostgresLockStore;
 use lore_postgres::store::mutable_store::PostgresMutableStore;
 use lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT_MILLIS;
+use lore_postgres::store::write_behind::DEFAULT_STAGE_READ_WAIT_MILLIS;
 use lore_postgres::store::write_behind::WriteBehindSettings;
 use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_postgres::store::write_behind::WriteBehindWatermarks;
@@ -376,6 +377,9 @@ pub struct WriteBehindConfig {
     /// How long a PUT waits for a staging I/O slot before `SlowDown`. Optional;
     /// defaults to 1000. Zero refuses at once.
     pub stage_io_wait_millis: Option<u64>,
+    /// How long a GET waits for a staged-read I/O slot before `SlowDown`.
+    /// Optional; defaults to 250. Zero refuses at once.
+    pub stage_read_wait_millis: Option<u64>,
     /// Maintenance-published policy identity, shared by every replica.
     pub cell_id: Option<String>,
     pub policy_revision: Option<String>,
@@ -666,7 +670,7 @@ fn enabled_fragment_provider_config(
 /// seconds — is refused rather than honoured for the next eleven days.
 const MAX_WRITE_BEHIND_INTERVAL_MILLIS: u64 = 3_600_000;
 
-/// Upper bound on `stage_io_wait_millis`.
+/// Upper bound on `stage_io_wait_millis` and `stage_read_wait_millis`.
 const MAX_STAGE_IO_WAIT_MILLIS: u64 = 10_000;
 
 fn write_behind_error(name: &str, message: impl Into<String>) -> PluginError {
@@ -806,16 +810,24 @@ fn validated_write_behind_settings(
         }
     }
 
-    // Optional, unlike the thresholds: it tunes latency, not a safety bound.
-    // Capped so a unit mistake cannot park PUTs for minutes.
+    // Optional, unlike the thresholds: they tune latency, not a safety bound.
+    // Capped so a unit mistake cannot park PUTs or GETs for minutes.
     let stage_io_wait = raw
         .stage_io_wait_millis
         .unwrap_or(DEFAULT_STAGE_IO_WAIT_MILLIS);
-    if stage_io_wait > MAX_STAGE_IO_WAIT_MILLIS {
-        return Err(write_behind_error(
-            name,
-            format!("requires stage_io_wait_millis between 0 and {MAX_STAGE_IO_WAIT_MILLIS}"),
-        ));
+    let stage_read_wait = raw
+        .stage_read_wait_millis
+        .unwrap_or(DEFAULT_STAGE_READ_WAIT_MILLIS);
+    for (field, value) in [
+        ("stage_io_wait_millis", stage_io_wait),
+        ("stage_read_wait_millis", stage_read_wait),
+    ] {
+        if value > MAX_STAGE_IO_WAIT_MILLIS {
+            return Err(write_behind_error(
+                name,
+                format!("requires {field} between 0 and {MAX_STAGE_IO_WAIT_MILLIS}"),
+            ));
+        }
     }
 
     let settings = WriteBehindSettings {
@@ -832,6 +844,7 @@ fn validated_write_behind_settings(
         drain_stale_after: Duration::from_millis(drain_stale_after),
         sample_interval: Duration::from_millis(sample_interval),
         stage_io_wait: Duration::from_millis(stage_io_wait),
+        stage_read_wait: Duration::from_millis(stage_read_wait),
     };
     let required_text = |field: &str, value: &Option<String>| {
         value
@@ -3272,6 +3285,59 @@ staging_root = "/var/lib/loreserver/staging"
             error.contains("stage_io_wait_millis") && error.contains("between 0 and 10000"),
             "got {error}"
         );
+    }
+
+    /// Row 80 follow-up: the GET read wait is optional, defaults to 250 ms,
+    /// accepts zero (refuse at once), is bounded like the PUT knob, and is
+    /// independent of it.
+    #[test]
+    fn stage_read_wait_defaults_to_250_ms_and_is_bounded_like_the_put_wait() {
+        let complete = valid_write_behind_block();
+        let settings = |text: &str| {
+            validated_write_behind_settings(PLUGIN_NAME, &raw_write_behind(text))
+                .map(|composition| composition.settings)
+        };
+        let with = |line: &str| {
+            let mutated = complete.replace(
+                "sample_interval_millis = 5000",
+                &format!("sample_interval_millis = 5000\n{line}"),
+            );
+            assert_ne!(
+                mutated, complete,
+                "the fixture must set sample_interval_millis"
+            );
+            mutated
+        };
+        let defaulted = settings(&complete).unwrap();
+        assert_eq!(defaulted.stage_read_wait, Duration::from_millis(250));
+        assert_eq!(defaulted.stage_io_wait, Duration::from_secs(1));
+        assert_eq!(
+            settings(&with("stage_read_wait_millis = 0"))
+                .unwrap()
+                .stage_read_wait,
+            Duration::ZERO
+        );
+        let tuned = settings(&with("stage_read_wait_millis = 10000")).unwrap();
+        assert_eq!(tuned.stage_read_wait, Duration::from_secs(10));
+        assert_eq!(
+            tuned.stage_io_wait,
+            Duration::from_secs(1),
+            "the read knob must not move the put knob"
+        );
+        let error = match settings(&with("stage_read_wait_millis = 10001")) {
+            Ok(_) => panic!("10001 ms must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("stage_read_wait_millis") && error.contains("between 0 and 10000"),
+            "got {error}"
+        );
+        // The PUT knob's own bound still names the PUT field.
+        let error = match settings(&with("stage_io_wait_millis = 10001")) {
+            Ok(_) => panic!("10001 ms must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("stage_io_wait_millis"), "got {error}");
     }
 
     /// Row 76: write-behind reserves one domain connection for its observer,

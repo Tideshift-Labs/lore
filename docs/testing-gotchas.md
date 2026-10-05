@@ -305,6 +305,8 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
 - **Public stage concurrency**: Test multi-worker lifecycle with a Tokio multi-thread runtime.
 - **Doc comments**: Module doc comments can trip source-pin scans if they name forbidden words. Use exact syntactical shapes instead.
 - **Process-global state**: OTel, auth caches, etc., are shared. Avoid assertions on global emptiness.
+- **Staging I/O permit waits** (`write_behind/root.rs`): `io_permit_within` records the refusal counter and wait histogram through `OnceLock` global instruments, and `opentelemetry_sdk` is not a dev-dependency, so no test asserts counter values. Pin the returned `Io { "staging I/O capacity", WouldBlock }` plus `store_error().is_slow_down()` instead, and say counters are unasserted. Pool-policy tests are `cfg(all(test, unix))` in `durability_tests.rs`, so they run only under `run-write-behind-linux.ps1`.
+- **A red drain test beside your change is not yours until proven**: in a shared tree another lane's drain-order edits (random cursor, shuffled batch) fail `adapter_parallel_drain_*` and `small_worker_batches_*` live cases that assume ascending hash order. Check `git diff` of `store/fragment_write_behind.rs` before blaming a permit or read-path change.
 
 ## AWS SDK specifics
 

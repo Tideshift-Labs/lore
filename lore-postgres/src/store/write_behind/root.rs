@@ -119,8 +119,14 @@ struct RootInner {
     directory: std::fs::File,
     /// Shared by all clones. Each blocking closure owns its permit until its
     /// final syscall completes, even if the async caller stops waiting.
-    /// Reads, purge and the physical inventory use this pool.
+    /// Drain and cleanup reads, purge and the physical inventory use this
+    /// pool. None of them waits for a slot.
     io_capacity: Arc<Semaphore>,
+    /// Foreground GET reads' own pool, the same size. A GET may wait for a
+    /// slot (row 80), and, as with puts below, a queue of waiting GETs on the
+    /// shared pool would take every freed permit ahead of the drain's
+    /// `try_acquire` and starve promotion and purge.
+    read_capacity: Arc<Semaphore>,
     /// The put path's own pool, the same size. A put may wait for a slot (see
     /// [`ConfinedRoot::io_permit_within`]), and a tokio semaphore hands a
     /// released permit to its queued waiters before any `try_acquire`. One
@@ -156,20 +162,29 @@ pub(crate) fn derived_staged_key(hash: &[u8], epoch: i64) -> Result<String, Writ
     Ok(format!("{}.s{epoch}", hex::encode(hash)))
 }
 
+/// Slots in each of a root's three I/O pools.
+#[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
+pub(crate) const STAGE_IO_SLOTS: usize = 16;
+
 /// The staging path that asked for an I/O slot.
 ///
-/// Reads, purge and the physical inventory share one bounded slot pool; puts
-/// have their own. A put holds its slot across `begin_stage`, so a slow
-/// coordinator slows other puts. The refusal counter carries this label so
-/// that shows up.
+/// Three bounded pools. Puts and foreground GET reads each have their own,
+/// because each may wait; drain and cleanup reads, purge and the physical
+/// inventory share the third and never wait. A put holds its slot across
+/// `begin_stage`, so a slow coordinator slows other puts. The refusal counter
+/// carries this label so that shows up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StageIoPath {
     Put,
+    /// A foreground GET's staged read. Waits up to the configured read wait.
     #[cfg_attr(
         not(any(unix, test)),
         expect(dead_code, reason = "staging is Unix-only")
     )]
     Read,
+    /// A drain promotion or cleanup read. Refused at once when its pool is full.
+    #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
+    DrainRead,
     #[cfg_attr(
         not(any(unix, test)),
         expect(dead_code, reason = "staging is Unix-only")
@@ -183,6 +198,7 @@ impl StageIoPath {
         match self {
             Self::Put => "put",
             Self::Read => "read",
+            Self::DrainRead => "drain_read",
             Self::Remove => "remove",
             Self::Inventory => "inventory",
         }
@@ -206,7 +222,8 @@ impl ConfinedRoot {
     fn capacity(&self, path: StageIoPath) -> &Arc<Semaphore> {
         match path {
             StageIoPath::Put => &self.inner.put_capacity,
-            StageIoPath::Read | StageIoPath::Remove | StageIoPath::Inventory => {
+            StageIoPath::Read => &self.inner.read_capacity,
+            StageIoPath::DrainRead | StageIoPath::Remove | StageIoPath::Inventory => {
                 &self.inner.io_capacity
             }
         }
@@ -233,6 +250,11 @@ impl ConfinedRoot {
     /// landed in waves 10 s apart even though slots freed within milliseconds.
     /// Waiters queue in arrival order. Dropping the returned future leaves the
     /// queue and holds no permit. A zero `wait` is [`Self::try_io_permit`].
+    ///
+    /// The wait is hard-bounded by `wait`, and each nonzero-wait call records
+    /// how long it waited in the `stage_io_wait` histogram, labelled `path`
+    /// and `outcome` (`granted` or `refused`). A refusal is also counted in
+    /// `stage_io_refusals`, as before.
     pub(crate) async fn io_permit_within(
         &self,
         path: StageIoPath,
@@ -241,11 +263,17 @@ impl ConfinedRoot {
         if wait.is_zero() {
             return self.try_io_permit(path);
         }
-        match tokio::time::timeout(wait, self.capacity(path).clone().acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(permit),
-            // `Err` inside is a closed semaphore, which nothing here does; treat
-            // it as the refusal it would otherwise be.
-            Ok(Err(_)) | Err(_) => Err(io_refusal(path)),
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(wait, self.capacity(path).clone().acquire_owned()).await;
+        let waited = started.elapsed();
+        // An inner `Err` is a closed semaphore, which nothing here does; treat
+        // it as the refusal it would otherwise be.
+        if let Ok(Ok(permit)) = outcome {
+            crate::metrics::record_stage_io_wait(path.label(), "granted", waited);
+            Ok(permit)
+        } else {
+            crate::metrics::record_stage_io_wait(path.label(), "refused", waited);
+            Err(io_refusal(path))
         }
     }
 
@@ -375,11 +403,12 @@ mod platform {
                     device,
                     inode,
                     directory,
-                    // Bounds unfinished reads and exact removals, and
-                    // separately finalizers, including cancelled callers, to
-                    // sixteen each per root handle.
-                    io_capacity: Arc::new(tokio::sync::Semaphore::new(16)),
-                    put_capacity: Arc::new(tokio::sync::Semaphore::new(16)),
+                    // Bounds unfinished drain reads and exact removals, and
+                    // separately GET reads and finalizers, including
+                    // cancelled callers, to sixteen each per root handle.
+                    io_capacity: Arc::new(tokio::sync::Semaphore::new(super::STAGE_IO_SLOTS)),
+                    read_capacity: Arc::new(tokio::sync::Semaphore::new(super::STAGE_IO_SLOTS)),
+                    put_capacity: Arc::new(tokio::sync::Semaphore::new(super::STAGE_IO_SLOTS)),
                 }),
             };
             root.probe()?;
@@ -528,11 +557,34 @@ mod platform {
         /// regular file on the recorded device.
         ///
         /// `Ok(None)` is a real `ENOENT` and nothing else.
+        ///
+        /// A drain or cleanup read: it takes a slot from the shared pool or is
+        /// refused at once.
         pub(crate) async fn read_regular(
             &self,
             resolved: &ResolvedStagedPath,
         ) -> Result<Option<Bytes>, WriteBehindError> {
-            let permit = self.try_io_permit(StageIoPath::Read)?;
+            let permit = self.try_io_permit(StageIoPath::DrainRead)?;
+            self.read_regular_permitted(permit, resolved).await
+        }
+
+        /// [`Self::read_regular`] for a foreground GET: it takes a slot from
+        /// the GET pool and waits up to `wait` for one. A zero `wait` refuses
+        /// at once.
+        pub(crate) async fn read_regular_within(
+            &self,
+            resolved: &ResolvedStagedPath,
+            wait: std::time::Duration,
+        ) -> Result<Option<Bytes>, WriteBehindError> {
+            let permit = self.io_permit_within(StageIoPath::Read, wait).await?;
+            self.read_regular_permitted(permit, resolved).await
+        }
+
+        async fn read_regular_permitted(
+            &self,
+            permit: tokio::sync::OwnedSemaphorePermit,
+            resolved: &ResolvedStagedPath,
+        ) -> Result<Option<Bytes>, WriteBehindError> {
             let root = self.clone();
             let path = resolved.path().to_path_buf();
             let device = self.inner.device;
@@ -884,6 +936,14 @@ mod platform {
             Err(WriteBehindError::UnsupportedPlatform)
         }
 
+        pub(crate) async fn read_regular_within(
+            &self,
+            _resolved: &ResolvedStagedPath,
+            _wait: std::time::Duration,
+        ) -> Result<Option<Bytes>, WriteBehindError> {
+            Err(WriteBehindError::UnsupportedPlatform)
+        }
+
         pub(crate) async fn remove_regular(
             &self,
             _resolved: &ResolvedStagedPath,
@@ -939,6 +999,7 @@ mod tests {
         let cases = [
             (StageIoPath::Put, "put"),
             (StageIoPath::Read, "read"),
+            (StageIoPath::DrainRead, "drain_read"),
             (StageIoPath::Remove, "remove"),
             (StageIoPath::Inventory, "inventory"),
         ];
