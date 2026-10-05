@@ -3381,7 +3381,7 @@ impl PostgresFragmentCoordinator {
             || head.manifest_id.as_deref() != Some(source.manifest_id.as_slice())
         {
             return Ok(BeginOutcome::Fenced(
-                FenceReason::PromotionSourceChanged, // "staged source changed after validation"
+                FenceReason::PromotionSourceChanged(promotion_source_mover(&head, source)), // mover
             ));
         }
         let exact_source = tx.query_opt(
@@ -7449,8 +7449,9 @@ pub enum FenceReason {
     /// `begin_promotion` found a head that is no longer `Staged`.
     PromotionHeadNotStaged(FragmentLifecycleState),
     /// `begin_promotion`'s head moved (epoch, fence or manifest) after the
-    /// caller validated the staged source.
-    PromotionSourceChanged,
+    /// caller validated the staged source. The payload names which operation
+    /// moved it, read off the head the begin already holds locked.
+    PromotionSourceChanged(PromotionMover),
     /// `begin_promotion`'s exact staged epoch row or custody row no longer
     /// matches the validated source.
     PromotionRepresentationChanged,
@@ -7467,7 +7468,7 @@ impl FenceReason {
     pub fn label(self) -> &'static str {
         match self {
             Self::PromotionHeadNotStaged(_) => "promotion_head_not_staged",
-            Self::PromotionSourceChanged => "promotion_source_changed",
+            Self::PromotionSourceChanged(_) => "promotion_source_changed",
             Self::PromotionRepresentationChanged => "promotion_representation_changed",
             Self::RepairHeadNotMissing(_) => "repair_head_not_missing",
             Self::StagePreparationLive => "stage_preparation_live",
@@ -7481,10 +7482,81 @@ impl FenceReason {
             Self::PromotionHeadNotStaged(state)
             | Self::RepairHeadNotMissing(state)
             | Self::HeadDeletingOrTombstoned(state) => Some(state),
-            Self::PromotionSourceChanged
+            Self::PromotionSourceChanged(_)
             | Self::PromotionRepresentationChanged
             | Self::StagePreparationLive => None,
         }
+    }
+
+    /// The operation that moved a promotion's source, where the reason
+    /// records one.
+    pub fn mover(self) -> Option<PromotionMover> {
+        match self {
+            Self::PromotionSourceChanged(mover) => Some(mover),
+            Self::PromotionHeadNotStaged(_)
+            | Self::PromotionRepresentationChanged
+            | Self::RepairHeadNotMissing(_)
+            | Self::StagePreparationLive
+            | Self::HeadDeletingOrTombstoned(_) => None,
+        }
+    }
+}
+
+/// Which operation moved a `Staged` head between drain validation and
+/// `begin_promotion`, for [`FenceReason::PromotionSourceChanged`].
+///
+/// Only two operations move the fence and leave the head `Staged`:
+/// `begin_promotion` (stamps the promotion token) and `abandon_promotion`
+/// (clears it). A changed epoch or manifest means a new representation was
+/// published instead. Every mover here is another replica: one replica's
+/// drain holds a pass mutex, walks one shared cursor, takes one batch per
+/// pass, and joins every promotion before the next pass
+/// (`store/fragment_write_behind.rs` `drain_pass`), so same-replica overlap
+/// is impossible by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromotionMover {
+    /// The head's epoch or manifest differs from the validated source.
+    EpochMoved,
+    /// Same epoch and manifest; the head carries the promotion token, so a
+    /// rival `begin_promotion` stamped the new fence.
+    RivalBegin,
+    /// Same epoch and manifest; no token, so the last fence mover was a
+    /// rival's `abandon_promotion`. A rival begin followed by its own
+    /// abandon also lands here.
+    SettledAbandon,
+    /// Same epoch and manifest, and a token that is not the promotion token.
+    /// Unreachable by construction; labelled rather than folded into another
+    /// mover so damage stays visible.
+    UnknownOperation,
+}
+
+impl PromotionMover {
+    /// Static, bounded metric label for the mover.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::EpochMoved => "epoch_moved",
+            Self::RivalBegin => "rival_begin",
+            Self::SettledAbandon => "settled_abandon",
+            Self::UnknownOperation => "unknown_operation",
+        }
+    }
+}
+
+/// Classify who moved a promotion's source, from the head `begin_promotion`
+/// holds `FOR UPDATE`. Pure; no query.
+fn promotion_source_mover(
+    head: &FragmentHeadLock,
+    source: &FragmentDrainCandidate,
+) -> PromotionMover {
+    if head.current_epoch != source.epoch
+        || head.manifest_id.as_deref() != Some(source.manifest_id.as_slice())
+    {
+        return PromotionMover::EpochMoved;
+    }
+    match head.active_operation.as_deref() {
+        Some(token) if token == PROMOTION_OPERATION.as_slice() => PromotionMover::RivalBegin,
+        None => PromotionMover::SettledAbandon,
+        Some(_) => PromotionMover::UnknownOperation,
     }
 }
 
@@ -7496,7 +7568,9 @@ impl std::fmt::Display for FenceReason {
                 "promotion requires a Staged head; this one is {}",
                 state.label()
             ),
-            Self::PromotionSourceChanged => f.write_str("staged source changed after validation"),
+            Self::PromotionSourceChanged(_) => {
+                f.write_str("staged source changed after validation")
+            }
             Self::PromotionRepresentationChanged => {
                 f.write_str("staged representation changed after validation")
             }
@@ -7530,6 +7604,9 @@ pub struct BeginOutcomeLabels {
     /// [`FragmentLifecycleState::label`] where the outcome observed one, else
     /// `none`.
     pub head_state: &'static str,
+    /// [`PromotionMover::label`] for `fenced / promotion_source_changed`,
+    /// else `none`.
+    pub mover: &'static str,
 }
 
 /// Label one promotion begin from the drain's `promote()` path for the
@@ -7542,11 +7619,13 @@ pub fn begin_outcome_labels(result: Result<&BeginOutcome, &DomainError>) -> Begi
             outcome: "admitted",
             reason: NONE,
             head_state: NONE,
+            mover: NONE,
         },
         Ok(BeginOutcome::AlreadyReadable(witness)) => BeginOutcomeLabels {
             outcome: "already_readable",
             reason: NONE,
             head_state: witness.state.label(),
+            mover: NONE,
         },
         Ok(BeginOutcome::Fenced(reason)) => BeginOutcomeLabels {
             outcome: "fenced",
@@ -7554,11 +7633,13 @@ pub fn begin_outcome_labels(result: Result<&BeginOutcome, &DomainError>) -> Begi
             head_state: reason
                 .head_state()
                 .map_or(NONE, FragmentLifecycleState::label),
+            mover: reason.mover().map_or(NONE, PromotionMover::label),
         },
         Ok(BeginOutcome::WriteClaimBlocked { .. }) => BeginOutcomeLabels {
             outcome: "write_claim_blocked",
             reason: NONE,
             head_state: NONE,
+            mover: NONE,
         },
         Err(error) => BeginOutcomeLabels {
             outcome: "error",
@@ -7578,6 +7659,7 @@ pub fn begin_outcome_labels(result: Result<&BeginOutcome, &DomainError>) -> Begi
                 DomainError::Internal(_) => "internal",
             },
             head_state: NONE,
+            mover: NONE,
         },
     }
 }
@@ -7997,10 +8079,17 @@ mod begin_outcome_label_tests {
 
     fn every_fence_reason() -> Vec<FenceReason> {
         let mut reasons = vec![
-            FenceReason::PromotionSourceChanged,
             FenceReason::PromotionRepresentationChanged,
             FenceReason::StagePreparationLive,
         ];
+        for mover in [
+            PromotionMover::EpochMoved,
+            PromotionMover::RivalBegin,
+            PromotionMover::SettledAbandon,
+            PromotionMover::UnknownOperation,
+        ] {
+            reasons.push(FenceReason::PromotionSourceChanged(mover));
+        }
         for state in ALL_STATES {
             reasons.push(FenceReason::PromotionHeadNotStaged(state));
             reasons.push(FenceReason::RepairHeadNotMissing(state));
@@ -8034,7 +8123,9 @@ mod begin_outcome_label_tests {
         assert_eq!(blocked.reason, "none");
         assert_eq!(blocked.head_state, "none");
 
-        let fenced = label(&BeginOutcome::Fenced(FenceReason::PromotionSourceChanged));
+        let fenced = label(&BeginOutcome::Fenced(FenceReason::PromotionSourceChanged(
+            PromotionMover::RivalBegin,
+        )));
         assert_eq!(fenced.outcome, "fenced");
         assert_eq!(fenced.reason, "promotion_source_changed");
         assert_eq!(fenced.head_state, "none");
@@ -8108,7 +8199,7 @@ mod begin_outcome_label_tests {
             }
         }
         for reason in [
-            FenceReason::PromotionSourceChanged,
+            FenceReason::PromotionSourceChanged(PromotionMover::SettledAbandon),
             FenceReason::PromotionRepresentationChanged,
             FenceReason::StagePreparationLive,
         ] {
@@ -8171,5 +8262,177 @@ mod begin_outcome_label_tests {
             seen.insert(labels.reason);
         }
         assert_eq!(seen.len(), cases.len(), "error reasons must be distinct");
+    }
+
+    const ALL_MOVERS: [(PromotionMover, &str); 4] = [
+        (PromotionMover::RivalBegin, "rival_begin"),
+        (PromotionMover::SettledAbandon, "settled_abandon"),
+        (PromotionMover::EpochMoved, "epoch_moved"),
+        (PromotionMover::UnknownOperation, "unknown_operation"),
+    ];
+
+    #[test]
+    fn each_mover_maps_to_its_exact_literal() {
+        for (mover, literal) in ALL_MOVERS {
+            assert_eq!(mover.label(), literal);
+            let labels = label(&BeginOutcome::Fenced(FenceReason::PromotionSourceChanged(
+                mover,
+            )));
+            assert_eq!(labels.outcome, "fenced");
+            assert_eq!(labels.reason, "promotion_source_changed");
+            assert_eq!(labels.head_state, "none");
+            assert_eq!(labels.mover, literal, "{mover:?}");
+        }
+    }
+
+    #[test]
+    fn the_mover_literal_set_is_exactly_the_documented_set() {
+        // Every outcome and reason this module can build, collected by mover.
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        for reason in every_fence_reason() {
+            seen.insert(label(&BeginOutcome::Fenced(reason)).mover);
+        }
+        seen.insert(label(&admitted()).mover);
+        seen.insert(
+            label(&BeginOutcome::WriteClaimBlocked {
+                hard_not_after: SystemTime::UNIX_EPOCH,
+            })
+            .mover,
+        );
+        for state in ALL_STATES {
+            seen.insert(label(&BeginOutcome::AlreadyReadable(Box::new(witness(state)))).mover);
+        }
+        seen.insert(begin_outcome_labels(Err(&DomainError::Internal(String::new()))).mover);
+        assert_eq!(
+            seen,
+            BTreeSet::from([
+                "rival_begin",
+                "settled_abandon",
+                "epoch_moved",
+                "unknown_operation",
+                "none",
+            ])
+        );
+    }
+
+    #[test]
+    fn every_non_source_changed_outcome_has_mover_none() {
+        for reason in every_fence_reason() {
+            if matches!(reason, FenceReason::PromotionSourceChanged(_)) {
+                assert_ne!(reason.mover(), None);
+                continue;
+            }
+            assert_eq!(reason.mover(), None, "{reason:?}");
+            assert_eq!(
+                label(&BeginOutcome::Fenced(reason)).mover,
+                "none",
+                "{reason:?}"
+            );
+        }
+        assert_eq!(label(&admitted()).mover, "none");
+        assert_eq!(
+            label(&BeginOutcome::WriteClaimBlocked {
+                hard_not_after: SystemTime::UNIX_EPOCH,
+            })
+            .mover,
+            "none"
+        );
+        for state in ALL_STATES {
+            assert_eq!(
+                label(&BeginOutcome::AlreadyReadable(Box::new(witness(state)))).mover,
+                "none"
+            );
+        }
+        for error in [
+            DomainError::InvalidInput(String::new()),
+            DomainError::NotReady(String::new()),
+            DomainError::Contention(String::new()),
+            DomainError::Transient(String::new()),
+            DomainError::Internal(String::new()),
+            DomainError::PreconditionRejected {
+                reason: "fragment_head_absent".to_owned(),
+                reason_version: 1,
+            },
+        ] {
+            assert_eq!(begin_outcome_labels(Err(&error)).mover, "none", "{error:?}");
+        }
+    }
+
+    #[test]
+    fn source_changed_display_is_independent_of_the_mover() {
+        for (mover, _) in ALL_MOVERS {
+            assert_eq!(
+                FenceReason::PromotionSourceChanged(mover).to_string(),
+                "staged source changed after validation"
+            );
+        }
+    }
+
+    fn candidate(epoch: i64, manifest: u8) -> FragmentDrainCandidate {
+        FragmentDrainCandidate {
+            hash: vec![1u8; 32],
+            epoch,
+            last_fence: 4,
+            object_key: "key".to_owned(),
+            manifest_id: vec![manifest; 32],
+            size_payload: 1,
+            size_content: 1,
+            decoded_hash: vec![2u8; 32],
+            payload_flags: 0,
+            original_flags: 0,
+            provider_body_blake3: None,
+            provider_body_size: None,
+        }
+    }
+
+    fn head(
+        epoch: i64,
+        manifest: Option<u8>,
+        active_operation: Option<Vec<u8>>,
+    ) -> FragmentHeadLock {
+        FragmentHeadLock {
+            current_epoch: epoch,
+            state: FragmentLifecycleState::Staged,
+            manifest_id: manifest.map(|byte| vec![byte; 32]),
+            last_fence: 9,
+            active_operation,
+        }
+    }
+
+    #[test]
+    fn the_classifier_names_the_operation_that_moved_the_source() {
+        let source = candidate(3, 8);
+        let token = Some(PROMOTION_OPERATION.to_vec());
+        // Same epoch and manifest: the token decides between begin and abandon.
+        assert_eq!(
+            promotion_source_mover(&head(3, Some(8), token.clone()), &source),
+            PromotionMover::RivalBegin
+        );
+        assert_eq!(
+            promotion_source_mover(&head(3, Some(8), None), &source),
+            PromotionMover::SettledAbandon
+        );
+        assert_eq!(
+            promotion_source_mover(
+                &head(3, Some(8), Some(b"other-operation!".to_vec())),
+                &source
+            ),
+            PromotionMover::UnknownOperation
+        );
+        // A moved epoch or manifest wins over any token state.
+        for active in [token, None, Some(b"other-operation!".to_vec())] {
+            assert_eq!(
+                promotion_source_mover(&head(4, Some(8), active.clone()), &source),
+                PromotionMover::EpochMoved
+            );
+            assert_eq!(
+                promotion_source_mover(&head(3, Some(7), active.clone()), &source),
+                PromotionMover::EpochMoved
+            );
+            assert_eq!(
+                promotion_source_mover(&head(3, None, active), &source),
+                PromotionMover::EpochMoved
+            );
+        }
     }
 }

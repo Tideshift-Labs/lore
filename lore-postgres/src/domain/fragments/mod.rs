@@ -180,6 +180,7 @@ pub use coordinator::MAX_FRAGMENT_WRITE_CLAIM_PRUNE_BATCH;
 pub use coordinator::MAX_LIFECYCLE_GENERATION_FANOUT;
 pub use coordinator::MAX_PUSH_FRAGMENT_REVALIDATIONS;
 pub use coordinator::PostgresFragmentCoordinator;
+pub use coordinator::PromotionMover;
 pub use coordinator::PushGenerationWitness;
 pub use coordinator::PushWitnessVerdict;
 pub use coordinator::REQUIRED_FRAGMENT_CHANGED;

@@ -136,7 +136,7 @@ pub(crate) fn record_staged_put_refusal(reason: &'static str) {
 }
 
 /// Count one `begin_promotion` return on the write-behind drain, labelled
-/// `outcome`, `reason` and `head_state` (see
+/// `outcome`, `reason`, `head_state` and `mover` (see
 /// `domain::fragments::begin_outcome_labels`). Splits the non-admitted begins,
 /// which the drain otherwise drops silently, by cause.
 pub(crate) fn record_promotion_begin_outcome(labels: crate::domain::fragments::BeginOutcomeLabels) {
@@ -149,6 +149,7 @@ pub(crate) fn record_promotion_begin_outcome(labels: crate::domain::fragments::B
                 KeyValue::new("outcome", labels.outcome),
                 KeyValue::new("reason", labels.reason),
                 KeyValue::new("head_state", labels.head_state),
+                KeyValue::new("mover", labels.mover),
             ],
         );
 }
