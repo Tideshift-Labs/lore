@@ -3534,6 +3534,7 @@ mod tests {
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
             stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+            drain_reserve: Default::default(),
         })
         .unwrap();
         let payload = Bytes::from(format!(

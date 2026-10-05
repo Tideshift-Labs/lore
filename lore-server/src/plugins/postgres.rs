@@ -56,6 +56,14 @@ use lore_postgres::store::write_behind::DEFAULT_STAGE_READ_WAIT_MILLIS;
 use lore_postgres::store::write_behind::WriteBehindSettings;
 use lore_postgres::store::write_behind::WriteBehindStage;
 use lore_postgres::store::write_behind::WriteBehindWatermarks;
+use lore_postgres::store::write_behind::drain_reserve::DEFAULT_DRAIN_RESERVE_BACKOFF_BASE_MILLIS;
+use lore_postgres::store::write_behind::drain_reserve::DEFAULT_DRAIN_RESERVE_BACKOFF_CAP_MILLIS;
+use lore_postgres::store::write_behind::drain_reserve::DEFAULT_DRAIN_RESERVE_PERMIT_WAIT_MILLIS;
+use lore_postgres::store::write_behind::drain_reserve::DrainReserveSettings;
+use lore_postgres::store::write_behind::drain_reserve::MAX_DRAIN_RESERVE_ATTEMPTS;
+use lore_postgres::store::write_behind::drain_reserve::MAX_DRAIN_RESERVE_BACKOFF_MILLIS;
+use lore_postgres::store::write_behind::drain_reserve::MAX_DRAIN_RESERVE_PERMIT_WAIT_MILLIS;
+use lore_postgres::store::write_behind::drain_reserve::MAX_DRAIN_RESERVE_PERMITS;
 use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -389,6 +397,18 @@ pub struct WriteBehindConfig {
     /// How many promotions one drain pass runs at once, 1 to 8. Optional;
     /// defaults to a fixed 4 regardless of pool size (row 80).
     pub worker_concurrency: Option<usize>,
+    /// Row 80: reserve attempts one replica runs at once, 1 to 8. Optional;
+    /// defaults to 1. There is no unlimited value.
+    pub drain_reserve_permits: Option<usize>,
+    /// How long one reserve attempt waits for that permit before the
+    /// promotion is abandoned (`permit_timeout`), 1 to 10000. Defaults to 1000.
+    pub drain_reserve_permit_wait_millis: Option<u64>,
+    /// Total reserve tries per promotion, 1 to 10. Defaults to 5.
+    pub drain_reserve_attempts: Option<u32>,
+    /// The first jittered backoff ceiling, 1 to 1000. Defaults to 5.
+    pub drain_reserve_backoff_base_millis: Option<u64>,
+    /// The largest backoff ceiling, base to 1000. Defaults to 80.
+    pub drain_reserve_backoff_cap_millis: Option<u64>,
     pub observer_interval_millis: Option<u64>,
     pub cleanup_interval_millis: Option<u64>,
     pub cleanup_batch: Option<u32>,
@@ -711,6 +731,72 @@ fn required_write_behind_root(
     Ok(root)
 }
 
+/// The drain's reserve permit and retry schedule (row 80), every key optional.
+/// A zero permit count is refused rather than read as "unlimited".
+fn validated_drain_reserve(
+    name: &str,
+    raw: &WriteBehindConfig,
+) -> Result<DrainReserveSettings, PluginError> {
+    let defaults = DrainReserveSettings::default();
+    let permits = raw.drain_reserve_permits.unwrap_or(defaults.permits);
+    if !(1..=MAX_DRAIN_RESERVE_PERMITS).contains(&permits) {
+        return Err(write_behind_error(
+            name,
+            format!("requires drain_reserve_permits between 1 and {MAX_DRAIN_RESERVE_PERMITS}"),
+        ));
+    }
+    let attempts = raw.drain_reserve_attempts.unwrap_or(defaults.attempts);
+    if !(1..=MAX_DRAIN_RESERVE_ATTEMPTS).contains(&attempts) {
+        return Err(write_behind_error(
+            name,
+            format!("requires drain_reserve_attempts between 1 and {MAX_DRAIN_RESERVE_ATTEMPTS}"),
+        ));
+    }
+    let permit_wait = raw
+        .drain_reserve_permit_wait_millis
+        .unwrap_or(DEFAULT_DRAIN_RESERVE_PERMIT_WAIT_MILLIS);
+    if !(1..=MAX_DRAIN_RESERVE_PERMIT_WAIT_MILLIS).contains(&permit_wait) {
+        return Err(write_behind_error(
+            name,
+            format!(
+                "requires drain_reserve_permit_wait_millis between 1 and \
+                 {MAX_DRAIN_RESERVE_PERMIT_WAIT_MILLIS}"
+            ),
+        ));
+    }
+    let base = raw
+        .drain_reserve_backoff_base_millis
+        .unwrap_or(DEFAULT_DRAIN_RESERVE_BACKOFF_BASE_MILLIS);
+    if !(1..=MAX_DRAIN_RESERVE_BACKOFF_MILLIS).contains(&base) {
+        return Err(write_behind_error(
+            name,
+            format!(
+                "requires drain_reserve_backoff_base_millis between 1 and \
+                 {MAX_DRAIN_RESERVE_BACKOFF_MILLIS}"
+            ),
+        ));
+    }
+    let cap = raw
+        .drain_reserve_backoff_cap_millis
+        .unwrap_or(DEFAULT_DRAIN_RESERVE_BACKOFF_CAP_MILLIS.max(base));
+    if !(base..=MAX_DRAIN_RESERVE_BACKOFF_MILLIS).contains(&cap) {
+        return Err(write_behind_error(
+            name,
+            format!(
+                "requires drain_reserve_backoff_cap_millis between \
+                 drain_reserve_backoff_base_millis and {MAX_DRAIN_RESERVE_BACKOFF_MILLIS}"
+            ),
+        ));
+    }
+    Ok(DrainReserveSettings {
+        permits,
+        permit_wait: Duration::from_millis(permit_wait),
+        attempts,
+        backoff_base: Duration::from_millis(base),
+        backoff_cap: Duration::from_millis(cap),
+    })
+}
+
 /// Turn one enabled block into the store crate's own settings type, refusing
 /// every value the staging tier could not honour.
 ///
@@ -830,6 +916,7 @@ fn validated_write_behind_settings(
         }
     }
 
+    let drain_reserve = validated_drain_reserve(name, raw)?;
     let settings = WriteBehindSettings {
         root,
         watermarks: WriteBehindWatermarks {
@@ -845,6 +932,7 @@ fn validated_write_behind_settings(
         sample_interval: Duration::from_millis(sample_interval),
         stage_io_wait: Duration::from_millis(stage_io_wait),
         stage_read_wait: Duration::from_millis(stage_read_wait),
+        drain_reserve,
     };
     let required_text = |field: &str, value: &Option<String>| {
         value
@@ -3338,6 +3426,181 @@ staging_root = "/var/lib/loreserver/staging"
             Err(error) => error.to_string(),
         };
         assert!(error.contains("stage_io_wait_millis"), "got {error}");
+    }
+
+    /// Row 80 reserve contention: the reserve permit and retry keys are
+    /// optional, default to one permit and five tries, and refuse zero
+    /// permits and out-of-range values by name.
+    #[test]
+    fn drain_reserve_keys_default_to_one_permit_and_five_tries_and_are_bounded() {
+        let complete = valid_write_behind_block();
+        let settings = |text: &str| {
+            validated_write_behind_settings(PLUGIN_NAME, &raw_write_behind(text))
+                .map(|composition| composition.settings.drain_reserve)
+        };
+        let with = |lines: &str| {
+            let mutated = complete.replace(
+                "sample_interval_millis = 5000",
+                &format!("sample_interval_millis = 5000\n{lines}"),
+            );
+            assert_ne!(
+                mutated, complete,
+                "the fixture must set sample_interval_millis"
+            );
+            mutated
+        };
+        assert_eq!(
+            settings(&complete).unwrap(),
+            DrainReserveSettings::default()
+        );
+        let tuned = settings(&with(
+            "drain_reserve_permits = 2\ndrain_reserve_permit_wait_millis = 300\n\
+             drain_reserve_attempts = 3\ndrain_reserve_backoff_base_millis = 10\n\
+             drain_reserve_backoff_cap_millis = 40",
+        ))
+        .unwrap();
+        assert_eq!(
+            tuned,
+            DrainReserveSettings {
+                permits: 2,
+                permit_wait: Duration::from_millis(300),
+                attempts: 3,
+                backoff_base: Duration::from_millis(10),
+                backoff_cap: Duration::from_millis(40),
+            }
+        );
+        // A base above the default cap raises the defaulted cap with it.
+        let raised = settings(&with("drain_reserve_backoff_base_millis = 200")).unwrap();
+        assert_eq!(raised.backoff_cap, Duration::from_millis(200));
+        for (line, field) in [
+            ("drain_reserve_permits = 0", "drain_reserve_permits"),
+            ("drain_reserve_permits = 9", "drain_reserve_permits"),
+            ("drain_reserve_attempts = 0", "drain_reserve_attempts"),
+            ("drain_reserve_attempts = 11", "drain_reserve_attempts"),
+            (
+                "drain_reserve_permit_wait_millis = 0",
+                "drain_reserve_permit_wait_millis",
+            ),
+            (
+                "drain_reserve_permit_wait_millis = 10001",
+                "drain_reserve_permit_wait_millis",
+            ),
+            (
+                "drain_reserve_backoff_base_millis = 0",
+                "drain_reserve_backoff_base_millis",
+            ),
+            (
+                "drain_reserve_backoff_cap_millis = 1001",
+                "drain_reserve_backoff_cap_millis",
+            ),
+            (
+                "drain_reserve_backoff_base_millis = 50\ndrain_reserve_backoff_cap_millis = 40",
+                "drain_reserve_backoff_cap_millis",
+            ),
+        ] {
+            let error = match settings(&with(line)) {
+                Ok(_) => panic!("{line} must be refused"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(field), "{line}: got {error}");
+        }
+    }
+
+    /// Row 80 reserve contention: the documented default literals, the
+    /// reserve keys' independence from the stage I/O wait knobs in both
+    /// directions, and a misspelled reserve key refused rather than ignored.
+    #[test]
+    fn drain_reserve_keys_are_independent_of_the_stage_wait_knobs_and_misspellings_are_refused() {
+        let complete = valid_write_behind_block();
+        let settings = |text: &str| {
+            validated_write_behind_settings(PLUGIN_NAME, &raw_write_behind(text))
+                .map(|composition| composition.settings)
+        };
+        let with = |lines: &str| {
+            let mutated = complete.replace(
+                "sample_interval_millis = 5000",
+                &format!("sample_interval_millis = 5000\n{lines}"),
+            );
+            assert_ne!(
+                mutated, complete,
+                "the fixture must set sample_interval_millis"
+            );
+            mutated
+        };
+        // The documented values, as literals rather than the crate constants.
+        let defaulted = settings(&complete).unwrap();
+        assert_eq!(defaulted.drain_reserve.permits, 1);
+        assert_eq!(
+            defaulted.drain_reserve.permit_wait,
+            Duration::from_millis(1000)
+        );
+        assert_eq!(defaulted.drain_reserve.attempts, 5);
+        assert_eq!(
+            defaulted.drain_reserve.backoff_base,
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            defaulted.drain_reserve.backoff_cap,
+            Duration::from_millis(80)
+        );
+        // Bounds are inclusive at both ends.
+        let edges = settings(&with(
+            "drain_reserve_permits = 8\ndrain_reserve_attempts = 10\n\
+             drain_reserve_permit_wait_millis = 10000\n\
+             drain_reserve_backoff_base_millis = 1000\n\
+             drain_reserve_backoff_cap_millis = 1000",
+        ))
+        .unwrap();
+        assert_eq!(edges.drain_reserve.permits, 8);
+        assert_eq!(edges.drain_reserve.attempts, 10);
+        let floor = settings(&with(
+            "drain_reserve_permits = 1\ndrain_reserve_attempts = 1\n\
+             drain_reserve_permit_wait_millis = 1\n\
+             drain_reserve_backoff_base_millis = 1\n\
+             drain_reserve_backoff_cap_millis = 1",
+        ))
+        .unwrap();
+        assert_eq!(floor.drain_reserve.attempts, 1);
+        // Reserve keys do not move the stage waits.
+        let reserve_only = settings(&with(
+            "drain_reserve_permits = 3\ndrain_reserve_permit_wait_millis = 9000",
+        ))
+        .unwrap();
+        assert_eq!(reserve_only.stage_io_wait, defaulted.stage_io_wait);
+        assert_eq!(reserve_only.stage_read_wait, defaulted.stage_read_wait);
+        // Stage waits do not move the reserve settings.
+        let stage_only = settings(&with(
+            "stage_io_wait_millis = 7000\nstage_read_wait_millis = 6000",
+        ))
+        .unwrap();
+        assert_eq!(stage_only.drain_reserve, defaulted.drain_reserve);
+        assert_eq!(stage_only.stage_io_wait, Duration::from_millis(7000));
+        assert_eq!(stage_only.stage_read_wait, Duration::from_millis(6000));
+        // A refused reserve value never leaks into a stage-wait refusal.
+        let error = match settings(&with(
+            "stage_io_wait_millis = 10001\ndrain_reserve_permits = 0",
+        )) {
+            Ok(_) => panic!("both values are out of range"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("stage_io_wait_millis") || error.contains("drain_reserve_permits"),
+            "got {error}"
+        );
+        // `deny_unknown_fields`: a near-miss key is an error, not a silent default.
+        for typo in [
+            "drain_reserve_permit = 2",
+            "reserve_permits = 2",
+            "drain_reserve_attempt = 2",
+            "drain_reserve_backoff_millis = 5",
+        ] {
+            let error = match toml::from_str::<WriteBehindConfig>(typo) {
+                Ok(_) => panic!("{typo} must be refused as an unknown key"),
+                Err(error) => error.to_string(),
+            };
+            // Not a missing-field error: the key itself must be what is refused.
+            assert!(error.contains("unknown field"), "{typo}: got {error}");
+        }
     }
 
     /// Row 76: write-behind reserves one domain connection for its observer,

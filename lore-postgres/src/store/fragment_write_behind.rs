@@ -24,6 +24,8 @@ use crate::domain::fragments::states::FragmentLifecycleState;
 use crate::store::write_behind::CapacityVerdict;
 use crate::store::write_behind::cleanup::StageFileCandidate;
 use crate::store::write_behind::cleanup::StageFileScanner;
+use crate::store::write_behind::drain_reserve::DrainReserveGate;
+use crate::store::write_behind::drain_reserve::GatedReserve;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "fragment_write_behind_adapter_tests.rs"]
@@ -378,6 +380,7 @@ mod source_tests {
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
             stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+            drain_reserve: Default::default(),
         })
         .unwrap();
         let hash = [0xf1; 32];
@@ -491,6 +494,7 @@ mod source_tests {
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
             stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+            drain_reserve: Default::default(),
         })
         .unwrap();
         for mode in [
@@ -1032,6 +1036,9 @@ pub struct FragmentWriteBehindHandle {
     provider: Arc<FragmentProviderEntry>,
     stage: Arc<WriteBehindStage>,
     drain: FragmentDrainCapability,
+    /// Row 80: this replica's reserve permit and retry schedule. Wraps only
+    /// `reserve_spool`; see [`DrainReserveGate`].
+    reserve_gate: DrainReserveGate,
     maintenance: FragmentDrainMaintenanceHandle,
     policy: FragmentDrainPolicyPin,
     send_timeout: Duration,
@@ -1091,12 +1098,14 @@ impl PostgresImmutableStore {
             .map_err(provider_store_err)?;
         let scanner = Arc::new(std::sync::Mutex::new(StageFileScanner::default()));
         let drain_concurrency = default_drain_concurrency();
+        let reserve_gate = DrainReserveGate::new(stage.drain_reserve());
         Ok(Arc::new(FragmentWriteBehindHandle {
             coordinator: coordinator.clone(),
             observer,
             provider: provider.clone(),
             stage,
             drain,
+            reserve_gate,
             maintenance,
             policy,
             send_timeout: self.io_timeout,
@@ -1762,27 +1771,44 @@ impl FragmentWriteBehindHandle {
             Ok((claim, input))
         };
         let (claim, input) = plan_input().map_err(PromotionFailure::store(Stage::Plan))?;
-        let mut plan = FragmentDrainReservationPlan::new(input);
-        let mut reservation_result = self.drain.reserve_spool(&mut plan).await;
-        for _ in 0..2 {
-            if !matches!(
-                &reservation_result,
-                Err(
-                    lore_fragment_provider::FragmentProviderError::DrainAuthority(
-                        lore_fragment_provider::FragmentDrainAuthorityError::Unavailable
-                            // Rolled back for certain; the same descriptor is safe to replay.
-                            | lore_fragment_provider::FragmentDrainAuthorityError::Contended
+        // The plan retains its exact accepted descriptor across uncertain
+        // database outcomes. A retry must not mint another quota identity. The
+        // lock only lends the plan to one attempt at a time; attempts never
+        // overlap, so it is never contended.
+        let lent_plan = Mutex::new(FragmentDrainReservationPlan::new(input));
+        // Row 80: one per-replica permit per attempt, taken before the attempt
+        // checks out a dispatch connection and dropped before the jittered
+        // backoff. A permit timeout abandons here like any reserve failure.
+        let reservation = self
+            .reserve_gate
+            .run(
+                || {
+                    let lent = &lent_plan;
+                    async move {
+                        let mut plan = lent.lock().await;
+                        self.drain.reserve_spool(&mut plan).await
+                    }
+                },
+                |error| {
+                    matches!(
+                        error,
+                        lore_fragment_provider::FragmentProviderError::DrainAuthority(
+                            lore_fragment_provider::FragmentDrainAuthorityError::Unavailable
+                                // Rolled back for certain; the same descriptor is safe to replay.
+                                | lore_fragment_provider::FragmentDrainAuthorityError::Contended
+                        )
                     )
-                )
-            ) {
-                break;
-            }
-            // The plan retains its exact accepted descriptor across uncertain
-            // database outcomes. A retry must not mint another quota identity.
-            reservation_result = self.drain.reserve_spool(&mut plan).await;
-        }
-        let reservation =
-            reservation_result.map_err(PromotionFailure::provider(Stage::ReserveSpool))?;
+                },
+            )
+            .await
+            .map_err(|failure| match failure {
+                GatedReserve::Failed(error) => {
+                    PromotionFailure::provider(Stage::ReserveSpool)(error)
+                }
+                GatedReserve::PermitTimeout => {
+                    PromotionFailure::slow_down(Stage::ReserveSpool, ABANDON_CAUSE_PERMIT_TIMEOUT)
+                }
+            })?;
         let budget_pin = reservation.budget_pin().clone();
         let bytes = body.bytes.clone();
         // The reservation is retained with the receipt so ready derives all
@@ -2126,6 +2152,9 @@ pub(crate) const ABANDON_CAUSE_NONE: &str = "none";
 pub(crate) const ABANDON_CAUSE_TIMEOUT: &str = "timeout";
 /// The step's blocking task panicked or was cancelled.
 pub(crate) const ABANDON_CAUSE_JOIN: &str = "join";
+/// No reserve permit came free within the configured wait (row 80). Only
+/// `reserve_spool` carries it.
+pub(crate) const ABANDON_CAUSE_PERMIT_TIMEOUT: &str = "permit_timeout";
 
 /// The closed `cause` label for a provider seam failure. See
 /// [`lore_fragment_provider::FragmentProviderError::diagnostic_label`].
@@ -2211,6 +2240,7 @@ impl PromotionFailure {
 mod abandon_label_tests {
     use super::ABANDON_CAUSE_JOIN;
     use super::ABANDON_CAUSE_NONE;
+    use super::ABANDON_CAUSE_PERMIT_TIMEOUT;
     use super::ABANDON_CAUSE_TIMEOUT;
     use super::PromotionAbandonStage;
     use super::abandon_provider_cause;
@@ -2325,10 +2355,12 @@ mod abandon_label_tests {
         assert_eq!(ABANDON_CAUSE_NONE, "none");
         assert_eq!(ABANDON_CAUSE_TIMEOUT, "timeout");
         assert_eq!(ABANDON_CAUSE_JOIN, "join");
+        assert_eq!(ABANDON_CAUSE_PERMIT_TIMEOUT, "permit_timeout");
         let local = [
             ABANDON_CAUSE_NONE,
             ABANDON_CAUSE_TIMEOUT,
             ABANDON_CAUSE_JOIN,
+            ABANDON_CAUSE_PERMIT_TIMEOUT,
         ];
         let providers = [
             FragmentProviderError::PutAdmissionTimedOut,

@@ -349,3 +349,13 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
 4. **Execution**: Run detached, poll `docker inspect` for status, then remove.
 5. **Fixture manifests**: If a test runs `cargo check --offline` on a fixture crate, prefetch it with `cargo fetch --manifest-path <fixture>/Cargo.toml` first.
 6. **Port allocation**: Avoid `bind(0)` when both TCP and UDP ports are needed; Windows has disjoint UDP/TCP reservations. Sample randomly instead.
+
+## Async timing tests in `lore-postgres`
+
+- **`start_paused` fails with E0599 on `Builder::start_paused`; `tokio::spawn` fails clippy** ->
+  `lore-postgres` needs the `tokio` `test-util` dev-dependency (workspace tokio lacks it), and the
+  workspace `clippy.toml` bans `tokio::spawn`/`JoinSet::spawn` while `lore_spawn!` escapes paused
+  time. Drive concurrent contenders on one task with `tokio::join!` or a poll-all helper; see
+  `lore-postgres/tests/write_behind_drain_reserve.rs`.
+- **Appending to an `eol=lf` file with `Add-Content` writes CRLF** -> rewrite with
+  `[IO.File]::WriteAllText` and an LF-normalised string, then `git ls-files --eol <path>`.

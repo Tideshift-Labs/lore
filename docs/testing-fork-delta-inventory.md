@@ -209,6 +209,13 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   [`testing-gotchas.md`](testing-gotchas.md#postgres--database-testing) ("measuring `numbackends`
   on a connection you then drop") for the harness lesson this test file's own iteration surfaced.
 - **WP-114/WP-115 durable promotion send claim [SERVER, `lore-postgres/src/domain/fragments/`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-114-wp-115-durable-promotion-send-claim-server-lore-postgres-src-domain-fragments). Gates: `pwsh -File lore-postgres/tests/run-fragment-lifecycle-live.ps1`
+- **Row 80 drain reserve permit and backoff [SERVER, `lore-postgres/src/store/write_behind/drain_reserve.rs`]**:
+  per-replica `DrainReserveGate` around `reserve_spool` only; TOML keys `drain_reserve_*` under
+  `[write_behind]`. Gates: `cargo test -p lore-postgres --test write_behind_drain_reserve --test
+  write_behind_source_pins` (paused-time gate cases through the public API; pins for permit scope,
+  the gated-only call site, and the retry set being exactly Unavailable and Contended against the
+  seven `DrainError` variants) and `cargo test -p lore-server --lib drain_reserve`. The abandon
+  counter has no test readback, so `permit_timeout` is pinned by label constant and call-site scan.
 - **WP-114 CD-6/CD-7 write-behind store adapter [SERVER, `lore-postgres/src/store/write_behind/`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-114-cd-6-cd-7-write-behind-store-adapter-server-lore-postgres-src-store-write-behind). Gates: `cargo test -p lore-postgres --test write_behind_stage --test
     write_behind_source_pins`
 - **CR-035 write-behind backpressure is not unreadiness [SERVER,   `lore-server/src/fragment_write_behind.rs`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-035-write-behind-backpressure-is-not-unreadiness-server-lore-server-src-fragment-write-behind-rs). Gates: `cargo test -p lore-server --lib fragment_write_behind`

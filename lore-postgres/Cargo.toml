@@ -116,6 +116,9 @@ failure_generator = []
 [dev-dependencies]
 serial_test = { workspace = true }
 tokio-util = { workspace = true }
+# `#[tokio::test(start_paused = true)]` for the drain reserve gate's timing tests
+# (store/write_behind/drain_reserve.rs, tests/write_behind_drain_reserve.rs).
+tokio = { workspace = true, features = ["test-util"] }
 # WP-119 Step A tests only (domain_outbox_encoding.rs): parses the
 # idempotency-key.json conformance fixture once the docs lane lands it.
 serde_json = { workspace = true }

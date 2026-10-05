@@ -492,3 +492,168 @@ fn finalize_creates_and_fsyncs_fanout_directories_before_the_rename_and_fsyncs_t
         "step 5 syncs the held leaf descriptor"
     );
 }
+
+/// Row 80: the reserve permit is taken before anything checks out a dispatch
+/// connection, and is dropped before the backoff sleep.
+///
+/// Held by text because the order is a property of one block's scope: the
+/// permit is a `let` inside a `{ ... }` that closes before the sleep. Moving the
+/// sleep inside the block, or hoisting the permit out of the loop, keeps every
+/// functional case green for a promotion that always succeeds, and silently
+/// restores a connection-holding, sleep-holding permit under contention.
+#[test]
+fn the_reserve_permit_is_taken_before_the_attempt_and_dropped_before_the_sleep() {
+    let source = read_source("src/store/write_behind/drain_reserve.rs");
+    let run = function(&source, "pub async fn run<");
+    assert_order(
+        run,
+        &[
+            "let result = {",
+            "let _permit =",
+            "self.permits.acquire()",
+            "attempt().await",
+            "};",
+            "backoff_delay(",
+            "tokio::time::sleep(delay).await",
+        ],
+    );
+    // One permit binding, scoped in the block: a second one outside it, an
+    // owned permit, a forget, or an explicit leak would outlive the sleep.
+    assert_eq!(
+        run.matches("_permit").count(),
+        1,
+        "exactly one permit binding"
+    );
+    for forbidden in ["acquire_owned", "forget(", "add_permits(", "Semaphore::new"] {
+        assert!(
+            !run.contains(forbidden),
+            "the run loop must not use {forbidden:?}; the permit's scope is the attempt"
+        );
+    }
+    // The permit block must be balanced and closed before the `match` that
+    // decides to sleep, so the sleep cannot run while the permit is alive.
+    let block_start = run.find("let result = {").expect("block");
+    let decision = run.find("match result").expect("retry decision");
+    let sleep = run.find("tokio::time::sleep(delay)").expect("sleep");
+    assert!(block_start < decision && decision < sleep);
+    let block = &run[block_start..decision];
+    assert_eq!(
+        block.matches('{').count(),
+        block.matches('}').count(),
+        "the permit block must be closed before the retry decision and the sleep"
+    );
+    assert!(
+        !run[decision..].contains("_permit"),
+        "the permit binding must not be visible to the sleep"
+    );
+}
+
+/// Row 80: the old two-replay loop is gone, and the only `reserve_spool` call in
+/// `send_promotion` sits inside the gate's attempt closure. A second call site
+/// outside the gate would bypass both the permit and the schedule.
+#[test]
+fn the_old_two_retry_reserve_loop_is_gone_and_the_only_call_is_gated() {
+    let source = read_source("src/store/fragment_write_behind.rs");
+    let send = function(&source, "async fn send_promotion(");
+    for stale in [
+        "for _ in 0..2",
+        "reservation_result",
+        "let mut plan = FragmentDrainReservationPlan::new",
+    ] {
+        assert!(
+            !send.contains(stale),
+            "send_promotion still carries the old unbounded-replay shape {stale:?}"
+        );
+    }
+    assert_eq!(
+        send.matches(".reserve_spool(").count(),
+        1,
+        "exactly one reserve call in send_promotion"
+    );
+    assert_order(
+        send,
+        &[
+            ".reserve_gate",
+            ".run(",
+            "self.drain.reserve_spool(",
+            "GatedReserve::PermitTimeout",
+            "Stage::ReserveSpool",
+            "ABANDON_CAUSE_PERMIT_TIMEOUT",
+        ],
+    );
+    // No other call anywhere in the adapter file reaches the drain capability's
+    // reserve; its test modules do not call it either.
+    assert_eq!(
+        source.matches(".reserve_spool(").count(),
+        1,
+        "no ungated reserve_spool call anywhere in the adapter"
+    );
+    // The gate is per replica: one per handle, built from the stage's settings.
+    assert!(
+        source.contains("DrainReserveGate::new(stage.drain_reserve())"),
+        "the handle must build one gate from the configured settings"
+    );
+}
+
+/// Row 80 (d): the retry classification is exactly `Unavailable` and
+/// `Contended`, as before. Refused, Invalid, and the schema and metadata
+/// variants are final. The predicate is an inline closure, so this is a scan of
+/// that one `matches!` and a check that no catch-all widened it.
+///
+/// Every real `DrainError` variant is named here, so a new one forces a
+/// decision: add it to `FINAL` or to the retried list and update the closure.
+#[test]
+fn only_unavailable_and_contended_reserve_errors_are_retried() {
+    const RETRIED: [&str; 2] = ["Unavailable", "Contended"];
+    const FINAL: [&str; 5] = [
+        "Refused",
+        "Invalid",
+        "MetadataUnderflow",
+        "SchemaUpgradeRequired",
+        "SchemaUnknown",
+    ];
+    let source = read_source("src/store/fragment_write_behind.rs");
+    let send = function(&source, "async fn send_promotion(");
+    let start = send.find("matches!(").expect("the retry predicate");
+    let predicate = &send[start..];
+    let end = predicate.find(")\n                },").unwrap_or_else(|| {
+        // rustfmt may reflow the closer; fall back to the first stage label.
+        predicate.find(".await").expect("end of the .run( call")
+    });
+    let predicate = &predicate[..end];
+    for variant in RETRIED {
+        assert!(
+            predicate.contains(&format!("FragmentDrainAuthorityError::{variant}")),
+            "{variant} must stay retried"
+        );
+    }
+    for variant in FINAL {
+        assert!(
+            !predicate.contains(variant),
+            "{variant} must stay final (not retried)"
+        );
+    }
+    for catch_all in ["_ =>", "Err(_)", "..)", "DrainAuthority(_)"] {
+        assert!(
+            !predicate.contains(catch_all),
+            "the retry predicate must not use the catch-all {catch_all:?}"
+        );
+    }
+    // The 7-variant roster itself, from the single exhaustive diagnostic.
+    let provider = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../lore-fragment-provider/src/lib.rs"),
+    )
+    .expect("lore-fragment-provider lib.rs readable");
+    let diagnostic = function(&provider, "pub fn drain_diagnostic(");
+    for variant in RETRIED.iter().chain(FINAL.iter()) {
+        assert!(
+            diagnostic.contains(&format!("FragmentDrainAuthorityError::{variant}")),
+            "{variant} is no longer a DrainError variant; update this pin"
+        );
+    }
+    assert_eq!(
+        diagnostic.matches("FragmentDrainAuthorityError::").count(),
+        RETRIED.len() + FINAL.len(),
+        "DrainError gained a variant; classify it as retried or final here"
+    );
+}

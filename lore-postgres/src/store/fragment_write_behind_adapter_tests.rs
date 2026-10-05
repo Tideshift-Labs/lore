@@ -292,6 +292,7 @@ impl Fixture {
             sample_interval: Duration::from_secs(3600),
             stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
             stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+            drain_reserve: Default::default(),
         })
         .unwrap();
         let s3_config = aws_sdk_s3::config::Builder::new()

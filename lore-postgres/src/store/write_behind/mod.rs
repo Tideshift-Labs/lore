@@ -36,6 +36,7 @@
 
 pub mod admission;
 pub mod cleanup;
+pub mod drain_reserve;
 pub mod finalize;
 pub mod root;
 
@@ -253,6 +254,9 @@ pub struct WriteBehindSettings {
     /// answers `SlowDown`. Zero refuses at once, the behaviour before row 80's
     /// follow-up. Drain and cleanup reads never wait.
     pub stage_read_wait: Duration,
+    /// The drain's per-replica reserve permit and retry schedule (row 80).
+    /// The stage only carries it to the drain handle; nothing here uses it.
+    pub drain_reserve: drain_reserve::DrainReserveSettings,
 }
 
 /// [`WriteBehindSettings::stage_read_wait`]'s default. About one mean GET
@@ -349,6 +353,7 @@ pub struct WriteBehindStage {
     hard_limits: (u64, u64),
     stage_io_wait: Duration,
     stage_read_wait: Duration,
+    drain_reserve: drain_reserve::DrainReserveSettings,
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -432,8 +437,15 @@ impl WriteBehindStage {
             ),
             stage_io_wait: settings.stage_io_wait,
             stage_read_wait: settings.stage_read_wait,
+            drain_reserve: settings.drain_reserve,
             sampler,
         }))
+    }
+
+    /// The drain's reserve permit and retry schedule, as configured.
+    #[must_use]
+    pub fn drain_reserve(&self) -> drain_reserve::DrainReserveSettings {
+        self.drain_reserve
     }
 
     /// The current admission mode.

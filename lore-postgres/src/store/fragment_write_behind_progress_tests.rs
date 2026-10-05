@@ -32,6 +32,7 @@ async fn observer_sees_peer_stage_then_refuses_a_replaced_local_mount_without_re
         sample_interval: Duration::from_secs(3600),
         stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
         stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+        drain_reserve: Default::default(),
     })
     .unwrap();
     let bytes = Bytes::from_static(b"peer stage after observer was empty");

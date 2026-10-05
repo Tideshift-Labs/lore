@@ -96,6 +96,7 @@ fn settings(root: PathBuf) -> WriteBehindSettings {
         sample_interval: Duration::from_secs(3_600),
         stage_io_wait: lore_postgres::store::write_behind::DEFAULT_STAGE_IO_WAIT,
         stage_read_wait: lore_postgres::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+        drain_reserve: Default::default(),
     }
 }
 
