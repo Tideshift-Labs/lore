@@ -81,6 +81,250 @@ mod drain_concurrency_tests {
     }
 }
 
+/// Row 80 idea 4: a random cursor start and a shuffled batch (pure seam; the
+/// candidate query is simulated with its own `hash > $2 ORDER BY hash LIMIT $1`).
+#[cfg(test)]
+mod drain_walk_tests {
+    use std::collections::BTreeSet;
+
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    use super::*;
+
+    fn hash(byte: u8) -> Vec<u8> {
+        let mut hash = vec![byte; 32];
+        hash[31] = byte.wrapping_mul(7);
+        hash
+    }
+
+    /// The candidate query's keyset contract over an in-memory keyspace.
+    fn page_after(keyspace: &BTreeSet<Vec<u8>>, after: &[u8], limit: usize) -> Vec<Vec<u8>> {
+        keyspace
+            .iter()
+            .filter(|candidate| candidate.as_slice() > after)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// One drain pass's cursor handling, composed from the same seam calls
+    /// `drain_pass` makes. Returns the page in promotion order and whether
+    /// the pass wrapped to the start of the keyspace.
+    fn pass(
+        state: &mut DrainState,
+        keyspace: &BTreeSet<Vec<u8>>,
+        limit: usize,
+        rng: &mut StdRng,
+    ) -> (Vec<Vec<u8>>, bool) {
+        let cursor = state.cursor.clone();
+        let mut page = page_after(keyspace, &cursor, limit);
+        let wrapped = DrainState::must_wrap(&cursor, page.len());
+        if wrapped {
+            state.wrap();
+            page = page_after(keyspace, &[], limit);
+        }
+        state.begin_batch(&mut page, Vec::as_slice, rng);
+        (page, wrapped)
+    }
+
+    #[test]
+    fn boot_uses_a_32_byte_seed_drawn_from_the_rng() {
+        let fixed = DrainState::with_cursor_seed([0xAB; 32]);
+        assert_eq!(fixed.cursor, vec![0xAB; 32]);
+        assert!(fixed.cooldown.is_empty());
+
+        let mut expected = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut StdRng::seed_from_u64(9), &mut expected);
+        let seeded = DrainState::seeded(&mut StdRng::seed_from_u64(9));
+        assert_eq!(seeded.cursor, expected.to_vec());
+        let other = DrainState::seeded(&mut StdRng::seed_from_u64(10));
+        assert_ne!(seeded.cursor, other.cursor);
+    }
+
+    #[test]
+    fn after_a_batch_the_cursor_is_the_batch_max_for_any_shuffle() {
+        let batch: Vec<Vec<u8>> = [9u8, 3, 200, 41, 17].iter().map(|b| hash(*b)).collect();
+        let max = batch.iter().max().cloned();
+        for seed in 0..64 {
+            let mut state = DrainState::with_cursor_seed([0; 32]);
+            let mut page = batch.clone();
+            state.begin_batch(&mut page, Vec::as_slice, &mut StdRng::seed_from_u64(seed));
+            assert_eq!(Some(state.cursor.clone()), max, "seed {seed}");
+        }
+        // An empty page leaves the cursor where it was.
+        let mut state = DrainState::with_cursor_seed([5; 32]);
+        let mut empty: Vec<Vec<u8>> = Vec::new();
+        state.begin_batch(&mut empty, Vec::as_slice, &mut StdRng::seed_from_u64(0));
+        assert_eq!(state.cursor, vec![5; 32]);
+    }
+
+    #[test]
+    fn the_shuffle_is_a_permutation_of_the_batch() {
+        let batch: Vec<Vec<u8>> = (0u8..40).map(hash).collect();
+        let mut reordered = false;
+        for seed in 0..16 {
+            let mut page = batch.clone();
+            DrainState::with_cursor_seed([0; 32]).begin_batch(
+                &mut page,
+                Vec::as_slice,
+                &mut StdRng::seed_from_u64(seed),
+            );
+            let mut sorted = page.clone();
+            sorted.sort();
+            assert_eq!(sorted, batch, "seed {seed}");
+            reordered |= page != batch;
+        }
+        assert!(reordered, "the shuffle never changed the order");
+    }
+
+    #[test]
+    fn the_wrap_visits_every_hash_exactly_once_per_cycle_from_any_seed() {
+        let keyspace: BTreeSet<Vec<u8>> = (0u8..=250).step_by(3).map(hash).collect();
+        for (seed, limit) in [(0u64, 1usize), (1, 4), (2, 7), (3, 16), (4, 500)] {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut state = DrainState::seeded(&mut rng);
+            let bound = keyspace.len() + 2;
+            // The seeded start covers only a suffix; a full cycle begins at
+            // the first wrap and ends before the next one.
+            let mut cycles: Vec<Vec<Vec<u8>>> = Vec::new();
+            for _ in 0..bound * 3 {
+                let (page, wrapped) = pass(&mut state, &keyspace, limit, &mut rng);
+                if wrapped {
+                    cycles.push(Vec::new());
+                }
+                if let Some(cycle) = cycles.last_mut() {
+                    cycle.extend(page);
+                }
+                if cycles.len() == 3 {
+                    break;
+                }
+            }
+            assert!(cycles.len() >= 3, "seed {seed} limit {limit}: no wrap");
+            for cycle in &cycles[..2] {
+                let distinct: BTreeSet<Vec<u8>> = cycle.iter().cloned().collect();
+                assert_eq!(cycle.len(), keyspace.len(), "seed {seed} limit {limit}");
+                assert_eq!(distinct, keyspace, "seed {seed} limit {limit}");
+            }
+        }
+    }
+}
+
+/// Row 80 idea 4, replica decorrelation: replicas that boot with different
+/// cursors must not read identical first pages. The candidate query is
+/// simulated with its own keyset contract (`hash > $2 ORDER BY hash LIMIT $1`).
+#[cfg(test)]
+mod drain_walk_replica_tests {
+    use std::collections::BTreeSet;
+
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    use super::*;
+
+    const PAGE: usize = 8;
+
+    /// 64 hashes spread evenly over the first byte, so a page is a narrow
+    /// slice of the keyspace.
+    fn keyspace() -> BTreeSet<Vec<u8>> {
+        (0u8..64)
+            .map(|i| {
+                let mut hash = vec![0u8; 32];
+                hash[0] = i * 4;
+                hash
+            })
+            .collect()
+    }
+
+    fn page_after(keyspace: &BTreeSet<Vec<u8>>, after: &[u8]) -> Vec<Vec<u8>> {
+        keyspace
+            .iter()
+            .filter(|candidate| candidate.as_slice() > after)
+            .take(PAGE)
+            .cloned()
+            .collect()
+    }
+
+    /// The first page a replica reads after boot, in promotion order. A
+    /// non-empty cursor with an empty page wraps, exactly as `drain_pass` does.
+    fn first_page(mut state: DrainState, keyspace: &BTreeSet<Vec<u8>>, seed: u64) -> Vec<Vec<u8>> {
+        let cursor = state.cursor.clone();
+        let mut page = page_after(keyspace, &cursor);
+        if DrainState::must_wrap(&cursor, page.len()) {
+            state.wrap();
+            page = page_after(keyspace, &[]);
+        }
+        state.begin_batch(&mut page, Vec::as_slice, &mut StdRng::seed_from_u64(seed));
+        page
+    }
+
+    fn empty_cursor_state() -> DrainState {
+        let mut state = DrainState::with_cursor_seed([0; 32]);
+        state.wrap();
+        assert!(state.cursor.is_empty());
+        state
+    }
+
+    #[test]
+    fn a_seeded_cursor_is_not_the_empty_cursor() {
+        for seed in 0..32u64 {
+            let state = DrainState::seeded(&mut StdRng::seed_from_u64(seed));
+            assert_eq!(state.cursor.len(), 32, "seed {seed}");
+            assert_ne!(state.cursor, Vec::<u8>::new(), "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_random_start_and_an_empty_start_do_not_read_identical_first_pages() {
+        let keyspace = keyspace();
+        let lockstep = first_page(empty_cursor_state(), &keyspace, 0);
+        let lockstep_set: BTreeSet<_> = lockstep.iter().cloned().collect();
+        assert_eq!(lockstep.len(), PAGE);
+        let lockstep_max = lockstep_set.iter().max().cloned().unwrap_or_default();
+
+        let mut differing = 0;
+        let seeds = 0..32u64;
+        for seed in seeds.clone() {
+            let state = DrainState::seeded(&mut StdRng::seed_from_u64(seed));
+            let start = state.cursor.clone();
+            let page = first_page(state, &keyspace, seed);
+            let page_set: BTreeSet<_> = page.iter().cloned().collect();
+            if page_set != lockstep_set {
+                differing += 1;
+            }
+            // A start past the empty replica's whole page cannot share a hash
+            // with it, so the two replicas never contend on the first page.
+            if start > lockstep_max {
+                assert!(page_set.is_disjoint(&lockstep_set), "seed {seed}");
+            }
+        }
+        // Eight of 64 hashes are the empty replica's page, so nearly every
+        // random start must differ; allow none to coincide by luck alone.
+        assert_eq!(differing, seeds.count(), "some random start read page one");
+    }
+
+    #[test]
+    fn a_start_past_every_hash_wraps_to_the_same_set_as_an_empty_start() {
+        let keyspace = keyspace();
+        let high = DrainState::with_cursor_seed([0xFF; 32]);
+        let wrapped = first_page(high, &keyspace, 1);
+        let lockstep = first_page(empty_cursor_state(), &keyspace, 2);
+        let a: BTreeSet<_> = wrapped.into_iter().collect();
+        let b: BTreeSet<_> = lockstep.into_iter().collect();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn two_different_shuffle_seeds_promote_one_page_in_different_orders() {
+        let keyspace = keyspace();
+        let one = first_page(empty_cursor_state(), &keyspace, 1);
+        let two = first_page(empty_cursor_state(), &keyspace, 2);
+        let set = |page: &[Vec<u8>]| page.iter().cloned().collect::<BTreeSet<_>>();
+        assert_eq!(set(&one), set(&two));
+        assert_ne!(one, two, "two seeds produced one order");
+    }
+}
+
 #[cfg(all(test, unix))]
 mod source_tests {
     use uuid::Uuid;
@@ -675,9 +919,63 @@ pub fn default_drain_concurrency() -> usize {
 
 /// The keyset cursor and the per-hash retry cooldown. Locked only for short
 /// bookkeeping, never across a promotion (row 77).
+///
+/// Row 80 idea 4: replicas used to start from an empty cursor and walk the
+/// same `ORDER BY hash` keyset in near lockstep, so each fenced the other's
+/// promotion begins. The cursor now starts at a random 32-byte point, and each
+/// batch is promoted in random order. `begin_promotion` stays the sole locked
+/// admission; only the read order changes. The wrap on an empty page still
+/// walks the whole keyspace, so no hash starves and a dead replica strands
+/// nothing (there is no partition).
 struct DrainState {
     cursor: Vec<u8>,
     cooldown: BTreeMap<Vec<u8>, (Instant, u32)>,
+}
+
+impl DrainState {
+    /// Boot state with the cursor seeded from `rng`. The seed is exactly 32
+    /// bytes, the only non-empty length the candidate query accepts.
+    fn seeded<R: rand::Rng + ?Sized>(rng: &mut R) -> Self {
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        Self::with_cursor_seed(seed)
+    }
+
+    /// Boot state with a fixed cursor seed (test seam).
+    fn with_cursor_seed(seed: [u8; 32]) -> Self {
+        Self {
+            cursor: seed.to_vec(),
+            cooldown: BTreeMap::new(),
+        }
+    }
+
+    /// Whether a page read after `queried` must be re-read from the start of
+    /// the keyspace: it came back empty from a non-empty cursor.
+    fn must_wrap(queried: &[u8], page_len: usize) -> bool {
+        page_len == 0 && !queried.is_empty()
+    }
+
+    /// Restart the keyset walk at the start of the keyspace.
+    fn wrap(&mut self) {
+        self.cursor.clear();
+    }
+
+    /// Take one candidate page: move the cursor to the page's greatest hash,
+    /// once, then shuffle the page in place. The cursor moves before the
+    /// shuffle and before any promotion, because a per-item write after a
+    /// shuffle would move it backward. The cooldown map is untouched: a
+    /// cooled hash is passed over this cycle exactly as before.
+    fn begin_batch<T, R: rand::Rng + ?Sized>(
+        &mut self,
+        batch: &mut [T],
+        hash: impl Fn(&T) -> &[u8],
+        rng: &mut R,
+    ) {
+        if let Some(max) = batch.iter().map(&hash).max() {
+            self.cursor = max.to_vec();
+        }
+        rand::seq::SliceRandom::shuffle(batch, rng);
+    }
 }
 
 /// One concurrent promotion's retained file tasks. A promotion holds its slot
@@ -804,10 +1102,7 @@ impl PostgresImmutableStore {
             send_timeout: self.io_timeout,
             late_effect_bound: *late_effect_bound,
             pass: Mutex::new(()),
-            state: Mutex::new(DrainState {
-                cursor: Vec::new(),
-                cooldown: BTreeMap::new(),
-            }),
+            state: Mutex::new(DrainState::seeded(&mut rand::rng())),
             slots: (0..MAX_DRAIN_CONCURRENCY)
                 .map(|_| Arc::new(Mutex::new(DrainSlot::default())))
                 .collect(),
@@ -1117,8 +1412,8 @@ impl FragmentWriteBehindHandle {
             .staged_drain_candidates_after(bound, &cursor)
             .await
             .map_err(domain_store_err)?;
-        if candidates.is_empty() && !cursor.is_empty() {
-            self.state.lock().await.cursor.clear();
+        if DrainState::must_wrap(&cursor, candidates.len()) {
+            self.state.lock().await.wrap();
             candidates = self
                 .coordinator
                 .staged_drain_candidates_after(bound, &[])
@@ -1127,17 +1422,26 @@ impl FragmentWriteBehindHandle {
         }
         {
             let now = Instant::now();
-            self.state.lock().await.cooldown.retain(|_, (until, _)| {
+            let mut state = self.state.lock().await;
+            state.cooldown.retain(|_, (until, _)| {
                 now.saturating_duration_since(*until) < Duration::from_secs(300)
             });
+            // The cursor jumps to the page's max hash here, once. If the
+            // no-free-slot break below ends the loop early, the rest of this
+            // page waits for the wrap. That happens only when every slot holds
+            // a timed-out file task.
+            state.begin_batch(
+                &mut candidates,
+                FragmentDrainCandidate::hash,
+                &mut rand::rng(),
+            );
         }
         let mut promoted = 0;
         let mut running = tokio::task::JoinSet::new();
         for source in candidates {
             let hash = source.hash().to_vec();
             {
-                let mut state = self.state.lock().await;
-                state.cursor = hash.clone();
+                let state = self.state.lock().await;
                 if state
                     .cooldown
                     .get(&hash)

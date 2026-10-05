@@ -333,6 +333,9 @@ impl Fixture {
             )
             .await
             .unwrap();
+        // These cases assert an ascending keyset walk from the start; the
+        // random boot cursor (row 80 idea 4) is covered by drain_walk_tests.
+        handle.state.lock().await.wrap();
         let address = Address {
             context: Context::default(),
             hash: Hash::from(blake3::hash(&payload).as_bytes().as_slice()),

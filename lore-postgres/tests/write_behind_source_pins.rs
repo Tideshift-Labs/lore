@@ -308,6 +308,54 @@ fn staged_read_never_lets_an_unavailable_root_reach_the_missing_publication() {
     );
 }
 
+/// Row 80 idea 4, the seam the pure `drain_walk` tests cannot reach. Those
+/// tests compose their own copy of one drain pass, so deleting the
+/// `begin_batch` call from `drain_pass` or restoring a per-item cursor write
+/// (which would move the cursor backward after the shuffle) would still pass
+/// them. These pins scope to the real function bodies.
+#[test]
+fn drain_pass_takes_one_batch_and_writes_no_per_item_cursor() {
+    let source = read_source("src/store/fragment_write_behind.rs");
+    let drain_pass = function(&source, "pub async fn drain_pass(");
+
+    // Negatives first: a per-item write is the forbidden shape.
+    assert!(
+        !drain_pass.contains("state.cursor = "),
+        "drain_pass must not assign the cursor per item; the shuffled page would move it backward"
+    );
+    assert!(
+        !drain_pass.contains(".cursor = "),
+        "drain_pass must not assign the cursor directly; only begin_batch moves it"
+    );
+    assert_eq!(
+        drain_pass.matches("state.begin_batch(").count(),
+        1,
+        "drain_pass must move the cursor and shuffle through begin_batch exactly once"
+    );
+    assert_order(
+        drain_pass,
+        &[
+            "staged_drain_candidates_after(",
+            "state.begin_batch(",
+            "for source in candidates {",
+        ],
+    );
+}
+
+#[test]
+fn write_behind_boot_seeds_the_drain_cursor_randomly() {
+    let source = read_source("src/store/fragment_write_behind.rs");
+    let create = function(&source, "pub async fn create_write_behind_handle(");
+    assert!(
+        create.contains("DrainState::seeded(&mut rand::rng())"),
+        "the handle must boot with a random cursor, not an empty one"
+    );
+    assert!(
+        !create.contains("cursor: Vec::new()"),
+        "the handle must not boot with an empty cursor"
+    );
+}
+
 /// Durable finalization ordering, structural half. No userspace test can prove
 /// bytes survive a real power loss; what a source pin CAN prove is that the
 /// operations ADR-00027 requires before the authoritative `Staged` commit
