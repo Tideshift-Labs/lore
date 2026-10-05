@@ -183,7 +183,10 @@ pub(crate) enum StageIoPath {
     )]
     Read,
     /// A drain promotion or cleanup read. Refused at once when its pool is full.
-    #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
+    #[cfg_attr(
+        not(any(unix, test)),
+        expect(dead_code, reason = "staging is Unix-only")
+    )]
     DrainRead,
     #[cfg_attr(
         not(any(unix, test)),
