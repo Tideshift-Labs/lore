@@ -610,6 +610,14 @@ pub fn build_pool(url: &str, pool_max: u32, tls: &TlsConfig) -> Result<Pool, Str
 /// `name` is the `pool` label (`immutable`, `mutable`, `lock`, `domain`,
 /// `relay`, ...). It is a `&'static str` so a repository, branch, or tenant
 /// identifier cannot reach a metric label.
+///
+/// Every connection this pool opens runs with
+/// `plan_cache_mode = force_custom_plan`, set and read back by a `post_create`
+/// hook before the connection is pooled
+/// ([`crate::statement_cache::apply_plan_cache_mode`]). A connection the server
+/// will not give that mode fails its checkout. This is what keeps statements
+/// cached by [`crate::statement_cache::CachedStatements`] on custom plans; see
+/// that module for why.
 pub fn build_pool_named(
     url: &str,
     pool_max: u32,
@@ -619,9 +627,48 @@ pub fn build_pool_named(
     let manager = build_manager(url, tls, RecyclingMethod::Fast)?;
     let inner = deadpool_postgres::Pool::builder(manager)
         .max_size(pool_max as usize)
+        .post_create(deadpool_postgres::Hook::async_fn(
+            move |client, _metrics| {
+                Box::pin(async move {
+                    crate::statement_cache::apply_plan_cache_mode(client)
+                        .await
+                        .map_err(|error| {
+                            tracing::warn!(
+                                pool = name,
+                                error = %error,
+                                "postgres connection rejected: plan_cache_mode setup failed"
+                            );
+                            deadpool_postgres::HookError::message(error)
+                        })
+                })
+            },
+        ))
         .build()
         .map_err(|e| format!("failed to build postgres pool: {e}"))?;
     Ok(named_pool(inner, name))
+}
+
+/// Read `plan_cache_mode` on one pooled connection and refuse anything but
+/// [`crate::statement_cache::PLAN_CACHE_MODE`]. Run once at store startup, so
+/// a pool whose connections lost the setting stops the boot instead of
+/// serving cached statements on generic plans.
+///
+/// # Errors
+///
+/// The checkout or the `SHOW` failed, or the mode differs.
+pub async fn verify_plan_cache_mode(pool: &Pool) -> Result<(), String> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|e| format!("postgres connect failed: {e}"))?;
+    let mode = crate::statement_cache::show_plan_cache_mode(&client).await?;
+    if mode != crate::statement_cache::PLAN_CACHE_MODE {
+        return Err(format!(
+            "postgres pool connection runs plan_cache_mode {mode}, expected {}",
+            crate::statement_cache::PLAN_CACHE_MODE
+        ));
+    }
+    Ok(())
 }
 
 fn build_manager(

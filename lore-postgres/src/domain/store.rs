@@ -163,6 +163,9 @@ impl PostgresDomainStore {
             DomainPoolLayout::ReserveObserver { .. } => observer_shared_pool_max(pool_max)?,
         };
         let pool = crate::pool::build_pool_named(url, shared_max, tls, "domain")?;
+        // The fragment coordinator's hot statements are prepared once per
+        // connection; they are safe only on custom plans (row 80 idea 3).
+        crate::pool::verify_plan_cache_mode(&pool).await?;
         // Skip completed DDL and commit each missing statement before the next
         // one. Replica joins must not retain schema locks across live writes.
         crate::pool::ensure_schema_online(&pool, schema::SCHEMA).await?;

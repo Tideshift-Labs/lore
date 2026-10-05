@@ -63,7 +63,7 @@ pub(super) async fn reserve_stage_locked(
     sequence.enter(LockClass::StageCustody)?;
     // The head is locked (or was inserted in this transaction). Reserve the
     // permanent marker now; physical cleanup cannot require a later allocation.
-    let inserted = tx.execute(
+    let inserted = tx.execute_cached(
         "INSERT INTO lore_fragment_stage_custody \
          (hash,epoch,operation_fence,original_flags,size_payload,prepare_deadline,state,metadata_bytes) \
          SELECT $1,$2,$3,$4,$5,clock_timestamp() + prepare_ttl_ms * interval '1 millisecond',0,$6 \
@@ -76,7 +76,7 @@ pub(super) async fn reserve_stage_locked(
         ));
     }
     sequence.enter(LockClass::StageUsage)?;
-    let charged = tx.execute(
+    let charged = tx.execute_cached(
         "UPDATE lore_fragment_stage_usage AS u SET \
          live_bytes=u.live_bytes+$1, live_files=u.live_files+1, \
          charged_bytes=u.charged_bytes+$1, charged_files=u.charged_files+1, \
@@ -101,7 +101,7 @@ pub(super) async fn publish_stage_locked(
 ) -> Result<bool, DomainError> {
     sequence.enter(LockClass::StageCustody)?;
     let n = tx
-        .execute(
+        .execute_cached(
             "UPDATE lore_fragment_stage_custody SET state=1 \
          WHERE hash=$1 AND epoch=$2 AND operation_fence=$3 AND state=0 \
            AND prepare_deadline>clock_timestamp() AND size_payload=$4",

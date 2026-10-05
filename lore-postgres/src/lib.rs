@@ -20,4 +20,5 @@
 pub mod domain;
 pub mod metrics;
 pub mod pool;
+pub mod statement_cache;
 pub mod store;

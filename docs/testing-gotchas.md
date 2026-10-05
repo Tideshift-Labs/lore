@@ -74,6 +74,18 @@ Durable, recurring testing lessons grouped by topic.
   constant. See `lore-postgres/tests/domain_outbox_event_plane.rs`'s `total_backends` helper for
   the worked pattern (six of seven cases needed it before this lesson, all six failed the same
   way: "N other backends" where N included the test's own leftover setup connections).
+- **A plan-shape gate needs three parts, and a control that can go red.** Read the statement
+  inventory from source (the `*_cached(` literals) so a new statement cannot dodge the gate;
+  `PREPARE` each under `SET plan_cache_mode = force_generic_plan` and `EXPLAIN (FORMAT JSON)
+  EXECUTE` it with every parameter `NULL` (the generic plan ignores values, `simple_query` returns
+  the JSON as text); then prove sensitivity by planning the same statement re-spelled with a bound
+  state list and asserting it loses the partial index. `pg_prepared_statements.custom_plans` /
+  `generic_plans` (PG14+) observes which plan ran, with an `auto` session as the control. Worked
+  example: `lore-postgres/tests/statement_cache_live.rs`.
+- **A pool test that holds every slot and then checks out once more hangs forever.** The default
+  `deadpool` pool has no wait timeout, so the test sits at 0 CPU, not failing. Drop the held guards
+  first. Kill a hung live test by its test-binary name only; `Stop-Process` on every `cargo` also
+  kills other lanes' builds in the shared checkout.
 
 ## Histogram/quantile fixtures
 

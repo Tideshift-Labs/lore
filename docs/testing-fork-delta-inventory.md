@@ -117,6 +117,18 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   upgrade-fragments` binary end to end, refusal without `--confirm-replicas-stopped` included. See
   [testing-gotchas.md](testing-gotchas.md#cr-039-fragment-schema-upgrade-fixture-gotchas) for the
   fixture traps this tier's revision-4 downgrade and readiness fixtures needed.
+- **Row 80 idea 3, per-connection prepared-statement cache [SERVER, `lore-postgres/src/statement_cache.rs`]**:
+  hot fragment-coordinator statements run through `*_cached` methods; every pooled connection is
+  set to `plan_cache_mode = force_custom_plan` by a `post_create` hook and read back with `SHOW`,
+  and `PostgresDomainStore::connect` verifies it before schema work. Offline:
+  `cargo test -p lore-postgres --test statement_cache_source_pins` (statement inventory read from
+  the `*_cached(` literals; one pin per statement in `tests/common/cached_sql.rs`; no
+  `DISCARD`/`RESET`/`Clean` recycle; the stage observer pool, which lacks the hook, never runs a
+  cached statement). Live: five cases in `--test statement_cache_live`, run by
+  `run-fragment-lifecycle-live.ps1` (setting across recycle and pool growth, verification failure,
+  prepared once with `custom_plans=9, generic_plans=0` against an `auto` control, registry equals
+  call-site literals, generic-plan EXPLAIN on a skewed fixture). A new `*_cached` statement fails
+  the one-to-one pin check until it is pinned.
 - **CR-021 AWS error honesty and retry [SERVER]**: the shared classifier preserves modeled absence,
   maps only retryable failures to `SlowDown`, and keeps permanent failures source-preserving
   `Internal`. SDK retry defaults to Standard, with Adaptive opt-in and Disabled as one attempt.

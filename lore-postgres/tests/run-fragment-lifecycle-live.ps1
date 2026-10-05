@@ -372,6 +372,25 @@ $inventory = @(
             'changed_source_witness_is_fenced_before_any_claim_is_created',
             'keyset_pages_reach_later_hashes_and_wrap_without_repeating_the_first_batch'
         )
+    },
+    # WP-115 row 80 idea 3: the per-connection prepared-statement cache. Every pooled
+    # connection runs plan_cache_mode = force_custom_plan; the EXPLAIN gate proves even
+    # a generic plan of each cached statement avoids a lifecycle/write-claims seq scan.
+    # NOT Unix-gated. Its source half, statement_cache_source_pins, is not #[ignore]
+    # and runs under plain `cargo test`.
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
+        Target        = 'statement_cache_live'
+        Exact         = $true
+        ExactPrefixes = @()
+        Cases         = @(
+            'every_pooled_connection_reports_force_custom_plan_across_recycle_and_growth',
+            'a_connection_that_lost_the_setting_fails_verification_and_a_dead_session_fails_apply',
+            'a_cached_statement_is_prepared_once_replays_identically_and_never_goes_generic',
+            'a_real_lifecycle_prepares_only_statements_that_are_literal_at_a_pinned_call_site',
+            'every_cached_statement_has_a_safe_generic_plan_on_a_skewed_population'
+        )
     }
 )
 
@@ -413,6 +432,7 @@ $platformSkipStatus = "NOT RUN (platform: Unix-only - owned by $(Split-Path -Lea
 # have its numbers swallowed, which is the one thing it exists to produce.
 $printOutputCases = @(
     'generic_keyset_plan_uses_recovery_index_on_a_mixed_state_population',
+    'every_cached_statement_has_a_safe_generic_plan_on_a_skewed_population',
     'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout',
     'same_repo_lifecycle_traffic_requires_complete_proof',
     'cross_repo_bulk_upload_does_not_abort_unrelated_push',

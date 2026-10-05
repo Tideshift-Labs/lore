@@ -97,6 +97,7 @@ use crate::domain::outbox::builders;
 use crate::domain::outbox::version::AggregateVersion;
 use crate::domain::schema::STATE_LIVE;
 use crate::pool::Pool;
+use crate::statement_cache::CachedStatements;
 
 /// Reserved limit for a future certified complete membership proof under
 /// CR-031's F-031 amendment. Selective fallback is disabled; the scalar-only
@@ -2553,7 +2554,7 @@ async fn run_resolve_statement(
         .map(|request| request.context.as_slice())
         .collect::<Vec<_>>();
     let rows = client
-        .query(
+        .query_cached(
             "WITH requested AS ( \
                      SELECT request.hash, request.context, request.ordinality \
                        FROM unnest($2::bytea[], $3::bytea[]) WITH ORDINALITY \
@@ -2864,7 +2865,7 @@ impl PostgresFragmentCoordinator {
             });
         }
         let database_now: SystemTime = tx
-            .query_one("SELECT clock_timestamp()", &[])
+            .query_one_cached("SELECT clock_timestamp()", &[])
             .await
             .map_err(|error| DomainError::from_pg("fragment write authorization clock", error))?
             .get(0);
@@ -2877,7 +2878,7 @@ impl PostgresFragmentCoordinator {
                 reason_version: 1,
             });
         };
-        tx.execute(
+        tx.execute_cached(
             "UPDATE lore_fragment_write_claims \
                 SET state = $3, authorized_at = clock_timestamp() \
               WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $4",
@@ -3384,7 +3385,7 @@ impl PostgresFragmentCoordinator {
                 FenceReason::PromotionSourceChanged(promotion_source_mover(&head, source)), // mover
             ));
         }
-        let exact_source = tx.query_opt(
+        let exact_source = tx.query_opt_cached(
             "SELECT 1 FROM lore_fragment_epochs \
              WHERE hash = $1 AND epoch = $2 AND manifest_id = $3 \
                AND object_key = $4 AND size_payload = $5 AND size_content = $6 \
@@ -3470,7 +3471,7 @@ impl PostgresFragmentCoordinator {
         // The fence stamp and the ownership token move together: the token is
         // what `authorize_write_claim` checks, and the fence is what fences a
         // displaced owner's intent at `commit_publication`.
-        tx.execute(
+        tx.execute_cached(
             "UPDATE lore_fragment_lifecycle \
                 SET last_fence = $2, active_operation = $3, updated_at = clock_timestamp() \
               WHERE hash = $1",
@@ -3594,7 +3595,7 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         let fence = next_fence(&tx).await?;
-        tx.execute(
+        tx.execute_cached(
             "UPDATE lore_fragment_lifecycle \
                 SET last_fence = $2, active_operation = NULL, updated_at = clock_timestamp() \
               WHERE hash = $1",
@@ -4843,7 +4844,7 @@ impl PostgresFragmentCoordinator {
         }
         let client = self.checkout().await?;
         let rows = client
-            .query(
+            .query_cached(
                 "SELECT l.hash AS hash, \
                         l.current_epoch AS epoch, \
                         l.last_fence AS last_fence, \
@@ -5030,7 +5031,7 @@ impl PostgresFragmentCoordinator {
         if let Some(head) = &existing {
             if head.state == FragmentLifecycleState::PreparingStage {
                 let live = tx
-                    .query_opt(
+                    .query_opt_cached(
                         "SELECT 1 FROM lore_fragment_stage_custody \
                     WHERE hash=$1 AND epoch=$2 AND state=0 AND prepare_deadline>clock_timestamp()",
                         &[&hash, &head.current_epoch],
@@ -5161,7 +5162,7 @@ impl PostgresFragmentCoordinator {
         };
         if existing.is_none() {
             let inserted = tx
-                .execute(
+                .execute_cached(
                     "INSERT INTO lore_fragment_lifecycle ( \
                      hash, current_epoch, state, manifest_id, last_fence, active_operation \
                  ) VALUES ($1, $2, $3, NULL, $4, $5) \
@@ -5180,7 +5181,7 @@ impl PostgresFragmentCoordinator {
                 return Ok(None);
             }
         } else {
-            tx.execute(
+            tx.execute_cached(
                 "INSERT INTO lore_fragment_lifecycle ( \
                  hash, current_epoch, state, manifest_id, last_fence, active_operation \
              ) VALUES ($1, $2, $3, NULL, $4, $5) \
@@ -5396,7 +5397,7 @@ impl PostgresFragmentCoordinator {
         // Immutable: a repair successor is a new row at a greater epoch, never
         // an update of an existing one. `DO NOTHING` covers only the exact
         // replay of one operation's own commit.
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO lore_fragment_epochs ( \
                  hash, epoch, authority, object_key, manifest_id, size_payload, size_content, \
                  decoded_hash, payload_flags, provider_body_blake3, provider_body_size, \
@@ -5427,7 +5428,7 @@ impl PostgresFragmentCoordinator {
         // Quarantine every predecessor. The old bytes are retained as evidence
         // and never revived or overwritten; a later GC package owns reclaiming
         // them.
-        tx.execute(
+        tx.execute_cached(
             "UPDATE lore_fragment_epochs SET disposition = $3 \
               WHERE hash = $1 AND epoch < $2 AND disposition = $4",
             &[
@@ -5441,7 +5442,7 @@ impl PostgresFragmentCoordinator {
         .map_err(|error| DomainError::from_pg("publication predecessor quarantine", error))?;
 
         let published = authority.readable_state();
-        tx.execute(
+        tx.execute_cached(
             "UPDATE lore_fragment_lifecycle \
                 SET current_epoch = $2, state = $3, manifest_id = $4, last_fence = $5, \
                     active_operation = NULL, diagnostic_class = 0, \
@@ -5458,7 +5459,7 @@ impl PostgresFragmentCoordinator {
         .await
         .map_err(|error| DomainError::from_pg("publication head update", error))?;
 
-        tx.execute(
+        tx.execute_cached(
             "INSERT INTO lore_fragment_lifecycle_metering ( \
                  hash, epoch, payload_flags, size_payload, size_content, authority \
              ) VALUES ($1, $2, $3, $4, $5, $6) \
@@ -5581,13 +5582,13 @@ impl FragmentHeadLock {
 /// exist. Any future caller that proceeds on `None` must re-derive that
 /// argument rather than inherit it.
 async fn lock_fragment_head(
-    tx: &tokio_postgres::Transaction<'_>,
+    tx: &impl CachedStatements,
     sequence: &mut LockSequence,
     hash: &[u8],
 ) -> Result<Option<FragmentHeadLock>, DomainError> {
     sequence.enter(LockClass::Fragments)?;
     let row = tx
-        .query_opt(
+        .query_opt_cached(
             "SELECT current_epoch, state, manifest_id, last_fence, active_operation \
                FROM lore_fragment_lifecycle WHERE hash = $1 FOR UPDATE",
             &[&hash],
@@ -5668,7 +5669,7 @@ async fn create_write_claim_locked(
     let source_epoch = lineage.source.map(|source| source.epoch);
     let source_manifest_id = lineage.source.map(|source| source.manifest_id);
     let row = tx
-        .query_one(
+        .query_one_cached(
             "WITH claim_clock AS (SELECT clock_timestamp() AS now) \
              INSERT INTO lore_fragment_write_claims ( \
                  logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
@@ -5780,12 +5781,12 @@ async fn write_claim_barrier_locked(
 ) -> Result<FragmentWriteClaimBarrier, DomainError> {
     sequence.enter(LockClass::Fragments)?;
     let database_now: SystemTime = tx
-        .query_one("SELECT clock_timestamp()", &[])
+        .query_one_cached("SELECT clock_timestamp()", &[])
         .await
         .map_err(|error| DomainError::from_pg("fragment write claim barrier clock", error))?
         .get(0);
     let rows = tx
-        .query(
+        .query_cached(
             "SELECT state, send_not_after, hard_not_after \
                FROM lore_fragment_write_claims \
               WHERE hash = $1 \
@@ -6431,7 +6432,7 @@ async fn lock_write_claim_identity(
 ) -> Result<Option<LockedFragmentWriteClaim>, DomainError> {
     sequence.enter(LockClass::Fragments)?;
     let row = tx
-        .query_opt(
+        .query_opt_cached(
             "SELECT logical_request_id, attempt_id, hash, epoch, fence, authority, object_key, \
                     body_blake3, body_size, state, kind, source_epoch, source_manifest_id, \
                     send_not_after, hard_not_after, \
@@ -6566,7 +6567,7 @@ async fn settle_write_claim_locked(
         });
     }
     let updated = tx
-        .execute(
+        .execute_cached(
             "UPDATE lore_fragment_write_claims \
                 SET state = $3, settled_at = clock_timestamp() \
               WHERE logical_request_id = $1 AND attempt_id = $2 AND state = $4",
@@ -6916,8 +6917,8 @@ async fn replay_staged_lease(
 }
 
 /// Allocate one monotonic epoch or fence. Gaps are valid.
-async fn next_fence(tx: &tokio_postgres::Transaction<'_>) -> Result<i64, DomainError> {
-    tx.query_one("SELECT nextval('lore_fragment_fence_seq')::bigint", &[])
+async fn next_fence(tx: &impl CachedStatements) -> Result<i64, DomainError> {
+    tx.query_one_cached("SELECT nextval('lore_fragment_fence_seq')::bigint", &[])
         .await
         .map_err(|error| DomainError::from_pg("fragment fence allocation", error))
         .map(|row| row.get(0))
@@ -7041,7 +7042,7 @@ async fn plan_lifecycle_fanout(
     hash: &[u8],
 ) -> Result<Vec<Vec<u8>>, DomainError> {
     let rows = tx
-        .query(
+        .query_cached(
             "SELECT repository_id FROM lore_fragment_associations \
               WHERE hash = $1 AND state = $2 ORDER BY repository_id",
             &[&hash, &schema::ASSOCIATION_LIVE],
@@ -7071,7 +7072,7 @@ async fn lock_lifecycle_fanout(
     for repository_id in repositories {
         sequence.enter(LockClass::Repository)?;
         let locked = tx
-            .execute(
+            .execute_cached(
                 "SELECT 1 FROM lore_domain_repositories WHERE repository_id = $1 FOR UPDATE",
                 &[&repository_id],
             )
@@ -7175,7 +7176,7 @@ async fn apply_lifecycle_generation(
     // Writing the already-locked set makes "one statement over rows this
     // transaction holds" literally true rather than true by inference.
     let rows = tx
-        .query(
+        .query_cached(
             "UPDATE lore_domain_repositories \
                 SET fragment_lifecycle_generation = fragment_lifecycle_generation + 1 \
               WHERE repository_id = ANY($1) \
