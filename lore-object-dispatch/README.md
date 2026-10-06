@@ -13,6 +13,7 @@ There is no separate dispatcher process, no in-cell mTLS service, and no survivi
 
 ### Out-of-Band Cell Schema Install (WP-114 CD-1)
 Migrations are never auto-installed by runtime. They are installed out of band through the concrete `cell-schema-install` binary.
+- **TLS:** The installer's transport follows the same rule as the dispatch pool (`dispatch_pool::cell_tls_connector`). When `LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM` (PEM text) is set, the URL must say `sslmode=require`. The server is verified against exactly that bundle (chain and host name, libpq `verify-full` semantics). When it is unset, the URL must say `sslmode=disable`. `prefer` or a missing `sslmode` exits 2.
 For a detailed catalogue of embedded migrations (including BLAKE3 hashes and detailed bytes sizes), see [README-migrations.md](./README-migrations.md).
 
 ### Shared Spool Verifier

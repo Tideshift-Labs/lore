@@ -37,5 +37,5 @@ LORE_TEST_LOCAL_CODEC_PG_URL=postgresql://... cargo test -p lore-object-dispatch
 
 ## Notes
 
-- `run-cell-schema-install-live.ps1` runs against its own disposable container and connects **as** `object_dispatch_retention_migrator`.
+- `run-cell-schema-install-live.ps1` runs against its own disposable container and connects **as** `object_dispatch_retention_migrator`. It also provisions a TLS-only container to cover the CA-bundle path (`LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM` with `sslmode=require`).
 - Policy rollover is offline: finish drain and cleanup, stop all replicas, and run `cell-drain-policy-configure rotate policy.json --replicas-excluded`.

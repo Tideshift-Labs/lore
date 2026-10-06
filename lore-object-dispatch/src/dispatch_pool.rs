@@ -657,8 +657,30 @@ fn connection_material(
             "dispatch pool URL user must be the exact authority role for this pool",
         ));
     }
+    let tls = cell_tls_connector(&postgres, &config.tls)?;
+    Ok((postgres, tls))
+}
+
+/// Builds the TLS connector for one cell database connection under `tls`, after checking that the
+/// parsed URL's `sslmode` agrees with it in both directions.
+///
+/// Shared by the dispatch pool and the out-of-band cell operator commands, so every cell database
+/// connection gets the same fail-closed posture: `prefer` is never accepted, a pinned CA is never
+/// configured beside a URL that would not use it, and `sslmode=require` without a CA is refused
+/// rather than left to fail at handshake. With a pinned CA, rustls verifies both the chain and the
+/// host name in the URL, which is libpq's `verify-full`.
+///
+/// # Errors
+///
+/// [`DispatchPoolError::InvalidConfiguration`] when `sslmode` and `tls` disagree, and
+/// [`DispatchPoolError::InvalidTlsMaterial`] when the PEM bundle is empty or unusable. Neither
+/// carries the URL or the PEM.
+pub fn cell_tls_connector(
+    postgres: &tokio_postgres::Config,
+    tls: &DispatchTlsMode,
+) -> Result<MakeRustlsConnect, DispatchPoolError> {
     let mut roots = RootCertStore::empty();
-    match &config.tls {
+    match tls {
         DispatchTlsMode::Disabled => {
             if postgres.get_ssl_mode() != SslMode::Disable {
                 return Err(DispatchPoolError::InvalidConfiguration(
@@ -690,12 +712,12 @@ fn connection_material(
         }
     }
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let tls = ClientConfig::builder_with_provider(provider)
+    let client_config = ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|_err| DispatchPoolError::InvalidTlsMaterial("unsupported TLS protocol set"))?
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok((postgres, MakeRustlsConnect::new(tls)))
+    Ok(MakeRustlsConnect::new(client_config))
 }
 
 fn positive_duration(value: Duration, message: &'static str) -> Result<(), DispatchPoolError> {
@@ -977,6 +999,109 @@ mod tests {
                 "dispatch pool without TLS material requires sslmode=disable"
             ))
         );
+    }
+
+    fn parsed(sslmode: Option<&str>) -> tokio_postgres::Config {
+        let query = sslmode.map_or_else(String::new, |mode| format!("?sslmode={mode}"));
+        format!("postgres://migrator:secret@cell.invalid:5432/lorecell{query}")
+            .parse()
+            .expect("test URL parses")
+    }
+
+    fn test_ca_pem() -> String {
+        let key = rcgen::KeyPair::generate().expect("test CA key");
+        rcgen::CertificateParams::new(vec!["cell.invalid".to_owned()])
+            .expect("test CA params")
+            .self_signed(&key)
+            .expect("test CA certificate")
+            .pem()
+    }
+
+    const NO_TLS_MESSAGE: &str = "dispatch pool without TLS material requires sslmode=disable";
+    const PINNED_MESSAGE: &str = "dispatch pool with a pinned root CA requires sslmode=require";
+
+    #[test]
+    fn the_connector_accepts_exactly_the_two_consistent_pairings() {
+        assert!(cell_tls_connector(&parsed(Some("disable")), &DispatchTlsMode::Disabled).is_ok());
+        assert!(
+            cell_tls_connector(
+                &parsed(Some("require")),
+                &DispatchTlsMode::PinnedRootCa(test_ca_pem())
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_connector_refuses_a_disabled_mode_beside_any_other_sslmode() {
+        for sslmode in [Some("require"), Some("prefer"), None] {
+            assert_eq!(
+                cell_tls_connector(&parsed(sslmode), &DispatchTlsMode::Disabled).err(),
+                Some(DispatchPoolError::InvalidConfiguration(NO_TLS_MESSAGE)),
+                "sslmode {sslmode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connector_refuses_a_pinned_ca_beside_any_other_sslmode() {
+        // `prefer` (and an absent sslmode, which defaults to it) would fall back to plaintext when
+        // the handshake fails, so it must be unreachable through the pinned mode as well.
+        for sslmode in [Some("disable"), Some("prefer"), None] {
+            assert_eq!(
+                cell_tls_connector(
+                    &parsed(sslmode),
+                    &DispatchTlsMode::PinnedRootCa(test_ca_pem())
+                )
+                .err(),
+                Some(DispatchPoolError::InvalidConfiguration(PINNED_MESSAGE)),
+                "sslmode {sslmode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_connector_refuses_unusable_ca_material_with_fixed_text() {
+        let secret_looking = "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n";
+        for pem in [
+            String::new(),
+            "  \r\n\t\n".to_owned(),
+            "this is not a certificate".to_owned(),
+            secret_looking.to_owned(),
+        ] {
+            let error = cell_tls_connector(
+                &parsed(Some("require")),
+                &DispatchTlsMode::PinnedRootCa(pem.clone()),
+            )
+            .err();
+            assert_eq!(
+                error,
+                Some(DispatchPoolError::InvalidTlsMaterial(
+                    "pinned root CA bundle is empty"
+                )),
+                "pem {pem:?}"
+            );
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("c2VjcmV0"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn the_connector_refuses_a_malformed_certificate_body() {
+        for body in ["!!!not-base64!!!", "AAAA"] {
+            let pem = format!("-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n");
+            assert!(
+                matches!(
+                    cell_tls_connector(
+                        &parsed(Some("require")),
+                        &DispatchTlsMode::PinnedRootCa(pem)
+                    )
+                    .err(),
+                    Some(DispatchPoolError::InvalidTlsMaterial(_))
+                ),
+                "body {body}"
+            );
+        }
     }
 
     #[test]

@@ -341,6 +341,8 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
 - **List diffs**: Cross-check hardcoded live-test targets against `cargo test --list`.
 - **Piping to head**: `script | head` can SIGPIPE without killing detached containers. Redirect to files.
 - **Container ownership**: Confirm container ownership (e.g. by pid label) before removal.
+- **TLS-only Postgres fixture** (`run-cell-schema-install-live.ps1`, second container): start the stock image, `docker exec --user root` `openssl req -x509 ... -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE` (a CA-flagged self-signed cert used as end entity is refused by webpki), chown/chmod 600 the key, rewrite `$PGDATA/pg_hba.conf` to `hostssl`-only, `ALTER SYSTEM SET ssl/ssl_cert_file/ssl_key_file` + `pg_reload_conf()`, then poll `SHOW ssl` and `pg_hba_file_rules` errors. The cert is its own CA; connect as `localhost` (SAN) and use `127.0.0.1` for the host-mismatch negative case. Give both containers the same ownership label so the collision guard and teardown cover both.
+- **Substring source guards vs. docs**: `cell_schema_install.rs`'s "no service shell" scan of the bin source must skip `//` comment lines; prose such as "the server is verified" contains `serve`.
 
 ## Running Unix-only tests on Windows (Docker Desktop)
 

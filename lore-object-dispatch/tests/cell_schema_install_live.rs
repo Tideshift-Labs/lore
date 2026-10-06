@@ -883,6 +883,147 @@ async fn live_postgres_cell_schema_revokes_service_privileges_after_replacement(
     assert_eq!(restored.replaced_functions_revoked, 4);
 }
 
+/// Runs the real `cell-schema-install` binary with a controlled environment.
+fn run_installer(action: &str, url: &str, ca_pem: Option<&str>) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_cell-schema-install"));
+    command.env_clear();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+    command
+        .arg(action)
+        .env("LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL", url);
+    if let Some(pem) = ca_pem {
+        command.env("LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM", pem);
+    }
+    command.output().expect("spawn cell-schema-install")
+}
+
+/// The installer binary over explicit plaintext against a plain (ssl=off) PostgreSQL, and a
+/// TLS-configured client against that same server, which must fail rather than fall back.
+///
+/// `LORE_TEST_CELL_SCHEMA_BINARY_PG_URL` is the URL with no query string.
+#[test]
+#[ignore = "requires a fresh disposable plain PostgreSQL database"]
+fn live_cell_schema_install_binary_installs_and_attests_over_explicit_plaintext() {
+    let base = std::env::var("LORE_TEST_CELL_SCHEMA_BINARY_PG_URL")
+        .expect("LORE_TEST_CELL_SCHEMA_BINARY_PG_URL must name a fresh plain database");
+    assert!(!base.contains('?'), "the base URL must carry no query");
+    let plain = format!("{base}?sslmode=disable");
+
+    // A TLS-configured client against a server with ssl=off must fail, not retry in plaintext.
+    let key = rcgen::KeyPair::generate().expect("CA key");
+    let pem = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .expect("CA params")
+        .self_signed(&key)
+        .expect("CA certificate")
+        .pem();
+    let tls_attempt = run_installer("attest", &format!("{base}?sslmode=require"), Some(&pem));
+    assert_eq!(
+        tls_attempt.status.code(),
+        Some(1),
+        "a TLS-configured client must not fall back to plaintext"
+    );
+    assert!(
+        String::from_utf8_lossy(&tls_attempt.stderr)
+            .contains("could not connect to the cell authority database")
+    );
+
+    let install = run_installer("install", &plain, None);
+    assert_eq!(
+        install.status.code(),
+        Some(0),
+        "plaintext install failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let attest = run_installer("attest", &plain, None);
+    assert_eq!(
+        attest.status.code(),
+        Some(0),
+        "plaintext attest failed: {}",
+        String::from_utf8_lossy(&attest.stderr)
+    );
+    assert!(String::from_utf8_lossy(&attest.stdout).contains("catalog manifest:"));
+}
+
+/// The installer binary against a TLS-only PostgreSQL (`hostssl` is the only network `pg_hba`
+/// line, so plaintext is refused by the server itself, not just by the client).
+///
+/// `LORE_TEST_CELL_SCHEMA_TLS_PG_URL` is the URL with no query string, host `localhost`, matching
+/// the certificate's only SAN. `LORE_TEST_CELL_SCHEMA_TLS_CA_PEM` is that server's self-signed
+/// certificate, which is its own CA.
+#[test]
+#[ignore = "requires a fresh disposable TLS-only PostgreSQL database"]
+fn live_cell_schema_install_binary_verifies_a_pinned_ca_and_refuses_plaintext() {
+    let base = std::env::var("LORE_TEST_CELL_SCHEMA_TLS_PG_URL")
+        .expect("LORE_TEST_CELL_SCHEMA_TLS_PG_URL must name a fresh TLS-only database");
+    let pem = std::env::var("LORE_TEST_CELL_SCHEMA_TLS_CA_PEM")
+        .expect("LORE_TEST_CELL_SCHEMA_TLS_CA_PEM must carry the server certificate");
+    assert!(
+        pem.contains("BEGIN CERTIFICATE"),
+        "the CA variable must hold a PEM certificate"
+    );
+    assert!(!base.contains('?'), "the base URL must carry no query");
+    let required = format!("{base}?sslmode=require");
+    let connect_failure = "could not connect to the cell authority database";
+
+    // A different self-signed certificate for the same name: chain verification must fail.
+    let wrong_key = rcgen::KeyPair::generate().expect("wrong CA key");
+    let wrong_pem = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+        .expect("wrong CA params")
+        .self_signed(&wrong_key)
+        .expect("wrong CA certificate")
+        .pem();
+    let wrong = run_installer("attest", &required, Some(&wrong_pem));
+    assert_eq!(wrong.status.code(), Some(1), "a wrong CA must not verify");
+    assert!(String::from_utf8_lossy(&wrong.stderr).contains(connect_failure));
+
+    // The right CA, but a host the certificate does not name: verify-full semantics.
+    let address = base.replace("@localhost:", "@127.0.0.1:");
+    assert_ne!(address, base, "the base URL must use host localhost");
+    let mismatched = run_installer("attest", &format!("{address}?sslmode=require"), Some(&pem));
+    assert_eq!(
+        mismatched.status.code(),
+        Some(1),
+        "a host name outside the certificate's SAN must not verify"
+    );
+
+    // Plaintext, explicitly requested: the server refuses it (hostssl only).
+    let plaintext = run_installer("attest", &format!("{base}?sslmode=disable"), None);
+    assert_eq!(
+        plaintext.status.code(),
+        Some(1),
+        "the server must refuse plaintext"
+    );
+    assert!(String::from_utf8_lossy(&plaintext.stderr).contains(connect_failure));
+
+    // Nothing above may have installed anything: the first success is the pinned-CA install.
+    let install = run_installer("install", &required, Some(&pem));
+    assert_eq!(
+        install.status.code(),
+        Some(0),
+        "install over verified TLS failed: {}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let attest = run_installer("attest", &required, Some(&pem));
+    assert_eq!(
+        attest.status.code(),
+        Some(0),
+        "attest over verified TLS failed: {}",
+        String::from_utf8_lossy(&attest.stderr)
+    );
+    assert!(String::from_utf8_lossy(&attest.stdout).contains("catalog manifest:"));
+    for output in [&wrong, &mismatched, &plaintext, &install, &attest] {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!text.contains("BEGIN CERTIFICATE"), "output echoed the PEM");
+        assert!(!text.contains(&base), "output echoed the URL");
+    }
+}
+
 /// Not a gate: installs a fresh chain and prints the live manifest digests so the pinned constants
 /// can be measured rather than guessed. Run through `run-cell-schema-install-live.ps1 -Measure`.
 #[tokio::test]

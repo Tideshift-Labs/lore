@@ -11,7 +11,10 @@
 //! Usage:
 //!
 //! ```text
-//! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../cell"
+//! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../cell?sslmode=disable"
+//! # or, for a TLS-only database such as managed PostgreSQL:
+//! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL = "postgresql://.../cell?sslmode=require"
+//! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM = Get-Content -Raw ca-certificate.crt
 //! cell-schema-install install    # install the CR-033 D5 set, then attest
 //! cell-schema-install attest     # attest only; never writes schema
 //! cell-schema-install upgrade    # CR-038: move an attested R25/R26/R27 cell to current, offline
@@ -32,6 +35,13 @@
 //! environment so it never appears in a process argument list, and it is never echoed, including on
 //! failure.
 //!
+//! TLS follows the dispatch pool's rule (`dispatch_pool::cell_tls_connector`). With
+//! `LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM` set, the URL must say `sslmode=require`, and the
+//! server is verified against exactly that PEM bundle, chain and host name both (libpq's
+//! `verify-full`). Without it, the URL must say `sslmode=disable`. `prefer`, which falls back to
+//! plaintext when the handshake fails, is refused either way. The PEM is read only from the
+//! environment and never echoed.
+//!
 //! `install` additionally requires that no transaction is already open on the connection, which for
 //! this binary is always true. It cannot run inside one: every frozen artifact carries its own
 //! `BEGIN`/`COMMIT`, and every layer install procedure requires `SERIALIZABLE`. Only `attest` is
@@ -50,13 +60,21 @@ use lore_object_dispatch::cell_schema_install::install_cell_schema;
 use lore_object_dispatch::cell_schema_install::measure_catalog_manifest;
 use lore_object_dispatch::cell_schema_install::release_cell_schema_lock;
 use lore_object_dispatch::cell_schema_install::upgrade_cell_schema;
+use lore_object_dispatch::dispatch_pool::DispatchPoolError;
+use lore_object_dispatch::dispatch_pool::DispatchTlsMode;
+use lore_object_dispatch::dispatch_pool::cell_tls_connector;
 use tokio_util::task::AbortOnDropHandle;
 
 /// Environment variable naming the cell database, under the crate's bytewise config prefix.
 const MIGRATOR_URL_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL";
 
+/// Environment variable carrying the PEM root CA bundle for a TLS cell database.
+const MIGRATOR_CA_PEM_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM";
+
 const USAGE: &str = "usage: cell-schema-install <install|attest|upgrade|measure>\n\
-     the cell database URL is read from LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL";
+     the cell database URL is read from LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL\n\
+     for TLS, set LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM and sslmode=require\n\
+     (verify-full semantics; libpq's sslmode=verify-full and sslrootcert are not accepted)";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Action {
@@ -95,6 +113,45 @@ fn main() -> ExitCode {
         eprintln!("{MIGRATOR_URL_ENV} is empty");
         return ExitCode::from(2);
     }
+    let tls = match std::env::var(MIGRATOR_CA_PEM_ENV) {
+        Ok(pem) if !pem.trim().is_empty() => DispatchTlsMode::PinnedRootCa(pem),
+        Ok(_) => {
+            eprintln!("{MIGRATOR_CA_PEM_ENV} is set but empty");
+            return ExitCode::from(2);
+        }
+        Err(std::env::VarError::NotPresent) => DispatchTlsMode::Disabled,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("{MIGRATOR_CA_PEM_ENV} is not valid Unicode");
+            return ExitCode::from(2);
+        }
+    };
+    // Never echo the URL or the parser diagnostic; either can carry credentials.
+    let Ok(config) = url.parse::<tokio_postgres::Config>() else {
+        eprintln!(
+            "{MIGRATOR_URL_ENV} is not a valid PostgreSQL URL (sslmode must be disable or require)"
+        );
+        return ExitCode::from(2);
+    };
+    let connector = match cell_tls_connector(&config, &tls) {
+        Ok(connector) => connector,
+        Err(DispatchPoolError::InvalidConfiguration(_)) => {
+            if matches!(tls, DispatchTlsMode::PinnedRootCa(_)) {
+                eprintln!(
+                    "{MIGRATOR_CA_PEM_ENV} is set, so {MIGRATOR_URL_ENV} must say sslmode=require"
+                );
+            } else {
+                eprintln!(
+                    "{MIGRATOR_URL_ENV} must say sslmode=disable, or set {MIGRATOR_CA_PEM_ENV} and sslmode=require"
+                );
+            }
+            return ExitCode::from(2);
+        }
+        // Fixed text only; never the PEM.
+        Err(error) => {
+            eprintln!("{MIGRATOR_CA_PEM_ENV}: {error}");
+            return ExitCode::from(2);
+        }
+    };
 
     let runtime = if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -105,21 +162,24 @@ fn main() -> ExitCode {
         eprintln!("could not start the local async runtime");
         return ExitCode::from(2);
     };
-    runtime.block_on(run(action, &url))
+    runtime.block_on(run(action, &config, connector))
 }
 
-async fn run(action: Action, url: &str) -> ExitCode {
-    // NoTls: the cell authority is the cell's own database, reached inside the cell. The external
-    // endpoint contract (pinned CA, mandatory client certificate) was written for the retired
-    // cross-region authority database and does not survive CR-033's re-scope.
-    let (client, connection) =
-        if let Ok(pair) = tokio_postgres::connect(url, tokio_postgres::NoTls).await {
-            pair
-        } else {
-            // Never echo the URL or the driver diagnostic; either can carry credentials.
-            eprintln!("could not connect to the cell authority database");
-            return ExitCode::from(1);
-        };
+async fn run(
+    action: Action,
+    config: &tokio_postgres::Config,
+    connector: tokio_postgres_rustls::MakeRustlsConnect,
+) -> ExitCode {
+    // No client certificate: the mandatory-mTLS contract was written for the retired cross-region
+    // authority database and does not survive CR-033's re-scope. Server verification, when TLS is
+    // configured, is the dispatch pool's.
+    let (client, connection) = if let Ok(pair) = config.connect(connector).await {
+        pair
+    } else {
+        // Never echo the URL or the driver diagnostic; either can carry credentials.
+        eprintln!("could not connect to the cell authority database");
+        return ExitCode::from(1);
+    };
     let _connection_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
         "cell-schema-install-postgres",
         async move {

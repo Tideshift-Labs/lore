@@ -69,6 +69,8 @@ $crateRoot = Split-Path -Parent $PSScriptRoot
 $loreRoot = Split-Path -Parent $crateRoot
 $runId = [Guid]::NewGuid().ToString('N')
 $containerName = "wp114-cell-schema-install-live-$runId"
+$tlsContainerName = "wp114-cell-schema-install-live-tls-$runId"
+$tlsContainerStarted = $false
 $ownershipLabel = "com.tideshift.lore.cell-schema-install-live=$runId"
 $containerStarted = $false
 $runPassed = $false
@@ -118,6 +120,22 @@ $gateTests = @(
     }
 )
 
+$gateTests += @{
+    EnvVar   = 'LORE_TEST_CELL_SCHEMA_BINARY_PG_URL'
+    Name     = 'live_cell_schema_install_binary_installs_and_attests_over_explicit_plaintext'
+    Database = 'cell_schema_binary_plain'
+}
+
+# The TLS tier. Unlike the rows above it runs against its OWN container (ssl=on, hostssl-only
+# pg_hba, a self-signed certificate generated inside it whose only SAN is `localhost`), and its
+# environment is set by the TLS provisioning block below, not by the generic per-test loop.
+$gateTests += @{
+    EnvVar   = 'LORE_TEST_CELL_SCHEMA_TLS_PG_URL'
+    Name     = 'live_cell_schema_install_binary_verifies_a_pinned_ca_and_refuses_plaintext'
+    Database = 'cell_schema_tls'
+    Tls      = $true
+}
+
 $measureTest = @{
     EnvVar   = 'LORE_TEST_CELL_SCHEMA_MEASURE_PG_URL'
     Name     = 'live_postgres_cell_schema_measure_catalog_manifest'
@@ -144,6 +162,10 @@ foreach ($known in $knownTests) {
 $priorEnvironment = @{}
 foreach ($name in $environmentNames) {
     $priorEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+}
+foreach ($extraName in @('LORE_TEST_CELL_SCHEMA_TLS_CA_PEM')) {
+    $environmentNames += $extraName
+    $priorEnvironment[$extraName] = [Environment]::GetEnvironmentVariable($extraName, 'Process')
 }
 $environmentNames += 'LORE_TEST_CELL_SCHEMA_MEASURE_TARGET'
 $priorEnvironment['LORE_TEST_CELL_SCHEMA_MEASURE_TARGET'] =
@@ -333,6 +355,7 @@ GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator
     )
 
     foreach ($t in $tests) {
+        if ($t.ContainsKey('Tls')) { continue }
         Invoke-Checked docker @(
             'exec', $containerName, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres',
             '-c', "CREATE DATABASE $($t.Database);"
@@ -355,6 +378,103 @@ GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator
                 )
             }
         }
+    }
+
+    $tlsTests = @($tests | Where-Object { $_.ContainsKey('Tls') })
+    if ($tlsTests.Count -gt 0) {
+        # A second, separate container: the plain tier's server must stay plaintext-trusting, and
+        # this one must refuse plaintext at the server so the refusal is not only the client's.
+        $tlsContainerStarted = $true
+        Invoke-Checked docker @(
+            'run', '--detach', '--name', $tlsContainerName,
+            '--label', $ownershipLabel,
+            '--label', "com.tideshift.lore.cell-schema-install-live.pid=$PID",
+            '--label', "com.tideshift.lore.cell-schema-install-live.started=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))",
+            '--publish', '127.0.0.1::5432',
+            '--env', 'POSTGRES_HOST_AUTH_METHOD=trust',
+            $PostgresImage
+        )
+        $tlsPortRaw = & docker port $tlsContainerName '5432/tcp'
+        $tlsPortText = if ($null -ne $tlsPortRaw) { ($tlsPortRaw | Out-String).Trim() } else { '' }
+        if ($LASTEXITCODE -ne 0 -or $tlsPortText -notmatch ':(?<port>[0-9]+)$') {
+            throw 'failed to resolve the disposable TLS PostgreSQL host port'
+        }
+        $tlsPort = $Matches.port
+
+        $tlsReady = $false
+        foreach ($attempt in 1..120) {
+            $tlsLog = (& docker logs $tlsContainerName 2>&1) -join "`n"
+            if ([regex]::Matches($tlsLog, 'database system is ready to accept connections').Count -ge 2) {
+                $tlsReady = $true
+                break
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        if (-not $tlsReady) {
+            & docker logs $tlsContainerName
+            throw 'disposable TLS PostgreSQL did not become ready within 60 seconds'
+        }
+
+        Invoke-Checked docker @(
+            'exec', $tlsContainerName, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres',
+            '-c', $roleSql
+        )
+        # basicConstraints CA:FALSE matters: the certificate is its own trust anchor, and webpki
+        # refuses a CA-flagged certificate used as the end entity.
+        Invoke-Checked docker @(
+            'exec', '--user', 'root', $tlsContainerName, 'sh', '-c',
+            'openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -keyout /var/lib/postgresql/server.key -out /var/lib/postgresql/server.crt -addext subjectAltName=DNS:localhost -addext basicConstraints=critical,CA:FALSE -addext keyUsage=digitalSignature,keyEncipherment -addext extendedKeyUsage=serverAuth && chown postgres:postgres /var/lib/postgresql/server.key /var/lib/postgresql/server.crt && chmod 600 /var/lib/postgresql/server.key'
+        )
+        # hostssl is the only network line: the server itself refuses a plaintext connection.
+        Invoke-Checked docker @(
+            'exec', $tlsContainerName, 'sh', '-c',
+            'printf "%s\n" "local all all trust" "hostssl all all all trust" "host all all all reject" > "$PGDATA/pg_hba.conf"'
+        )
+        foreach ($setting in @(
+                "ALTER SYSTEM SET ssl_cert_file = '/var/lib/postgresql/server.crt';",
+                "ALTER SYSTEM SET ssl_key_file = '/var/lib/postgresql/server.key';",
+                "ALTER SYSTEM SET ssl = 'on';",
+                'SELECT pg_reload_conf();')) {
+            Invoke-Checked docker @(
+                'exec', $tlsContainerName, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres',
+                '-c', $setting
+            )
+        }
+        $sslOn = $false
+        foreach ($attempt in 1..40) {
+            $sslRaw = & docker exec $tlsContainerName psql -tA -U postgres -d postgres -c 'SHOW ssl;'
+            $badRules = & docker exec $tlsContainerName psql -tA -U postgres -d postgres -c 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL;'
+            if (($sslRaw | Out-String).Trim() -eq 'on' -and ($badRules | Out-String).Trim() -eq '0') {
+                $sslOn = $true
+                break
+            }
+            Start-Sleep -Milliseconds 250
+        }
+        if (-not $sslOn) {
+            & docker logs $tlsContainerName
+            throw 'the TLS PostgreSQL did not reload with ssl=on and a clean pg_hba.conf'
+        }
+
+        foreach ($t in $tlsTests) {
+            Invoke-Checked docker @(
+                'exec', $tlsContainerName, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres',
+                '-c', "CREATE DATABASE $($t.Database);"
+            )
+            Invoke-Checked docker @(
+                'exec', $tlsContainerName, 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'postgres', '-d', 'postgres',
+                '-c', "GRANT CREATE ON DATABASE $($t.Database) TO object_dispatch_retention_owner;"
+            )
+            [Environment]::SetEnvironmentVariable(
+                $t.EnvVar,
+                "postgresql://object_dispatch_retention_migrator@localhost:$tlsPort/$($t.Database)",
+                'Process'
+            )
+        }
+        $certificate = (& docker exec $tlsContainerName cat /var/lib/postgresql/server.crt) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $certificate -notmatch 'BEGIN CERTIFICATE') {
+            throw 'failed to read the TLS server certificate'
+        }
+        [Environment]::SetEnvironmentVariable('LORE_TEST_CELL_SCHEMA_TLS_CA_PEM', $certificate + "`n", 'Process')
     }
 
     $results = @()
@@ -449,21 +569,26 @@ finally {
         [Environment]::SetEnvironmentVariable($name, $priorEnvironment[$name], 'Process')
     }
 
-    if ($containerStarted -and ($runPassed -or -not $KeepOnFailure)) {
-        $actualLabelRaw = & docker inspect --format "{{ index .Config.Labels `"com.tideshift.lore.cell-schema-install-live`" }}" $containerName 2>$null
-        $inspectExitCode = $LASTEXITCODE
-        $actualLabel = if ($null -ne $actualLabelRaw) { ($actualLabelRaw | Out-String).Trim() } else { '' }
-        if ($inspectExitCode -eq 0 -and $actualLabel -eq $runId) {
-            # --volumes: postgres:16 declares VOLUME /var/lib/postgresql/data, so a plain
-            # `docker rm --force` leaves an anonymous, unreferenced volume behind every run.
-            & docker rm --force --volumes $containerName *> $null
+    $ownedNames = @()
+    if ($containerStarted) { $ownedNames += $containerName }
+    if ($tlsContainerStarted) { $ownedNames += $tlsContainerName }
+    foreach ($ownedName in $ownedNames) {
+        if ($runPassed -or -not $KeepOnFailure) {
+            $actualLabelRaw = & docker inspect --format "{{ index .Config.Labels `"com.tideshift.lore.cell-schema-install-live`" }}" $ownedName 2>$null
+            $inspectExitCode = $LASTEXITCODE
+            $actualLabel = if ($null -ne $actualLabelRaw) { ($actualLabelRaw | Out-String).Trim() } else { '' }
+            if ($inspectExitCode -eq 0 -and $actualLabel -eq $runId) {
+                # --volumes: postgres:16 declares VOLUME /var/lib/postgresql/data, so a plain
+                # `docker rm --force` leaves an anonymous, unreferenced volume behind every run.
+                & docker rm --force --volumes $ownedName *> $null
+            }
+            else {
+                Write-Warning "refusing to remove unowned container $ownedName"
+            }
         }
         else {
-            Write-Warning "refusing to remove unowned container $containerName"
+            Write-Warning "keeping container $ownedName for debugging (-KeepOnFailure)"
         }
-    }
-    elseif ($containerStarted) {
-        Write-Warning "keeping container $containerName for debugging (-KeepOnFailure)"
     }
 }
 

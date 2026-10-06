@@ -1039,9 +1039,16 @@ fn no_service_shell_and_runtime_source_never_calls_the_install_procedures() {
 
     let bin_source = std::fs::read_to_string(&bin_path)
         .unwrap_or_else(|error| panic!("read {}: {error}", bin_path.display()));
+    // Scan code only: the TLS contract's prose legitimately says "the server is verified", and a
+    // guard against a service shell is about what the binary does, not what its docs say.
+    let bin_code: String = bin_source
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
     for forbidden in ["TcpListener", "bind(", "serve", "tonic", "axum", "loop {"] {
         assert!(
-            !bin_source.contains(forbidden),
+            !bin_code.contains(forbidden),
             "the operator CLI must not be a long-running service (found {forbidden})"
         );
     }
