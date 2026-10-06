@@ -159,6 +159,18 @@ impl Fixture {
         payload: Bytes,
         lose_commit_ack: bool,
     ) -> Self {
+        Self::open_tuned(result, remote, payload, lose_commit_ack, |_| {}).await
+    }
+
+    /// [`Self::open`] with the staging tier's settings adjusted before it
+    /// opens, for cases that need other watermarks or a live sampler.
+    async fn open_tuned(
+        result: PutResult,
+        remote: FragmentGetResponse,
+        payload: Bytes,
+        lose_commit_ack: bool,
+        tune: impl FnOnce(&mut WriteBehindSettings),
+    ) -> Self {
         if lose_commit_ack {
             assert!(crate::domain::fragments::failpoints_compiled());
             assert_eq!(
@@ -207,11 +219,39 @@ impl Fixture {
             .try_into()
             .unwrap();
         let expiry = setup["expiry"].as_i64().unwrap();
+        let root = std::env::temp_dir().join(format!("lore-adapter-{}", Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let stage_root = root.join("stage");
+        let spool_root = root.join("spool");
+        std::fs::create_dir(&stage_root).unwrap();
+        std::fs::create_dir(&spool_root).unwrap();
+        let mut settings = WriteBehindSettings {
+            root: stage_root,
+            watermarks: WriteBehindWatermarks {
+                low_bytes: 10000000,
+                high_bytes: 20000000,
+                hard_bytes: 30000000,
+                low_count: 1000,
+                high_count: 2000,
+                hard_count: 3000,
+                min_free_bytes: 0,
+            },
+            drain_stale_after: Duration::from_secs(60),
+            sample_interval: Duration::from_secs(3600),
+            stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
+            stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+            drain_reserve: Default::default(),
+        };
+        tune(&mut settings);
+        // The handle refuses to start unless the hard limits equal the published
+        // stage policy (`verify_stage_capacity`), so the policy follows them.
+        let hard_bytes = i64::try_from(settings.watermarks.hard_bytes).unwrap();
+        let hard_count = i64::try_from(settings.watermarks.hard_count).unwrap();
         admin
             .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance")
             .await
             .unwrap();
-        admin.query_one("SELECT stage_policy_publish_v1('adapter-cell','adapter-policy-v1',$1,30000000,3000,100000000,10000,60000,$2)", &[&&digest[..], &expiry]).await.unwrap();
+        admin.query_one("SELECT stage_policy_publish_v1('adapter-cell','adapter-policy-v1',$1,$3,$4,100000000,10000,60000,$2)", &[&&digest[..], &expiry, &hard_bytes, &hard_count]).await.unwrap();
         admin
             .batch_execute("RESET SESSION AUTHORIZATION")
             .await
@@ -271,30 +311,7 @@ impl Fixture {
             .await
             .unwrap(),
         );
-        let root = std::env::temp_dir().join(format!("lore-adapter-{}", Uuid::now_v7()));
-        std::fs::create_dir(&root).unwrap();
-        let stage_root = root.join("stage");
-        let spool_root = root.join("spool");
-        std::fs::create_dir(&stage_root).unwrap();
-        std::fs::create_dir(&spool_root).unwrap();
-        let stage = WriteBehindStage::open(WriteBehindSettings {
-            root: stage_root,
-            watermarks: WriteBehindWatermarks {
-                low_bytes: 10000000,
-                high_bytes: 20000000,
-                hard_bytes: 30000000,
-                low_count: 1000,
-                high_count: 2000,
-                hard_count: 3000,
-                min_free_bytes: 0,
-            },
-            drain_stale_after: Duration::from_secs(60),
-            sample_interval: Duration::from_secs(3600),
-            stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
-            stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
-            drain_reserve: Default::default(),
-        })
-        .unwrap();
+        let stage = WriteBehindStage::open(settings).unwrap();
         let s3_config = aws_sdk_s3::config::Builder::new()
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .region(aws_sdk_s3::config::Region::new("us-east-1"))
@@ -1126,6 +1143,9 @@ mod cleanup_fault_tests;
 
 #[path = "fragment_write_behind_progress_tests.rs"]
 mod progress_tests;
+
+#[path = "fragment_write_behind_admission_tests.rs"]
+mod admission_tests;
 
 #[path = "fragment_write_behind_staged_read_tests.rs"]
 mod staged_read_tests;
