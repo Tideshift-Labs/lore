@@ -373,8 +373,11 @@ async fn admission_lost_root_with_no_pending_staged_bytes_falls_back_to_direct_w
 /// sources, the ceiling `tune` set refuses the next PUT with no direct write.
 ///
 /// The hard limits are also the published stage policy, which the database
-/// ledger enforces at `begin_stage`. Admission refuses first, from the
-/// observed occupancy, so the refused PUT never reaches that backstop.
+/// ledger enforces at `begin_stage`. Here admission refuses first, from the
+/// observed occupancy, so the refused PUT never reaches that backstop. A PUT
+/// that does reach it (occupancy stale between observations) gets the ledger's
+/// `NotReady`, which `domain_store_err` maps to `Internal`, not `SlowDown`; no
+/// case here pins that class.
 async fn assert_occupancy_ceiling_refuses(
     tune: impl FnOnce(&mut WriteBehindWatermarks),
     ceiling: impl Fn(&AdmissionSnapshot) -> bool,
