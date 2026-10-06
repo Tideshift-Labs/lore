@@ -469,6 +469,18 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_upgraded_cell_at_real_dev_cap_stays_writable',
         'live_upgraded_cell_survives_the_load_that_wedges_an_unupgraded_cell',
         'live_write_behind_refuses_an_unupgraded_cell_and_accepts_an_upgraded_one',
+        # Same file, later cases (migrations 0029/0030, WP-115 rows 56/59/66/78). Each is
+        # #[ignore = "requires a fresh disposable PostgreSQL ..."] (a live-PG gate, not a platform
+        # gate) and is executed by run-cell-schema-forward-upgrade-live.ps1, not this runner.
+        'live_a_cleanup_claim_lost_to_another_replica_reads_as_contended',
+        'live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap_again',
+        'live_superseded_marker_deletion_refuses_a_counter_underflow',
+        'live_released_rows_and_markers_are_scanned_only_when_due',
+        'live_a_contended_claim_clears_its_lease_so_a_peer_retakes_the_row_at_once',
+        'live_cleanup_claimers_lease_disjoint_rows_and_an_expired_lease_is_retaken',
+        'live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded',
+        'live_r29_cell_is_refused_then_upgrades_and_counts_every_charge',
+        'live_the_active_service_session_guard_ignores_a_real_autovacuum_worker',
         # CR-034 budget pin refresh -- run-budget-pin-refresh-live.ps1
         'live_postgres_head_read_function_is_the_only_door_and_is_least_privilege',
         'live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the_new_fence',
@@ -788,6 +800,9 @@ WHERE n.nspname = 'object_store_retention'
             )
             $output = & cargo @cargoArgs 2>&1 | Out-String
             $exitCode = $LASTEXITCODE
+            # Echo cargo's output verbatim on every branch so `test result:` lines reach stdout
+            # (the Gate 0 receipt producers parse them).
+            Write-Host $output
 
             $runningMatch = [regex]::Match($output, 'running (\d+) tests?')
             $resultMatch = [regex]::Match($output, 'test result: (?:ok|FAILED)\. (\d+) passed; (\d+) failed;')

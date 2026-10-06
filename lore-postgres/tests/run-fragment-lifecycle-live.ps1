@@ -189,7 +189,7 @@ $inventory = @(
             # WP-118 Phase 7: CR-031's two sustained-upload-traffic push cases, the shared-hash
             # fanout cost characterization (INV-EF P2-7), and the copy path's association-
             # generation bump. The fanout case is a measurement: its numbers are printed, not
-            # asserted, so it is listed in $printOutputCases below.
+            # asserted; the runner echoes every case's output, so they reach stdout.
             'same_repo_lifecycle_traffic_requires_complete_proof'
             'cross_repo_bulk_upload_does_not_abort_unrelated_push'
             # Item 1b: the literal association-traffic scenario as a CHARACTERIZATION. It asserts
@@ -426,18 +426,9 @@ $unixOnlyCases = @(
 $unixOnlyOwner = 'lore-postgres/tests/run-write-behind-linux.ps1'
 $platformSkipStatus = "NOT RUN (platform: Unix-only - owned by $(Split-Path -Leaf $unixOnlyOwner))"
 
-# Cases whose captured stdout is evidence in its own right, not just failure
-# context. Every case runs with `--nocapture`, but the runner only echoes the
-# captured output on FAIL/NOT RUN; a measurement that PASSES would otherwise
-# have its numbers swallowed, which is the one thing it exists to produce.
-$printOutputCases = @(
-    'generic_keyset_plan_uses_recovery_index_on_a_mixed_state_population',
-    'every_cached_statement_has_a_safe_generic_plan_on_a_skewed_population',
-    'shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increasing_fanout',
-    'same_repo_lifecycle_traffic_requires_complete_proof',
-    'cross_repo_bulk_upload_does_not_abort_unrelated_push',
-    'fresh_same_repo_association_traffic_preserves_the_scalar_fast_path'
-)
+# Every case runs with `--nocapture` and the runner echoes each case's captured
+# output on every branch, so a measurement case that PASSES still prints its
+# numbers (and every case's `test result:` line reaches stdout).
 
 $results = @(
     foreach ($target in $inventory) {
@@ -676,6 +667,10 @@ try {
                 )
                 $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
+                # Echo cargo's output verbatim for EVERY case on every branch so `test result:`
+                # lines reach stdout (the Gate 0 receipt producers parse them).
+                Write-Host "  --- captured output for $($result.Test) ---"
+                Write-Host $output
             }
             finally {
                 $ErrorActionPreference = $priorErrorAction
@@ -704,10 +699,6 @@ try {
                 $result.Failed -eq 0 -and $exitCode -eq 0) {
                 $result.Status = 'PASS'
                 Write-Host '  PASS'
-                if ($result.Test -in $printOutputCases) {
-                    Write-Host "  --- captured output for $($result.Test) ---"
-                    Write-Host $output
-                }
             }
             elseif ($result.Ran -eq 1) {
                 $result.Status = 'FAIL'

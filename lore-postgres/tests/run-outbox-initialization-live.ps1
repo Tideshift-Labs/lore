@@ -229,6 +229,9 @@ try {
                 )
                 $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE
+                # Echo cargo's output verbatim on every branch so `test result:` lines reach stdout
+                # (the Gate 0 receipt producers parse them).
+                Write-Host $output
             }
             finally {
                 $ErrorActionPreference = $priorErrorAction

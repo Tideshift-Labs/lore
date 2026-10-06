@@ -392,6 +392,9 @@ try {
             $commandLog.Add("$testBin $($testArgs -join ' ')   # db=$database rows=$Rows profile=$profileName")
             $output = & $testBin @testArgs 2>&1 | Out-String
             $exitCode = $LASTEXITCODE
+            # Echo the test binary's output verbatim on every branch so `test result:` lines reach
+            # stdout (the Gate 0 receipt producers parse them).
+            Write-Host $output
         }
         finally {
             Pop-Location

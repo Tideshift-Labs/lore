@@ -617,6 +617,9 @@ try {
             'cargo', 'test', '-p', $target.Package, '--test', $target.Target,
             '--', '--test-threads=1'
         )
+        # Echo cargo's output verbatim (here and at every test-run site below) so `test result:`
+        # lines reach stdout; the Gate 0 receipt producers parse them.
+        Write-Host $run.Output
         $counts = Read-TestCounts -Output $run.Output
         $status = if ($run.ExitCode -eq 0 -and $counts.Ran -eq $target.Enumerated -and
             $counts.Passed -eq $target.Enumerated -and $counts.Failed -eq 0) { 'PASS' } else { 'FAIL' }
@@ -629,6 +632,7 @@ try {
     # The lib target's non-ignored cases, which is where durability_tests lives.
     Write-Host 'Running lore-postgres --lib ...'
     $libRun = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-postgres', '--lib')
+    Write-Host $libRun.Output
     $libCounts = Read-TestCounts -Output $libRun.Output
     # The enumerated count is GATING here, not decoration. Without the `Ran -eq $libCatalog.Count`
     # term a single passing case satisfied `Passed -gt 0` and the row still PRINTED
@@ -671,6 +675,7 @@ try {
         $command += @('--', '--test-threads=1')
         Write-Host "Running $($variant.Package) --lib ($($variant.Label)) ..."
         $run = Invoke-InContainer -Command $command
+        Write-Host $run.Output
         $counts = Read-TestCounts -Output $run.Output
         $status = if ($run.ExitCode -eq 0 -and $counts.Passed -gt 0 -and $counts.Failed -eq 0 -and
             $counts.Ran -eq $catalog.Count -and $counts.Ignored -eq $ignored.Count -and
@@ -714,6 +719,7 @@ try {
 
     Write-Host 'Running lore-server --lib ...'
     $serverRun = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-server', '--lib')
+    Write-Host $serverRun.Output
     $serverCounts = Read-TestCounts -Output $serverRun.Output
     # `Ran -eq $serverCatalog.Count` for the same reason the `lore-postgres` lib row uses it: it
     # accounts for every enumerated case (passed, failed or ignored) and so catches a
@@ -748,6 +754,7 @@ try {
         foreach ($target in @('direct_put_compile_fail', 'drain_capability_compile_fail')) {
             Write-Host "Running lore-fragment-provider --test $target (best effort) ..."
             $run = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-fragment-provider', '--test', $target)
+            Write-Host $run.Output
             $counts = Read-TestCounts -Output $run.Output
             # Each target holds exactly one `#[test]`. Exit code alone would call a
             # filtered-to-zero run green, so require the case to have actually run and passed.
@@ -892,6 +899,7 @@ try {
                     $environmentPairs += "LORE_FRAGMENT_FAILPOINT_DIR=$stagedReadFailpointDir"
                 }
                 $run = Invoke-InContainer -Command $command -EnvironmentPairs $environmentPairs
+                Write-Host $run.Output
             }
             finally {
                 # Deliberately NOT Invoke-Checked. A throw from a `finally` replaces whatever

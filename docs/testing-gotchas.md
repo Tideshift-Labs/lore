@@ -337,6 +337,7 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
 - **Argument arrays**: Build command arguments as an array (`$args = @(...)`) and use splatting (`& cmd @args`) instead of backticks.
 - **Output truncation**: `Format-Table` truncates to console width; use `Out-String -Width 200`.
 - **Line continuations**: `+` continues an expression, not a command. Assign to a variable first.
+- **Echo captured cargo output**: Gate 0 receipt producers parse cargo's `test result: ok. N passed; ...` lines from runner stdout. A runner that captures `$output = & cargo ... | Out-String` must `Write-Host $output` right after `$exitCode = $LASTEXITCODE` (inside the `try`, so a throwing `finally` cannot lose it), or the row reads FAIL with a green run. Do not also echo on the pass branch, or the counts double.
 - **List diffs**: Cross-check hardcoded live-test targets against `cargo test --list`.
 - **Piping to head**: `script | head` can SIGPIPE without killing detached containers. Redirect to files.
 - **Container ownership**: Confirm container ownership (e.g. by pid label) before removal.
