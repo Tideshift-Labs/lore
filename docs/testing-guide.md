@@ -37,8 +37,13 @@ Baseline gates for a substantial fork merge:
 cargo +nightly fmt --all -- --check
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets --no-deps -- -D warnings
-cargo test --workspace -j 4
+cargo test --workspace --no-fail-fast -j 4
 ```
+
+- `--no-fail-fast` is required: without it the first failing crate stops the run and hides the rest.
+- `lore-integration-tests` fixtures resolve `../../lorehub/docker/test-fixtures`, so they assume the
+  `lorehub-all` sibling layout.
+- `scripts/test` needs `--use-grpc` on the fork.
 
 Use narrower gates while iterating, but record any intentionally omitted live or platform-specific
 tier in the worklog.
