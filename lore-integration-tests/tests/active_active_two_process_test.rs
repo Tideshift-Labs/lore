@@ -309,10 +309,18 @@ mod active_active_two_process_tests {
 
         // Both processes serve it. B has never seen a write for this
         // repository and holds no state that A put there.
+        //
+        // The read uses an IDENTITY token (server audience, no `resources`
+        // claim). Since v0.10.0 a claim-carrying token is authorized from its
+        // claim and never reaches the stub, so `token` here would prove
+        // nothing about the authorizer; the control below pins that.
+        let identity_token = fixture.minter.mint_identity("case-a-reader");
         for (label, cell) in [("A", &a), ("B", &b)] {
-            let response = client::repository_get(cell.grpc_endpoint(), &token, &repository)
-                .await
-                .unwrap_or_else(|status| panic!("read through process {label}: {status:?}"));
+            let checks_before = fixture.stub.permission_checks();
+            let response =
+                client::repository_get(cell.grpc_endpoint(), &identity_token, &repository)
+                    .await
+                    .unwrap_or_else(|status| panic!("read through process {label}: {status:?}"));
             let served = response
                 .repository
                 .unwrap_or_else(|| panic!("process {label} returned no repository"));
@@ -325,19 +333,36 @@ mod active_active_two_process_tests {
                 served.name, name,
                 "process {label} served a different repository name"
             );
+            assert!(
+                fixture.stub.permission_checks() > checks_before,
+                "process {label}: RepositoryGet with an identity token must have consulted the authorizer; the stub saw no new check"
+            );
         }
 
         // Those reads went through the auth-grpc repository-query authorizer,
         // which exists on this cell only because WP-120 wired `auth_url`.
-        // Asserted so the new coupling is visible rather than implicit: this
-        // case now depends on the harness's stub answering `CheckUserPermission`
-        // — permissively, on purpose, so nothing here is evidence about read
-        // authorization.
-        assert!(
-            fixture.stub.permission_checks() >= 2,
-            "each process's RepositoryGet must have consulted the authorizer; it saw {} checks",
-            fixture.stub.permission_checks()
-        );
+        // Asserted per process so the coupling is visible rather than
+        // implicit: this case depends on the harness's stub answering
+        // `CheckUserPermission` — permissively, on purpose, so nothing here is
+        // evidence about read authorization.
+        // (Asserted per process inside the read loop above via `checks_before`.)
+
+        // Control: a CLAIM-CARRYING token is authorized from its `resources`
+        // claim and never reaches the stub (v0.10.0 `RepositoryAuthorizer`
+        // semantics). The read still succeeds and the stub count does not move.
+        for (label, cell) in [("A", &a), ("B", &b)] {
+            let checks_before = fixture.stub.permission_checks();
+            client::repository_get(cell.grpc_endpoint(), &token, &repository)
+                .await
+                .unwrap_or_else(|status| {
+                    panic!("claim-carrying read through process {label}: {status:?}")
+                });
+            assert_eq!(
+                fixture.stub.permission_checks(),
+                checks_before,
+                "process {label}: a claim-carrying token must be answered from its resources claim without a CheckUserPermission call"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

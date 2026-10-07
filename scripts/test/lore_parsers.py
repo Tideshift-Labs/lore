@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from dataclasses import field as dc_field
 from typing import TYPE_CHECKING
 
@@ -134,6 +134,7 @@ class LockStatus:
 class SpecificSharedStoreInfo:
     path: str = ""
     exists: bool = False
+    in_registry: bool = False
 
     def __eq__(self, other) -> bool:
         return self.path == other.path and self.exists == other.exists
@@ -143,6 +144,18 @@ class SpecificSharedStoreInfo:
 class SharedStoreInfo:
     is_automatic: bool = False
     stores: typing.Dict[str, SpecificSharedStoreInfo] = field(default_factory=dict)
+
+
+@dataclass
+class SharedStoreListEntry:
+    path: str = ""
+    remote_url: str = ""
+    instances: typing.List[typing.Tuple[str, str]] | None = None
+
+
+@dataclass
+class SharedStoreList:
+    entries: typing.Dict[str, SharedStoreListEntry] = field(default_factory=dict)
 
 
 BISECT_START_END_PATTERN = re.compile(
@@ -202,6 +215,25 @@ def parse_status_summary_json(status_output: str) -> dict | None:
     single repositoryStatusSummary event data (with `adds`, `deletes`,
     `modifies`, `moves`, `copies` keys), or None if no summary was emitted."""
     entries = parse_jsonl(status_output, "repositoryStatusSummary")
+    return entries[-1] if entries else None
+
+
+def parse_commit_stats_json(output: str) -> dict | None:
+    """Parse `lore commit --json` output and return the revisionCommitStats event
+    data, or None if none was emitted.
+
+    A commit emits this event once, when it has drained every background write,
+    and only at statistics level one and above.
+    """
+    entries = parse_jsonl(output, "revisionCommitStats")
+    return entries[-1] if entries else None
+
+
+def parse_push_stats_json(output: str) -> dict | None:
+    """Parse `lore push --json` output and return the branchPushStats event data,
+    or None if none was emitted. Emitted once, as `parse_commit_stats_json`
+    describes."""
+    entries = parse_jsonl(output, "branchPushStats")
     return entries[-1] if entries else None
 
 
@@ -301,7 +333,9 @@ def parse_branch_list(output: str):
 
     # If there's a remote section after archived, split it out
     if "Remote branches:" in archived_string:
-        archived_part, remote_after_archived = archived_string.split("Remote branches:", 1)
+        archived_part, remote_after_archived = archived_string.split(
+            "Remote branches:", 1
+        )
     else:
         archived_part = archived_string
         remote_after_archived = ""
@@ -339,7 +373,9 @@ def parse_branch_list(output: str):
         if branch.strip() and not branch.strip().startswith("No ")
     ]
 
-    return BranchList(current_branch, local_branches, remote_branches, archived_branches)
+    return BranchList(
+        current_branch, local_branches, remote_branches, archived_branches
+    )
 
 
 def parse_branch_list_json(output: str) -> BranchList:
@@ -386,6 +422,11 @@ def parse_branch_info(output: str):
     return BranchDescription(**result_values)
 
 
+# Revision metadata keys are open-ended, so a revision may carry keys this
+# harness has no field for. Those are skipped rather than failing the parse.
+_REVISION_INFO_FIELDS = frozenset(f.name for f in fields(RevisionInfo))
+
+
 def parse_revision_list(revision_output: str, oneline: bool) -> list[RevisionInfo]:
     revision_output = revision_output.replace("\\n", "\n")
     revisions = []
@@ -420,8 +461,39 @@ def parse_revision_list(revision_output: str, oneline: bool) -> list[RevisionInf
                     message_lines.append(s)
             if message_lines:
                 record["message"] = "\n".join(message_lines)
-            revisions.append(RevisionInfo(**record))
+            revisions.append(
+                RevisionInfo(
+                    **{k: v for k, v in record.items() if k in _REVISION_INFO_FIELDS}
+                )
+            )
     revisions.reverse()
+    return revisions
+
+
+def parse_revision_list_json(output: str) -> list[dict]:
+    """Parse `--json` revision output into one dict per revision, in the order the
+    events arrive: newest first for `history`.
+
+    A revision arrives as a `revisionInfo` or `revisionHistoryEntry` event carrying its
+    signature, number and parents, followed by one `metadata` event per key it records.
+    Those go under `metadata` on the revision they followed, keyed as they are recorded -
+    `branch`, `timestamp` and `message` among them - rather than beside the event's own
+    fields, which a metadata key is free to be named the same as.
+    """
+    revisions = []
+    for line in output.strip().split("\n"):
+        try:
+            parsed = json.loads(line.strip())
+        except json.JSONDecodeError:
+            # Skip non-JSON lines (headers, etc.)
+            continue
+        data = parsed.get("data")
+        if not isinstance(data, dict):
+            continue
+        if parsed.get("tagName") in ("revisionInfo", "revisionHistoryEntry"):
+            revisions.append(dict(data) | {"metadata": {}})
+        elif parsed.get("tagName") == "metadata" and revisions:
+            revisions[-1]["metadata"][data["key"]] = data["value"]["data"]
     return revisions
 
 
@@ -483,3 +555,27 @@ def parse_shared_store_info(output: str) -> SharedStoreInfo:
         elif prefix == "Exists":
             info.stores[latest_url].exists = value == "true"
     return info
+
+
+def parse_shared_store_list(output: str) -> SharedStoreList:
+    store_list = SharedStoreList()
+    lines = list(output.splitlines())
+    latest_entry: SharedStoreListEntry | None = None
+    for line in lines:
+        prefix_result = get_prefix(line)
+        if prefix_result is None:
+            continue
+        (prefix, value) = prefix_result
+        if prefix == "Store at path":
+            if latest_entry is not None:
+                store_list.entries[latest_entry.path] = latest_entry
+            latest_entry = SharedStoreListEntry(path=value)
+        elif prefix == "Remote URL":
+            latest_entry.remote_url = value
+        elif prefix == "Instances":
+            latest_entry.instances = []
+        elif prefix.startswith("-"):
+            latest_entry.instances.append((prefix.removeprefix("-"), value))
+    if latest_entry is not None:
+        store_list.entries[latest_entry.path] = latest_entry
+    return store_list

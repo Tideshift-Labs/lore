@@ -26,11 +26,13 @@
 #[cfg(all(test, feature = "integration_tests"))]
 mod quic_session_rebind_tests {
     use std::collections::HashMap;
+    use std::collections::HashSet;
     use std::error::Error;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -47,6 +49,7 @@ mod quic_session_rebind_tests {
     use lore_revision::store::remote::RemoteImmutableStore;
     use lore_server::auth::jwk::JWKServiceError;
     use lore_server::auth::jwt::JwtVerifier;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
@@ -64,6 +67,7 @@ mod quic_session_rebind_tests {
     use lore_server::quic::quinn::service_store::StreamDataHandlerBuilder;
     use lore_server::quic::storage_service_v4::ParsedStorageRequestV4;
     use lore_server::quic::storage_service_v4::StorageServiceV4;
+    use lore_server::quic::stream_handler::AdmissionLimits;
     use lore_server::quic::stream_handler::StreamHandler;
     use lore_server::quic::tests::TEST_PROTOCOL_V4;
     use lore_server::quic::tests::server_certs;
@@ -71,6 +75,7 @@ mod quic_session_rebind_tests {
     use lore_storage::MutableStore;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_telemetry::user_agent_filter::UserAgentFilter;
     use lore_transport::quic::QuicOpCode;
     use lore_transport::quic::client::CertificateSettings;
     use lore_transport::quic::client::CongestionAlgorithm;
@@ -99,9 +104,51 @@ mod quic_session_rebind_tests {
     struct Observed {
         opcode: u8,
         session_id: u32,
+        /// Which accepted connection carried the command: a per-process counter assigned when
+        /// the server builds the connection's service, unique across every server in a test.
+        connection: usize,
     }
 
     type Log = Arc<StdMutex<Vec<Observed>>>;
+
+    /// Source of [`Observed::connection`]. Not the quinn `stable_id`, which is an address and can
+    /// repeat once a closed connection is freed.
+    static NEXT_RECORDED_CONNECTION: AtomicUsize = AtomicUsize::new(1);
+
+    /// The commands that belong to an operation: everything except `ClientIdentify`.
+    ///
+    /// `ClientIdentify` (upstream `a3917c1b`, opcode 14) is connection setup. The client writes it
+    /// from the `AuthAdapter` connect/reconnect hooks with session id 0 and no awaited response,
+    /// before `epoch` is bumped, so it is not one of `send_with_reconnect`'s two dispatches and
+    /// not a command `StorageSession::attempt` counts against `ATTEMPT_BUDGET`. A budget assertion
+    /// counts the operation's commands; [`assert_client_identify_at_most_once_per_connection`]
+    /// bounds the setup traffic separately.
+    fn operation_commands(log: &[Observed]) -> Vec<Observed> {
+        log.iter()
+            .copied()
+            .filter(|o| o.opcode != Command::ClientIdentify as u8)
+            .collect()
+    }
+
+    /// The setup message is sent at most once on each connection and never under a session id,
+    /// so excluding it from a budget count cannot hide a resent operation.
+    fn assert_client_identify_at_most_once_per_connection(log: &[Observed]) {
+        let mut identified = HashSet::new();
+        for observed in log
+            .iter()
+            .filter(|o| o.opcode == Command::ClientIdentify as u8)
+        {
+            assert_eq!(
+                observed.session_id, 0,
+                "ClientIdentify is connection setup and must carry no session id: {log:?}"
+            );
+            assert!(
+                identified.insert(observed.connection),
+                "ClientIdentify sent more than once on connection {}: {log:?}",
+                observed.connection
+            );
+        }
+    }
 
     /// A deterministic "dispatched, then response lost" fault: once the wrapped service has
     /// computed the real response for `opcode` (the real mutation has already happened), fire
@@ -147,6 +194,7 @@ mod quic_session_rebind_tests {
     struct RecordingStorageServiceV4 {
         inner: StorageServiceV4,
         connection_id: usize,
+        recorded_connection: usize,
         log: Log,
         sever: Option<SeverResponse>,
         hold_answered_error: Option<HoldAnsweredError>,
@@ -178,6 +226,7 @@ mod quic_session_rebind_tests {
             self.log.lock().expect("log mutex poisoned").push(Observed {
                 opcode: header.cmd,
                 session_id: header.session_id,
+                connection: self.recorded_connection,
             });
             self.inner.parse_request_bytes(header, bytes)
         }
@@ -191,6 +240,7 @@ mod quic_session_rebind_tests {
                 ParsedStorageRequestV4::StorageCommand { opcode, .. } => Some(*opcode),
                 ParsedStorageRequestV4::AuthorizeStart { .. }
                 | ParsedStorageRequestV4::AuthorizeStop { .. } => Some(Command::Authorize as u8),
+                ParsedStorageRequestV4::ClientIdentify(_) => Some(Command::ClientIdentify as u8),
             };
             let result = self.inner.run_request_handler(context, request).await;
             if opcode == Some(Command::Authorize as u8) {
@@ -338,20 +388,32 @@ mod quic_session_rebind_tests {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let inner = StorageServiceV4::new(
                         jwt_verifier.clone(),
+                        Arc::new(AllowAllRepositoryAuthorizer),
                         immutable_store.clone(),
                         immutable_store.clone(),
                         mutable_store.clone(),
                         false,
+                        Arc::new(UserAgentFilter::default()),
                     );
                     let service = RecordingStorageServiceV4 {
                         inner,
                         connection_id: context.get::<ConnectionId>().map(|id| id.0).unwrap_or(0),
+                        recorded_connection: NEXT_RECORDED_CONNECTION
+                            .fetch_add(1, Ordering::Relaxed),
                         log: log.clone(),
                         sever: sever.clone(),
                         hold_answered_error: hold_answered_error.clone(),
                     };
-                    Box::new(StreamHandler::new(Arc::new(service), context, 100, None))
-                        as Box<dyn StreamDataHandler>
+                    Box::new(StreamHandler::new(
+                        Arc::new(service),
+                        context,
+                        AdmissionLimits {
+                            process_limit: 100,
+                            inflight_limit: 800,
+                            handler_timeout: None,
+                            permit_timeout: None,
+                        },
+                    )) as Box<dyn StreamDataHandler>
                 }),
             );
             Self { service_store }
@@ -634,11 +696,11 @@ mod quic_session_rebind_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None, false)
+                .with_jwt_verifier(None, false, Arc::new(AllowAllRepositoryAuthorizer))
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;
@@ -1075,8 +1137,11 @@ mod quic_session_rebind_tests {
                     .expect("post-failover put should succeed");
 
                 let log_b_snapshot = log_b.lock().unwrap().clone();
+                assert_client_identify_at_most_once_per_connection(&log_b_snapshot);
                 assert_eq!(
-                    log_b_snapshot.first().map(|o| o.opcode),
+                    operation_commands(&log_b_snapshot)
+                        .first()
+                        .map(|o| o.opcode),
                     Some(Command::Authorize as u8),
                     "the first command independent server B ever sees on this connection must \
                      be a fresh Authorize, not a bare reused command; observed: {log_b_snapshot:?}"
@@ -1338,12 +1403,15 @@ mod quic_session_rebind_tests {
                 }
             }
         }
+        assert_client_identify_at_most_once_per_connection(log);
+        let operation = operation_commands(log);
         assert!(
-            (1..=1 + lost_retries).contains(&log.len()),
+            (1..=1 + lost_retries).contains(&operation.len()),
             "{arm}: {log:?}, {events:?}"
         );
         assert!(
-            log.iter()
+            operation
+                .iter()
                 .all(|o| o.opcode == Command::Authorize as u8 && o.session_id == 0),
             "{arm}: only Authorize Start may reach the server: {log:?}"
         );
@@ -1623,7 +1691,11 @@ mod quic_session_rebind_tests {
                     assert_replacement_failed_closed(&log, &observations, "forced lost refusal"),
                     1
                 );
-                assert_eq!(log.len(), 2, "both server receipts are controlled: {log:?}");
+                assert_eq!(
+                    operation_commands(&log).len(),
+                    2,
+                    "both server receipts are controlled: {log:?}"
+                );
                 Ok(())
             })
             .await
@@ -1743,7 +1815,8 @@ mod quic_session_rebind_tests {
     /// path (reconnect succeeds, replacement `session_start` succeeds on its first try) costs
     /// exactly [`lore_transport::ATTEMPT_BUDGET`] wire commands (one Authorize, one retried
     /// operation) on the replacement connection, not more -- this is the common case, not the
-    /// ceiling.
+    /// ceiling. The replacement connection also carries one `ClientIdentify` (connection setup,
+    /// not an operation command; see [`operation_commands`]), bounded to one per connection.
     #[tokio::test]
     async fn b6_one_operation_call_spends_at_most_the_shared_attempt_budget() -> TestResult {
         let execution = setup_execution("test".to_string());
@@ -1785,8 +1858,9 @@ mod quic_session_rebind_tests {
                     .expect("post-reconnect put should succeed");
 
                 let log_b_snapshot = log_b.lock().unwrap().clone();
+                assert_client_identify_at_most_once_per_connection(&log_b_snapshot);
                 assert_eq!(
-                    log_b_snapshot.len(),
+                    operation_commands(&log_b_snapshot).len(),
                     lore_transport::ATTEMPT_BUDGET as usize,
                     "the CLEAN single-reconnect path (replacement session_start succeeds on its \
                      first try) must dispatch exactly ATTEMPT_BUDGET ({}) wire commands on the \
@@ -3004,11 +3078,8 @@ mod quic_session_rebind_tests {
                 // proof of a SERVER-side refusal, not just an unsent command.
                 let log_snapshot = log.lock().unwrap().clone();
                 assert_eq!(
-                    log_snapshot.last(),
-                    Some(&Observed {
-                        opcode: Command::Put as u8,
-                        session_id: id_a,
-                    }),
+                    log_snapshot.last().map(|o| (o.opcode, o.session_id)),
+                    Some((Command::Put as u8, id_a)),
                     "the server must have received the forged Put carrying connection 1's \
                      session id on connection 2's wire; observed: {log_snapshot:?}"
                 );
@@ -3105,11 +3176,8 @@ mod quic_session_rebind_tests {
 
                 let log_snapshot = log.lock().unwrap().clone();
                 assert_eq!(
-                    log_snapshot.last(),
-                    Some(&Observed {
-                        opcode: Command::Authorize as u8,
-                        session_id: id_a,
-                    }),
+                    log_snapshot.last().map(|o| (o.opcode, o.session_id)),
+                    Some((Command::Authorize as u8, id_a)),
                     "the server must have received the forged stop on connection 2's wire; \
                      observed: {log_snapshot:?}"
                 );

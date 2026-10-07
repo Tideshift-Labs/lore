@@ -899,7 +899,7 @@ fn run_installer(action: &str, url: &str, ca_pem: Option<&str>) -> std::process:
     command.output().expect("spawn cell-schema-install")
 }
 
-/// The installer binary over explicit plaintext against a plain (ssl=off) PostgreSQL, and a
+/// The installer binary over explicit plaintext against a plain (ssl=off) `PostgreSQL`, and a
 /// TLS-configured client against that same server, which must fail rather than fall back.
 ///
 /// `LORE_TEST_CELL_SCHEMA_BINARY_PG_URL` is the URL with no query string.
@@ -946,7 +946,7 @@ fn live_cell_schema_install_binary_installs_and_attests_over_explicit_plaintext(
     assert!(String::from_utf8_lossy(&attest.stdout).contains("catalog manifest:"));
 }
 
-/// The installer binary against a TLS-only PostgreSQL (`hostssl` is the only network `pg_hba`
+/// The installer binary against a TLS-only `PostgreSQL` (`hostssl` is the only network `pg_hba`
 /// line, so plaintext is refused by the server itself, not just by the client).
 ///
 /// `LORE_TEST_CELL_SCHEMA_TLS_PG_URL` is the URL with no query string, host `localhost`, matching

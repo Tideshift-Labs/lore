@@ -97,7 +97,7 @@ impl ManagedPushRunner {
         let result = lore_transport::with_caller_operation(context, future).await;
         let status = result.as_ref().err().map_or(0, FfiError::ffi_code);
         let body = async {
-            if status == 194 {
+            if status == lore_base::error::UnnameableResource::FFI_CODE {
                 shared.mark_parent_uncertain(parent, status).await?;
             } else {
                 shared.complete_parent_body(parent).await?;
@@ -110,12 +110,16 @@ impl ManagedPushRunner {
         .await;
         if let Err(error) = body {
             // Retain the original ambiguous attempt identity even when its body marker cannot publish.
-            if status == 193 || status == 194 {
+            if status == lore_base::error::OutcomeUnknown::FFI_CODE
+                || status == lore_base::error::UnnameableResource::FFI_CODE
+            {
                 return result;
             }
             return Err(error).forward::<E>("completing push stage body");
         }
-        if status != 193 && status != 194 {
+        if status != lore_base::error::OutcomeUnknown::FFI_CODE
+            && status != lore_base::error::UnnameableResource::FFI_CODE
+        {
             // Stage completion never completes the outer UI workflow. Finish its app record
             // first so an observer failure cannot release the shared worktree blocker.
             if let Some(observer) = &self.observer {

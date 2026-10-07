@@ -105,7 +105,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let signature = Box::pin(commit::commit(repository.clone(), &write_token, options))
                     .await
@@ -137,8 +136,6 @@ mod tests {
                     .expect("Failed to get branch from metadata");
 
                 assert_eq!(branch_id, default_branch_id);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -241,14 +238,11 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
                         .await
                         .expect("Failed to commit revision");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -374,7 +368,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 Box::pin(commit::commit(repository.clone(), &write_token, options))
                     .await
@@ -389,8 +382,6 @@ mod tests {
                     expected,
                     "commit did not record the modified time it read the file at"
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -481,7 +472,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let callback: lore_revision::interface::LoreEventCallback = None;
                 let dry_run = Arc::new(ExecutionContext::new_client_with_user_id(
@@ -505,8 +495,6 @@ mod tests {
                     0,
                     "a dry run recorded a modified time"
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -583,13 +571,10 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let result =
                     Box::pin(commit::commit(repository.clone(), &write_token, options)).await;
                 assert!(result.is_err(), "commit without staged changes should fail");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");

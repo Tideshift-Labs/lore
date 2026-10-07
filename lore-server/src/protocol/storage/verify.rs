@@ -173,7 +173,6 @@ mod tests {
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::relay::EventDispatcher;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
-    use rand::distr::SampleString;
     use rand::random;
 
     use super::*;
@@ -188,17 +187,8 @@ mod tests {
         Bytes::from(bytes)
     }
 
-    fn generate_tempdir() -> std::path::PathBuf {
-        let testname = format!(
-            "lore-verify-test-{}",
-            rand::distr::Alphanumeric
-                .sample_string(&mut rand::rng(), 8)
-                .as_str()
-        );
-        let mut dir = std::env::temp_dir();
-        dir.push(testname);
-        std::fs::create_dir_all(&dir).expect("Create test directory");
-        std::fs::canonicalize(dir).expect("Canonicalize temporary test dir")
+    fn generate_tempdir() -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new("lore-verify-test-")
     }
 
     fn setup_test_execution() -> Arc<ExecutionContext> {
@@ -309,13 +299,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_not_found() {
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir),
+                    Some(dir_path),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -357,20 +347,18 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 
     #[tokio::test]
     async fn test_handle_success() {
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir),
+                    Some(dir_path),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -402,8 +390,6 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 
     fn corrupt_packfile(
@@ -443,13 +429,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_corrupted_heal() {
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir.clone()),
+                    Some(dir_path.clone()),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -484,7 +470,7 @@ mod tests {
 
                 // Recreate the store so it reloads from disk
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir.clone()),
+                    Some(dir_path.clone()),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -504,20 +490,18 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 
     #[tokio::test]
     async fn test_handle_corrupted_no_heal() {
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir.clone()),
+                    Some(dir_path.clone()),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -552,7 +536,7 @@ mod tests {
 
                 // Recreate the store so it reloads from disk
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir.clone()),
+                    Some(dir_path.clone()),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -572,7 +556,5 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 }

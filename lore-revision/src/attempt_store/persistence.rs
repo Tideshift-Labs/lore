@@ -153,7 +153,7 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
         let bootstrap = ancestor.join(BOOTSTRAP_LOCK_FILE);
         match std::fs::metadata(&bootstrap) {
             Ok(_) => {
-                let _repair = FSLock::acquire_file_lock(ancestor.join(BOOTSTRAP_FILE))
+                let _repair = FSLock::acquire_file_lock(ancestor.join(BOOTSTRAP_FILE), false)
                     .await
                     .map_err(|error| io_error("lock ancestor bootstrap", ancestor, error))?;
                 sync_directory(Some(ancestor))?;
@@ -166,7 +166,7 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
     drop(repair);
     #[cfg(test)]
     let wait = phase_diagnostics::start(Some(&absolute), "bootstrap_fslock_wait");
-    let _bootstrap = FSLock::acquire_file_lock(parent.join(BOOTSTRAP_FILE))
+    let _bootstrap = FSLock::acquire_file_lock(parent.join(BOOTSTRAP_FILE), false)
         .await
         .map_err(|error| io_error("lock bootstrap for", &absolute, error))?;
     #[cfg(test)]

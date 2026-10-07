@@ -16,6 +16,7 @@ mod remote_store_tests {
     use lore_revision::lore::RepositoryId;
     use lore_revision::store::remote::RemoteImmutableStore;
     use lore_revision::store::remote::RemoteMutableStore;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
@@ -110,13 +111,13 @@ mod remote_store_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )
                 // Auth-OFF harness: no verifier, so `enforce_write_permission` no-ops
                 // regardless (see `with_jwt_verifier`'s doc comment) -- `false` for clarity.
-                .with_jwt_verifier(None, false)
+                .with_jwt_verifier(None, false, Arc::new(AllowAllRepositoryAuthorizer))
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;

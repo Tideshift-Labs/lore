@@ -33,10 +33,10 @@ impl JWKService for CachedKey {
     }
 }
 
-fn interceptor() -> JWTAuthnInterceptor {
-    JWTAuthnInterceptor::new(&JwtVerifier {
+fn interceptor() -> JWTInterceptor {
+    JWTInterceptor::new(&JwtVerifier {
         jwk_service: Arc::new(CachedKey),
-        jwt_issuer: Some("https://issuer.example".into()),
+        jwt_issuer: Some(vec!["https://issuer.example".into()]),
         jwt_audience: Some(vec!["lore".into()]),
     })
 }

@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use crate::change;
 use crate::change::NodeChangeState;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::lore::Address;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
@@ -23,13 +24,14 @@ use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
-use crate::state::ChangeSink;
-use crate::state::OwnedChangeSink;
+use crate::state::ChangeSender;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateChildrenNodes;
 use crate::state::StateError;
 use crate::state::StateNamedNode;
 use crate::state::add_change;
+use crate::state::emit_change;
 use crate::state::named_node_sort;
 use crate::util::path::RelativePath;
 
@@ -115,10 +117,16 @@ pub async fn diff_subtree(
     path: RelativePath,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
-    if to.repository.filter.emit_excludes(&path, true, filter_mode) {
+    let parent_states = to.mapping.repository.filter.parent_exclusion_states(&path);
+    let (states, excluded) =
+        to.mapping
+            .repository
+            .filter
+            .child_emit_excludes(parent_states, &path, true, filter_mode);
+    if excluded {
         lore_debug!("Excluded by filter: {}", path.as_str());
         return Ok(());
     }
@@ -126,14 +134,20 @@ pub async fn diff_subtree(
     diff_subtree_node(
         from,
         to,
-        DiffPaths {
-            from: path.clone(),
-            to: path,
-            relocated_staged_directory: false,
+        DiffCursor {
+            paths: DiffPaths {
+                from: path.clone(),
+                to: path,
+                relocated_staged_directory: false,
+            },
+            states: DiffStates {
+                from: states,
+                to: states,
+            },
         },
         flags,
         graft,
-        sink,
+        changes,
         filter_mode,
     )
     .await
@@ -142,16 +156,14 @@ pub async fn diff_subtree(
 fn recurse_diff_subtree_node(
     from: NodeChangeState,
     to: NodeChangeState,
-    paths: DiffPaths,
+    cursor: DiffCursor,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    mut sink: OwnedChangeSink,
+    changes: ChangeSender,
     filter_mode: FilterMode,
-) -> Pin<Box<dyn Future<Output = Result<OwnedChangeSink, StateError>> + Send>> {
+) -> Pin<Box<dyn Future<Output = Result<(), StateError>> + Send>> {
     Box::pin(async move {
-        let mut local = sink.as_sink();
-        diff_subtree_node(from, to, paths, flags, graft, &mut local, filter_mode).await?;
-        Ok(sink)
+        diff_subtree_node(from, to, cursor, flags, graft, &changes, filter_mode).await
     })
 }
 
@@ -171,20 +183,63 @@ impl DiffPaths {
     }
 }
 
+/// The filter verdicts for [`DiffPaths`], one per side.
+///
+/// A rename gives the two sides different paths, and each side's children are
+/// filtered against its own, so the walk carries a verdict for each rather than
+/// one for both.
+#[derive(Clone, Copy)]
+struct DiffStates {
+    from: FilterStates,
+    to: FilterStates,
+}
+
+/// Where the walk stands on both sides: the paths, and the verdicts they were
+/// reached with.
+struct DiffCursor {
+    paths: DiffPaths,
+    states: DiffStates,
+}
+
+impl DiffCursor {
+    /// Re-seeds the verdicts after [`find_sorted_children`] replaced a file path
+    /// with its parent, which the ones carried in no longer describe.
+    ///
+    /// A whole-path fold, because the parent has no walk behind it here. One
+    /// walk starts this way at most.
+    fn reseed(&mut self, from: &NodeChangeState, to: &NodeChangeState) {
+        self.states = DiffStates {
+            from: from
+                .mapping
+                .repository
+                .filter
+                .exclusion_states(&self.paths.from),
+            to: to
+                .mapping
+                .repository
+                .filter
+                .exclusion_states(&self.paths.to),
+        };
+    }
+}
+
 async fn diff_subtree_node(
     from: NodeChangeState,
     to: NodeChangeState,
-    paths: DiffPaths,
+    cursor: DiffCursor,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
     // If path is a file then treat this as a call for the parent with only one child.
-    let mut possibly_parent_paths = paths;
-    let (from_nodes, to_nodes) =
-        find_sorted_children(&mut possibly_parent_paths, &from, &to).await?;
-    let paths = possibly_parent_paths;
+    let mut cursor = cursor;
+    let (from_nodes, to_nodes, popped) =
+        find_sorted_children(&mut cursor.paths, &from, &to).await?;
+    if popped {
+        cursor.reseed(&from, &to);
+    }
+    let DiffCursor { paths, states } = cursor;
 
     let mut subtasks = JoinSet::new();
 
@@ -195,9 +250,10 @@ async fn diff_subtree_node(
         &from,
         &to,
         &paths,
+        states,
         flags,
         graft,
-        sink,
+        changes,
         filter_mode,
         &from_nodes,
         &to_nodes,
@@ -222,19 +278,25 @@ async fn diff_subtree_node_walk(
     from: &NodeChangeState,
     to: &NodeChangeState,
     paths: &DiffPaths,
+    states: DiffStates,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    sink: &mut ChangeSink<'_>,
+    changes: &ChangeSender,
     filter_mode: FilterMode,
     from_nodes: &StateChildrenNodes,
     to_nodes: &StateChildrenNodes,
-    subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
+    subtasks: &mut JoinSet<Result<(), StateError>>,
 ) -> Result<(), StateError> {
     let mut to_index = 0;
     for from_named_node in from_nodes.children.iter() {
-        let Some(from_node_search) =
-            get_filtered_node_and_path(from_nodes, from_named_node.node, &paths.from, filter_mode)
-                .await?
+        let Some((from_node_search, from_node_states)) = get_filtered_node_and_path(
+            from_nodes,
+            from_named_node.node,
+            &paths.from,
+            states.from,
+            filter_mode,
+        )
+        .await?
         else {
             continue;
         };
@@ -246,10 +308,11 @@ async fn diff_subtree_node_walk(
                 subtasks,
                 flags,
                 DiffContext {
-                    sink,
+                    changes,
                     from_nodes,
                     to_nodes,
                     paths,
+                    states,
                     filter_mode,
                 },
                 from,
@@ -264,15 +327,17 @@ async fn diff_subtree_node_walk(
         {
             add_change_for_solo_from_node(
                 DiffContext {
-                    sink,
+                    changes,
                     from_nodes,
                     to_nodes,
                     paths,
+                    states,
                     filter_mode,
                 },
                 from_named_node,
                 to,
                 &from_node_search,
+                from_node_states,
             )
             .await?;
         } else {
@@ -284,15 +349,17 @@ async fn diff_subtree_node_walk(
                 flags,
                 graft.clone(),
                 DiffContext {
-                    sink,
+                    changes,
                     from_nodes,
                     to_nodes,
                     paths,
+                    states,
                     filter_mode,
                 },
                 to_named_node,
                 from_named_node.node,
                 &from_node_search,
+                from_node_states,
             )
             .await?;
         }
@@ -303,10 +370,11 @@ async fn diff_subtree_node_walk(
             subtasks,
             flags,
             DiffContext {
-                sink,
+                changes,
                 from_nodes,
                 to_nodes,
                 paths,
+                states,
                 filter_mode,
             },
             from,
@@ -316,36 +384,38 @@ async fn diff_subtree_node_walk(
     }
 
     while let Some(task_result) = subtasks.join_next().await {
-        let task_sink = task_result
+        task_result
             .internal("Task failure")
             .map_err(StateError::from)
             .flatten()?;
-        sink.finalize_task_sink(task_sink);
     }
 
     Ok(())
 }
 
-struct DiffContext<'a, 'b> {
-    sink: &'a mut ChangeSink<'b>,
+struct DiffContext<'a> {
+    changes: &'a ChangeSender,
     from_nodes: &'a StateChildrenNodes,
     to_nodes: &'a StateChildrenNodes,
     paths: &'a DiffPaths,
+    states: DiffStates,
     filter_mode: FilterMode,
 }
 
 async fn add_change_for_solo_from_node(
-    context: DiffContext<'_, '_>,
+    context: DiffContext<'_>,
     from_named_node: &StateNamedNode,
     to: &NodeChangeState,
     from_node_search: &NodeSearchResult,
+    from_node_states: FilterStates,
 ) -> Result<(), StateError> {
     let DiffContext {
-        sink,
+        changes,
         from_nodes,
         to_nodes,
         filter_mode,
         paths,
+        ..
     } = context;
     let NodeSearchResult {
         node: from_node,
@@ -374,22 +444,30 @@ async fn add_change_for_solo_from_node(
     } else {
         lore_trace!("Node {} deleted", from_named_node.node);
 
+        // Under a relocated staged directory a delete is reported where the
+        // directory now stands; elsewhere this is `from_path` itself.
+        let deletion_path = paths.deletion_path(from_path);
         let from = NodeChangeState {
-            repository: from_nodes.repository.clone(),
-            state: from_nodes.state.clone(),
-            node: from_named_node.node,
+            mapping: NodeMapping {
+                repository: from_nodes.repository.clone(),
+                state: from_nodes.state.clone(),
+                path: deletion_path.clone(),
+                node: from_named_node.node,
+            },
+            observed: None,
             flags: NodeFlags::from_bits_retain(from_node.flags),
             address: from_node.address,
+            mode: from_node.mode,
         };
 
         add_change(
             from,
-            to.invalid(),
+            to.invalid(deletion_path),
             change::FileAction::Delete,
-            &paths.deletion_path(from_path),
-            None,
-            sink,
+            change::Flags::None,
+            changes,
             filter_mode,
+            from_node_states,
         )
         .await?;
     }
@@ -397,24 +475,35 @@ async fn add_change_for_solo_from_node(
 }
 
 async fn add_change_for_solo_to_node(
-    subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
+    subtasks: &mut JoinSet<Result<(), StateError>>,
     flags: u32,
-    context: DiffContext<'_, '_>,
+    context: DiffContext<'_>,
     from: &NodeChangeState,
     to_index: usize,
 ) -> Result<(), StateError> {
     let DiffContext {
-        sink,
+        changes,
         from_nodes,
         to_nodes,
         paths,
+        states,
         filter_mode,
     } = context;
     let to_named_node = &to_nodes.children[to_index];
-    let Some(NodeSearchResult {
-        node: to_node,
-        path: subpath,
-    }) = get_filtered_node_and_path(to_nodes, to_named_node.node, &paths.to, filter_mode).await?
+    let Some((
+        NodeSearchResult {
+            node: to_node,
+            path: subpath,
+        },
+        to_node_states,
+    )) = get_filtered_node_and_path(
+        to_nodes,
+        to_named_node.node,
+        &paths.to,
+        states.to,
+        filter_mode,
+    )
+    .await?
     else {
         return Ok(());
     };
@@ -424,12 +513,18 @@ async fn add_change_for_solo_to_node(
         lore_trace!("Node {} deleted", to_named_node.node);
         (change::FileAction::Delete, None)
     } else if to_node.is_staged_move() {
-        // Look up the original path from the from state
-        let original_path = from_nodes
-            .state
-            .node_path(from_nodes.repository.clone(), to_named_node.node)
-            .await
-            .ok();
+        // TODO(mjansson): A node moved within a repository the working tree materializes below
+        //                 its root needs the path of the mount to spell where it was, which the
+        //                 walk does not carry. Such a move is realized as a delete and an add.
+        let original_path = if from_nodes.repository.id == from_nodes.repository.root_id() {
+            from_nodes
+                .state
+                .node_path(from_nodes.repository.clone(), to_named_node.node)
+                .await
+                .ok()
+        } else {
+            None
+        };
         lore_trace!(
             "Node {} moved from {:?} to {}",
             to_named_node.node,
@@ -446,64 +541,96 @@ async fn add_change_for_solo_to_node(
     };
 
     let to = NodeChangeState {
-        repository: to_nodes.repository.clone(),
-        state: to_nodes.state.clone(),
-        node: to_named_node.node,
+        mapping: NodeMapping {
+            repository: to_nodes.repository.clone(),
+            state: to_nodes.state.clone(),
+            path: subpath.clone(),
+            node: to_named_node.node,
+        },
+        observed: None,
         flags: NodeFlags::from_bits_retain(to_node.flags),
         address: to_node.address,
+        mode: to_node.mode,
     };
 
     // A moved directory still contains independently changed children. The
     // generic Move emitter does not recurse, so compare the original subtree
     // against its new location after emitting the directory move.
-    let moved_from = if file_action == change::FileAction::Move
-        && to_node.is_directory()
-        && !to_node.is_link()
-    {
-        from_nodes
-            .state
-            .try_node(from_nodes.repository.clone(), to_named_node.node)
-            .await
-            .filter(|node| {
-                node.is_directory()
-                    && !node.is_link()
-                    && node.address.context == to_node.address.context
-            })
-            .map(|node| NodeChangeState {
-                repository: from_nodes.repository.clone(),
-                state: from_nodes.state.clone(),
-                node: to_named_node.node,
-                flags: NodeFlags::from_bits_retain(node.flags),
-                address: node.address,
-            })
-    } else {
-        None
+    let moved_from = match &from_path {
+        Some(moved_source)
+            if file_action == change::FileAction::Move
+                && to_node.is_directory()
+                && !to_node.is_link() =>
+        {
+            from_nodes
+                .state
+                .try_node(from_nodes.repository.clone(), to_named_node.node)
+                .await
+                .filter(|node| {
+                    node.is_directory()
+                        && !node.is_link()
+                        && node.address.context == to_node.address.context
+                })
+                .map(|node| {
+                    (
+                        NodeChangeState {
+                            mapping: NodeMapping {
+                                repository: from_nodes.repository.clone(),
+                                state: from_nodes.state.clone(),
+                                path: moved_source.clone(),
+                                node: to_named_node.node,
+                            },
+                            observed: None,
+                            flags: NodeFlags::from_bits_retain(node.flags),
+                            address: node.address,
+                            mode: node.mode,
+                        },
+                        moved_source.clone(),
+                    )
+                })
+        }
+        _ => None,
     };
 
+    let from = from.invalid(match file_action {
+        // Empty where the walk could not spell the source, which is a move it reports without one.
+        change::FileAction::Move => from_path.unwrap_or_default(),
+        _ => subpath.clone(),
+    });
+
     add_change(
-        from.invalid(),
+        from,
         to.clone(),
         file_action,
-        &subpath,
-        from_path.as_ref(),
-        sink,
+        change::Flags::None,
+        changes,
         filter_mode,
+        to_node_states,
     )
     .await?;
-    if let (Some(from), Some(from_path)) = (moved_from, from_path) {
-        let task_sink = sink.task_sink();
+    if let Some((moved_from, moved_source)) = moved_from {
+        // The two sides stand at different paths, so each walk is seeded from a
+        // whole-path fold of its own, as a walk rooted at a path is.
+        let child_states = DiffStates {
+            from: from_nodes.repository.filter.exclusion_states(&moved_source),
+            to: to_nodes.repository.filter.exclusion_states(&subpath),
+        };
+        let task_changes = changes.clone();
         lore_spawn!(subtasks, async move {
             recurse_diff_subtree_node(
-                from,
+                moved_from,
                 to,
-                DiffPaths {
-                    from: from_path,
-                    to: subpath,
-                    relocated_staged_directory: true,
+                DiffCursor {
+                    paths: DiffPaths {
+                        from: moved_source,
+                        to: subpath,
+                        relocated_staged_directory: true,
+                    },
+                    states: child_states,
                 },
                 flags,
                 None,
-                task_sink,
+                task_changes,
                 filter_mode,
             )
             .await
@@ -512,20 +639,53 @@ async fn add_change_for_solo_to_node(
     Ok(())
 }
 
+/// The verdict a walk under `path` inherits, given `node`'s own.
+///
+/// The walk continues under `path` as a directory, and a whole-path query folds
+/// every ancestor as one. A directory node was already stepped that way, so
+/// `node_states` stands; a link node was not, and is stepped again as the
+/// directory its content sits in.
+fn subtree_states(
+    nodes: &StateChildrenNodes,
+    parent: FilterStates,
+    path: &RelativePath,
+    node: &Node,
+    node_states: FilterStates,
+    mode: FilterMode,
+) -> FilterStates {
+    if node.is_directory() {
+        return node_states;
+    }
+    nodes
+        .repository
+        .filter
+        .child_excludes_tree(parent, path, true, mode)
+        .0
+}
+
+/// Report the change between the two nodes the walk paired by name, and descend where both are
+/// directories.
+///
+/// The walk pairs on a case-folded name, so a pair's own two spellings can differ, and that is the
+/// rename it reports as a move. A node below such a pair stands at two paths without being renamed
+/// itself, and is reported only for what else changed about it.
+#[allow(clippy::too_many_arguments)]
 async fn add_change_for_paired_nodes(
-    subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
+    subtasks: &mut JoinSet<Result<(), StateError>>,
     flags: u32,
     graft: Option<Arc<GraftOracle>>,
-    context: DiffContext<'_, '_>,
+    context: DiffContext<'_>,
     to_named_node: &StateNamedNode,
     from_node_id: NodeID,
     from_node_search: &NodeSearchResult,
+    from_node_states: FilterStates,
 ) -> Result<(), StateError> {
     let DiffContext {
-        sink,
+        changes,
         from_nodes,
         to_nodes,
         paths,
+        states,
         filter_mode,
     } = context;
     let NodeSearchResult {
@@ -550,6 +710,13 @@ async fn add_change_for_paired_nodes(
     let to_mode = to_node.mode;
     let mode_equal = from_mode == to_mode;
     let is_modify = !hash_equal || !mode_equal;
+    // What the walk measured of the content, which the action states nothing about: a node can be
+    // moved and modified at once, or moved with the content it had.
+    let measured = if is_modify {
+        change::Flags::Modify
+    } else {
+        change::Flags::None
+    };
     let is_staged = to_node.is_staged();
     let is_staged_delete = to_node.is_staged_delete();
     let is_staged_merge = to_node.is_staged_merge();
@@ -557,32 +724,49 @@ async fn add_change_for_paired_nodes(
     let is_dirty_delete = to_node.is_dirty_delete();
 
     let to = NodeChangeState {
-        repository: to_nodes.repository.clone(),
-        state: to_nodes.state.clone(),
-        node: to_named_node.node,
+        mapping: NodeMapping {
+            repository: to_nodes.repository.clone(),
+            state: to_nodes.state.clone(),
+            path: from_path.clone(),
+            node: to_named_node.node,
+        },
+        observed: None,
         flags: NodeFlags::from_bits_retain(to_node.flags),
         address: to_node.address,
+        mode: to_node.mode,
     };
 
     let from = NodeChangeState {
-        repository: from_nodes.repository.clone(),
-        state: from_nodes.state.clone(),
-        node: from_node_id,
+        mapping: NodeMapping {
+            repository: from_nodes.repository.clone(),
+            state: from_nodes.state.clone(),
+            path: from_path.clone(),
+            node: from_node_id,
+        },
+        observed: None,
         flags: NodeFlags::from_bits_retain(from_node.flags),
         address: from_node.address,
+        mode: from_node.mode,
     };
 
     if is_staged_delete || is_dirty_delete {
         lore_trace!("Diff node {} deleted", &paths.to);
 
+        // Reported where a relocated staged directory now stands; elsewhere
+        // this is `from_path` itself.
+        let deletion_path = paths.deletion_path(from_path);
+        let mut from = from;
+        let mut to = to;
+        from.mapping.path = deletion_path.clone();
+        to.mapping.path = deletion_path;
         add_change(
             from,
             to,
             change::FileAction::Delete,
-            &paths.deletion_path(from_path),
-            None,
-            sink,
+            change::Flags::None,
+            changes,
             filter_mode,
+            from_node_states,
         )
         .await?;
     } else {
@@ -607,6 +791,8 @@ async fn add_change_for_paired_nodes(
         let is_rename = *from_name != *to_name;
 
         let subpath = paths.to.push_into_buf(&to_name).freeze();
+        let mut to = to;
+        to.mapping.path = subpath.clone();
         if is_rename {
             lore_trace!("Node is renamed from {from_name} -> {to_name}");
         }
@@ -624,29 +810,43 @@ async fn add_change_for_paired_nodes(
                     "Diff node {subpath} file modified {from_address} size {from_size} to {to_address} size {to_size}, mode {from_mode} to {to_mode} - {action:?}"
                 );
 
-                add_change(
+                emit_change(
                     from.clone(),
                     to.clone(),
                     action,
-                    &subpath,
-                    if is_rename { Some(from_path) } else { None },
-                    sink,
+                    measured,
+                    changes,
                     filter_mode,
                 )
                 .await?;
             }
         } else if !was_file && !is_file {
+            let child_states = DiffStates {
+                from: subtree_states(
+                    from_nodes,
+                    states.from,
+                    from_path,
+                    from_node,
+                    from_node_states,
+                    filter_mode,
+                ),
+                to: to_nodes
+                    .repository
+                    .filter
+                    .child_excludes_tree(states.to, &subpath, true, filter_mode)
+                    .0,
+            };
+
             if !mode_equal || is_rename {
                 lore_trace!(
                     "Diff node {subpath} directory mode change from {from_mode} to {to_mode}, {action:?}|modify"
                 );
-                add_change(
+                emit_change(
                     from.clone(),
                     to.clone(),
                     action,
-                    &subpath,
-                    if is_rename { Some(from_path) } else { None },
-                    sink,
+                    measured,
+                    changes,
                     filter_mode,
                 )
                 .await?;
@@ -655,14 +855,17 @@ async fn add_change_for_paired_nodes(
                 if to_node.is_link() {
                     let link_repository_id: RepositoryId = to_node.address.context.into();
 
-                    let can_read_link = to.repository.can_read_link(link_repository_id);
+                    let can_read_link = to.mapping.repository.can_read_link(link_repository_id);
 
                     // If the link is staged and doesn't have staged children, it's a link update
                     let recurse_link = if !can_read_link {
                         false
                     } else {
-                        let linked_repository =
-                            Arc::new(to.repository.to_link_context(link_repository_id).await);
+                        let linked_repository = to
+                            .mapping
+                            .repository
+                            .to_link_context(link_repository_id)
+                            .await;
                         let linked_state =
                             State::deserialize(linked_repository.clone(), to_node.address.hash)
                                 .await
@@ -684,34 +887,36 @@ async fn add_change_for_paired_nodes(
                                  for linked repository {link_repository_id}"
                             );
                         }
-                        add_change(
+                        emit_change(
                             from.clone(),
                             to.clone(),
                             action,
-                            &subpath,
-                            None,
-                            sink,
+                            measured,
+                            changes,
                             filter_mode,
                         )
                         .await?;
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
                         let from_path = from_path.clone();
-                        let task_sink = sink.task_sink();
+                        let task_changes = changes.clone();
                         lore_spawn!(subtasks, async move {
                             recurse_diff_subtree_node(
                                 from,
                                 to,
-                                DiffPaths {
-                                    from: from_path,
-                                    to: subpath,
-                                    relocated_staged_directory: false,
+                                DiffCursor {
+                                    paths: DiffPaths {
+                                        from: from_path,
+                                        to: subpath,
+                                        relocated_staged_directory: false,
+                                    },
+                                    states: child_states,
                                 },
                                 flags,
                                 // A linked repository merges through its own
                                 // link.
                                 None,
-                                task_sink,
+                                task_changes,
                                 filter_mode,
                             )
                             .await
@@ -732,13 +937,12 @@ async fn add_change_for_paired_nodes(
                         lore_trace!(
                             "Diff node {subpath} unchanged on target, grafting subtree {from_address} -> {to_address}"
                         );
-                        add_change(
+                        emit_change(
                             from.clone(),
                             to.clone(),
                             change::FileAction::Graft,
-                            &subpath,
-                            None,
-                            sink,
+                            measured,
+                            changes,
                             filter_mode,
                         )
                         .await?;
@@ -748,19 +952,22 @@ async fn add_change_for_paired_nodes(
                         );
                         let from_path = from_path.clone();
                         let relocated_staged_directory = paths.relocated_staged_directory;
-                        let task_sink = sink.task_sink();
+                        let task_changes = changes.clone();
                         lore_spawn!(subtasks, async move {
                             recurse_diff_subtree_node(
                                 from,
                                 to,
-                                DiffPaths {
-                                    from: from_path,
-                                    to: subpath,
-                                    relocated_staged_directory,
+                                DiffCursor {
+                                    paths: DiffPaths {
+                                        from: from_path,
+                                        to: subpath,
+                                        relocated_staged_directory,
+                                    },
+                                    states: child_states,
                                 },
                                 flags,
                                 graft,
-                                task_sink,
+                                task_changes,
                                 filter_mode,
                             )
                             .await
@@ -774,24 +981,33 @@ async fn add_change_for_paired_nodes(
                 if was_file { "file" } else { "directory" },
                 if is_file { "file" } else { "directory" }
             );
+            let to_node_states = to_nodes
+                .repository
+                .filter
+                .child_excludes_tree(states.to, &subpath, to_node.is_directory(), filter_mode)
+                .0;
+            // Reported where a relocated staged directory now stands; elsewhere
+            // this is `from_path` itself.
+            let mut deleted = from.clone();
+            deleted.mapping.path = paths.deletion_path(from_path);
             add_change(
-                from.clone(),
+                deleted,
                 to.clone(),
                 change::FileAction::Delete,
-                &paths.deletion_path(from_path),
-                None,
-                sink,
+                change::Flags::None,
+                changes,
                 filter_mode,
+                from_node_states,
             )
             .await?;
             add_change(
                 from,
                 to,
                 change::FileAction::Add,
-                &subpath,
-                None,
-                sink,
+                change::Flags::None,
+                changes,
                 filter_mode,
+                to_node_states,
             )
             .await?;
         }
@@ -799,24 +1015,29 @@ async fn add_change_for_paired_nodes(
     Ok(())
 }
 
+/// The third element reports whether `directory_paths` was popped to the
+/// parent, which a caller holding a verdict for the path it passed in has to
+/// know about.
 async fn find_sorted_children(
     directory_paths: &mut DiffPaths,
     from: &NodeChangeState,
     to: &NodeChangeState,
-) -> Result<(StateChildrenNodes, StateChildrenNodes), StateError> {
+) -> Result<(StateChildrenNodes, StateChildrenNodes, bool), StateError> {
     // If the given path and subtrees are files and not directories, which
     // can be the case when called from library interfaces like status with
     // an explicit path, we need to handle this here.
     let is_file_path = {
         let is_from_file = from
+            .mapping
             .state
-            .node(from.repository.clone(), from.node)
+            .node(from.mapping.repository.clone(), from.mapping.node)
             .await
             .map(|node| node.is_file())
             .unwrap_or_default();
         let is_to_file = to
+            .mapping
             .state
-            .node(to.repository.clone(), to.node)
+            .node(to.mapping.repository.clone(), to.mapping.node)
             .await
             .map(|node| node.is_file())
             .unwrap_or_default();
@@ -827,43 +1048,51 @@ async fn find_sorted_children(
         // Given path was a file node, treat it as enumerating the parent directory
         // and finding a single node for that file
         let mut from_nodes = StateChildrenNodes {
-            repository: from.repository.clone(),
-            state: from.state.clone(),
+            repository: from.mapping.repository.clone(),
+            state: from.mapping.state.clone(),
             children: vec![],
         };
 
-        if from.node.is_valid_node_id()
-            && let Ok(node) = from.state.node(from.repository.clone(), from.node).await
+        if from.mapping.node.is_valid_node_id()
+            && let Ok(node) = from
+                .mapping
+                .state
+                .node(from.mapping.repository.clone(), from.mapping.node)
+                .await
         {
             from_nodes.children.push(StateNamedNode {
-                node: from.node,
+                node: from.mapping.node,
                 name: node.name_hash,
             });
         }
 
         let mut to_nodes = StateChildrenNodes {
-            repository: to.repository.clone(),
-            state: to.state.clone(),
+            repository: to.mapping.repository.clone(),
+            state: to.mapping.state.clone(),
             children: vec![],
         };
 
-        if to.node.is_valid_node_id()
-            && let Ok(node) = to.state.node(to.repository.clone(), to.node).await
+        if to.mapping.node.is_valid_node_id()
+            && let Ok(node) = to
+                .mapping
+                .state
+                .node(to.mapping.repository.clone(), to.mapping.node)
+                .await
         {
             to_nodes.children.push(StateNamedNode {
-                node: to.node,
+                node: to.mapping.node,
                 name: node.name_hash,
             });
         }
         directory_paths.from.pop();
         directory_paths.to.pop();
-        (from_nodes, to_nodes)
+        (from_nodes, to_nodes, true)
     } else {
         // Given path was a directory, enumerate all nodes
         let from_nodes = {
-            let repository = from.repository.clone();
-            let state = from.state.clone();
-            let node = from.node;
+            let repository = from.mapping.repository.clone();
+            let state = from.mapping.state.clone();
+            let node = from.mapping.node;
             lore_spawn!(async move {
                 let mut nodes = state
                     .collect_children_unsorted(
@@ -876,9 +1105,9 @@ async fn find_sorted_children(
             })
         };
         let to_nodes = {
-            let repository = to.repository.clone();
-            let state = to.state.clone();
-            let node = to.node;
+            let repository = to.mapping.repository.clone();
+            let state = to.mapping.state.clone();
+            let node = to.mapping.node;
             lore_spawn!(async move {
                 let mut nodes = state
                     .collect_children_unsorted(
@@ -901,6 +1130,7 @@ async fn find_sorted_children(
             to_nodes
                 .internal("Task failure")
                 .map_err(StateError::from)??,
+            false,
         )
     })
 }
@@ -910,7 +1140,65 @@ pub struct NodeSearchResult {
     pub path: RelativePath,
 }
 
-pub async fn get_node_and_path(
+/// The node a walk matched against an entry on disk.
+pub struct NodeMatch {
+    pub node: Node,
+    /// The node's own path, present only where the state spells its name differently from
+    /// the entry. Names are matched by a case-folded hash, so every other node is spelled
+    /// exactly by the entry and its path is built from that instead.
+    pub renamed_path: Option<RelativePath>,
+}
+
+impl NodeMatch {
+    /// The node's own path, for a change to record or a recursion to walk below.
+    ///
+    /// `parent` must be the one [`get_node_match`] was given and `name` the entry it was
+    /// matched against: a renamed node already carries a path built under that parent, and
+    /// answers with it whatever is passed here.
+    pub fn path(&self, parent: &RelativePath, name: &str) -> RelativePath {
+        match &self.renamed_path {
+            Some(path) => path.clone(),
+            None => parent.push_into_buf(name).freeze(),
+        }
+    }
+
+    /// Whether the state spells the node's name differently from the entry on disk.
+    pub fn renamed(&self) -> bool {
+        self.renamed_path.is_some()
+    }
+}
+
+/// The node `node_id` holds, matched against the entry named `name` in `parent`, or nothing
+/// where the node's name is unusable.
+///
+/// A walk matches far more nodes than it records, so no path is built for a node the state
+/// spells as the entry does; [`NodeMatch::path`] builds one where it is needed.
+pub async fn get_node_match(
+    nodes: &StateChildrenNodes,
+    node_id: NodeID,
+    name: &str,
+    parent: &RelativePath,
+) -> Result<Option<NodeMatch>, StateError> {
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+    let block = nodes
+        .state
+        .block_with_nametable(nodes.repository.clone(), block_index)
+        .await?;
+    let node = block.node(node_index);
+    let node_name = match block.node_name_ref(node_index) {
+        Ok(node_name) => node_name,
+        Err(err) => {
+            lore_warn!("Skipping node {} with invalid name: {err}", node_id);
+            return Ok(None);
+        }
+    };
+    let renamed_path = (*node_name != *name).then(|| parent.push_into_buf(&node_name).freeze());
+
+    Ok(Some(NodeMatch { node, renamed_path }))
+}
+
+async fn get_node_and_path(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,
@@ -929,29 +1217,35 @@ pub async fn get_node_and_path(
             return Ok(None);
         }
     };
-    let path = path.push_into_buf(&name).freeze();
+    let path = path.push_into_buf(name).freeze();
 
     Ok(Some(NodeSearchResult { node, path }))
 }
 
+/// [`get_node_and_path`] for a walk standing in `path`: `parent_states` is the
+/// filter's verdict for it, and the child's own is returned alongside the node
+/// for the walk to carry below.
 pub async fn get_filtered_node_and_path(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,
+    parent_states: FilterStates,
     filter_mode: FilterMode,
-) -> Result<Option<NodeSearchResult>, StateError> {
+) -> Result<Option<(NodeSearchResult, FilterStates)>, StateError> {
     Ok(get_node_and_path(nodes, node_id, path)
         .await?
         .and_then(|result| {
-            if nodes.repository.filter.emit_excludes(
+            let (states, excluded) = nodes.repository.filter.child_emit_excludes(
+                parent_states,
                 &result.path,
                 result.node.is_directory(),
                 filter_mode,
-            ) {
+            );
+            if excluded {
                 lore_trace!("Path excluded by filter: {}", path);
                 None
             } else {
-                Some(result)
+                Some((result, states))
             }
         }))
 }

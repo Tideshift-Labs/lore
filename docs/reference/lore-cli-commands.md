@@ -4,11 +4,13 @@ The `lore` command-line client drives every local and remote Lore operation: cre
 
 This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+1031`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
 
 ```bash
-{ sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
+printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
 ```
+
+`clap-markdown` ends its output with a blank line, which the quoted expansion strips. A subcommand carrying no help text renders as a trailing separator, which the whitespace hook rejects — write the help text rather than trimming the line.
 
 <!-- BEGIN generated: lore --markdown-help -->
 
@@ -137,6 +139,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore link remove`↴](#lore-link-remove)
 * [`lore link update`↴](#lore-link-update)
 * [`lore link list`↴](#lore-link-list)
+* [`lore link info`↴](#lore-link-info)
 * [`lore status`↴](#lore-status)
 * [`lore clone`↴](#lore-clone)
 * [`lore stage`↴](#lore-stage)
@@ -161,12 +164,15 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service set-executable`↴](#lore-service-set-executable)
+* [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
 * [`lore shared-store`↴](#lore-shared-store)
 * [`lore shared-store create`↴](#lore-shared-store-create)
 * [`lore shared-store info`↴](#lore-shared-store-info)
+* [`lore shared-store list`↴](#lore-shared-store-list)
 * [`lore shared-store set-use-automatically`↴](#lore-shared-store-set-use-automatically)
 
 ## `lore`
@@ -214,16 +220,21 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
-* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service. On its own it acts as the identity the token was issued to, and operations needing an authentication token fail rather than falling back to the secure store
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
 * `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
 * `--search-limit <SEARCH_LIMIT>` — Set maximum number of revisions to search when matching or finding revisions
 * `--search-nearest` — Set to search for nearest match when matching revisions
-* `--gc` — Set to run automatic garbage collection on local store in background
+* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
+* `--stats <level>` — Report what the operation cost: `--stats` for totals, `--stats=2` to add per-fragment detail
+
+  Default value: `0`
+* `--event-interval <milliseconds>` — How often to emit progress events, in milliseconds
 
 
 
@@ -309,16 +320,28 @@ List repositories
 
 Create a repository in the given directory
 
-**Usage:** `lore repository create [OPTIONS] <url>`
+**Usage:** `lore repository create [OPTIONS] [url]`
 
 ###### **Arguments:**
 
-* `<url>` — URL of repository
+* `<url>` — URL of repository. With --offline this is the repository name instead, and may be omitted to name it after the current directory
 
 ###### **Options:**
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+
+  Default value: `none`
+
+  Possible values:
+  - `none`:
+    No virtual file system; files are materialized directly on disk
+  - `default`:
+    Use whichever VFS system is preferred based on the user's system
+  - `swfs`:
+    Use Epic's Split Write File System as the Virtual File System
+
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
@@ -341,8 +364,19 @@ Clone a remote repository into the given path
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
-* `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+
+  Default value: `none`
+
+  Possible values:
+  - `none`:
+    No virtual file system; files are materialized directly on disk
+  - `default`:
+    Use whichever VFS system is preferred based on the user's system
+  - `swfs`:
+    Use Epic's Split Write File System as the Virtual File System
+
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -366,7 +400,7 @@ Delete a repository
 
 ###### **Arguments:**
 
-* `<url>` — URL of repository
+* `<url>` — URL of repository, or a bare name or ID resolved against this repository's remote
 
 
 
@@ -544,7 +578,7 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
 
 
 
@@ -558,7 +592,7 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries
+Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
 
 **Usage:** `lore repository instance prune`
 
@@ -720,6 +754,7 @@ Merge two branches
 
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
+* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 
 
@@ -755,6 +790,7 @@ Merge into branch
 * `--id <branch-id>` — ID of the target branch to merge the current branch into
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
+* `--inherit-metadata <KEY>` — Carry this metadata key from the current branch onto the revision created on the target branch. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 
 
@@ -776,6 +812,7 @@ Start a merge process
 * `--dry-run` — Do a dry run merge start and only report what changes would be done, do not change anything in the file system
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
+* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 
 
@@ -883,11 +920,18 @@ Diff two branches using the common ancestor base revision Will calculate the set
 
 Archive an existing branch
 
-**Usage:** `lore branch archive <branch>`
+**Usage:** `lore branch archive [OPTIONS] <branch>`
 
 ###### **Arguments:**
 
 * `<branch>` — Name of the branch to archive
+
+###### **Options:**
+
+* `--include-layers` — Also archive the branch in every configured layer
+* `--layer <path>` — Also archive the branch in the layer at the given mount path
+* `--include-links` — Also archive the branch in every configured link
+* `--link <path>` — Also archive the branch in the link at the given mount path
 
 
 
@@ -939,11 +983,13 @@ Branch latest related commands
 
 ###### **Subcommands:**
 
-* `list` —
+* `list` — List previous latest pointers of a branch
 
 
 
 ## `lore branch latest list`
+
+List previous latest pointers of a branch
 
 **Usage:** `lore branch latest list [OPTIONS] [LIMIT]`
 
@@ -1092,7 +1138,6 @@ Commit the staged state
 
 ###### **Options:**
 
-* `--stats` — Print stats
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
@@ -1104,15 +1149,11 @@ Commit the staged state
 
 Amend the latest commit's message
 
-**Usage:** `lore revision amend [OPTIONS] <MESSAGE>`
+**Usage:** `lore revision amend <MESSAGE>`
 
 ###### **Arguments:**
 
 * `<MESSAGE>` — Commit message
-
-###### **Options:**
-
-* `--stats` — Print stats
 
 
 
@@ -1126,7 +1167,7 @@ Synchronize to a given state of a repository
 
 ###### **Arguments:**
 
-* `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
 
 ###### **Options:**
 
@@ -1244,6 +1285,7 @@ Cherry-pick a revision onto the currently synced revision
 
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the cherry-pick
 * `--no-commit` — Disable auto commits even if no conflicts arise from the cherry-pick
+* `--inherit-metadata <KEY>` — Carry this metadata key from the picked revision onto the revision this creates. Repeatable. Pass `*` to carry every key that is not reserved to the cherry-pick itself. Carries nothing when not given
 
 
 
@@ -1978,7 +2020,8 @@ Display identity information for the current user or specified user IDs
 
 ###### **Options:**
 
-* `--with-token` — Include cached tokens in the output
+* `--with-identity-token` — Include cached identity tokens in the output
+* `--with-access-token` — Include the current repository's access token in the output
 
 
 
@@ -2124,6 +2167,7 @@ Link commands
 * `remove` — Remove the link at the given point in the repository
 * `update` — Update the link to a new pin
 * `list` — List all links in the repository
+* `info` — Show detailed information about the link at the given path
 
 
 
@@ -2186,6 +2230,18 @@ List all links in the repository
 
 
 
+## `lore link info`
+
+Show detailed information about the link at the given path
+
+**Usage:** `lore link info <link_path>`
+
+###### **Arguments:**
+
+* `<link_path>` — Path in the repository of the link to describe
+
+
+
 ## `lore status`
 
 Show current repository status.
@@ -2234,8 +2290,19 @@ Clone a remote repository into the given path
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
-* `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+
+  Default value: `none`
+
+  Possible values:
+  - `none`:
+    No virtual file system; files are materialized directly on disk
+  - `default`:
+    Use whichever VFS system is preferred based on the user's system
+  - `swfs`:
+    Use Epic's Split Write File System as the Virtual File System
+
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -2462,7 +2529,6 @@ Commit the staged revision
 
 ###### **Options:**
 
-* `--stats` — Print stats
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
@@ -2480,7 +2546,7 @@ Synchronize to a repository state
 
 ###### **Arguments:**
 
-* `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
 
 ###### **Options:**
 
@@ -2598,8 +2664,10 @@ Manage the repository in a service process
 ###### **Subcommands:**
 
 * `run` — Run this process as the service
-* `start` — Start service for a repository
-* `stop` — Stop service for a repository
+* `start` — Start the service, unless one is already running
+* `stop` — Stop the running service
+* `set-executable` — Set which executable is started as the service
+* `set-use-automatically` — Set whether commands are carried out by the service
 
 
 
@@ -2613,7 +2681,7 @@ Run this process as the service
 
 ## `lore service start`
 
-Start service for a repository
+Start the service, unless one is already running
 
 **Usage:** `lore service start`
 
@@ -2621,13 +2689,35 @@ Start service for a repository
 
 ## `lore service stop`
 
-Stop service for a repository
+Stop the running service
 
-**Usage:** `lore service stop [all]`
+**Usage:** `lore service stop`
+
+
+
+## `lore service set-executable`
+
+Set which executable is started as the service
+
+**Usage:** `lore service set-executable [path]`
 
 ###### **Arguments:**
 
-* `<all>` — Flag to stop servicing all repositories
+* `<path>` — Path of the executable to start as the service. Leave empty to clear it
+
+
+
+## `lore service set-use-automatically`
+
+Set whether commands are carried out by the service
+
+**Usage:** `lore service set-use-automatically <enabled>`
+
+###### **Arguments:**
+
+* `<enabled>` — Whether to carry commands out in the service
+
+   `Set` rather than the default a `bool` field is given: this reads a value rather than being present or absent, and clap refuses a positional whose action takes none.
 
   Possible values: `true`, `false`
 
@@ -2682,13 +2772,16 @@ Manage the shared store
 
 ###### **Subcommands:**
 
-* `create` —
-* `info` —
-* `set-use-automatically` —
+* `create` — Create a shared store backed by a remote
+* `info` — Show the shared store this repository uses
+* `list` — Show information about the registry of shared stores
+* `set-use-automatically` — Set whether new clones use a shared store without being asked to
 
 
 
 ## `lore shared-store create`
+
+Create a shared store backed by a remote
 
 **Usage:** `lore shared-store create [OPTIONS] <remote-url>`
 
@@ -2708,11 +2801,30 @@ Manage the shared store
 
 ## `lore shared-store info`
 
+Show the shared store this repository uses
+
 **Usage:** `lore shared-store info`
 
 
 
+## `lore shared-store list`
+
+Show information about the registry of shared stores
+
+**Usage:** `lore shared-store list [OPTIONS]`
+
+###### **Options:**
+
+* `--include-instances <INCLUDE_INSTANCES>` — Look up all instances each shared store is used by
+
+  Possible values: `true`, `false`
+
+
+
+
 ## `lore shared-store set-use-automatically`
+
+Set whether new clones use a shared store without being asked to
 
 **Usage:** `lore shared-store set-use-automatically <enabled>`
 

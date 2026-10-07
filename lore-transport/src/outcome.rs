@@ -377,7 +377,7 @@ mod tests {
         assert!(!error.is_disconnected());
         assert!(!error.is_slow_down());
         assert!(!error.is_not_found());
-        assert_eq!(error.ffi_code(), 193);
+        assert_eq!(error.ffi_code(), 248);
     }
 
     /// An applied outcome passes through untouched.

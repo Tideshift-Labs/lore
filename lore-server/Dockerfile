@@ -24,10 +24,17 @@ COPY . .
 ARG LORE_REVISION
 ENV LORE_BUILD_VERSION_NAME=${LORE_REVISION}
 
+# arm64 always builds Graviton3+/Neoverse V1-tuned.
+ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure && \
+    if [ "$TARGETARCH" = "arm64" ]; then \
+        cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure \
+            --config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb; \
+    else \
+        cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure; \
+    fi && \
     cp /build/target/release/loreserver /build/loreserver-bin && \
     cp /build/target/release/cell-schema-install /build/cell-schema-install-bin && \
     cp /build/target/release/cell-budget-configure /build/cell-budget-configure-bin && \

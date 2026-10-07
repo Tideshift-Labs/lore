@@ -82,14 +82,17 @@ fn postgres_only_settings(url: &str) -> Settings {
     settings.lock_store = Some(LockStoreSettings {
         mode: "postgres".into(),
     });
-    settings.server.auth = Some(AuthSettings {
-        jwk: Some(JWKServiceSettings {
-            endpoint: "https://issuer.invalid/jwks".into(),
-        }),
-        jwt_audience: None,
-        jwt_issuer: Some("https://issuer.invalid".into()),
-        enforce_write_permission: true,
+    // Upstream v0.10.0 makes jwt_issuer/jwt_audience mandatory; resource_claim keeps the fork's
+    // GlobalGrants refusal out of the way. enforce_write_permission defaults to true.
+    let mut auth: AuthSettings = toml::from_str(
+        "jwt_issuer = 'https://issuer.invalid'\njwt_audience = ['lore']\nresource_claim = 'resources'",
+    )
+    .unwrap();
+    auth.jwk = Some(JWKServiceSettings {
+        endpoint: Some("https://issuer.invalid/jwks".into()),
     });
+    assert!(auth.enforce_write_permission);
+    settings.server.auth = Some(auth);
     let plugin = format!("url = {url:?}\npool_max = 4\ndomain_pool_max = 4\n");
     settings
         .plugins

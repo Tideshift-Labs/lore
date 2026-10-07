@@ -34,6 +34,7 @@ use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -129,16 +130,18 @@ async fn repository_delete(
     let Ok(data) = repository_query_id(
         repository.clone(),
         repository.id,
-        None, /* auth url */
-        None, /* authorization */
+        None, /* skip authz */
+        None, /* token */
     )
     .await
+    .filter_slow_down()?
     else {
         return Err(Status::not_found("Repository does not exist"));
     };
 
     let metadata = repository::metadata(repository.clone(), data.metadata)
         .await
+        .filter_slow_down()?
         .map_err(|_err| Status::not_found("Repository metadata not found"))?;
 
     let user_id = execution_context().user_id().await;
@@ -169,17 +172,23 @@ async fn repository_delete(
         RepositoryId::default(),
     )
     .await
+    .filter_slow_down()?
     .warn_map_err(|err| {
         Status::internal(format!("Failed to delete repository name mapping: {err}"))
     })?;
 
     repository::metadata_store_hash(repository.clone(), Hash::default())
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| {
             Status::internal(format!("Failed to delete repository metadata: {err}"))
         })?;
 
     // Purge any branches
+    // no filter_slow_down()? usage here: the repository record is already
+    // torn down above, so this purge is past the point of no return. A
+    // retryable status would invite a retry that only finds the repository
+    // gone, leaving these keys orphaned.
     if let Ok(mut branch_stream) = branch::list(repository.clone()).await {
         let mut branch_list = vec![];
         while let Some(branch) = branch_stream.next().await {

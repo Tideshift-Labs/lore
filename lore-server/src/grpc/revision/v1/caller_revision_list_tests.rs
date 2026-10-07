@@ -23,7 +23,11 @@ async fn caller_required_revision_lists_preserve_history_without_mutable_backfil
                     assert_eq!(response.items.len(), 2);
                     assert_eq!(Hash::from(response.items[0].signature.as_ref()), signatures[1]);
                 } else {
-                    let mut request = tonic::Request::new(lore_proto::RevisionListRequest { start: Some(lore_proto::revision_list_request::Start::Identifier(lore_proto::RevisionIdentifer { branch: branch_id.into(), number: 2 })) });
+                    // v0 starts at #3, not #2. Upstream 4ed62928 seals boundary B only when
+                    // the walk crosses older <= B < newer, so the #2 -> #1 step seals nothing
+                    // at step size 2. The #3 -> #2 step seals boundary 2. Both policies take
+                    // the same path, so the required case must suppress a real write.
+                    let mut request = tonic::Request::new(lore_proto::RevisionListRequest { start: Some(lore_proto::revision_list_request::Start::Identifier(lore_proto::RevisionIdentifer { branch: branch_id.into(), number: 3 })) });
                     request.metadata_mut().insert_bin(REPOSITORY_ID_KEY, tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()));
                     request.extensions_mut().insert(policy);
                     let provider = TestInstrumentProvider {};
@@ -33,7 +37,8 @@ async fn caller_required_revision_lists_preserve_history_without_mutable_backfil
                         walk_duration: provider.latency_histogram_ms("caller-test.walk"),
                     };
                     let response = crate::grpc::handlers::revision_list::handler(request, immutable, spy, 2, crate::grpc::server::RevisionListAcceleration { step_keys: true, list_cache: false }, &instruments).await.unwrap().into_inner();
-                    assert_eq!(response.items.len(), 2);
+                    assert_eq!(response.items.len(), 3);
+                    assert_eq!(Hash::from(response.items[0].signature.as_ref()), signatures[0]);
                 }
                 if required { assert_eq!(writes.load(Ordering::SeqCst), 0, "v1={v1}"); }
                 else { assert!(writes.load(Ordering::SeqCst) > 0, "compatible positive control v1={v1}"); }

@@ -212,7 +212,7 @@ impl ImmutableStore for RpcStore {
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
         None
     }
-    async fn compact_stop(self: Arc<Self>) {}
+    async fn stop_gc(self: Arc<Self>, _terminate: bool) {}
     fn max_query_batch(&self) -> Option<usize> {
         None
     }

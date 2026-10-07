@@ -45,6 +45,8 @@ oodle = []
 trace_log = []
 
 [dev-dependencies]
+# The shared test temp-directory helper, re-exported by src/test_util.rs.
+lore-base = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]

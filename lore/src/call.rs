@@ -22,8 +22,8 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
-use lore_revision::repository::RepositoryFormat;
 pub use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::repository::get_dot_lore_path;
 use lore_revision::util;
 use lore_transport::outcome::AttemptId;
 use uuid::Uuid;
@@ -502,9 +502,8 @@ async fn prepare_repository_call(
         }
     };
 
-    let format = RepositoryFormat::detect(&repository_path);
-    let dot_dir = format.dot_dir();
-    if !repository_path.join(dot_dir).is_dir() {
+    let dotpath = get_dot_lore_path(&repository_path).map_err(|err| err.ffi_code())?;
+    if !dotpath.is_dir() {
         let err = RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
         });
@@ -563,9 +562,22 @@ where
         }
     };
 
-    let format = RepositoryFormat::detect(&repository_path);
-    let dot_dir = format.dot_dir();
-    if !repository_path.join(dot_dir).is_dir() {
+    // Upstream's mount-aware lookup, as the untyped path uses. Its refusal is dispatched here
+    // like every other pre-command failure on this path, rather than returned bare.
+    let dotpath = match get_dot_lore_path(&repository_path) {
+        Ok(dotpath) => dotpath,
+        Err(invalid) => {
+            let err = ErrT::from(RepositoryError::from(invalid));
+            let detail = LoreErrorDetail::from_error(&err);
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let _ = execution_context().dispatcher.complete(detail).await;
+                })
+                .await;
+            return Err(err);
+        }
+    };
+    if !dotpath.is_dir() {
         let err = ErrT::from(RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),
         }));

@@ -44,7 +44,7 @@ use lore_transport::ReplayClass;
 use lore_transport::quic::storage_service::Command;
 use lore_transport::storage_replay_class;
 
-/// B12: every `Command` variant classified by name, exhaustively. Adding a 13th `Command` variant
+/// B12: every `Command` variant classified by name, exhaustively. Adding a 14th `Command` variant
 /// without extending this match is a compile error, not a silently-defaulted class.
 fn classify(command: Command) -> ReplayClass {
     match command {
@@ -66,6 +66,9 @@ fn classify(command: Command) -> ReplayClass {
         // connection close reaps, and a lost `session_stop` response is idempotent. Neither
         // publishes a lifecycle association nor advances a mutable key.
         Command::Authorize => ReplayClass::ReadRetryable,
+        // Announces the client's user agent. No lifecycle association, no mutable key, and a repeat
+        // restates the same identity.
+        Command::ClientIdentify => ReplayClass::ReadRetryable,
     }
 }
 
@@ -80,6 +83,7 @@ fn every_command_variant_matches_the_normative_cr_026_classification() {
         Command::Query,
         Command::MutableLoad,
         Command::Authorize,
+        Command::ClientIdentify,
     ];
     let mutable_no_replay = [
         Command::Put,
@@ -90,9 +94,9 @@ fn every_command_variant_matches_the_normative_cr_026_classification() {
         Command::Verify,
     ];
 
-    // 12 total: 6 read-retryable + 6 mutable-no-replay. If this count ever drifts, a variant was
+    // 13 total: 7 read-retryable + 6 mutable-no-replay. If this count ever drifts, a variant was
     // added to `Command` without a corresponding entry in one of these two lists above.
-    assert_eq!(read_retryable.len() + mutable_no_replay.len(), 12);
+    assert_eq!(read_retryable.len() + mutable_no_replay.len(), 13);
 
     for command in read_retryable {
         assert_eq!(

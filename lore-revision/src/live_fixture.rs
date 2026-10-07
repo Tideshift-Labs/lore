@@ -1037,7 +1037,6 @@ impl LiveRepository {
                 link: None,
                 layer_messages: HashMap::new(),
                 layer: None,
-                stats: false,
             },
         ))
         .await

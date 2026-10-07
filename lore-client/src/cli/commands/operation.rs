@@ -6,6 +6,8 @@ use std::sync::Arc;
 
 use lore::interface::LoreGlobalArgs;
 use lore_revision::attempt_store::RepositoryAttemptStore;
+use lore_revision::lore_base::error::OutcomeUnknown;
+use lore_revision::lore_base::error::UnnameableResource;
 use lore_revision::repository_fence::RepositoryMutationGuard;
 use lore_transport::AttemptId;
 use lore_transport::AttemptStore;
@@ -210,14 +212,14 @@ where
             .await;
         // A crash before this proof, or an unnameable resource, cannot be cleared by
         // receipts for named children alone.
-        if status == 194 {
+        if status == UnnameableResource::FFI_CODE {
             if let Err(error) = store.mark_parent_uncertain(parent, status).await {
                 crate::eprintln!("{error}");
             }
         } else {
             store.complete_parent_body(parent).await?;
         }
-        if status != 193 && status != 194 {
+        if status != OutcomeUnknown::FFI_CODE && status != UnnameableResource::FFI_CODE {
             fence.finish(parent).await?;
         }
         Ok::<_, lore_transport::ProtocolError>(status)

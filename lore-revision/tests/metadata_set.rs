@@ -43,7 +43,6 @@ mod tests {
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
@@ -90,14 +89,16 @@ mod tests {
             .expect("Failed to initialize repository");
             let repository = Arc::new(
                 RepositoryContext::new(RepositoryContextCreationArgs {
-                    path: Some(root.clone()),
+                    paths: Some(repository::RepositoryPaths::new(
+                        root.clone(),
+                        root.join(repository::DOT_LORE),
+                    )),
                     immutable_store,
                     mutable_store,
                     id: repository_id,
                     instance_id: created_repo.instance_id,
                     remote: Err(ProtocolError::from(NoRemote)),
                     filter: Arc::default(),
-                    format: RepositoryFormat::Lore,
                     filesystem_provider: None,
                 })
                 .with_write_token(write_token.share()),
@@ -192,7 +193,6 @@ mod tests {
                 link: None,
                 layer_messages: HashMap::new(),
                 layer: None,
-                stats: false,
             },
         ))
         .await

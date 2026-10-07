@@ -4,6 +4,7 @@ pub mod chunker;
 pub mod compress;
 pub mod concurrency;
 pub mod conformance;
+pub mod content;
 pub mod defragment;
 pub mod error;
 pub mod errors;
@@ -31,9 +32,8 @@ pub(crate) mod test_util;
 pub(crate) mod typed_bytes;
 pub(crate) mod types;
 pub mod write;
+pub mod write_stats;
 pub mod write_tracker;
-
-use std::time::Duration;
 
 // Re-export compress types
 pub use compress::COMPRESSION_MODE;
@@ -44,6 +44,9 @@ pub use compress::FragmentError;
 pub use compress::compress;
 pub use compress::decompress;
 pub use compress::decompress_into_slice;
+pub use compress::set_compression_level;
+pub use compress::suggest_compression_mode;
+pub use compress::writable_compression_mode;
 // Re-export concurrency primitives
 pub use concurrency::FILE_COUNT_LIMIT_DEFAULT;
 pub use concurrency::FRAGMENT_BUDGET_KIB;
@@ -58,6 +61,9 @@ pub use concurrency::file_count_limit_acquire;
 pub use concurrency::file_count_limiter;
 pub use concurrency::fragment_limiter;
 pub use concurrency::fragment_permit_count;
+pub use content::ContentHandle;
+pub use content::ContentSource;
+pub use content::WindowRead;
 // Re-export new read/write/defragment types
 pub use defragment::DefragmentSink;
 pub use error::StorageError;
@@ -86,6 +92,8 @@ pub use hash::hash_string_bytes;
 // Re-export store traits
 pub use immutable_store::ImmutableStore;
 pub use immutable_store::StoreError;
+pub(crate) use immutable_store::payload_is_content;
+pub(crate) use immutable_store::validate_buffer_capacity;
 pub use immutable_store::validate_fragment_list;
 pub use immutable_store::validate_fragment_metadata;
 pub use immutable_store::validate_fragment_payload;
@@ -99,6 +107,10 @@ pub use local::mutable_store::LocalMutableStoreError;
 pub use local::mutable_store::MutableStoreSettings;
 use lore_base::lore_info;
 use lore_base::lore_warn;
+pub use lore_base::retry::DEFAULT_JITTER;
+pub use lore_base::retry::Retry;
+pub use lore_base::retry::retry;
+pub use lore_base::retry::retry_with_jitter;
 // Re-export maintenance functions
 pub use maintenance::compactor;
 pub use maintenance::evictor;
@@ -108,6 +120,7 @@ pub use mutable_store::MutableStore;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore
+pub use packstore::CallerBuffer;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
@@ -117,9 +130,12 @@ pub use read::load_fragment;
 pub use read::load_raw_local;
 pub use read::read;
 pub use read::read_into;
+pub use read::read_into_buffer;
 pub use read::read_into_file;
 pub use read::read_raw;
 pub use read::read_resolved;
+pub use read::read_resolved_into_buffer;
+pub use read::read_resolved_into_file;
 pub use read::read_resolved_stream;
 pub use read::read_stream;
 pub use read::remote_fetch_inflight;
@@ -127,6 +143,7 @@ pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;
 pub use store_types::KeyValueStream;
+pub use store_types::PayloadRead;
 pub use store_types::StoreGetData;
 pub use store_types::StoreMatch;
 pub use store_types::StoreMatchResult;
@@ -150,7 +167,9 @@ pub use types::deserialize_context;
 pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
+pub use write::ContentHashes;
 pub use write::FileMatch;
+pub use write::FusedPublish;
 pub use write::StoreResult;
 pub use write::content_write_inflight;
 pub use write::content_write_peak;
@@ -166,55 +185,22 @@ pub use write::write_content;
 pub use write::write_from_file;
 pub use write::write_raw;
 pub use write::write_resolved;
+pub use write::write_resolved_from_file;
+pub use write_stats::FragmentWriteCounts;
+pub use write_stats::FragmentWriteStats;
+pub use write_tracker::WriteContext;
+pub use write_tracker::WriteTracker;
 
-/// Retry waiter with exponential backoff and jitter.
-pub struct Retry {
-    current: u64,
-    maximum: u64,
-    jitter: f32,
-    counter: usize,
-    limit: usize,
-}
-
-const DEFAULT_JITTER: f32 = 0.1;
-
-impl Retry {
-    pub async fn wait(&mut self) -> bool {
-        if self.counter >= self.limit {
-            return false;
-        }
-
-        // Generate some jitter to avoid alignment storms
-        let jitter = rand::random::<f32>() * self.jitter;
-        let jitter = std::cmp::min((jitter * self.current as f32) as u64, 100);
-
-        tokio::time::sleep(Duration::from_millis(self.current + jitter)).await;
-
-        self.current = std::cmp::min(self.current * 2, self.maximum);
-        self.counter += 1;
-
-        true
-    }
-
-    pub fn counter(&self) -> usize {
-        self.counter
-    }
-
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-}
-
-/// Create a retry waiter, start and maximum times in milliseconds. Will give up
-/// after trying for the limit number of times.
-pub fn retry(start: u64, maximum: u64, limit: usize) -> Retry {
-    Retry {
-        current: start,
-        maximum,
-        jitter: DEFAULT_JITTER,
-        counter: 0,
-        limit,
-    }
+/// Back-off for store operations, including every `SlowDown` retry path. Tops out at one second
+/// so a caller that can recompute is not held for minutes.
+pub fn store_retry() -> Retry {
+    retry(
+        50,
+        1_000,
+        *STORE_RETRY_ATTEMPTS.get_or_init(|| {
+            60 //default try 60 times
+        }),
+    )
 }
 
 /// Store interactions use a retry policy to retry failures.

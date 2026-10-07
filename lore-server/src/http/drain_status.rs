@@ -172,6 +172,9 @@ mod tests {
             immutable_store,
             mutable_store,
             jwt_verifier: None,
+            repository_authorizer: std::sync::Arc::new(
+                crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+            ),
             max_file_size: 100,
             presign_config: None,
         };

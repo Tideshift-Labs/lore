@@ -419,93 +419,101 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn admits_exact_mixed_actions_and_rename_then_deserializes_published_state() {
         LORE_CONTEXT
-            .scope(execution(), async {
-                let fixture = Fixture::new().await;
-                fixture.write("stable.txt", b"stable-before\n");
-                fixture.write("same-size.bin", b"AAAA");
-                fixture.write("delete.txt", b"delete me\n");
-                fixture.write("old-name.txt", b"rename payload\n");
-                fixture.seed_commit("baseline").await;
+            .scope(
+                execution(),
+                Box::pin(async {
+                    let fixture = Fixture::new().await;
+                    fixture.write("stable.txt", b"stable-before\n");
+                    fixture.write("same-size.bin", b"AAAA");
+                    fixture.write("delete.txt", b"delete me\n");
+                    fixture.write("old-name.txt", b"rename payload\n");
+                    fixture.seed_commit("baseline").await;
 
-                let stable = b"stable-after-with-a-different-size\n";
-                let same_size = b"BBBB";
-                let added = b"new payload\n";
-                fixture.write("stable.txt", stable);
-                fixture.write("same-size.bin", same_size);
-                fixture.write("add.txt", added);
-                std::fs::remove_file(fixture.absolute("delete.txt")).expect("delete tracked file");
-                std::fs::rename(
-                    fixture.absolute("old-name.txt"),
-                    fixture.absolute("new-name.txt"),
-                )
-                .expect("rename tracked file");
-
-                let result = fixture
-                    .exact(
-                        "mixed exact transaction",
-                        vec![
-                            selected("stable.txt", ExpectedFileAction::Modify, Some(stable)),
-                            selected("same-size.bin", ExpectedFileAction::Modify, Some(same_size)),
-                            selected("add.txt", ExpectedFileAction::Add, Some(added)),
-                            selected("delete.txt", ExpectedFileAction::Delete, None),
-                            selected("old-name.txt", ExpectedFileAction::Delete, None),
-                            selected(
-                                "new-name.txt",
-                                ExpectedFileAction::Add,
-                                Some(b"rename payload\n"),
-                            ),
-                        ],
+                    let stable = b"stable-after-with-a-different-size\n";
+                    let same_size = b"BBBB";
+                    let added = b"new payload\n";
+                    fixture.write("stable.txt", stable);
+                    fixture.write("same-size.bin", same_size);
+                    fixture.write("add.txt", added);
+                    std::fs::remove_file(fixture.absolute("delete.txt"))
+                        .expect("delete tracked file");
+                    std::fs::rename(
+                        fixture.absolute("old-name.txt"),
+                        fixture.absolute("new-name.txt"),
                     )
-                    .await
-                    .expect("admit exact mixed transaction");
+                    .expect("rename tracked file");
 
-                let expected_actions = vec![
-                    row("add.txt", ExpectedFileAction::Add),
-                    row("delete.txt", ExpectedFileAction::Delete),
-                    row("new-name.txt", ExpectedFileAction::Add),
-                    row("old-name.txt", ExpectedFileAction::Delete),
-                    row("same-size.bin", ExpectedFileAction::Modify),
-                    row("stable.txt", ExpectedFileAction::Modify),
-                ];
-                assert_eq!(result.generated_actions, expected_actions);
-                assert_eq!(result.effective_actions, expected_actions);
+                    let result = fixture
+                        .exact(
+                            "mixed exact transaction",
+                            vec![
+                                selected("stable.txt", ExpectedFileAction::Modify, Some(stable)),
+                                selected(
+                                    "same-size.bin",
+                                    ExpectedFileAction::Modify,
+                                    Some(same_size),
+                                ),
+                                selected("add.txt", ExpectedFileAction::Add, Some(added)),
+                                selected("delete.txt", ExpectedFileAction::Delete, None),
+                                selected("old-name.txt", ExpectedFileAction::Delete, None),
+                                selected(
+                                    "new-name.txt",
+                                    ExpectedFileAction::Add,
+                                    Some(b"rename payload\n"),
+                                ),
+                            ],
+                        )
+                        .await
+                        .expect("admit exact mixed transaction");
 
-                let anchors = fixture.anchors().await;
-                assert_eq!(anchors.current, result.revision);
-                assert_eq!(anchors.branch_latest, result.revision);
-                assert_eq!(anchors.staged, None);
-                let committed = State::deserialize(fixture.repository.clone(), result.revision)
-                    .await
-                    .expect("deserialize exact published revision");
-                assert_eq!(
-                    collect_files(&fixture, committed).await,
-                    BTreeSet::from([
-                        "add.txt".to_string(),
-                        "new-name.txt".to_string(),
-                        "same-size.bin".to_string(),
-                        "stable.txt".to_string(),
-                    ])
-                );
-                assert_eq!(
-                    committed_bytes(&fixture, result.revision, "stable.txt").await,
-                    stable
-                );
-                assert_eq!(
-                    committed_bytes(&fixture, result.revision, "same-size.bin").await,
-                    same_size
-                );
-                assert_eq!(
-                    committed_bytes(&fixture, result.revision, "new-name.txt").await,
-                    b"rename payload\n"
-                );
-            })
+                    let expected_actions = vec![
+                        row("add.txt", ExpectedFileAction::Add),
+                        row("delete.txt", ExpectedFileAction::Delete),
+                        row("new-name.txt", ExpectedFileAction::Add),
+                        row("old-name.txt", ExpectedFileAction::Delete),
+                        row("same-size.bin", ExpectedFileAction::Modify),
+                        row("stable.txt", ExpectedFileAction::Modify),
+                    ];
+                    assert_eq!(result.generated_actions, expected_actions);
+                    assert_eq!(result.effective_actions, expected_actions);
+
+                    let anchors = fixture.anchors().await;
+                    assert_eq!(anchors.current, result.revision);
+                    assert_eq!(anchors.branch_latest, result.revision);
+                    assert_eq!(anchors.staged, None);
+                    let committed = State::deserialize(fixture.repository.clone(), result.revision)
+                        .await
+                        .expect("deserialize exact published revision");
+                    assert_eq!(
+                        collect_files(&fixture, committed).await,
+                        BTreeSet::from([
+                            "add.txt".to_string(),
+                            "new-name.txt".to_string(),
+                            "same-size.bin".to_string(),
+                            "stable.txt".to_string(),
+                        ])
+                    );
+                    assert_eq!(
+                        committed_bytes(&fixture, result.revision, "stable.txt").await,
+                        stable
+                    );
+                    assert_eq!(
+                        committed_bytes(&fixture, result.revision, "same-size.bin").await,
+                        same_size
+                    );
+                    assert_eq!(
+                        committed_bytes(&fixture, result.revision, "new-name.txt").await,
+                        b"rename payload\n"
+                    );
+                }),
+            )
             .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn rejects_public_input_and_semantic_mismatches_without_publishing_anchors() {
         LORE_CONTEXT
-            .scope(execution(), async {
+            .scope(execution(), Box::pin(async {
                 let fixture = Fixture::new().await;
                 let original = b"original bytes\n";
                 fixture.write("tracked.txt", original);
@@ -607,7 +615,7 @@ mod tests {
                     |kind| matches!(kind, ExactSelectionErrorKind::InvalidInput { paths, .. } if paths == &vec!["tracked.txt".to_string()]),
                 )
                 .await;
-            })
+            }))
             .await;
     }
 
@@ -693,240 +701,251 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn unchanged_modify_metadata_inherits_committed_not_abandoned_staged_state() {
         LORE_CONTEXT
-            .scope(execution(), async {
-                let fixture = Fixture::new().await;
-                fixture.write("tracked.bin", b"baseline\n");
-                fixture.stage_all().await;
-                let tracked_path = fixture.absolute("tracked.bin");
-                metadata::set::set_file(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    &[tracked_path.to_string_lossy().as_ref()],
-                    &[b"owner"],
-                    &[b"committed"],
-                    &[MetadataType::String],
-                    &[1],
-                )
-                .await
-                .expect("seed committed file metadata");
-                let baseline = Box::pin(commit::commit(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    CommitOptions::new("metadata baseline".to_string()),
-                ))
-                .await
-                .expect("commit metadata baseline");
-                let (committed_hash, committed_metadata) =
-                    file_metadata_at(&fixture, baseline, "tracked.bin")
-                        .await
-                        .expect("load committed metadata");
-                assert_eq!(
-                    committed_metadata
-                        .get_string("owner")
-                        .expect("committed owner metadata"),
-                    "committed"
-                );
-
-                metadata::set::set_file(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    &[tracked_path.to_string_lossy().as_ref()],
-                    &[b"owner"],
-                    &[b"abandoned-staged"],
-                    &[MetadataType::String],
-                    &[1],
-                )
-                .await
-                .expect("stage abandoned file metadata");
-                let abandoned_revision = fixture
-                    .anchors()
-                    .await
-                    .staged
-                    .expect("abandoned metadata must publish a staged anchor");
-                let (abandoned_hash, abandoned_metadata) =
-                    file_metadata_at(&fixture, abandoned_revision, "tracked.bin")
-                        .await
-                        .expect("load abandoned staged metadata");
-                assert_ne!(abandoned_hash, committed_hash);
-                assert_eq!(
-                    abandoned_metadata
-                        .get_string("owner")
-                        .expect("abandoned owner metadata"),
-                    "abandoned-staged"
-                );
-
-                let modified = b"modified\n";
-                fixture.write("tracked.bin", modified);
-                let result = fixture
-                    .exact(
-                        "inherit committed metadata",
-                        vec![selected(
-                            "tracked.bin",
-                            ExpectedFileAction::Modify,
-                            Some(modified),
-                        )],
+            .scope(
+                execution(),
+                Box::pin(async {
+                    let fixture = Fixture::new().await;
+                    fixture.write("tracked.bin", b"baseline\n");
+                    fixture.stage_all().await;
+                    let tracked_path = fixture.absolute("tracked.bin");
+                    metadata::set::set_file(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        &[tracked_path.to_string_lossy().as_ref()],
+                        &[b"owner"],
+                        &[b"committed"],
+                        &[MetadataType::String],
+                        &[1],
                     )
                     .await
-                    .expect("commit Modify with unchanged metadata");
+                    .expect("seed committed file metadata");
+                    let baseline = Box::pin(commit::commit(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        CommitOptions::new("metadata baseline".to_string()),
+                    ))
+                    .await
+                    .expect("commit metadata baseline");
+                    let (committed_hash, committed_metadata) =
+                        file_metadata_at(&fixture, baseline, "tracked.bin")
+                            .await
+                            .expect("load committed metadata");
+                    assert_eq!(
+                        committed_metadata
+                            .get_string("owner")
+                            .expect("committed owner metadata"),
+                        "committed"
+                    );
 
-                let (published_hash, published_metadata) =
-                    file_metadata_at(&fixture, result.revision, "tracked.bin")
+                    metadata::set::set_file(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        &[tracked_path.to_string_lossy().as_ref()],
+                        &[b"owner"],
+                        &[b"abandoned-staged"],
+                        &[MetadataType::String],
+                        &[1],
+                    )
+                    .await
+                    .expect("stage abandoned file metadata");
+                    let abandoned_revision = fixture
+                        .anchors()
                         .await
-                        .expect("load published inherited metadata");
-                assert_eq!(published_hash, committed_hash);
-                assert_eq!(
-                    published_metadata
-                        .get_string("owner")
-                        .expect("published owner metadata"),
-                    "committed"
-                );
-                assert_eq!(fixture.anchors().await.staged, None);
-            })
+                        .staged
+                        .expect("abandoned metadata must publish a staged anchor");
+                    let (abandoned_hash, abandoned_metadata) =
+                        file_metadata_at(&fixture, abandoned_revision, "tracked.bin")
+                            .await
+                            .expect("load abandoned staged metadata");
+                    assert_ne!(abandoned_hash, committed_hash);
+                    assert_eq!(
+                        abandoned_metadata
+                            .get_string("owner")
+                            .expect("abandoned owner metadata"),
+                        "abandoned-staged"
+                    );
+
+                    let modified = b"modified\n";
+                    fixture.write("tracked.bin", modified);
+                    let result = fixture
+                        .exact(
+                            "inherit committed metadata",
+                            vec![selected(
+                                "tracked.bin",
+                                ExpectedFileAction::Modify,
+                                Some(modified),
+                            )],
+                        )
+                        .await
+                        .expect("commit Modify with unchanged metadata");
+
+                    let (published_hash, published_metadata) =
+                        file_metadata_at(&fixture, result.revision, "tracked.bin")
+                            .await
+                            .expect("load published inherited metadata");
+                    assert_eq!(published_hash, committed_hash);
+                    assert_eq!(
+                        published_metadata
+                            .get_string("owner")
+                            .expect("published owner metadata"),
+                        "committed"
+                    );
+                    assert_eq!(fixture.anchors().await.staged, None);
+                }),
+            )
             .await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn admits_exact_add_modify_clear_mixed_metadata_and_preserves_delete_inheritance() {
         LORE_CONTEXT
-            .scope(execution(), async {
-                let fixture = Fixture::new().await;
-                for path in ["modify.bin", "clear.bin", "delete.bin", "unchanged.bin"] {
-                    fixture.write(path, format!("baseline:{path}\n").as_bytes());
-                }
-                fixture.stage_all().await;
-                let metadata_paths: Vec<_> = ["modify.bin", "clear.bin", "delete.bin"]
-                    .iter()
-                    .map(|path| fixture.absolute(path).to_string_lossy().into_owned())
-                    .collect();
-                metadata::set::set_file(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    &metadata_paths
+            .scope(
+                execution(),
+                Box::pin(async {
+                    let fixture = Fixture::new().await;
+                    for path in ["modify.bin", "clear.bin", "delete.bin", "unchanged.bin"] {
+                        fixture.write(path, format!("baseline:{path}\n").as_bytes());
+                    }
+                    fixture.stage_all().await;
+                    let metadata_paths: Vec<_> = ["modify.bin", "clear.bin", "delete.bin"]
                         .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>(),
-                    &[b"prior", b"prior", b"prior"],
-                    &[b"modify", b"clear", b"delete"],
-                    &[
-                        MetadataType::String,
-                        MetadataType::String,
-                        MetadataType::String,
-                    ],
-                    &[1, 1, 1],
-                )
-                .await
-                .expect("seed baseline file metadata");
-                let baseline = Box::pin(commit::commit(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    CommitOptions::new("metadata baseline".to_string()),
-                ))
-                .await
-                .expect("commit metadata baseline");
-                let (delete_metadata_hash, _) = file_metadata_at(&fixture, baseline, "delete.bin")
-                    .await
-                    .expect("delete baseline metadata");
-
-                let modify = b"modified owner bytes\n";
-                let clear = b"clear owner bytes\n";
-                let unchanged = b"unchanged metadata owner bytes\n";
-                let added = b"added owner bytes\n";
-                fixture.write("modify.bin", modify);
-                fixture.write("clear.bin", clear);
-                fixture.write("unchanged.bin", unchanged);
-                fixture.write("add.bin", added);
-                std::fs::remove_file(fixture.absolute("delete.bin"))
-                    .expect("remove metadata-bearing file");
-                let binary_payload = b"\x00exact audit payload\xff";
-                fixture.write("audit-source.bin", binary_payload);
-
-                let result = fixture
-                    .exact(
-                        "exact metadata transaction",
-                        vec![
-                            SelectedFile {
-                                path: "modify.bin".to_string(),
-                                expected_effective_action: ExpectedFileAction::Modify,
-                                source_hash: Some(digest(modify)),
-                                file_metadata: FileMetadataSelection::Exact(vec![
-                                    FileMetadataEntry {
-                                        key: "kind".to_string(),
-                                        value: "Actor".to_string(),
-                                        value_type: ExactMetadataType::String,
-                                    },
-                                    FileMetadataEntry {
-                                        key: "audit".to_string(),
-                                        value: "audit-source.bin".to_string(),
-                                        value_type: ExactMetadataType::Binary,
-                                    },
-                                ]),
-                            },
-                            SelectedFile {
-                                path: "add.bin".to_string(),
-                                expected_effective_action: ExpectedFileAction::Add,
-                                source_hash: Some(digest(added)),
-                                file_metadata: FileMetadataSelection::Exact(vec![
-                                    FileMetadataEntry {
-                                        key: "count".to_string(),
-                                        value: "7".to_string(),
-                                        value_type: ExactMetadataType::Numeric,
-                                    },
-                                ]),
-                            },
-                            SelectedFile {
-                                path: "clear.bin".to_string(),
-                                expected_effective_action: ExpectedFileAction::Modify,
-                                source_hash: Some(digest(clear)),
-                                file_metadata: FileMetadataSelection::Clear,
-                            },
-                            selected("unchanged.bin", ExpectedFileAction::Modify, Some(unchanged)),
-                            selected("delete.bin", ExpectedFileAction::Delete, None),
+                        .map(|path| fixture.absolute(path).to_string_lossy().into_owned())
+                        .collect();
+                    metadata::set::set_file(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        &metadata_paths
+                            .iter()
+                            .map(String::as_str)
+                            .collect::<Vec<_>>(),
+                        &[b"prior", b"prior", b"prior"],
+                        &[b"modify", b"clear", b"delete"],
+                        &[
+                            MetadataType::String,
+                            MetadataType::String,
+                            MetadataType::String,
                         ],
+                        &[1, 1, 1],
                     )
                     .await
-                    .expect("admit exact metadata transaction");
-
-                let (_, modify_metadata) =
-                    file_metadata_at(&fixture, result.revision, "modify.bin")
-                        .await
-                        .expect("committed modify metadata");
-                assert_eq!(
-                    modify_metadata.get_string("kind").expect("kind metadata"),
-                    "Actor"
-                );
-                let audit_address = modify_metadata
-                    .get_address("audit")
-                    .expect("audit metadata address");
-                let audit_bytes = lore_revision::immutable::read(
-                    fixture.repository.clone(),
-                    audit_address,
-                    None,
-                    lore_revision::immutable::read_options_from_repository(&fixture.repository)
-                        .no_remote(),
-                )
-                .await
-                .expect("materialize exact audit metadata");
-                assert_eq!(audit_bytes.as_ref(), binary_payload);
-
-                let (_, add_metadata) = file_metadata_at(&fixture, result.revision, "add.bin")
+                    .expect("seed baseline file metadata");
+                    let baseline = Box::pin(commit::commit(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        CommitOptions::new("metadata baseline".to_string()),
+                    ))
                     .await
-                    .expect("committed add metadata");
-                assert_eq!(add_metadata.get_u64("count").expect("numeric metadata"), 7);
-                assert!(
-                    file_metadata_at(&fixture, result.revision, "clear.bin")
+                    .expect("commit metadata baseline");
+                    let (delete_metadata_hash, _) =
+                        file_metadata_at(&fixture, baseline, "delete.bin")
+                            .await
+                            .expect("delete baseline metadata");
+
+                    let modify = b"modified owner bytes\n";
+                    let clear = b"clear owner bytes\n";
+                    let unchanged = b"unchanged metadata owner bytes\n";
+                    let added = b"added owner bytes\n";
+                    fixture.write("modify.bin", modify);
+                    fixture.write("clear.bin", clear);
+                    fixture.write("unchanged.bin", unchanged);
+                    fixture.write("add.bin", added);
+                    std::fs::remove_file(fixture.absolute("delete.bin"))
+                        .expect("remove metadata-bearing file");
+                    let binary_payload = b"\x00exact audit payload\xff";
+                    fixture.write("audit-source.bin", binary_payload);
+
+                    let result = fixture
+                        .exact(
+                            "exact metadata transaction",
+                            vec![
+                                SelectedFile {
+                                    path: "modify.bin".to_string(),
+                                    expected_effective_action: ExpectedFileAction::Modify,
+                                    source_hash: Some(digest(modify)),
+                                    file_metadata: FileMetadataSelection::Exact(vec![
+                                        FileMetadataEntry {
+                                            key: "kind".to_string(),
+                                            value: "Actor".to_string(),
+                                            value_type: ExactMetadataType::String,
+                                        },
+                                        FileMetadataEntry {
+                                            key: "audit".to_string(),
+                                            value: "audit-source.bin".to_string(),
+                                            value_type: ExactMetadataType::Binary,
+                                        },
+                                    ]),
+                                },
+                                SelectedFile {
+                                    path: "add.bin".to_string(),
+                                    expected_effective_action: ExpectedFileAction::Add,
+                                    source_hash: Some(digest(added)),
+                                    file_metadata: FileMetadataSelection::Exact(vec![
+                                        FileMetadataEntry {
+                                            key: "count".to_string(),
+                                            value: "7".to_string(),
+                                            value_type: ExactMetadataType::Numeric,
+                                        },
+                                    ]),
+                                },
+                                SelectedFile {
+                                    path: "clear.bin".to_string(),
+                                    expected_effective_action: ExpectedFileAction::Modify,
+                                    source_hash: Some(digest(clear)),
+                                    file_metadata: FileMetadataSelection::Clear,
+                                },
+                                selected(
+                                    "unchanged.bin",
+                                    ExpectedFileAction::Modify,
+                                    Some(unchanged),
+                                ),
+                                selected("delete.bin", ExpectedFileAction::Delete, None),
+                            ],
+                        )
                         .await
-                        .is_none(),
-                    "Clear must commit a zero file-metadata hash"
-                );
-                assert!(
-                    result
-                        .committed_file_metadata_hashes
-                        .iter()
-                        .any(|item| item.path == "delete.bin"
-                            && item.hash == delete_metadata_hash.to_string()),
-                    "Delete must report the inherited prior metadata hash"
-                );
-            })
+                        .expect("admit exact metadata transaction");
+
+                    let (_, modify_metadata) =
+                        file_metadata_at(&fixture, result.revision, "modify.bin")
+                            .await
+                            .expect("committed modify metadata");
+                    assert_eq!(
+                        modify_metadata.get_string("kind").expect("kind metadata"),
+                        "Actor"
+                    );
+                    let audit_address = modify_metadata
+                        .get_address("audit")
+                        .expect("audit metadata address");
+                    let audit_bytes = lore_revision::immutable::read(
+                        fixture.repository.clone(),
+                        audit_address,
+                        None,
+                        lore_revision::immutable::read_options_from_repository(&fixture.repository)
+                            .no_remote(),
+                    )
+                    .await
+                    .expect("materialize exact audit metadata");
+                    assert_eq!(audit_bytes.as_ref(), binary_payload);
+
+                    let (_, add_metadata) = file_metadata_at(&fixture, result.revision, "add.bin")
+                        .await
+                        .expect("committed add metadata");
+                    assert_eq!(add_metadata.get_u64("count").expect("numeric metadata"), 7);
+                    assert!(
+                        file_metadata_at(&fixture, result.revision, "clear.bin")
+                            .await
+                            .is_none(),
+                        "Clear must commit a zero file-metadata hash"
+                    );
+                    assert!(
+                        result
+                            .committed_file_metadata_hashes
+                            .iter()
+                            .any(|item| item.path == "delete.bin"
+                                && item.hash == delete_metadata_hash.to_string()),
+                        "Delete must report the inherited prior metadata hash"
+                    );
+                }),
+            )
             .await;
     }
 
@@ -1033,35 +1052,38 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn rejects_input_bounds_before_reading_binary_metadata_sources() {
         LORE_CONTEXT
-            .scope(execution(), async {
-                let fixture = Fixture::new().await;
-                let payload = b"bounded input\n";
-                fixture.write("baseline.bin", b"baseline\n");
-                fixture.seed_commit("baseline").await;
-                fixture.write("bounded.bin", payload);
-                let mut file = selected("bounded.bin", ExpectedFileAction::Add, Some(payload));
-                file.file_metadata = FileMetadataSelection::Exact(vec![
-                    FileMetadataEntry {
-                        key: "missing-binary".to_string(),
-                        value: "does-not-exist.bin".to_string(),
-                        value_type: ExactMetadataType::Binary,
-                    },
-                    FileMetadataEntry {
-                        key: "oversized".to_string(),
-                        value: "x".repeat(4 * 1_024 * 1_024 + 1),
-                        value_type: ExactMetadataType::String,
-                    },
-                ]);
+            .scope(
+                execution(),
+                Box::pin(async {
+                    let fixture = Fixture::new().await;
+                    let payload = b"bounded input\n";
+                    fixture.write("baseline.bin", b"baseline\n");
+                    fixture.seed_commit("baseline").await;
+                    fixture.write("bounded.bin", payload);
+                    let mut file = selected("bounded.bin", ExpectedFileAction::Add, Some(payload));
+                    file.file_metadata = FileMetadataSelection::Exact(vec![
+                        FileMetadataEntry {
+                            key: "missing-binary".to_string(),
+                            value: "does-not-exist.bin".to_string(),
+                            value_type: ExactMetadataType::Binary,
+                        },
+                        FileMetadataEntry {
+                            key: "oversized".to_string(),
+                            value: "x".repeat(4 * 1_024 * 1_024 + 1),
+                            value_type: ExactMetadataType::String,
+                        },
+                    ]);
 
-                assert_rejection_preserves_anchors(&fixture, vec![file], |kind| {
-                    matches!(
-                        kind,
-                        ExactSelectionErrorKind::InvalidInput { reason, .. }
-                            if reason.contains("metadata value exceeds limit")
-                    )
-                })
-                .await;
-            })
+                    assert_rejection_preserves_anchors(&fixture, vec![file], |kind| {
+                        matches!(
+                            kind,
+                            ExactSelectionErrorKind::InvalidInput { reason, .. }
+                                if reason.contains("metadata value exceeds limit")
+                        )
+                    })
+                    .await;
+                }),
+            )
             .await;
     }
 
@@ -1160,7 +1182,7 @@ mod tests {
     #[ignore = "descriptive performance measurement; run explicitly with --ignored --nocapture"]
     async fn measures_validation_only_reread_and_md5_at_actor_sized_100_and_1000_files() {
         LORE_CONTEXT
-            .scope(execution(), async {
+            .scope(execution(), Box::pin(async {
                 for file_count in [100_usize, 1_000] {
                     let fixture = Fixture::new().await;
                     let mut files = Vec::with_capacity(file_count);
@@ -1208,7 +1230,7 @@ mod tests {
                         elapsed.as_micros()
                     );
                 }
-            })
+            }))
             .await;
     }
 

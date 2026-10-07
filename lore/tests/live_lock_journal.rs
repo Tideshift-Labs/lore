@@ -2105,7 +2105,7 @@ fn a_panicking_batch_task_surfaces_outcome_unknown_naming_its_own_recorded_attem
 /// `acquire`'s rollback arm re-raised a flat `AcquireError::internal("Failed to acquire the
 /// lock")`, which translates to `Internal`'s code (-1, CLI exit 255) regardless of what the
 /// server actually said. Every existing acquire test in this file asserts `assert_ne!` against 0
-/// and 193 (`LoreError::OutcomeUnknown as i32`) for exactly this reason: that assertion shape
+/// and 248 (`LoreError::OutcomeUnknown as i32`) for exactly this reason: that assertion shape
 /// stays green whether the carry-back exists or not, because both `Internal` and `NotAuthorized`
 /// satisfy it. Asserting the exact code is what a revert of the carry-back turns red.
 ///

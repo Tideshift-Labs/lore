@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
 use lore_base::error::Maintenance;
 use lore_base::error::NoRemote;
@@ -11,6 +12,7 @@ use lore_base::error::NotFound;
 use lore_base::error::NotSupported;
 use lore_base::error::OutcomeUnknown;
 use lore_base::error::Oversized;
+use lore_base::error::RepositoryNotFound;
 use lore_base::error::SlowDown;
 use lore_base::error::TokenNotFound;
 use lore_base::runtime::LORE_CONTEXT;
@@ -34,6 +36,7 @@ use lore_revision::repository::RepositoryContext;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::call::repository_call_no_store;
 use crate::call::repository_call_read;
 use crate::call::setup_execution;
 use crate::call_delegation::dispatch_call;
@@ -42,6 +45,9 @@ use crate::interface::LoreString;
 #[error_set]
 pub enum AuthStoreError {
     TokenNotFound,
+    // Raised when the command needs a repository to resolve an auth endpoint from and
+    // was not run in one, which is a different fix for the caller than any of the below.
+    RepositoryNotFound,
     // The remaining variants mirror `ProtocolError` so a connect failure can be
     // forwarded whole, preserving its kind instead of collapsing to `Internal`.
     Disconnected,
@@ -50,6 +56,7 @@ pub enum AuthStoreError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,
@@ -130,7 +137,8 @@ async fn resolve_user_info_local(
         let local_args = LoreAuthLocalUserInfoArgs {
             auth_endpoint: LoreString::default(),
             user_ids: LoreArray::default(),
-            with_token: 0,
+            with_identity_token: 0,
+            with_access_token: 0,
         };
         return local_user_info_impl(globals, local_args, callback).await;
     }
@@ -152,14 +160,59 @@ async fn resolve_user_info_impl(
     lore_revision::auth::userinfo::resolve_user_info(repository, ids).await
 }
 
-fn read_repository_config(repository_path: &str) -> Option<String> {
+/// What the repository at a given path says about its remote.
+///
+/// A repository with no remote URL is distinct from no repository at all: the former is a
+/// configured state that network commands answer with `NoRemote`, the latter leaves the
+/// auth endpoint genuinely unresolvable.
+enum RepositoryRemote {
+    /// No repository config could be read at this path.
+    NoRepository,
+    /// A repository is present, but no remote URL is configured for it.
+    NoRemote,
+    /// A repository is present with a remote URL configured.
+    Remote(String),
+}
+
+fn read_repository_remote(repository_path: &str) -> RepositoryRemote {
+    // Presence of the tracking directory is what says a repository is here. A missing
+    // config file reads as the default config, so asking the config alone would report
+    // every path in the filesystem as a repository that merely has no remote.
+    //
+    // Resolve that directory the way the config loader does rather than joining `.lore`
+    // onto the path: a repository under a VFS keeps its tracking directory outside the
+    // working copy, and looking only for a physical one would report it as no repository
+    // at all. Loading from the directory already resolved keeps the two from diverging.
+    let Ok(dot_dir) =
+        lore_revision::repository::get_dot_lore_path(std::path::Path::new(repository_path))
+    else {
+        return RepositoryRemote::NoRepository;
+    };
+    if !dot_dir.is_dir() {
+        return RepositoryRemote::NoRepository;
+    }
+
     // If this command is invoked in a repository, load the config
-    if let Ok(repository_config) =
-        lore_revision::repository::load_repository_config(repository_path)
-    {
-        repository_config.remote_url
-    } else {
-        None
+    let Ok(repository_config) =
+        lore_revision::repository::load_repository_config_from_dot_dir(&dot_dir)
+    else {
+        return RepositoryRemote::NoRepository;
+    };
+
+    match repository_config.remote_url {
+        Some(remote_url) if !remote_url.is_empty() => RepositoryRemote::Remote(remote_url),
+        _ => RepositoryRemote::NoRemote,
+    }
+}
+
+/// The remote URL configured for the repository at `repository_path`, if it has one.
+///
+/// Collapses "no repository" and "repository with no remote" into `None` for the callers
+/// that only need a URL to hand to the transport, which reports the absence itself.
+fn configured_remote_url(repository_path: &str) -> Option<String> {
+    match read_repository_remote(repository_path) {
+        RepositoryRemote::Remote(remote_url) => Some(remote_url),
+        RepositoryRemote::NoRepository | RepositoryRemote::NoRemote => None,
     }
 }
 
@@ -232,7 +285,7 @@ async fn login_with_token_local(
     let remote_url = if !args.remote_url.is_empty() {
         args.remote_url.to_string()
     } else {
-        read_repository_config(globals.repository_path.as_str()).unwrap_or_default()
+        configured_remote_url(globals.repository_path.as_str()).unwrap_or_default()
     };
 
     let execution = setup_execution(globals, callback);
@@ -319,7 +372,7 @@ async fn login_interactive_local(
     let remote_url = if !args.remote_url.is_empty() {
         args.remote_url.to_string()
     } else {
-        read_repository_config(globals.repository_path.as_str()).unwrap_or_default()
+        configured_remote_url(globals.repository_path.as_str()).unwrap_or_default()
     };
 
     let execution = setup_execution(globals, callback);
@@ -571,8 +624,13 @@ pub struct LoreAuthLocalUserInfoArgs {
     pub auth_endpoint: LoreString,
     /// User identities to resolve; empty resolves the current user
     pub user_ids: LoreArray<LoreString>,
-    /// Emit cached token details for identities with a local token
-    pub with_token: u8,
+    /// Emit cached identity token details for identities with a local token
+    #[serde(alias = "with_token")]
+    pub with_identity_token: u8,
+    /// Emit the repository's authorization (access) token. Requires running
+    /// inside a repository
+    #[serde(default)]
+    pub with_access_token: u8,
 }
 
 /// Resolves user identities to user information using locally stored JWT tokens.
@@ -585,9 +643,14 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// `auth_endpoint` is empty, resolves it from the repository's remote
 /// environment configuration.
 ///
-/// When `with_token` is set, emits `AuthUserToken` events (including the
-/// cached token string) for identities that have a locally stored token,
-/// and `AuthUserInfo` events for others.
+/// When `with_identity_token` is set, emits `AuthUserToken` events (including
+/// the cached identity token string) for identities that have a locally stored
+/// token, and `AuthUserInfo` events for others.
+///
+/// When `with_access_token` is set, the call requires a repository and
+/// additionally emits an `AuthIdentity` event carrying the repository-scoped
+/// authorization (access) token for the current user, performing a token
+/// exchange when no valid cached token exists.
 ///
 /// For remote resolution of user IDs with proper authorization, use
 /// [`resolve_user_info`] which queries the remote authentication service.
@@ -610,7 +673,8 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
-/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 pub async fn local_user_info(
     globals: LoreGlobalArgs,
     args: LoreAuthLocalUserInfoArgs,
@@ -630,18 +694,31 @@ async fn resolve_auth_endpoint(
 
     // Forward the connect error instead of discarding it, so the real failure
     // reaches the caller rather than collapsing into the generic error below.
-    if let Some(remote_url) = read_repository_config(repository_path) {
-        let connection = lore_revision::protocol::connect(
-            &remote_url,
-            identity,
-            lore_revision::lore::RepositoryId::default(),
-        )
-        .await
-        .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
+    match read_repository_remote(repository_path) {
+        RepositoryRemote::Remote(remote_url) => {
+            let connection = lore_revision::protocol::connect(
+                &remote_url,
+                identity,
+                lore_revision::lore::RepositoryId::default(),
+            )
+            .await
+            .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
 
-        let auth_url = connection.auth_url().to_string();
-        if !auth_url.is_empty() {
-            return Ok(auth_url);
+            let auth_url = connection.auth_url().to_string();
+            if !auth_url.is_empty() {
+                return Ok(auth_url);
+            }
+        }
+        // The repository exists and simply has no remote. Nothing is unreachable and
+        // nothing is unsupported — there is just no remote to ask for an auth endpoint.
+        RepositoryRemote::NoRemote => return Err(NoRemote.into()),
+        // Without a repository there is nowhere to read a remote from, and the fix is to
+        // run this from one (or pass an endpoint) rather than to configure anything.
+        RepositoryRemote::NoRepository => {
+            return Err(RepositoryNotFound {
+                repository: repository_path.to_string(),
+            }
+            .into());
         }
     }
 
@@ -656,87 +733,120 @@ async fn local_user_info_impl(
     args: LoreAuthLocalUserInfoArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let repository_path = globals.repository_path.to_string();
-    let identity = globals.identity().unwrap_or_default().to_string();
+    // The access token is scoped to a repository, so that variant runs as a
+    // repository call. Plain identity resolution stays repository-free.
+    if args.with_access_token != 0 {
+        return repository_call_no_store(
+            globals,
+            callback,
+            args,
+            local_user_info,
+            |repository, args| async move {
+                emit_local_user_info(&args).await?;
+                auth::userinfo::repository_access_token(repository)
+                    .await
+                    .forward::<AuthStoreError>("resolving the repository access token")
+            },
+        )
+        .await;
+    }
 
     let execution = setup_execution(globals, callback);
 
-    let include_token = args.with_token != 0;
-
     LORE_CONTEXT
         .scope(execution, async move {
-            let result = async move {
-                let auth_endpoint =
-                    resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity)
-                        .await?;
-
-                let mut user_ids: Vec<String> = args
-                    .user_ids
-                    .as_slice()
-                    .iter()
-                    .map(|s| s.as_str().to_string())
-                    .collect();
-
-                // When no user IDs are provided, resolve the current user: the
-                // identity this call acts as, which is what a supplied token
-                // names. Only without one does the store decide, since a caller
-                // working from supplied tokens may have no store at all -- and
-                // whichever identity it holds first need not be this caller.
-                if user_ids.is_empty() {
-                    if !identity.is_empty() {
-                        user_ids.push(identity.clone());
-                    } else {
-                        let identities =
-                            lore_credential::token_store::load_identities(&auth_endpoint)
-                                .await
-                                .forward::<AuthStoreError>("accessing token store")?;
-                        if let Some(first) = identities.into_iter().next() {
-                            user_ids.push(first);
-                        }
-                    }
-                }
-
-                let resolved = lore_revision::auth::userinfo::resolve_local_user_info(
-                    &auth_endpoint,
-                    &user_ids,
-                )
-                .await;
-
-                for entry in &resolved {
-                    if include_token && let Some(user_info) = &entry.local_user_info {
-                        LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
-                            id: user_info.id.clone().into(),
-                            name: user_info.name.clone().into(),
-                            token: user_info.token.clone().into(),
-                            preferred_username: user_info.preferred_username.clone().into(),
-                            flag_service_account: user_info.is_service_account.into(),
-                            expires: user_info.expires,
-                        })
-                        .send();
-                        continue;
-                    }
-
-                    LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
-                        id: entry.id.clone().into(),
-                        name: entry.name.clone().into(),
-                    })
-                    .send();
-                }
-
-                Ok::<(), AuthStoreError>(())
-            }
-            .await;
+            let result = emit_local_user_info(&args).await;
             execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
 
+/// Resolves the requested identities from locally stored tokens and emits one
+/// `AuthUserInfo` or `AuthUserToken` event per identity. Runs inside an
+/// execution scope. The caller dispatches completion.
+async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), AuthStoreError> {
+    let execution = execution_context();
+    let globals = execution.globals();
+    let repository_path = globals.repository_path.to_string();
+    let identity = globals.identity().unwrap_or_default().to_string();
+    let include_identity_token = args.with_identity_token != 0;
+
+    let auth_endpoint =
+        resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity).await?;
+
+    let mut user_ids: Vec<String> = args
+        .user_ids
+        .as_slice()
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+
+    // When no user IDs are provided, resolve the current user: the
+    // identity this call acts as, which is what a supplied token
+    // names. Only without one does the store decide, since a caller
+    // working from supplied tokens may have no store at all -- and
+    // whichever identity it holds first need not be this caller.
+    if user_ids.is_empty() {
+        if !identity.is_empty() {
+            user_ids.push(identity.clone());
+        } else {
+            let identities = lore_credential::token_store::load_identities(&auth_endpoint)
+                .await
+                .forward::<AuthStoreError>("accessing token store")?;
+            if let Some(first) = identities.into_iter().next() {
+                user_ids.push(first);
+            }
+        }
+    }
+
+    let resolved =
+        lore_revision::auth::userinfo::resolve_local_user_info(&auth_endpoint, &user_ids).await;
+
+    for entry in &resolved {
+        if include_identity_token && let Some(user_info) = &entry.local_user_info {
+            LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
+                id: user_info.id.clone().into(),
+                name: user_info.name.clone().into(),
+                token: user_info.token.clone().into(),
+                preferred_username: user_info.preferred_username.clone().into(),
+                flag_service_account: user_info.is_service_account.into(),
+                expires: user_info.expires,
+            })
+            .send();
+            continue;
+        }
+
+        LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
+            id: entry.id.clone().into(),
+            name: entry.name.clone().into(),
+        })
+        .send();
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod resolve_auth_endpoint_tests {
-    use lore_base::error::NotSupported;
+    use lore_base::error::NoRemote;
+    use lore_base::error::RepositoryNotFound;
     use lore_error_set::FfiError;
 
+    use super::RepositoryRemote;
+    use super::read_repository_remote;
     use super::resolve_auth_endpoint;
+
+    /// A repository directory with the given `config.toml` body, or none at all when
+    /// `config` is `None`. Returns the repository root.
+    fn repository_with_config(label: &str, config: Option<&str>) -> lore_base::test_util::TempDir {
+        let root = lore_base::test_util::TempDir::new(&format!("lore-auth-{label}-"));
+        let dot_dir = root.join(lore_revision::repository::DOT_LORE);
+        std::fs::create_dir_all(&dot_dir).expect("creating the repository directory");
+        if let Some(config) = config {
+            std::fs::write(dot_dir.join("config.toml"), config).expect("writing the config");
+        }
+        root
+    }
 
     // An explicit endpoint is returned verbatim without touching the
     // repository config or the network.
@@ -748,19 +858,81 @@ mod resolve_auth_endpoint_tests {
         assert_eq!(endpoint, "ucs-auth://auth.example.com");
     }
 
-    // With no explicit endpoint and no resolvable repository remote, the
-    // operation is `NotSupported` (code 9) — there is no URL to key a token
-    // lookup on — rather than an opaque internal error.
+    // Run outside a repository with no explicit endpoint, the answer names the actual
+    // problem — there is no repository here to read a remote from — rather than the
+    // generic "requires a configured auth endpoint", which reads as though something
+    // needs configuring when the fix is to run this from a repository or pass an endpoint.
     #[tokio::test]
-    async fn missing_endpoint_is_not_supported() {
+    async fn missing_repository_is_repository_not_found() {
         let err = resolve_auth_endpoint("", "/does/not/exist", "")
             .await
             .expect_err("a missing endpoint must be an error");
 
-        let not_supported_code = NotSupported {
-            operation: String::new(),
+        let repository_not_found_code = RepositoryNotFound {
+            repository: String::new(),
         }
         .ffi_code();
-        assert_eq!(err.ffi_code(), not_supported_code);
+        assert_eq!(err.ffi_code(), repository_not_found_code, "{err:?}");
+    }
+
+    // A repository created without a URL has a remote-less config. Asking it for an auth
+    // endpoint is `NoRemote`, not `NotSupported` and not a connection failure:
+    // there is no remote to reach, as opposed to one that could not be reached.
+    #[tokio::test]
+    async fn repository_without_a_remote_is_no_remote() {
+        let root = repository_with_config("empty-remote", Some("remote_url = \"\"\n"));
+
+        let err = resolve_auth_endpoint("", &root.display().to_string(), "")
+            .await
+            .expect_err("a repository with no remote must be an error");
+
+        assert_eq!(err.ffi_code(), NoRemote.ffi_code(), "{err:?}");
+    }
+
+    // Same answer when the config omits the key outright rather than writing it empty,
+    // which is what an older or hand-edited config looks like.
+    #[tokio::test]
+    async fn repository_with_no_remote_key_is_no_remote() {
+        let root = repository_with_config("absent-remote", Some("identity = \"me\"\n"));
+
+        let err = resolve_auth_endpoint("", &root.display().to_string(), "")
+            .await
+            .expect_err("a repository with no remote must be an error");
+
+        assert_eq!(err.ffi_code(), NoRemote.ffi_code(), "{err:?}");
+    }
+
+    // A missing config file parses as the default config, so repository presence has to
+    // come from the tracking directory. Without that check every path in the filesystem
+    // would report as a remote-less repository and mask the `NotSupported` case above.
+    #[test]
+    fn a_path_outside_a_repository_is_not_a_remote_less_repository() {
+        assert!(matches!(
+            read_repository_remote("/does/not/exist"),
+            RepositoryRemote::NoRepository
+        ));
+
+        let root = repository_with_config("no-config", None);
+        assert!(
+            matches!(
+                read_repository_remote(&root.display().to_string()),
+                RepositoryRemote::NoRemote
+            ),
+            "a repository whose config is absent still has no remote"
+        );
+    }
+
+    #[test]
+    fn a_configured_remote_is_returned() {
+        let root = repository_with_config(
+            "with-remote",
+            Some("remote_url = \"lore://127.0.0.1:41337\"\n"),
+        );
+
+        let remote = read_repository_remote(&root.display().to_string());
+        assert!(
+            matches!(remote, RepositoryRemote::Remote(ref url) if url == "lore://127.0.0.1:41337"),
+            "a configured remote should be reported verbatim"
+        );
     }
 }

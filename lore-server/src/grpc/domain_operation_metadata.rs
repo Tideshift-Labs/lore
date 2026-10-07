@@ -32,7 +32,7 @@
 //! The receipt key's `tenant_scope_key` is a versioned canonical tuple over the
 //! **target** resource identity, derived independently of the token's resource
 //! list. `auth/jwt.rs` accepts a wildcard `urc-*` resource, and the repository
-//! v1 service runs under the authn-only `JWTAuthnInterceptor`, so a
+//! v1 service runs under the authn-only `JWTInterceptor`, so a
 //! token-derived scope is both unsatisfiable for create (no repository exists
 //! yet) and ambiguous under a wildcard. The builders below take raw target
 //! identity bytes and refuse anything shaped like a `urc-` resource string, so

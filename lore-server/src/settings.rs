@@ -20,6 +20,8 @@ use lore_telemetry::TraceConfigError;
 use serde::Deserialize;
 
 use crate::auth::jwk::JWKServiceSettings;
+use crate::authnz::repository_authorizer::refuse_global_grants;
+use crate::authnz::repository_authorizer::select_repository_authorizer;
 use crate::grpc::server::FeatureSettings;
 use crate::grpc::server::GrpcPublicServicesSettings;
 use crate::hooks::HookSettings;
@@ -168,6 +170,7 @@ impl Settings {
         let settings: Settings = settings.try_deserialize()?;
         validate_trace_config(&settings)?;
         validate_feature_config(&settings)?;
+        validate_auth_config(&settings)?;
         let settings_string = format!("{settings:?}");
         let settings_hash = hash::hash_string(&settings_string);
 
@@ -176,6 +179,36 @@ impl Settings {
 
         Ok((settings, settings_hash))
     }
+}
+
+/// Missing `jwt_issuer` / `jwt_audience` under `[server.auth]` fails
+/// deserialization. Calls repository authorizer selection logic to verify
+/// that the configuration combination is valid for authorization.
+fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> {
+    let auth = settings.server.auth.as_ref();
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.as_deref());
+    // Run the authorizer selection at load, so a refused pairing bails here,
+    // before any initialization, instead of at server startup.
+    let selection = select_repository_authorizer(auth, auth_url)
+        .map_err(|err| config::ConfigError::Message(err.to_string()))?;
+    let Some(auth) = auth else {
+        return Ok(());
+    };
+    if auth.jwt_issuer.is_empty() {
+        return Err(config::ConfigError::Message(
+            "server.auth.jwt_issuer must not be empty".to_string(),
+        ));
+    }
+    if auth.jwt_audience.is_empty() {
+        return Err(config::ConfigError::Message(
+            "server.auth.jwt_audience must not be empty".to_string(),
+        ));
+    }
+    refuse_global_grants(selection).map_err(|err| config::ConfigError::Message(err.to_string()))
 }
 
 fn validate_trace_config(settings: &Settings) -> Result<(), config::ConfigError> {
@@ -222,22 +255,92 @@ fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
 /// Server-related settings
 ///
 
+#[serde_with::serde_as]
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct AuthSettings {
+    /// Optional JWK override. Verification is enabled by `[server.auth]`.
+    /// If this or its `endpoint` is absent, the JWKS endpoint is
+    /// resolved through OIDC discovery against `jwt_issuer`.
     pub jwk: Option<JWKServiceSettings>,
-    pub jwt_audience: Option<Vec<String>>,
-    pub jwt_issuer: Option<String>,
-    /// Enforce the JWT `resources[].permission` vector on write RPCs (read ≠
-    /// write). Default ON — the mint already emits `write` for write-capable
-    /// identities, so there is no inert window; the flag exists purely as an
-    /// instant rollback (ADR-00011).
+    /// The accepted `aud` values.
+    pub jwt_audience: Vec<String>,
+    /// The accepted `iss` values. A bare string still parses, so existing
+    /// configs need no edit. Two entries is for the length of an issuer's
+    /// cutover — accepting tokens minted under both the old and the new `iss`
+    /// while they are both in flight — and one entry otherwise. The list is not
+    /// for discovering several providers: discovery resolves against the first
+    /// entry, and two entries with different discovery documents is a
+    /// configuration error.
+    #[serde_as(as = "serde_with::OneOrMany<_, serde_with::formats::PreferMany>")]
+    pub jwt_issuer: Vec<String>,
+    /// Dotted path of the JWT claim carrying the caller's allowed actions.
+    pub permission_claim: Option<String>,
+    /// Dotted path of the claim carrying per-repository resource grants.
+    /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
+    pub resource_claim: Option<String>,
+    /// The field inside each resource entry naming the resource, for
+    /// providers whose entry shape cannot be changed (Keycloak's UMA
+    /// `permissions` entries carry `rsname`, for example).
+    #[serde(default = "AuthSettings::default_resource_id_claim")]
+    pub resource_id_claim: String,
+    /// Template that renders a repository id into the corresponding resource
+    /// name.
+    #[serde(default = "AuthSettings::default_resource_id_template")]
+    pub resource_id_template: String,
+    /// The resource name that matches every repository.
+    #[serde(default = "AuthSettings::default_resource_wildcard")]
+    pub resource_wildcard: String,
+    /// The claim recorded and compared as the caller's identity.
+    #[serde(default = "AuthSettings::default_identity_claim")]
+    pub identity_claim: String,
+    /// What the repository listing answers for an authenticated caller with
+    /// no explicit grant. Gates listing of the IDs only, never grants
+    /// access to the contents.
+    #[serde(default)]
+    pub baseline_access: BaselineAccess,
+    /// FORK-LOCAL (Tideshift, ADR-00011): enforce the JWT
+    /// `resources[].permission` vector on write RPCs (read ≠ write). Default
+    /// ON — the mint already emits `write` for write-capable identities, so
+    /// there is no inert window; the flag exists purely as an instant rollback.
     #[serde(default = "default_enforce_write_permission")]
     pub enforce_write_permission: bool,
 }
 
 fn default_enforce_write_permission() -> bool {
     true
+}
+
+impl AuthSettings {
+    fn default_resource_id_template() -> String {
+        crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
+    }
+
+    fn default_resource_id_claim() -> String {
+        "resource_id".to_string()
+    }
+
+    fn default_resource_wildcard() -> String {
+        crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
+    }
+
+    fn default_identity_claim() -> String {
+        "sub".to_string()
+    }
+}
+
+/// What `list_repositories` answers for an authenticated caller holding no
+/// explicit grant.
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineAccess {
+    /// Every partition the server holds is listed. Opt-in: it discloses
+    /// partition identifiers to every authenticated caller.
+    Reachable,
+    /// Nothing is listed without a grant. The default, so the disclosing
+    /// option is an explicit choice.
+    #[default]
+    Denied,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -335,8 +438,17 @@ pub struct QuicSettings {
     /// then assume something has gone wrong and return a timeout response so we can get metrics
     /// and clients don't hang forever
     pub handler_timeout_seconds: Option<u64>,
-    /// How many inflight messages are allowed per connection
-    pub connection_message_limit: Option<usize>,
+    /// How many inflight messages are allowed per QUIC stream. With `max_bidi_streams` streams
+    /// this is the per-connection parallelism, so a value of 500 over 8 streams allows 4000
+    /// commands in flight per connection.
+    pub stream_message_limit: Option<usize>,
+    /// Hard ceiling on requests in handling per connection, counted across all its streams and
+    /// including those still waiting for a stream permit. Over it, the server answers `SlowDown`
+    /// immediately rather than waiting. Defaults to `stream_message_limit * max_bidi_streams`.
+    pub connection_inflight_limit: Option<usize>,
+    /// How long a request may wait for one of the `stream_message_limit` permits before the
+    /// server answers `SlowDown`. Defaults to roughly one round trip, 100ms.
+    pub permit_timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -344,7 +456,10 @@ pub struct QuicSettings {
 pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
     pub grpc: Option<GrpcSettings>,
-    pub grpc_public_services: Option<GrpcPublicServicesSettings>,
+    /// One block per public gRPC service; an absent table enables every
+    /// service.
+    #[serde(default)]
+    pub grpc_public_services: GrpcPublicServicesSettings,
     pub grpc_internal: Option<GrpcSettings>,
     pub http: Option<HttpSettings>,
     // the public facing QUIC server settings
@@ -388,6 +503,45 @@ pub struct ServerSettings {
 pub struct GrpcInternalClientSettings {
     pub url: String,
     pub certs: Option<CertificateSettings>,
+    /// Ceiling on the TCP connect. Covers neither DNS nor the TLS handshake.
+    #[serde(default = "GrpcInternalClientSettings::default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    /// Deadline for each request on the channel. Keep below the
+    /// `request_handler_timeout_seconds` of the endpoint whose handler issues it.
+    #[serde(default = "GrpcInternalClientSettings::default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "GrpcInternalClientSettings::default_tcp_keepalive_seconds")]
+    pub tcp_keepalive_seconds: u64,
+    /// HTTP/2 keep-alive PING interval, sent while the channel is idle. Keep below
+    /// the idle timeout of anything on the path that reaps idle connections.
+    #[serde(default = "GrpcInternalClientSettings::default_http2_keepalive_interval_seconds")]
+    pub http2_keepalive_interval_seconds: u64,
+    /// How long a keep-alive PING may go unanswered before the connection is
+    /// dropped.
+    #[serde(default = "GrpcInternalClientSettings::default_http2_keepalive_timeout_seconds")]
+    pub http2_keepalive_timeout_seconds: u64,
+}
+
+impl GrpcInternalClientSettings {
+    fn default_connect_timeout_seconds() -> u64 {
+        5
+    }
+
+    fn default_request_timeout_seconds() -> u64 {
+        40
+    }
+
+    fn default_tcp_keepalive_seconds() -> u64 {
+        30
+    }
+
+    fn default_http2_keepalive_interval_seconds() -> u64 {
+        20
+    }
+
+    fn default_http2_keepalive_timeout_seconds() -> u64 {
+        10
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -770,6 +924,306 @@ mod tests {
             .expect("[server.http] should deserialize")
     }
 
+    /// A bare-string `jwt_issuer` and a one-entry list are the same
+    /// configuration, so existing config files need no edit.
+    #[test]
+    fn jwt_issuer_accepts_a_bare_string_and_a_list() {
+        let bare: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] with a bare string should deserialize");
+        let list: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = ["LEGACY_AUTH_KEYWORD"]
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] with a list should deserialize");
+
+        assert_eq!(bare.jwt_issuer, list.jwt_issuer);
+        assert_eq!(bare.jwt_issuer, vec!["LEGACY_AUTH_KEYWORD".to_string()]);
+    }
+
+    #[test]
+    fn jwt_issuer_accepts_two_entries_for_a_cutover() {
+        let auth: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = ["LEGACY_AUTH_KEYWORD", "https://auth.example.com/realms/lore"]
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] with two issuers should deserialize");
+
+        assert_eq!(
+            auth.jwt_issuer,
+            vec![
+                "LEGACY_AUTH_KEYWORD".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]
+        );
+    }
+
+    /// Every authorization field round-trips from TOML, including the
+    /// literal `urc-*` wildcard.
+    #[test]
+    fn auth_settings_authorization_fields_round_trip() {
+        let auth: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            permission_claim = "realm_access.roles"
+            resource_claim = "resources"
+            resource_id_claim = "rsname"
+            resource_id_template = "repo:{id}"
+            resource_wildcard = "urc-*"
+            identity_claim = "preferred_username"
+            baseline_access = "reachable"
+        "#,
+        )
+        .expect("[server.auth] with every authorization field should deserialize");
+
+        assert_eq!(auth.permission_claim.as_deref(), Some("realm_access.roles"));
+        assert_eq!(auth.resource_claim.as_deref(), Some("resources"));
+        assert_eq!(auth.resource_id_claim, "rsname");
+        assert_eq!(auth.resource_id_template, "repo:{id}");
+        assert_eq!(auth.resource_wildcard, "urc-*");
+        assert_eq!(auth.identity_claim, "preferred_username");
+        assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
+    }
+
+    /// A config setting none of the authorization fields gets the documented
+    /// defaults: the `urc-` template and wildcard literals, `sub` as the
+    /// identity claim, and no permission or resource claim selected.
+    #[test]
+    fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
+        let auth: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] without the authorization fields should deserialize");
+
+        assert_eq!(auth.resource_id_template, "urc-{id}");
+        assert_eq!(auth.resource_wildcard, "urc-*");
+        assert_eq!(auth.resource_id_claim, "resource_id");
+        assert_eq!(auth.baseline_access, BaselineAccess::Denied);
+        assert_eq!(auth.permission_claim, None);
+        assert_eq!(auth.resource_claim, None);
+        assert_eq!(auth.identity_claim, "sub");
+    }
+
+    /// Minimal loadable settings with the given `[server.auth]` keys, for the
+    /// startup-validation tests. `Settings` deserializes with a `'static`
+    /// bound, so the assembled TOML is leaked; each test builds one.
+    fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
+        let config = format!(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [server.auth]
+            {auth_keys}
+        "#
+        );
+        toml::from_str(Box::leak(config.into_boxed_str()))
+    }
+
+    #[test]
+    fn auth_without_jwt_audience_fails_to_parse_naming_the_setting() {
+        let error = settings_with_auth_keys(r#"jwt_issuer = "LEGACY_AUTH_KEYWORD""#)
+            .expect_err("[server.auth] without jwt_audience must fail to parse");
+        assert!(
+            error.to_string().contains("jwt_audience"),
+            "the error must name the missing setting: {error}"
+        );
+    }
+
+    #[test]
+    fn auth_without_jwt_issuer_fails_to_parse_naming_the_setting() {
+        let error = settings_with_auth_keys(r#"jwt_audience = ["lore-service"]"#)
+            .expect_err("[server.auth] without jwt_issuer must fail to parse");
+        assert!(
+            error.to_string().contains("jwt_issuer"),
+            "the error must name the missing setting: {error}"
+        );
+    }
+
+    /// An empty list parses but would reject every token, which is never what
+    /// was configured on purpose, so validation refuses it.
+    #[test]
+    fn auth_with_empty_jwt_audience_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = []
+        "#,
+        )
+        .expect("an empty jwt_audience list still parses");
+        validate_auth_config(&settings)
+            .expect_err("[server.auth] with an empty jwt_audience must fail validation");
+    }
+
+    #[test]
+    fn auth_with_empty_jwt_issuer_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = []
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("an empty jwt_issuer list still parses");
+        validate_auth_config(&settings)
+            .expect_err("[server.auth] with an empty jwt_issuer must fail validation");
+    }
+
+    // FORK-LOCAL (Tideshift): upstream's version of this test has neither
+    // `resource_claim` nor `auth_url`, which selects GlobalGrants and is
+    // refused here (see `fork_global_grants_selection_fails_validation`).
+    // `resource_claim` keeps the test about the issuer/audience pair.
+    #[test]
+    fn auth_with_issuer_and_audience_passes_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service", ".example.net"]
+            resource_claim = "resources"
+        "#,
+        )
+        .expect("a complete [server.auth] must parse");
+        validate_auth_config(&settings).expect("a complete [server.auth] must validate");
+    }
+
+    /// FORK-LOCAL (Tideshift): `[server.auth]` with neither `auth_url` nor
+    /// `resource_claim` selects `GlobalGrants`, under which any verified token
+    /// reaches every partition. Lorehub never wants that tier, so the loader
+    /// refuses it and names the two settings that fix it.
+    #[test]
+    fn fork_global_grants_selection_fails_validation() {
+        for keys in [
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+        "#,
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+            permission_claim = "realm_access.roles"
+        "#,
+        ] {
+            let settings = settings_with_auth_keys(keys).expect("the pairing still parses");
+            let error = validate_auth_config(&settings)
+                .expect_err("GlobalGrants selection must fail validation");
+            assert!(error.to_string().contains("resource_claim"), "{error}");
+            assert!(error.to_string().contains("auth_url"), "{error}");
+        }
+    }
+
+    /// FORK-LOCAL (Tideshift): the two selections Lorehub deploys still load.
+    #[test]
+    fn fork_auth_client_and_resource_grants_selections_pass_validation() {
+        let resource_grants = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+            resource_claim = "resources"
+        "#,
+        )
+        .expect("parses");
+        validate_auth_config(&resource_grants).expect("ResourceGrants must validate");
+        let auth_client = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+
+            [environment.endpoint]
+            auth_url = "https://legacy-auth.example.com"
+        "#,
+        )
+        .expect("parses");
+        validate_auth_config(&auth_client).expect("AuthClient must validate");
+    }
+
+    /// No `[server.auth]` at all keeps starting: verification stays off and
+    /// nothing is mandatory.
+    #[test]
+    fn no_auth_table_passes_validation() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#,
+        )
+        .expect("settings deserialize");
+        validate_auth_config(&settings).expect("no [server.auth] must stay valid");
+    }
+
+    /// `auth_url` names an authorization service, but without `[server.auth]`
+    /// nothing verifies tokens and the server would run open. The loader
+    /// refuses it, naming both settings.
+    #[test]
+    fn auth_url_without_server_auth_fails_validation() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [environment.endpoint]
+            auth_url = "https://legacy-auth.example.com"
+        "#,
+        )
+        .expect("settings deserialize");
+        let error = validate_auth_config(&settings)
+            .expect_err("auth_url without [server.auth] must fail validation");
+        assert!(error.to_string().contains("auth_url"), "{error}");
+        assert!(error.to_string().contains("[server.auth]"), "{error}");
+    }
+
+    /// The authorizer-selection conflict bails at config load: setting
+    /// `resource_claim` while `auth_url` is still configured is refused
+    /// before any initialization, naming both settings.
+    #[test]
+    fn auth_url_with_resource_claim_fails_validation() {
+        // The trailing table is appended after the `[server.auth]` keys the
+        // helper writes, which TOML reads as a sibling table.
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+            resource_claim = "resources"
+
+            [environment.endpoint]
+            auth_url = "https://legacy-auth.example.com"
+        "#,
+        )
+        .expect("the conflicting pairing still parses");
+        let error = validate_auth_config(&settings)
+            .expect_err("auth_url with resource_claim must fail validation");
+        assert!(error.to_string().contains("auth_url"), "{error}");
+        assert!(error.to_string().contains("resource_claim"), "{error}");
+    }
+
     /// Both keys absent means an empty policy, which resolves to the built-in set.
     #[test]
     fn presign_content_type_lists_default_to_empty() {
@@ -876,6 +1330,227 @@ mod tests {
             topology.provider,
             crate::topology::TopologyProvider::Consul
         ));
+    }
+
+    #[test]
+    fn a_disabled_service_is_parsed() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.storage_service]
+            enabled = false
+
+            [server.grpc_public_services.lock_service]
+            enabled = false
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(!services.storage_service.enabled);
+        assert!(!services.lock_service.enabled);
+        assert!(services.thin_client_service.enabled);
+        assert!(services.admin_service.enabled);
+    }
+
+    /// An absent table means every service registers.
+    #[test]
+    fn an_absent_table_registers_every_service() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(services.admin_service.enabled);
+        assert!(services.storage_service.enabled);
+        assert!(services.lock_service.enabled);
+        assert!(services.notification_service.enabled);
+    }
+
+    /// `general` nests under the service block.
+    #[test]
+    fn general_settings_parse_under_the_service_block() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.lock_service.general]
+            max_encoding_message_size = 16777216
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+
+        assert_eq!(
+            settings
+                .server
+                .grpc_public_services
+                .lock_service
+                .general
+                .max_encoding_message_size,
+            Some(16_777_216)
+        );
+        assert!(
+            settings.server.grpc_public_services.lock_service.enabled,
+            "a block carrying only `general` must stay enabled"
+        );
+    }
+
+    /// `mode = "none"` is how a layered config opts out of the `[lock_store]`
+    /// table that `default.toml` sets.
+    #[test]
+    fn a_lock_store_mode_of_none_parses() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [lock_store]
+            mode = "none"
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+
+        assert_eq!(
+            settings.lock_store.expect("lock_store present").mode,
+            "none"
+        );
+    }
+
+    /// Unknown keys are ignored, so a misspelled disable leaves the service
+    /// registered.
+    #[test]
+    fn a_misspelled_disable_leaves_the_service_registered() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.thin_cleint_service]
+            enabled = false
+
+            [server.grpc_public_services.storage_service]
+            enabld = false
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(services.thin_client_service.enabled);
+        assert!(services.storage_service.enabled);
+    }
+
+    /// The pre-`general` spelling of `max_encoding_message_size` deserializes
+    /// but is silently dropped.
+    #[test]
+    fn the_pre_general_spelling_of_max_encoding_message_size_is_dropped() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.lock_service]
+            max_encoding_message_size = 16777216
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+
+        assert_eq!(
+            settings
+                .server
+                .grpc_public_services
+                .lock_service
+                .general
+                .max_encoding_message_size,
+            None
+        );
+    }
+
+    /// A configuration disabling every public gRPC service loads.
+    #[test]
+    fn disabling_every_service_still_loads() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [server.grpc_public_services.admin_service]
+            enabled = false
+
+            [server.grpc_public_services.storage_service]
+            enabled = false
+
+            [server.grpc_public_services.revision_service]
+            enabled = false
+
+            [server.grpc_public_services.repository_service]
+            enabled = false
+
+            [server.grpc_public_services.environment_service]
+            enabled = false
+
+            [server.grpc_public_services.thin_client_service]
+            enabled = false
+
+            [server.grpc_public_services.lock_service]
+            enabled = false
+
+            [server.grpc_public_services.notification_service]
+            enabled = false
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#;
+
+        let settings: Settings = toml::from_str(config).expect("settings deserialize");
+        let services = &settings.server.grpc_public_services;
+
+        assert!(!services.admin_service.enabled);
+        assert!(!services.storage_service.enabled);
+        assert!(!services.revision_service.enabled);
+        assert!(!services.repository_service.enabled);
+        assert!(!services.environment_service.enabled);
+        assert!(!services.thin_client_service.enabled);
+        assert!(!services.lock_service.enabled);
+        assert!(!services.notification_service.enabled);
     }
 
     #[test]

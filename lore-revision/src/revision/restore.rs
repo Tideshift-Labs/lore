@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
@@ -11,7 +10,7 @@ use serde::Serialize;
 
 use crate::branch;
 use crate::branch::BranchLatestStatus;
-use crate::branch::push::PushStatistics;
+use crate::branch::push::PushProgress;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
@@ -29,14 +28,17 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::metadata;
 use crate::metadata::Metadata;
+use crate::metadata::MetadataInherit;
 use crate::metadata::MetadataType;
 use crate::metadata::RESTORED_FROM;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
 use crate::state;
+use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
@@ -318,30 +320,32 @@ pub async fn restore(
             if change.action == change::FileAction::Delete {
                 let block = change
                     .from
+                    .mapping
                     .state
                     .block(
-                        change.from.repository.clone(),
-                        NodeBlock::index(change.from.node),
+                        change.from.mapping.repository.clone(),
+                        NodeBlock::index(change.from.mapping.node),
                     )
                     .await
                     .forward::<RestoreError>("deserializing state node block")?;
-                block.node(Node::index(change.from.node))
+                block.node(Node::index(change.from.mapping.node))
             } else {
                 let block = change
                     .to
+                    .mapping
                     .state
                     .block(
-                        change.to.repository.clone(),
-                        NodeBlock::index(change.to.node),
+                        change.to.mapping.repository.clone(),
+                        NodeBlock::index(change.to.mapping.node),
                     )
                     .await
                     .forward::<RestoreError>("deserializing state node block")?;
-                block.node(Node::index(change.to.node))
+                block.node(Node::index(change.to.mapping.node))
             }
         };
 
         LoreEvent::RevisionRestoreFile(LoreRevisionRestoreFileEventData {
-            path: LoreString::from(&change.path),
+            path: LoreString::from(change.path()),
             action: change.action.into(),
             size: node.size,
             is_file: node.is_file() as u8,
@@ -390,12 +394,21 @@ pub async fn restore(
     })
     .send();
 
-    // Apply the metadata on the state
+    let restored_metadata_hash = current_state.metadata_hash();
+    let restored_metadata = if restored_metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), restored_metadata_hash)
+            .await
+            .forward::<RestoreError>("deserializing restored revision metadata")?
+    };
+
     branch::merge::merge_metadata(
         repository.clone(),
         Arc::new(changes.clone()),
         current_state.clone(),
         state_staged.clone(),
+        &MetadataInherit::All,
     )
     .await
     .forward::<RestoreError>("merging metadata on state")?;
@@ -403,15 +416,16 @@ pub async fn restore(
 
     // Get or create metadata chunk
     let metadata_hash = state_staged.metadata_hash();
-    if metadata_hash.is_zero() {
-        return Err(RestoreError::internal("Failed to deserialize metadata"));
-    }
-    let original_metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-        .await
-        .forward::<RestoreError>("deserializing original metadata")?;
+    let original_metadata = if metadata_hash.is_zero() {
+        Metadata::new()
+    } else {
+        Metadata::deserialize(repository.clone(), metadata_hash)
+            .await
+            .forward::<RestoreError>("deserializing original metadata")?
+    };
 
     let message = options.message.unwrap_or(
-        original_metadata
+        restored_metadata
             .get_string(metadata::MESSAGE)
             .forward::<RestoreError>("reading commit message from metadata")?
             .to_owned(),
@@ -446,13 +460,15 @@ pub async fn restore(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        repository.require_path()?,
+        RelativePath::new(),
+        ROOT_NODE,
         metadata.clone(),
-        None,
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),
         modified_times.clone(),
+        commit::CommitStats::new(),
+        execution_context().globals().event_interval(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
@@ -500,7 +516,7 @@ pub async fn restore(
     let mut revision_number = new_state.revision_number();
     let mut remote_pushed = false;
     if let Ok(remote) = repository.remote().await {
-        let stats = Arc::new(PushStatistics::default());
+        let stats = Arc::new(PushProgress::new(execution_context().push_stats().clone()));
 
         LoreEvent::RevisionRestoreFragmentBegin(LoreRevisionRestoreFragmentBeginEventData {
             fragments: fragments.len() as u64,
@@ -521,6 +537,7 @@ pub async fn restore(
             storage_protocol.clone(),
             fragments,
             remote.environment.max_query_batch(),
+            execution_context().push_stats(),
         )
         .await
         .forward::<RestoreError>("querying missing fragments from server")?;
@@ -536,8 +553,8 @@ pub async fn restore(
             tokio::select! {
                 _ = ticker.tick() => {
                     LoreEvent::RevisionRestoreFragmentProgress(LoreRevisionRestoreFragmentProgressEventData {
-                        complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: stats.fragment_count.load(Ordering::Relaxed) as u64,
+                        complete: stats.complete(),
+                        count: stats.count(),
                     }).send();
                 },
                 result = &mut push_task => {
@@ -548,7 +565,7 @@ pub async fn restore(
         result.forward::<RestoreError>("pushing fragments to remote")?;
 
         LoreEvent::RevisionRestoreFragmentEnd(LoreRevisionRestoreFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
+            fragments: stats.complete(),
         })
         .send();
 

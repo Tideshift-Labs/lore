@@ -1726,9 +1726,10 @@ async fn measure_the_real_lore_client_resource_exhausted_retry_budget() {
         );
     }
     // Every hinted wait is the 10 s hint, so eleven of them land just past 110 s
-    // and a twelfth would not fit inside the 120 s deadline. Jitter is added to
-    // the base step, not to the hint, so it moves this total by well under a
-    // second rather than by 100 ms per wait.
+    // and a twelfth would not fit inside the 120 s deadline. Jitter is applied to
+    // the base step, not to the hint (symmetric, so a negative draw is absorbed
+    // by the hint floor), so it moves this total by under 300 ms (at most +99 ms
+    // on each of the three waits at the 10 s ceiling) rather than by 100 ms per wait.
     assert!(
         total >= Duration::from_millis(110_000) && total <= Duration::from_millis(110_400),
         "measured hinted retry budget {total:?} is outside the schedule the pinned constants, \
@@ -1760,9 +1761,13 @@ async fn measure_the_real_lore_client_resource_exhausted_retry_budget() {
         baseline_attempts, 18,
         "the unhinted path spends its budget on more, shorter attempts"
     );
+    // Window: base 12,750 + 10 * 10,000 = 112,750 ms, displaced by `lore_base::retry`'s symmetric
+    // jitter (-mag..=mag-1 ms per wait, mag 25 / 50 / 100 x16 over the 18 waits): 111,075 ms to
+    // 114,407 ms, plus 18 ms of paused-clock tick rounding. Every draw still admits the 18th
+    // attempt and refuses the 19th (see `lore-transport/tests/grpc_retry_hint.rs`).
     assert!(
-        baseline_total >= Duration::from_millis(112_800)
-            && baseline_total <= Duration::from_millis(114_300),
+        baseline_total >= Duration::from_millis(111_075)
+            && baseline_total <= Duration::from_millis(114_425),
         "measured unhinted retry budget {baseline_total:?} is outside the schedule the pinned \
          constants and RETRY_WALL_CLOCK_BUDGET imply; honouring the hint must not have changed \
          the no-hint path"

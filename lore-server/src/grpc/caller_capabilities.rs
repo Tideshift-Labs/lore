@@ -449,11 +449,7 @@ pub fn validate_settings(settings: &crate::settings::Settings) -> anyhow::Result
         "required caller capability policy forbids unguarded QUIC and internal replication ingress"
     );
     anyhow::ensure!(
-        server
-            .grpc_public_services
-            .as_ref()
-            .and_then(|services| services.forwarded_requests.as_ref())
-            .is_none(),
+        server.grpc_public_services.forwarded_requests.is_none(),
         "required caller capability policy forbids forwarded requests"
     );
     anyhow::ensure!(

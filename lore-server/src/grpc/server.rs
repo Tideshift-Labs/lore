@@ -28,10 +28,12 @@ use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use serde::Deserialize;
+use tonic::service::Routes;
 use tonic::transport::Certificate;
 use tonic::transport::Identity;
 use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::Server;
+use tower::Layer;
 use tower::ServiceBuilder;
 use tower::layer::util::Stack;
 use tower_http::classify::GrpcCode;
@@ -45,9 +47,9 @@ use super::caller_capabilities::CallerCapabilityLayer;
 use super::caller_capabilities::CallerCapabilityPolicy;
 use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
-use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
 use crate::authnz::rebac::GrpcRepositoryOperationAuthorizationVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
@@ -70,6 +72,9 @@ use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::drain::GrpcDrainLayer;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
+use crate::grpc::tower::malformed_request::MalformedRequestLayer;
+use crate::grpc::tower::partition_access::PartitionAccessLayer;
+use crate::grpc::tower::partition_access::PartitionAccessService;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
@@ -83,22 +88,28 @@ use crate::util::core_hop::CoreHopLayer;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     Stack<
-        CallerCapabilityLayer,
+        MalformedRequestLayer,
         Stack<
-            GrpcResponseTraceLayer,
+            CallerCapabilityLayer,
             Stack<
-                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+                GrpcResponseTraceLayer,
                 Stack<
-                    LoreTracingLayer,
+                    ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                     Stack<
+                        LoreTracingLayer,
                         Stack<
-                            TraceLayer<
-                                SharedClassifier<GrpcErrorsAsFailures>,
-                                MakeCorrelationIdSpan,
+                            Stack<
+                                TraceLayer<
+                                    SharedClassifier<GrpcErrorsAsFailures>,
+                                    MakeCorrelationIdSpan,
+                                >,
+                                CorrelationIdLayer,
                             >,
-                            CorrelationIdLayer,
+                            Stack<
+                                GrpcDrainLayer,
+                                Stack<CoreHopLayer, tower::layer::util::Identity>,
+                            >,
                         >,
-                        Stack<GrpcDrainLayer, Stack<CoreHopLayer, tower::layer::util::Identity>>,
                     >,
                 >,
             >,
@@ -142,15 +153,81 @@ pub(crate) fn domain_operation_receipt_capability_available(
     service_available && enforcement_enabled
 }
 
-#[derive(Clone, Debug, Deserialize)]
-pub struct GrpcServiceSettings {
-    // max size of response payloads
+/// Settings available in each public gRPC service block's `general` table.
+/// Each service applies only the fields it supports.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ServiceSettings {
+    /// Maximum encoded response size in bytes.
+    #[serde(default)]
     pub max_encoding_message_size: Option<usize>,
 }
 
+/// The `enabled` / `general` pair carried by every public gRPC service block.
+/// [`GenericServiceSettings`] implements it.
+pub trait GrpcServiceSettings {
+    /// Whether the public gRPC router registers this service.
+    fn enabled(&self) -> bool;
+    /// Common settings for this service.
+    fn general(&self) -> &ServiceSettings;
+}
+
+const fn enabled_by_default() -> bool {
+    true
+}
+
+/// A service settings block with no fields beyond the shared `enabled` /
+/// `general` pair.
 #[derive(Clone, Debug, Deserialize)]
+pub struct GenericServiceSettings {
+    #[serde(default = "enabled_by_default")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub general: ServiceSettings,
+}
+
+/// Hand-written rather than derived: `#[derive(Default)]` on a `bool` field
+/// yields `false`, which would disable every service a configuration omits.
+impl Default for GenericServiceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: enabled_by_default(),
+            general: ServiceSettings::default(),
+        }
+    }
+}
+
+impl GrpcServiceSettings for GenericServiceSettings {
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn general(&self) -> &ServiceSettings {
+        &self.general
+    }
+}
+
+/// One settings block per public gRPC service. Unknown keys are ignored, so a
+/// misspelled block or key leaves the service registered.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct GrpcPublicServicesSettings {
-    pub lock_service: Option<GrpcServiceSettings>,
+    #[serde(default)]
+    pub admin_service: GenericServiceSettings,
+    #[serde(default)]
+    pub storage_service: GenericServiceSettings,
+    #[serde(default)]
+    pub revision_service: GenericServiceSettings,
+    #[serde(default)]
+    pub repository_service: GenericServiceSettings,
+    #[serde(default)]
+    pub environment_service: GenericServiceSettings,
+    #[serde(default)]
+    pub thin_client_service: GenericServiceSettings,
+    #[serde(default)]
+    pub lock_service: GenericServiceSettings,
+    #[serde(default)]
+    pub notification_service: GenericServiceSettings,
+
+    /// Not a service. Configures forwarding for services that already register.
     pub forwarded_requests: Option<ForwardedRequestsSettings>,
 }
 
@@ -208,9 +285,22 @@ pub struct RevisionListAcceleration {
 
 impl RevisionListAcceleration {
     pub fn from_feature(feature: &FeatureSettings) -> Self {
+        let step_keys = feature.revision_step_keys.unwrap_or(true);
+
+        let wants_list_cache = feature.revision_list_cache.unwrap_or(true);
+        let list_cache = if !step_keys && wants_list_cache {
+            warn!(
+                ?feature,
+                "List Cache acceleration feature does not function without Step Keys feature"
+            );
+            false
+        } else {
+            wants_list_cache
+        };
+
         Self {
-            step_keys: feature.revision_step_keys.unwrap_or(true),
-            list_cache: feature.revision_list_cache.unwrap_or(true),
+            step_keys,
+            list_cache,
         }
     }
 }
@@ -552,7 +642,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
         http2_keep_alive_interval: Option<Duration>,
         http2_keep_alive_timeout: Option<Duration>,
         request_handler_timeout: Duration,
-        service_settings: Option<GrpcPublicServicesSettings>,
+        service_settings: GrpcPublicServicesSettings,
         user_agent_filter: Arc<UserAgentFilter>,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     ) -> GrpcServerBuilder<MaybeJwtVerifier> {
@@ -599,7 +689,7 @@ pub struct MaybeJwtVerifier {
     http2_keep_alive_interval: Option<Duration>,
     http2_keep_alive_timeout: Option<Duration>,
     request_handler_timeout: Duration,
-    service_settings: Option<GrpcPublicServicesSettings>,
+    service_settings: GrpcPublicServicesSettings,
     user_agent_filter: Arc<UserAgentFilter>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
 }
@@ -615,26 +705,50 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         self
     }
     fn make_lock_service(
-        services_settings: &Option<GrpcPublicServicesSettings>,
+        settings: &ServiceSettings,
         inner: LoreLockService,
     ) -> LockServiceServer<LoreLockService> {
         let mut lock_service = LockServiceServer::new(inner);
 
-        if let Some(lock_service_settings) = services_settings
-            .as_ref()
-            .and_then(|s| s.lock_service.as_ref())
-            && let Some(max_encoding_message_size) = lock_service_settings.max_encoding_message_size
-        {
+        if let Some(max_encoding_message_size) = settings.max_encoding_message_size {
             lock_service = lock_service.max_encoding_message_size(max_encoding_message_size);
         }
 
         lock_service
     }
 
+    /// The one registration path for a partition-scoped authenticated
+    /// service: the JWT interceptor verifies the token, and the
+    /// [`PartitionAccessLayer`] inside it asks the configured authorizer
+    /// whether that caller may reach the partition the request names.
+    /// Per-operation permissions are the handlers' own checks, answered from
+    /// the `PartitionGrants` extension the layer exposes (or the authorizer,
+    /// when the grants are not enumerable).
+    ///
+    /// This layer checks access only from the request metadata headers,
+    /// which covers most of the operations. If the authorization decision
+    /// needs to be done based on a request body value, needs custom authz
+    /// check inside the handler (e.g. notification subscribe, lock action
+    /// checks). The middleware sees the request body only as a binary stream,
+    /// so we cannot easily action on any body values.
+    fn partition_scoped<S>(
+        service: S,
+        jwt_interceptor: &JWTInterceptor,
+        authorizer: &Arc<dyn RepositoryAuthorizer>,
+        request_timeout: Duration,
+    ) -> tonic::service::interceptor::InterceptedService<PartitionAccessService<S>, JWTInterceptor>
+    {
+        tonic::service::interceptor::InterceptedService::new(
+            PartitionAccessLayer::new(authorizer.clone(), request_timeout).layer(service),
+            jwt_interceptor.clone(),
+        )
+    }
+
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
         enforce_write_permission: bool,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
         anyhow::ensure!(
             self.0.caller_capability_policy != CallerCapabilityPolicy::RequireOutcomeUnknownV1
@@ -645,19 +759,74 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         // extensions, so write-permission enforcement no-ops regardless; pass
         // `false` for clarity when there's no verifier.
         let enforce_write_permission = jwt_verifier.is_some() && enforce_write_permission;
+        let rpc_timeout = self.0.request_handler_timeout;
+        let services = &self.0.service_settings;
+        let mut registered = Vec::new();
+        let mut check_enabled = |settings: &dyn GrpcServiceSettings, name: &'static str| {
+            let enabled = settings.enabled();
+            info!(service = name, enabled, "Public gRPC service enabled");
+            if enabled {
+                registered.push(name);
+            }
+            enabled
+        };
+
+        let metrics_layer = tower::ServiceBuilder::new()
+            .layer(GrpcMetricsLayer::new(self.0.user_agent_filter.clone()));
+        let mut server = Server::builder()
+            .http2_keepalive_interval(self.0.http2_keep_alive_interval)
+            .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
+        if let Some(tls_config) = self.0.tls_config {
+            server = server.tls_config(tls_config)?;
+        }
+        let trace_layer_config = {
+            let mut config = TraceLayerConfig::default();
+            config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
+            config
+        };
+        let public_grpc_guard = self
+            .0
+            .drain_state
+            .as_ref()
+            .map(DrainState::register_public_grpc);
+        let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(CoreHopLayer)
+            .layer(GrpcDrainLayer(self.0.drain_state))
+            .layer(
+                CorrelationIdLayerBuilder::new()
+                    .with_grpc_tracer(trace_layer_config)
+                    .build(),
+            )
+            .layer(LoreTracingLayer {})
+            .layer(metrics_layer)
+            .layer(GrpcResponseTraceLayer {})
+            .layer(CallerCapabilityLayer::new(self.0.caller_capability_policy))
+            // Innermost: the layers above must observe the reclassified status.
+            .layer(MalformedRequestLayer::new(self.0.user_agent_filter))
+            // Empty routes turn the `Server` into a `Router` without mounting
+            // anything; unmatched paths answer UNIMPLEMENTED.
+            .add_routes(Routes::default());
+
         let storage_svc = LoreStorageService::new(
             self.0.immutable_store.clone(),
             self.0.local_store.clone(),
             self.0.mutable_store.clone(),
             enforce_write_permission,
         );
+        let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
+            source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
+                crate::grpc::thinclient::v1::revision_diff::DEFAULT_REVISION_DIFF_SOURCE_CAP,
+            ),
+            history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
+        };
         let history_step_size = self
             .0
             .feature
             .history_step_size
             .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
         let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
-        let rpc_timeout = self.0.request_handler_timeout;
         // Push-time advisory-lock enforcement (CR-019): `Some(..)` only when the
         // opt-in feature is on AND a lock store is configured AND a JWT verifier
         // exists to make lock ownership a verified pair; otherwise `None` → the
@@ -691,19 +860,20 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                     None
                 }
                 (Some(lock_store), Some(verifier)) => {
-                    let issuer_policy = LockOwnerIssuerPolicy::from_configured_issuer(
+                    let issuer_policy = LockOwnerIssuerPolicy::from_configured_issuers(
                         verifier.jwt_issuer.as_deref(),
                     );
                     if issuer_policy == LockOwnerIssuerPolicy::Unprovable {
-                        // Any issuer the JWK service can verify is accepted, so a
-                        // stored subject-only owner names no provable pair and the
-                        // guard must fail closed on every lock it finds — including
-                        // the pusher's own.
+                        // Without exactly one configured issuer, a stored
+                        // subject-only owner names no provable pair, so the
+                        // guard must fail closed on every lock it finds —
+                        // including the pusher's own.
                         warn!(
                             "[feature] enforce_locks_on_push is true but [server.auth] \
-                             jwt_issuer is unset; lock ownership cannot be proved to be a \
-                             verified issuer/subject pair, so EVERY lock on a changed path \
-                             will block the push. Set jwt_issuer."
+                             jwt_issuer does not name exactly one issuer; lock ownership \
+                             cannot be proved to be a verified issuer/subject pair, so EVERY \
+                             lock on a changed path will block the push. Set exactly one \
+                             jwt_issuer."
                         );
                     }
                     Some(PushLockEnforcement {
@@ -715,6 +885,18 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         } else {
             None
         };
+        let thin_client_v1_svc = LoreThinClientV1Service::new(
+            self.0.immutable_store.clone(),
+            self.0.mutable_store.clone(),
+            rpc_timeout,
+            revision_diff_config,
+            history_step_size,
+            acceleration,
+        );
+
+        let mut admin_svc = self.0.admin_svc;
+        admin_svc.set_jwt_verifier(jwt_verifier.clone());
+        admin_svc.set_rpc_timeout(rpc_timeout);
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
@@ -740,20 +922,9 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             push_lock_enforcement,
             self.0.domain_context.clone(),
         );
-        let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {
-            source_cap: self.0.feature.revision_diff_source_cap.unwrap_or(
-                crate::grpc::thinclient::v1::revision_diff::DEFAULT_REVISION_DIFF_SOURCE_CAP,
-            ),
-            history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
-        };
-        let thin_client_v1_svc = LoreThinClientV1Service::new(
-            self.0.immutable_store.clone(),
-            self.0.mutable_store.clone(),
-            rpc_timeout,
-            revision_diff_config,
-        );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
+            repository_authorizer.clone(),
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
@@ -762,6 +933,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
         let repository_v1_svc = LoreRepositoryV1Service::new(
             self.0.environment.clone(),
+            repository_authorizer.clone(),
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
@@ -773,8 +945,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         // The private receipt rail is meaningful only with all three pieces:
         // a Postgres domain coordinator, JWT authentication, and the private
         // auth-grpc verifier URL. It is registered below only in the auth-ON
-        // branch through JWTAuthnInterceptor. A partial configuration exposes
-        // no endpoint and advertises no v2 capability.
+        // branch, behind the authn-only JWT interceptor and NOT the partition
+        // layer: its requests name no partition the layer could decide on, and
+        // the service makes its own authorization calls. A partial configuration
+        // exposes no endpoint and advertises no v2 capability.
         let auth_url = self
             .0
             .environment
@@ -815,6 +989,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                         lock_store.clone(),
                         self.0.notification_sender.clone(),
                         self.0.hook_dispatcher.clone(),
+                        repository_authorizer.clone(),
                         rpc_timeout,
                         enforce_write_permission,
                     )
@@ -823,89 +998,76 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             }
             None => None,
         };
-        let metrics_layer =
-            tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(self.0.user_agent_filter));
-        let mut server = Server::builder()
-            .http2_keepalive_interval(self.0.http2_keep_alive_interval)
-            .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
-        if let Some(tls_config) = self.0.tls_config {
-            server = server.tls_config(tls_config)?;
+
+        let notification_service = self.0.notification_service;
+
+        let authenticated = jwt_verifier.is_some();
+
+        if check_enabled(&services.admin_service, "admin_service") {
+            router = router.add_service(AdminServiceServer::new(admin_svc));
         }
-
-        let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_jwt_verifier(jwt_verifier.clone());
-        admin_svc.set_rpc_timeout(rpc_timeout);
-        let trace_layer_config = {
-            let mut config = TraceLayerConfig::default();
-            config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
-            config
-        };
-        let public_grpc_guard = self
-            .0
-            .drain_state
-            .as_ref()
-            .map(DrainState::register_public_grpc);
-        let mut router = server
-            // Outermost, so everything inward runs on core: this stack is served
-            // from net.
-            .layer(CoreHopLayer)
-            .layer(GrpcDrainLayer(self.0.drain_state))
-            .layer(
-                CorrelationIdLayerBuilder::new()
-                    .with_grpc_tracer(trace_layer_config)
-                    .build(),
-            )
-            .layer(LoreTracingLayer {})
-            .layer(metrics_layer)
-            .layer(GrpcResponseTraceLayer {})
-            .layer(CallerCapabilityLayer::new(self.0.caller_capability_policy));
-
-        let mut router = router.add_service(AdminServiceServer::new(admin_svc));
 
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
             let jwt_interceptor = JWTInterceptor::new(jwt_verifier);
-            // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-            let jwt_authn_interceptor = JWTAuthnInterceptor::new(jwt_verifier);
-            router = router
-                .add_service(StorageServiceServer::with_interceptor(
-                    storage_svc.clone(),
-                    jwt_interceptor.clone(),
-                ))
-                .add_service(
-                    storage_service_v1_server::StorageServiceServer::with_interceptor(
-                        storage_svc,
-                        jwt_interceptor.clone(),
-                    ),
-                )
-                .add_service(RevisionServiceServer::with_interceptor(
-                    revision_svc,
-                    jwt_interceptor.clone(),
-                ))
-                .add_service(revision_v1_server::RevisionServiceServer::with_interceptor(
-                    revision_v1_svc,
-                    jwt_interceptor.clone(),
-                ))
-                .add_service(
-                    thin_client_v1_server::ThinClientServiceServer::with_interceptor(
-                        thin_client_v1_svc,
-                        jwt_interceptor.clone(),
-                    ),
-                )
-                .add_service(RepositoryServiceServer::with_interceptor(
-                    repository_svc,
-                    // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
-                    jwt_authn_interceptor.clone(),
-                ))
-                .add_service(
-                    repository_v1_server::RepositoryServiceServer::with_interceptor(
-                        repository_v1_svc,
-                        jwt_authn_interceptor.clone(),
-                    ),
-                )
-                .add_service(EnvironmentServiceServer::new(environment_svc))
-                .add_service(environment_v1_server::EnvironmentServiceServer::new(
-                    environment_v1_svc,
+
+            if check_enabled(&services.storage_service, "storage_service") {
+                router = router
+                    .add_service(Self::partition_scoped(
+                        StorageServiceServer::new(storage_svc.clone()),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
+                    ))
+                    .add_service(Self::partition_scoped(
+                        storage_service_v1_server::StorageServiceServer::new(storage_svc),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
+                    ));
+            }
+            if check_enabled(&services.revision_service, "revision_service") {
+                router = router
+                    .add_service(Self::partition_scoped(
+                        RevisionServiceServer::new(revision_svc),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
+                    ))
+                    .add_service(Self::partition_scoped(
+                        revision_v1_server::RevisionServiceServer::new(revision_v1_svc),
+                        &jwt_interceptor,
+                        &repository_authorizer,
+                        rpc_timeout,
+                    ));
+            }
+            if check_enabled(&services.thin_client_service, "thin_client_service") {
+                router = router.add_service(Self::partition_scoped(
+                    thin_client_v1_server::ThinClientServiceServer::new(thin_client_v1_svc),
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    rpc_timeout,
                 ));
+            }
+            if check_enabled(&services.repository_service, "repository_service") {
+                router = router
+                    .add_service(RepositoryServiceServer::with_interceptor(
+                        repository_svc,
+                        jwt_interceptor.clone(),
+                    ))
+                    .add_service(
+                        repository_v1_server::RepositoryServiceServer::with_interceptor(
+                            repository_v1_svc,
+                            jwt_interceptor.clone(),
+                        ),
+                    );
+            }
+            if check_enabled(&services.environment_service, "environment_service") {
+                router = router
+                    .add_service(EnvironmentServiceServer::new(environment_svc))
+                    .add_service(environment_v1_server::EnvironmentServiceServer::new(
+                        environment_v1_svc,
+                    ));
+            }
 
             if let Some(domain_operation_svc) = domain_operation_svc {
                 let domain_operation_server =
@@ -914,22 +1076,28 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                         .max_encoding_message_size(64 * 1024);
                 router = router.add_service(tonic::service::interceptor::InterceptedService::new(
                     domain_operation_server,
-                    jwt_authn_interceptor.clone(),
+                    jwt_interceptor.clone(),
                 ));
             }
 
             // Locks require auth, so set that up here
-            if let Some(lock_svc) = lock_svc {
-                let lock_service = Self::make_lock_service(&self.0.service_settings, lock_svc);
-                let intercepted_service = tonic::service::interceptor::InterceptedService::new(
+            if let Some(lock_svc) = lock_svc
+                && check_enabled(&services.lock_service, "lock_service")
+            {
+                let lock_service =
+                    Self::make_lock_service(services.lock_service.general(), lock_svc);
+                router = router.add_service(Self::partition_scoped(
                     lock_service,
-                    jwt_interceptor.clone(),
-                );
-                router = router.add_service(intercepted_service);
+                    &jwt_interceptor,
+                    &repository_authorizer,
+                    rpc_timeout,
+                ));
             }
 
             // Notifications require auth
-            if let Some(notification_service) = self.0.notification_service {
+            if let Some(notification_service) = notification_service
+                && check_enabled(&services.notification_service, "notification_service")
+            {
                 router = router.add_service(
                     lore_notification::NotificationServiceServer::with_interceptor(
                         notification_service,
@@ -938,36 +1106,66 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
                 );
             }
         } else {
-            router = router
-                .add_service(StorageServiceServer::new(storage_svc.clone()))
-                .add_service(storage_service_v1_server::StorageServiceServer::new(
-                    storage_svc,
-                ))
-                .add_service(RevisionServiceServer::new(revision_svc))
-                .add_service(revision_v1_server::RevisionServiceServer::new(
-                    revision_v1_svc,
-                ))
-                .add_service(thin_client_v1_server::ThinClientServiceServer::new(
+            if check_enabled(&services.storage_service, "storage_service") {
+                router = router
+                    .add_service(StorageServiceServer::new(storage_svc.clone()))
+                    .add_service(storage_service_v1_server::StorageServiceServer::new(
+                        storage_svc,
+                    ));
+            }
+            if check_enabled(&services.revision_service, "revision_service") {
+                router = router
+                    .add_service(RevisionServiceServer::new(revision_svc))
+                    .add_service(revision_v1_server::RevisionServiceServer::new(
+                        revision_v1_svc,
+                    ));
+            }
+            if check_enabled(&services.thin_client_service, "thin_client_service") {
+                router = router.add_service(thin_client_v1_server::ThinClientServiceServer::new(
                     thin_client_v1_svc,
-                ))
-                .add_service(RepositoryServiceServer::new(repository_svc))
-                .add_service(repository_v1_server::RepositoryServiceServer::new(
-                    repository_v1_svc,
-                ))
-                .add_service(EnvironmentServiceServer::new(environment_svc))
-                .add_service(environment_v1_server::EnvironmentServiceServer::new(
-                    environment_v1_svc,
                 ));
-            if let Some(lock_svc) = lock_svc {
-                let lock_service = Self::make_lock_service(&self.0.service_settings, lock_svc);
+            }
+            if check_enabled(&services.repository_service, "repository_service") {
+                router = router
+                    .add_service(RepositoryServiceServer::new(repository_svc))
+                    .add_service(repository_v1_server::RepositoryServiceServer::new(
+                        repository_v1_svc,
+                    ));
+            }
+            if check_enabled(&services.environment_service, "environment_service") {
+                router = router
+                    .add_service(EnvironmentServiceServer::new(environment_svc))
+                    .add_service(environment_v1_server::EnvironmentServiceServer::new(
+                        environment_v1_svc,
+                    ));
+            }
+            if let Some(lock_svc) = lock_svc
+                && check_enabled(&services.lock_service, "lock_service")
+            {
+                let lock_service =
+                    Self::make_lock_service(services.lock_service.general(), lock_svc);
                 router = router.add_service(lock_service);
             }
-            if let Some(notification_service) = self.0.notification_service {
+            if let Some(notification_service) = notification_service
+                && check_enabled(&services.notification_service, "notification_service")
+            {
                 router = router.add_service(lore_notification::NotificationServiceServer::new(
                     notification_service,
                 ));
             }
         }
+
+        info!(
+            services = registered.join(", "),
+            authenticated, "Registered public gRPC services"
+        );
+        if registered.is_empty() {
+            warn!(
+                "No public gRPC services registered; every RPC on this listener \
+                 will answer UNIMPLEMENTED"
+            );
+        }
+
         Ok(GrpcServerBuilder(WantsAddress {
             router,
             public_grpc_guard,
@@ -1096,6 +1294,128 @@ pub async fn serve_maintenance(
 mod tests {
     use super::*;
 
+    /// Every service's table key paired with its settings block.
+    fn all_service_blocks(
+        settings: &GrpcPublicServicesSettings,
+    ) -> [(&'static str, &dyn GrpcServiceSettings); 8] {
+        [
+            ("admin_service", &settings.admin_service),
+            ("storage_service", &settings.storage_service),
+            ("revision_service", &settings.revision_service),
+            ("repository_service", &settings.repository_service),
+            ("environment_service", &settings.environment_service),
+            ("thin_client_service", &settings.thin_client_service),
+            ("lock_service", &settings.lock_service),
+            ("notification_service", &settings.notification_service),
+        ]
+    }
+
+    /// An absent block means enabled.
+    #[test]
+    fn an_absent_block_enables_the_service() {
+        let settings: GrpcPublicServicesSettings =
+            serde_json::from_str("{}").expect("an empty table is valid");
+
+        for (name, service) in all_service_blocks(&settings) {
+            assert!(
+                service.enabled(),
+                "{name} must register when its block is absent"
+            );
+        }
+    }
+
+    /// A present block with an absent `enabled` key means enabled.
+    #[test]
+    fn an_absent_enabled_key_enables_the_service() {
+        let settings: GrpcPublicServicesSettings =
+            serde_json::from_str(r#"{"lock_service": {"general": {}}}"#)
+                .expect("a block without `enabled` is valid");
+
+        assert!(settings.lock_service.enabled());
+    }
+
+    #[test]
+    fn a_disabled_service_reports_disabled_and_leaves_the_rest_alone() {
+        let settings: GrpcPublicServicesSettings =
+            serde_json::from_str(r#"{"storage_service": {"enabled": false}}"#)
+                .expect("a disabled block is valid");
+
+        assert!(!settings.storage_service.enabled());
+        assert!(settings.thin_client_service.enabled());
+    }
+
+    #[test]
+    fn general_settings_nest_under_the_service_block() {
+        let settings: GrpcPublicServicesSettings = serde_json::from_str(
+            r#"{"lock_service": {"general": {"max_encoding_message_size": 16777216}}}"#,
+        )
+        .expect("a nested general block is valid");
+
+        assert_eq!(
+            settings.lock_service.general().max_encoding_message_size,
+            Some(16_777_216)
+        );
+    }
+
+    /// Unknown keys are ignored, so a misspelled disable leaves the service
+    /// registered.
+    #[test]
+    fn a_misspelled_disable_leaves_the_service_registered() {
+        let misspelled_block: GrpcPublicServicesSettings =
+            serde_json::from_str(r#"{"storage_servce": {"enabled": false}}"#)
+                .expect("an unknown block is ignored");
+        let misspelled_key: GrpcPublicServicesSettings =
+            serde_json::from_str(r#"{"storage_service": {"enabld": false}}"#)
+                .expect("an unknown key is ignored");
+
+        assert!(misspelled_block.storage_service.enabled());
+        assert!(misspelled_key.storage_service.enabled());
+    }
+
+    /// Every service's table key is distinct and addresses its own block.
+    #[test]
+    fn every_service_has_its_own_block_under_the_key_it_renders() {
+        let default_settings = GrpcPublicServicesSettings::default();
+        let all = all_service_blocks(&default_settings);
+        let mut names: Vec<&str> = all.iter().map(|(name, _)| *name).collect();
+        names.sort_unstable();
+        names.dedup();
+
+        assert_eq!(names.len(), all.len(), "{names:?}");
+
+        for (key, _) in all {
+            let settings: GrpcPublicServicesSettings =
+                serde_json::from_str(&format!(r#"{{"{key}": {{"enabled": false}}}}"#))
+                    .unwrap_or_else(|error| panic!("{key} must be a settings key: {error}"));
+
+            let (_, disabled_service) = all_service_blocks(&settings)
+                .into_iter()
+                .find(|(name, _)| *name == key)
+                .expect("every rendered key must resolve back to its own block");
+
+            assert!(
+                !disabled_service.enabled(),
+                "{key} must address its own block"
+            );
+        }
+    }
+
+    /// A configuration disabling every service still deserializes.
+    #[test]
+    fn all_disabled_still_deserializes() {
+        let disabled = all_service_blocks(&GrpcPublicServicesSettings::default())
+            .iter()
+            .map(|(name, _)| format!(r#""{name}": {{"enabled": false}}"#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let settings: GrpcPublicServicesSettings =
+            serde_json::from_str(&format!("{{{disabled}}}")).expect("must still deserialize");
+
+        for (name, service) in all_service_blocks(&settings) {
+            assert!(!service.enabled(), "{name} must read as disabled");
+        }
+    }
+
     /// Generate a CA and a matching server cert+key using rcgen, writing the cert
     /// and key to a tempdir (the server takes file paths, not PEM bytes).
     ///
@@ -1106,7 +1426,7 @@ mod tests {
         String,
         std::path::PathBuf,
         std::path::PathBuf,
-        tempfile::TempDir,
+        lore_base::test_util::TempDir,
     ) {
         use rcgen::BasicConstraints;
         use rcgen::CertificateParams;
@@ -1127,10 +1447,7 @@ mod tests {
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
-        let dir = tempfile::Builder::new()
-            .prefix("lore-server-tls-test-")
-            .tempdir()
-            .unwrap();
+        let dir = lore_base::test_util::TempDir::new("lore-server-tls-test-");
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
         std::fs::write(&cert_path, server_cert.pem()).unwrap();

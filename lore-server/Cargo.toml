@@ -96,6 +96,7 @@ vergen = { workspace = true }
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-tokio"] }
 ctor = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 axum-test = "18.1.0"
 rcgen = { workspace = true }
 tempfile = "3.21"

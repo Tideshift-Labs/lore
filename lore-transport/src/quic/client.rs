@@ -424,7 +424,6 @@ pub struct QuicConnection {
     max_reconnects: Option<u32>,
     reconnect_guard: Semaphore,
     counter: AtomicU32,
-    non_priority_counter: AtomicU32,
     pub stream_count: AtomicU32,
     stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
     max_chunk_size: usize,
@@ -467,7 +466,6 @@ impl QuicConnection {
             max_reconnects: None,
             reconnect_guard: Semaphore::new(1),
             counter: AtomicU32::new(0),
-            non_priority_counter: AtomicU32::new(0),
             stream_count: AtomicU32::new(0),
             stream_inflight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             max_chunk_size,
@@ -791,7 +789,7 @@ where
         // section that takes the writer, where nothing can invalidate it before the bytes are
         // framed. Removing it here also keeps its captured epoch out of this future, which is
         // size bounded by `test_futures_size`.
-        match send_command_tracked::<HIGH_PRIORITY>(
+        match send_command_tracked::<HIGH_PRIORITY, true>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -1079,7 +1077,7 @@ where
                 service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
             );
         };
-        match send_command_tracked::<HIGH_PRIORITY>(
+        match send_command_tracked::<HIGH_PRIORITY, true>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -1803,7 +1801,7 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
 
 /// Counts a request as outstanding on a stream for as long as the guard is alive.
 ///
-/// The count is what the high priority path of [`select_stream`] balances on, so it has
+/// The count is what [`select_stream`] balances on, so it has
 /// to come back down on every way out of a send - error returns and a dropped send future
 /// included, not just the successful path.
 struct StreamInflightGuard<'a> {
@@ -1823,34 +1821,40 @@ impl Drop for StreamInflightGuard<'_> {
     }
 }
 
-/// Select stream index based on priority scheduling.
-fn select_stream(
-    stream_inflight: &[AtomicU64],
-    non_priority_counter: &AtomicU32,
-    reader_count: u32,
-    high_priority: bool,
-) -> u32 {
-    if high_priority {
-        // Pick the stream with fewest outstanding requests
-        let mut min_inflight = u64::MAX;
-        let mut min_stream = 0u32;
-        for i in 0..reader_count {
-            let inflight = stream_inflight[i as usize].load(Ordering::Relaxed);
-            if inflight < min_inflight {
-                min_inflight = inflight;
-                min_stream = i;
-            }
-        }
-        min_stream
+/// Select the stream to send a command on: of the streams that command may use, the one with
+/// the fewest requests outstanding.
+///
+/// A high priority command may use any stream. Everything else is confined to
+/// `PRIORITY_STREAM_COUNT..reader_count`, so bulk traffic can never crowd the metadata path off
+/// the streams kept for it. Until that many streams exist there is nothing to reserve yet, and
+/// every command shares whatever is open.
+///
+/// Balancing on outstanding requests rather than round-robining matters because a QUIC stream is
+/// an in-order byte FIFO: a stream still draining a large response would keep receiving its turn
+/// under round-robin, queueing new requests behind bytes already in flight. It also keeps the
+/// client honest about the server's per-stream processing limit, which it would otherwise walk
+/// into on one stream while others sat idle.
+///
+/// Ties resolve to the lowest eligible index, which deliberately keeps a caller that issues one
+/// request at a time on a single stream rather than scattering requests that were never
+/// concurrent.
+fn select_stream(stream_inflight: &[AtomicU64], reader_count: u32, high_priority: bool) -> u32 {
+    let first = if high_priority || reader_count <= PRIORITY_STREAM_COUNT {
+        0
     } else {
-        // Round-robin across streams PRIORITY_STREAM_COUNT..STREAM_COUNT
-        let index = non_priority_counter.fetch_add(1, Ordering::Relaxed);
-        if reader_count > PRIORITY_STREAM_COUNT {
-            PRIORITY_STREAM_COUNT + (index % (reader_count - PRIORITY_STREAM_COUNT))
-        } else {
-            0
+        PRIORITY_STREAM_COUNT
+    };
+
+    let mut min_inflight = u64::MAX;
+    let mut min_stream = first;
+    for i in first..reader_count {
+        let inflight = stream_inflight[i as usize].load(Ordering::Relaxed);
+        if inflight < min_inflight {
+            min_inflight = inflight;
+            min_stream = i;
         }
     }
+    min_stream
 }
 
 pub async fn send_normal(
@@ -1860,7 +1864,40 @@ pub async fn send_normal(
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command::<false>(connection, command, session_id, v4, chunks).await
+    send_command::<false, true>(connection, command, session_id, v4, chunks).await
+}
+
+/// Announces the client's user agent for a connection, sent once on connect and again on each
+/// reconnect. Both QUIC protocols carry this same message under their own opcode, and both handle
+/// it at the connection layer rather than in a service.
+///
+/// Request:  user agent, ASCII, at most 256 bytes
+/// Response: empty
+///
+/// Advisory only: the server discards an empty, oversized or non-ASCII value rather than rejecting
+/// it, so a client that cannot identify itself still gets a working connection.
+///
+/// Returns once the bytes are written rather than once the server has acknowledged them, so
+/// establishing a connection costs no round trip for it. Being written first on the initial stream
+/// still puts it ahead of every command later written to that stream; a command that opens a
+/// second stream can be handled first, and is then recorded with no user agent.
+pub async fn send_client_identify(
+    connection: Arc<QuicConnection>,
+    command: QuicOpCode,
+    v4: bool,
+    user_agent: &str,
+) -> Result<(), QuicClientError> {
+    send_without_response(
+        connection,
+        command,
+        0,
+        v4,
+        &mut [
+            Bytes::default(),
+            Bytes::copy_from_slice(user_agent.as_bytes()),
+        ],
+    )
+    .await
 }
 
 pub async fn send_high_priority(
@@ -1870,7 +1907,7 @@ pub async fn send_high_priority(
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command::<true>(connection, command, session_id, v4, chunks).await
+    send_command::<true, true>(connection, command, session_id, v4, chunks).await
 }
 
 pub fn send_normal_with_reconnect<'a, ServiceClientType, const LEN: usize>(
@@ -1944,16 +1981,28 @@ where
     }
 }
 
-pub async fn send_command<const HIGH_PRIORITY: bool>(
+/// Send a command, waiting for its response only when `AWAIT_RESPONSE`.
+///
+/// `AWAIT_RESPONSE` is a const parameter rather than a split into a write half and a wait half so
+/// that each instantiation is a single future: a wait half awaited by a write half would nest one
+/// future inside the other and grow the send path. A `false` instantiation compiles the response
+/// wait out entirely and resolves as soon as the bytes are written, yielding `Bytes::default()`.
+///
+/// Either way the command is registered with the stream's [`ResponseReader`] before the bytes go
+/// out. Dropping the receiver unread is expected and handled; leaving the command unregistered is
+/// not, and would make the reader treat the response as unexpected and tear the stream down.
+pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
     session_id: u32,
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command_tracked::<HIGH_PRIORITY>(connection, command, session_id, v4, chunks)
-        .await
-        .map_err(|failure| failure.error)
+    send_command_tracked::<HIGH_PRIORITY, AWAIT_RESPONSE>(
+        connection, command, session_id, v4, chunks,
+    )
+    .await
+    .map_err(|failure| failure.error)
 }
 
 /// [`send_command`], additionally reporting whether the request reached the wire.
@@ -1962,7 +2011,7 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
 /// written, so only the write and the response wait are dispatched. That split is what the
 /// replay contract branches on, so it is recorded here at the one place that can actually
 /// observe it rather than inferred from an error kind further up.
-async fn send_command_tracked<const HIGH_PRIORITY: bool>(
+async fn send_command_tracked<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
     session_id: u32,
@@ -2036,7 +2085,6 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
         let reader_count = connection_lock.reader.len() as u32;
         let stream_index = select_stream(
             connection.stream_inflight.as_slice(),
-            &connection.non_priority_counter,
             reader_count,
             HIGH_PRIORITY,
         ) as usize
@@ -2088,6 +2136,10 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
         })?;
     }
 
+    if !AWAIT_RESPONSE {
+        return Ok(Bytes::default());
+    }
+
     // The request is fully written by here, so the server has seen the command either way.
     // What is left is whether an answer came back, and the two ways it can fail to are not the
     // same thing to the replay contract.
@@ -2107,6 +2159,23 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool>(
             // Everything else was decoded from a response header the server actually sent.
             _ => SendFailure::answered(error),
         })
+}
+
+/// Send a command and return once its bytes are written, discarding the response.
+///
+/// Completes without a network round trip: the write lands in the connection's send buffer,
+/// which for a small message on a healthy connection has credit to spare. Only for commands whose
+/// response carries nothing a caller can act on - a failure after the write is invisible here.
+pub async fn send_without_response(
+    connection: Arc<QuicConnection>,
+    command: QuicOpCode,
+    session_id: u32,
+    v4: bool,
+    chunks: &mut [Bytes],
+) -> Result<(), QuicClientError> {
+    send_command::<false, false>(connection, command, session_id, v4, chunks)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]
@@ -2140,12 +2209,11 @@ mod tests {
     #[test]
     fn high_priority_spreads_concurrent_requests_over_every_stream() {
         let inflight = inflight_counters();
-        let non_priority_counter = AtomicU32::new(0);
 
         let mut guards = Vec::new();
         let mut selected = Vec::new();
         for _ in 0..STREAM_COUNT {
-            let stream = select_stream(&inflight, &non_priority_counter, STREAM_COUNT, true);
+            let stream = select_stream(&inflight, STREAM_COUNT, true);
             guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
             selected.push(stream);
         }
@@ -2157,10 +2225,9 @@ mod tests {
     #[test]
     fn high_priority_reuses_a_stream_once_its_request_completed() {
         let inflight = inflight_counters();
-        let non_priority_counter = AtomicU32::new(0);
 
         for _ in 0..STREAM_COUNT * 4 {
-            let stream = select_stream(&inflight, &non_priority_counter, STREAM_COUNT, true);
+            let stream = select_stream(&inflight, STREAM_COUNT, true);
             let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
             assert_eq!(stream, 0);
         }
@@ -2173,17 +2240,65 @@ mod tests {
     }
 
     #[test]
-    fn normal_priority_round_robins_over_the_non_priority_streams() {
+    fn normal_priority_spreads_concurrent_requests_over_the_non_priority_streams() {
         let inflight = inflight_counters();
-        let non_priority_counter = AtomicU32::new(0);
 
-        let selected: Vec<u32> = (PRIORITY_STREAM_COUNT..STREAM_COUNT)
-            .map(|_| select_stream(&inflight, &non_priority_counter, STREAM_COUNT, false))
-            .collect();
+        let mut guards = Vec::new();
+        let mut selected = Vec::new();
+        for _ in PRIORITY_STREAM_COUNT..STREAM_COUNT {
+            let stream = select_stream(&inflight, STREAM_COUNT, false);
+            guards.push(StreamInflightGuard::new(&inflight[stream as usize]));
+            selected.push(stream);
+        }
 
+        selected.sort_unstable();
         assert_eq!(
             selected,
             (PRIORITY_STREAM_COUNT..STREAM_COUNT).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn normal_priority_leaves_the_priority_streams_to_metadata() {
+        let inflight = inflight_counters();
+
+        // Every non-priority stream is busy while the priority streams sit idle. Balancing on
+        // outstanding requests alone would send bulk traffic to a priority stream; the reserved
+        // window is what stops it.
+        let _guards: Vec<_> = (PRIORITY_STREAM_COUNT..STREAM_COUNT)
+            .map(|stream| StreamInflightGuard::new(&inflight[stream as usize]))
+            .collect();
+
+        let stream = select_stream(&inflight, STREAM_COUNT, false);
+        assert!(
+            stream >= PRIORITY_STREAM_COUNT,
+            "bulk traffic must stay off the reserved streams, got {stream}"
+        );
+    }
+
+    #[test]
+    fn normal_priority_shares_what_is_open_before_any_stream_can_be_reserved() {
+        let inflight = inflight_counters();
+
+        // With fewer streams open than the reservation needs, there is nothing to reserve.
+        assert_eq!(select_stream(&inflight, 1, false), 0);
+        assert_eq!(select_stream(&inflight, PRIORITY_STREAM_COUNT, false), 0);
+    }
+
+    #[test]
+    fn normal_priority_reuses_a_stream_once_its_request_completed() {
+        let inflight = inflight_counters();
+
+        for _ in 0..STREAM_COUNT * 4 {
+            let stream = select_stream(&inflight, STREAM_COUNT, false);
+            let _guard = StreamInflightGuard::new(&inflight[stream as usize]);
+            assert_eq!(stream, PRIORITY_STREAM_COUNT);
+        }
+
+        assert!(
+            inflight
+                .iter()
+                .all(|count| count.load(Ordering::Relaxed) == 0)
         );
     }
     fn ipv6_addr() -> SocketAddr {

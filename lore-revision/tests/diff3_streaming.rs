@@ -164,7 +164,6 @@ mod tests {
                 link: None,
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
-                stats: false,
             };
             Box::pin(commit::commit(
                 self.repository.clone(),
@@ -256,7 +255,7 @@ mod tests {
     fn changes_as_summary(changes: &[lore_revision::change::NodeChange]) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = changes
             .iter()
-            .map(|c| (c.path.as_str().to_string(), format!("{:?}", c.action)))
+            .map(|c| (c.path().as_str().to_string(), format!("{:?}", c.action)))
             .collect();
         out.sort();
         out
@@ -323,7 +322,7 @@ mod tests {
                 let same_path_changes: Vec<_> = diff
                     .changes
                     .iter()
-                    .filter(|c| c.path.as_str() == "shared.txt")
+                    .filter(|c| c.path().as_str() == "shared.txt")
                     .collect();
                 assert_eq!(
                     same_path_changes.len(),
@@ -400,7 +399,7 @@ mod tests {
                 .expect("diff3_collect failed");
 
                 let summary = changes_as_summary(&diff.changes);
-                let paths: Vec<&str> = diff.changes.iter().map(|c| c.path.as_str()).collect();
+                let paths: Vec<&str> = diff.changes.iter().map(|c| c.path().as_str()).collect();
 
                 // The target-only change (beta.txt, untouched by source) is
                 // dropped: target's walk is scoped to source-touched paths.
@@ -481,7 +480,7 @@ mod tests {
                         .with_write_token(fixture.write_token.share()),
                 );
 
-                let merged_rev = lore_revision::branch::merge::merge_start(
+                let merged_rev = Box::pin(lore_revision::branch::merge::merge_start(
                     view_repo.clone(),
                     &fixture.write_token,
                     main_branch,
@@ -489,8 +488,9 @@ mod tests {
                         message: "merge main into feature (sparse view)".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        inherit_metadata: Default::default(),
                     },
-                )
+                ))
                 .await
                 .expect("merge_start failed");
 
@@ -524,9 +524,10 @@ mod tests {
 
                 let full_summary = changes_as_summary(&full.changes);
                 let scoped_summary = changes_as_summary(&scoped.changes);
-                let full_paths: Vec<&str> = full.changes.iter().map(|c| c.path.as_str()).collect();
+                let full_paths: Vec<&str> =
+                    full.changes.iter().map(|c| c.path().as_str()).collect();
                 let scoped_paths: Vec<&str> =
-                    scoped.changes.iter().map(|c| c.path.as_str()).collect();
+                    scoped.changes.iter().map(|c| c.path().as_str()).collect();
 
                 // The view-scoped diff hides the out-of-view file.
                 assert!(
@@ -584,7 +585,7 @@ mod tests {
         main_branch: BranchId,
         message: &str,
     ) -> Hash {
-        lore_revision::branch::merge::merge_start(
+        Box::pin(lore_revision::branch::merge::merge_start(
             view_repo.clone(),
             &fixture.write_token,
             main_branch,
@@ -592,8 +593,9 @@ mod tests {
                 message: message.to_string(),
                 no_commit: false,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                inherit_metadata: Default::default(),
             },
-        )
+        ))
         .await
         .expect("merge_start failed")
     }
@@ -621,7 +623,7 @@ mod tests {
         .expect("diff3_collect failed");
         diff.changes
             .iter()
-            .map(|change| change.path.as_str().to_string())
+            .map(|change| change.path().as_str().to_string())
             .collect()
     }
 
@@ -673,8 +675,13 @@ mod tests {
                 fixture.write_file("game/a.txt", b"feature change\n");
 
                 let view_repo = engine_excluded_context(&fixture);
-                let merged_rev =
-                    merge_main_under_view(&view_repo, &fixture, main_branch, "merge main").await;
+                let merged_rev = Box::pin(merge_main_under_view(
+                    &view_repo,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                ))
+                .await;
 
                 // Every path under engine/ must now agree with main. A missed
                 // create or discard shows up here as a divergent path.
@@ -732,12 +739,12 @@ mod tests {
                 //    what must stop the later merge from adopting it.
                 fixture.switch_to(main_branch, base_revision).await;
                 let feature_branch = fixture.create_branch("feature").await;
-                let feature_rev = merge_main_under_view(
+                let feature_rev = Box::pin(merge_main_under_view(
                     &fixture.repository,
                     &fixture,
                     other_branch,
                     "merge other",
-                )
+                ))
                 .await;
 
                 // 4. main advances a different out-of-view path.
@@ -749,8 +756,13 @@ mod tests {
                 // 5. feature merges main under a view that excludes engine/.
                 fixture.switch_to(feature_branch, feature_rev).await;
                 let view_repo = engine_excluded_context(&fixture);
-                let merged_rev =
-                    merge_main_under_view(&view_repo, &fixture, main_branch, "merge main").await;
+                let merged_rev = Box::pin(merge_main_under_view(
+                    &view_repo,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                ))
+                .await;
 
                 let divergent = paths_divergent_from_main(
                     &fixture,
@@ -840,7 +852,13 @@ mod tests {
                         .with_write_token(fixture.write_token.share()),
                 );
 
-                merge_main_under_view(&view_repo, &fixture, main_branch, "merge main").await;
+                Box::pin(merge_main_under_view(
+                    &view_repo,
+                    &fixture,
+                    main_branch,
+                    "merge main",
+                ))
+                .await;
 
                 let destination = fixture.repo_path.join("shown.txt");
                 assert!(
@@ -1011,7 +1029,7 @@ mod tests {
                 let conflict_paths: Vec<_> = diff
                     .conflicts
                     .iter()
-                    .map(|(s, _)| s.path.as_str().to_string())
+                    .map(|(s, _)| s.path().as_str().to_string())
                     .collect();
                 assert!(
                     conflict_paths.iter().any(|p| p == "sub/conflicted.txt"),
@@ -1027,7 +1045,7 @@ mod tests {
                 // the directory's path; the overlap filter strips
                 // them when a conflict overlaps.
                 let dir_delete_in_changes = diff.changes.iter().any(|c| {
-                    c.path.as_str() == "sub" && c.action == FileAction::Delete
+                    c.path().as_str() == "sub" && c.action == FileAction::Delete
                 });
                 assert!(
                     !dir_delete_in_changes,
@@ -1039,7 +1057,7 @@ mod tests {
                 // still be present — it is not in conflict, so it is
                 // a clean delete and stays in changes.
                 let keep_deleted = diff.changes.iter().any(|c| {
-                    c.path.as_str() == "sub/keep.txt"
+                    c.path().as_str() == "sub/keep.txt"
                         && c.action == FileAction::Delete
                 });
                 assert!(
@@ -1134,7 +1152,7 @@ mod tests {
                     .conflicts
                     .iter()
                     .flat_map(|(s, t)| {
-                        vec![s.path.as_str().to_string(), t.path.as_str().to_string()]
+                        vec![s.path().as_str().to_string(), t.path().as_str().to_string()]
                     })
                     .collect();
                 let total_a_mentions = summary.iter().filter(|(p, _)| p == "a.txt").count()
@@ -1215,7 +1233,7 @@ mod tests {
                 // Step 4: merge target into source. Source has not
                 // touched shared.txt yet, so the merge resolves
                 // cleanly and auto-commits.
-                let merge_revision = lore_revision::branch::merge::merge_start(
+                let merge_revision = Box::pin(lore_revision::branch::merge::merge_start(
                     fixture.repository.clone(),
                     &fixture.write_token,
                     target_branch,
@@ -1223,8 +1241,9 @@ mod tests {
                         message: "merge target into source".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        inherit_metadata: Default::default(),
                     },
-                )
+                ))
                 .await
                 .expect("merge_start failed");
                 assert_ne!(
@@ -1261,7 +1280,7 @@ mod tests {
                 let conflict_paths: Vec<_> = diff
                     .conflicts
                     .iter()
-                    .map(|(s, _)| s.path.as_str().to_string())
+                    .map(|(s, _)| s.path().as_str().to_string())
                     .collect();
                 assert!(
                     !conflict_paths.iter().any(|p| p == "shared.txt"),
@@ -1274,7 +1293,7 @@ mod tests {
                 let in_changes = diff
                     .changes
                     .iter()
-                    .any(|c| c.path.as_str() == "shared.txt");
+                    .any(|c| c.path().as_str() == "shared.txt");
                 assert!(
                     in_changes,
                     "shared.txt should appear in changes after history-walk resolution; got changes {:?}",
@@ -1334,10 +1353,9 @@ mod tests {
                 .map(|change| {
                     (
                         change.action,
-                        change.path.as_str().trim_end_matches('/').to_owned(),
+                        change.path().as_str().trim_end_matches('/').to_owned(),
                         change
-                            .from_path
-                            .as_ref()
+                            .move_source()
                             .map(|path| path.as_str().trim_end_matches('/').to_owned()),
                     )
                 })

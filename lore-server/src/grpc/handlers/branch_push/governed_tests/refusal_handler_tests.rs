@@ -156,16 +156,13 @@ async fn both_push_handlers_terminalize_actual_early_store_slowdown_without_publ
             .await
             .map(|_| ())
         };
-        // The first mutable read loads metadata, whose established mapping is
-        // Internal. Pin that actual seam rather than a later state-load error.
+        // The first mutable read loads metadata. Upstream fa606b08 maps its
+        // SlowDown to ResourceExhausted, like the fork's later push-store
+        // refusals (state_load, parent_load). That is safe: settle_governed_push
+        // settles the receipt NotApplied before any error returns, whatever its
+        // code, so this attempt can never later become Applied.
         let status = result.unwrap_err();
-        assert_eq!(status.code(), Code::Internal, "v1={v1}: {status}");
-        assert!(
-            status
-                .message()
-                .starts_with("Failed to load branch metadata: "),
-            "unexpected failure context: {status}"
-        );
+        assert_eq!(status.code(), Code::ResourceExhausted, "v1={v1}: {status}");
         assert!(
             status.message().contains("Store overloaded, slow down"),
             "missing injected SlowDown cause: {status}"

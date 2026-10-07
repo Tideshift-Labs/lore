@@ -18,22 +18,21 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
     use lore_base::types::CloneHeapAlloc;
+    use lore_base::types::Context;
     use lore_base::types::ZeroHeapAlloc;
     use lore_revision::immutable;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::metadata::Metadata;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
-    use lore_storage::Context;
     use lore_storage::Fragment;
     use lore_storage::FragmentFlags;
     use lore_storage::FragmentReference;
@@ -48,7 +47,6 @@ mod tests {
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
     use zerocopy::IntoBytes;
 
     include!("helper.rs");
@@ -589,8 +587,8 @@ mod tests {
             self.inner.clone().compact_resume_at().await
         }
 
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
+        async fn stop_gc(self: Arc<Self>, terminate: bool) {
+            self.inner.clone().stop_gc(terminate).await;
         }
 
         fn max_query_batch(&self) -> Option<usize> {
@@ -658,17 +656,15 @@ mod tests {
 
                 let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
-                    RepositoryContext::new(RepositoryContextCreationArgs {
-                        path: Some(path.clone()),
-                        immutable_store: fault_store.clone(),
-                        mutable_store: mutable_store.clone(),
-                        id: repository_id.into(),
-                        instance_id: lore_revision::instance::InstanceId::default(),
-                        remote: Err(ProtocolError::from(NoRemote)),
-                        filter: Arc::default(),
-                        format: RepositoryFormat::Lore,
-                        filesystem_provider: None,
-                    })
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            fault_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id.into())
+                        .with_instance_id(lore_revision::instance::InstanceId::default()),
+                    )
                     .with_write_token(write_token.share()),
                 );
 
@@ -793,17 +789,12 @@ mod tests {
 
                 let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
-                    RepositoryContext::new(RepositoryContextCreationArgs {
-                        path: Some(path.clone()),
-                        immutable_store: real_store,
-                        mutable_store: mutable_store.clone(),
-                        id: repository_id.into(),
-                        instance_id: lore_revision::instance::InstanceId::default(),
-                        remote: Err(ProtocolError::from(NoRemote)),
-                        filter: Arc::default(),
-                        format: RepositoryFormat::Lore,
-                        filesystem_provider: None,
-                    })
+                    RepositoryContext::new(
+                        default_repository_creation_args(real_store, mutable_store.clone())
+                            .with_path(&path)
+                            .with_id(repository_id.into())
+                            .with_instance_id(lore_revision::instance::InstanceId::default()),
+                    )
                     .with_write_token(write_token.share()),
                 );
 
@@ -973,17 +964,15 @@ mod tests {
 
                 let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
-                    RepositoryContext::new(RepositoryContextCreationArgs {
-                        path: Some(path.clone()),
-                        immutable_store: fault_store.clone(),
-                        mutable_store: mutable_store.clone(),
-                        id: repository_id.into(),
-                        instance_id: lore_revision::instance::InstanceId::default(),
-                        remote: Err(ProtocolError::from(NoRemote)),
-                        filter: Arc::default(),
-                        format: RepositoryFormat::Lore,
-                        filesystem_provider: None,
-                    })
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            fault_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path)
+                        .with_id(repository_id.into())
+                        .with_instance_id(lore_revision::instance::InstanceId::default()),
+                    )
                     .with_write_token(write_token.share()),
                 );
 
@@ -1142,6 +1131,100 @@ mod tests {
         .await;
     }
 
+    /// A revision metadata value of type Address names a payload held in a
+    /// fragment of its own, which the walk collects so the payload reaches the
+    /// peer with the revision it belongs to.
+    ///
+    /// The payload is written before the value names it, so the first collection
+    /// pins that a blob the metadata does not name stays out: without it the
+    /// assertion that follows would hold for a walk that collected everything in
+    /// the store.
+    #[tokio::test]
+    async fn collect_new_revision_metadata_fragments() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                let payload = lore_revision::immutable::write(
+                    repository.clone(),
+                    Context::default(),
+                    Bytes::from_static(b"revision metadata payload"),
+                    lore_revision::immutable::write_options_from_repository(repository.clone()),
+                )
+                .await
+                .expect("Failed to write the metadata payload");
+
+                let state_from = Arc::new(State::new());
+                state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = Arc::new(State::new());
+                state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    !fragments.contains(&payload),
+                    "A payload no metadata names was collected"
+                );
+
+                let mut metadata = Metadata::new();
+                metadata
+                    .set_address("build-artifact", payload)
+                    .expect("Failed to set the metadata address");
+                let metadata_hash = metadata
+                    .serialize(repository.clone())
+                    .await
+                    .expect("Failed to serialize the metadata");
+
+                state_to.set_metadata_hash(metadata_hash);
+                state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    fragments.contains(&Address::zero_context_hash(metadata_hash)),
+                    "The blob holding the revision metadata was not collected"
+                );
+                assert!(
+                    fragments.contains(&payload),
+                    "The payload the revision metadata names was not collected"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     /// Helper to create a Node with specific flags for testing
     fn node_with_flags(flags: u16) -> Node {
         Node {
@@ -1151,76 +1234,67 @@ mod tests {
     }
 
     use lore_revision::change;
-    use lore_revision::change::FileAction;
     use lore_revision::state::compute_change_flags;
 
     #[test]
-    fn returns_none_for_default_node_with_valid_to() {
+    fn returns_none_for_a_node_carrying_no_flags() {
         let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert_eq!(flags, change::Flags::None);
     }
 
+    /// A modification is what a walk measured against its to state, which no node states about
+    /// itself, so the walk joins it onto the flags the node carries.
     #[test]
-    fn sets_modify_flag_for_keep_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Keep, false);
-        assert!(flags.contains(change::Flags::Modify));
-    }
-
-    #[test]
-    fn does_not_set_modify_flag_for_add_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Add, false);
-        assert!(!flags.contains(change::Flags::Modify));
-    }
-
-    #[test]
-    fn does_not_set_modify_flag_for_delete_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Delete, false);
-        assert!(!flags.contains(change::Flags::Modify));
+    fn a_nodes_flags_never_state_a_modification() {
+        for node in [
+            Node::default(),
+            node_with_flags(NodeFlags::Staged.bits()),
+            node_with_flags(NodeFlags::StagedMergeConflict.bits()),
+        ] {
+            assert!(!compute_change_flags(&node).contains(change::Flags::Modify));
+        }
     }
 
     #[test]
     fn sets_staged_flag_when_node_is_staged() {
         let node = node_with_flags(NodeFlags::Staged.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Staged));
     }
 
     #[test]
     fn sets_merge_flag_when_node_is_staged_merge() {
         let node = node_with_flags(NodeFlags::StagedMerge.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Merge));
     }
 
     #[test]
     fn sets_conflict_flag_when_node_is_merge_conflict() {
         let node = node_with_flags(NodeFlags::StagedMergeConflict.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Conflict));
     }
 
     #[test]
     fn sets_conflict_resolved_flag_when_node_is_merge_resolved() {
         let node = node_with_flags(NodeFlags::StagedMergeResolved.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictResolved));
     }
 
     #[test]
     fn sets_conflict_mine_flag_when_node_is_merge_mine() {
         let node = node_with_flags(NodeFlags::StagedMergeMine.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictMine));
     }
 
     #[test]
     fn sets_conflict_theirs_flag_when_node_is_merge_theirs() {
         let node = node_with_flags(NodeFlags::StagedMergeTheirs.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictTheirs));
     }
 
@@ -1228,9 +1302,7 @@ mod tests {
     fn combines_multiple_flags() {
         // Node that is staged and also a merge conflict
         let node = node_with_flags(NodeFlags::StagedMergeConflict.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, false);
-        // Should have Modify (from invalid to), Staged, Merge, and Conflict
-        assert!(flags.contains(change::Flags::Modify));
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Staged));
         assert!(flags.contains(change::Flags::Merge));
         assert!(flags.contains(change::Flags::Conflict));
@@ -1986,11 +2058,20 @@ mod single_file_compare_result_tests {
         );
     }
 
-    fn make_change_state(repository: Arc<RepositoryContext>, context: Context) -> NodeChangeState {
+    fn make_change_state(
+        repository: Arc<RepositoryContext>,
+        context: Context,
+        path: &str,
+    ) -> NodeChangeState {
         NodeChangeState {
-            repository,
-            state: Arc::new(State::new()),
-            node: INVALID_NODE,
+            mapping: lore_revision::state::NodeMapping {
+                repository,
+                state: Arc::new(State::new()),
+                path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
+                node: INVALID_NODE,
+            },
+            observed: None,
+            mode: 0,
             flags: NodeFlags::NoFlags,
             address: Address {
                 hash: Hash::default(),
@@ -1999,6 +2080,8 @@ mod single_file_compare_result_tests {
         }
     }
 
+    /// Both sides stand where the change does, as a walk leaves them: coalescing a delete and an
+    /// add into a move carries the delete side across, and the source it reports comes from there.
     fn make_change(
         repository: Arc<RepositoryContext>,
         action: FileAction,
@@ -2009,11 +2092,38 @@ mod single_file_compare_result_tests {
         NodeChange {
             action,
             flags: change::Flags::None,
-            from: make_change_state(repository.clone(), from_context),
-            to: make_change_state(repository, to_context),
-            path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
-            from_path: None,
+            from: make_change_state(repository.clone(), from_context, path),
+            to: make_change_state(repository, to_context, path),
         }
+    }
+
+    /// A mount of the repository `link_repository` names, added or deleted at `path`.
+    fn make_link_change(
+        repository: Arc<RepositoryContext>,
+        action: FileAction,
+        path: &str,
+        link_repository: Context,
+    ) -> NodeChange {
+        let mut change = if action == FileAction::Delete {
+            make_change(
+                repository,
+                action,
+                path,
+                link_repository,
+                Context::default(),
+            )
+        } else {
+            make_change(
+                repository,
+                action,
+                path,
+                Context::default(),
+                link_repository,
+            )
+        };
+        change.from.flags = NodeFlags::Link;
+        change.to.flags = NodeFlags::Link;
+        change
     }
 
     /// Create a Context from a u128 value for testing
@@ -2066,7 +2176,7 @@ mod single_file_compare_result_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Add);
-        assert_eq!(changes[0].path.as_str(), "new_file.txt");
+        assert_eq!(changes[0].path().as_str(), "new_file.txt");
     }
 
     #[tokio::test]
@@ -2085,7 +2195,7 @@ mod single_file_compare_result_tests {
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Delete);
-        assert_eq!(changes[0].path.as_str(), "deleted_file.txt");
+        assert_eq!(changes[0].path().as_str(), "deleted_file.txt");
     }
 
     #[tokio::test]
@@ -2115,11 +2225,36 @@ mod single_file_compare_result_tests {
         // Should have exactly one move change
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].action, FileAction::Move);
-        assert_eq!(changes[0].path.as_str(), "new/path.txt");
+        assert_eq!(changes[0].path().as_str(), "new/path.txt");
         assert_eq!(
-            changes[0].from_path.as_ref().map(|p| p.as_str()),
+            changes[0].move_source().map(|p| p.as_str()),
             Some("old/path.txt")
         );
+    }
+
+    #[tokio::test]
+    async fn mounts_of_one_repository_stay_separate_add_and_delete() {
+        let repo = new_test_context().await;
+        let link_repository = context_from_u128(42);
+
+        let mut changes = vec![
+            make_link_change(
+                repo.clone(),
+                FileAction::Delete,
+                "vendor/part",
+                link_repository,
+            ),
+            make_link_change(repo, FileAction::Add, "vendor/whole", link_repository),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].action, FileAction::Delete);
+        assert_eq!(changes[0].path().as_str(), "vendor/part");
+        assert_eq!(changes[1].action, FileAction::Add);
+        assert_eq!(changes[1].path().as_str(), "vendor/whole");
+        assert!(changes.iter().all(|change| change.move_source().is_none()));
     }
 
     #[tokio::test]
@@ -2168,7 +2303,7 @@ mod single_file_compare_result_tests {
         assert!(changes.iter().all(|c| c.action == FileAction::Move));
 
         // Both should have from_path set
-        assert!(changes.iter().all(|c| c.from_path.is_some()));
+        assert!(changes.iter().all(|c| c.move_source().is_some()));
     }
 
     #[tokio::test]
@@ -2340,10 +2475,61 @@ mod single_file_compare_result_tests {
             .iter()
             .find(|c| c.action == FileAction::Move)
             .unwrap();
-        assert_eq!(move_change.path.as_str(), "moved_to.txt");
+        assert_eq!(move_change.path().as_str(), "moved_to.txt");
         assert_eq!(
-            move_change.from_path.as_ref().map(|p| p.as_str()),
+            move_change.move_source().map(|p| p.as_str()),
             Some("moved_from.txt")
+        );
+    }
+
+    /// Dropping the folded delete leaves the changes around it where they were, which a caller
+    /// that does not sort afterwards reports in the order the walk found them.
+    #[tokio::test]
+    async fn changes_not_folded_into_a_move_keep_their_order() {
+        let repo = new_test_context().await;
+        let moved = context_from_u128(1);
+        let kept_first = context_from_u128(2);
+        let kept_last = context_from_u128(3);
+
+        let mut changes = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Keep,
+                "first.txt",
+                kept_first,
+                kept_first,
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "moved_from.txt",
+                moved,
+                Context::default(),
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Keep,
+                "last.txt",
+                kept_last,
+                kept_last,
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "moved_to.txt",
+                Context::default(),
+                moved,
+            ),
+        ];
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(
+            changes
+                .iter()
+                .map(|c| c.path().as_str())
+                .collect::<Vec<_>>(),
+            vec!["first.txt", "last.txt", "moved_to.txt"],
         );
     }
 
@@ -2382,6 +2568,100 @@ mod single_file_compare_result_tests {
         assert_eq!(changes[0].from.address.hash, Hash::from_u64(12345));
         // Also verify the file_id (context) is preserved in the from state
         assert_eq!(changes[0].from.address.context, file_id);
+    }
+
+    /// A move states what became of the content as well as of the location, so one standing at
+    /// content its source did not hold states a modification and one standing at the same content
+    /// states none.
+    #[tokio::test]
+    async fn a_coalesced_move_states_whether_the_content_changed() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(43);
+
+        let mut carried = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        detect_and_coalesce_moves(&mut carried);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].action, FileAction::Move);
+        assert!(
+            !carried[0].flags.contains(change::Flags::Modify),
+            "a move carrying the content its source held states no modification"
+        );
+
+        let mut edited = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        edited[1].to.address.hash = Hash::from_u64(99);
+        detect_and_coalesce_moves(&mut edited);
+        assert_eq!(edited.len(), 1);
+        assert_eq!(edited[0].action, FileAction::Move);
+        assert!(
+            edited[0].flags.contains(change::Flags::Modify),
+            "a move carrying content its source did not hold states a modification"
+        );
+    }
+
+    /// The executable bit is part of what a file is, so a move that changes it is a modification
+    /// even where every byte of the content stands, as a paired walk reports one.
+    #[tokio::test]
+    async fn a_coalesced_move_states_a_mode_change_as_a_modification() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(44);
+
+        let mut changes = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        changes[1].to.mode = lore_revision::node::NodeFileMode::Executable.bits();
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, FileAction::Move);
+        assert_eq!(
+            changes[0].from.address.hash, changes[0].to.address.hash,
+            "the content is meant to stand, so only the mode answers for the modification"
+        );
+        assert!(changes[0].flags.contains(change::Flags::Modify));
     }
 }
 
@@ -2491,6 +2771,23 @@ mod is_file_modified_chunking_compat {
     /// execution context the store operations read.
     ///
     /// The directory outlives `body`, which is what lets it write the files to hash.
+    /// The content a file the test wrote holds, for exercising the storage comparison directly.
+    /// Logic outside the provider names no file; these tests are the comparison's own.
+    fn file_content(path: &std::path::Path) -> lore_storage::ContentSource<'_> {
+        lore_storage::ContentSource::file(path)
+    }
+
+    /// An operation on the repository, which is what every caller compares a file through.
+    async fn working_operation(
+        repository: &Arc<RepositoryContext>,
+    ) -> Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl> {
+        repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("beginning an operation")
+    }
+
     async fn on_a_repository<Body, Run>(body: Body)
     where
         Body: FnOnce(Arc<RepositoryContext>, PathBuf, Context) -> Run,
@@ -2541,9 +2838,15 @@ mod is_file_modified_chunking_compat {
                 "a buffer hash cannot equal a fragment list hash"
             );
             assert_eq!(
-                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare small file"),
+                immutable::file_matches(
+                    repository.clone(),
+                    address,
+                    Some(size),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await
+                .expect("Failed to compare small file"),
                 lore_storage::FileMatch::Match,
                 "the stored list holds this content whatever the buffer hash says"
             );
@@ -2566,9 +2869,15 @@ mod is_file_modified_chunking_compat {
             std::fs::write(&path, &modified).expect("Failed to write small file");
 
             assert_eq!(
-                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare small file"),
+                immutable::file_matches(
+                    repository.clone(),
+                    address,
+                    Some(size),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await
+                .expect("Failed to compare small file"),
                 lore_storage::FileMatch::Differs,
             );
         })
@@ -2604,9 +2913,15 @@ mod is_file_modified_chunking_compat {
             ));
 
             assert_eq!(
-                immutable::file_matches(empty, path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare large file"),
+                immutable::file_matches(
+                    empty,
+                    address,
+                    Some(size),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await
+                .expect("Failed to compare large file"),
                 lore_storage::FileMatch::Match,
                 "the current chunking reproduces the address it was stored under"
             );
@@ -2629,9 +2944,15 @@ mod is_file_modified_chunking_compat {
             std::fs::write(&path, &modified).expect("Failed to write large file");
 
             assert_eq!(
-                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
-                    .await
-                    .expect("Failed to compare large file"),
+                immutable::file_matches(
+                    repository.clone(),
+                    address,
+                    Some(size),
+                    &file_content(&path),
+                    &lore_storage::ContentHashes::default(),
+                )
+                .await
+                .expect("Failed to compare large file"),
                 lore_storage::FileMatch::Differs,
             );
         })
@@ -2668,6 +2989,8 @@ mod is_file_modified_chunking_compat {
                 file_size,
                 &RelativePath::new_from_initial_path("large.bin").unwrap(),
                 true,
+                working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
             )
             .await
             .expect("file_modification failed")
@@ -2703,7 +3026,16 @@ mod is_file_modified_chunking_compat {
 
             let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
             let modified =
-                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
+                file_modification(
+                    repository.clone(),
+                    &node,
+                    mtime,
+                    size,
+                    &relative_path,
+                    true,
+                    working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
+                )
                     .await
                     .expect("file_modification failed")
             .is_modified();
@@ -2740,7 +3072,16 @@ mod is_file_modified_chunking_compat {
 
             let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
             let modified =
-                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
+                file_modification(
+                    repository.clone(),
+                    &node,
+                    mtime,
+                    size,
+                    &relative_path,
+                    true,
+                    working_operation(&repository).await.as_ref(),
+                &lore_storage::ContentHashes::default(),
+                )
                     .await
                     .expect("file_modification failed")
             .is_modified();
@@ -2913,10 +3254,6 @@ mod block_single_flight {
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             self.inner.clone().compact_resume_at().await
-        }
-
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
         }
 
         fn max_query_batch(&self) -> Option<usize> {

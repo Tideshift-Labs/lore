@@ -59,7 +59,7 @@ impl RepositoryMutationGuard {
             None
         } else {
             Some(
-                FSLock::acquire_file_lock(dot.join("workflow-admission"))
+                FSLock::acquire_file_lock(dot.join("workflow-admission"), false)
                     .await
                     .map_err(|error| ProtocolError::internal(error.to_string()))?,
             )

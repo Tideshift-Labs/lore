@@ -4,6 +4,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -523,6 +524,20 @@ impl SharedRuntime {
 /// Core runtime — see [`core_runtime`].
 static CORE_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
 
+/// Whether shutdown has begun. Set once and never cleared, because shutdown is
+/// terminal for the process.
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn claim_runtime_shutdown() -> bool {
+    SHUTDOWN_STARTED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+pub fn runtime_shutdown_started() -> bool {
+    SHUTDOWN_STARTED.load(Ordering::Relaxed)
+}
+
 /// Network runtime — see [`net_runtime`].
 static NET_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
 
@@ -859,6 +874,26 @@ impl Default for TokioSettings {
     }
 }
 
+impl TokioSettings {
+    /// Settings for a process that relays its calls to the Lore service.
+    ///
+    /// A relaying process writes a request to a socket and reads events back,
+    /// and the service does the work. Sizing its pools for work it will not do
+    /// costs threads a whole machine's worth of clients pays for. Both pools sit
+    /// at [`MIN_THREADS_PER_POOL`], which every pool keeps regardless, so none
+    /// can starve another. The net pool is left at the process default: a
+    /// relaying process makes no remote calls of its own, and that default is
+    /// already small.
+    pub fn relay_only() -> Self {
+        TokioSettings {
+            max_blocking_threads: MIN_THREADS_PER_POOL,
+            thread_keep_alive_seconds: default_thread_keep_alive(),
+            worker_threads: Some(MIN_THREADS_PER_POOL),
+            net_threads: None,
+        }
+    }
+}
+
 /// Returns a handle to the shared tokio runtime, creating it lazily with default settings.
 pub fn runtime() -> Handle {
     runtime_with_settings(None)
@@ -1029,6 +1064,7 @@ pub async fn runtime_flush_guarded() {
 /// `current_thread` runtime, and `Handle::block_on` cannot drive a
 /// `current_thread` runtime's I/O or timers from a foreign thread, so bouncing
 /// the future onto the caller's own handle hangs.
+///
 pub fn shutdown_block_on<F>(future: F, wait_timeout: Duration) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
@@ -1105,6 +1141,34 @@ pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A relaying process does no work of its own, so its pools sit at the
+    /// minimum every pool keeps anyway.
+    #[test]
+    fn relay_settings_ask_for_the_least_a_pool_keeps() {
+        let relay = TokioSettings::relay_only();
+
+        assert_eq!(relay.worker_threads, Some(MIN_THREADS_PER_POOL));
+        assert_eq!(relay.max_blocking_threads, MIN_THREADS_PER_POOL);
+        assert_eq!(relay.thread_keep_alive_seconds, default_thread_keep_alive());
+        assert_eq!(
+            relay.net_threads, None,
+            "the net pool keeps the process default, which is already small"
+        );
+    }
+
+    /// Sizing for relaying must never ask for more than sizing for working.
+    #[test]
+    fn relay_settings_are_never_larger_than_the_default_ones() {
+        let relay = TokioSettings::relay_only();
+        let default = TokioSettings::default();
+
+        assert!(relay.max_blocking_threads <= default.max_blocking_threads);
+        assert!(
+            relay.worker_threads.unwrap_or(usize::MAX)
+                <= default.worker_threads.unwrap_or(usize::MAX)
+        );
+    }
     use super::*;
 
     /// The net runtime has `max_blocking_threads(1)`, so blocking work dispatched there

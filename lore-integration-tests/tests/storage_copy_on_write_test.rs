@@ -36,6 +36,7 @@ mod storage_copy_on_write_tests {
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
@@ -278,8 +279,8 @@ mod storage_copy_on_write_tests {
                     assert_eq!(completed.len(), 1);
                     serde_json::from_str(&completed[0]).unwrap()
                 };
-                assert_eq!(detail["status"], 193);
-                assert_eq!(detail["error"]["errorCode"], 193);
+                assert_eq!(detail["status"], 248);
+                assert_eq!(detail["error"]["errorCode"], 248);
                 assert_eq!(detail["error"]["attemptId"], unresolved[0].attempt_id.to_string());
                 assert_eq!(detail["error"]["operation"], "StorageService.Copy");
                 close_handle(handle_id).await;
@@ -342,7 +343,7 @@ mod storage_copy_on_write_tests {
                             Bytes::from_static(b"real managed write namespace"),
                             lore_storage::options::WriteOptions::default(),
                             Some(session),
-                            None,
+                            lore_storage::write_tracker::WriteContext::none(),
                             None,
                         ),
                     )
@@ -431,7 +432,10 @@ mod storage_copy_on_write_tests {
                                 ),
                                 lore_storage::options::WriteOptions::default(),
                                 Some(session.clone()),
-                                tracker.clone(),
+                                lore_storage::write_tracker::WriteContext::tracked(
+                                    tracker.clone(),
+                                    None,
+                                ),
                                 None,
                             ),
                         )
@@ -704,10 +708,6 @@ mod storage_copy_on_write_tests {
             self.inner.clone().compact_resume_at().await
         }
 
-        async fn compact_stop(self: Arc<Self>) {
-            self.inner.clone().compact_stop().await;
-        }
-
         fn max_query_batch(&self) -> Option<usize> {
             self.inner.max_query_batch()
         }
@@ -797,11 +797,11 @@ mod storage_copy_on_write_tests {
                     None,
                     None,
                     Duration::from_secs(30),
-                    None,
+                    Default::default(),
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None, false)
+                .with_jwt_verifier(None, false, Arc::new(AllowAllRepositoryAuthorizer))
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;

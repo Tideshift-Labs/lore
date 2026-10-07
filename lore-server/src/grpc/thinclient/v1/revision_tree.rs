@@ -52,6 +52,8 @@ pub async fn handler(
     request: Request<RevisionTreeRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionTreeStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -84,7 +86,9 @@ pub async fn handler(
         .scope(execution, async move {
             // Resolve up-front so the unary part of the call can surface
             // NotFound / Internal before the stream opens.
-            let (signature, identifier) = resolve_to_identifier(&repository, query.into()).await?;
+            let (signature, identifier) =
+                resolve_to_identifier(&repository, query.into(), history_step_size, acceleration)
+                    .await?;
 
             if signature.is_zero() {
                 return Err(Status::invalid_argument(
@@ -136,7 +140,9 @@ async fn stream_tree(
     let result = match tree(repository.clone(), signature, path, max_depth, can_read).await {
         Ok(result) => result,
         Err(err) => {
-            let status = if err.is_invalid_path() {
+            let status = if err.is_slow_down() {
+                Status::resource_exhausted(err.to_string())
+            } else if err.is_invalid_path() {
                 Status::invalid_argument("Cannot calculate tree for path that is not a directory")
             } else if err.is_node_not_found() {
                 Status::not_found("A node in the tree could not be found")
@@ -208,6 +214,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
     fn make_request(
@@ -584,7 +591,15 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let err = match handler(request, immutable_store, mutable_store).await {
+            let err = match handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            {
                 Ok(_) => panic!("unset query should fail"),
                 Err(err) => err,
             };
@@ -612,6 +627,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -680,6 +697,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -717,6 +736,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -744,6 +765,8 @@ mod test {
                 make_request(repository, Query::Signature(bogus.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -771,6 +794,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -808,6 +833,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("unary part succeeds");
@@ -847,6 +874,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("unary part succeeds");
@@ -896,6 +925,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -939,6 +970,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -992,6 +1025,8 @@ mod test {
                 ),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1053,6 +1088,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1130,6 +1167,8 @@ mod test {
                 make_request(originating, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1198,6 +1237,8 @@ mod test {
             make_request(repository, Query::Signature(signature.into()), None, None),
             immutable_store,
             mutable_store,
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
         )
         .await
         .expect("handler ok");
@@ -1330,9 +1371,15 @@ mod test {
                 .extensions_mut()
                 .insert(token_authorized_for(&[originating]));
 
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("handler ok");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("handler ok");
 
             let nodes: Vec<thin_client_v1::TreeNode> = collect(response)
                 .await
@@ -1396,6 +1443,8 @@ mod test {
                 make_request(a, Query::Signature(a_sig.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1531,6 +1580,8 @@ mod test {
                 make_request(a, Query::Signature(a_sig.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1609,9 +1660,15 @@ mod test {
                 .extensions_mut()
                 .insert(token_authorized_for(&[originating]));
 
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("unary part succeeds");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("unary part succeeds");
 
             let items: Vec<_> = collect(response).await;
             // Header is emitted before the error.
@@ -1647,6 +1704,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1701,6 +1760,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1755,6 +1816,8 @@ mod test {
                 make_request(repository, Query::Signature(signature.into()), None, None),
                 immutable_store,
                 mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");

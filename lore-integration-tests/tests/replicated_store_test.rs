@@ -170,6 +170,7 @@ mod replicated_store_tests {
             "",
             partition,
             &credentials,
+            None,
         )
         .await
         .expect("storage client connection");

@@ -36,6 +36,7 @@ use super::security_headers::PolicyField;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::drain::DrainState;
 use crate::http::repositories;
@@ -66,6 +67,7 @@ pub struct ServerState {
     pub immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     pub mutable_store: Arc<dyn lore_storage::MutableStore>,
     pub jwt_verifier: Option<JwtVerifier>,
+    pub repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
 }
@@ -395,11 +397,13 @@ impl LoreHttpServer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn serve(
         settings: LoreHttpServerSettings,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         drain: Option<Arc<DrainState>>,
         facets: HealthFacets,
         signal: impl Future<Output = ()> + Send + 'static,
@@ -449,6 +453,7 @@ impl LoreHttpServer {
             immutable_store,
             mutable_store,
             jwt_verifier,
+            repository_authorizer,
             max_file_size: settings.max_file_size,
             presign_config,
         };

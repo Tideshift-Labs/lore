@@ -169,5 +169,9 @@ pub fn storage_replay_class(command: Command) -> ReplayClass {
         // `session_stop` response is idempotent. Neither publishes a lifecycle association nor
         // advances a mutable key, which is what `MutableNoReplay` exists to protect.
         Command::Authorize => ReplayClass::ReadRetryable,
+
+        // Announces the client's user agent for the connection. It neither publishes a lifecycle
+        // association nor advances a mutable key, and a repeat restates the same identity.
+        Command::ClientIdentify => ReplayClass::ReadRetryable,
     }
 }

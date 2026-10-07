@@ -59,7 +59,12 @@ documentation_style = "c99"
 ############################# Codegen Options ##################################
 
 [export]
-exclude = []
+# `FilterState` and `FilterStates` are public so a tree walk can thread the
+# filter verdict down as it descends, and so the filter tests can build one.
+# `FileInfo` is public so the walk and the stage path can pass what a path
+# measured. All three are Rust-side only -- no C entry point takes or returns
+# them -- so cbindgen would otherwise emit opaque typedefs no caller can use.
+exclude = ["FileInfo", "FilterState", "FilterStates"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
 # explicitly. The `lore_revision_tree_*_args_t` types live here too so the
@@ -69,10 +74,13 @@ exclude = []
 # `LoreNodeStagedAction` names the values of the `staged_action` field on the
 # child and node-info records; the field is a `uint32_t` there, as `kind` is, so
 # nothing declares the enum type and cbindgen cannot reach it on its own.
+# `CompressionMode` names the values `lore_set_compression_mode` takes, whose
+# parameter is a `uint32_t` for the same reason.
 include = [
     "LoreStore",
     "LoreRevisionTree",
     "LoreNodeStagedAction",
+    "CompressionMode",
     "LoreRevisionTreeLoadArgs",
     "LoreRevisionTreeCloseArgs",
     "LoreRevisionTreeResolvePathArgs",
@@ -94,6 +102,7 @@ include = [
 [export.rename]
 "Address" = "lore_address_t"
 "BranchId" = "lore_branch_id_t"
+"CompressionMode" = "lore_compression_mode_t"
 "Context" = "lore_context_t"
 "Fragment" = "lore_fragment_t"
 "Hash" = "lore_hash_t"
@@ -208,6 +217,7 @@ include = [
 "LoreBranchPushFragmentProgressEventData" = "lore_branch_push_fragment_progress_event_data_t"
 "LoreBranchPushRevisionPushBeginEventData" = "lore_branch_push_revision_push_begin_event_data_t"
 "LoreBranchPushRevisionPushEndEventData" = "lore_branch_push_revision_push_end_event_data_t"
+"LoreBranchPushStatsEventData" = "lore_branch_push_stats_event_data_t"
 "LoreBranchPushRevisionPushUpdateEventData" = "lore_branch_push_revision_push_update_event_data_t"
 "LoreBranchPushRevisionUpdateBeginEventData" = "lore_branch_push_revision_update_begin_event_data_t"
 "LoreBranchPushRevisionUpdateEndEventData" = "lore_branch_push_revision_update_end_event_data_t"
@@ -221,6 +231,7 @@ include = [
 "LoreBranchUnprotectArgs" = "lore_branch_unprotect_args_t"
 "LoreBranchUnprotectEventData" = "lore_branch_unprotect_event_data_t"
 "LoreBytes" = "lore_bytes_t"
+"LoreBytesMut" = "lore_bytes_mut_t"
 "LoreCompleteEventData" = "lore_complete_event_data_t"
 "LoreEndEventData" = "lore_end_event_data_t"
 "LoreErrorCode" = "lore_error_code_t"
@@ -343,6 +354,7 @@ include = [
 "LoreDependencyResolveBeginEventData" = "lore_dependency_resolve_begin_event_data_t"
 "LoreDependencyResolveItemEventData" = "lore_dependency_resolve_item_event_data_t"
 "LoreDependencyResolveEndEventData" = "lore_dependency_resolve_end_event_data_t"
+"LoreVfsType" = "lore_vfs_type_t"
 "LoreRepositoryCloneArgs" = "lore_repository_clone_args_t"
 "LoreRepositoryCloneBeginEventData" = "lore_repository_clone_begin_event_data_t"
 "LoreRepositoryCloneCountData" = "lore_repository_clone_count_data_t"
@@ -386,6 +398,9 @@ include = [
 "LoreRevisionCommitEndEventData" = "lore_revision_commit_end_event_data_t"
 "LoreRevisionCommitProgressEventData" = "lore_revision_commit_progress_event_data_t"
 "LoreRevisionCommitRevisionEventData" = "lore_revision_commit_revision_event_data_t"
+"LoreRevisionCommitStatsEventData" = "lore_revision_commit_stats_event_data_t"
+"FragmentWriteCounts" = "lore_fragment_stats_data_t"
+"LoreCommitFileStatsData" = "lore_commit_file_stats_data_t"
 "LoreRevisionAmendArgs" = "lore_revision_amend_args_t"
 "LoreRevisionInfoArgs" = "lore_revision_info_args_t"
 "LoreRevisionInfoDeltaEventData" = "lore_revision_info_delta_event_data_t"
@@ -402,6 +417,7 @@ include = [
 "LoreRevisionMetadataListArgs" = "lore_revision_metadata_list_args_t"
 "LoreRevisionMetadataSetArgs" = "lore_revision_metadata_set_args_t"
 "LoreRevisionResolveEventData" = "lore_revision_resolve_event_data_t"
+"LoreRevisionResolveTarget" = "lore_revision_resolve_target_t"
 "LoreRevisionSyncArgs" = "lore_revision_sync_args_t"
 "LoreRevisionSyncFileEventData" = "lore_revision_sync_file_event_data_t"
 "LoreRevisionSyncProgressEventData" = "lore_revision_sync_progress_event_data_t"
@@ -423,9 +439,15 @@ include = [
 "LoreSharedStoreInfoArgs" = "lore_shared_store_info_args_t"
 "LoreSharedStoreMode" = "lore_shared_store_mode_t"
 "LoreSharedStoreInfoEventData" = "lore_shared_store_info_event_data_t"
+"LoreSharedStoreListArgs" = "lore_shared_store_list_args_t"
+"LoreSharedStoreListEventData" = "lore_shared_store_list_event_data_t"
+"LoreSharedStoreListItem" = "lore_shared_store_list_item_t"
+"LoreArray_lore_shared_store_list_item" = "lore_shared_store_list_item_array_t"
 "LoreSharedStoreSetUseAutomaticallyArgs" = "lore_shared_store_set_use_automatically_args_t"
 "LoreServiceStartArgs" = "lore_service_start_args_t"
 "LoreServiceStopArgs" = "lore_service_stop_args_t"
+"LoreServiceSetExecutableArgs" = "lore_service_set_executable_args_t"
+"LoreServiceSetUseAutomaticallyArgs" = "lore_service_set_use_automatically_args_t"
 "LoreStore" = "lore_store_t"
 "LoreStorageCloseArgs" = "lore_storage_close_args_t"
 "LoreStorageFlushArgs" = "lore_storage_flush_args_t"
@@ -458,6 +480,12 @@ include = [
 "LoreStorageGetFileArgs" = "lore_storage_get_file_args_t"
 "LoreStorageGetFileItem" = "lore_storage_get_file_item_t"
 "LoreArray_lore_storage_get_file_item" = "lore_storage_get_file_item_array_t"
+"LoreStoragePutFileResolvedArgs" = "lore_storage_put_file_resolved_args_t"
+"LoreStoragePutFileResolvedItem" = "lore_storage_put_file_resolved_item_t"
+"LoreArray_lore_storage_put_file_resolved_item" = "lore_storage_put_file_resolved_item_array_t"
+"LoreStorageGetFileResolvedArgs" = "lore_storage_get_file_resolved_args_t"
+"LoreStorageGetFileResolvedItem" = "lore_storage_get_file_resolved_item_t"
+"LoreArray_lore_storage_get_file_resolved_item" = "lore_storage_get_file_resolved_item_array_t"
 "LoreStorageUploadArgs" = "lore_storage_upload_args_t"
 "LoreStorageUploadItem" = "lore_storage_upload_item_t"
 "LoreArray_lore_storage_upload_item" = "lore_storage_upload_item_array_t"

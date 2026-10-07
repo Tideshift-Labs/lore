@@ -29,18 +29,16 @@
 //! unchanged by that, as is every cut boundary.
 
 use std::collections::VecDeque;
-use std::path::Path;
 
 use bytes::Bytes;
 use bytes::BytesMut;
-use lore_io::IoDriver;
-use lore_io::IoFile;
-use lore_io::OpenOptions;
 use tokio::task::JoinHandle;
 
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
 use crate::concurrency::FRAGMENT_SIZE_EXPECTED;
 use crate::concurrency::FRAGMENT_SIZE_MINIMUM;
+use crate::content::ContentHandle;
+use crate::content::WindowRead;
 use crate::error::StorageError;
 
 /// Window capacity: one maximum fragment of headroom for the undecided remainder,
@@ -53,15 +51,6 @@ pub struct Chunk {
     pub data: Bytes,
 }
 
-/// Open `path` for reading, returning the shared handle and its size.
-pub async fn open_read(path: &Path) -> std::io::Result<(IoFile, u64)> {
-    let file = IoDriver::global()
-        .open(path, &OpenOptions::new().read(true))
-        .await?;
-    let size = file.metadata().await?.len();
-    Ok((file, size))
-}
-
 /// How the chunker picks cut points.
 enum CutMode {
     /// Cut where the content says to, matching whole-file `FastCDC`.
@@ -69,21 +58,6 @@ enum CutMode {
     /// Cut every N bytes. Never exceeds [`FRAGMENT_SIZE_THRESHOLD`], so the window
     /// always holds at least one whole chunk.
     FixedSize(usize),
-}
-
-/// The window a read fills, owned by the operation for its whole flight and handed back
-/// with it. A single segment: the read lands in `buffer[start..start + want]`, leaving
-/// anything in front of it as headroom for bytes the caller carries over itself.
-pub(crate) struct WindowRead {
-    pub(crate) buffer: BytesMut,
-    pub(crate) start: usize,
-    pub(crate) want: usize,
-}
-
-impl lore_io::StableBufListMut for WindowRead {
-    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
-        std::iter::once(&mut self.buffer[self.start..self.start + self.want])
-    }
 }
 
 /// A read in flight into the window that is not being cut.
@@ -96,7 +70,7 @@ struct PendingRead {
 
 /// Cuts a file into chunks a window at a time.
 pub struct FileChunker {
-    file: IoFile,
+    handle: ContentHandle,
     /// Unconsumed bytes live in `window[head..head + length]`. Everything outside that
     /// range is uninitialised until a read or a carry-over writes it.
     window: BytesMut,
@@ -134,15 +108,19 @@ pub struct FileChunker {
 
 impl FileChunker {
     /// Cut on content, matching [`fastcdc::v2020::FastCDC`] over the whole file.
-    pub async fn content_defined(file: IoFile, file_size: u64) -> Self {
-        Self::open(file, file_size, CutMode::ContentDefined).await
+    pub(crate) async fn content_defined(handle: ContentHandle, file_size: u64) -> Self {
+        Self::open(handle, file_size, CutMode::ContentDefined).await
     }
 
     /// Cut every `chunk_size` bytes, clamped to a whole fragment and at least one byte
     /// so a caller passing zero cannot stall the cut loop.
-    pub async fn fixed_size(file: IoFile, file_size: u64, chunk_size: usize) -> Self {
+    pub(crate) async fn fixed_size(
+        handle: ContentHandle,
+        file_size: u64,
+        chunk_size: usize,
+    ) -> Self {
         let mode = CutMode::FixedSize(chunk_size.clamp(1, FRAGMENT_SIZE_THRESHOLD));
-        Self::open(file, file_size, mode).await
+        Self::open(handle, file_size, mode).await
     }
 
     /// Reserves every window this chunker will allocate plus one maximum-size chunk
@@ -159,7 +137,7 @@ impl FileChunker {
     /// Every term is bounded by the file: nothing larger than the file is ever
     /// buffered or cut from it, and a file that fits in one read gets a single window
     /// with no headroom and no read-ahead.
-    async fn open(file: IoFile, file_size: u64, mode: CutMode) -> Self {
+    async fn open(handle: ContentHandle, file_size: u64, mode: CutMode) -> Self {
         let capacity = file_size.min(WINDOW_SIZE as u64) as usize;
         let single_read = file_size <= WINDOW_SIZE as u64;
         let headroom = if single_read {
@@ -174,7 +152,7 @@ impl FileChunker {
                 .await;
 
         Self {
-            file,
+            handle,
             // SAFETY: no byte is read before it is written. The cut only ever looks at
             // `window[head..head + length]`, which is the region the read filled plus the
             // remainder `swap_in` carries into the headroom in front of it.
@@ -306,15 +284,15 @@ impl FileChunker {
     /// end, and one appended to mid-write cannot yield a chunk list covering more bytes
     /// than the root fragment records, which readers trust.
     fn start_read(&self, buffer: BytesMut) -> PendingRead {
-        let file = self.file.clone();
+        let handle = self.handle.clone();
         let start = self.headroom;
         let offset = self.read_offset;
         let remaining = self.file_size.saturating_sub(offset);
         let want = (buffer.len() - start).min(remaining as usize);
 
         let task = lore_base::lore_spawn!(async move {
-            let window = file
-                .read_exact_vectored_at(
+            handle
+                .read_window(
                     WindowRead {
                         buffer,
                         start,
@@ -322,8 +300,7 @@ impl FileChunker {
                     },
                     offset,
                 )
-                .await?;
-            Ok(window.buffer)
+                .await
         });
 
         PendingRead { task, want }
@@ -430,7 +407,10 @@ mod tests {
         file.sync_all().expect("sync test file");
         drop(file);
 
-        let (file, file_size) = open_read(&path).await.expect("open test file");
+        let (file, file_size) = crate::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open test file");
         let mut chunker = if fixed_size > 0 {
             FileChunker::fixed_size(file, file_size, fixed_size).await
         } else {
@@ -571,7 +551,10 @@ mod tests {
     async fn open_chunker(dir: &TempDir, name: &str, size: usize) -> FileChunker {
         let path = dir.path().join(name);
         std::fs::write(&path, random_buffer(size)).expect("write test file");
-        let (file, _) = open_read(&path).await.expect("open test file");
+        let (file, _) = crate::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open test file");
 
         FileChunker::content_defined(file, size as u64).await
     }
@@ -635,7 +618,10 @@ mod tests {
         let declared = 3 * WINDOW_SIZE + 517;
         std::fs::write(&path, random_buffer(declared)).expect("write test file");
 
-        let (file, _) = open_read(&path).await.expect("open test file");
+        let (file, _) = crate::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open test file");
         let mut chunker = FileChunker::content_defined(file, declared as u64).await;
 
         // Grow the file behind the chunker, as an appender would.
@@ -673,7 +659,10 @@ mod tests {
         let declared = 4 * WINDOW_SIZE;
         std::fs::write(&path, random_buffer(2 * WINDOW_SIZE)).expect("write test file");
 
-        let (file, _) = open_read(&path).await.expect("open test file");
+        let (file, _) = crate::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open test file");
         let mut chunker = FileChunker::content_defined(file, declared as u64).await;
         chunker
             .next_chunk()
@@ -718,12 +707,15 @@ mod tests {
         std::fs::write(&path, vec![7u8; 4 * FRAGMENT_SIZE_THRESHOLD]).expect("seed file");
         // Write-only handle: every positional read fails.
         let file = lore_io::IoDriver::global()
-            .open(&path, &OpenOptions::new().write(true))
+            .open(&path, &lore_io::OpenOptions::new().write(true))
             .await
             .expect("open write-only");
 
-        let mut chunker =
-            FileChunker::content_defined(file, 4 * FRAGMENT_SIZE_THRESHOLD as u64).await;
+        let mut chunker = FileChunker::content_defined(
+            crate::content::ContentHandle::File(file),
+            4 * FRAGMENT_SIZE_THRESHOLD as u64,
+        )
+        .await;
         let Err(first) = chunker.next_chunk().await else {
             panic!("read must fail");
         };

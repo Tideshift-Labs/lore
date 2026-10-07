@@ -8,7 +8,7 @@
 //!   `error_code = NONE`.
 //! - missing content → `ADDRESS_NOT_FOUND`.
 //! - file write failure → `INTERNAL`.
-//! - `offset` past the end of the content → `INVALID_ARGUMENTS`.
+//! - `offset` past the end of the content → `INVALID_ARGUMENTS`, with `path` left untouched.
 //! - otherwise: `read_into_file` writes the reassembled payload.
 //!
 //! Ranges: `offset` and `length` select part of the content, `length = 0` meaning "to the
@@ -20,16 +20,13 @@
 //! `GET_ITEM_COMPLETE`.
 //!
 //! Multi-fragment writes go through a temp file at `<path>.loretmp` (or `<path>.<ext>.loretmp`
-//! if `path` already has an extension); the rename to the final target is atomic. On failure
-//! mid-write the library leaves the temp file behind — the target itself is either finalized or
-//! untouched, but cleanup of the lingering temp is the caller's responsibility.
+//! if `path` already has an extension); the rename to the final target is atomic. A failure
+//! mid-write removes the temp file, so the target is either the finished range or untouched.
 
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
-use lore_base::lore_spawn;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -44,9 +41,9 @@ use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::read::read_into_file;
+use lore_storage::read::write_all_to_file;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::task::JoinSet;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -142,23 +139,18 @@ async fn get_file_local(
         args,
         get_file,
         async move |store, args| {
-            let items = args.items.as_slice().to_vec();
+            let items = args.items.as_slice();
             if items.is_empty() {
                 return Ok::<(), GetFileError>(());
             }
             let effective = store.effective_flags(per_call)?;
-            let total = items.len();
             let mut reuse = crate::storage::store::SessionReuse::default();
-            let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
-            for item in items {
+
+            crate::storage::fan_out_items!(items, "get_file", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move {
-                    get_file_item(store, item, effective, session).await
-                });
-            }
-            let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "get_file")
+                async move { get_file_item(store, &item, effective, session).await }
+            })
         },
     )
     .await
@@ -166,11 +158,11 @@ async fn get_file_local(
 
 async fn get_file_item(
     store: Arc<StoreInternal>,
-    item: LoreStorageGetFileItem,
+    item: &LoreStorageGetFileItem,
     effective: crate::storage::store::EffectiveFlags,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let error_code = resolve_get_file_item(store, &item, effective, session).await;
+    let error_code = resolve_get_file_item(store, item, effective, session).await;
     let address = if error_code == LoreErrorCode::None {
         item.address
     } else {
@@ -185,6 +177,11 @@ async fn get_file_item(
     error_code
 }
 
+/// Read one item's content into its file.
+///
+/// A start past the end of the content is a caller mistake rather than an empty read, as in `get`,
+/// and is rejected rather than answered with an empty file. `read_into_file` leaves the target
+/// alone in that case, so a destination that was already there survives.
 async fn resolve_get_file_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetFileItem,
@@ -198,10 +195,8 @@ async fn resolve_get_file_item(
     if path_str.is_empty() {
         return LoreErrorCode::InvalidArguments;
     }
-    let path = PathBuf::from(path_str);
-
     if item.address.hash == Hash::default() {
-        return match tokio::fs::File::create(&path).await {
+        return match write_all_to_file(Path::new(path_str), bytes::Bytes::new(), false).await {
             Ok(_) => LoreErrorCode::None,
             Err(_) => LoreErrorCode::Internal,
         };
@@ -224,9 +219,6 @@ async fn resolve_get_file_item(
     )
     .await
     {
-        // As in `get`: a start past the end of the content is a caller mistake rather than an
-        // empty read. The target has already been written by then — it holds the zero bytes
-        // the range resolved to, which is what any failed write of a range leaves behind.
         Ok((fragment, _)) if item.offset > fragment.size_content => LoreErrorCode::InvalidArguments,
         Ok(_) => LoreErrorCode::None,
         Err(err) => crate::storage::storage_error_to_code(&err),

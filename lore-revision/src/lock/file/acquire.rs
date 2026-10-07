@@ -1030,8 +1030,8 @@ mod tests {
 
     /// `AcquireError::UnnameableResource` itself: the guard on someone deleting its entry from
     /// the single `matches!` in `BatchSetError::is_decisive`, plus its public translation and its
-    /// FFI code. Allocated from the Outcome block (193-199, `lore-base/src/error.rs`), so its code
-    /// must sit beside `OutcomeUnknown`'s 193 without colliding with it or with `Internal`'s -1.
+    /// FFI code. Allocated from the Outcome block (248-254, `lore-base/src/error.rs`), so its code
+    /// must sit beside `OutcomeUnknown`'s 248 without colliding with it or with `Internal`'s -1.
     mod unnameable_resource_tests {
         use lore_base::error::UnnameableResource;
 
@@ -1073,14 +1073,14 @@ mod tests {
             );
         }
 
-        /// `ffi_code()` is 194, distinct from both `Internal` (-1) and `OutcomeUnknown` (193) --
+        /// `ffi_code()` is 249, distinct from both `Internal` (-1) and `OutcomeUnknown` (248) --
         /// the terminal status a C caller actually reads, independent of `translated()`'s coarser
         /// `LoreError` bucket.
         #[test]
-        fn unnameable_resource_ffi_code_is_194_and_distinct() {
+        fn unnameable_resource_ffi_code_is_249_and_distinct() {
             let error = unnameable();
 
-            assert_eq!(error.ffi_code(), 194);
+            assert_eq!(error.ffi_code(), 249);
             assert_ne!(error.ffi_code(), lore_error_set::Internal::FFI_CODE);
             assert_ne!(
                 error.ffi_code(),

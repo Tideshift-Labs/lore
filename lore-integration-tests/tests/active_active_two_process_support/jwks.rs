@@ -231,18 +231,31 @@ impl TokenMinter {
         self.mint_full(subject, Vec::new(), vec![AUTHN_AUDIENCE.to_owned()])
     }
 
+    /// An identity-shaped token for `subject`: the SERVER audience
+    /// (`self.audience`) but NO `resources` claim.
+    ///
+    /// Since v0.10.0's `RepositoryAuthorizer`, a token that carries a
+    /// `resources` claim is authorized from that claim alone, with no call to
+    /// the auth service (`granted_actions` in
+    /// `lore-server/src/authnz/repository_authorizer.rs`). Only a token
+    /// without the claim reaches `CheckUserPermission`, so this is the shape a
+    /// case needs to prove a read consulted the authorizer. The stub's
+    /// `authenticate` accepts it (issuer plus storage audience).
+    pub fn mint_identity(&self, subject: &str) -> String {
+        self.mint_full(subject, Vec::new(), vec![self.audience.clone()])
+    }
+
     /// A token that also names one repository EXACTLY, with the obliterate
     /// permission.
     ///
-    /// The wildcard is not enough here, and the reason is a real asymmetry in
-    /// the server rather than a quirk of this harness. `can_obliterate` reads
-    /// `user_permissions`, which walks the token's resources and returns the
-    /// permissions of the entry whose parsed repository EQUALS the target
-    /// (`lore-server/src/grpc/mod.rs:425-427,480-495`) — no wildcard match.
-    /// Every other write path goes through `has_required_permission`, which
-    /// uses `matches_repository` and does honour `urc-*`. A wildcard-only token
-    /// is therefore refused for obliterate alone, with a bare "Permission
-    /// denied" that reads like a harness misconfiguration.
+    /// [`Self::mint`]'s wildcard entry carries only `read` and `write`, so a
+    /// token holding just that is refused for obliterate with a bare
+    /// "Permission denied" that reads like a harness misconfiguration. The
+    /// extra exact entry supplies the missing `obliterate` and `migrate`
+    /// permissions. Since upstream `657e05e9` (one wildcard-honouring
+    /// `ResourceMatcher` for every in-token reader) the wildcard and the exact
+    /// entry are matched and MERGED, so the exact match is no longer what
+    /// matters; the permission list is.
     pub fn mint_for_repository(&self, subject: &str, repository_id: &[u8]) -> String {
         let hex: String = repository_id
             .iter()

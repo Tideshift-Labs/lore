@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use lore_base::fs::lock::FSLock;
+use lore_error_set::HasAll;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -126,7 +127,7 @@ pub async fn load_with_lock<ConfigType: Default + Serialize + for<'a> Deserializ
     path: impl AsRef<Path>,
 ) -> Result<(ConfigType, FSLock), LoadError> {
     let path = path.as_ref();
-    let lock = FSLock::acquire_file_lock(path).await.map_err(|err| {
+    let lock = FSLock::acquire_file_lock(path, true).await.map_err(|err| {
         LoadError::internal(format!("failed to lock config {}: {err}", path.display()))
     })?;
     let config = load(path).await?;
@@ -182,6 +183,48 @@ pub async fn save<ConfigType: Serialize>(
     Ok(())
 }
 
+#[allow(async_fn_in_trait)]
+pub trait SaveableConfig: Serialize + for<'a> Deserialize<'a> + Default + Clone {
+    type ErrorType: ErrorSet
+        + HasAll<<LoadError as ErrorSet>::Variants>
+        + HasAll<<SaveError as ErrorSet>::Variants>;
+
+    fn file_location() -> Result<PathBuf, Self::ErrorType>;
+
+    async fn modify_on_load(self) -> Result<Self, Self::ErrorType> {
+        Ok(self)
+    }
+
+    async fn load() -> Result<Self, Self::ErrorType> {
+        Self::load_from_path(&Self::file_location()?).await
+    }
+    async fn load_from_path(path: &Path) -> Result<Self, Self::ErrorType> {
+        let config: Self = load(path)
+            .await
+            .forward::<Self::ErrorType>("Loading global config")?;
+        config.modify_on_load().await
+    }
+
+    async fn load_locked() -> Result<(Self, FSLock), Self::ErrorType> {
+        Self::load_locked_from_path(&Self::file_location()?).await
+    }
+    async fn load_locked_from_path(path: &Path) -> Result<(Self, FSLock), Self::ErrorType> {
+        let (config, lock) = load_with_lock::<Self>(path)
+            .await
+            .forward::<Self::ErrorType>("Loading global config")?;
+        Ok((config.modify_on_load().await?, lock))
+    }
+
+    async fn save(&self, lock: FSLock) -> Result<(), Self::ErrorType> {
+        self.save_at_path(lock, &Self::file_location()?).await
+    }
+    async fn save_at_path(&self, lock: FSLock, path: &Path) -> Result<(), Self::ErrorType> {
+        let result = save(self, path).await;
+        drop(lock);
+        result.forward::<Self::ErrorType>("saving global config")
+    }
+}
+
 #[cfg(test)]
 // Fixtures write config files directly; what these test is how loading and saving read them.
 #[allow(clippy::disallowed_methods)]
@@ -195,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_absent_config_is_the_default() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let config: Settings = load(dir.path().join("absent.toml"))
             .await
             .expect("an absent config defaults");
@@ -204,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_round_trips() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"configured\"\n").expect("write config");
 
@@ -216,7 +259,7 @@ mod tests {
     /// as empty TOML, so defaulting here would be indistinguishable from a deliberate default.
     #[tokio::test]
     async fn a_config_that_is_not_text_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x80]).expect("write config");
 
@@ -225,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_that_is_not_toml_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"this is not toml = = =").expect("write config");
 
@@ -236,7 +279,7 @@ mod tests {
     /// that default back over a configuration that was merely inaccessible.
     #[tokio::test]
     async fn a_config_that_cannot_be_read_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::create_dir(&path).expect("occupy the config path");
 
@@ -245,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_blocking_load_of_an_absent_config_is_the_default() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let config: Settings =
             load_blocking(dir.path().join("absent.toml")).expect("an absent config defaults");
         assert_eq!(config, Settings::default());
@@ -256,7 +299,7 @@ mod tests {
     /// which presented as a repository with no remote.
     #[test]
     fn a_blocking_load_of_a_config_that_cannot_be_read_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::create_dir(&path).expect("occupy the config path");
 
@@ -265,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_replaces_the_config_and_leaves_no_temporary_file() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"original\"\n").expect("write config");
 
@@ -287,7 +330,7 @@ mod tests {
     /// standing in for a crash or a full disk at the same point.
     #[tokio::test]
     async fn a_save_that_fails_before_the_rename_keeps_the_previous_config() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"original\"\n").expect("write config");
         std::fs::create_dir(temp_path(&path)).expect("occupy the temporary path");
@@ -311,7 +354,7 @@ mod tests {
     /// which file it was writing and which one still holds a good copy.
     #[tokio::test]
     async fn a_failed_save_names_the_target_and_the_temporary() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"original\"\n").expect("write config");
         std::fs::create_dir(temp_path(&path)).expect("occupy the temporary path");

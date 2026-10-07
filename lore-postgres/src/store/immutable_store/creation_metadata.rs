@@ -142,6 +142,14 @@ impl ImmutableStore for CreationMetadataStore {
     async fn get(self: Arc<Self>, _: Partition, _: Address) -> Result<StoreGetData, StoreError> {
         Err(unsupported())
     }
+    async fn get_into(
+        self: Arc<Self>,
+        _: Partition,
+        _: Address,
+        _: &mut lore_storage::CallerBuffer,
+    ) -> Result<(Fragment, lore_storage::PayloadRead), StoreError> {
+        Err(unsupported())
+    }
     async fn get_metadata(
         self: Arc<Self>,
         _: Partition,
@@ -177,7 +185,7 @@ impl ImmutableStore for CreationMetadataStore {
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
         None
     }
-    async fn compact_stop(self: Arc<Self>) {}
+    async fn stop_gc(self: Arc<Self>, _: bool) {}
     fn max_query_batch(&self) -> Option<usize> {
         Some(2)
     }

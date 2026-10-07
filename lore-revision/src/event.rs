@@ -61,11 +61,13 @@ use crate::branch::push::LoreBranchPushRevisionPushEndEventData;
 use crate::branch::push::LoreBranchPushRevisionPushUpdateEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateBeginEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateEndEventData;
+use crate::branch::push::LoreBranchPushStatsEventData;
 use crate::branch::reset::LoreBranchResetEventData;
 use crate::commit::LoreRevisionCommitBeginEventData;
 use crate::commit::LoreRevisionCommitEndEventData;
 use crate::commit::LoreRevisionCommitProgressEventData;
 use crate::commit::LoreRevisionCommitRevisionEventData;
+use crate::commit::LoreRevisionCommitStatsEventData;
 use crate::dependency::LoreDependencyResolveBeginEventData;
 use crate::dependency::LoreDependencyResolveEndEventData;
 use crate::dependency::LoreDependencyResolveItemEventData;
@@ -218,6 +220,7 @@ use crate::revision::sync::LoreRevisionSyncRevisionEventData;
 use crate::revision::sync::LoreRevisionSyncTargetEventData;
 use crate::shared_store::LoreSharedStoreCreateEventData;
 use crate::shared_store::LoreSharedStoreInfoEventData;
+use crate::shared_store::LoreSharedStoreListEventData;
 use crate::stage::LoreFileStageBeginEventData;
 use crate::stage::LoreFileStageEndEventData;
 use crate::stage::LoreFileStageFileEventData;
@@ -401,6 +404,80 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
     }
 }
 
+/// Borrowed writable byte slice the caller hands to the library. The counterpart of
+/// `lore_bytes_t`: the caller owns the memory and the library fills it.
+///
+/// A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
+/// value says, as does a length no allocation can have.
+///
+/// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
+/// The buffers supplied by the items of one call must not overlap: the items run alongside each
+/// other, so two covering the same byte would write it at once.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct LoreBytesMut {
+    /// Pointer to the start of the writable slice.
+    pub ptr: *mut core::ffi::c_void,
+    /// Number of bytes available behind `ptr`.
+    pub len: usize,
+}
+
+// SAFETY: as `LoreBytes`, with the caller owning the memory; the call it is handed to bounds the
+// lifetime.
+unsafe impl Send for LoreBytesMut {}
+unsafe impl Sync for LoreBytesMut {}
+
+impl Default for LoreBytesMut {
+    fn default() -> Self {
+        LoreBytesMut {
+            ptr: core::ptr::null_mut(),
+            len: 0,
+        }
+    }
+}
+
+impl LoreBytesMut {
+    /// Whether a buffer is supplied.
+    ///
+    /// A length above `isize::MAX` describes no allocation Rust can address, and reading it as one
+    /// is undefined rather than merely wrong, so such a value is taken as no buffer at all and the
+    /// item is answered the way it is answered without one.
+    pub fn is_supplied(&self) -> bool {
+        !self.ptr.is_null() && self.len > 0 && isize::try_from(self.len).is_ok()
+    }
+}
+
+impl PartialEq for LoreBytesMut {
+    fn eq(&self, other: &Self) -> bool {
+        // Compared as a destination rather than as contents: nothing has written the bytes yet.
+        self.ptr == other.ptr && self.len == other.len
+    }
+}
+
+impl core::fmt::Debug for LoreBytesMut {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LoreBytesMut")
+            .field("supplied", &self.is_supplied())
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl serde::Serialize for LoreBytesMut {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Only the capacity is part of the request; the library writes the contents.
+        serializer.serialize_u64(self.len as u64)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for LoreBytesMut {
+    fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
+        Err(serde::de::Error::custom(
+            "LoreBytesMut cannot be deserialized — it names caller memory",
+        ))
+    }
+}
+
 /// Small discriminator enum for per-item terminal events in the
 /// content-addressed storage API.
 ///
@@ -443,7 +520,7 @@ pub enum LoreErrorCode {
     /// A per-item unknown must reach the caller as itself: flattening it to `Internal`
     /// while the batch continues is exactly how a copied or healed item that may have
     /// landed gets reported as one that did not.
-    OutcomeUnknown = 193,
+    OutcomeUnknown = 248,
 }
 
 // cbindgen cannot evaluate a const in a discriminant position — it drops the
@@ -648,7 +725,7 @@ pub struct LoreErrorDetail {
     pub trace_locations: LoreArray<LoreTraceLocation>,
     /// The operation whose outcome is unresolved, for the errors that name one.
     ///
-    /// Non-empty exactly when `error_code` is `193`, and empty for every other
+    /// Non-empty exactly when `error_code` is `248`, and empty for every other
     /// error. C has no absent string, so empty is how absence is spelled; a
     /// consumer decides by the code, not by testing this field. Read it with
     /// `attempt_id`, never on its own: an operation without the attempt it
@@ -659,7 +736,7 @@ pub struct LoreErrorDetail {
     pub operation: LoreString,
     /// The attempt whose outcome is unresolved, for the errors that name one.
     ///
-    /// Non-empty exactly when `error_code` is `193`. This is the value a caller
+    /// Non-empty exactly when `error_code` is `248`. This is the value a caller
     /// carries into its durable record and later quotes to an authoritative
     /// receipt lookup, so it is the field that makes a lost response
     /// recoverable rather than merely reportable. It is minted before dispatch,
@@ -1191,6 +1268,8 @@ pub enum LoreEvent {
     SharedStoreCreate(LoreSharedStoreCreateEventData),
     /// Information about a shared store.
     SharedStoreInfo(LoreSharedStoreInfoEventData),
+    /// List of all shared stores.
+    SharedStoreList(LoreSharedStoreListEventData),
     /// One staged entry in a link listing.
     LinkStagedEntry(LoreLinkStagedEntryEventData),
     // Content-addressed storage API
@@ -1272,6 +1351,10 @@ pub enum LoreEvent {
     RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
     /// A metadata-clear entry completed.
     RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData),
+    /// What a commit has cost so far, or in total once it has drained its writes.
+    RevisionCommitStats(LoreRevisionCommitStatsEventData),
+    /// What a push has cost so far, or in total once it has finished.
+    BranchPushStats(LoreBranchPushStatsEventData),
 }
 
 impl LoreEvent {
@@ -1518,7 +1601,7 @@ mod error_detail_tests {
         let detail =
             LoreErrorDetail::from_error_with_trace(&unknown, &lore_error_set::Trace::new());
 
-        assert_eq!(detail.error_code, 193);
+        assert_eq!(detail.error_code, 248);
         assert_eq!(detail.operation.as_str(), "RevisionService.BranchCreate");
         assert_eq!(
             detail.attempt_id.as_str(),
@@ -1534,7 +1617,7 @@ mod error_detail_tests {
         let detail =
             LoreErrorDetail::from_error_with_trace(&ordinary, &lore_error_set::Trace::new());
 
-        assert_ne!(detail.error_code, 193);
+        assert_ne!(detail.error_code, 248);
         assert!(detail.operation.as_str().is_empty());
         assert!(detail.attempt_id.as_str().is_empty());
     }

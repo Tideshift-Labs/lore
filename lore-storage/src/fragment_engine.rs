@@ -26,7 +26,11 @@ use crate::types::Context;
 use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Partition;
+use crate::write::FusedPublish;
+use crate::write::StoreResult;
 use crate::write::store_fragment;
+use crate::write::store_fragment_publishing;
+use crate::write_tracker::WriteContext;
 
 /// Figure out where to cut `buffer` into chunks, all in one go.
 ///
@@ -62,8 +66,12 @@ fn chunk_boundaries(
 /// fragment list. Returns the root address.
 ///
 /// When the entire buffer fits in a single chunk, the single-fragment fast path
-/// is used and no fragment list is created. In `hash_only` mode, fragments are
+/// is used and no fragment list is created. Under [`WriteOptions::hash_only`], fragments are
 /// not actually stored — only their hashes are computed.
+///
+/// `publish` asks for a `KeyType::Resolve` mapping to ride along with the upload of the tree's
+/// top-level fragment, saving the round trip a separate mapping write would cost. See
+/// [`FusedPublish`] for how the request travels and when a level withdraws it.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_fragmented(
     store: Arc<dyn ImmutableStore>,
@@ -71,10 +79,10 @@ pub async fn write_fragmented(
     context: Context,
     buffer: Bytes,
     flags: WriteOptions,
-    hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let size = buffer.len();
     let mut read_permit = permit;
@@ -95,7 +103,7 @@ pub async fn write_fragmented(
             size_content: chunk_size as u64,
         };
 
-        let chunk_permit = if hash_only {
+        let chunk_permit = if flags.hash_only {
             None
         } else {
             let needed = crate::concurrency::fragment_permit_count(chunk_size) as usize;
@@ -106,9 +114,12 @@ pub async fn write_fragmented(
         };
 
         if chunk_offset == 0 && chunk_size == size {
-            // Everything was put in a single fragment
             let hash = hash::hash_slice(chunk_buffer.as_ref());
-            let result = store_fragment(
+            if flags.hash_only {
+                return Ok((Address { context, hash }, false, false));
+            }
+
+            let result = store_fragment_publishing(
                 store,
                 partition,
                 Address { context, hash },
@@ -116,19 +127,21 @@ pub async fn write_fragmented(
                 chunk_buffer,
                 flags.local_cache_priority,
                 remote_session,
-                tracker,
+                writes,
                 chunk_permit,
+                publish.as_ref().map(|publish| publish.key()),
             )
             .await?;
+            record_published(publish.as_ref(), &result);
             return Ok((result.address, result.stored_local, result.stored_durable));
         }
 
         let store = store.clone();
         let session = remote_session.clone();
-        let task_tracker = tracker.clone();
+        let task_writes = writes.clone();
         lore_base::lore_spawn!(tasks, async move {
             let hash = hash::hash_slice(chunk_buffer.as_ref());
-            let (chunk_address, chunk_local, chunk_remote) = if hash_only {
+            let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                 (Address { context, hash }, false, false)
             } else {
                 let result = store_fragment(
@@ -139,7 +152,7 @@ pub async fn write_fragmented(
                     chunk_buffer,
                     flags.local_cache_priority,
                     session,
-                    task_tracker,
+                    task_writes,
                     chunk_permit,
                 )
                 .await?;
@@ -167,9 +180,9 @@ pub async fn write_fragmented(
         context,
         size,
         flags,
-        hash_only,
         remote_session,
-        tracker,
+        writes,
+        publish,
     )
     .await
 }
@@ -197,17 +210,21 @@ pub async fn write_fragmented(
 /// This is only reached for files larger than one fragment, so the single-fragment
 /// fast path in [`write_fragmented`] cannot apply — no chunk ever exceeds
 /// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks.
+///
+/// `publish` fuses a `KeyType::Resolve` mapping into the upload of the tree's top-level fragment,
+/// as it does in [`write_fragmented`]: publishing a file costs no round trip beyond the ones its
+/// content already costs.
 #[allow(clippy::too_many_arguments)]
-pub async fn write_fragmented_from_file(
+pub(crate) async fn write_fragmented_from_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     context: Context,
-    file: lore_io::IoFile,
+    handle: crate::content::ContentHandle,
     size: usize,
     flags: WriteOptions,
-    hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
@@ -217,9 +234,9 @@ pub async fn write_fragmented_from_file(
 
     let file_size = size as u64;
     let mut chunker = if let Some(step) = flags.cut_size() {
-        FileChunker::fixed_size(file, file_size, step).await
+        FileChunker::fixed_size(handle, file_size, step).await
     } else {
-        FileChunker::content_defined(file, file_size).await
+        FileChunker::content_defined(handle, file_size).await
     };
 
     // The chunk the chunker pre-paid, as a slot so its use is tracked rather than inferred.
@@ -248,10 +265,10 @@ pub async fn write_fragmented_from_file(
 
         let store = store.clone();
         let session = remote_session.clone();
-        let task_tracker = tracker.clone();
+        let task_writes = writes.clone();
         lore_base::lore_spawn!(tasks, async move {
             let hash = hash::hash_slice(chunk_buffer.as_ref());
-            let (chunk_address, chunk_local, chunk_remote) = if hash_only {
+            let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                 (Address { context, hash }, false, false)
             } else {
                 let result = store_fragment(
@@ -262,7 +279,7 @@ pub async fn write_fragmented_from_file(
                     chunk_buffer,
                     flags.local_cache_priority,
                     session,
-                    task_tracker,
+                    task_writes,
                     chunk_budget,
                 )
                 .await?;
@@ -292,9 +309,9 @@ pub async fn write_fragmented_from_file(
         context,
         size,
         flags,
-        hash_only,
         remote_session,
-        tracker,
+        writes,
+        publish,
     )
     .await
 }
@@ -363,9 +380,9 @@ async fn write_chunk_list(
     context: Context,
     size: usize,
     flags: WriteOptions,
-    hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     results.drain(&mut tasks).await;
 
@@ -406,10 +423,10 @@ async fn write_chunk_list(
         list_buffer.freeze(),
         size,
         flags,
-        hash_only,
         remote_session,
-        tracker,
+        writes,
         list_permit,
+        publish_if_remote(publish, leaves_remote),
     )
     .await?;
     Ok((
@@ -417,6 +434,29 @@ async fn write_chunk_list(
         root_local && leaves_local,
         root_remote && leaves_remote,
     ))
+}
+
+/// The publish request to hand the level above, withdrawn when a child of this level did not reach
+/// the remote.
+///
+/// The frame that stores the top-level fragment cannot see these children, so each level that can
+/// gates the request as it passes it on. Without that, a tree the server holds only part of would
+/// have its key published with the root's upload.
+fn publish_if_remote(
+    publish: Option<Arc<FusedPublish>>,
+    children_remote: bool,
+) -> Option<Arc<FusedPublish>> {
+    publish.filter(|_| children_remote)
+}
+
+/// Report back that the top-level fragment's upload carried the key, so the caller owes it no
+/// mapping write. Content already durable uploads nothing and leaves the request unmarked.
+fn record_published(publish: Option<&Arc<FusedPublish>>, result: &StoreResult) {
+    if result.published
+        && let Some(publish) = publish
+    {
+        publish.mark_published();
+    }
 }
 
 /// Helper function to write a list of fragment references
@@ -428,6 +468,11 @@ async fn write_chunk_list(
 /// The next level is reserved while this level's chunks still hold their splits. That cannot
 /// deadlock: nothing holding a chunk permit ever waits on the budget, so every holder drains
 /// regardless.
+///
+/// A list that fits one fragment *is* the tree's top level, and it is stored last — every level
+/// below has already been awaited by the frame that called this one. So it is the one place a
+/// [`FusedPublish`] can be honoured, and the only place it is: the recursive branch passes the
+/// request on rather than acting on it.
 #[allow(clippy::too_many_arguments)]
 async fn write_fragmentlist_impl(
     store: Arc<dyn ImmutableStore>,
@@ -436,10 +481,10 @@ async fn write_fragmentlist_impl(
     buffer: Bytes,
     content_size: usize,
     flags: WriteOptions,
-    hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let size = buffer.len();
 
@@ -450,14 +495,14 @@ async fn write_fragmentlist_impl(
             size_payload: size as u32,
             size_content: content_size as u64,
         };
-        if hash_only {
+        if flags.hash_only {
             Ok((Address { context, hash }, false, false))
         } else {
             let permit = match permit {
                 Some(permit) => Some(permit),
                 None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
             };
-            let result = store_fragment(
+            let result = store_fragment_publishing(
                 store,
                 partition,
                 Address { context, hash },
@@ -465,10 +510,12 @@ async fn write_fragmentlist_impl(
                 buffer,
                 true, /* Fragment lists have local priority */
                 remote_session,
-                tracker,
+                writes,
                 permit,
+                publish.as_ref().map(|publish| publish.key()),
             )
             .await?;
+            record_published(publish.as_ref(), &result);
             Ok((result.address, result.stored_local, result.stored_durable))
         }
     } else {
@@ -507,7 +554,7 @@ async fn write_fragmentlist_impl(
                 size_content: chunk_content_size as u64,
             };
 
-            let chunk_permit = if hash_only {
+            let chunk_permit = if flags.hash_only {
                 None
             } else {
                 let needed = crate::concurrency::fragment_permit_count(chunk_size) as usize;
@@ -519,10 +566,10 @@ async fn write_fragmentlist_impl(
 
             let store = store.clone();
             let session = remote_session.clone();
-            let task_tracker = tracker.clone();
+            let task_writes = writes.clone();
             lore_base::lore_spawn!(tasks, async move {
                 let hash = hash::hash_slice(chunk_buffer.as_ref());
-                let (chunk_address, chunk_local, chunk_remote) = if hash_only {
+                let (chunk_address, chunk_local, chunk_remote) = if flags.hash_only {
                     (Address { context, hash }, false, false)
                 } else {
                     let permit = chunk_permit;
@@ -534,7 +581,7 @@ async fn write_fragmentlist_impl(
                         chunk_buffer,
                         flags.local_cache_priority,
                         session,
-                        task_tracker,
+                        task_writes,
                         permit,
                     )
                     .await?;
@@ -599,10 +646,10 @@ async fn write_fragmentlist_impl(
             buffer,
             content_size,
             flags,
-            hash_only,
             remote_session,
-            tracker,
+            writes,
             next_permit,
+            publish_if_remote(publish, children_remote),
         )
         .await?;
         Ok((
@@ -623,10 +670,10 @@ pub fn write_fragmentlist(
     buffer: Bytes,
     content_size: usize,
     flags: WriteOptions,
-    hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
-    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publish: Option<Arc<FusedPublish>>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(Address, bool, bool), StorageError>> + Send>,
 > {
@@ -637,10 +684,10 @@ pub fn write_fragmentlist(
         buffer,
         content_size,
         flags,
-        hash_only,
         remote_session,
-        tracker,
+        writes,
         permit,
+        publish,
     ))
 }
 
@@ -688,6 +735,51 @@ mod tests {
         assert_eq!(WriteOptions::default().cut_size(), None);
     }
 
+    /// Content cutting to one chunk is addressed without being stored, the same as content
+    /// cutting to several: the fast path answers with the address the store would have held it
+    /// under, and the store holds nothing.
+    #[tokio::test]
+    async fn addressing_a_single_chunk_stores_nothing() {
+        let dir = crate::test_util::TempDir::new("lore-storage-hash-only-");
+        let store = crate::local::immutable_store::LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            crate::local::immutable_store::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create test store");
+        let partition = Partition::from([5u8; 16]);
+        let buffer = mixed_pattern_buffer(1024);
+        assert_eq!(
+            chunk_boundaries(buffer.clone(), None).expect("chunking succeeds"),
+            vec![(0, buffer.len())],
+            "the fast path is what this covers"
+        );
+
+        let (address, stored_local, stored_durable) = write_fragmented(
+            store.clone(),
+            partition,
+            Context::default(),
+            buffer,
+            WriteOptions::default().hash_only(),
+            None,
+            crate::write_tracker::WriteContext::none(),
+            None,
+            None,
+        )
+        .await
+        .expect("addressing the content");
+
+        assert!(!stored_local, "addressing stored the chunk locally");
+        assert!(!stored_durable, "addressing stored the chunk durably");
+        let described = store.get_metadata(partition, address).await;
+        assert!(
+            !described.is_ok_and(|described| {
+                described.match_made != crate::store_types::StoreMatch::MatchNone
+            }),
+            "addressing stored the chunk"
+        );
+    }
+
     #[tokio::test]
     async fn fastcdc_batch_handles_buffer_smaller_than_min_chunk() {
         // Tiny buffer — should be one chunk covering the whole thing.
@@ -706,7 +798,10 @@ mod tests {
         let dir = crate::test_util::TempDir::new("lore-storage-truncated-");
         let path = std::path::Path::new(dir.as_ref()).join("truncated");
         std::fs::write(&path, b"").expect("create empty file");
-        let (file, _) = crate::chunker::open_read(&path).await.expect("open file");
+        let (file, _) = crate::content::ContentSource::file(&path)
+            .open()
+            .await
+            .expect("open file");
         let store = crate::local::immutable_store::LocalImmutableStore::new(
             Some(std::path::PathBuf::from(dir.as_ref())),
             crate::local::immutable_store::ImmutableStoreSettings::default(),
@@ -720,9 +815,9 @@ mod tests {
             Context::from([1u8; 16]),
             file,
             4 * FRAGMENT_SIZE_THRESHOLD,
-            WriteOptions::default(),
-            true,
+            WriteOptions::default().hash_only(),
             None,
+            crate::write_tracker::WriteContext::none(),
             None,
         )
         .await

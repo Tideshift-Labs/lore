@@ -184,8 +184,6 @@ mod tests {
     use lore_storage::StoreError;
     use lore_storage::StoreGetData;
     use lore_storage::StoreObliterateStats;
-    use rand::distr::Alphanumeric;
-    use rand::distr::SampleString as _;
     use rand::random;
 
     use super::*;
@@ -264,8 +262,6 @@ mod tests {
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             None
         }
-
-        async fn compact_stop(self: Arc<Self>) {}
 
         fn max_query_batch(&self) -> Option<usize> {
             None
@@ -367,8 +363,6 @@ mod tests {
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
             None
         }
-
-        async fn compact_stop(self: Arc<Self>) {}
 
         fn max_query_batch(&self) -> Option<usize> {
             None
@@ -546,15 +540,8 @@ mod tests {
             .await;
     }
 
-    fn generate_tempdir() -> std::path::PathBuf {
-        let testname = format!(
-            "lore-copy-test-{}",
-            Alphanumeric.sample_string(&mut rand::rng(), 8).as_str()
-        );
-        let mut dir = std::env::temp_dir();
-        dir.push(testname);
-        std::fs::create_dir_all(&dir).expect("Create test directory");
-        std::fs::canonicalize(dir).expect("Canonicalize temporary test dir")
+    fn generate_tempdir() -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new("lore-copy-test-")
     }
 
     fn setup_test_execution() -> Arc<lore_revision::interface::ExecutionContext> {
@@ -579,13 +566,13 @@ mod tests {
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir),
+                    Some(dir_path),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -664,8 +651,6 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 
     /// R6 — two sequential Copy handler calls for the same source→dest pair both succeed.
@@ -679,13 +664,13 @@ mod tests {
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir),
+                    Some(dir_path),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -725,8 +710,6 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 
     /// R4 — Copy handler returns `FragmentNotFound` when the source fragment
@@ -740,13 +723,13 @@ mod tests {
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir),
+                    Some(dir_path),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -778,8 +761,6 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 
     /// R4 / R5 — Independent Copy handler calls fail or succeed independently;
@@ -796,13 +777,13 @@ mod tests {
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
         let dir = generate_tempdir();
-        let dir_cleanup = dir.clone();
+        let dir_path = dir.path().to_path_buf();
         let execution = setup_test_execution();
 
         LORE_CONTEXT
             .scope(execution, async move {
                 let store = lore_storage::LocalImmutableStore::new(
-                    Some(dir),
+                    Some(dir_path),
                     ImmutableStoreSettings::default(),
                 )
                 .await
@@ -872,7 +853,5 @@ mod tests {
                 }
             })
             .await;
-
-        let _ = std::fs::remove_dir_all(&dir_cleanup);
     }
 }

@@ -161,7 +161,7 @@ async fn link_unknown_retains_original_attempt_blocks_later_stage_and_recovers_t
         .await;
     let error = result.unwrap_err();
     let (parent, attempt) = original.unwrap();
-    assert_eq!(error.ffi_code(), 193);
+    assert_eq!(error.ffi_code(), 248);
     let attempt_text = attempt.to_string();
     assert_eq!(
         error.outcome_identity(),
@@ -344,7 +344,7 @@ async fn observer_body_failure_cannot_replace_unknown_attempt_with_decisive_erro
         .unwrap_err();
     let (parent, attempt) = original.unwrap();
     let text = attempt.to_string();
-    assert_eq!(error.ffi_code(), 193);
+    assert_eq!(error.ffi_code(), 248);
     assert_eq!(
         error.outcome_identity(),
         Some(("RevisionService.BranchPush", text.as_str()))

@@ -31,6 +31,7 @@ use crate::domain::MetadataCasOutcome;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -137,6 +138,7 @@ pub async fn handler(
             // metadata blob and pass this check.
             branch::metadata_hash(repository.clone(), branch_id)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     info!({BRANCH_ID} = %branch_id, ?err, "Branch metadata not found");
                     Status::not_found(format!("Branch {branch_id} not found"))
@@ -152,6 +154,7 @@ pub async fn handler(
             } else {
                 Metadata::deserialize(repository.clone(), expected)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         warn_error_to_status(&err, |err| {
                             Status::invalid_argument(format!(
@@ -163,6 +166,7 @@ pub async fn handler(
 
             let proposed_metadata = Metadata::deserialize(repository.clone(), updated)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::invalid_argument(format!(
@@ -282,6 +286,7 @@ pub async fn handler(
                     .write_mutable_store(&write_token)
                     .compare_and_swap(repository_id, metadata_key, expected, updated, key_type)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         warn!({BRANCH_ID} = %branch_id, ?err, "Branch metadata CAS failed");
                         warn_error_to_status(&err, |err| {

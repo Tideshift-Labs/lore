@@ -1,18 +1,24 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_error_set::prelude::*;
 
 use crate::errors::*;
+use crate::file::stage::is_path_under_layer_mask;
+use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
+use crate::layer;
 use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::node::INVALID_NODE;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
@@ -133,8 +139,25 @@ pub(crate) async fn dirty_relative_paths(
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
     let staged_revision = state_staged.revision();
 
-    let signature =
-        dirty_relative_paths_in(repository.clone(), state_current, state_staged, paths).await?;
+    let layers = layer::list(repository.clone())
+        .await
+        .forward::<DirtyError>("Failed to list layers")?;
+    let (parent_paths, layer_jobs) = route_layer_paths(&layers, paths);
+
+    let mask = (!layers.is_empty()).then(|| Arc::new(layer::target_paths(&layers)));
+
+    let signature = dirty_relative_paths_in_masked(
+        repository.clone(),
+        state_current,
+        state_staged,
+        parent_paths,
+        mask,
+    )
+    .await?;
+
+    for (layer_index, remains) in layer_jobs {
+        dirty_into_layer(repository.clone(), &layers[layer_index], &remains).await?;
+    }
 
     // Current is never anchored as staged, and matching either input state
     // means nothing was dirtied.
@@ -147,6 +170,122 @@ pub(crate) async fn dirty_relative_paths(
     Ok(signature)
 }
 
+/// Each `remain` names a path below the layer's mount, which the layer draws from the same offset
+/// below its source. The subtree is named by its node in each of the layer's trees, so the walk
+/// carries the mount path alone and the layer's own spelling never leaves this function.
+async fn dirty_into_layer(
+    repository: Arc<RepositoryContext>,
+    layer: &layer::Layer,
+    remains: &[RelativePath],
+) -> Result<(), DirtyError> {
+    let mount_root = repository.require_path()?.join(&layer.target_path);
+    let mount_path = RelativePath::new_from_initial_path(&layer.target_path)
+        .forward_with::<DirtyError, _>(|| {
+            format!("Invalid layer target path {}", layer.target_path)
+        })?;
+    let source_path = RelativePath::new_from_initial_path(&layer.source_path)
+        .forward_with::<DirtyError, _>(|| {
+            format!("Invalid layer source path {}", layer.source_path)
+        })?;
+
+    let layer_state = layer
+        .deserialize_current_and_staged(repository.clone())
+        .await
+        .forward::<DirtyError>("Failed to deserialize layer state")?;
+
+    let current_revision = layer_state.state_current.revision();
+
+    let walk = DirtyWalk {
+        repository: layer_state.repository.clone(),
+        state_current: layer_state.state_current.clone(),
+        state_staged: layer_state.state_staged.clone(),
+        stats: Arc::new(DirtyStats::default()),
+        mask: None,
+    };
+    let source_root = dirty_nodes_below(
+        &walk,
+        DirtyNodes {
+            current: ROOT_NODE,
+            staged: ROOT_NODE,
+        },
+        &source_path,
+    )
+    .await;
+    let force = execution_context().globals().force();
+
+    for remain in remains {
+        let path = mount_path.join(remain.as_str());
+        let absolute_path = remain.to_absolute_path(&mount_root);
+
+        let parent_states = walk.repository.filter.parent_exclusion_states(&path);
+        let (states, excluded) = walk.repository.filter.child_emit_excludes_unless_forced(
+            force,
+            parent_states,
+            &path,
+            true,
+            FilterMode::Full,
+        );
+        if excluded {
+            lore_trace!("Layer path excluded by filter: {}", path.as_str());
+            continue;
+        }
+
+        dirty_path(
+            &walk,
+            dirty_nodes_below(&walk, source_root, remain).await,
+            StagedParent::below(source_root.staged, remain.parent()),
+            &path,
+            &absolute_path,
+            DiskState::Unknown,
+            states,
+        )
+        .await?;
+    }
+
+    let stats = &walk.stats;
+    let state_staged = &walk.state_staged;
+
+    // A staged state never hashes equal to the committed current, so pinning an unmutated layer
+    // pins a staged revision with nothing in it, which makes `commit` abort with `NothingStaged`
+    // after the parent has already committed.
+    if !state_staged.is_dirty() {
+        lore_debug!("No dirty markers for layer at {}", layer.target_path);
+        return Ok(());
+    }
+
+    state_staged.reparent_onto(current_revision);
+
+    let token = repository
+        .try_write_token()
+        .expect("dirty requires write access");
+    let signature = state_staged
+        .serialize(layer_state.repository.clone(), token)
+        .await
+        .forward::<DirtyError>("Failed to serialize layer staged revision state")?;
+
+    if signature != layer.current && !execution_context().globals().dry_run() {
+        layer::store_layer_staged(
+            repository.clone(),
+            token,
+            layer.target_path.as_str(),
+            layer.repository,
+            signature,
+        )
+        .await
+        .forward::<DirtyError>("Failed to store layer staged state")?;
+    }
+
+    lore_debug!(
+        "Dirtied {} paths in layer at {}, staged {signature}",
+        stats.modify_count.load(Ordering::Relaxed)
+            + stats.add_count.load(Ordering::Relaxed)
+            + stats.delete_count.load(Ordering::Relaxed),
+        layer.target_path
+    );
+
+    Ok(())
+}
+
 /// Apply dirty markers against explicit states, reading and writing no
 /// anchors. Pass a clone of `state_current` as `state_staged` when nothing is
 /// staged yet. Returns `state_staged`'s own revision when no path produced a
@@ -157,32 +296,62 @@ pub(crate) async fn dirty_relative_paths_in(
     state_staged: Arc<State>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
-    let current_revision = state_current.revision();
+    dirty_relative_paths_in_masked(repository, state_current, state_staged, paths, None).await
+}
 
-    let stats = Arc::new(DirtyStats::default());
+/// [`dirty_relative_paths_in`] with the layer mount subtrees the parent walk must not descend
+/// into, so layer content is never enqueued as parent nodes.
+async fn dirty_relative_paths_in_masked(
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    paths: Vec<RelativePath>,
+    mask: Option<Arc<Vec<String>>>,
+) -> Result<Hash, DirtyError> {
+    let current_revision = state_current.revision();
+    let repository_path = repository.require_path()?.to_path_buf();
+
+    let walk = DirtyWalk {
+        repository: repository.clone(),
+        state_current: state_current.clone(),
+        state_staged: state_staged.clone(),
+        stats: Arc::new(DirtyStats::default()),
+        mask,
+    };
+    let root = DirtyNodes {
+        current: ROOT_NODE,
+        staged: ROOT_NODE,
+    };
     let force = execution_context().globals().force();
 
     for relative_path in paths.iter() {
-        if !force
-            && repository
-                .filter
-                .emit_excludes(relative_path, true, FilterMode::Full)
-        {
+        let parent_states = repository.filter.parent_exclusion_states(relative_path);
+        let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+            force,
+            parent_states,
+            relative_path,
+            true,
+            FilterMode::Full,
+        );
+        if excluded {
             lore_trace!("Path excluded by filter: {}", relative_path.as_str());
             continue;
         }
 
+        let absolute_path = relative_path.to_absolute_path(&repository_path);
         dirty_path(
-            repository.clone(),
-            state_current.clone(),
-            state_staged.clone(),
+            &walk,
+            dirty_nodes_below(&walk, root, relative_path).await,
+            StagedParent::below(root.staged, relative_path.parent()),
             relative_path,
+            &absolute_path,
             DiskState::Unknown,
-            stats.clone(),
+            states,
         )
         .await?;
     }
 
+    let stats = &walk.stats;
     let modify = stats.modify_count.load(Ordering::Relaxed);
     let add = stats.add_count.load(Ordering::Relaxed);
     let delete = stats.delete_count.load(Ordering::Relaxed);
@@ -225,16 +394,181 @@ enum DiskState {
     Unknown,
 }
 
-/// Process a single path and determine the dirty action.
-async fn dirty_path(
+/// The trees a dirty walk marks and what every step of it shares.
+///
+/// A walk starts where a path was resolved once, and reaches every node below from the one
+/// above, so nothing after that reads a path against a tree. The paths it carries are therefore
+/// the working-tree paths the filesystem and the filter answer for, whatever the tree being
+/// marked spells them as — which is what a layer drawn from somewhere other than its mount
+/// needs.
+struct DirtyWalk {
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
-    relative_path: &RelativePath,
-    disk_state: DiskState,
     stats: Arc<DirtyStats>,
+    mask: Option<Arc<Vec<String>>>,
+}
+
+/// The node a path names in each tree, `INVALID_NODE` where a tree holds none.
+#[derive(Clone, Copy)]
+struct DirtyNodes {
+    current: NodeID,
+    staged: NodeID,
+}
+
+impl DirtyNodes {
+    /// The child named `name` of each of these, for a walk stepping into a directory.
+    ///
+    /// A staged tree with nothing staged in it shares its storage with the current one, so both
+    /// sides answer alike and the lookup is taken once.
+    async fn child(self, walk: &DirtyWalk, name: &str) -> Self {
+        let name_hash = crate::hash::hash_string(name);
+        let current = subnode(
+            &walk.state_current,
+            &walk.repository,
+            self.current,
+            name_hash,
+        )
+        .await;
+        if self.current == self.staged && Arc::ptr_eq(&walk.state_current, &walk.state_staged) {
+            return DirtyNodes {
+                current,
+                staged: current,
+            };
+        }
+        DirtyNodes {
+            current,
+            staged: subnode(&walk.state_staged, &walk.repository, self.staged, name_hash).await,
+        }
+    }
+}
+
+/// The child of `parent` named by `name_hash`, or `INVALID_NODE` where it holds none.
+async fn subnode(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    parent: NodeID,
+    name_hash: u64,
+) -> NodeID {
+    if !parent.is_valid_or_root_node_id() {
+        return INVALID_NODE;
+    }
+    state
+        .find_subnode(repository.clone(), parent, name_hash)
+        .await
+        .unwrap_or(INVALID_NODE)
+}
+
+/// The node `names` reaches from `base` in each tree, walking down from where a caller resolved
+/// the base. An empty `names` is the base itself.
+async fn dirty_nodes_below(walk: &DirtyWalk, base: DirtyNodes, names: &RelativePath) -> DirtyNodes {
+    let mut nodes = base;
+    let mut remaining = names.clone();
+    while !remaining.is_empty() {
+        let name = remaining.pop_root();
+        nodes = nodes.child(walk, name).await;
+    }
+    nodes
+}
+
+/// Where the staged directory a path is a child of is reached from.
+///
+/// A walk descending a directory holds that directory's node and names nothing further. A path a
+/// caller names outright has ancestors nothing has visited, so `names` reaches from the node the
+/// walk starts at down to the path's parent.
+#[derive(Clone, Copy)]
+struct StagedParent<'a> {
+    base: NodeID,
+    names: Option<&'a str>,
+}
+
+impl<'a> StagedParent<'a> {
+    /// The directory node a walk is descending, which the staged tree already holds.
+    fn node(base: NodeID) -> Self {
+        StagedParent { base, names: None }
+    }
+
+    /// The node `names` reaches from `base`, for a path a caller named outright.
+    fn below(base: NodeID, names: Option<&'a str>) -> Self {
+        StagedParent { base, names }
+    }
+
+    /// The directory node, creating the ones that lead to it where the staged tree lacks them.
+    ///
+    /// Asked for only where something is added below it, so a path that turns out to need no
+    /// marker leaves no directory behind.
+    async fn resolve(self, walk: &DirtyWalk) -> Result<NodeID, DirtyError> {
+        match self.names.filter(|names| !names.is_empty()) {
+            Some(names) => ensure_dirty_parent_dirs(walk, self.base, names).await,
+            None => Ok(self.base),
+        }
+    }
+}
+
+/// The staged node of a directory on disk the walk is about to descend, adding it where the
+/// staged tree holds none.
+///
+/// `None` where the trees the walk marks do not reach it. The staged tree is derived from the
+/// current one, so a directory the current revision holds and the staged tree does not is one a
+/// link owns, and the repository behind that link marks its own.
+async fn dirty_directory_node(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    parent: StagedParent<'_>,
+    in_current_revision: bool,
+    relative_path: &RelativePath,
+) -> Result<Option<NodeID>, DirtyError> {
+    if nodes.staged.is_valid_or_root_node_id() {
+        return Ok(Some(nodes.staged));
+    }
+    if in_current_revision {
+        lore_trace!(
+            "Dirty directory is not held by the staged tree, not recursed: {}",
+            relative_path.as_str()
+        );
+        return Ok(None);
+    }
+
+    let parent = parent.resolve(walk).await?;
+    dirty_add_directory(walk, parent, relative_path.name(), relative_path.as_str())
+        .await
+        .map(Some)
+}
+
+/// Process a single path and determine the dirty action.
+///
+/// `nodes` names the path in each tree and `parent` reaches the staged directory it is a child
+/// of, both established by the caller. `absolute_path` is passed in rather than derived from
+/// `relative_path` because the working tree is the parent's while the trees marked can be a
+/// layer's.
+///
+/// `states` is the filter verdict the caller reached for `relative_path`, which
+/// the recursions below inherit instead of folding the path again per node.
+#[allow(clippy::too_many_arguments)]
+async fn dirty_path(
+    walk: &DirtyWalk,
+    nodes: DirtyNodes,
+    parent: StagedParent<'_>,
+    relative_path: &RelativePath,
+    absolute_path: &Path,
+    disk_state: DiskState,
+    states: FilterStates,
 ) -> Result<(), DirtyError> {
-    let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
+    let DirtyWalk {
+        repository,
+        state_staged,
+        stats,
+        mask,
+        ..
+    } = walk;
+
+    if let Some(mask) = mask.as_deref()
+        && is_path_under_layer_mask(relative_path.as_str(), mask)
+    {
+        lore_trace!("Path inside layer mount, not a parent path: {relative_path}");
+        return Ok(());
+    }
+
     let (exists_on_disk, is_dir) = match disk_state {
         DiskState::Present(metadata) => (true, metadata.is_dir()),
         DiskState::Absent => (false, false),
@@ -245,14 +579,14 @@ async fn dirty_path(
         }
     };
 
-    let staged_link = state_staged
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .ok();
+    let staged_node = nodes
+        .staged
+        .is_valid_or_root_node_id()
+        .then_some(nodes.staged);
 
-    let staged_pending_add = match &staged_link {
-        Some(link) => state_staged
-            .node(repository.clone(), link.node)
+    let staged_pending_add = match staged_node {
+        Some(node_id) => state_staged
+            .node(repository.clone(), node_id)
             .await
             .is_ok_and(|node| node.is_dirty_add()),
         None => false,
@@ -262,85 +596,63 @@ async fn dirty_path(
     // yet it shares storage with `state_current` and resolves there too; exclude
     // it so re-dirtying that node (e.g. recursing a dirtied committed parent)
     // keeps it an add rather than a modify.
-    let in_current_revision = !staged_pending_add
-        && state_current
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .is_ok();
+    let in_current_revision = !staged_pending_add && nodes.current.is_valid_or_root_node_id();
 
     if exists_on_disk && is_dir {
         // A new directory is itself an add; mark it so an empty one is tracked
         // even though the child recursion finds no files to anchor it.
-        if !in_current_revision && staged_link.is_none() {
-            dirty_add_directory(
-                repository.clone(),
-                state_staged.clone(),
-                relative_path,
-                stats.clone(),
-            )
-            .await?;
-        }
+        let Some(staged_node) =
+            dirty_directory_node(walk, nodes, parent, in_current_revision, relative_path).await?
+        else {
+            return Ok(());
+        };
         // Directory on disk -> recurse children
         lore_trace!("Dirty directory recurse: {}", relative_path.as_str());
         dirty_directory(
-            repository.clone(),
-            state_current.clone(),
-            state_staged.clone(),
+            walk,
+            DirtyNodes {
+                current: nodes.current,
+                staged: staged_node,
+            },
             relative_path,
-            &absolute_path,
-            stats.clone(),
+            absolute_path,
+            states,
         )
         .await?;
     } else if exists_on_disk && in_current_revision {
         // File on disk + in revision -> Modify
         lore_trace!("Dirty modify: {}", relative_path.as_str());
-        let link = staged_link
-            .or(state_current
-                .find_node_link(repository.clone(), relative_path.as_str())
-                .await
-                .ok())
-            .ok_or_else(|| DirtyError::internal("Node not found for dirty modify"))?;
+        let node_id = staged_node.unwrap_or(nodes.current);
 
         state_staged
-            .node_mark_dirty(repository.clone(), link.node, NodeFlags::DirtyModify, true)
+            .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyModify, true)
             .await
             .forward::<DirtyError>("Failed to mark node as dirty")?;
 
         stats.modify_count.fetch_add(1, Ordering::Relaxed);
     } else if exists_on_disk {
         // Skip when already tracked so a repeated dirty doesn't duplicate the node.
-        if staged_link.is_none() {
+        if staged_node.is_none() {
             lore_trace!("Dirty add: {}", relative_path.as_str());
-            dirty_add(
-                repository.clone(),
-                state_staged.clone(),
-                relative_path,
-                stats.clone(),
-            )
-            .await?;
+            let parent = parent.resolve(walk).await?;
+            dirty_add(walk, parent, relative_path.name()).await?;
         }
     } else if in_current_revision {
         // Not on disk + in revision -> Delete
         lore_trace!("Dirty delete: {}", relative_path.as_str());
-        let link = staged_link
-            .or(state_current
-                .find_node_link(repository.clone(), relative_path.as_str())
-                .await
-                .ok())
-            .ok_or_else(|| DirtyError::internal("Node not found for dirty delete"))?;
-
         dirty_delete(
             repository.clone(),
             state_staged.clone(),
-            link.node,
+            staged_node.unwrap_or(nodes.current),
             relative_path,
             stats.clone(),
+            states,
         )
         .await?;
-    } else if let Some(link) = staged_link {
+    } else if let Some(staged_node) = staged_node {
         // Not on disk + not in revision + exists in staged tree
         let node = state_staged
-            .node(repository.clone(), link.node)
+            .node(repository.clone(), staged_node)
             .await
             .forward::<DirtyError>("Failed to get staged node")?;
         if node.is_dirty_add() {
@@ -349,8 +661,8 @@ async fn dirty_path(
                 relative_path.as_str()
             );
             // Clear dirty flags so the node is no longer marked
-            let block_index = NodeBlock::index(link.node);
-            let node_index = Node::index(link.node);
+            let block_index = NodeBlock::index(staged_node);
+            let node_index = Node::index(staged_node);
             let block = state_staged
                 .block(repository.clone(), block_index)
                 .await
@@ -367,7 +679,7 @@ async fn dirty_path(
             crate::state::node_discard_patch(
                 state_staged.clone(),
                 repository.clone(),
-                link.node,
+                staged_node,
                 |_discarded_node_id, _flags| {},
             )
             .await
@@ -429,6 +741,7 @@ async fn dirty_delete(
     node_id: NodeID,
     path: &RelativePath,
     stats: Arc<DirtyStats>,
+    states: FilterStates,
 ) -> Result<(), DirtyError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -467,19 +780,21 @@ async fn dirty_delete(
                 .forward::<DirtyError>("Failed to get child name")?;
             let child_path = path.push_into_buf(&child_name).freeze();
 
-            if force
-                || !repository.filter.excludes(
-                    &child_path,
-                    child_node.is_directory(),
-                    FilterMode::Full,
-                )
-            {
+            let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
+                force,
+                states,
+                &child_path,
+                child_node.is_directory(),
+                FilterMode::Full,
+            );
+            if !excluded {
                 dirty_delete_recurse(
                     repository.clone(),
                     state.clone(),
                     child_node_id,
                     child_path,
                     stats.clone(),
+                    child_states,
                 )
                 .await?;
             } else {
@@ -505,102 +820,84 @@ fn dirty_delete_recurse(
     node_id: NodeID,
     path: RelativePath,
     stats: Arc<DirtyStats>,
+    states: FilterStates,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send>> {
-    Box::pin(async move { dirty_delete(repository, state, node_id, &path, stats).await })
+    Box::pin(async move { dirty_delete(repository, state, node_id, &path, stats, states).await })
 }
 
-/// Add a new file node to the staged tree with Dirty+Add.
-async fn dirty_add(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    relative_path: &RelativePath,
-    stats: Arc<DirtyStats>,
-) -> Result<(), DirtyError> {
-    // Find or create parent directory nodes along the path
-    let parent_path = relative_path.parent();
-    let file_name = relative_path.name();
-
-    let parent_node_id = if let Some(p) = parent_path {
-        if !p.is_empty() {
-            ensure_dirty_parent_dirs(repository.clone(), state.clone(), p).await?
-        } else {
-            ROOT_NODE
-        }
-    } else {
-        ROOT_NODE
-    };
-
+/// Add a new file node named `name` under `parent_staged` with Dirty+Add.
+async fn dirty_add(walk: &DirtyWalk, parent_staged: NodeID, name: &str) -> Result<(), DirtyError> {
     let node = Node {
         flags: NodeFlags::File.bits(),
-        name_hash: crate::hash::hash_string(file_name),
+        name_hash: crate::hash::hash_string(name),
         ..Default::default()
     };
 
-    let node_id = state
-        .node_add(repository.clone(), parent_node_id, node, file_name)
+    let node_id = walk
+        .state_staged
+        .node_add(walk.repository.clone(), parent_staged, node, name)
         .await
         .forward::<DirtyError>("Failed to add dirty node")?;
 
     // Mark with propagation so reused committed ancestors are marked up to root,
     // not left clean under a dirty child where a non-scan status walk prunes them.
-    state
-        .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyAdd, true)
+    walk.state_staged
+        .node_mark_dirty(walk.repository.clone(), node_id, NodeFlags::DirtyAdd, true)
         .await
         .forward::<DirtyError>("Failed to mark dirty add and propagate to parents")?;
 
-    stats.add_count.fetch_add(1, Ordering::Relaxed);
+    walk.stats.add_count.fetch_add(1, Ordering::Relaxed);
 
     Ok(())
 }
 
-/// Mark a new (untracked) directory node as Dirty+Add in the staged tree,
-/// creating any missing ancestor directory nodes. Mirrors `dirty_add` for the
-/// directory case so a brand-new EMPTY directory is tracked even when the child
-/// recursion finds no files to anchor it.
+/// Mark a new (untracked) directory node named `name` under `parent_staged` as Dirty+Add in the
+/// staged tree, answering with the node it added. Mirrors `dirty_add` for the directory case so a
+/// brand-new EMPTY directory is tracked even when the child recursion finds no files to anchor it.
 async fn dirty_add_directory(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    relative_path: &RelativePath,
-    stats: Arc<DirtyStats>,
-) -> Result<(), DirtyError> {
-    let parent_path = relative_path.parent();
-    let dir_name = relative_path.name();
-
-    let parent_node_id = match parent_path {
-        Some(p) if !p.is_empty() => {
-            ensure_dirty_parent_dirs(repository.clone(), state.clone(), p).await?
-        }
-        _ => ROOT_NODE,
-    };
+    walk: &DirtyWalk,
+    parent_staged: NodeID,
+    name: &str,
+    relative_path: &str,
+) -> Result<NodeID, DirtyError> {
+    lore_trace!("Dirty add directory: {relative_path}");
 
     let node = Node {
-        name_hash: crate::hash::hash_string(dir_name),
+        name_hash: crate::hash::hash_string(name),
         ..Default::default()
     };
-    let new_id = state
-        .node_add(repository.clone(), parent_node_id, node, dir_name)
+    let new_id = walk
+        .state_staged
+        .node_add(walk.repository.clone(), parent_staged, node, name)
         .await
         .forward::<DirtyError>("Failed to add dirty directory node")?;
 
-    state
-        .node_mark_dirty(repository.clone(), new_id, NodeFlags::DirtyAdd, true)
+    walk.state_staged
+        .node_mark_dirty(walk.repository.clone(), new_id, NodeFlags::DirtyAdd, true)
         .await
         .forward::<DirtyError>("Failed to mark dirty add directory and propagate to parents")?;
 
-    stats.add_count.fetch_add(1, Ordering::Relaxed);
-    Ok(())
+    walk.stats.add_count.fetch_add(1, Ordering::Relaxed);
+    Ok(new_id)
 }
 
-/// Walk path segments and create missing directory nodes, returning the
-/// final parent node ID. Existing directories are reused; missing ones are
-/// created with Dirty flag so they appear in the state tree.
-/// The caller is responsible for checking the full path against ignore filters.
+/// Walk the names below `base` and create the missing directory nodes, returning the final node.
+/// Existing directories are reused; missing ones are created with Dirty flag so they appear in
+/// the state tree.
+///
+/// Reaches only where a walk starts: every node below one it has visited is a child of a node it
+/// holds. The caller is responsible for checking the full path against ignore filters.
 async fn ensure_dirty_parent_dirs(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
+    walk: &DirtyWalk,
+    base: NodeID,
     parent_path: &str,
 ) -> Result<NodeID, DirtyError> {
-    let mut current_node = ROOT_NODE;
+    let DirtyWalk {
+        repository,
+        state_staged: state,
+        ..
+    } = walk;
+    let mut current_node = base;
 
     for segment in parent_path.split('/').filter(|s| !s.is_empty()) {
         let name_hash = crate::hash::hash_string(segment);
@@ -682,13 +979,17 @@ async fn mark_children_dirty_moved(
 }
 
 /// Recursively process a directory, marking each child as dirty based on filesystem state.
+///
+/// `nodes` names the directory in each tree, and every child is reached from it rather than
+/// resolved from `dir_path`, which is the working-tree path the filter and the listing answer for.
+///
+/// `states` is the filter verdict for `dir_path`, which each child steps from.
 fn dirty_directory<'a>(
-    repository: Arc<RepositoryContext>,
-    state_current: Arc<State>,
-    state_staged: Arc<State>,
+    walk: &'a DirtyWalk,
+    nodes: DirtyNodes,
     dir_path: &'a RelativePath,
     absolute_path: &'a std::path::Path,
-    stats: Arc<DirtyStats>,
+    states: FilterStates,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
         let mut entries = lore_io::IoDriver::global()
@@ -701,48 +1002,53 @@ fn dirty_directory<'a>(
                 )
             })?;
 
+        let force = execution_context().globals().force();
         while let Some(entry) = entries.next().await {
             let entry = entry.map_err(|e| {
                 DirtyError::internal_with_context(e, "Failed to read directory entry")
             })?;
-            let name_str = entry.file_name.to_string_lossy();
+            let name_str = crate::util::fs::entry_name(entry.file_name)
+                .forward::<DirtyError>("Unusable directory entry")?;
             let child_path = dir_path.push_into_buf(&name_str).freeze();
 
-            let force = execution_context().globals().force();
-            if !force
-                && repository
-                    .filter
-                    .emit_excludes(&child_path, true, FilterMode::Full)
-            {
+            let (child_states, excluded) =
+                walk.repository.filter.child_emit_excludes_unless_forced(
+                    force,
+                    states,
+                    &child_path,
+                    true,
+                    FilterMode::Full,
+                );
+            if excluded {
                 continue;
             }
 
             dirty_path(
-                repository.clone(),
-                state_current.clone(),
-                state_staged.clone(),
+                walk,
+                nodes.child(walk, name_str.as_str()).await,
+                StagedParent::node(nodes.staged),
                 &child_path,
+                &absolute_path.join(name_str.as_str()),
                 entry
                     .metadata
                     .map_or(DiskState::Unknown, DiskState::Present),
-                stats.clone(),
+                child_states,
             )
             .await?;
         }
 
         // Also check for files in the current revision that are NOT on disk (deletes)
-        if let Ok(dir_link) = state_current
-            .find_node_link(repository.clone(), dir_path.as_str())
-            .await
-        {
-            let children = state_current
-                .node_children(repository.clone(), dir_link.node)
+        if nodes.current.is_valid_or_root_node_id() {
+            let children = walk
+                .state_current
+                .node_children(walk.repository.clone(), nodes.current)
                 .await
                 .forward::<DirtyError>("Failed to get directory children")?;
 
             for &child_id in &children {
-                let child_name = state_current
-                    .node_name_clone(repository.clone(), child_id)
+                let child_name = walk
+                    .state_current
+                    .node_name_clone(walk.repository.clone(), child_id)
                     .await
                     .forward::<DirtyError>("Failed to get child name")?;
 
@@ -756,13 +1062,34 @@ fn dirty_directory<'a>(
                     .is_err()
                 {
                     let child_rel = child_path_buf.freeze();
-                    dirty_path(
-                        repository.clone(),
-                        state_current.clone(),
-                        state_staged.clone(),
+                    // Deletes are reported whatever the filter says, so the step
+                    // is taken only to carry the verdict into the recursion.
+                    let (child_states, _) = walk.repository.filter.child_excludes_tree(
+                        states,
                         &child_rel,
+                        true,
+                        FilterMode::Full,
+                    );
+                    // The current side is the child being enumerated, so only the staged side
+                    // is looked up.
+                    let child_nodes = DirtyNodes {
+                        current: child_id,
+                        staged: subnode(
+                            &walk.state_staged,
+                            &walk.repository,
+                            nodes.staged,
+                            crate::hash::hash_string(&child_name),
+                        )
+                        .await,
+                    };
+                    dirty_path(
+                        walk,
+                        child_nodes,
+                        StagedParent::node(nodes.staged),
+                        &child_rel,
+                        &child_abs,
                         DiskState::Absent,
-                        stats.clone(),
+                        child_states,
                     )
                     .await?;
                 }

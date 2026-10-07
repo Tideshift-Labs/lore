@@ -235,14 +235,17 @@ async fn run_cutover_checks_lock_fencing_preconditions_before_opening_any_connec
 // ─── 3. `lock_fencing_settings_preconditions` ──────────────────────────────
 
 fn valid_auth_settings() -> AuthSettings {
-    AuthSettings {
-        jwk: Some(lore_server::auth::jwk::JWKServiceSettings {
-            endpoint: "https://issuer.invalid/jwks".to_string(),
-        }),
-        jwt_audience: None,
-        jwt_issuer: Some("https://issuer.invalid".to_string()),
-        enforce_write_permission: true,
-    }
+    // Upstream v0.10.0 makes jwt_issuer/jwt_audience mandatory; resource_claim keeps the fork's
+    // GlobalGrants refusal out of the way. enforce_write_permission defaults to true.
+    let mut auth: AuthSettings = toml::from_str(
+        "jwt_issuer = 'https://issuer.invalid'\njwt_audience = ['lore']\nresource_claim = 'resources'",
+    )
+    .expect("auth fixture must parse");
+    auth.jwk = Some(lore_server::auth::jwk::JWKServiceSettings {
+        endpoint: Some("https://issuer.invalid/jwks".into()),
+    });
+    assert!(auth.enforce_write_permission);
+    auth
 }
 
 fn settings_with_valid_lock_fencing_preconditions() -> Settings {
@@ -306,7 +309,7 @@ fn lock_fencing_settings_preconditions_refuses_absent_jwt_issuer() {
         .auth
         .as_mut()
         .expect("fixture must carry auth")
-        .jwt_issuer = None;
+        .jwt_issuer = Vec::new();
     let error = lock_fencing_settings_preconditions(&settings)
         .expect_err("an absent jwt_issuer must be refused");
     let message = error.to_string().to_lowercase();
@@ -324,7 +327,7 @@ fn lock_fencing_settings_preconditions_refuses_empty_jwt_issuer() {
         .auth
         .as_mut()
         .expect("fixture must carry auth")
-        .jwt_issuer = Some(String::new());
+        .jwt_issuer = vec![String::new()];
     let error = lock_fencing_settings_preconditions(&settings)
         .expect_err("an empty jwt_issuer must be refused");
     let message = error.to_string().to_lowercase();

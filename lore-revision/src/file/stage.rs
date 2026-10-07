@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
@@ -10,6 +11,9 @@ use tokio::task::JoinSet;
 use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::hash::hash_string;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
@@ -37,10 +41,10 @@ use crate::stage::StageError;
 use crate::stage::StageOptions;
 use crate::stage::StageStats;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::DepthPath;
 use crate::util::path::RelativePath;
-use crate::util::path::RelativePathBuf;
 use crate::util::path::path_depth;
 use crate::util::path::shared_component_depth;
 
@@ -66,56 +70,49 @@ fn longest_ancestor<'a>(
     }
 }
 
-/// What [`stage::stage_filesystem_path`] takes as the point a walk starts from,
-/// and the path it covers below that point.
-struct WalkBase {
-    absolute: std::path::PathBuf,
-    relative: RelativePathBuf,
-    node: crate::node::NodeID,
-    path: RelativePath,
-    /// The prefix map, which is keyed by repository-relative paths and so only
-    /// answers for a walk that starts at the repository root.
+/// Where a walk has reached and where it is going: the point it starts from, what is left to
+/// consume below it, and the case resolutions it may use on the way.
+struct TreeWalkPath {
+    /// The point the walk starts from.
+    at: NodeMapping,
+    /// What is left of the target below `at`, which the walk consumes.
+    remainder: RelativePath,
+    /// Resolutions memoized for the shared ancestors, keyed from the repository root, so they
+    /// answer only for a walk that starts there.
     prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
 }
 
-impl WalkBase {
-    /// The whole of `path` walked from the repository root, for a path with no
-    /// pre-created ancestor.
-    fn from_root(
-        repository_root: &std::path::Path,
+/// Where the walk for a target starts. Neither answer is a failure: a target with no created
+/// ancestor is walked whole from the repository root.
+enum WalkStart {
+    /// The deepest ancestor that already has a node, spelled as the case resolved it, and what is
+    /// left of the target below it.
+    BelowAncestor {
         path: RelativePath,
-        prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
-    ) -> Self {
-        Self {
-            absolute: repository_root.to_path_buf(),
-            relative: RelativePathBuf::new(),
-            node: ROOT_NODE,
-            path,
-            prefixes,
-        }
-    }
+        node: crate::node::NodeID,
+        remainder: RelativePath,
+    },
+    /// The repository root, with the target untouched. The memo is keyed from that root, so this
+    /// is the only walk it answers for.
+    FromRoot(RelativePath),
 }
 
-/// Where the walk for `target` should start: the deepest ancestor that already
-/// has a node, with what is left of the target below it. `Err` returns `target`
-/// untouched, for one with no such ancestor, which has to start at the
-/// repository root.
+/// Where the walk for `target` starts and what is left of it below that point.
 ///
-/// The chain above the base is resolved once, while it is created, rather than
-/// once per target: a metadata syscall and a node lookup per component per
-/// target, for an answer that does not change.
+/// The chain above the start is resolved once, while it is created, rather than once per target:
+/// a metadata syscall and a node lookup per component per target, for an answer that does not
+/// change.
 ///
-/// Takes `target` by value so what is left below the base is a view of it
-/// rather than a second path built from its bytes.
-fn walk_base(
+/// Takes `target` by value so what is left below the start is a view of it rather than a second
+/// path built from its bytes.
+fn walk_start(
     mut target: RelativePath,
-    repository_root: &std::path::Path,
     ancestor_nodes: &AncestorNodes<'_>,
     prefixes: Option<&Arc<crate::util::fs::ResolvedPrefixes>>,
-) -> Result<WalkBase, RelativePath> {
-    let (absolute, relative, node, prefix_depth) = {
+) -> WalkStart {
+    let (path, node, prefix_depth) = {
         let Some((prefix, node)) = longest_ancestor(target.as_str(), ancestor_nodes) else {
-            return Err(target);
+            return WalkStart::FromRoot(target);
         };
         let prefix_depth = path_depth(prefix);
         // The case the prefix resolved to, and only when it resolved as a whole:
@@ -126,22 +123,18 @@ fn walk_base(
             .map_or(prefix, |(_, variation)| variation);
         // Already clean: a map value built from cleaned parts, so it needs no
         // validating or rewriting.
-        let relative = RelativePathBuf::new_from_clean_parts(variation, "");
         (
-            repository_root.join(variation),
-            relative,
+            RelativePath::new_from_clean_parts(variation, ""),
             node,
             prefix_depth,
         )
     };
     target.pop_root_repeat(prefix_depth);
-    Ok(WalkBase {
-        absolute,
-        relative,
+    WalkStart::BelowAncestor {
+        path,
         node,
-        path: target,
-        prefixes: None,
-    })
+        remainder: target,
+    }
 }
 
 /// Fold one finished pre-create into the ancestor node map, keeping the first
@@ -211,28 +204,26 @@ fn shared_ancestors(targets: &[RelativePath]) -> Vec<DepthPath> {
 /// Spawn a stage task into the given layer's repository covering `remain` (the
 /// path-suffix relative to the layer's mount). An empty `remain` stages the
 /// layer's whole subtree.
+#[allow(clippy::too_many_arguments)]
 async fn stage_into_single_layer(
+    operation: Arc<InstanceOperationImpl>,
     tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
     layer: &crate::layer::Layer,
     layer_state: &crate::layer::LayerState,
-    parent_repository: Arc<RepositoryContext>,
     remain: RelativePath,
     stats: Arc<StageStats>,
     options: StageOptions,
 ) -> Result<(), StageError> {
-    let absolute_path = parent_repository.require_path()?.join(&layer.target_path);
-
-    let layer_relative_path = RelativePathBuf::new_from_initial_path(&layer.source_path)
-        .forward::<StageError>("Failed to construct layer relative path")?;
+    let layer_source_path = RelativePath::new_from_initial_path(&layer.source_path)
+        .forward::<StageError>("Failed to construct layer source path")?;
+    let layer_mount_path = RelativePath::new_from_initial_path(&layer.target_path)
+        .forward::<StageError>("Failed to construct layer target path")?;
 
     // TODO(mjansson): If this has gone past a link into a subrepository, we
-    // need to stage the link node and upwards in the layer repository. The base
-    // below also stays relative to this repository while the walk runs against
-    // the linked one, so the filter and the delete lookup are handed a path the
-    // linked repository does not hold.
+    // need to stage the link node and upwards in the layer repository.
     let layer_staged_node = layer_state
         .state_staged
-        .find_node_link(layer_state.repository.clone(), layer_relative_path.as_str())
+        .find_node_link(layer_state.repository.clone(), layer_source_path.as_str())
         .await
         .forward::<StageError>("Failed to locate layer source base node")?;
 
@@ -254,21 +245,278 @@ async fn stage_into_single_layer(
     lore_spawn!(
         tasks,
         stage::stage_filesystem_path(
-            layer_repository,
-            layer_state_staged,
-            absolute_path,
-            layer_relative_path,
-            layer_staged_node.node,
+            operation,
+            NodeMapping {
+                repository: layer_repository,
+                state: layer_state_staged,
+                path: layer_mount_path,
+                node: layer_staged_node.node,
+            },
             remain,
             stats,
             options,
             None, // No link tracking in layer staging
             None, // Layers don't have nested layer mounts (no overlap)
             None, // Prefixes are resolved against the repository root, not a layer
+            None, // Node ids here index the layer's own state
         )
     );
 
     Ok(())
+}
+
+/// What every walk a stage spawns starts from: the trees it writes, the operation it
+/// runs under, and the masking and case resolution its targets share.
+struct StageWalk {
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    stats: Arc<StageStats>,
+    link_tracker: Arc<LinkTracker>,
+    global_mask: Option<Arc<Vec<String>>>,
+    prefixes: Option<Arc<crate::util::fs::ResolvedPrefixes>>,
+    options: StageOptions,
+}
+
+impl StageWalk {
+    /// The trees this walk writes, mapped at `node` and the path it stands at.
+    fn at(&self, path: RelativePath, node: crate::node::NodeID) -> NodeMapping {
+        NodeMapping {
+            repository: self.repository.clone(),
+            state: self.state.clone(),
+            path,
+            node,
+        }
+    }
+
+    /// Where a walk of `target` starts, and what it covers below that point, mapped into the
+    /// trees this walk writes.
+    fn walk(&self, target: RelativePath, ancestors: &AncestorNodes<'_>) -> TreeWalkPath {
+        match walk_start(target, ancestors, self.prefixes.as_ref()) {
+            WalkStart::BelowAncestor {
+                path,
+                node,
+                remainder,
+            } => TreeWalkPath {
+                at: self.at(path, node),
+                remainder,
+                prefixes: None,
+            },
+            WalkStart::FromRoot(remainder) => TreeWalkPath {
+                at: self.at(RelativePath::new(), ROOT_NODE),
+                remainder,
+                prefixes: self.prefixes.clone(),
+            },
+        }
+    }
+}
+
+/// Resolve the case of every directory the targets share once, so no target under them
+/// resolves it again.
+///
+/// Nothing is resolved under `Keep`, which stages by renaming the file system to match the
+/// tree: the first such rename would leave the map naming a directory that is no longer
+/// there.
+async fn resolve_shared_prefixes(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    shared_ancestors: &[DepthPath],
+    options: StageOptions,
+) -> Result<Option<Arc<crate::util::fs::ResolvedPrefixes>>, StageError> {
+    if matches!(options.case_change, stage::StageCaseChange::Keep) {
+        return Ok(None);
+    }
+
+    let prefixes = Arc::new(
+        crate::util::fs::resolve_prefixes(operation, repository.require_path()?, shared_ancestors)
+            .await,
+    );
+    lore_debug!(
+        "Resolved {} of {} shared ancestor prefixes",
+        prefixes.len(),
+        shared_ancestors.len()
+    );
+    Ok(Some(prefixes))
+}
+
+/// Create the node for every directory the targets share, a depth level at a time.
+///
+/// A level's nodes are the next level's parents, so each level is drained before the
+/// next starts. A pre-create in flight is allocating nodes and is drained even where an
+/// earlier one failed, rather than cancelled part way through.
+async fn precreate_shared_ancestors<'a>(
+    walk: &StageWalk,
+    shared_ancestors: &'a [DepthPath],
+) -> Result<AncestorNodes<'a>, StageError> {
+    let mut options = walk.options;
+    options.no_children = true;
+    let mut nodes = AncestorNodes::with_capacity(shared_ancestors.len());
+    let mut failure: Option<StageError> = None;
+
+    for level in shared_ancestors.chunk_by(|left, right| left.depth() == right.depth()) {
+        if failure.is_some() {
+            break;
+        }
+
+        let mut level_tasks: JoinSet<(usize, Result<crate::node::NodeLink, StageError>)> =
+            JoinSet::new();
+        for (index, ancestor) in level.iter().enumerate() {
+            if failure.is_some() {
+                break;
+            }
+            let walk_path = walk.walk(
+                RelativePath::new_from_clean_parts(ancestor.path(), ""),
+                &nodes,
+            );
+            let operation = walk.operation.clone();
+            let stats = walk.stats.clone();
+            let link_tracker = walk.link_tracker.clone();
+            let global_mask = walk.global_mask.clone();
+            lore_spawn!(level_tasks, async move {
+                let result = Box::pin(stage::stage_filesystem_path(
+                    operation,
+                    walk_path.at,
+                    walk_path.remainder,
+                    stats,
+                    options,
+                    Some(link_tracker),
+                    global_mask,
+                    walk_path.prefixes,
+                    None, // Pre-create stages no children, so it reaches no boundary
+                ))
+                .await;
+                (index, result)
+            });
+
+            while let Some(joined) = level_tasks.try_join_next() {
+                collect_precreate(joined, level, &mut nodes, &mut failure);
+            }
+            while level_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
+                && let Some(joined) = level_tasks.join_next().await
+            {
+                collect_precreate(joined, level, &mut nodes, &mut failure);
+            }
+        }
+        while let Some(joined) = level_tasks.join_next().await {
+            collect_precreate(joined, level, &mut nodes, &mut failure);
+        }
+    }
+
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(nodes),
+    }
+}
+
+/// Spawn a walk per target into `tasks`.
+///
+/// The shared ancestors exist by now and the targets are disjoint, so every remaining
+/// creation is single-writer or a distinct sibling, which `node_add` publishes with an
+/// atomic CAS prepend. Reports the first failure, having stopped spawning at it; what is
+/// already in flight is the caller's to drain.
+async fn spawn_target_walks(
+    walk: &StageWalk,
+    antichain: Vec<RelativePath>,
+    ancestors: &AncestorNodes<'_>,
+    discards: &Arc<Mutex<Vec<crate::node::NodeID>>>,
+    tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
+) -> Option<StageError> {
+    let mut failure = None;
+    for target in antichain {
+        let walk_path = walk.walk(target, ancestors);
+        lore_spawn!(
+            tasks,
+            stage::stage_filesystem_path(
+                walk.operation.clone(),
+                walk_path.at,
+                walk_path.remainder,
+                walk.stats.clone(),
+                walk.options,
+                Some(walk.link_tracker.clone()),
+                walk.global_mask.clone(),
+                walk_path.prefixes,
+                Some(discards.clone()),
+            )
+        );
+        if let Err(err) = lore_limit_drain_tasks!(
+            tasks,
+            MAX_CONCURRENT_TREE_TASKS,
+            StageError::internal("Failed to join task")
+        ) {
+            failure = failure.or(Some(err));
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+    failure
+}
+
+/// Spawn a walk per targeted layer into `tasks`, reporting the first failure as
+/// [`spawn_target_walks`] does. Layer jobs run against their own separate states.
+async fn spawn_layer_walks(
+    walk: &StageWalk,
+    layers: &[(crate::layer::Layer, crate::layer::LayerState)],
+    layer_paths: Vec<(usize, RelativePath)>,
+    tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
+) -> Option<StageError> {
+    let mut failure = None;
+    for (layer_index, remain) in layer_paths {
+        let (layer, layer_state) = &layers[layer_index];
+        if let Err(err) = stage_into_single_layer(
+            walk.operation.clone(),
+            tasks,
+            layer,
+            layer_state,
+            remain,
+            walk.stats.clone(),
+            walk.options,
+        )
+        .await
+        {
+            failure = Some(err);
+            break;
+        }
+        if let Err(err) = lore_limit_drain_tasks!(
+            tasks,
+            MAX_CONCURRENT_TREE_TASKS,
+            StageError::internal("Failed to join task")
+        ) {
+            failure = failure.or(Some(err));
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+    failure
+}
+
+/// Drain every spawned walk, reporting progress while they run. The first failure wins,
+/// `failure` included, so a spawn that stopped early is reported ahead of a join.
+async fn drain_walks(
+    tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
+    stats: &Arc<StageStats>,
+    ticker: &mut tokio::time::Interval,
+    mut failure: Option<StageError>,
+) -> Option<StageError> {
+    while !tasks.is_empty() {
+        tokio::select! {
+            _ = ticker.tick() => {
+                event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
+                    count: LoreFileStageCountData::new(stats.clone()),
+                }).send();
+            },
+            result = tasks.join_next() => {
+                if let Some(result) = result {
+                    failure = failure.or(result
+                        .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
+                        .flatten()
+                        .err());
+                }
+            }
+        }
+    }
+    failure
 }
 
 /// Normalize a path as given into one relative to the repository root.
@@ -370,20 +618,13 @@ pub(crate) async fn stage_state(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
     let link_tracker = LinkTracker::new();
+    let discards: Arc<Mutex<Vec<crate::node::NodeID>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Every layer mount is staged by its own task, never the parent walk, so
     // masking every layer subtree on every main-repo walk is correct: an entry
     // not under a given target is never reached anyway.
-    let global_mask: Option<Arc<Vec<String>>> = if layers.is_empty() {
-        None
-    } else {
-        Some(Arc::new(
-            layers
-                .iter()
-                .map(|(layer, _)| layer.target_path.clone())
-                .collect(),
-        ))
-    };
+    let global_mask: Option<Arc<Vec<String>>> = (!layers.is_empty())
+        .then(|| Arc::new(layer::target_paths(layers.iter().map(|(layer, _)| layer))));
     let layer_target_refs: Vec<&str> = global_mask
         .as_deref()
         .map(|paths| paths.iter().map(String::as_str).collect())
@@ -407,196 +648,51 @@ pub(crate) async fn stage_state(
     let shared_ancestors = shared_ancestors(&antichain);
     let precreate_count = shared_ancestors.len();
 
-    // Resolve the case of those directories once, so no target under them
-    // resolves them again. Not under `Keep`, which stages by renaming the file
-    // system to match the tree - the first such rename would leave the map
-    // naming a directory that is no longer there.
-    let prefixes = if matches!(options.case_change, stage::StageCaseChange::Keep) {
-        None
-    } else {
-        let prefixes = Arc::new(
-            crate::util::fs::resolve_prefixes(repository.require_path()?, &shared_ancestors).await,
-        );
-        lore_debug!(
-            "Resolved {} of {} shared ancestor prefixes",
-            prefixes.len(),
-            precreate_count
-        );
-        Some(prefixes)
-    };
-
-    let mut precreate_options = options;
-    precreate_options.no_children = true;
-    let repository_root = repository.require_path()?.to_path_buf();
-    // Node of each shared ancestor as it is created, so the next level starts
-    // from its parent instead of resolving the chain above it again.
-    let mut ancestor_nodes = AncestorNodes::with_capacity(shared_ancestors.len());
-    let mut precreate_failure: Option<StageError> = None;
-
-    for level in shared_ancestors.chunk_by(|left, right| left.depth() == right.depth()) {
-        if precreate_failure.is_some() {
-            break;
-        }
-
-        let mut level_tasks: JoinSet<(usize, Result<crate::node::NodeLink, StageError>)> =
-            JoinSet::new();
-        for (index, ancestor) in level.iter().enumerate() {
-            if precreate_failure.is_some() {
-                break;
-            }
-            let ancestor = RelativePath::new_from_clean_parts(ancestor.path(), "");
-            let base = walk_base(
-                ancestor,
-                repository_root.as_path(),
-                &ancestor_nodes,
-                prefixes.as_ref(),
-            );
-            let base = base.unwrap_or_else(|ancestor| {
-                WalkBase::from_root(repository_root.as_path(), ancestor, prefixes.clone())
-            });
-            let repository = repository.clone();
-            let state = state.clone();
-            let stats = stats.clone();
-            let link_tracker = link_tracker.clone();
-            let global_mask = global_mask.clone();
-            lore_spawn!(level_tasks, async move {
-                let result = stage::stage_filesystem_path(
-                    repository,
-                    state,
-                    base.absolute,
-                    base.relative,
-                    base.node,
-                    base.path,
-                    stats,
-                    precreate_options,
-                    Some(link_tracker),
-                    global_mask,
-                    base.prefixes,
-                )
-                .await;
-                (index, result)
-            });
-
-            while let Some(joined) = level_tasks.try_join_next() {
-                collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
-            }
-            while level_tasks.len() >= MAX_CONCURRENT_TREE_TASKS
-                && let Some(joined) = level_tasks.join_next().await
-            {
-                collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
-            }
-        }
-        // Drained even on failure: a pre-create in flight is allocating nodes and
-        // must not be cancelled part way through.
-        while let Some(joined) = level_tasks.join_next().await {
-            collect_precreate(joined, level, &mut ancestor_nodes, &mut precreate_failure);
-        }
-    }
-    if let Some(err) = precreate_failure {
-        return Err(err);
-    }
-
-    // Shared ancestors now exist and the targets are disjoint, so every remaining
-    // creation is single-writer or a distinct sibling, which `node_add` publishes
-    // with an atomic CAS prepend. Layer jobs run against their own separate states.
-    let mut failure = None;
-    let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
-
-    for target in antichain {
-        let base = walk_base(
-            target,
-            repository_root.as_path(),
-            &ancestor_nodes,
-            prefixes.as_ref(),
-        );
-        let base = base.unwrap_or_else(|target| {
-            WalkBase::from_root(repository_root.as_path(), target, prefixes.clone())
-        });
-        lore_spawn!(
-            tasks,
-            stage::stage_filesystem_path(
-                repository.clone(),
-                state.clone(),
-                base.absolute,
-                base.relative,
-                base.node,
-                base.path,
-                stats.clone(),
-                options,
-                Some(link_tracker.clone()),
-                global_mask.clone(),
-                base.prefixes,
-            )
-        );
-        if let Err(err) = lore_limit_drain_tasks!(
-            tasks,
-            MAX_CONCURRENT_TREE_TASKS,
-            StageError::internal("Failed to join task")
-        ) {
-            failure = failure.or(Some(err));
-        }
-        if failure.is_some() {
-            break;
-        }
-    }
     let main_count = antichain_len + precreate_count;
-
     // A layer may be targeted by several paths; serialize each only once.
     let staged_layers: std::collections::BTreeSet<usize> = layer_paths
         .iter()
         .map(|(layer_index, _)| *layer_index)
         .collect();
 
-    if failure.is_none() {
-        for (layer_index, remain) in layer_paths {
-            let (layer, layer_state) = &layers[layer_index];
-            if let Err(err) = stage_into_single_layer(
-                &mut tasks,
-                layer,
-                layer_state,
-                repository.clone(),
-                remain,
-                stats.clone(),
-                options,
-            )
-            .await
-            {
-                failure = Some(err);
-                break;
-            }
-            if let Err(err) = lore_limit_drain_tasks!(
-                tasks,
-                MAX_CONCURRENT_TREE_TASKS,
-                StageError::internal("Failed to join task")
-            ) {
-                failure = failure.or(Some(err));
-            }
-            if failure.is_some() {
-                break;
-            }
-        }
-    }
+    // One filesystem operation covers the whole stage: a layer or link at a subpath
+    // is a subtree of the same filesystem and takes the operation its parent holds.
+    with_operation(repository.file_system(), true, async |operation| {
+        let walk = StageWalk {
+            prefixes: resolve_shared_prefixes(&operation, &repository, &shared_ancestors, options)
+                .await?,
+            operation,
+            repository: repository.clone(),
+            state: state.clone(),
+            stats: stats.clone(),
+            link_tracker: link_tracker.clone(),
+            global_mask: global_mask.clone(),
+            options,
+        };
 
-    while !tasks.is_empty() {
-        tokio::select! {
-            _ = ticker.tick() => {
-                event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
-                    count: LoreFileStageCountData::new(stats.clone()),
-                }).send();
-            },
-            result = tasks.join_next() => {
-                if let Some(result) = result {
-                    failure = failure.or(result
-                        .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
-                        .flatten()
-                        .err());
-                }
-            }
+        let ancestors = precreate_shared_ancestors(&walk, &shared_ancestors).await?;
+
+        let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
+        let mut failure =
+            spawn_target_walks(&walk, antichain, &ancestors, &discards, &mut tasks).await;
+        if failure.is_none() {
+            failure = spawn_layer_walks(&walk, &layers, layer_paths, &mut tasks).await;
         }
-    }
-    if let Some(err) = failure {
-        return Err(err);
-    }
+        match drain_walks(&mut tasks, &stats, &mut ticker, failure).await {
+            Some(err) => Err(err),
+            None => Ok::<(), StageError>(()),
+        }
+    })
+    .await?;
+
+    let queued = discards
+        .lock()
+        .map(|mut queued| std::mem::take(&mut *queued))
+        .unwrap_or_default();
+    let discarded = !queued.is_empty();
+    state::apply_pending_discards(state.clone(), repository.clone(), queued)
+        .await
+        .forward::<StageError>("Failed to discard nested repository entries")?;
 
     let layer_staged: Vec<_> = staged_layers
         .into_iter()
@@ -607,7 +703,9 @@ pub(crate) async fn stage_state(
     let total_count = count.total_count;
     event::LoreEvent::FileStageEnd(LoreFileStageEndEventData { count }).send();
 
-    if total_count == 0 {
+    // A discard stages nothing and so raises no count, but it does mutate the
+    // tree, and the mutation is only kept if the state is serialized below.
+    if total_count == 0 && !discarded {
         return Ok(state.revision());
     }
 
@@ -651,9 +749,11 @@ pub(crate) async fn stage_state(
 
             if signature != current_revision {
                 staged_revision = signature;
-                crate::instance::store_staged_anchor(&repository, signature)
-                    .await
-                    .forward::<StageError>("Failed to serialize staged anchor")?;
+                if !execution_context().globals().dry_run() {
+                    crate::instance::store_staged_anchor(&repository, signature)
+                        .await
+                        .forward::<StageError>("Failed to serialize staged anchor")?;
+                }
             }
 
             event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
@@ -694,7 +794,7 @@ pub(crate) async fn stage_state(
             .await
             .forward::<StageError>("Failed to serialize staged revision state")?;
 
-        if signature != layer.current {
+        if signature != layer.current && !execution_context().globals().dry_run() {
             layer::store_layer_staged(
                 repository.clone(),
                 token,
@@ -891,8 +991,7 @@ async fn resolve_stage_target(
             let (resolved_repository, resolved_state) = if node_link.repository == repository.id {
                 (repository.clone(), state.clone())
             } else {
-                let linked_repository =
-                    Arc::new(repository.to_link_context(node_link.repository).await);
+                let linked_repository = repository.to_link_context(node_link.repository).await;
                 let linked_state =
                     State::deserialize(linked_repository.clone(), node_link.revision)
                         .await
@@ -917,11 +1016,7 @@ async fn resolve_stage_target(
 
         if let Some((resolved_state, resolved_repository, root_node, true)) = resolved {
             let dirty_paths = resolved_state
-                .collect_dirty_paths(
-                    resolved_repository,
-                    root_node,
-                    RelativePathBuf::new_from_clean_parts(relative_path.as_str(), ""),
-                )
+                .collect_dirty_paths(resolved_repository, root_node, relative_path.clone())
                 .await
                 .forward::<StageError>("Failed to collect dirty paths")?;
             return Ok(ResolvedTarget::Multiple(dirty_paths));
@@ -986,12 +1081,58 @@ async fn mark_children_moved(
     mark_children_moved_recursive(repository, state, parent_node, move_flag).await
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Marks each of `paths` as merged, reporting the counts staged so far while one runs.
+///
+/// One ticker covers the whole run rather than one per path, so the progress reported is
+/// periodic in time rather than in paths.
+async fn stage_merge_paths(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state_stage: &Arc<State>,
+    state_merge: &Arc<State>,
+    paths: &LoreArray<LoreString>,
+    stats: &Arc<StageStats>,
+) -> Result<(), StageError> {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
+    for path in paths.as_slice() {
+        let Some(relative_path) = normalize_stage_path(repository, path).await else {
+            continue;
+        };
+
+        // TODO(mjansson): Layers
+
+        // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+        let mut task = lore_spawn!(stage::stage_merge_path(
+            operation.clone(),
+            repository.clone(),
+            state_stage.clone(),
+            state_merge.clone(),
+            relative_path.clone(),
+            stats.clone(),
+        ));
+
+        let result = loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
+                        count: LoreFileStageCountData::new(stats.clone()),
+                    }).send();
+                },
+                result = &mut task => {
+                    break result.map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?;
+                }
+            }
+        };
+
+        result?;
+    }
+    Ok(())
+}
+
 pub async fn stage_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
-    options: StageOptions,
 ) -> Result<Hash, StageError> {
     let (state_current, state_staged, _branch) =
         state::State::deserialize_current_and_staged(repository.clone())
@@ -1012,41 +1153,21 @@ pub async fn stage_merge(
     })
     .send();
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
-    for path in paths.as_slice() {
-        let Some(relative_path) = normalize_stage_path(&repository, path).await else {
-            continue;
-        };
-
-        // TODO(mjansson): Layers
-
-        lore_debug!("Stage merge options: {:?}", options);
-        let mut task = lore_spawn!(stage::stage_merge_path(
-            repository.clone(),
-            state_stage.clone(),
-            state_merge.clone(),
-            relative_path.clone(),
-            stats.clone(),
-            options,
-            None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-        ));
-
-        let result = loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
-                        count: LoreFileStageCountData::new(stats.clone()),
-                    }).send();
-                },
-                result = &mut task => {
-                    break result.map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?;
-                }
-            }
-        };
-
-        result?;
-    }
+    // One operation covers every path: one per path would freeze a filesystem per path.
+    // Nothing is written: the conflict is recorded in the staged state.
+    with_operation(repository.file_system(), false, async |operation| {
+        stage_merge_paths(
+            &operation,
+            &repository,
+            &state_stage,
+            &state_merge,
+            &paths,
+            &stats,
+        )
+        .await
+    })
+    .await?;
 
     // TODO(vri): UCS-17955 - Merging and conflict resolution for links
     // Serialize all staged links states recursively
@@ -1055,9 +1176,11 @@ pub async fn stage_merge(
         .serialize(repository.clone(), token)
         .await
         .forward::<StageError>("Failed to serialize staged revision state")?;
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<StageError>("Failed to serialize staged anchor")?;
+    if !execution_context().globals().dry_run() {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<StageError>("Failed to serialize staged anchor")?;
+    }
 
     event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
         repository: repository.id,
@@ -1068,6 +1191,10 @@ pub async fn stage_merge(
     Ok(signature)
 }
 
+/// Stages the move of `from_path` to `to_path`, which the working tree already holds moved.
+///
+/// One operation covers the move: measuring the target and staging the directory it lands in both
+/// read the working tree, and a filesystem holds one operation at a time.
 #[allow(clippy::too_many_arguments)]
 pub async fn stage_move(
     repository: Arc<RepositoryContext>,
@@ -1123,6 +1250,15 @@ pub async fn stage_move(
             "Path {from_path} does not exist in repository "
         )));
     }
+    if from_node_link.repository != repository.id {
+        // TODO(vri): UCS-18009 - Implement stage move for linked changes
+        // The lookup crossed a link, so the node it answers with is numbered by that
+        // repository's state and names nothing in this one. Everything below reads and
+        // relinks it here.
+        return Err(StageError::internal(
+            "Links not yet implemented, cannot perform actions in other repositories",
+        ));
+    }
 
     let from_node = state
         .node(repository.clone(), from_node_link.node)
@@ -1135,72 +1271,77 @@ pub async fn stage_move(
         .await
         .unwrap_or_default();
 
-    // Get target file/directory metadata
-    let to_absolute_path = to_path.to_absolute_path(repository.require_path()?);
-    let to_metadata = lore_io::IoDriver::global()
-        .metadata(to_absolute_path)
-        .await
-        .internal_with(|| format!("Path {to_path} does not exist in repository "))?;
-
-    if from_node.is_directory() && !to_metadata.is_dir() {
-        return Err(StageError::internal("Cannot move a directory to a file"));
-    }
-    if !from_node.is_directory() && to_metadata.is_dir() {
-        return Err(StageError::internal("Cannot move a file to a directory"));
-    }
-
     let stats = Arc::new(StageStats::default());
-
-    if to_node_link.is_valid() {
-        // Stage existing target node as deleted, it is being replaced by the source file
-        lore_debug!(
-            "Staging existing target node {} as deleted",
-            to_node_link.node
-        );
-        if to_node_link.repository != repository.id {
-            // TODO(vri): UCS-18009 - Implement stage move for linked changes
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
-
-        stage::stage_delete(
-            repository.clone(),
-            state.clone(),
-            to_node_link.node,
-            options.node_flags,
-            stats.clone(),
-            None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
-        )
-        .await?;
-    }
-
-    // Make sure the target parent node exist
-    let mut parent_path = to_path.clone();
-    parent_path.pop();
-    let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
-    lore_debug!(
-        "New parent node path: {}/ ({})",
-        parent_path,
-        parent_absolute_path.display()
-    );
 
     let mut parent_options = options;
     parent_options.no_children = true;
 
-    let parent_node_link = Box::pin(stage::stage_filesystem_path(
-        repository.clone(),
-        state.clone(),
-        repository.require_path()?.to_path_buf(),
-        RelativePathBuf::new(),
-        ROOT_NODE,
-        parent_path,
-        stats.clone(),
-        parent_options,
-        None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
-        None,
-        None, // No prefix map for a path resolved on its own
-    ))
+    let parent_node_link = with_operation(repository.file_system(), true, async |operation| {
+        let to_info = operation
+            .file_info(&to_path)
+            .await
+            .forward::<StageError>("Failed to read the move target")?;
+        if !to_info.exists() {
+            return Err(StageError::internal(format!(
+                "Path {to_path} does not exist in repository "
+            )));
+        }
+
+        if from_node.is_directory() && !to_info.is_dir() {
+            return Err(StageError::internal("Cannot move a directory to a file"));
+        }
+        if !from_node.is_directory() && to_info.is_dir() {
+            return Err(StageError::internal("Cannot move a file to a directory"));
+        }
+
+        if to_node_link.is_valid() {
+            // Stage existing target node as deleted, it is being replaced by the source file
+            lore_debug!(
+                "Staging existing target node {} as deleted",
+                to_node_link.node
+            );
+            if to_node_link.repository != repository.id {
+                // TODO(vri): UCS-18009 - Implement stage move for linked changes
+                return Err(StageError::internal(
+                    "Links not yet implemented, cannot perform actions in other repositories",
+                ));
+            }
+
+            stage::stage_delete(
+                repository.clone(),
+                state.clone(),
+                to_path.clone(),
+                to_node_link.node,
+                options.node_flags,
+                stats.clone(),
+                None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
+            )
+            .await?;
+        }
+
+        // Make sure the target parent node exist
+        let mut parent_path = to_path.clone();
+        parent_path.pop();
+        let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
+        lore_debug!(
+            "New parent node path: {}/ ({})",
+            parent_path,
+            parent_absolute_path.display()
+        );
+
+        Box::pin(stage::stage_filesystem_path(
+            operation,
+            NodeMapping::root(repository.clone(), state.clone()),
+            parent_path,
+            stats.clone(),
+            parent_options,
+            None, // TODO(vri): UCS-18009 - Implement stage move for linked changes
+            None,
+            None, // No prefix map for a path resolved on its own
+            None, // A move stages the parent alone, so it reaches no boundary
+        ))
+        .await
+    })
     .await?;
 
     let block_index = NodeBlock::index(from_node_link.node);
@@ -1434,9 +1575,11 @@ pub async fn stage_move(
         .serialize(repository.clone(), token)
         .await
         .forward::<StageError>("Failed to serialize staged revision state")?;
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<StageError>("Failed to serialize staged anchor")?;
+    if !execution_context().globals().dry_run() {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<StageError>("Failed to serialize staged anchor")?;
+    }
 
     event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
         repository: repository.id,
@@ -1520,6 +1663,64 @@ pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&st
             layer_indices: ancestor_indices,
         }
     }
+}
+
+/// Splits paths into those the parent repository owns and, per layer, the mount-relative
+/// suffixes that layer owns.
+///
+/// Layer content is deliberately absent from the parent's tree, so a path under a mount
+/// evaluated against the parent's states matches nothing at all.
+pub(crate) fn route_layer_paths(
+    layers: &[crate::layer::Layer],
+    paths: Vec<RelativePath>,
+) -> (Vec<RelativePath>, Vec<(usize, Vec<RelativePath>)>) {
+    if layers.is_empty() {
+        return (paths, Vec::new());
+    }
+
+    let targets: Vec<&str> = layers
+        .iter()
+        .map(|layer| layer.target_path.as_str())
+        .collect();
+
+    let mut parent_paths = Vec::new();
+    let mut remains_per_layer: Vec<Vec<RelativePath>> = vec![Vec::new(); layers.len()];
+
+    for path in paths {
+        match classify_stage_path(path.as_str(), &targets) {
+            LayerRoute::Inside {
+                layer_index,
+                remain,
+            } => remains_per_layer[layer_index].push(remain),
+            LayerRoute::AncestorOf { layer_indices } => {
+                parent_paths.push(path);
+                for layer_index in layer_indices {
+                    remains_per_layer[layer_index].push(RelativePath::new());
+                }
+            }
+            LayerRoute::Disjoint => parent_paths.push(path),
+        }
+    }
+
+    let layer_jobs = remains_per_layer
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut remains)| {
+            if remains.is_empty() {
+                return None;
+            }
+            // A mount root subsumes any suffix beneath it.
+            if remains.iter().any(RelativePath::is_empty) {
+                remains = vec![RelativePath::new()];
+            } else {
+                remains.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                remains.dedup_by(|a, b| a.as_str() == b.as_str());
+            }
+            Some((index, remains))
+        })
+        .collect();
+
+    (parent_paths, layer_jobs)
 }
 
 /// Returns true if `relative_path` is at or inside any of the masked subtree paths.
@@ -1749,98 +1950,85 @@ mod walk_base_tests {
         RelativePath::new_from_clean_parts(path, "")
     }
 
+    fn below_ancestor(start: WalkStart) -> (RelativePath, crate::node::NodeID, RelativePath) {
+        match start {
+            WalkStart::BelowAncestor {
+                path,
+                node,
+                remainder,
+            } => (path, node, remainder),
+            WalkStart::FromRoot(_) => panic!("an ancestor was created"),
+        }
+    }
+
     #[test]
-    fn walk_base_starts_at_that_ancestor_with_the_rest_below_it() {
-        let root = std::path::Path::new("/repo");
+    fn walk_start_starts_at_that_ancestor_with_the_rest_below_it() {
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
 
-        let base = walk_base(path("a/b/c"), root, &nodes, None).expect("an ancestor was created");
-        assert_eq!(base.absolute, root.join("a/b"));
-        assert_eq!(base.relative.as_str(), "a/b");
-        assert_eq!(base.node, NODE_AB);
-        assert_eq!(base.path.as_str(), "c");
-        assert!(
-            base.prefixes.is_none(),
-            "the map answers from the root only"
-        );
+        let (path_at, node, remainder) = below_ancestor(walk_start(path("a/b/c"), &nodes, None));
+        assert_eq!(path_at.as_str(), "a/b");
+        assert_eq!(node, NODE_AB);
+        assert_eq!(remainder.as_str(), "c");
 
-        let base = walk_base(path("a/x/y/z"), root, &nodes, None).expect("an ancestor was created");
-        assert_eq!(base.relative.as_str(), "a");
-        assert_eq!(base.node, NODE_A);
-        assert_eq!(base.path.as_str(), "x/y/z");
+        let (path_at, node, remainder) = below_ancestor(walk_start(path("a/x/y/z"), &nodes, None));
+        assert_eq!(path_at.as_str(), "a");
+        assert_eq!(node, NODE_A);
+        assert_eq!(remainder.as_str(), "x/y/z");
     }
 
     /// The remainder is a view of the target, so its lowercase form has to be
     /// advanced along with it rather than left naming the whole path.
     #[test]
-    fn walk_base_leaves_the_remainder_lowercased_from_the_base_down() {
-        let root = std::path::Path::new("/repo");
+    fn walk_start_leaves_the_remainder_lowercased_from_the_start_down() {
         let nodes = created(&[("Assets", NODE_A)]);
 
-        let base =
-            walk_base(path("Assets/Meshes/Rock"), root, &nodes, None).expect("one was created");
-        assert_eq!(base.path.as_str(), "Meshes/Rock");
-        assert_eq!(base.path.as_lowercase_str(), "meshes/rock");
+        let (_, _, remainder) =
+            below_ancestor(walk_start(path("Assets/Meshes/Rock"), &nodes, None));
+        assert_eq!(remainder.as_str(), "Meshes/Rock");
+        assert_eq!(remainder.as_lowercase_str(), "meshes/rock");
     }
 
     #[test]
-    fn walk_base_gives_the_target_back_when_no_ancestor_was_created() {
-        let root = std::path::Path::new("/repo");
+    fn walk_start_takes_the_whole_target_from_the_root_when_no_ancestor_was_created() {
         let nodes = created(&[("x", NODE_A)]);
 
-        let Err(returned) = walk_base(path("a/b"), root, &nodes, None) else {
+        let WalkStart::FromRoot(returned) = walk_start(path("a/b"), &nodes, None) else {
             panic!("no ancestor was created");
         };
         assert_eq!(returned.as_str(), "a/b", "the target comes back untouched");
 
-        assert!(walk_base(path("a"), root, &nodes, None).is_err());
-        assert!(walk_base(path("a"), root, &created(&[]), None).is_err());
+        assert!(matches!(
+            walk_start(path("a"), &nodes, None),
+            WalkStart::FromRoot(_)
+        ));
+        assert!(matches!(
+            walk_start(path("a"), &created(&[]), None),
+            WalkStart::FromRoot(_)
+        ));
     }
 
     #[test]
-    fn from_root_covers_the_whole_path_and_keeps_the_prefix_map() {
-        let root = std::path::Path::new("/repo");
-        let prefixes = resolved(&[("a", "A")]);
-
-        let base = WalkBase::from_root(
-            root,
-            RelativePath::new_from_clean_parts("a/b", ""),
-            Some(prefixes),
-        );
-        assert_eq!(base.absolute, root);
-        assert!(base.relative.is_empty());
-        assert_eq!(base.node, ROOT_NODE);
-        assert_eq!(base.path.as_str(), "a/b");
-        assert!(base.prefixes.is_some(), "a walk from the root can use it");
-    }
-
-    #[test]
-    fn walk_base_takes_the_case_the_prefix_resolved_to() {
-        let root = std::path::Path::new("/repo");
+    fn walk_start_takes_the_case_the_prefix_resolved_to() {
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
         let prefixes = resolved(&[("a", "A"), ("a/b", "A/B")]);
 
-        let base = walk_base(path("a/b/c"), root, &nodes, Some(&prefixes))
-            .expect("an ancestor was created");
-        assert_eq!(base.absolute, root.join("A/B"));
-        assert_eq!(base.relative.as_str(), "A/B");
-        assert_eq!(base.node, NODE_AB);
-        assert_eq!(base.path.as_str(), "c", "the remainder is not recased");
+        let (path_at, node, remainder) =
+            below_ancestor(walk_start(path("a/b/c"), &nodes, Some(&prefixes)));
+        assert_eq!(path_at.as_str(), "A/B");
+        assert_eq!(node, NODE_AB);
+        assert_eq!(remainder.as_str(), "c", "the remainder is not recased");
     }
 
     /// A prefix resolves as a whole or not at all: the map answers for the
     /// longest prefix it holds, and a shorter one answers for a shorter path.
     #[test]
-    fn walk_base_ignores_a_resolution_covering_only_part_of_the_prefix() {
-        let root = std::path::Path::new("/repo");
+    fn walk_start_ignores_a_resolution_covering_only_part_of_the_prefix() {
         let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
         let prefixes = resolved(&[("a", "A")]);
 
-        let base = walk_base(path("a/b/c"), root, &nodes, Some(&prefixes))
-            .expect("an ancestor was created");
-        assert_eq!(base.absolute, root.join("a/b"));
-        assert_eq!(base.relative.as_str(), "a/b");
-        assert_eq!(base.node, NODE_AB);
+        let (path_at, node, _) = below_ancestor(walk_start(path("a/b/c"), &nodes, Some(&prefixes)));
+        assert_eq!(path_at.as_str(), "a/b");
+        assert_eq!(node, NODE_AB);
     }
 }
 

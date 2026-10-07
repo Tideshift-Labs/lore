@@ -122,10 +122,13 @@ pub enum LoreCommand {
     RevisionSync(crate::revision::LoreRevisionSyncArgs),
     ServiceStart(crate::service::LoreServiceStartArgs),
     ServiceStop(crate::service::LoreServiceStopArgs),
+    ServiceSetExecutable(crate::service::LoreServiceSetExecutableArgs),
+    ServiceSetUseAutomatically(crate::service::LoreServiceSetUseAutomaticallyArgs),
     NotificationSubscribe(crate::notification::LoreNotificationSubscribeArgs),
     NotificationUnsubscribe(crate::notification::LoreNotificationUnsubscribeArgs),
     SharedStoreCreate(crate::shared_store::LoreSharedStoreCreateArgs),
     SharedStoreInfo(crate::shared_store::LoreSharedStoreInfoArgs),
+    SharedStoreList(crate::shared_store::LoreSharedStoreListArgs),
     SharedStoreSetUseAutomatically(crate::shared_store::LoreSharedStoreSetUseAutomaticallyArgs),
     StorageOpen(crate::storage::open::LoreStorageOpenArgs),
     StorageClose(crate::storage::close::LoreStorageCloseArgs),
@@ -163,6 +166,8 @@ pub enum LoreCommand {
     RevisionTreeCommit(crate::revision_tree::commit::LoreRevisionTreeCommitArgs),
     StorageGetResolved(crate::storage::get_resolved::LoreStorageGetResolvedArgs),
     StoragePutResolved(crate::storage::put_resolved::LoreStoragePutResolvedArgs),
+    StorageGetFileResolved(crate::storage::get_file_resolved::LoreStorageGetFileResolvedArgs),
+    StoragePutFileResolved(crate::storage::put_file_resolved::LoreStoragePutFileResolvedArgs),
     // Append wire variants to preserve existing bitcode discriminants.
     ManagedBranchPush(crate::branch::LoreManagedBranchPushArgs),
 }

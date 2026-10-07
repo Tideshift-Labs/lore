@@ -3271,7 +3271,9 @@ impl ImmutableStore for PostgresImmutableStore {
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
+    /// Nothing to stop: `evict` and `compact` above are no-ops, so this store
+    /// never runs a GC pass. Stated explicitly rather than inherited.
+    async fn stop_gc(self: Arc<Self>, _terminate: bool) {}
 
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())

@@ -22,6 +22,7 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -426,7 +427,7 @@ pub async fn handler_with_domain(
     let caller_context = CallerContext::from_original_request(&request)?;
     let authorization = crate::grpc::get_authorization_optional(request.extensions());
     let can_set_creator =
-        crate::grpc::is_owner_or_admin(request.extensions(), caller_context.repository_id);
+        crate::grpc::can_set_branch_creator(request.extensions(), caller_context.repository_id);
     let admitted = crate::domain::admit_at_entry(
         domain_context,
         request.metadata(),
@@ -626,6 +627,7 @@ pub async fn branch_create_implementation(
                 false,
             )
             .await
+            .filter_slow_down()?
             .map_err(|err| {
                 if err.is_branch_already_exists() {
                     Status::already_exists(err.to_string())
@@ -639,6 +641,9 @@ pub async fn branch_create_implementation(
                 .await;
             hook_dispatcher.spawn_post(HookPoint::BranchCreate, hook_ctx);
 
+            // no filter_slow_down()? usage here: the branch is already created,
+            // so these response reads must not return a retryable status — the
+            // retry can only fail with BranchAlreadyExists.
             let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
                 .await
                 .warn_map_err(|err| Status::internal(err.to_string()))?;
@@ -648,8 +653,13 @@ pub async fn branch_create_implementation(
 
             debug!({BRANCH_ID} = %branch_id, %name, "Created branch");
 
-            let response_branch =
-                build_branch(repository, branch_id, &metadata, metadata_hash, false).await?;
+            // no filter_slow_down()? usage here: the branch exists, so an
+            // unreadable latest must not fail a create that has already
+            // committed.
+            let latest = branch::load_latest(repository, branch_id)
+                .await
+                .unwrap_or_default();
+            let response_branch = build_branch(branch_id, &metadata, metadata_hash, false, latest);
 
             instrument_provider
                 .counter("num_branches_created")

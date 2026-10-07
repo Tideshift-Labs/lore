@@ -71,6 +71,9 @@ use lore_proto::rebac::VerifyRepositoryOperationAuthorizationResponse;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
 use lore_server::authnz::rebac::RepositoryOperationAuthorizationVerifier;
+use lore_server::authnz::repository_authorizer::RawToken;
+use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use lore_server::domain::DomainContext;
 use lore_server::domain::PLATFORM_METHOD_REPOSITORY_CREATE;
 use lore_server::grpc::domain_operation_metadata::AUTHN_BEARER_KEY;
@@ -148,7 +151,24 @@ fn authenticated_request<T>(
             .expect("ascii header"),
     );
     request.extensions_mut().insert(token.clone());
+    // Upstream v0.10.0's authorizer reads the verified token as claims plus raw bearer.
     request
+        .extensions_mut()
+        .insert(RawToken("wp120-test-authn-bearer".to_owned()));
+    request
+}
+
+/// The per-repository `resources` claim reader the fork's auth-ON configs select
+/// (`resource_claim = "resources"`), in its default `urc-{id}` / `urc-*` shape. Upstream v0.10.0
+/// routes `AdminLock`'s `migrate` check through it.
+fn claims_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+    Arc::new(ResourceGrantsAuthorizer::new(
+        "resources".to_string(),
+        "resource_id".to_string(),
+        None,
+        "urc-{id}".to_string(),
+        "urc-*".to_string(),
+    ))
 }
 
 async fn outbox_row_count(client: &Client, repository_id: &[u8]) -> i64 {
@@ -452,6 +472,7 @@ async fn armed_service(
         Arc::new(lock_store),
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
+        claims_authorizer(),
         Duration::from_secs(60),
         false,
     )
@@ -683,6 +704,7 @@ async fn force_unlock_with_no_fenced_coordinator_is_refused() {
         Arc::new(lock_store),
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
+        claims_authorizer(),
         Duration::from_secs(60),
         false,
     );
@@ -764,6 +786,7 @@ async fn unarmed_legacy_route_succeeds_and_appends_nothing() {
         Arc::new(lock_store),
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
+        claims_authorizer(),
         Duration::from_secs(60),
         false,
     );
@@ -901,6 +924,7 @@ async fn force_unlock_permission_check_precedes_fenced_routing_disclosure() {
         Arc::new(lock_store),
         Arc::new(NotificationSender::default()),
         Arc::new(HookDispatcher::empty()),
+        claims_authorizer(),
         Duration::from_secs(60),
         false,
     );

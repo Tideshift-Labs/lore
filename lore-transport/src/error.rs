@@ -251,6 +251,9 @@ pub(crate) fn answer_lost_code(error: &ProtocolError) -> Option<tonic::Code> {
     None
 }
 
+use crate::grpc::address_not_found_details;
+use crate::grpc::address_not_found_status;
+
 #[error_set(clone)]
 pub enum ProtocolError {
     Disconnected,
@@ -259,6 +262,7 @@ pub enum ProtocolError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,
@@ -342,6 +346,10 @@ impl From<tonic::Status> for ProtocolError {
             }
             tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
             tonic::Code::NotFound => ProtocolError::from(NotFound),
+            tonic::Code::FailedPrecondition => match address_not_found_details(&value) {
+                Some(error) => ProtocolError::from(error),
+                None => ProtocolError::internal_with_context(value, "remote rejected the request"),
+            },
             tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
             tonic::Code::OutOfRange => ProtocolError::from(Oversized {
                 context: value.message().to_string(),
@@ -507,6 +515,7 @@ impl From<ProtocolError> for tonic::Status {
             }
             ProtocolError::SlowDown(_) => tonic::Status::new(tonic::Code::ResourceExhausted, msg),
             ProtocolError::NotFound(_) => tonic::Status::new(tonic::Code::NotFound, msg),
+            ProtocolError::AddressNotFound(error) => address_not_found_status(&error, msg),
             ProtocolError::Oversized(_) => tonic::Status::new(tonic::Code::OutOfRange, msg),
             ProtocolError::Disconnected(_) | ProtocolError::Maintenance(_) => {
                 tonic::Status::new(tonic::Code::Unavailable, msg)

@@ -116,6 +116,9 @@ class PathExistChildrenLinkError(LoreException): ...
 class NestedLinkError(LoreException): ...
 
 
+class NestedRepositoryError(LoreException): ...
+
+
 class PathExistLinkError(LoreException): ...
 
 
@@ -149,6 +152,9 @@ class LinkNotFoundError(LoreException): ...
 class LinkPinDivergedError(LoreException): ...
 
 
+class OverlappingLinkError(LoreException): ...
+
+
 class NotALayerError(LoreException): ...
 
 
@@ -178,6 +184,9 @@ class NotSupportedError(LoreException):
     configured."""
 
 
+class SwfsOutsideServiceError(LoreException): ...
+
+
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     # Hoisted above every generic substring below, and anchored, on purpose.
     # `NotAuthenticated` now renders as `Not authenticated: <reason>` where the
@@ -202,6 +211,11 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
         re.compile(r"(?m)^(?:\x1b\[[0-9;]*m)*(?:\[Error\]\s*)?Not authenticated\b"),
         NotAuthenticatedError,
     ),
+    # A refused revision specifier carries "Failed to find revision" on its
+    # trace, which a pattern below matches, so the refusal is named here by the
+    # one string only it carries rather than by the generic "Operation not
+    # supported" further down.
+    ("partial revision hash signature", NotSupportedError),
     ("Unable to commit", CommitFailed),
     (
         "Target branch to merge into has a newer revision, merge target branch first",
@@ -244,6 +258,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Link path already has children", PathExistChildrenLinkError),
     ("Link path is already a link", PathExistLinkError),
     ("Nested link", NestedLinkError),
+    ("path is a nested repository", NestedRepositoryError),
     ("A shared store was supposed to exist at", MissingSharedStore),
     ("Invalid repository path", InvalidRepositoryPath),
     ("Loading the shared store for a repo with remote url", WrongSharedStoreRemote),
@@ -257,6 +272,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
     ("Link pin conflict at", LinkPinDivergedError),
+    ("overlaps the link already mounted at", OverlappingLinkError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),
@@ -267,6 +283,10 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     # path that mentions the failure mid-line. It sits at the tail so a generic
     # pattern above it wins on the rare output that contains both.
     ("Not authenticated", NotAuthenticatedError),
+    (
+        "Attempting to create an SWFS instance outside the service",
+        SwfsOutsideServiceError,
+    ),
 ]
 
 

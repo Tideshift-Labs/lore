@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
+use clap::ValueEnum;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreFileAction;
@@ -31,6 +32,7 @@ use lore::interface::LoreSharedStoreMode;
 use lore::interface::LoreString;
 use lore::repository;
 use lore::repository::LoreRepositoryDeleteArgs;
+use lore::repository::LoreVfsType;
 use lore::runtime;
 use parking_lot::Mutex;
 
@@ -108,11 +110,34 @@ pub struct RepositoryStatusArgs {
     targets: Option<String>,
 }
 
+/// Virtual File System type for repository operations.
+#[derive(ValueEnum, Clone, Copy, Default)]
+pub enum VfsType {
+    /// No virtual file system; files are materialized directly on disk.
+    #[default]
+    None,
+    /// Use whichever VFS system is preferred based on the user's system.
+    Default,
+    /// Use Epic's Split Write File System as the Virtual File System.
+    Swfs,
+}
+
+impl VfsType {
+    pub fn to_lore(self) -> LoreVfsType {
+        match self {
+            VfsType::None => LoreVfsType::None,
+            VfsType::Default => LoreVfsType::Default,
+            VfsType::Swfs => LoreVfsType::Swfs,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct RepositoryCreateArgs {
-    /// URL of repository
+    /// URL of repository. With --offline this is the repository name instead, and may
+    /// be omitted to name it after the current directory
     #[clap(value_name = "url")]
-    url: String,
+    url: Option<String>,
 
     /// Optional description of repository
     #[clap(long, value_name = "description")]
@@ -121,6 +146,10 @@ pub struct RepositoryCreateArgs {
     /// Optional ID of repository
     #[clap(long, value_name = "id")]
     id: Option<String>,
+
+    /// Virtual File System type. When not 'none', creates a VFS as the repository directory.
+    #[clap(long, value_enum, default_value = "none")]
+    vfs: VfsType,
 
     /// Use the shared store rather than create a local immutable store
     #[clap(long)]
@@ -157,13 +186,13 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     bare: bool,
 
-    /// Clone virtually using split-write filesystem
-    #[clap(long = "virtual", action)]
-    virtually: bool,
-
     /// Write directly to the destination file instead of write to a temporary file and move into place
     #[clap(long, action)]
     direct_file_write: bool,
+
+    /// Virtual File System type. When not 'none', creates a VFS as the repository directory.
+    #[clap(long, value_enum, default_value = "none")]
+    vfs: VfsType,
 
     /// Layer to add
     #[clap(long, value_name = "repository")]
@@ -208,7 +237,7 @@ pub struct RepositoryCloneArgs {
 
 #[derive(Args)]
 pub struct RepositoryDeleteArgs {
-    /// URL of repository
+    /// URL of repository, or a bare name or ID resolved against this repository's remote
     #[clap(value_name = "url")]
     url: String,
 }
@@ -376,7 +405,7 @@ pub struct RepositoryInstanceArgs {
 pub enum RepositoryInstanceCommands {
     /// List all registered instances for this repository
     List,
-    /// Remove stale instance entries
+    /// Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
     Prune,
 }
 
@@ -825,6 +854,14 @@ pub fn handle_repository_info(globals: LoreGlobalArgs, args: &RepositoryInfoArgs
                         anstyle::Reset
                     );
                 }
+                if !data.instance_id.is_zero() {
+                    println!(
+                        "{}Instance:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        data.instance_id.text_encoding()
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -860,25 +897,10 @@ pub fn handle_repository_list(globals: LoreGlobalArgs, args: &RepositoryListArgs
 }
 
 pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreateArgs) -> u8 {
-    // Check if we have a full URL or just a name
-    let url = if !args.url.contains("/") {
-        match std::env::var("LORE_REMOTE_URL") {
-            Ok(mut url) => {
-                url.push('/');
-                url.push_str(args.url.as_str());
-                url
-            }
-            // Offline/local create never connects to a remote, so a bare
-            // repository name is accepted as-is without a host name.
-            Err(_) if globals.offline() || globals.local() => args.url.clone(),
-            Err(_) => {
-                println!("Repository URL must include a host name");
-                return 1;
-            }
-        }
-    } else {
-        args.url.clone()
-    };
+    // Passed through as given. Whether an argument without a host is a repository name or
+    // a malformed URL depends on `--offline`, which the core resolves along with the rest
+    // of the globals, so there is nothing to decide here.
+    let url = args.url.clone().unwrap_or_default();
 
     let args = LoreRepositoryCreateArgs {
         repository_url: url.into(),
@@ -890,6 +912,7 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
             LoreSharedStoreMode::Inherit
         },
         shared_store_path: args.shared_store_path.as_ref().into(),
+        vfs: args.vfs.to_lore(),
     };
 
     let callback = output_formatter().unwrap_or(Some(
@@ -914,30 +937,30 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
 }
 
 pub fn handle_repository_delete(globals: LoreGlobalArgs, args: &RepositoryDeleteArgs) -> u8 {
-    // Check if we have a full URL or just a name
-    let url = if !args.url.contains("/") {
-        let Ok(mut url) = std::env::var("LORE_REMOTE_URL") else {
-            println!("Repository URL must include a host name");
-            return 1;
-        };
-        url.push('/');
-        url.push_str(args.url.as_str());
-        url
-    } else {
-        args.url.clone()
-    };
-    let repository_url = LoreString::from_str(url.as_str());
+    // Passed through as given: a full URL, or a bare name or ID that the core resolves
+    // against this working copy's remote.
+    let repository_url = LoreString::from_str(args.url.as_str());
 
     let args = LoreRepositoryDeleteArgs { repository_url };
+
+    let dry_run = globals.dry_run();
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(data) if data.status == 0 => {
-                println!(
-                    "{}Repository deleted successfully{}",
-                    CommonStyles::SUCCESS,
-                    anstyle::Reset
-                );
+                if dry_run {
+                    println!(
+                        "{}Repository would be deleted{}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset
+                    );
+                } else {
+                    println!(
+                        "{}Repository deleted successfully{}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -960,19 +983,12 @@ fn format_clone_retain_replace(retain: u64, replace: u64) -> String {
 
 #[allow(clippy::unnecessary_unwrap)]
 pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneArgs) -> u8 {
-    // Check if we have a full URL or just a name
-    let repository_url = if !args.url.contains("/") {
-        let Ok(mut url) = std::env::var("LORE_REMOTE_URL") else {
-            println!("Repository URL must include a host name");
-            return 1;
-        };
-        url.push('/');
-        url.push_str(args.url.as_str());
-        url
-    } else {
-        args.url.clone()
-    };
-    let repository_url = LoreString::from(repository_url);
+    // Cloning fetches from a server, so the URL has to carry the host.
+    if !args.url.contains('/') {
+        println!("Repository URL must include a host name");
+        return 1;
+    }
+    let repository_url = LoreString::from(args.url.clone());
 
     let mut globals = globals;
     if let Some(path) = args.path.as_deref() {
@@ -996,8 +1012,8 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         revision,
         view: args.view.as_ref().into(),
         bare: args.bare.into(),
-        virtually: args.virtually.into(),
         direct_file_write: args.direct_file_write.into(),
+        vfs: args.vfs.to_lore(),
         layer: args.layer.as_ref().into(),
         layer_metadata: args.layer_metadata.as_ref().into(),
         prefetch: args.prefetch.as_ref().into(),
@@ -1064,19 +1080,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
                 );
                 println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
             }
-            LoreEvent::RevisionResolve(data) => {
-                if data.revision_number != 0 {
-                    println!(
-                        "Resolving revision number {} on branch {}",
-                        data.revision_number, data.branch
-                    );
-                } else {
-                    println!(
-                        "Resolving revision partial hash signature {}",
-                        data.revision
-                    );
-                }
-            }
+            LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1699,6 +1703,18 @@ pub fn handle_repository_commands(cmd: &RepositoryCommands, globals: LoreGlobalA
     }
 }
 
+/// Suffix for the `stale` value of a `RepositoryInstance` event: 1 is a path
+/// that no longer exists, 2 a path whose repository now names another instance,
+/// 3 a path holding no checkout.
+fn instance_stale_suffix(stale: u8) -> &'static str {
+    match stale {
+        0 => "",
+        2 => " (superseded)",
+        3 => " (no checkout)",
+        _ => " (stale)",
+    }
+}
+
 fn handle_repository_instance_list(globals: LoreGlobalArgs) -> u8 {
     let args = lore::repository::LoreRepositoryInstanceListArgs {};
 
@@ -1706,10 +1722,13 @@ fn handle_repository_instance_list(globals: LoreGlobalArgs) -> u8 {
         (Box::new(|event: &LoreEvent| match event {
             LoreEvent::Complete(_) => {}
             LoreEvent::RepositoryInstance(data) => {
-                let stale = if data.stale != 0 { " (stale)" } else { "" };
                 println!(
                     "{} {} {} {}{}",
-                    data.instance_id, data.path, data.branch_name, data.revision, stale
+                    data.instance_id,
+                    data.path,
+                    data.branch_name,
+                    data.revision,
+                    instance_stale_suffix(data.stale)
                 );
             }
             LoreEvent::Maintenance(data) => {
@@ -1740,7 +1759,12 @@ fn handle_repository_instance_prune(globals: LoreGlobalArgs) -> u8 {
             }
             LoreEvent::RepositoryInstance(data) => {
                 pruned_count_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                println!("  Pruned {} {}", data.instance_id, data.path);
+                println!(
+                    "  Pruned {} {}{}",
+                    data.instance_id,
+                    data.path,
+                    instance_stale_suffix(data.stale)
+                );
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

@@ -26,7 +26,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.9.1-nightly"
+version = "0.10.1-nightly"
 
 [workspace.dependencies]
 lore = { path = "lore" }
@@ -67,7 +67,7 @@ config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
-diffy = "0.4.2"
+diffy = "0.5.2"
 directories = "6.0.0"
 enum_dispatch = "0.3.13"
 tracing-appender = "0.2.3"
@@ -106,6 +106,7 @@ quinn = { version = "0.11.9", default-features = false, features = ["runtime-tok
 quinn-proto = { version = "=0.11.13", default-features = false }
 quote = "1.0.40"
 rand = "0.9.2"
+tempfile = "3.21"
 regex = "1"
 rcgen = "0.14.4"
 reqwest = { version = "0.12.23", default-features = false, features = [
@@ -223,3 +224,6 @@ debug-assertions = false
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
+# Fixes a `**` backtracking defect that made the filter silently under-exclude;
+# see vendor/glob-match/Cargo.toml.
+glob-match = { path = "vendor/glob-match" }

@@ -29,6 +29,7 @@ use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -103,6 +104,7 @@ pub async fn handler(
         .scope(execution, async move {
             let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
                 .await
+                .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
@@ -133,16 +135,22 @@ pub async fn handler(
                 RepositoryId::default(),
             )
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to delete repository name mapping: {err}"))
             })?;
 
             repository::metadata_store_hash(repository.clone(), Hash::default())
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to delete repository metadata: {err}"))
                 })?;
 
+            // no filter_slow_down()? usage here: the repository record is
+            // already torn down above, so this purge is past the point of no
+            // return. A retryable status would invite a retry that only finds
+            // the repository gone, leaving these keys orphaned.
             if let Ok(mut branch_stream) = branch::list(repository.clone()).await {
                 let mut branch_list = vec![];
                 while let Some(branch) = branch_stream.next().await {

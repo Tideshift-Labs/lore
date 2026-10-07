@@ -290,7 +290,9 @@ def test_dirty_move_of_uncommitted_source_stays_add(new_lore_repo):
         "--scan must not invent move provenance, "
         f"got fromPath={scanned_entry.get('fromPath')!r}"
     )
-    assert scanned_entry["flagDirty"] is True, "new.txt should stay flagDirty after scan"
+    assert scanned_entry["flagDirty"] is True, (
+        "new.txt should stay flagDirty after scan"
+    )
     assert find_status_entry(scanned, "old.txt") is None, (
         "the vacated source path must not reappear after scan"
     )
@@ -381,6 +383,30 @@ def test_dirty_ignore(new_lore_repo):
     entries = get_status_files(repo)
     ghost_entry = find_status_entry(entries, "ghost.txt")
     assert ghost_entry is None, "ghost.txt should not appear"
+
+
+@pytest.mark.smoke
+def test_dirty_ignore_in_a_directory_that_does_not_exist(new_lore_repo):
+    """A named path in a directory neither the tree nor the disk holds marks nothing.
+
+    Reaching the path means walking down to where it would be added, and the directories that
+    lead there must be created only where something is actually added below them. Marked
+    alongside a real change, so the state is serialized and anything spurious is kept.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("modified\n")
+    repo.dirty(["base.txt", os.path.join("ghost_dir", "ghost.txt")], offline=True)
+
+    entries = get_status_files(repo)
+    paths = sorted(entry.get("path") for entry in entries)
+    assert paths == ["base.txt"], f"Expected only the real change marked, got: {entries}"
 
 
 # ===========================================================================
@@ -1182,6 +1208,28 @@ def test_dirty_add_in_new_directory(new_lore_repo):
     entry = find_status_entry(entries, "new_dir/sub_dir/new_file.txt")
     assert entry is not None, "new file in new dir should be dirty"
     assert entry["flagDirty"] is True
+
+
+@pytest.mark.smoke
+def test_stage_named_nested_path_survives_commit(new_lore_repo):
+    """staging a new file by name creates its ancestors, which the commit has to keep."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("existing.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    repo.make_dirs("new_dir/sub_dir")
+    with repo.open_file("new_dir/sub_dir/new_file.txt", "w+") as f:
+        f.write("new content\n")
+
+    # Named rather than scanned, so the ancestors are created to host the target.
+    repo.stage("new_dir/sub_dir/new_file.txt", offline=True)
+    repo.commit(offline=True)
+
+    committed = repo.file_info("new_dir/sub_dir/new_file.txt", offline=True)
+    assert committed, "a staged file under a new directory must survive the commit"
 
 
 @pytest.mark.smoke

@@ -17,6 +17,13 @@ name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration_tests"]
 
+# Its own target rather than a module of the suite: it installs a process-wide GC event sink
+# provider, which takes the first registration and would otherwise race the suite's own.
+# Needs no service from compose.yaml, so it is not behind `integration_tests`.
+[[test]]
+name = "store_gc_trigger"
+path = "tests/store_gc_trigger_test.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -31,7 +38,6 @@ serde_json = { workspace = true }
 rs-consul = "0.13.0"
 rustls = { workspace = true, optional = true }
 serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
-tempfile = "3.21"
 tokio = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
@@ -54,7 +60,11 @@ uuid = { workspace = true }
 # Verification stays `lore-server`'s: this only signs the tokens its
 # `JwtVerifier` is then asked to accept or refuse.
 jsonwebtoken = { workspace = true }
+ctor = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
+# `UserAgentFilter` for the hand-built `StorageServiceV4` in quic_session_rebind_test.rs.
+lore-telemetry = { workspace = true }
 lore-transport = { workspace = true, features = ["test_seams"] }
 rcgen = { workspace = true }
 serde = { workspace = true }

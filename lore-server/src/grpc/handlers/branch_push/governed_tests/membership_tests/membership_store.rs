@@ -216,8 +216,8 @@ impl ImmutableStore for MembershipStore {
         self.inner.clone().compact_resume_at().await
     }
 
-    async fn compact_stop(self: Arc<Self>) {
-        self.inner.clone().compact_stop().await;
+    async fn stop_gc(self: Arc<Self>, terminate: bool) {
+        self.inner.clone().stop_gc(terminate).await;
     }
 
     fn max_query_batch(&self) -> Option<usize> {

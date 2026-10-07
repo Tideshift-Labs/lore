@@ -23,7 +23,6 @@ pub mod storage;
 pub mod storage_service;
 pub mod thinclient;
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,13 +35,22 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_postgres::domain::locks::VerifiedLockOwner;
+use lore_revision::branch::BranchError;
+use lore_revision::diff::DiffError;
+use lore_revision::find::FindError;
+use lore_revision::immutable::ImmutableError;
 use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
+use lore_revision::metadata::branch::BranchMetadataError;
+use lore_revision::metadata::repository::RepositoryMetadataError;
+use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
 use lore_revision::state::StateError;
+use lore_storage::StoreError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -50,6 +58,7 @@ pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
 pub use server::GrpcServerBuilder;
+pub use server::GrpcServiceSettings;
 pub use storage_service::LoreStorageService;
 pub use thinclient::LoreThinClientV1Service;
 use tokio::sync::mpsc::Sender;
@@ -63,8 +72,10 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourcePermission;
+use crate::auth::jwt::ResourceMatcher;
 use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -350,6 +361,18 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
     }
 }
 
+/// Rebuild the interceptor-verified token from request extensions. `None`
+/// when no interceptor ran (no verifier configured) or when either half is
+/// missing.
+pub fn get_verified_token(extensions: &Extensions) -> Option<VerifiedToken<'_>> {
+    let claims = extensions.get::<AuthorizationToken>()?;
+    let raw = extensions.get::<RawToken>()?;
+    Some(VerifiedToken {
+        raw: &raw.0,
+        claims,
+    })
+}
+
 pub fn link_read_authorizer(
     authorization: Option<AuthorizationToken>,
 ) -> lore_revision::state::CanReadRepository {
@@ -438,12 +461,56 @@ pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> b
         || user_permissions.contains(&"admin".to_string())
 }
 
+/// FORK-LOCAL (Tideshift): the permission list of the FIRST token resource
+/// whose `urc-<hex>` id names `repository`, and nothing else.
+///
+/// This is the pre-v0.10.0 `user_permissions` reader, kept verbatim for the
+/// fork-owned sites that were built on it. Upstream 657e05e9 changed
+/// [`user_permissions`] to merge every matching entry and honour `urc-*`; this
+/// helper does neither. A `urc-*` entry never matches here (its id does not
+/// parse as a repository), and an exact entry after the first is ignored.
+pub fn first_exact_repository_permissions(
+    extensions: &Extensions,
+    repository: RepositoryId,
+) -> Vec<String> {
+    let user_resources = resources_from_token(get_authorization(extensions).ok());
+    for resource in user_resources {
+        let resource_repository = resource
+            .resource_id
+            .strip_prefix("urc-")
+            .unwrap_or_default();
+        let resource_repository: RepositoryId = resource_repository
+            .parse::<Context>()
+            .unwrap_or_default()
+            .into();
+        if resource_repository == repository {
+            return resource.permission;
+        }
+    }
+
+    Vec::new()
+}
+
+/// FORK-LOCAL (Tideshift): whether a `BranchCreate` caller may name a
+/// `creator` other than its own verified identity.
+///
+/// Requires `owner` or `admin` on the FIRST exact `urc-<repository>` entry
+/// (see [`first_exact_repository_permissions`]). A `urc-*` grant does not
+/// qualify. This keeps the fork's pre-v0.10.0 creator-attribution rule; it does
+/// not follow upstream's wildcard-honouring [`is_owner_or_admin`].
+pub fn can_set_branch_creator(extensions: &Extensions, repository: RepositoryId) -> bool {
+    let permissions = first_exact_repository_permissions(extensions, repository);
+    permissions
+        .iter()
+        .any(|permission| permission == "owner" || permission == "admin")
+}
+
 pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
     user_permissions(extensions, repository).contains(&"obliterate".to_string())
 }
 
 pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    has_required_permission(extensions, repository, "migrate")
+    user_permissions(extensions, repository).contains(&"migrate".to_string())
 }
 
 /// The `ForceUnlock` bar: the `owner` permission, and deliberately not
@@ -475,14 +542,16 @@ pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool
 /// new name introduced here: [`is_owner_or_admin`] already matches the same
 /// string, and Lorehub's mint emits it for the `owner` role alongside `migrate`.
 ///
-/// It resolves that string differently, though, and the difference is worth
-/// naming so nobody reads the two as interchangeable. [`is_owner_or_admin`] goes
-/// through [`user_permissions`], which returns the FIRST resource matching the
-/// repository and does not honour the `urc-*` wildcard. This goes through
-/// [`has_required_permission`], which filters ALL matching resources and does
-/// honour the wildcard. That is deliberate: it makes this gate behave exactly
-/// like [`can_admin_lock`], the sibling it is being split away from, so the two
-/// administrative RPCs differ in which scope they demand and in nothing else.
+/// It reads the string through [`has_required_permission`], which merges ALL
+/// resources matching the repository and honours the `urc-*` wildcard. That
+/// was its semantics before v0.10.0 and it is unchanged. Since upstream
+/// 657e05e9 (merged at v0.10.0) [`is_owner_or_admin`], [`can_admin_lock`] and
+/// [`can_obliterate`] resolve the same way through [`user_permissions`]. The
+/// fork's branch-creator rule does NOT: it keeps the pre-v0.10.0 first-exact,
+/// no-wildcard reader ([`can_set_branch_creator`]). This gate still behaves
+/// exactly like [`can_admin_lock`], the sibling it was split away from, so the
+/// two administrative RPCs differ in which scope they demand and in nothing
+/// else.
 pub fn can_force_unlock(extensions: &Extensions, repository: RepositoryId) -> bool {
     has_required_permission(extensions, repository, "owner")
 }
@@ -567,31 +636,24 @@ pub fn is_self_force_unlock(
     caller.ct_matches(&named)
 }
 
-pub fn get_matching_permissions(
-    extensions: &Extensions,
-    repository: RepositoryId,
-) -> Vec<ResourcePermission> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    let repository_to_match = format!("urc-{repository}");
-
-    user_resources
-        .into_iter()
-        .filter(|resource| resource.matches_repository(&repository_to_match))
-        .collect()
-}
-
+/// FORK-LOCAL (Tideshift, CR-018 / CR-030): whether the verified token grants
+/// `permission_to_check` on `repository_to_check`.
+///
+/// Reads the token's `resources` claim through [`user_permissions`], which
+/// since upstream 657e05e9 merges every matching entry and honours the `urc-*`
+/// wildcard — the semantics the fork's earlier filter-all-matching reader had.
+/// It deliberately reads the claim, not the configured `RepositoryAuthorizer`,
+/// for parity with the pre-v0.10.0 write gate (merge decision D2). A follow-up
+/// is open: an identity token (no `resources` claim) that reaches a service
+/// through the online authorizer is still refused every write here.
 pub fn has_required_permission(
     extensions: &Extensions,
     repository_to_check: RepositoryId,
     permission_to_check: &str,
 ) -> bool {
-    get_matching_permissions(extensions, repository_to_check)
-        .into_iter()
-        .any(|resource_permission| {
-            resource_permission
-                .permission
-                .contains(&permission_to_check.to_string())
-        })
+    user_permissions(extensions, repository_to_check)
+        .iter()
+        .any(|permission| permission == permission_to_check)
 }
 
 /// Enforce a write-path permission. No-op when auth is OFF (no token in
@@ -616,20 +678,7 @@ pub fn require_permission(
 
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
     let user_resources = resources_from_token(get_authorization(extensions).ok());
-    for resource in user_resources {
-        let resource_repository = resource
-            .resource_id
-            .strip_prefix("urc-")
-            .unwrap_or_default();
-        let resource_repository: RepositoryId = Context::from_str(resource_repository)
-            .unwrap_or_default()
-            .into();
-        if resource_repository == repository {
-            return resource.permission;
-        }
-    }
-
-    Vec::new()
+    ResourceMatcher::default().merged_permissions(&user_resources, repository)
 }
 
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {
@@ -766,42 +815,130 @@ pub trait FilterSlowDownExt<T, E> {
     fn filter_slow_down(self) -> Result<Result<T, E>, Status>;
 }
 
-impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
-    fn filter_slow_down(self) -> Result<Result<T, StateError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
+/// Implements [`FilterSlowDownExt`] for error sets that declare a `SlowDown`
+/// variant: the backpressure signal becomes `RESOURCE_EXHAUSTED`, and every
+/// other outcome passes through for the caller to match on.
+macro_rules! impl_filter_slow_down {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl<T> FilterSlowDownExt<T, $error> for Result<T, $error> {
+                fn filter_slow_down(self) -> Result<Result<T, $error>, Status> {
+                    if let Err(err) = &self
+                        && err.is_slow_down()
+                    {
+                        return Err(Status::resource_exhausted(err.to_string()));
+                    }
+                    Ok(self)
+                }
+            }
+        )+
+    };
+}
+
+impl_filter_slow_down!(
+    BranchError,
+    BranchMetadataError,
+    DiffError,
+    FindError,
+    ImmutableError,
+    LinkError,
+    MetadataError,
+    RepositoryError,
+    RepositoryMetadataError,
+    StateError,
+    StoreError,
+);
+
+/// Converts a failed result into `Ok(None)` when `discard` accepts the error,
+/// and into a [`Status`] otherwise.
+///
+/// The failing path routes through [`FilterSlowDownExt::filter_slow_down`]
+/// first, so an error that carries its own status keeps it and only the
+/// remainder is reported as internal. A caller that can act on `None` keeps
+/// that path without also discarding the errors it cannot act on.
+pub fn none_or_status<T, E>(
+    result: Result<T, E>,
+    discard: impl FnOnce(&E) -> bool,
+) -> Result<Option<T>, Status>
+where
+    Result<T, E>: FilterSlowDownExt<T, E>,
+    E: std::error::Error,
+{
+    match result.filter_slow_down()? {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if discard(&err) => Ok(None),
+        Err(err) => Err(warn_error_to_status(&err, |err| {
+            Status::internal(err.to_string())
+        })),
     }
 }
 
-impl<T> FilterSlowDownExt<T, LinkError> for Result<T, LinkError> {
-    fn filter_slow_down(self) -> Result<Result<T, LinkError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
+/// Reads a revision hash out of a request's `signature` field, refusing a
+/// signature that is not a whole one.
+///
+/// A partial hash signature is a request the server cannot act on rather than a
+/// revision it looked for and did not find, so it is refused as
+/// `FAILED_PRECONDITION`: retrying it unchanged fails the same way.
+///
+/// An empty field is not a partial signature but an unset one, and is left to
+/// the zero hash its callers already handle.
+pub fn revision_signature(signature: Bytes) -> Result<Hash, Status> {
+    if !signature.is_empty() && signature.len() != size_of::<Hash>() {
+        return Err(Status::failed_precondition(format!(
+            "partial revision hash signature of {} byte(s) - give the whole {} byte signature, or a branch and revision number",
+            signature.len(),
+            size_of::<Hash>(),
+        )));
     }
-}
 
-impl<T> FilterSlowDownExt<T, MetadataError> for Result<T, MetadataError> {
-    fn filter_slow_down(self) -> Result<Result<T, MetadataError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
-    }
+    Ok(Hash::from(signature))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+    use crate::auth::jwt::ResourcePermission;
+
+    #[test]
+    fn revision_signature_reads_a_whole_signature() {
+        let hash = Hash::hash_buffer(&[1, 2, 3]);
+        let read = revision_signature(Bytes::from(hash)).expect("a whole signature is read");
+        assert_eq!(read, hash);
+    }
+
+    // Not a partial signature but an unset one, which the callers already answer
+    // for as a revision that does not exist.
+    #[test]
+    fn revision_signature_reads_an_absent_signature_as_zero() {
+        let read = revision_signature(Bytes::new()).expect("an unset signature is read");
+        assert!(read.is_zero());
+    }
+
+    // Both directions of wrong: a prefix of a hash, and a hash with anything
+    // trailing it.
+    #[test]
+    fn revision_signature_refuses_a_signature_that_is_not_whole() {
+        let hash = Hash::hash_buffer(&[1, 2, 3]);
+        for length in [1, 8, size_of::<Hash>() - 1, size_of::<Hash>() + 1] {
+            let mut signature = Vec::from(Bytes::from(hash));
+            signature.resize(length, 0);
+
+            let status = revision_signature(Bytes::from(signature))
+                .expect_err("a signature that is not whole is refused");
+            assert_eq!(
+                status.code(),
+                tonic::Code::FailedPrecondition,
+                "a {length} byte signature was not refused as a failed precondition",
+            );
+            assert!(
+                status.message().contains("partial revision hash signature"),
+                "the refusal does not say what was wrong: {}",
+                status.message(),
+            );
+        }
+    }
 
     #[test]
     fn get_authorization_extracts_auth() {
@@ -814,7 +951,7 @@ mod tests {
     }
 
     #[test]
-    fn get_matching_permissions_includes_matched_repo_permissions() {
+    fn user_permissions_includes_matched_repo_permissions() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -836,15 +973,15 @@ mod tests {
             Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
                 .unwrap()
                 .into();
-        let matched_resources = get_matching_permissions(&extensions, test_repository_context);
-        let no_matched_resources =
-            get_matching_permissions(&extensions, test_unrelated_repository_context);
-        assert_eq!(matched_resources, vec![test_resource_permission]);
-        assert_eq!(no_matched_resources, vec![]);
+        let matched_permissions = user_permissions(&extensions, test_repository_context);
+        let no_matched_permissions =
+            user_permissions(&extensions, test_unrelated_repository_context);
+        assert_eq!(matched_permissions, vec!["test_permission".to_string()]);
+        assert_eq!(no_matched_permissions, Vec::<String>::new());
     }
 
     #[test]
-    fn get_matching_permissions_includes_wildcard_resource() {
+    fn user_permissions_includes_wildcard_resource() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -873,19 +1010,19 @@ mod tests {
             Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
                 .unwrap()
                 .into();
-        let matched_resources = get_matching_permissions(&extensions, test_repository_context);
-        let no_matched_resources =
-            get_matching_permissions(&extensions, test_unrelated_repository_context);
+        let matched_permissions = user_permissions(&extensions, test_repository_context);
+        let no_matched_permissions =
+            user_permissions(&extensions, test_unrelated_repository_context);
         assert_eq!(
-            matched_resources,
+            matched_permissions,
             vec![
-                test_resource_permission,
-                test_wildcard_resource_permission.clone()
+                "test_permission".to_string(),
+                "test_wildcard_permission".to_string()
             ]
         );
         assert_eq!(
-            no_matched_resources,
-            vec![test_wildcard_resource_permission]
+            no_matched_permissions,
+            vec!["test_wildcard_permission".to_string()]
         );
     }
 
@@ -917,35 +1054,30 @@ mod tests {
                 .into();
 
         // user has test_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"test_permission".to_string())
+        );
         // user has other_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "other_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"other_permission".to_string())
+        );
         // user doesn't have test_permission2 for a given repo in their token
-        assert!(!has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission2"
-        ),);
+        assert!(
+            !user_permissions(&extensions, test_repository_context)
+                .contains(&"test_permission2".to_string())
+        );
         // user doesn't have test_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "test_permission"
-        ),);
+        assert!(
+            !user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"test_permission".to_string())
+        );
         // user doesn't have other_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "other_permission"
-        ));
+        assert!(
+            !user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"other_permission".to_string())
+        );
     }
 
     #[test]
@@ -987,36 +1119,31 @@ mod tests {
                 .into();
 
         // user has test_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"test_permission".to_string())
+        );
         // user has unique_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "unique_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"unique_permission".to_string())
+        );
         // user has test_wildcard_permission for a given repo — through the wildcard resource
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_wildcard_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"test_wildcard_permission".to_string())
+        );
         // user also has test_permission for an unrelated repository — through the wildcard resource
-        assert!(has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "test_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"test_permission".to_string())
+        );
 
         // user doesn't have unique_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "unique_permission"
-        ));
+        assert!(
+            !user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"unique_permission".to_string())
+        );
     }
 
     #[test]
@@ -1097,6 +1224,188 @@ mod tests {
             &extensions,
             test_unrelated_repository_context
         ));
+    }
+
+    /// Regression: two entries matching the same partition merge
+    /// their permission lists. The old reader stopped at the first matching
+    /// entry, so whichever permission sat in a later entry was lost.
+    #[test]
+    fn user_permissions_merge_across_matching_entries() {
+        let mut extensions = Extensions::new();
+        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let mut test_authz_token = AuthorizationToken::default();
+
+        let test_resource_permissions = vec![
+            ResourcePermission {
+                resource_id: test_repository_id.clone(),
+                permission: vec!["push".to_string()],
+            },
+            ResourcePermission {
+                resource_id: "urc-*".to_string(),
+                permission: vec!["migrate".to_string()],
+            },
+            ResourcePermission {
+                resource_id: test_repository_id.clone(),
+                permission: vec!["obliterate".to_string()],
+            },
+        ];
+
+        test_authz_token.resources = Some(test_resource_permissions);
+        extensions.insert(test_authz_token.clone());
+
+        let test_repository_context: RepositoryId =
+            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
+                .unwrap()
+                .into();
+
+        assert_eq!(
+            user_permissions(&extensions, test_repository_context),
+            vec![
+                "push".to_string(),
+                "migrate".to_string(),
+                "obliterate".to_string()
+            ]
+        );
+    }
+
+    /// Regression: a `urc-*` grant now satisfies `can_obliterate`
+    /// and `is_owner_or_admin`, not just `can_admin_lock`. The old
+    /// `user_permissions` reader never looked at the wildcard entry, so the
+    /// three checks disagreed about one token.
+    #[test]
+    fn wildcard_grant_satisfies_every_action_check() {
+        let mut extensions = Extensions::new();
+        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
+        let mut test_authz_token = AuthorizationToken::default();
+
+        let test_wildcard_resource_permission = ResourcePermission {
+            resource_id: "urc-*".to_string(),
+            permission: vec![
+                "obliterate".to_string(),
+                "admin".to_string(),
+                "migrate".to_string(),
+            ],
+        };
+
+        test_authz_token.resources = Some(vec![test_wildcard_resource_permission]);
+        extensions.insert(test_authz_token.clone());
+
+        for repository_id in [test_repository_id, unrelated_repository_id] {
+            let repository_context: RepositoryId =
+                Context::from_str(repository_id.strip_prefix("urc-").unwrap())
+                    .unwrap()
+                    .into();
+            assert!(can_obliterate(&extensions, repository_context));
+            assert!(is_owner_or_admin(&extensions, repository_context));
+            assert!(can_admin_lock(&extensions, repository_context));
+        }
+    }
+
+    #[test]
+    fn no_grant_denies_every_action_check() {
+        let mut extensions = Extensions::new();
+        let mut test_authz_token = AuthorizationToken::default();
+        let test_resource_permissions = Vec::new();
+        test_authz_token.resources = Some(test_resource_permissions);
+        extensions.insert(test_authz_token.clone());
+
+        let test_repository_context: RepositoryId =
+            Context::from_str("0194b726b34e72b0b45550b88a967076")
+                .unwrap()
+                .into();
+
+        assert!(!is_owner_or_admin(&extensions, test_repository_context));
+        assert!(!can_obliterate(&extensions, test_repository_context));
+        assert!(!can_admin_lock(&extensions, test_repository_context));
+    }
+
+    /// Fork extensions carrying one verified token with `resources`.
+    fn fork_extensions_with(subject: &str, resources: Vec<(&str, &[&str])>) -> Extensions {
+        let mut extensions = Extensions::new();
+        extensions.insert(AuthorizationToken {
+            user_id: subject.to_string(),
+            issuer: "issuer".to_string(),
+            resources: Some(
+                resources
+                    .into_iter()
+                    .map(|(resource_id, permissions)| ResourcePermission {
+                        resource_id: resource_id.to_string(),
+                        permission: permissions.iter().map(|p| p.to_string()).collect(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        });
+        extensions
+    }
+
+    const FORK_REPO: &str = "0194b726b34e72b0b45550b88a967076";
+
+    fn fork_repo() -> RepositoryId {
+        Context::from_str(FORK_REPO).unwrap().into()
+    }
+
+    /// FORK-LOCAL: the branch-creator rule keeps the pre-v0.10.0 reader. Only
+    /// the FIRST exact `urc-<repo>` entry counts. `urc-*` and later exact
+    /// entries do not, although upstream's `is_owner_or_admin` now honours both.
+    #[test]
+    fn branch_creator_rule_reads_only_the_first_exact_entry() {
+        let exact = format!("urc-{FORK_REPO}");
+        let other = "urc-0192ae48ccf17060bc1ba9d04f6acb2f";
+
+        let wildcard_owner = fork_extensions_with("s", vec![("urc-*", &["owner"])]);
+        assert!(!can_set_branch_creator(&wildcard_owner, fork_repo()));
+        assert!(is_owner_or_admin(&wildcard_owner, fork_repo()));
+
+        let later_exact_admin =
+            fork_extensions_with("s", vec![(&exact, &["read"]), (&exact, &["admin"])]);
+        assert!(!can_set_branch_creator(&later_exact_admin, fork_repo()));
+        assert!(is_owner_or_admin(&later_exact_admin, fork_repo()));
+
+        let exact_owner_after_others = fork_extensions_with(
+            "s",
+            vec![
+                ("urc-*", &["read"]),
+                (other, &["owner"]),
+                (&exact, &["owner"]),
+            ],
+        );
+        assert!(can_set_branch_creator(
+            &exact_owner_after_others,
+            fork_repo()
+        ));
+
+        let exact_admin = fork_extensions_with("s", vec![(&exact, &["admin"])]);
+        assert!(can_set_branch_creator(&exact_admin, fork_repo()));
+
+        assert!(!can_set_branch_creator(&Extensions::new(), fork_repo()));
+    }
+
+    /// FORK-LOCAL: the write gate and both force-unlock gates keep their
+    /// pre-v0.10.0 semantics, which already merged every matching entry and
+    /// honoured `urc-*`.
+    #[test]
+    fn fork_write_and_force_unlock_gates_honour_wildcard_and_merge_entries() {
+        let exact = format!("urc-{FORK_REPO}");
+
+        let wildcard = fork_extensions_with("me", vec![("urc-*", &["read", "write", "owner"])]);
+        assert!(require_permission(&wildcard, fork_repo(), "write", true).is_ok());
+        assert!(can_force_unlock(&wildcard, fork_repo()));
+        assert!(is_self_force_unlock(&wildcard, fork_repo(), "me"));
+
+        let split = fork_extensions_with("me", vec![(&exact, &["read"]), (&exact, &["write"])]);
+        assert!(require_permission(&split, fork_repo(), "write", true).is_ok());
+        assert!(is_self_force_unlock(&split, fork_repo(), "me"));
+        assert!(!can_force_unlock(&split, fork_repo()));
+
+        let read_only = fork_extensions_with("me", vec![(&exact, &["read"])]);
+        assert_eq!(
+            require_permission(&read_only, fork_repo(), "write", true)
+                .unwrap_err()
+                .code(),
+            Code::PermissionDenied
+        );
     }
 
     mod timeout_grpc_tests {
@@ -1180,6 +1489,118 @@ mod tests {
             let filtered = result.filter_slow_down().unwrap();
             let underlying_error = filtered.expect_err("Should be err");
             assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn store_ok_passes_through() {
+            let result: Result<i32, StoreError> = Ok(42);
+            let filtered = result.filter_slow_down().unwrap();
+            assert_eq!(filtered.unwrap(), 42);
+        }
+
+        #[test]
+        fn store_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, StoreError> = Err(StoreError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn store_error_passes_through() {
+            let result: Result<i32, StoreError> = Err(StoreError::internal("other error"));
+            let filtered = result.filter_slow_down().unwrap();
+            let underlying_error = filtered.expect_err("Should be err");
+            assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn branch_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, BranchError> = Err(BranchError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn branch_error_passes_through() {
+            let result: Result<i32, BranchError> = Err(BranchError::internal("other error"));
+            let filtered = result.filter_slow_down().unwrap();
+            let underlying_error = filtered.expect_err("Should be err");
+            assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn repository_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, RepositoryError> = Err(RepositoryError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn immutable_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, ImmutableError> = Err(ImmutableError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn branch_metadata_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, BranchMetadataError> = Err(BranchMetadataError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        /// `filter_slow_down`'s mapping must survive: flattening every
+        /// undiscarded error into the internal arm loses it silently, because
+        /// both arms still produce a `Status`.
+        #[test]
+        fn discarded_error_is_none_and_others_keep_their_status() {
+            let absent: Result<i32, StoreError> = Err(StoreError::from(
+                lore_base::error::AddressNotFound::from(lore_base::types::Address::default()),
+            ));
+            assert_eq!(
+                none_or_status(absent, StoreError::is_address_not_found).unwrap(),
+                None
+            );
+
+            let throttled: Result<i32, StoreError> = Err(StoreError::from(SlowDown));
+            let status = none_or_status(throttled, StoreError::is_address_not_found)
+                .expect_err("an undiscarded error must not become None");
+            assert_eq!(status.code(), Code::ResourceExhausted);
+
+            let failed: Result<i32, StoreError> = Err(StoreError::internal("store unusable"));
+            let status = none_or_status(failed, StoreError::is_address_not_found)
+                .expect_err("an undiscarded error must not become None");
+            assert_eq!(status.code(), Code::Internal);
+        }
+
+        #[test]
+        fn find_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, FindError> = Err(FindError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn find_error_passes_through() {
+            let result: Result<i32, FindError> = Err(FindError::internal("no revision found"));
+            let filtered = result.filter_slow_down().unwrap();
+            let underlying_error = filtered.expect_err("Should be err");
+            assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn diff_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, DiffError> = Err(DiffError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn repository_metadata_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, RepositoryMetadataError> =
+                Err(RepositoryMetadataError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
         }
     }
 
@@ -1340,7 +1761,7 @@ mod tests {
     }
 
     /// Owner ruling D8: `ForceUnlock`'s second authorization arm. Follows the
-    /// `get_matching_permissions_*` fixture style above (build `Extensions`,
+    /// `user_permissions_*` fixture style above (build `Extensions`,
     /// insert an `AuthorizationToken` directly rather than a real JWT).
     ///
     /// `is_self_force_unlock` takes a `repository: RepositoryId` conjunct too

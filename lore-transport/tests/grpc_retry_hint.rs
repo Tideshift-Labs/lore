@@ -238,8 +238,15 @@ fn the_fixture_encoder_round_trips_through_an_independent_decode() {
 
 /// The no-regression pin: with no hint, `wait_with_hint` must behave exactly like calling
 /// `retry.wait()` directly. Mirrors `lore-server/tests/outbox_load_proof.rs`'s
-/// `measure_the_real_lore_client_resource_exhausted_retry_budget`, which pins this same 60-attempt,
-/// 532.75s-539s window against the raw `Retry::wait()` loop.
+/// `measure_the_real_lore_client_resource_exhausted_retry_budget`, which pins this same 60-attempt
+/// window against the raw `Retry::wait()` loop.
+///
+/// Window derivation (`lore_base::retry` jitters symmetrically: each wait deviates from its
+/// interval by up to `min(interval / 2, 100)` ms either way, truncated to `-mag..=mag-1`). Base
+/// schedule: 50+100+200+400+800+1600+3200+6400 = 12,750 ms over 8 attempts, then 52 attempts at
+/// 10,000 ms = 532,750 ms. Deviation magnitudes are 25 and 50 for the first two steps and 100 for
+/// the other 58, so the total lies in 532,750 - 5,875 = 526,875 ms to 532,750 + 5,815 = 538,565
+/// ms. The ceiling carries 60 ms (one per paused-clock sleep) for tick rounding.
 #[tokio::test(start_paused = true)]
 async fn no_hint_keeps_the_unhinted_sixty_attempt_budget_unchanged() {
     let mut retry = lore_transport::util::retry(50, 10_000, 60);
@@ -253,8 +260,9 @@ async fn no_hint_keeps_the_unhinted_sixty_attempt_budget_unchanged() {
     assert_eq!(attempts, 60);
     assert_eq!(retry.counter(), 60);
     assert!(
-        total >= Duration::from_millis(532_750) && total <= Duration::from_secs(539),
-        "no-hint total {total:?} is outside the unchanged schedule; wait_with_hint(None) must \
+        total >= Duration::from_millis(526_875) && total <= Duration::from_millis(538_625),
+        "no-hint total {total:?} is outside the derived 526.875s-538.625s schedule window; \
+         wait_with_hint(None) must \
          match retry.wait() exactly"
     );
 }
@@ -263,8 +271,9 @@ async fn no_hint_keeps_the_unhinted_sixty_attempt_budget_unchanged() {
 /// 3200/6400 ms, all under the 10s hint) must make each of those eight waits at least 10s, and
 /// the full 60-attempt run must still cost exactly 60 attempts -- honouring the hint must not
 /// spend extra budget. Window derivation: attempts 1-8 at 10,000ms each = 80s; attempts 9-60 (52
-/// of them) have a 10,000ms base step already at the cap, plus up to 100ms jitter each = 520.0s
-/// to 525.2s; total 600.0s to 605.2s.
+/// of them) have a 10,000ms base step already at the cap, and symmetric jitter of -100..=+99 ms
+/// around it, so `max(step, hint)` is 10,000ms to 10,099ms each = 520.0s to 525.148s (negative
+/// jitter is absorbed by the hint floor); total 600.0s to 605.148s, 605.2s with tick slack.
 #[tokio::test(start_paused = true)]
 async fn a_ten_second_hint_dominates_the_early_short_steps_and_the_total_lands_in_the_derived_window()
  {
@@ -303,7 +312,9 @@ async fn a_ten_second_hint_dominates_the_early_short_steps_and_the_total_lands_i
 /// case, a `min` where the code should compute a `max` would still pass every other test in this
 /// file. Drives the retry forward to attempt 20, well past attempt 9 where the base schedule
 /// already sits at the 10,000 ms cap, then asks for a 1s hint and asserts the wait stayed at the
-/// 10s ceiling rather than being pulled down to it.
+/// 10s ceiling rather than being pulled down to it. The ceiling step is jittered symmetrically by
+/// up to 100 ms, so the wait lies in 9,900..=10,099 ms; the floor asserted is 9,900 ms, which a
+/// hint-shortened wait (1,000 ms) would miss by a wide margin.
 #[tokio::test(start_paused = true)]
 async fn a_hint_shorter_than_a_capped_late_backoff_step_does_not_shorten_it() {
     let mut retry = lore_transport::util::retry(50, 10_000, 60);
@@ -321,8 +332,9 @@ async fn a_hint_shorter_than_a_capped_late_backoff_step_does_not_shorten_it() {
 
     assert!(waited);
     assert!(
-        elapsed >= Duration::from_secs(10),
-        "a 1s hint must not shorten an already-capped 10s backoff step: waited {elapsed:?}"
+        elapsed >= Duration::from_millis(9_900),
+        "a 1s hint must not shorten an already-capped 10s backoff step (9.9s jitter floor): \
+         waited {elapsed:?}"
     );
 }
 
@@ -361,17 +373,15 @@ async fn an_already_exhausted_budget_returns_false_without_sleeping_the_hint() {
 /// over 8 attempts, then 10,000 ms each; 12,750 + 10*10,000 = 112,750 ms after 18 attempts. A
 /// 19th attempt needs a 10,100 ms upper bound (10,000 ms base step plus the 100 ms jitter cap),
 /// and 112,750 + 10,100 = 122,850 ms > 120,000 ms, so it is refused before ever sleeping.
-/// Jitter across the 18 real waits: the first five steps (50/100/200/400/800 ms) are below the
-/// 1,000 ms jitter-cap threshold, where `jitter = min((raw * current) as u64, 100)` truncates a
-/// real-valued draw strictly below its supremum (`raw` is `rand::random::<f32>() * 0.1`, so
-/// `raw * current` is strictly less than 5/10/20/40/80 respectively) -- the achievable integer
-/// maximum is one less than each supremum: 4+9+19+39+79 = 150 ms, not the naive 5+10+20+40+80 =
-/// 155 ms. The remaining 13 steps (1600/3200/6400 ms, then 10,000 ms x 10) clear the 100 ms cap
-/// well before the same truncation matters (`raw` only needs to exceed 100/1600 = 0.0625 of its
-/// 0.1 ceiling), so each is capped at exactly 100 ms = 1,300 ms; total at most 1,450 ms. The
-/// assertion below still allows up to 114,205 ms rather than the tighter 114,200 ms this implies
-/// -- 5 ms of slack, kept for the same paused-clock rounding reason the hinted case's window
-/// documents below, and small enough that it cannot mask a real regression.
+/// Jitter across the 18 real waits (`lore_base::retry`'s symmetric jitter: each wait deviates by
+/// `-mag..=mag-1` ms, `mag = min(interval / 2, 100)`): the magnitudes are 25 (50 ms step), 50
+/// (100 ms step) and 100 for the remaining 16 steps, so the total lies in 112,750 - 1,675 =
+/// 111,075 ms to 112,750 + 1,657 = 114,407 ms. The assertion's ceiling is 114,425 ms: 18 ms of
+/// slack, one per paused-clock sleep, for tick rounding (see the hinted case's window below). The
+/// 19th attempt is refused for every jitter draw, because even the lowest possible cumulative
+/// total (111,075 ms) plus the 10,100 ms upper bound exceeds 120,000 ms; the 18th is admitted for
+/// every draw, because the highest cumulative total after 17 attempts (104,308 ms) plus 10,100 ms
+/// stays under it.
 #[tokio::test(start_paused = true)]
 async fn grpc_retry_unhinted_worst_case_is_bounded_by_the_wall_clock_budget() {
     let mut budget = lore_transport::grpc::grpc_retry();
@@ -388,8 +398,8 @@ async fn grpc_retry_unhinted_worst_case_is_bounded_by_the_wall_clock_budget() {
     );
     assert_eq!(budget.counter(), 18);
     assert!(
-        total >= Duration::from_millis(112_750) && total <= Duration::from_millis(114_205),
-        "unhinted budgeted total {total:?} is outside the derived 112.750s-114.205s window"
+        total >= Duration::from_millis(111_075) && total <= Duration::from_millis(114_425),
+        "unhinted budgeted total {total:?} is outside the derived 111.075s-114.425s window"
     );
     assert!(
         total <= Duration::from_secs(120),
@@ -406,12 +416,11 @@ async fn grpc_retry_unhinted_worst_case_is_bounded_by_the_wall_clock_budget() {
 /// Derivation: attempts 1-8 have a base step under 10s, so `wait_with_hint`'s
 /// `max(step, hint)` resolves to the hint exactly: 8 * 10,000 ms = 80,000 ms, and each of those
 /// eight waits is therefore at least 10s (the hint is still honoured within the budget). Attempts
-/// 9-11 sit at the 10,000 ms base-step ceiling (already >= the hint) plus up to 100 ms jitter
-/// (reachable, not just a supremum: `min` saturates to exactly 100 whenever the raw draw clears
-/// 0.01 of its 0.1 ceiling, comfortably likely), so cumulative time after 11 attempts is at most
-/// 80,000 + 3*10,100 = 110,300 ms exactly. A 12th attempt needs a 10,100 ms upper bound; even the
-/// minimum possible cumulative total (110,000 ms) plus that exceeds the 120,000 ms deadline, so a
-/// 12th attempt is always refused.
+/// 9-11 sit at the 10,000 ms base-step ceiling with symmetric jitter of -100..=+99 ms; the hint
+/// floors each wait at 10,000 ms, so each is 10,000..=10,099 ms and cumulative time after 11
+/// attempts is 110,000 ms to 80,000 + 3*10,099 = 110,297 ms. A 12th attempt needs a 10,100 ms
+/// upper bound; even the minimum possible cumulative total (110,000 ms) plus that exceeds the
+/// 120,000 ms deadline, so a 12th attempt is always refused, and the 11th is always admitted.
 ///
 /// The assertion's ceiling is 110,400 ms, not the tight 110,300 ms this derives: paused-clock
 /// `Instant` arithmetic can accumulate a tick of rounding across 11 `tokio::time::advance` calls,
@@ -515,9 +524,20 @@ async fn next_delay_upper_bound_is_a_true_upper_bound_and_not_a_state_change() {
     assert_eq!(retry.counter(), 0, "calling it must not consume an attempt");
 
     for attempt in 1..=3 {
+        let bound = retry
+            .next_delay_upper_bound()
+            .expect("an unexhausted Retry reports an upper bound");
+        let started = tokio::time::Instant::now();
         assert!(
             retry.wait().await,
             "the retry budget must not exhaust before attempt {attempt}"
+        );
+        // One millisecond of paused-clock tick rounding; the bound is the contract the budget
+        // gate relies on, so the real wait may never exceed it.
+        assert!(
+            started.elapsed() <= bound + Duration::from_millis(1),
+            "attempt {attempt} waited {:?}, longer than its advertised upper bound {bound:?}",
+            started.elapsed()
         );
     }
     assert_eq!(retry.counter(), 3);

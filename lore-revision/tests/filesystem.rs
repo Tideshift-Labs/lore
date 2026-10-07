@@ -16,27 +16,14 @@ mod tests {
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
     use lore_revision::branch;
-    use lore_revision::fs::filesystem_provider::FilesystemPath;
     use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::util::path::RelativePath;
-    use lore_revision::util::path::RepositoryPath;
 
     include!("helper.rs");
-
-    struct Cleanup {
-        path: PathBuf,
-    }
-
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 
     /// Runs a filesystem operation test with standard setup and teardown.
     ///
@@ -59,7 +46,6 @@ mod tests {
         let tempdir = generate_tempdir();
         let temp_path = tempdir.to_path_buf();
         let path = temp_path.clone();
-        let _cleanup = Cleanup { path: path.clone() };
 
         #[allow(clippy::disallowed_methods)]
         runtime()
@@ -91,8 +77,6 @@ mod tests {
                     .finalize(changes_made)
                     .await
                     .expect("finalize should succeed");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -144,24 +128,17 @@ mod tests {
                 // Test finalize with changes_made=false
                 let result = operation2.finalize(false).await;
                 assert!(result.is_ok(), "finalize(false) should succeed");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
-
-        #[allow(clippy::disallowed_methods)]
-        let _ = std::fs::remove_dir_all(temp_path.as_path());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_create_dir_all() {
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("test_subdir/nested").unwrap();
             operation
-                .create_dir_all(FilesystemPath::Repository(
-                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                ))
+                .create_dir_all(&rel_path)
                 .await
                 .expect("create_dir_all should succeed");
 
@@ -177,21 +154,20 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_file_info_directory() {
-        run_fs_test(|repository, operation, _path| async move {
+        run_fs_test(|_repository, operation, _path| async move {
             let rel_path = RelativePath::new_from_initial_path("test_dir").unwrap();
-            let rel_path = RepositoryPath::from_relative(&repository, rel_path).unwrap();
             operation
-                .create_dir_all(FilesystemPath::Repository(&rel_path))
+                .create_dir_all(&rel_path)
                 .await
                 .expect("create_dir_all should succeed");
 
             let info = operation
-                .file_info(FilesystemPath::Repository(&rel_path))
+                .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed");
-            assert!(info.exists, "Directory should exist");
-            assert!(info.is_dir, "Should be identified as directory");
-            assert!(!info.is_file, "Should not be identified as file");
+            assert!(info.exists(), "Directory should exist");
+            assert!(info.is_dir(), "Should be identified as directory");
+            assert!(!info.is_file(), "Should not be identified as file");
             true
         })
         .await;
@@ -199,7 +175,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_file_info_file() {
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let test_file = path.join("test_file.txt");
             let content = b"test content";
             {
@@ -209,15 +185,13 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("test_file.txt").unwrap();
             let info = operation
-                .file_info(FilesystemPath::Repository(
-                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                ))
+                .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed");
-            assert!(info.exists, "File should exist");
-            assert!(info.is_file, "Should be identified as file");
-            assert!(!info.is_dir, "Should not be identified as directory");
-            assert_eq!(info.size, content.len() as u64, "Size should match");
+            assert!(info.exists(), "File should exist");
+            assert!(info.is_file(), "Should be identified as file");
+            assert!(!info.is_dir(), "Should not be identified as directory");
+            assert_eq!(info.size(), content.len() as u64, "Size should match");
             false
         })
         .await;
@@ -225,17 +199,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_file_info_nonexistent() {
-        run_fs_test(|repository, operation, _path| async move {
+        run_fs_test(|_repository, operation, _path| async move {
             let rel_path = RelativePath::new_from_initial_path("nonexistent").unwrap();
             let info = operation
-                .file_info(FilesystemPath::Repository(
-                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                ))
+                .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed even for nonexistent path");
-            assert!(!info.exists, "Nonexistent path should have exists=false");
-            assert!(!info.is_file, "Nonexistent path should not be a file");
-            assert!(!info.is_dir, "Nonexistent path should not be a directory");
+            assert!(!info.exists(), "Nonexistent path should have exists=false");
+            assert!(!info.is_file(), "Nonexistent path should not be a file");
+            assert!(!info.is_dir(), "Nonexistent path should not be a directory");
             false
         })
         .await;
@@ -243,11 +215,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_create_file() {
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("new_file.txt").unwrap();
-            let rel_path = RepositoryPath::from_relative(&repository, rel_path).unwrap();
             operation
-                .create_file(FilesystemPath::Repository(&rel_path))
+                .create_file(&rel_path)
                 .await
                 .expect("create_file should succeed");
 
@@ -262,10 +233,10 @@ mod tests {
             );
 
             let info = operation
-                .file_info(FilesystemPath::Repository(&rel_path))
+                .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed");
-            assert_eq!(info.size, 0, "Created file should be empty");
+            assert_eq!(info.size(), 0, "Created file should be empty");
             true
         })
         .await;
@@ -273,7 +244,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_file() {
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let test_file = path.join("to_remove.txt");
             {
                 let mut file = std::fs::File::create(&test_file).expect("Create file failed");
@@ -283,9 +254,7 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("to_remove.txt").unwrap();
             operation
-                .remove(FilesystemPath::Repository(
-                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                ))
+                .remove(&rel_path)
                 .await
                 .expect("remove should succeed");
 
@@ -297,11 +266,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_empty_directory() {
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("empty_dir").unwrap();
-            let rel_path = RepositoryPath::from_relative(&repository, rel_path).unwrap();
             operation
-                .create_dir_all(FilesystemPath::Repository(&rel_path))
+                .create_dir_all(&rel_path)
                 .await
                 .expect("create_dir_all should succeed");
 
@@ -309,7 +277,7 @@ mod tests {
             assert!(absolute_dir.exists(), "Directory should exist");
 
             operation
-                .remove(FilesystemPath::Repository(&rel_path))
+                .remove(&rel_path)
                 .await
                 .expect("remove should succeed on empty directory");
 
@@ -324,7 +292,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_recursive() {
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let dir_path = path.join("dir_with_contents");
             std::fs::create_dir_all(&dir_path).expect("Create directory failed");
             {
@@ -345,9 +313,7 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("dir_with_contents").unwrap();
             operation
-                .remove_recursive(FilesystemPath::Repository(
-                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                ))
+                .remove_recursive(&rel_path)
                 .await
                 .expect("remove_recursive should succeed");
 
@@ -361,8 +327,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn instance_operation_copy_to_scratch_file() {
-        run_fs_test(|repository, operation, path| async move {
+    async fn instance_operation_copy_file() {
+        run_fs_test(|_repository, operation, path| async move {
             let source_file = path.join("source.txt");
             let content = b"source content for copy test";
             {
@@ -371,29 +337,21 @@ mod tests {
                 file.write_all(content).expect("Write failed");
             }
 
-            let scratch_dir = std::env::temp_dir();
-            let scratch_file = scratch_dir.join("lore_test_scratch_copy.txt");
-
             let source_rel_path = RelativePath::new_from_initial_path("source.txt").unwrap();
+            let destination_rel_path = RelativePath::new_from_initial_path("copy.txt").unwrap();
             operation
-                .copy_to_scratch_file(
-                    FilesystemPath::Repository(
-                        &RepositoryPath::from_relative(&repository, source_rel_path).unwrap(),
-                    ),
-                    &scratch_file,
-                )
+                .copy_file(&source_rel_path, &destination_rel_path)
                 .await
-                .expect("copy_to_scratch_file should succeed");
+                .expect("copy_file should succeed");
 
-            assert!(scratch_file.exists(), "Scratch file should exist");
-            let copied_content = std::fs::read(&scratch_file).expect("Read scratch file failed");
+            let destination = path.join("copy.txt");
+            assert!(destination.exists(), "The copy should exist");
+            let copied_content = std::fs::read(&destination).expect("Read copy failed");
             assert_eq!(
                 copied_content, content,
                 "Copied content should match source"
             );
 
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_file(&scratch_file);
             false
         })
         .await;
@@ -404,7 +362,7 @@ mod tests {
     async fn instance_operation_make_executable() {
         use std::os::unix::fs::PermissionsExt;
 
-        run_fs_test(|repository, operation, path| async move {
+        run_fs_test(|_repository, operation, path| async move {
             let test_file = path.join("script.sh");
             {
                 let mut file = std::fs::File::create(&test_file).expect("Create file failed");
@@ -422,12 +380,7 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("script.sh").unwrap();
             operation
-                .make_executable(
-                    FilesystemPath::Repository(
-                        &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
-                    ),
-                    true,
-                )
+                .make_executable(&rel_path, true)
                 .await
                 .expect("make_executable should succeed");
 
@@ -439,33 +392,6 @@ mod tests {
                 "File should be executable after make_executable"
             );
             true
-        })
-        .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn instance_operation_scratch_path() {
-        run_fs_test(|_repository, operation, _path| async move {
-            let scratch_dir = std::env::temp_dir().join("lore_test_scratch_dir");
-            std::fs::create_dir_all(&scratch_dir).expect("Create scratch dir failed");
-
-            let scratch_file = scratch_dir.join("scratch_file.txt");
-            {
-                let mut file =
-                    std::fs::File::create(&scratch_file).expect("Create scratch file failed");
-                file.write_all(b"scratch content").expect("Write failed");
-            }
-
-            let info = operation
-                .file_info(FilesystemPath::Scratch(scratch_file.as_path()))
-                .await
-                .expect("file_info on scratch path should succeed");
-            assert!(info.exists, "Scratch file should exist");
-            assert!(info.is_file, "Scratch path should be a file");
-
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_dir_all(&scratch_dir);
-            false
         })
         .await;
     }

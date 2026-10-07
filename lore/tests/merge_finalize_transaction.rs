@@ -73,6 +73,7 @@ mod tests {
                 description: LoreString::default(),
                 use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
+                vfs: Default::default(),
             };
             assert_eq!(
                 lore::repository::create(globals.clone(), args, None).await,
@@ -246,6 +247,7 @@ mod tests {
                 no_commit: 1,
                 link: LoreString::default(),
                 ignore_links: 0,
+                inherit_metadata: LoreArray::default(),
             };
             assert_eq!(
                 lore::branch::merge_start(self.globals.clone(), args, None).await,
@@ -313,13 +315,19 @@ mod tests {
                 }],
             };
             let encoded = toml::to_string_pretty(&config).expect("serialize layer fixture");
-            std::fs::write(lore_revision::layer::layer_config_path(&self.root), encoded)
-                .expect("write layer fixture");
+            std::fs::write(self.layer_config_path(), encoded).expect("write layer fixture");
+        }
+
+        /// Upstream v0.10.0 moved layer_config_path onto a RepositoryContext; this fixture
+        /// only has the root, so it resolves the dot dir the same way.
+        fn layer_config_path(&self) -> std::path::PathBuf {
+            lore_revision::repository::get_dot_lore_path(&self.root)
+                .expect("resolve the fixture dot dir")
+                .join(lore_revision::repository::LAYER)
         }
 
         fn remove_staged_layer_residue(&self) {
-            std::fs::remove_file(lore_revision::layer::layer_config_path(&self.root))
-                .expect("remove layer fixture");
+            std::fs::remove_file(self.layer_config_path()).expect("remove layer fixture");
         }
     }
 
@@ -484,6 +492,7 @@ mod tests {
             revision: picked.to_string().into(),
             message: "pick feature".into(),
             no_commit: 1,
+            inherit_metadata: LoreArray::default(),
         };
         assert_eq!(
             lore::revision::cherry_pick(cherry.globals.clone(), args, None).await,

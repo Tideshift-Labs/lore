@@ -27,6 +27,7 @@ use crate::domain::PLATFORM_METHOD_REPOSITORY_OBLITERATE;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::can_obliterate;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -169,6 +170,7 @@ pub async fn handler(
             immutable_store
                 .obliterate(repository, address, stats.clone())
                 .await
+                .filter_slow_down()?
                 .map_err(|e| {
                     warn!("Failed to obliterate {address}: {e}");
                     if e.is_address_not_found() {
@@ -280,13 +282,15 @@ mod tests {
                 .add(Duration::from_secs(60))
                 .as_secs(),
             audience: vec![TEST_AUDIENCE.to_string()],
-            env: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            env: Some("test".to_string()),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             resources,
             groups: None,
             is_service_account: Some(false),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
+            extra: Default::default(),
         };
         let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
         let mut header = Header::new(ALGORITHM);

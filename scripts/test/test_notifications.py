@@ -45,7 +45,7 @@ def notification_subscribe(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        env=repo._subprocess_env(),
+        env=repo.sandboxed_env(),
     )
 
     collected_output = ""

@@ -3276,9 +3276,14 @@ pub fn lock_fencing_settings_preconditions(settings: &Settings) -> Result<()> {
             "Lock fencing is enabled but no JWK verifier is configured"
         ));
     }
-    if auth.jwt_issuer.as_deref().is_none_or(str::is_empty) {
+    // `jwt_issuer` is a list since upstream v0.10.0. Fenced lock ownership is a
+    // verified (issuer, subject) pair recorded against ONE issuer, so a cell
+    // accepting two (an issuer cutover) cannot fence: refuse anything but
+    // exactly one non-empty issuer (merge decision D3).
+    if !matches!(auth.jwt_issuer.as_slice(), [issuer] if !issuer.is_empty()) {
         return Err(anyhow!(
-            "Lock fencing is enabled but no non-empty JWT issuer policy is configured"
+            "Lock fencing is enabled but [server.auth] jwt_issuer does not name exactly one \
+             non-empty issuer"
         ));
     }
     if !auth.enforce_write_permission {
@@ -4297,7 +4302,6 @@ mod tests {
     use super::test_support::context;
     use super::test_support::preparing_context;
     use super::*;
-    use crate::auth::jwk::JWKServiceSettings;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_KEY;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_V1_LEN;
     use crate::grpc::domain_operation_metadata::FINGERPRINT_VERSION_V1;
@@ -6206,14 +6210,20 @@ mod tests {
             .as_mut()
             .expect("default lock store")
             .mode = POSTGRES_MODE.to_owned();
-        settings.server.auth = Some(AuthSettings {
-            jwk: Some(JWKServiceSettings {
-                endpoint: "https://issuer.example/.well-known/jwks.json".to_owned(),
-            }),
-            jwt_audience: None,
-            jwt_issuer: Some("https://issuer.example".to_owned()),
-            enforce_write_permission: true,
-        });
+        // Built from TOML rather than a struct literal: upstream v0.10.0 grew
+        // `AuthSettings` (mandatory audience, list issuer, authorizer keys).
+        let auth: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://issuer.example"
+            jwt_audience = ["lore"]
+            enforce_write_permission = true
+
+            [jwk]
+            endpoint = "https://issuer.example/.well-known/jwks.json"
+            "#,
+        )
+        .expect("fenced [server.auth] fixture must deserialize");
+        settings.server.auth = Some(auth);
         settings
     }
 
@@ -6239,8 +6249,16 @@ mod tests {
         assert!(resolve_lock_fencing(&readiness, &no_jwk).is_err());
 
         let mut no_issuer = fenced_settings();
-        no_issuer.server.auth.as_mut().expect("auth").jwt_issuer = None;
+        no_issuer.server.auth.as_mut().expect("auth").jwt_issuer = Vec::new();
         assert!(resolve_lock_fencing(&readiness, &no_issuer).is_err());
+
+        // D3: an issuer cutover list cannot pin a fenced owner pair.
+        let mut two_issuers = fenced_settings();
+        two_issuers.server.auth.as_mut().expect("auth").jwt_issuer = vec![
+            "https://issuer.example".to_owned(),
+            "https://issuer-next.example".to_owned(),
+        ];
+        assert!(resolve_lock_fencing(&readiness, &two_issuers).is_err());
 
         let mut no_write_enforcement = fenced_settings();
         no_write_enforcement
@@ -6443,7 +6461,7 @@ mod tests {
         assert!(!err.to_string().contains("domain cutover"), "{err}");
 
         let mut no_issuer = fenced_settings();
-        no_issuer.server.auth.as_mut().expect("auth").jwt_issuer = None;
+        no_issuer.server.auth.as_mut().expect("auth").jwt_issuer = Vec::new();
         let err =
             resolve_lock_fencing(&readiness, &no_issuer).expect_err("missing issuer must refuse");
         assert!(!err.to_string().contains("domain cutover"), "{err}");

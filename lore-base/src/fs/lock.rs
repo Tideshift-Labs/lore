@@ -35,7 +35,10 @@ impl FSLock {
     /// Acquires an exclusive lock guarding `path`, waiting asynchronously
     /// — non-blocking lock attempts with timed retries — while another
     /// process holds it, so a contended lock never parks a runtime thread.
-    pub async fn acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<FSLock> {
+    pub async fn acquire_file_lock(
+        path: impl AsRef<Path>,
+        create_directory_if_necessary: bool,
+    ) -> std::io::Result<FSLock> {
         let mut path = path.as_ref().to_path_buf();
         let mut file_name = path
             .file_name()
@@ -44,6 +47,9 @@ impl FSLock {
             ))?
             .to_owned();
         path.pop();
+        if create_directory_if_necessary && !path.exists() {
+            std::fs::create_dir_all(&path)?;
+        }
         let mut path = path.canonicalize()?;
         file_name.push(".lock");
         path.push(file_name);
@@ -239,27 +245,7 @@ impl Drop for FSLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A directory to lock, removed when the test ends.
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-            std::fs::create_dir_all(&path).expect("failed to create temp dir");
-            TempDir(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_util::TempDir;
 
     /// The lock excludes a second acquirer, which waits rather than failing. Both `flock` and
     /// `LockFileEx` contend between separate handles on one file, so one process is enough to

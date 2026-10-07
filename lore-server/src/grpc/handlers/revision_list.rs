@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,15 +11,12 @@ use lore_proto::RevisionItem;
 use lore_proto::RevisionListRequest;
 use lore_proto::RevisionListResponse;
 use lore_proto::revision_list_request::Start;
-use lore_revision::branch;
-use lore_revision::find::FindMatchResult;
-use lore_revision::find::find_revision;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::revision::{self};
+use lore_revision::state::State;
 use lore_revision::state::{self};
 use lore_revision::util;
 use lore_telemetry::LabelArray;
@@ -42,7 +38,6 @@ use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
-use crate::grpc::get_write_token;
 use crate::grpc::revision_service::RevisionListInstruments;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
@@ -166,66 +161,38 @@ async fn resolve_start(
             let branch = BranchId::from(&identifier.branch);
 
             let step_key_hit = if acceleration.step_keys {
-                let (key, key_type) = branch::revision_step_key(
-                    repository::SALT_LORE,
-                    repository.id,
+                crate::cache::revision::resolve_via_step_key(
+                    repository,
                     branch,
                     identifier.number,
                     history_step_size,
-                );
-                // Ignore errors as this is just an acceleration construct
-                // This will be recreated on the lookup
-                repository
-                    .read_mutable_store()
-                    .load(repository.id, key, key_type)
-                    .await
-                    .ok()
-                    .map(|revision| (key, revision))
+                )
+                .await
+                .filter_slow_down()?
+                .unwrap_or_default()
             } else {
                 None
             };
 
-            if let Some((key, revision)) = step_key_hit {
-                debug!(
-                    number = %identifier.number,
-                    key = %key,
-                    "Found history step key"
-                );
-                // Now we have found the start revision of the containing HISTORY_STEP_SIZE
-                // block of revisions. Now we search for the exact matching revision.
-                let hash = find_revision(
-                    repository.clone(),
-                    branch,
-                    revision,
-                    false,
-                    None,
-                    |state, _metadata| {
-                        let state_revision_number = state.revision_number();
-                        match state_revision_number.cmp(&identifier.number) {
-                            Ordering::Equal => FindMatchResult::Match,
-                            Ordering::Less => FindMatchResult::Abort,
-                            Ordering::Greater => FindMatchResult::Continue,
-                        }
-                    },
-                )
-                .await
-                .map_err(|err| Status::invalid_argument(format!("invalid identifier {err}")))?;
+            if let Some(hash) = step_key_hit {
                 (hash, RevisionListStrategy::HistoryStep)
             } else {
                 let signature = format!("{}@{}", branch, identifier.number);
-                let hash = revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
-                )
-                .await
-                .map_err(|err| Status::invalid_argument(format!("invalid identifier {err}")))?;
+                let hash =
+                    revision::resolve(repository.clone(), signature, ResolveSearchLocation::Local)
+                        .await
+                        .filter_slow_down()?
+                        .map_err(|err| {
+                            Status::invalid_argument(format!("invalid identifier {err}"))
+                        })?;
 
                 (hash, RevisionListStrategy::FullIteration)
             }
         }
-        Start::Signature(signature) => (Hash::from(signature), RevisionListStrategy::Direct),
+        Start::Signature(signature) => (
+            crate::grpc::revision_signature(signature)?,
+            RevisionListStrategy::Direct,
+        ),
     };
 
     Ok(start_info)
@@ -259,10 +226,10 @@ async fn walk_revisions(
     let mut items = Vec::with_capacity(MAX_REVISION_LIST_RESPONSE_ITEMS);
 
     let mut base_revision = true;
-    // Track previous revision for step key backfill during full iteration.
-    // Stores (revision_number, revision_hash, metadata_hash) so the branch
-    // can be read from the revision metadata at boundary crossings.
-    let mut prev_step_info: Option<(u64, Hash, Hash)> = None;
+    // The revision visited before this one, held for the step key backfill
+    // below: sealing a boundary needs both sides of the crossing, and the
+    // branch comes from the newer side's metadata.
+    let mut prev_step_state: Option<Arc<State>> = None;
 
     while items.len() < MAX_REVISION_LIST_RESPONSE_ITEMS {
         let state = {
@@ -299,6 +266,9 @@ async fn walk_revisions(
             break;
         }
 
+        // no filter_slow_down()? usage here: this read only feeds an age
+        // metric, and a request must not fail because a metric could not be
+        // recorded.
         if base_revision
             && let Ok(metadata) =
                 Metadata::deserialize(repository.clone(), state.metadata_hash()).await
@@ -314,40 +284,41 @@ async fn walk_revisions(
 
         let current_number = state.revision_number();
 
-        // Backfill missing history step keys during full iteration walks.
-        // When we detect a step boundary crossing between consecutive
-        // revisions, write the step key for the higher-numbered revision
-        // so future lookups can use the HistoryStep strategy. The branch
+        // Backfill missing history step keys during full iteration walks, so
+        // later lookups can take the HistoryStep strategy. Each boundary
+        // crossed between the two revisions is sealed with the older of them,
+        // the highest revision numbered at or below that boundary. The branch
         // is read from the revision metadata rather than carried from the
         // request identifier.
         if allow_repairs
             && matches!(strategy, RevisionListStrategy::FullIteration)
-            && let Some((prev_number, prev_hash, prev_metadata_hash)) = prev_step_info
-            && prev_number / history_step_size != current_number / history_step_size
+            && let Some(previous_state) = &prev_step_state
+            && let Some((lowest_b, highest_b)) = crate::cache::revision::sealed_boundaries(
+                state.revision_number(),
+                previous_state.revision_number(),
+                history_step_size,
+            )
+            // no filter_slow_down()? usage here: this read only enables the
+            // best-effort step-key backfill below.
             && let Ok(metadata) =
-                Metadata::deserialize(repository.clone(), prev_metadata_hash).await
+                Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
             && let Ok(branch) = metadata.get_branch()
         {
-            let (key, key_type) = branch::revision_step_key(
-                repository::SALT_LORE,
-                repository.id,
-                branch,
-                prev_number,
-                history_step_size,
-            );
-            let write_token = get_write_token();
-            let _ = repository
-                .write_mutable_store(&write_token)
-                .store(repository.id, key, prev_hash, key_type)
+            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+                let _ = crate::cache::revision::seal_boundary_revision_number(
+                    repository.clone(),
+                    branch,
+                    history_step_size,
+                    boundary,
+                    &state,
+                    previous_state,
+                )
                 .await;
-            debug!(
-                number = prev_number,
-                key = %key,
-                "Backfilled history step key"
-            );
+                debug!(boundary, "Backfilled history step key");
+            }
         }
         if matches!(strategy, RevisionListStrategy::FullIteration) {
-            prev_step_info = Some((current_number, revision, state.metadata_hash()));
+            prev_step_state = Some(state.clone());
         }
 
         let item = RevisionItem {

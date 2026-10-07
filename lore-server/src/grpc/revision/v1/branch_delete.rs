@@ -26,6 +26,7 @@ use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -205,15 +206,15 @@ async fn branch_delete_local(
                     .branch_deleted(repository_id, branch_id)
                     .await;
                 hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
-                let mut record = build_branch(
-                    repository,
+                // The committed final latest is the response's latest; upstream's
+                // `build_branch` now takes it as a parameter instead of reading it.
+                let record = build_branch(
                     branch_id,
                     &committed.metadata,
                     committed.metadata_hash,
                     true,
-                )
-                .await?;
-                record.latest = committed.final_latest_hash.into();
+                    committed.final_latest_hash,
+                );
                 return Ok(Response::new(BranchDeleteResponse {
                     branch: Some(record),
                 }));
@@ -222,11 +223,14 @@ async fn branch_delete_local(
             // can still build the response from the preserved metadata.
             let pre_metadata = branch::metadata(repository.clone(), branch_id)
                 .await
+                .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
 
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 
-            let delete_result = branch::delete(repository.clone(), branch_id).await;
+            let delete_result = branch::delete(repository.clone(), branch_id)
+                .await
+                .filter_slow_down()?;
             let actually_deleted = match delete_result {
                 Ok(()) => true,
                 Err(err) if err.is_branch_not_found() => {
@@ -264,12 +268,20 @@ async fn branch_delete_local(
                 hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
             }
 
+            // no filter_slow_down()? usage here: the delete has already
+            // happened, so this response read must not return a retryable
+            // status.
             let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
                 .await
                 .warn_map_err(|err| Status::internal(err.to_string()))?;
 
+            // no filter_slow_down()? usage here: the delete has already
+            // happened, so an unreadable latest must not fail it.
+            let latest = branch::load_latest(repository, branch_id)
+                .await
+                .unwrap_or_default();
             let response_branch =
-                build_branch(repository, branch_id, &pre_metadata, metadata_hash, true).await?;
+                build_branch(branch_id, &pre_metadata, metadata_hash, true, latest);
 
             Ok(Response::new(BranchDeleteResponse {
                 branch: Some(response_branch),

@@ -4,6 +4,9 @@ use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use lore_base::error::ShutDown;
+use lore_error_set::FfiError;
+
 pub type LoreEvent = lore_revision::interface::LoreEvent;
 
 /// Return the tag identifying the type of an event.
@@ -23,7 +26,7 @@ pub extern "C" fn lore_event_type(event: &LoreEvent) -> u32 {
 /// A caller that sees it must treat the mutation as neither applied nor rejected. Reading
 /// current state does not resolve it: a later read reports where the repository is now, not what
 /// this attempt did. Retrying is the one response that is always wrong.
-pub const LORE_STATUS_OUTCOME_UNKNOWN: i32 = 193;
+pub const LORE_STATUS_OUTCOME_UNKNOWN: i32 = 248;
 
 // Ties the C-visible number to the Rust enum. A code that moves in `lore-base` fails the build
 // here rather than leaving the header describing the old numbering.
@@ -96,6 +99,10 @@ pub type LoreRevisionInfoDeltaEventData =
     lore_revision::revision::info::LoreRevisionInfoDeltaEventData;
 pub type LoreRevisionCommitRevisionEventData =
     lore_revision::commit::LoreRevisionCommitRevisionEventData;
+pub type LoreRevisionCommitStatsEventData = lore_revision::commit::LoreRevisionCommitStatsEventData;
+pub type LoreCommitFileStatsData = lore_revision::commit::LoreCommitFileStatsData;
+pub type LoreBranchPushStatsEventData = lore_revision::branch::push::LoreBranchPushStatsEventData;
+pub type LoreFragmentStatsData = lore_storage::FragmentWriteCounts;
 pub type LoreRevisionSyncProgressEventData =
     lore_revision::revision::sync::LoreRevisionSyncProgressEventData;
 pub type LoreRevisionSyncFileEventData =
@@ -103,6 +110,8 @@ pub type LoreRevisionSyncFileEventData =
 pub type LoreRevisionSyncRevisionEventData =
     lore_revision::revision::sync::LoreRevisionSyncRevisionEventData;
 pub type LoreRevisionBisectEventData = lore_revision::revision::bisect::LoreRevisionBisectEventData;
+pub type LoreRevisionResolveEventData = lore_revision::revision::LoreRevisionResolveEventData;
+pub type LoreRevisionResolveTarget = lore_revision::revision::LoreRevisionResolveTarget;
 pub type LoreLinkChangeEventData = lore_revision::link::LoreLinkChangeEventData;
 pub type LoreLinkEntryEventData = lore_revision::event::LoreLinkEntryEventData;
 pub type LoreLinkBranchCreateEventData = lore_revision::link::LoreLinkBranchCreateEventData;
@@ -330,10 +339,20 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 
 /// Resolve user identities to display names from locally stored JWT tokens.
 ///
-/// Does not contact the auth service. Decodes cached JWT tokens to extract
-/// display names. For user IDs without a local token, returns the raw user
+/// Decodes cached JWT tokens to extract display names without contacting the
+/// auth service. For user IDs without a local token, returns the raw user
 /// ID. For remote resolution with proper authorization, use
 /// `lore_auth_user_info` which queries the remote authentication service.
+///
+/// When `with_identity_token` is set, identities with a locally stored token
+/// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
+/// token instead of `AUTH_USER_INFO`.
+///
+/// When `with_access_token` is set, the call requires a repository and
+/// additionally emits one `AUTH_IDENTITY` event carrying the
+/// repository-scoped authorization (access) token for the current user. A
+/// valid cached token is reused. Otherwise a token exchange is performed
+/// against the auth service, so this variant can contact the network.
 ///
 /// # Events
 ///
@@ -355,6 +374,8 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
+/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_local_user_info(
     globals: &LoreGlobalArgs,
@@ -603,7 +624,7 @@ pub type LoreBranchDiffArgs = crate::branch::LoreBranchDiffArgs;
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming |
+/// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming. Includes the resolved branch names and revisions being compared |
 /// | `LORE_EVENT_BRANCH_DIFF_CHANGE_BEGIN` | `lore_branch_diff_change_begin_event_data_t` | Emitted before the list of changed files begins |
 /// | `LORE_EVENT_BRANCH_DIFF_CHANGE` | `lore_branch_diff_change_event_data_t` | Emitted for each changed file between the two branches |
 /// | `LORE_EVENT_BRANCH_DIFF_CHANGE_END` | `lore_branch_diff_change_end_event_data_t` | Emitted after all changed files have been reported |
@@ -641,7 +662,7 @@ pub extern "C" fn lore_branch_diff(
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming |
+/// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming; carries the resolved branch names and revisions being compared |
 /// | `LORE_EVENT_BRANCH_DIFF_CHANGE_BEGIN` | `lore_branch_diff_change_begin_event_data_t` | Emitted before the list of changed files begins |
 /// | `LORE_EVENT_BRANCH_DIFF_CHANGE` | `lore_branch_diff_change_event_data_t` | Emitted for each changed file between the two branches |
 /// | `LORE_EVENT_BRANCH_DIFF_CHANGE_END` | `lore_branch_diff_change_end_event_data_t` | Emitted after all changed files have been reported |
@@ -1528,7 +1549,7 @@ pub type LoreBranchSwitchArgs = crate::branch::LoreBranchSwitchArgs;
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization |
 /// | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted with the resulting revision after switch |
 /// | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
-/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial revision reference |
+/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_switch(
     globals: &LoreGlobalArgs,
@@ -1566,7 +1587,7 @@ pub extern "C" fn lore_branch_switch(
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization |
 /// | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted with the resulting revision after switch |
 /// | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
-/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial revision reference |
+/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_switch_async(
     globals: &LoreGlobalArgs,
@@ -5011,7 +5032,7 @@ pub type LoreRevisionDiffArgs = crate::revision::LoreRevisionDiffArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REVISION_DIFF_FILE` | `lore_revision_diff_file_event_data_t` | Emitted for each file that differs between the two revisions |
-/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_diff(
     globals: &LoreGlobalArgs,
@@ -5043,7 +5064,7 @@ pub extern "C" fn lore_revision_diff(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REVISION_DIFF_FILE` | `lore_revision_diff_file_event_data_t` | Emitted for each file that differs between the two revisions |
-/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_diff_async(
     globals: &LoreGlobalArgs,
@@ -5119,7 +5140,7 @@ pub extern "C" fn lore_revision_find_async(
 
 pub type LoreRevisionHistoryArgs = crate::revision::LoreRevisionHistoryArgs;
 
-/// Retrieve the commit history of the current branch.
+/// Retrieve the revision history of the current branch.
 ///
 /// # Events
 ///
@@ -5548,7 +5569,7 @@ pub type LoreRevisionSyncArgs = crate::revision::LoreRevisionSyncArgs;
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file deleted, modified, added, or merged during sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization and once at completion with cumulative update/delete/automerge/conflict counts |
 /// | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted once at the end with the resulting revision, branch, and merge/conflict flags |
-/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 /// | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
 /// | `LORE_EVENT_BRANCH_MERGE_START_BEGIN` | `lore_branch_merge_start_begin_event_data_t` | Emitted when an auto-merge is initiated (diverged branches) |
 /// | `LORE_EVENT_BRANCH_MERGE_START_END` | `lore_branch_merge_start_end_event_data_t` | Emitted when the auto-merge operation completes |
@@ -5594,7 +5615,7 @@ pub extern "C" fn lore_revision_sync(
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file deleted, modified, added, or merged during sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization and once at completion with cumulative update/delete/automerge/conflict counts |
 /// | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted once at the end with the resulting revision, branch, and merge/conflict flags |
-/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+/// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 /// | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
 /// | `LORE_EVENT_BRANCH_MERGE_START_BEGIN` | `lore_branch_merge_start_begin_event_data_t` | Emitted when an auto-merge is initiated (diverged branches) |
 /// | `LORE_EVENT_BRANCH_MERGE_START_END` | `lore_branch_merge_start_end_event_data_t` | Emitted when the auto-merge operation completes |
@@ -6467,11 +6488,13 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 
 /// Store one or more buffers and publish a mutable key naming each, in one round trip.
 ///
-/// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
-/// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
-/// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
-/// stored — so a key published this way never resolves to content that is not there. Writing the
-/// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+/// `lore_storage_put` followed by `lore_storage_mutable_store`, with the mapping riding on
+/// whichever request carries the content's top-level fragment rather than costing one of its own.
+/// The key is published under `LORE_KEY_TYPE_RESOLVE`, making it readable by
+/// `lore_storage_get_resolved`, and the mapping is written only once the content is stored — so a
+/// key published this way never resolves to content that is not there. Writing the same key type
+/// directly with `lore_storage_mutable_store` carries no such guarantee. Content the server
+/// already holds uploads nothing, so its key takes a mapping write instead — still one request.
 ///
 /// The local store always receives both the content and the mapping. `remote_write = 1` also
 /// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
@@ -6899,10 +6922,12 @@ pub type LoreStorageGetFileArgs = crate::storage::get_file::LoreStorageGetFileAr
 
 /// Write content-addressed payloads to filesystem paths.
 ///
-/// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or
-/// DATA events are produced — the payload is written straight to disk.
-/// On partial-write failure the library leaves whatever state the
-/// failure produced; cleanup is the caller's responsibility.
+/// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or DATA events are produced —
+/// the payload is written straight to disk. Multi-fragment writes stage through `<path>.loretmp`
+/// and rename atomically, and a failure mid-write removes the temp file, so the target is either
+/// the finished range or untouched. An `offset` past the end of the content is rejected with
+/// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
+/// survives.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_file(
     globals: &LoreGlobalArgs,
@@ -6920,6 +6945,130 @@ pub extern "C" fn lore_storage_get_file_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::storage::get_file::get_file);
+}
+
+pub type LoreStoragePutFileResolvedItem =
+    crate::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+pub type LoreStoragePutFileResolvedArgs =
+    crate::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+
+/// Store one or more files and publish a mutable key naming each, in one round trip.
+///
+/// `lore_storage_put_resolved` reading its content from a path instead of a buffer, and identical
+/// to it in everything but the source: the key is published under `LORE_KEY_TYPE_RESOLVE`, the
+/// mapping is written only once the content is stored, publishing is last-writer-wins, and
+/// `remote_write = 1` publishes remotely as well as locally.
+///
+/// The caller never loads the file, and the library holds no more than one fragment of it: a file
+/// at or below the fragment threshold is read once into the single fragment it becomes, a larger
+/// one chunks straight off disk.
+///
+/// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`, as does a missing,
+/// unreadable, or non-file `path` — a path that cannot be read is never taken for a delete, so a
+/// typo cannot retract a live key. A **zero-length** file does retract it, exactly as a
+/// zero-length `data` does in `lore_storage_put_resolved`.
+///
+/// A remote content upload that fails still leaves a successful local write, so the key is not
+/// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+/// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_file_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_file_resolved::put_file_resolved,
+    )
+}
+
+/// Store one or more files and publish a mutable key naming each (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_file_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_file_resolved::put_file_resolved,
+    );
+}
+
+pub type LoreStorageGetFileResolvedItem =
+    crate::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+pub type LoreStorageGetFileResolvedArgs =
+    crate::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+
+/// Resolve one or more mutable keys and write the content they name to filesystem paths, in one
+/// round trip.
+///
+/// `lore_storage_get_resolved` writing to a path instead of to the callback. Nothing is held whole
+/// on either side of the boundary: the resolve and the read of the root fragment share one request,
+/// and the content goes to disk fragment by fragment at its own offset, so a key naming something
+/// large needs neither the `streaming` mode nor a buffer for it. No
+/// `LORE_EVENT_STORAGE_GET_HEADER` or `LORE_EVENT_STORAGE_GET_DATA` is emitted, as with
+/// `lore_storage_get_file`.
+///
+/// The terminal event's `address` is the *resolved* address, so a caller still learns the
+/// key-to-hash mapping. A key with no mapping, or one naming absent content, reports
+/// `error_code = ADDRESS_NOT_FOUND`, carries a zero address, and leaves `path` untouched — there is
+/// no zero-hash truncation as in `lore_storage_get_file`, because a resolve that finds nothing is a
+/// miss rather than an address for empty content.
+///
+/// `offset` and `length` select part of the content and multi-fragment writes stage through
+/// `<path>.loretmp` before an atomic rename, both as in `lore_storage_get_file`: the file holds
+/// exactly the requested range from its own first byte, and the target is either the finished range
+/// or untouched. A start past the end is rejected with `INVALID_ARGUMENTS` without opening the
+/// target, so a destination that was already there survives.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event, carrying the resolved address |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_file_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_file_resolved::get_file_resolved,
+    )
+}
+
+/// Resolve mutable keys and write the content they name to files (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_file_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_file_resolved::get_file_resolved,
+    );
 }
 
 pub type LoreStorageUploadArgs = crate::storage::upload::LoreStorageUploadArgs;
@@ -6952,7 +7101,11 @@ pub extern "C" fn lore_storage_upload_async(
 
 pub type LoreServiceStartArgs = crate::service::LoreServiceStartArgs;
 
-/// Start the Lore background service.
+/// Start the Lore background service, unless one is already running.
+///
+/// Connects to the running service, and starts one when nothing is listening.
+/// Returns `0` once a service is reachable, whether it was already running or
+/// was started by this call.
 ///
 /// # Events
 ///
@@ -7004,7 +7157,10 @@ pub extern "C" fn lore_service_start_async(
 
 pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 
-/// Stop the Lore background service.
+/// Stop the running Lore background service.
+///
+/// Does not start a service in order to stop one. Returns `0` when no service
+/// is running, since that is the state the call asks for.
 ///
 /// # Events
 ///
@@ -7052,6 +7208,129 @@ pub extern "C" fn lore_service_stop_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::service::stop);
+}
+
+pub type LoreServiceSetExecutableArgs = crate::service::LoreServiceSetExecutableArgs;
+
+/// Name the executable the Lore background service runs from, for this machine.
+///
+/// Written to the user-level global config, so it holds for later commands and
+/// for other clients that read it. An empty `executable` clears the setting.
+/// Naming it decides which build serves the machine, rather than leaving that to
+/// whichever client happens to start a service first.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_executable(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetExecutableArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::service::set_executable)
+}
+
+/// Asynchronous version of `lore_service_set_executable`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_executable_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetExecutableArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::service::set_executable);
+}
+
+pub type LoreServiceSetUseAutomaticallyArgs = crate::service::LoreServiceSetUseAutomaticallyArgs;
+
+/// Set whether commands are carried out by the Lore background service.
+///
+/// Written to the user-level global config, so the service stays in use for
+/// later commands rather than for one command at a time. A non-zero `enabled`
+/// turns it on; zero turns it off.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_use_automatically(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetUseAutomaticallyArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::service::set_use_automatically,
+    )
+}
+
+/// Asynchronous version of `lore_service_set_use_automatically`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_service_set_use_automatically_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreServiceSetUseAutomaticallyArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::service::set_use_automatically,
+    );
 }
 
 pub type LoreNotificationSubscribeArgs = crate::notification::LoreNotificationSubscribeArgs;
@@ -7207,8 +7486,11 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 /// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shutdown() -> i32 {
-    crate::shutdown();
-    0
+    if crate::shutdown() {
+        0
+    } else {
+        ShutDown.ffi_code()
+    }
 }
 
 /// Limits the total number of threads Lore sizes its pools for.
@@ -7416,7 +7698,11 @@ pub extern "C" fn lore_repository_instance_list_async(
 
 pub type LoreRepositoryInstancePruneArgs = crate::repository::LoreRepositoryInstancePruneArgs;
 
-/// Remove stale instances of the repository that are no longer present.
+/// Remove stale instances of the repository: those whose path no longer
+/// exists, those whose path holds no checkout, and those whose path now holds
+/// a repository naming a different current instance. Each removed instance is
+/// reported through a `RepositoryInstance` event whose `stale` field gives the
+/// reason.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_repository_instance_prune(
     globals: &LoreGlobalArgs,
@@ -8223,4 +8509,62 @@ pub extern "C" fn lore_revision_tree_commit_async(
         callback,
         crate::revision_tree::commit::commit,
     );
+}
+
+/// Select how payloads are compressed before they are stored, over
+/// `lore_storage::COMPRESSION_MODE`.
+///
+/// `mode` is a `lore_compression_mode_t` value, which names what each mode does.
+///
+/// The default attempts compression, which is wasted work for a caller whose
+/// payloads arrive already compressed: the attempt reads every byte written and
+/// buys nothing back. A caller that knows the shape of its own data can say so.
+///
+/// Applies to payloads written after the call. Content already stored keeps the
+/// encoding it was written with, since every fragment records its own.
+///
+/// A mode selected here outranks the one a server states it prefers in the
+/// environment it answers a connection with: that preference is taken only where
+/// no mode has been selected yet, so a call made before the first connection
+/// stands.
+///
+/// Returns `0` when the mode was applied and `3`
+/// (`LORE_ERROR_CODE_INVALID_ARGUMENTS`) when it was not, in which case the call
+/// does nothing. Rejected are any value the enum does not name, and
+/// `LORE_COMPRESSION_MODE_OODLE`: `compress` refuses that mode as deprecated
+/// whether or not the `oodle` feature is compiled in, so accepting it here would
+/// only move the failure to the first write.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_set_compression_mode(mode: u32) -> i32 {
+    use lore_revision::event::LoreErrorCode;
+
+    if lore_storage::writable_compression_mode(mode).is_none() {
+        return LoreErrorCode::InvalidArguments as i32;
+    }
+    lore_storage::COMPRESSION_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    LoreErrorCode::None as i32
+}
+
+/// Select the level payloads are compressed at.
+///
+/// `level` is a zstd level, `1` through `22`, trading time spent per byte for
+/// bytes stored, or `-1` for the level each codec defaults to, `6` for zstd. A
+/// level outside the range a codec accepts is clamped into it, one level serving
+/// every codec and each accepting its own, so `0` selects the lowest zstd has.
+///
+/// The `LORE_COMPRESSION_LEVEL` environment variable outranks this selection where
+/// it names a level the codec accepts.
+///
+/// Call before the first payload is written: the level is read once, by the first
+/// compression, which sizes the workspace every later one is built in.
+///
+/// Returns `0` when the level was selected and `1` when a payload had already
+/// fixed it, in which case the selection decides nothing.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_set_compression_level(level: i32) -> i32 {
+    if lore_storage::set_compression_level(level) {
+        lore_revision::event::LoreErrorCode::None as i32
+    } else {
+        1
+    }
 }

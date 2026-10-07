@@ -7,17 +7,20 @@ use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio_stream::StreamExt;
 
 use crate::branch;
+use crate::errors::SlowDown;
+use crate::errors::absent_unless;
 use crate::event;
 use crate::immutable;
 use crate::immutable::ReadFromImmutable;
+use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
+use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_trace;
 use crate::metadata::Metadata;
@@ -28,9 +31,18 @@ use crate::state::StateData;
 pub const DEFAULT_SEARCH_LIMIT: usize = 1000;
 
 #[error_set]
-pub enum FindError {}
+pub enum FindError {
+    SlowDown,
+}
 
-impl crate::event::EventError for FindError {}
+impl event::EventError for FindError {
+    fn translated(&self) -> LoreError {
+        match self {
+            FindError::SlowDown(_) => LoreError::SlowDown,
+            FindError::Internal(_) => LoreError::Internal,
+        }
+    }
+}
 
 pub enum FindMatchResult {
     Match,
@@ -38,6 +50,12 @@ pub enum FindMatchResult {
     Abort,
 }
 
+/// Walk a branch's history from `revision` until `matcher` accepts a revision.
+///
+/// A zero `revision` starts from the branch latest, preferring the remote one so
+/// a search covers revisions the local store has not seen. An offline or
+/// local-only operation takes the local latest alone, since waiting on the
+/// connect is the whole cost such an operation asked to avoid.
 pub async fn find_revision<F>(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
@@ -51,15 +69,23 @@ where
 {
     let mut revision = revision;
     if revision.is_zero() {
-        if let Ok(remote) = repository.remote().await {
+        if !execution_context().globals().offline_or_local()
+            && let Ok(remote) = repository.remote().await
+        {
+            // no propagation here: a throttled or unreachable remote is what
+            // the local fallback below exists for, so it stays a zero latest
+            // rather than a failure.
             revision = branch::load_remote_latest(remote, repository.id, branch)
                 .await
                 .unwrap_or_default();
         }
         if revision.is_zero() {
-            revision = branch::load_latest(repository.clone(), branch)
-                .await
-                .unwrap_or_default();
+            revision = absent_unless::<_, _, FindError>(
+                branch::load_latest(repository.clone(), branch).await,
+                branch::BranchError::is_slow_down,
+                "loading branch latest",
+            )?
+            .unwrap_or_default();
         }
     }
     lore_debug!("Find start revision {}", revision);
@@ -223,94 +249,6 @@ pub async fn revision_by_number(
                     FindMatchResult::Continue
                 }
             }
-        },
-    )
-    .await
-}
-
-/// Find revision in any branch, or orphaned, by (partial) revision string
-pub async fn revision_by_string(
-    repository: Arc<RepositoryContext>,
-    current_branch: BranchId,
-    signature: &str,
-    search_limit: Option<usize>,
-) -> Result<Hash, FindError> {
-    if !current_branch.is_zero()
-        && let Ok(revision) = crate::find::revision_by_string_in_branch(
-            repository.clone(),
-            signature,
-            current_branch,
-            search_limit,
-        )
-        .await
-    {
-        return Ok(revision);
-    }
-
-    // TODO(mjansson): This should use partial match in immutable store instead
-    // TODO(mjansson): Default branch first
-    if let Ok(mut list) = branch::list(repository.clone()).await {
-        while let Some(branch) = list.next().await {
-            if branch == current_branch {
-                continue;
-            }
-
-            if let Ok(revision) =
-                revision_by_string_in_branch(repository.clone(), signature, branch, search_limit)
-                    .await
-            {
-                return Ok(revision);
-            }
-        }
-    }
-
-    if let Ok(remote) = repository.remote().await {
-        let list = branch::list_remote(remote, repository.id)
-            .await
-            .unwrap_or_default();
-        for branch in &list {
-            if let Ok(revision) =
-                revision_by_string_in_branch(repository.clone(), signature, branch.id, search_limit)
-                    .await
-            {
-                return Ok(revision);
-            }
-        }
-    }
-
-    Err(FindError::internal("no revision found"))
-}
-
-/// Find revision in specific branch by (partial) revision string
-pub async fn revision_by_string_in_branch(
-    repository: Arc<RepositoryContext>,
-    signature: &str,
-    branch: BranchId,
-    search_limit: Option<usize>,
-) -> Result<Hash, FindError> {
-    if signature.is_empty() {
-        return Err(FindError::internal("signature too short"));
-    }
-    if signature.len() > 64 {
-        return Err(FindError::internal("signature too long"));
-    }
-
-    let signature = signature.to_lowercase();
-
-    find_revision(
-        repository.clone(),
-        branch,
-        Hash::default(),
-        false, /* Without metadata */
-        search_limit,
-        |state, _metadata| {
-            // Does signature string (partially) match against revision hash?
-            let state_revision = state.revision().to_string().to_ascii_lowercase();
-            if state_revision.starts_with(&signature) {
-                return FindMatchResult::Match;
-            }
-
-            FindMatchResult::Continue
         },
     )
     .await

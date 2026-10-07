@@ -46,6 +46,7 @@ pub enum ImmutableError {
     AddressNotFound,
     PayloadNotFound,
     Disconnected,
+    InvalidArguments,
     Maintenance,
     NoRemote,
     NotAuthenticated,
@@ -76,11 +77,13 @@ pub struct LoreFragmentWriteEventData {
     pub deduplicated: u8,
 }
 
-/// Build a `WriteTracker`. When `stats` is set the tracker emits a
-/// `FragmentWrite` event per fragment; otherwise it carries no observer so the
-/// common commit path avoids the per-fragment overhead.
-pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
-    if !stats {
+/// Build a `WriteTracker`. When `per_fragment` is set the tracker emits a
+/// `FragmentWrite` event per fragment; otherwise it carries no observer.
+///
+/// Aggregate counters live on the execution context rather than the tracker, so
+/// this flag governs only the per-fragment events.
+pub fn commit_write_tracker(per_fragment: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
+    if !per_fragment {
         return Arc::new(lore_storage::write_tracker::WriteTracker::new());
     }
     Arc::new(lore_storage::write_tracker::WriteTracker::with_observer(
@@ -92,6 +95,34 @@ pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::Wri
             .send();
         }),
     ))
+}
+
+/// The counters this call's writes report into, or `None` where nothing counts
+/// them: statistics level zero, or outside a call.
+///
+/// Read at each write rather than threaded through the callers, so that a write
+/// carrying no tracker still lands in the operation's totals. At level zero the
+/// whole `lore-storage` write pipeline holds no counters and takes no atomic add
+/// per fragment.
+fn ambient_fragment_stats() -> Option<Arc<lore_storage::FragmentWriteStats>> {
+    let context = crate::runtime::try_execution_context()?;
+    if !context.globals().stats() {
+        return None;
+    }
+    Some(context.fragment_stats().clone())
+}
+
+/// The write context for a call that dispatches background writes into `tracker`.
+pub fn write_context(
+    tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
+) -> lore_storage::WriteContext {
+    lore_storage::WriteContext::tracked(tracker, ambient_fragment_stats())
+}
+
+/// The write context for a call that has no tracker, so its writes run inline
+/// but still land in this call's totals.
+pub fn counted_write_context() -> lore_storage::WriteContext {
+    lore_storage::WriteContext::counted(ambient_fragment_stats())
 }
 
 /// Construct [`WriteOptions`] from a repository context.
@@ -133,20 +164,31 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 /// The correlation id is read here rather than inside the resolver because the
 /// resolver runs wherever the read or write ends up, which is not necessarily
 /// under this command's execution context.
+///
+/// The context holds the session it is handed, so the resolver holds the context
+/// weakly: a strong reference there is a cycle neither end can free, and a context
+/// gone by the time a session resolves has no pool left to pick from.
 fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
     if repository.is_offline() {
         return None;
     }
-    let repository = repository.clone();
-    let correlation_id = crate::lore::execution_context()
-        .globals()
-        .correlation_id
-        .to_string();
-    Some(Arc::new(StorageSession::pending(move || {
-        let repository = repository.clone();
-        let correlation_id = correlation_id.clone();
-        async move { pooled_session(&repository, &correlation_id).await }
-    })))
+    Some(repository.lazy_session(|| {
+        let repository = Arc::downgrade(repository);
+        let correlation_id = crate::lore::execution_context()
+            .globals()
+            .correlation_id
+            .to_string();
+        Arc::new(StorageSession::pending(move || {
+            let repository = repository.clone();
+            let correlation_id = correlation_id.clone();
+            async move {
+                let repository = repository
+                    .upgrade()
+                    .ok_or_else(|| ProtocolError::from(lore_base::error::NoRemote))?;
+                pooled_session(&repository, &correlation_id).await
+            }
+        }))
+    }))
 }
 
 /// A pick from the pool the repository context holds, resolving it on first use.
@@ -172,7 +214,7 @@ pub async fn load_raw_store_retry(
     repository: Partition,
     address: Address,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    lore_storage::read::read_raw(store, repository, address)
+    lore_storage::read::read_raw(store, repository, address, false)
         .await
         .forward("loading raw fragment from store")
 }
@@ -197,7 +239,7 @@ pub async fn store_raw_remote_retry(
     fragment: Fragment,
     payload: Option<Bytes>,
 ) -> Result<(), ImmutableError> {
-    let mut retry = lore_storage::retry(50, 10_000, 60);
+    let mut retry = lore_storage::store_retry();
     loop {
         // The `_outcome` form (WP-120): the plain one collapses a lost response into
         // `Disconnected` below this loop, which the arm two down would then report as a
@@ -388,7 +430,7 @@ pub async fn store_raw_with_tracker(
         buffer,
         cache_local,
         session,
-        tracker,
+        write_context(tracker),
         None,
     )
     .await
@@ -430,7 +472,7 @@ pub async fn write_with_tracker(
         buffer,
         flags,
         session,
-        tracker,
+        write_context(tracker),
         None,
     )
     .await
@@ -465,50 +507,51 @@ pub async fn write_from_file_with_tracker(
     lore_storage::write_from_file(
         repository.immutable_store(),
         repository.id,
-        path,
+        &lore_storage::ContentSource::file(path),
         context,
         flags,
         session,
-        tracker,
+        write_context(tracker),
     )
     .await
     .map(|written| (written.address, written.size_content))
     .forward("writing immutable content from file")
 }
 
+/// The address the content of the file at `path` would be stored under.
+///
+/// Whether a file still holds content already stored is [`file_matches`], which measures against
+/// the fragmentation that content was stored under.
 pub async fn hash_file(
     repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
-    previous: Option<Address>,
-    previous_size: Option<usize>,
+    source: &lore_storage::ContentSource<'_>,
 ) -> Result<Hash, ImmutableError> {
-    lore_storage::hash_file(
-        repository.immutable_store(),
-        repository.id,
-        path,
-        previous,
-        previous_size,
-        None,
-    )
-    .await
-    .forward("hashing file")
+    lore_storage::hash_file(repository.immutable_store(), repository.id, source, None)
+        .await
+        .forward("hashing file")
 }
 
-/// Whether `path` still holds the content `previous` addresses, fetching fragment metadata
+/// Whether `source` still holds the content `previous` addresses, fetching fragment metadata
 /// but never content payloads.
+///
+/// Measured against the fragmentation the content was stored under, which is the only one that
+/// answers for it, so the comparison reaches the remote where the local store no longer holds it.
 pub async fn file_matches(
     repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
     previous: Address,
     previous_size: Option<usize>,
+    source: &lore_storage::ContentSource<'_>,
+    established: &lore_storage::ContentHashes,
 ) -> Result<lore_storage::FileMatch, ImmutableError> {
+    let remote_session = resolve_session(&repository);
     lore_storage::file_matches(
         repository.immutable_store(),
         repository.id,
-        path,
         previous,
         previous_size,
-        None,
+        remote_session,
+        source,
+        established,
     )
     .await
     .forward("comparing file against stored content")
@@ -856,7 +899,6 @@ mod session_tests {
             crate::instance::InstanceId::default(),
             state,
             Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
             None,
         ))
     }
@@ -939,7 +981,7 @@ mod session_tests {
         let error = store_raw_remote_retry(session, absent_address(), Fragment::new_zeroed(), None)
             .await
             .expect_err("an unknown attempt is never a successful put");
-        assert_eq!(error.ffi_code(), 193);
+        assert_eq!(error.ffi_code(), 248);
         let ImmutableError::OutcomeUnknown(unknown) = error else {
             panic!("the typed unknown result must survive the immutable layer");
         };
@@ -974,6 +1016,23 @@ mod session_tests {
         assert!(session.is_none());
     }
 
+    /// The context holds the session it is handed, so the session may not hold the
+    /// context back. A strong reference in the resolver is a cycle neither end can
+    /// free, and the command that built it completes with the context still alive.
+    #[tokio::test]
+    async fn a_resolved_session_does_not_keep_the_context_alive() {
+        let context =
+            context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+        let weak = Arc::downgrade(&context);
+
+        under_execution_context(async { resolve_session(&context) })
+            .await
+            .expect("a context that is not offline resolves a session");
+
+        drop(context);
+        assert_eq!(weak.strong_count(), 0);
+    }
+
     /// A failed connect is an answer a session carries, so one is still built: the
     /// failure belongs in the error the read or write reports.
     #[tokio::test]
@@ -997,12 +1056,13 @@ mod session_tests {
     async fn a_write_on_an_offline_context_stores_locally() {
         let context = context_with_state(RemoteState::Offline).await;
         let payload = Bytes::from_static(b"content with no remote to go to");
-        let address = under_execution_context(write(
+        // Boxed: the write pipeline's future sits at the crate's `future-size-threshold`.
+        let address = under_execution_context(Box::pin(write(
             context.clone(),
             Context::from([0x5au8; 16]),
             payload.clone(),
             WriteOptions::default().with_remote_write(),
-        ))
+        )))
         .await
         .expect("a write with no remote still stores locally");
 

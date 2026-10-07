@@ -30,10 +30,11 @@ use crate::domain::MetadataCasOutcome;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
-use crate::grpc::extract_authorization_header;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
 use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
@@ -87,6 +88,7 @@ async fn validate_binary_blobs(
         let options = lore_revision::immutable::read_options_from_repository(&repo).with_cache();
         if lore_revision::immutable::read(repo.clone(), address, None, options)
             .await
+            .filter_slow_down()?
             .is_err()
         {
             return Err(Status::not_found(format!(
@@ -111,8 +113,7 @@ pub async fn handler(
     let request_authorization = get_authorization_optional(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
@@ -174,7 +175,11 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             authorizer
-                .check_repository_access(authorization, repository_id.into())
+                .check_repository_access(
+                    get_verified_token(&extensions).as_ref(),
+                    repository_id.into(),
+                    None,
+                )
                 .await
                 .map_err(|_err| no_repository_access_status())?;
 
@@ -182,6 +187,7 @@ pub async fn handler(
             let current_metadata = if !expected_hash.is_zero() {
                 Metadata::deserialize(repository.clone(), expected_hash)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         warn_error_to_status(&err, |err| {
                             Status::invalid_argument(format!(
@@ -195,6 +201,7 @@ pub async fn handler(
 
             let proposed_metadata = Metadata::deserialize(repository.clone(), new_hash)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::invalid_argument(format!(
@@ -266,6 +273,7 @@ pub async fn handler(
                         KeyType::RepositoryMetadata,
                     )
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         warn_error_to_status(&err, |err| {
                             Status::internal(format!("failed to update metadata: {err}"))
@@ -430,16 +438,58 @@ mod tests {
         );
     }
 
-    mockall::mock! {
-        pub Authorizer {}
+    /// FORK-LOCAL (Tideshift, CR-029): panics if asked anything. Proof that
+    /// the admission gate decides before any authorization side effect.
+    struct PanicOnAnyCallAuthorizer;
 
-        #[async_trait::async_trait]
-        impl RepositoryAuthorizer for Authorizer {
-            async fn check_repository_access(
-                &self,
-                authorization: Option<String>,
-                repository_id: RepositoryId,
-            ) -> Result<(), Status>;
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for PanicOnAnyCallAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), Status> {
+            panic!("admission must decide before any authorization side effect")
+        }
+    }
+
+    /// Denies every request.
+    struct DenyAllRepositoryAuthorizer;
+
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
+        async fn check_repository_access(
+            &self,
+            token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+            repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), Status> {
+            // FORK-LOCAL (Tideshift, CR-011): the check is asked about the
+            // BODY repository id, with no token on this tokenless request.
+            assert!(token.is_none());
+            assert_eq!(repository_id, RepositoryId::from(REPOSITORY_ID));
+            Err(Status::permission_denied("denied"))
+        }
+    }
+
+    /// Permits, recording that the handler asked with `action: None`.
+    #[derive(Default)]
+    struct RecordingPermitAuthorizer {
+        called_with_action_none: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for RecordingPermitAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            action: Option<&str>,
+        ) -> Result<(), Status> {
+            self.called_with_action_none
+                .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -465,14 +515,11 @@ mod tests {
 
     // CR-029 R-BLOCK-2: a caller that supplies domain-operation carriage
     // against a cell with no coordinator must be refused, never silently
-    // ignored. `.times(0)` on the authorizer is the proof of "refused" over
+    // ignored. `PanicOnAnyCallAuthorizer` is the proof of "refused" over
     // "ignored": the gate must decide before any authorization side effect.
     #[tokio::test]
     async fn carriage_with_no_domain_context_is_refused_before_any_authorization_side_effect() {
         let (immutable, mutable, _) = test_store_create().await.unwrap();
-        let mut mock = MockAuthorizer::new();
-        mock.expect_check_repository_access().times(0);
-
         let mut request = Request::new(RepositoryMetadataSetRequest {
             repository_id: REPOSITORY_ID.to_vec().into(),
             expected_hash: vec![0u8; 32].into(),
@@ -480,9 +527,15 @@ mod tests {
         });
         insert_valid_domain_operation_headers(&mut request);
 
-        let err = handler(request, Arc::new(mock), immutable, mutable, None)
-            .await
-            .unwrap_err();
+        let err = handler(
+            request,
+            Arc::new(PanicOnAnyCallAuthorizer),
+            immutable,
+            mutable,
+            None,
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(err.code(), Code::FailedPrecondition);
     }
@@ -514,21 +567,20 @@ mod tests {
     #[tokio::test]
     async fn auth_configured_no_access_returns_permission_denied() {
         let (immutable, mutable, _) = test_store_create().await.unwrap();
-        let mut mock = MockAuthorizer::new();
-        mock.expect_check_repository_access()
-            .withf(|authorization, repository_id| {
-                authorization.is_none() && repository_id == &RepositoryId::from(REPOSITORY_ID)
-            })
-            .times(1)
-            .returning(|_, _| Err(Status::permission_denied("denied")));
         let request = Request::new(RepositoryMetadataSetRequest {
             repository_id: REPOSITORY_ID.to_vec().into(),
             expected_hash: vec![0u8; 32].into(),
             new_hash: vec![1u8; 32].into(),
         });
-        let err = handler(request, Arc::new(mock), immutable, mutable, None)
-            .await
-            .unwrap_err();
+        let err = handler(
+            request,
+            Arc::new(DenyAllRepositoryAuthorizer),
+            immutable,
+            mutable,
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
         assert_eq!(err.message(), "Unauthorized");
     }
@@ -539,17 +591,20 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let hash = seed_metadata_blob(immutable.clone(), mutable.clone()).await;
-                let mut mock = MockAuthorizer::new();
-                mock.expect_check_repository_access()
-                    .returning(|_, _| Ok(()));
+                let authorizer = Arc::new(RecordingPermitAuthorizer::default());
                 let request = Request::new(RepositoryMetadataSetRequest {
                     repository_id: REPOSITORY_ID.to_vec().into(),
                     expected_hash: vec![0u8; 32].into(),
                     new_hash: hash.into(),
                 });
-                handler(request, Arc::new(mock), immutable, mutable, None)
+                handler(request, authorizer.clone(), immutable, mutable, None)
                     .await
                     .unwrap();
+                assert!(
+                    authorizer
+                        .called_with_action_none
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                );
             })
             .await;
     }

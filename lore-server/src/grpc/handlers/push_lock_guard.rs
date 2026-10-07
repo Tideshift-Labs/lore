@@ -75,18 +75,25 @@ pub enum LockOwnerIssuerPolicy {
     /// therefore every lock row it admitted — carries exactly this issuer. A
     /// stored subject plus this issuer is a provable owner pair.
     Pinned(String),
-    /// The cell accepts any issuer its JWK service can verify, so a stored
-    /// subject names no provable pair: `mallory` under issuer B and `mallory`
-    /// under issuer A are indistinguishable in storage. Nothing can be proved
-    /// to be the pusher's own lock, so every lock on a changed path blocks.
+    /// The cell accepts more than one issuer (or any issuer its JWK service
+    /// can verify), so a stored subject names no provable pair: `mallory`
+    /// under issuer B and `mallory` under issuer A are indistinguishable in
+    /// storage. Nothing can be proved to be the pusher's own lock, so every
+    /// lock on a changed path blocks.
     Unprovable,
 }
 
 impl LockOwnerIssuerPolicy {
-    /// Derive the policy from the verifier's configured `jwt_issuer`.
-    pub fn from_configured_issuer(issuer: Option<&str>) -> Self {
-        match issuer {
-            Some(issuer) if !issuer.is_empty() => Self::Pinned(issuer.to_owned()),
+    /// Derive the policy from the verifier's configured `jwt_issuer` list.
+    ///
+    /// Since upstream v0.10.0 `jwt_issuer` is a list, so a cell can accept two
+    /// issuers during an issuer cutover. A stored subject is a provable owner
+    /// pair only when the cell accepts exactly ONE non-empty issuer; with two,
+    /// a row could have been admitted under either, so the policy is
+    /// `Unprovable` (fail closed) — never "pin the first one".
+    pub fn from_configured_issuers(issuers: Option<&[String]>) -> Self {
+        match issuers {
+            Some([issuer]) if !issuer.is_empty() => Self::Pinned(issuer.clone()),
             _ => Self::Unprovable,
         }
     }
@@ -285,13 +292,13 @@ pub(crate) async fn changed_paths(
 
     let mut paths = Vec::with_capacity(changes.len());
     for change in changes {
-        // The path in the target tree. A rename also carries `from_path` (the
+        // The path in the target tree. A rename also carries a move source (the
         // old path) — both endpoints are "changed" for lock purposes, since a
         // lock is on either the source or destination path.
-        paths.push(change.path.as_str().to_string());
-        if let Some(from_path) = change.from_path {
+        paths.push(change.path().as_str().to_string());
+        if let Some(from_path) = change.move_source() {
             let from = from_path.as_str().to_string();
-            if from != change.path.as_str() {
+            if from != change.path().as_str() {
                 paths.push(from);
             }
         }
@@ -334,6 +341,33 @@ mod tests {
 
     fn pinned() -> LockOwnerIssuerPolicy {
         LockOwnerIssuerPolicy::Pinned(ISSUER_A.to_owned())
+    }
+
+    /// FORK-LOCAL (Tideshift, merge decision D3): `jwt_issuer` became a list
+    /// at v0.10.0. Only exactly one non-empty issuer pins; none, an empty
+    /// string, or a two-issuer cutover list is unprovable (fail closed).
+    #[test]
+    fn issuer_policy_pins_only_exactly_one_non_empty_issuer() {
+        let one = vec![ISSUER_A.to_owned()];
+        assert_eq!(
+            LockOwnerIssuerPolicy::from_configured_issuers(Some(one.as_slice())),
+            pinned()
+        );
+        let two = vec![ISSUER_A.to_owned(), ISSUER_B.to_owned()];
+        let empty_entry = vec![String::new()];
+        let none: Vec<String> = Vec::new();
+        for issuers in [
+            Some(two.as_slice()),
+            Some(empty_entry.as_slice()),
+            Some(none.as_slice()),
+            None,
+        ] {
+            assert_eq!(
+                LockOwnerIssuerPolicy::from_configured_issuers(issuers),
+                LockOwnerIssuerPolicy::Unprovable,
+                "{issuers:?}"
+            );
+        }
     }
 
     async fn store_with_lock(

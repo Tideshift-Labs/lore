@@ -193,14 +193,20 @@ async fn startup_fixture(
     settings.mutable_store.mode = "postgres".into();
     settings.immutable_store.mode = immutable_mode.into();
     settings.lock_store.as_mut().unwrap().mode = "postgres".into();
-    settings.server.auth = Some(crate::settings::AuthSettings {
-        jwk: Some(crate::auth::jwk::JWKServiceSettings {
-            endpoint: "https://issuer.example/.well-known/jwks.json".into(),
-        }),
-        jwt_audience: None,
-        jwt_issuer: Some("https://issuer.example".into()),
-        enforce_write_permission: true,
-    });
+    // TOML, not a struct literal: upstream v0.10.0 grew `AuthSettings`.
+    settings.server.auth = Some(
+        toml::from_str(
+            r#"
+            jwt_issuer = "https://issuer.example"
+            jwt_audience = ["lore"]
+            enforce_write_permission = true
+
+            [jwk]
+            endpoint = "https://issuer.example/.well-known/jwks.json"
+            "#,
+        )
+        .unwrap(),
+    );
     settings.plugins.insert(
         "postgres".into(),
         toml::from_str(&format!("url = {url:?}\npool_max = 2\ndomain_pool_max = 2")).unwrap(),

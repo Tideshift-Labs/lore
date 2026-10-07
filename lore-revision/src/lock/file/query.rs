@@ -38,6 +38,7 @@ pub enum QueryError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     InvalidPath,

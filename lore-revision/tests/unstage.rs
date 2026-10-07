@@ -126,7 +126,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -225,7 +224,7 @@ mod tests {
                     println!(
                         "{}: {} {:?}",
                         change.action.as_string_short(),
-                        change.path,
+                        change.path(),
                         change.flags
                     );
                 }

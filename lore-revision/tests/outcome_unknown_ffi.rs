@@ -1,7 +1,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //
-// WP-120 Phase 4: the unknown outcome keeps code 193 all the way to the FFI boundary.
+// WP-120 Phase 4: the unknown outcome keeps code 248 all the way to the FFI boundary.
 //
 // The defect this exists to catch is not a wrong number, it is a *lost* one. An
 // `EventError::translated()` impl whose body is a blanket `LoreError::Internal`, or a match with
@@ -30,7 +30,7 @@ use lore_storage::error::protocol_error_to_storage;
 use lore_transport::ProtocolError;
 
 /// The code allocated in `lore_base::error`, which everything below has to agree with.
-const OUTCOME_UNKNOWN: i32 = 193;
+const OUTCOME_UNKNOWN: i32 = 248;
 
 fn unknown() -> OutcomeUnknown {
     OutcomeUnknown {
@@ -108,7 +108,7 @@ fn internal_and_outcome_unknown_stay_distinct() {
 
 // -------------------------------------------------------------------------------------------
 // The set-ladder pin for `FfiError::outcome_identity`. Every impl above proves the *code*
-// (193) and the *classification* (`translated() == OutcomeUnknown`) survive; none of them
+// (248) and the *classification* (`translated() == OutcomeUnknown`) survive; none of them
 // proves the operation and attempt id travel with it. `outcome_identity` is defaulted to
 // `None` on the trait, and an `#[error_set]`-generated impl delegates to it automatically
 // (`codegen.rs`'s `identity_arms`) -- but a *hand-written* conversion between sets, such as

@@ -1405,17 +1405,16 @@ pub(crate) async fn admission_node_paths(
         {
             continue;
         }
-        if change.from.node.is_valid_node_id() {
+        if change.from.mapping.node.is_valid_node_id() {
             let path = change
-                .from_path
-                .as_ref()
-                .unwrap_or(&change.path)
+                .move_source()
+                .unwrap_or(change.path())
                 .as_str()
                 .to_string();
-            paths.insert(change.from.node, path);
+            paths.insert(change.from.mapping.node, path);
         }
-        if change.to.node.is_valid_node_id() {
-            paths.insert(change.to.node, change.path.as_str().to_string());
+        if change.to.mapping.node.is_valid_node_id() {
+            paths.insert(change.to.mapping.node, change.path().as_str().to_string());
         }
     }
     Ok(paths)
@@ -1627,16 +1626,22 @@ pub async fn commit_exact_selection(
     .map_err(|err| ExactSelectionError::internal("building revision metadata", err))?;
 
     let admission = ExactSelectionAdmission::new(selected, expected_metadata);
+    // Held to the end of the call, as `commit()` holds its own: the statistics
+    // event reads the fragment counters, which settle only once the commit has
+    // drained its background writes.
+    let reporting = commit::CommitReporting::from_globals().with_call_stats(options.stats);
+    let _stats_report = reporting.report();
     let committed = commit::commit_staged_revision(
         repository.clone(),
         token.share(),
         state_current.clone(),
         state_staged.clone(),
+        RelativePath::new(),
+        crate::node::ROOT_NODE,
         metadata.clone(),
-        None,
         Arc::new(HashMap::new()),
         current_branch,
-        options.stats,
+        reporting,
         Some(admission.clone()),
     )
     .await;
@@ -1710,8 +1715,9 @@ mod tests {
     use crate::lore::BranchId;
     use crate::lore::RepositoryId;
     use crate::relay::EventDispatcher;
+    use crate::repository::DOT_LORE;
     use crate::repository::RepositoryContextCreationArgs;
-    use crate::repository::RepositoryFormat;
+    use crate::repository::RepositoryPaths;
 
     #[derive(Clone, Copy, Debug, PartialEq)]
     struct StoreCall {
@@ -1875,14 +1881,16 @@ mod tests {
         let token = RepositoryWriteToken::acquire(&repository_path).await;
         let repository = Arc::new(
             RepositoryContext::new(RepositoryContextCreationArgs {
-                path: Some(repository_path.clone()),
+                paths: Some(RepositoryPaths::new(
+                    repository_path.clone(),
+                    repository_path.join(DOT_LORE),
+                )),
                 immutable_store: immutable.clone(),
                 mutable_store: faulting_mutable.clone(),
                 id: repository_id,
                 instance_id,
                 remote: Err(ProtocolError::from(NoRemote)),
                 filter: Arc::default(),
-                format: RepositoryFormat::Lore,
                 filesystem_provider: None,
             })
             .with_write_token(token),
@@ -1955,14 +1963,16 @@ mod tests {
             .expect("reopen disk-backed mutable store"),
         );
         let reopened_repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: Some(repository_path),
+            paths: Some(RepositoryPaths::new(
+                repository_path.clone(),
+                repository_path.join(DOT_LORE),
+            )),
             immutable_store: immutable,
             mutable_store: reopened_mutable,
             id: repository_id,
             instance_id,
             remote: Err(ProtocolError::from(NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }));
         let reopened = commit::ExactAnchorSnapshot {
@@ -2602,7 +2612,7 @@ mod tests {
         // branch id) alone, so it can be computed before the repository -- let alone
         // any commit -- exists.
         let (poison_key, _) = crate::branch::mutable_key(
-            RepositoryFormat::Lore.salt(),
+            crate::repository::SALT_LORE,
             branch::LATEST,
             repository_id,
             branch,
@@ -2619,14 +2629,16 @@ mod tests {
         let token = RepositoryWriteToken::acquire(&repository_path).await;
         let repository = Arc::new(
             RepositoryContext::new(RepositoryContextCreationArgs {
-                path: Some(repository_path.clone()),
+                paths: Some(RepositoryPaths::new(
+                    repository_path.clone(),
+                    repository_path.join(DOT_LORE),
+                )),
                 immutable_store: immutable,
                 mutable_store: mutable,
                 id: repository_id,
                 instance_id,
                 remote: Err(ProtocolError::from(NoRemote)),
                 filter: Arc::default(),
-                format: RepositoryFormat::Lore,
                 filesystem_provider: None,
             })
             .with_write_token(token.share()),

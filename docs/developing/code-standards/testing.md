@@ -79,6 +79,54 @@ async fn test_with_isolated_state() {
 
 - `lore-revision/tests/helper.rs` — `test_store_create()`, `setup_test_execution()`.
 - `lore-revision/tests/` — Cross-module integration tests.
+- `lore-integration-tests/` — Tests against real infrastructure, without mocking
+
+### Scratch space on disk
+
+`lore_base::test_util::TempDir`, and `TempFile` for a single file, are the only
+way a test asks for scratch space on disk. Both are behind lore-base's
+`test-util` feature, which the crates that need it enable from their
+dev-dependencies:
+
+```toml
+[dev-dependencies]
+lore-base = { workspace = true, features = ["test-util"] }
+```
+
+```rust
+let dir = TempDir::new("my-test-");       // <temp>/my-test-A1b2C3d4
+std::fs::write(dir.child("data.bin"), b"...").expect("write");
+
+let file = TempFile::with_contents("my-test-", b"payload");
+some_api(file.path());
+```
+
+The name carries a random suffix, so two tests — or two runs on one machine —
+never share a directory, and removal happens in `Drop`, so it happens whether
+the test passes or fails an assertion.
+
+**Do not** build a path under `std::env::temp_dir()` by hand, and **do not**
+remove a directory on the last line of a test body: a failing assertion panics
+before reaching that line, so the run that most needs its output is the one that
+leaks it.
+
+**Return the guard, never a path derived from it.** A helper that ends
+`temp.path().to_path_buf()` drops the guard on return and deletes the directory
+its caller is about to read. Hand back the `TempDir` and let the caller hold it:
+
+```rust
+fn fixture() -> (TempDir, PathBuf) { ... }   // correct
+fn fixture() -> PathBuf { ... }              // deletes the directory on return
+```
+
+Set `LORE_KEEP_TEST_DATA=1` to keep the directories rather than remove them —
+the Rust equivalent of the smoke tests' `--keep-test-data`. The prefix is all
+there is to identify one afterwards, so give it the test's name wherever several
+tests in a module would otherwise share it.
+
+`tempfile` is the implementation and a dependency of `lore-base` only. Do not add
+it to another crate: a second guard type is a second set of rules, and it does not
+honour `LORE_KEEP_TEST_DATA`.
 
 ---
 
@@ -99,8 +147,39 @@ async fn test_with_isolated_state() {
 ### Fixtures
 
 - `new_lore_repo` — Creates a new test repository.
+- `scratch_dir` — Hands out a path beside the repositories for the test to create
+  something at: a shared store, a clone target, a moved instance.
 - `lore_executable_path` — Path to the Lore client binary.
 - `auto_lore_local_server` — Auto starts the server for the session.
+
+### Test data is removed as the run goes
+
+A full run writes about ten gigabytes, so nothing is kept once it is no longer
+needed. Cleanup is in two layers:
+
+1. **Per test.** `new_lore_repo` removes every repository it handed out and
+   every repository those went on to clone; `scratch_dir` removes every path it
+   handed out; `global_dir_name` removes the isolated global config and the
+   shared stores under it. All of this runs whether the test passed or failed.
+   A server built inside a test or a class fixture through
+   `generate_server_config` is removed at that same scope, after the fixture
+   that launched it has stopped it. An autouse fixture removes the per-test
+   `tmp_path`, which pytest itself only removes under the `failed` policy and
+   then only for tests that passed.
+2. **Per session.** `_SessionCleanup` in `lore_server.py` empties basetemp once
+   every worker has finished, taking the session server's root and anything a
+   per-test cleanup could not.
+
+**A test that creates files outside its repository must take `scratch_dir` and
+create them at a path it hands out.** Anything written straight to
+`tmp_path_factory.getbasetemp()` survives the test that made it and is only
+caught by the session sweep, which is a backstop, not the guard.
+
+Removal is best effort and never fails a test: a locked file is logged and left
+to the sweep.
+
+Pass `--keep-test-data` to keep everything on disk — repositories, stores,
+server roots and the server log — when investigating a failure.
 
 ### Usage
 
@@ -143,6 +222,7 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--lore-remote-url` | `lore://127.0.0.1:41338` | Server address |
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
+| `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
 
 ### Per-test timeout
 
@@ -182,7 +262,8 @@ Lore has a load-testing suite that exercises concurrent clone, commit, sync, loc
 1. **All Lore commands must have smoke tests** in `scripts/test/`.
 2. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
 3. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
-4. **Use the `new_lore_repo` fixture** for smoke tests (handles cleanup).
+4. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
+   a test creates outside its repository — both remove what they hand out.
 5. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
 6. **Use `offline=True`** for operations that don't need the server.
 7. **Feature-gate integration tests** that require external dependencies.

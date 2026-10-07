@@ -56,11 +56,14 @@ pub struct LoreFileHistoryEventData {
     pub size: u64,
     /// Action applied to the file at this revision.
     pub action: LoreFileAction,
+    /// Path the file was moved from at this revision. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreFileHistoryEventData {
     pub fn new(
         path: String,
+        from_path: String,
         repository: Arc<RepositoryContext>,
         state: Arc<State>,
         address: Address,
@@ -87,6 +90,7 @@ impl LoreFileHistoryEventData {
             address,
             size,
             action: LoreFileAction::from(file_action),
+            from_path: from_path.into(),
         }
     }
 }
@@ -179,6 +183,32 @@ pub struct HistoryOptions {
     pub depth: u32,
 }
 
+async fn node_path_in_revision(
+    repository: Arc<RepositoryContext>,
+    revision: Hash,
+    node_id: NodeID,
+) -> String {
+    if revision.is_zero() || node_id == INVALID_NODE {
+        return String::new();
+    }
+
+    let state = match state::State::deserialize(repository.clone(), revision).await {
+        Ok(state) => state,
+        Err(err) => {
+            lore_debug!("Failed to deserialize revision {revision} for previous path: {err}");
+            return String::new();
+        }
+    };
+
+    match state.node_path(repository, node_id).await {
+        Ok(path) => path,
+        Err(err) => {
+            lore_debug!("Node {node_id} has no path in revision {revision}: {err}");
+            String::new()
+        }
+    }
+}
+
 async fn history_state(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -206,7 +236,7 @@ async fn history_state(
     };
 
     // File properties
-    let (file_action, file_metadata_hash) = {
+    let (file_action, file_metadata_hash, previous_revision, previous_node) = {
         if node_id != INVALID_NODE {
             let file_metadata_node_id = node::node_to_file_metadata(node_id);
             let file_metadata_block_index = NodeFileMetadataBlock::index(file_metadata_node_id);
@@ -217,16 +247,22 @@ async fn history_state(
                 .await
                 .forward::<FileHistoryError>("Failed to deserialize metadata block")?;
 
-            let (file_action, file_metadata_hash) = {
-                let file_metadata_block_reader = file_metadata_block.read();
-                let file_metadata_node = file_metadata_block_reader.node(file_metadata_node_index);
+            let file_metadata_block_reader = file_metadata_block.read();
+            let file_metadata_node = file_metadata_block_reader.node(file_metadata_node_index);
 
-                (file_metadata_node.action[0], file_metadata_node.metadata)
-            };
-
-            (file_action, file_metadata_hash)
+            (
+                file_metadata_node.action[0],
+                file_metadata_node.metadata,
+                file_metadata_node.revision[0],
+                file_metadata_node.node[0],
+            )
         } else {
-            (FileAction::Delete as u16, Hash::default())
+            (
+                FileAction::Delete as u16,
+                Hash::default(),
+                Hash::default(),
+                INVALID_NODE,
+            )
         }
     };
 
@@ -237,9 +273,16 @@ async fn history_state(
         action
     };
 
+    let from_path = if action == FileAction::Move as u16 {
+        node_path_in_revision(repository.clone(), previous_revision, previous_node).await
+    } else {
+        String::new()
+    };
+
     // Revision
     event::LoreEvent::FileHistory(LoreFileHistoryEventData::new(
         path,
+        from_path,
         repository.clone(),
         state.clone(),
         node.as_ref().map(|node| node.address).unwrap_or_default(),
@@ -336,11 +379,6 @@ async fn find_start_revision(
         return revision::resolve(
             repository.clone(),
             revision_spec.as_str(),
-            if options.depth > 0 {
-                Some(options.depth as usize)
-            } else {
-                None
-            },
             execution_context().globals().search_location(),
         )
         .await
@@ -378,6 +416,12 @@ async fn find_start_revision(
         resolved.id
     };
 
+    if execution_context().globals().offline_or_local() {
+        return Ok(branch::load_latest(repository.clone(), branch)
+            .await
+            .unwrap_or_default());
+    }
+
     let remote_latest = if let Ok(remote) = repository.remote().await {
         branch::load_remote_latest(remote.clone(), repository.id, branch)
             .await
@@ -392,9 +436,6 @@ async fn find_start_revision(
     let local_latest = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    if execution_context().globals().local() {
-        return Ok(local_latest);
-    }
 
     // Is there a latest?
     if remote_latest.is_zero() {

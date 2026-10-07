@@ -37,9 +37,16 @@
 //! | 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
 //! | 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
 //! | 129–192 | *reserved* | `128 + signal`, i.e. killed by a signal. 130 is Ctrl-C, 137 is `SIGKILL`, 143 is `SIGTERM`. |
-//! | 193–199 | Outcome | The request was dispatched and what it did is not known. |
-//! | 200–254 | *reserved* | Free for future groups. |
+//! | 193–200 | Library lifecycle | The library cannot serve the call. |
+//! | 201–247 | *reserved* | Free for future groups. |
+//! | 248–254 | Outcome (FORK-LOCAL, Tideshift) | The request was dispatched and what it did is not known. |
 //! | 255 | *reserved* | `Internal`, which is `-1` truncated to a `u8`. |
+//!
+//! FORK-LOCAL (Tideshift, WP-120): the Outcome block is not an upstream group. It sits at the
+//! TOP of the free range on purpose. Upstream allocates new groups from the bottom of the free
+//! range, so a fork group at the top stays clear of every future upstream allocation. It was
+//! first allocated at 193–199 and moved to 248–254 when upstream v0.10.0 took 193–200 for
+//! `ShutDown`.
 //!
 //! The trait carries a code as `i32` rather than a `u8` because `Internal` is
 //! `-1`, which is not a code allocated here.
@@ -48,7 +55,7 @@
 //! code in that block. Never renumber an existing code to close a gap: the gaps
 //! are the headroom that keeps a group contiguous, and the tests below hold
 //! every block clear of the reserved values so anything taken from that
-//! headroom is a usable exit status. New groups come out of 193–254. A type
+//! headroom is a usable exit status. New groups come out of 201–247; 248–254 is the fork's Outcome block. A type
 //! whose name ends in `NotFound` belongs in the not-found block even when it
 //! also belongs to a subsystem that has its own errors elsewhere —
 //! `PluginNotFound` sits with the other not-found codes, not with the other
@@ -196,8 +203,11 @@ pub struct WriteRequired;
 // ---------------------------------------------------------------------------
 // Connectivity and availability (28–39)
 //
-// The remote could not be reached, dropped the connection, or is reachable but
-// declining work. Retrying later is often the right response.
+// Something the operation had to talk to could not be reached, dropped the
+// connection, or is reachable but declining work. Usually the remote; also the
+// local service process, which a call is relayed through and which the caller
+// reaches the same way — over a connection that may not be there. Retrying
+// later is often the right response.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Error, FfiError)]
@@ -221,6 +231,20 @@ pub struct Maintenance;
 #[error("Store overloaded, slow down")]
 #[ffi_code(31)]
 pub struct SlowDown;
+
+/// No Lore service could be reached, and none could be started.
+///
+/// Distinct from [`NotConnected`], which reports a remote: a caller that relays
+/// its calls through the local service handles this differently, because it is
+/// the one failure that means the operation did not run at all rather than ran
+/// and failed. Running the operation in this process instead is a reasonable
+/// answer to it and not to any other error here.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Lore service unavailable: {reason}")]
+#[ffi_code(32)]
+pub struct ServiceUnavailable {
+    pub reason: String,
+}
 
 // ---------------------------------------------------------------------------
 // Repository state (40–55)
@@ -510,7 +534,20 @@ pub struct MaxHistorySearchDepth;
 pub struct InefficientCompression;
 
 // ---------------------------------------------------------------------------
-// Outcome (193–199)
+// Library lifecycle (193–200)
+//
+// The library itself cannot serve the call. The error is caused by the
+// library's own state rather than the request, the caller's identity, or
+// anything a remote did.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Lore has been shut down")]
+#[ffi_code(193)]
+pub struct ShutDown;
+
+// ---------------------------------------------------------------------------
+// Outcome (248–254) — FORK-LOCAL (Tideshift, WP-120)
 //
 // The request reached the server and what it did is not known. This is not a
 // failure and not a success, and it is emphatically not a connectivity error:
@@ -518,8 +555,9 @@ pub struct InefficientCompression;
 // later" reading of the 28–39 block is the one response that must never be
 // applied to it.
 //
-// The block comes out of the 193–254 headroom rather than out of an existing
-// group because no existing group's meaning is true of it. A caller branching
+// The block comes out of the free headroom rather than out of an existing
+// group because no existing group's meaning is true of it. It takes the TOP of
+// that headroom because upstream allocates its new groups from the bottom. A caller branching
 // on the range learns "the outcome is unresolved", which is the only thing it
 // may act on until an operation-specific authoritative read says more.
 // ---------------------------------------------------------------------------
@@ -541,7 +579,7 @@ pub struct InefficientCompression;
 #[error(
     "{operation}: dispatched, response lost, outcome unknown (attempt {attempt_id}); read authoritative state before any new attempt"
 )]
-#[ffi_code(193)]
+#[ffi_code(248)]
 // Publishes the two fields through `FfiError::outcome_identity`, so a consumer across the C
 // boundary reads them as data rather than parsing them back out of the message above. This is
 // the only error in the registry that names an attempt, and the only one that needs to: the
@@ -572,7 +610,7 @@ pub struct OutcomeUnknown {
 #[error(
     "granted a resource this call cannot name and cannot release ({resource}); release it by name or ask an administrator"
 )]
-#[ffi_code(194)]
+#[ffi_code(249)]
 pub struct UnnameableResource {
     /// The resource as the server described it, which is all the caller has.
     pub resource: String,
@@ -596,6 +634,7 @@ mod tests {
         Configuration,
         ResourceLimits,
         Outcome,
+        LibraryLifecycle,
     }
 
     impl Group {
@@ -609,6 +648,7 @@ mod tests {
             Self::Configuration,
             Self::ResourceLimits,
             Self::Outcome,
+            Self::LibraryLifecycle,
         ];
 
         fn block(self) -> RangeInclusive<i32> {
@@ -621,7 +661,8 @@ mod tests {
                 Self::NotFound => 79..=99,
                 Self::Configuration => 110..=117,
                 Self::ResourceLimits => 118..=125,
-                Self::Outcome => 193..=199,
+                Self::Outcome => 248..=254,
+                Self::LibraryLifecycle => 193..=200,
             }
         }
     }
@@ -717,6 +758,11 @@ mod tests {
             ),
             ("Maintenance", Group::Connectivity, Maintenance.ffi_code()),
             ("SlowDown", Group::Connectivity, SlowDown.ffi_code()),
+            (
+                "ServiceUnavailable",
+                Group::Connectivity,
+                ServiceUnavailable { reason: text() }.ffi_code(),
+            ),
             (
                 "NothingStaged",
                 Group::RepositoryState,
@@ -871,6 +917,7 @@ mod tests {
                 Group::ResourceLimits,
                 InefficientCompression.ffi_code(),
             ),
+            ("ShutDown", Group::LibraryLifecycle, ShutDown.ffi_code()),
             (
                 "OutcomeUnknown",
                 Group::Outcome,

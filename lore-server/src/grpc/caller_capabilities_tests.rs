@@ -313,8 +313,15 @@ fn guarded_settings() -> crate::settings::Settings {
         .unwrap()
         .caller_capability_policy = CallerCapabilityPolicy::RequireOutcomeUnknownV1;
     settings.server.quic.as_mut().unwrap().enabled = false;
-    settings.server.auth =
-        Some(toml::from_str("[jwk]\nendpoint = 'http://jwks/.well-known/jwks.json'").unwrap());
+    // Upstream v0.10.0 makes jwt_issuer/jwt_audience mandatory; resource_claim
+    // keeps the fork's GlobalGrants refusal out of this test's way.
+    settings.server.auth = Some(
+        toml::from_str(
+            "jwt_issuer = 'https://issuer.example'\njwt_audience = ['lore']\n\
+             resource_claim = 'resources'\n[jwk]\nendpoint = 'http://jwks/.well-known/jwks.json'",
+        )
+        .unwrap(),
+    );
     settings
 }
 

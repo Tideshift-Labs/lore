@@ -92,14 +92,11 @@ mod open_tests {
         assert_eq!(events[complete_ix], Captured::Complete(status));
     }
 
-    /// Create a `tempfile::TempDir` that auto-cleans on Drop. The `tag` becomes part of the
+    /// Create a `lore_base::test_util::TempDir` that auto-cleans on Drop. The `tag` becomes part of the
     /// directory's filename prefix so call sites retain a contextual hint visible in the
     /// working directory.
-    fn tempdir(tag: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(&format!("lore-storage-open-{tag}-"))
-            .tempdir()
-            .expect("create tempdir")
+    fn tempdir(tag: &str) -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new(&format!("lore-storage-open-{tag}-"))
     }
 
     /// Create a repository backed by its own store.
@@ -122,6 +119,7 @@ mod open_tests {
                 id: LoreString::default(),
                 use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
+                vfs: Default::default(),
             },
             None,
         )
@@ -1235,6 +1233,200 @@ mod open_tests {
             assert_eq!(*error_code, lore_revision::event::LoreErrorCode::None);
             assert_eq!(*c_addr, address);
         }
+    }
+
+    /// A writable buffer for `data_out`, alongside the vector that owns it.
+    fn caller_buffer(capacity: usize) -> (Vec<u8>, lore_revision::event::LoreBytesMut) {
+        let mut buffer = vec![0u8; capacity];
+        let data_out = lore_revision::event::LoreBytesMut {
+            ptr: buffer.as_mut_ptr().cast(),
+            len: buffer.len(),
+        };
+        (buffer, data_out)
+    }
+
+    /// With `data_out` supplied the content lands in the caller's buffer and no `GET_DATA` is
+    /// emitted for it, while `GET_HEADER` still reports the whole content's size.
+    #[tokio::test]
+    async fn get_data_out_fills_the_buffer_and_emits_no_data() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let payload = b"delivered straight into the caller's buffer".to_vec();
+        let partition = Partition::from([0x21u8; 16]);
+        let context = Context::from([0x22u8; 16]);
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (buffer, data_out) = caller_buffer(payload.len());
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 200,
+            partition,
+            address,
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(buffer, payload, "the caller's buffer must hold the content");
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "an item delivering into its own buffer emits no GET_DATA, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::Header { id: 200, size_content, .. }
+                    if *size_content == payload.len() as u64
+            )),
+            "GET_HEADER must report the content size, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 200,
+                    error_code: lore_revision::event::LoreErrorCode::None,
+                    ..
+                }
+            )),
+            "the item must complete without error, got {events:?}"
+        );
+    }
+
+    /// The capacity `data_out` states is the limit: content that does not fit fails the item
+    /// rather than arriving truncated or falling back to `GET_DATA`.
+    #[tokio::test]
+    async fn get_data_out_shorter_than_the_content_fails_the_item() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let payload = b"longer than the buffer the caller offers".to_vec();
+        let partition = Partition::from([0x23u8; 16]);
+        let context = Context::from([0x24u8; 16]);
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (_buffer, data_out) = caller_buffer(payload.len() - 1);
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 201,
+            partition,
+            address,
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "a refused item must not fall back to GET_DATA, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 201,
+                    error_code: lore_revision::event::LoreErrorCode::InvalidArguments,
+                    ..
+                }
+            )),
+            "a buffer short of the content must fail the item, got {events:?}"
+        );
+    }
+
+    /// The zero-hash short-circuit is empty content, so an item delivering into its own buffer
+    /// completes without the empty `GET_DATA` a buffer-less item receives.
+    #[tokio::test]
+    async fn get_zero_hash_with_data_out_emits_no_data() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let (_buffer, data_out) = caller_buffer(8);
+        let item = lore::storage::get::LoreStorageGetItem {
+            id: 202,
+            partition: Partition::from([0x25u8; 16]),
+            address: Address {
+                hash: Hash::default(),
+                context: Context::from([0x26u8; 16]),
+            },
+            data_out,
+            ..Default::default()
+        };
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get::get(
+            globals(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(vec![item]),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        let events = sink.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| matches!(e, GetCaptured::Data { .. })),
+            "empty content must not arrive as an empty GET_DATA here, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::Header {
+                    id: 202,
+                    size_content: 0,
+                    ..
+                }
+            )),
+            "GET_HEADER must report empty content, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GetCaptured::ItemComplete {
+                    id: 202,
+                    error_code: lore_revision::event::LoreErrorCode::None,
+                    ..
+                }
+            )),
+            "the item must complete without error, got {events:?}"
+        );
     }
 
     /// `LoreBytes` on `GET_DATA` events is valid only for the callback's invocation. This
@@ -2551,6 +2743,56 @@ mod open_tests {
         );
     }
 
+    #[tokio::test]
+    async fn obliterate_batch_reports_each_item_independently() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x2Au8; 16]);
+        let context = Context::from([0x2Bu8; 16]);
+        let payload = b"batched obliterate".to_vec();
+        let address = put_once(handle, partition, context, &payload).await;
+
+        let (status, events) = obliterate_items(
+            handle,
+            vec![
+                lore::storage::obliterate::LoreStorageObliterateItem {
+                    id: 1,
+                    partition,
+                    address,
+                },
+                lore::storage::obliterate::LoreStorageObliterateItem {
+                    id: 2,
+                    partition: Partition::default(),
+                    address: Address {
+                        hash: Hash::from([0x2Cu8; 32]),
+                        context,
+                    },
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the rejected item fails the call");
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let code_for = |want: u64| {
+            events.iter().find_map(|e| match e {
+                ObliterateCaptured::Complete { id, error_code, .. } if *id == want => {
+                    Some(*error_code)
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(code_for(1), Some(lore_revision::event::LoreErrorCode::None));
+        assert_eq!(
+            code_for(2),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments),
+        );
+    }
+
     /// Capture for copy items.
     #[derive(Debug, Clone, PartialEq)]
     enum CopyCaptured {
@@ -3192,6 +3434,16 @@ mod open_tests {
         })
     }
 
+    /// The address the terminal event reported. An echo of the request for `get` and `get_file`;
+    /// the address the key resolved to for the resolved ops, where it is the answer rather than
+    /// the question.
+    fn item_address(events: &[GetCaptured]) -> Option<lore_base::types::Address> {
+        events.iter().find_map(|e| match e {
+            GetCaptured::ItemComplete { address, .. } => Some(*address),
+            _ => None,
+        })
+    }
+
     /// Open a handle and store `payload`, returning the handle and its address.
     async fn store_for_range_test(
         partition: lore_base::types::Partition,
@@ -3591,7 +3843,7 @@ mod open_tests {
         use lore_base::types::Partition;
 
         let len = 4 * FRAGMENT_SIZE_THRESHOLD;
-        let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(11)).collect();
+        let payload: Vec<u8> = (0..len).map(|i| ((i % 251) as u8) ^ 0x11).collect();
         let partition = Partition::from([0xE5u8; 16]);
         let context = Context::from([0xE6u8; 16]);
         let (handle, address) = store_for_range_test(partition, context, &payload, 64 * 1024).await;
@@ -3630,6 +3882,7 @@ mod open_tests {
         let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
 
         let (_target_guard, target) = temp_file_path("get-file-past-end");
+        std::fs::write(&target, b"a destination the caller already had").unwrap();
         let (status, events) = get_file_items(
             handle,
             vec![lore::storage::get_file::LoreStorageGetFileItem {
@@ -3648,29 +3901,26 @@ mod open_tests {
             item_code(&events),
             Some(lore_revision::event::LoreErrorCode::InvalidArguments)
         );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"a destination the caller already had",
+            "a rejected range must not replace the destination"
+        );
     }
 
-    /// Create a `tempfile::NamedTempFile` populated with `contents`. The returned guard
+    /// Create a temp file populated with `contents`. The returned guard
     /// auto-cleans the file on Drop (success or panic). Callers hold the guard for the test
     /// scope and pass `guard.path()` to the API.
-    fn write_temp_file(contents: &[u8], tag: &str) -> tempfile::NamedTempFile {
-        let mut file = tempfile::Builder::new()
-            .prefix(&format!("lore-put-file-{tag}-"))
-            .tempfile()
-            .expect("create tempfile");
-        std::io::Write::write_all(&mut file, contents).expect("write tempfile");
-        file
+    fn write_temp_file(contents: &[u8], tag: &str) -> lore_base::test_util::TempFile {
+        lore_base::test_util::TempFile::with_contents(&format!("lore-put-file-{tag}-"), contents)
     }
 
     /// Create a path inside a fresh `TempDir` for tests that need a destination file location
     /// (e.g. `get_file` target). The directory cleans up its entire tree on Drop, so the
     /// resulting file — whether the test creates it, the API creates it, or it never exists —
     /// is removed on both success and panic paths.
-    fn temp_file_path(tag: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::Builder::new()
-            .prefix(&format!("lore-storage-{tag}-"))
-            .tempdir()
-            .expect("create tempdir");
+    fn temp_file_path(tag: &str) -> (lore_base::test_util::TempDir, PathBuf) {
+        let dir = lore_base::test_util::TempDir::new(&format!("lore-storage-{tag}-"));
         let path = dir.path().join("target");
         (dir, path)
     }
@@ -3705,6 +3955,63 @@ mod open_tests {
             })
             .collect();
         (status, completes)
+    }
+
+    #[tokio::test]
+    async fn put_file_batch_reports_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let payload = b"batched put_file contents".to_vec();
+        let file = write_temp_file(&payload, "batch");
+        let partition = Partition::from([0x72u8; 16]);
+        let context = Context::from([0x82u8; 16]);
+
+        let (status, completes) = put_file_items(
+            handle,
+            vec![
+                lore::storage::put_file::LoreStoragePutFileItem {
+                    id: 1,
+                    partition,
+                    context,
+                    path: LoreString::from(file.path().display().to_string().as_str()),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+                lore::storage::put_file::LoreStoragePutFileItem {
+                    id: 2,
+                    partition,
+                    context,
+                    path: LoreString::default(),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0, "the empty path fails the call");
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let stored = completes
+            .iter()
+            .find(|c| c.id == 1)
+            .expect("stored item complete missing");
+        assert_eq!(stored.error_code, lore_revision::event::LoreErrorCode::None);
+        assert_eq!(
+            stored.address.hash,
+            lore_storage::hash_slice(payload.as_slice()),
+        );
+        let rejected = completes
+            .iter()
+            .find(|c| c.id == 2)
+            .expect("rejected item complete missing");
+        assert_eq!(
+            rejected.error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments,
+        );
     }
 
     #[tokio::test]
@@ -3948,6 +4255,64 @@ mod open_tests {
     }
 
     #[tokio::test]
+    async fn get_file_batch_reports_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0xC5u8; 16]);
+        let context = Context::from([0xC6u8; 16]);
+        let first_payload = b"first batched destination".to_vec();
+        let second_payload = b"second batched destination".to_vec();
+        let first_address = put_once(handle, partition, context, &first_payload).await;
+        let second_address = put_once(handle, partition, context, &second_payload).await;
+
+        let (_first_guard, first_path) = temp_file_path("get-file-batch-1");
+        let (_second_guard, second_path) = temp_file_path("get-file-batch-2");
+        let (status, events) = get_file_items(
+            handle,
+            vec![
+                lore::storage::get_file::LoreStorageGetFileItem {
+                    id: 1,
+                    partition,
+                    address: first_address,
+                    path: LoreString::from(first_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::get_file::LoreStorageGetFileItem {
+                    id: 2,
+                    partition,
+                    address: second_address,
+                    path: LoreString::from(second_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
+
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        let mut codes: Vec<(u64, lore_revision::event::LoreErrorCode)> = events
+            .iter()
+            .filter_map(|e| match e {
+                GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
+                _ => None,
+            })
+            .collect();
+        codes.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            codes,
+            vec![
+                (1, lore_revision::event::LoreErrorCode::None),
+                (2, lore_revision::event::LoreErrorCode::None),
+            ],
+            "one terminal event per item",
+        );
+    }
+
+    #[tokio::test]
     async fn get_file_writes_payload_to_disk() {
         // get_file behavior: get_file writes the reassembled bytes and
         // emits only GET_ITEM_COMPLETE — no HEADER, no DATA.
@@ -4110,6 +4475,959 @@ mod open_tests {
         assert_eq!(
             complete,
             Some((5, lore_revision::event::LoreErrorCode::InvalidArguments)),
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // put_file_resolved / get_file_resolved
+    //
+    // The local half of the file-backed resolved ops: publish a key from a file and read the
+    // content it names back into another file, without either side holding the content. What is
+    // local is the key lifecycle and the ranges; the single round trip needs a server and is
+    // pinned by `a_resolved_publish_rides_on_the_top_level_fragment_upload`.
+    // ---------------------------------------------------------------------
+
+    async fn put_file_resolved_items(
+        handle: lore::storage::handle::LoreStore,
+        items: Vec<lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem>,
+    ) -> (
+        i32,
+        Vec<lore_revision::store::event::LoreStoragePutItemCompleteEventData>,
+    ) {
+        let sink: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_for_cb = sink.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            sink_for_cb.lock().unwrap().push(event.clone());
+        }));
+        let status = lore::storage::put_file_resolved::put_file_resolved(
+            globals(),
+            lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(items),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        let completes = events
+            .iter()
+            .filter_map(|e| match e {
+                LoreEvent::StoragePutItemComplete(d) => Some(*d),
+                _ => None,
+            })
+            .collect();
+        (status, completes)
+    }
+
+    async fn get_file_resolved_items(
+        handle: lore::storage::handle::LoreStore,
+        items: Vec<lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem>,
+    ) -> (i32, Vec<GetCaptured>) {
+        let (sink, callback) = make_get_sink();
+        let status = lore::storage::get_file_resolved::get_file_resolved(
+            globals(),
+            lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs {
+                handle,
+                items: lore_revision::interface::LoreArray::from_vec(items),
+            },
+            callback,
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        (status, events)
+    }
+
+    /// Open an in-memory handle, the setup every file-resolved test starts from.
+    async fn open_in_memory_handle() -> lore::storage::handle::LoreStore {
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        lore::storage::handle::LoreStore { handle_id: id }
+    }
+
+    /// Publish `payload` from a temp file under `key` and return the address the key now names.
+    /// The temp file guard is dropped before returning: the content is in the store by then, so
+    /// nothing the caller does afterwards may read the source again.
+    async fn publish_file_under_key(
+        handle: lore::storage::handle::LoreStore,
+        partition: lore_base::types::Partition,
+        context: lore_base::types::Context,
+        key: lore_base::types::Hash,
+        payload: &[u8],
+        fixed_size_chunk: u64,
+    ) -> lore_base::types::Address {
+        let source = write_temp_file(payload, "publish");
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(source.path().display().to_string().as_str()),
+                    remote_write: 0,
+                    local_cache: 0,
+                    fixed_size_chunk,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0, "publishing the fixture file must succeed");
+        assert_eq!(completes.len(), 1);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::None
+        );
+        completes[0].address
+    }
+
+    /// The content never exists as a buffer on either side: it goes from one file into the store
+    /// under a key, and out of the store into another file by that key alone.
+    #[tokio::test]
+    async fn file_resolved_batches_report_each_item_independently() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x4Au8; 16]);
+        let context = Context::from([0x4Bu8; 16]);
+        let first_payload = b"first batched key contents".to_vec();
+        let second_payload = b"second batched key contents".to_vec();
+        let first_key = Hash::hash_buffer(b"file-resolved-batch-1");
+        let second_key = Hash::hash_buffer(b"file-resolved-batch-2");
+        let first_source = write_temp_file(&first_payload, "batch-publish-1");
+        let second_source = write_temp_file(&second_payload, "batch-publish-2");
+
+        let (put_status, mut put_completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key: first_key,
+                    context,
+                    path: LoreString::from(first_source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key: second_key,
+                    context,
+                    path: LoreString::from(second_source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(put_status, 0);
+        // Items resolve concurrently, so the events are correlated by id rather than by position.
+        put_completes.sort_by_key(|c| c.id);
+        assert_eq!(
+            put_completes.len(),
+            2,
+            "one terminal event per published item"
+        );
+        assert_eq!(
+            put_completes[0].address.hash,
+            lore_storage::hash_slice(first_payload.as_slice()),
+        );
+        assert_eq!(
+            put_completes[1].address.hash,
+            lore_storage::hash_slice(second_payload.as_slice()),
+        );
+
+        let (_first_guard, first_path) = temp_file_path("get-file-resolved-batch-1");
+        let (_second_guard, second_path) = temp_file_path("get-file-resolved-batch-2");
+        let (get_status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 3,
+                    partition,
+                    key: first_key,
+                    context,
+                    path: LoreString::from(first_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 4,
+                    partition,
+                    key: second_key,
+                    context,
+                    path: LoreString::from(second_path.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(get_status, 0);
+        assert_eq!(std::fs::read(&first_path).unwrap(), first_payload);
+        assert_eq!(std::fs::read(&second_path).unwrap(), second_payload);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, GetCaptured::ItemComplete { .. }))
+                .count(),
+            2,
+            "one terminal event per read item",
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_resolved_then_get_file_resolved_round_trips_through_files() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let payload = b"published from a file, read back into one".to_vec();
+        let partition = Partition::from([0x41u8; 16]);
+        let context = Context::from([0x42u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-round-trip");
+
+        let published = publish_file_under_key(handle, partition, context, key, &payload, 0).await;
+        assert_eq!(
+            published.hash,
+            lore_storage::hash_slice(payload.as_slice()),
+            "the published address must be the content the key now resolves to"
+        );
+        assert_eq!(published.context, context);
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-ok");
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+
+        // As with `get_file`, the payload goes straight to disk — no HEADER, no DATA.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GetCaptured::Header { .. } | GetCaptured::Data { .. })),
+            "get_file_resolved must not emit HEADER or DATA, got {events:?}",
+        );
+        let complete = events.iter().find_map(|e| match e {
+            GetCaptured::ItemComplete {
+                id,
+                address,
+                error_code,
+            } => Some((*id, *address, *error_code)),
+            _ => None,
+        });
+        assert_eq!(
+            complete,
+            Some((2, published, lore_revision::event::LoreErrorCode::None)),
+            "the terminal event must report the resolved address, so the caller learns the mapping"
+        );
+    }
+
+    /// A file large enough to fragment goes through the chunker on the way in and the defragment
+    /// pipeline on the way out, so neither direction holds it. The bytes on disk are what pins that
+    /// the scattered writes land at the right offsets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_file_resolved_writes_a_fragmented_key_leaf_by_leaf() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payload: Vec<u8> = (0..len).map(|i| ((i % 251) as u8) ^ 0x1F).collect();
+        let partition = Partition::from([0x43u8; 16]);
+        let context = Context::from([0x44u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-fragmented");
+
+        publish_file_under_key(handle, partition, context, key, &payload, 64 * 1024).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-fragmented");
+        let (status, _events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(std::fs::read(&target).unwrap(), payload);
+    }
+
+    /// Ranges behave as `get_file`'s do, across a fragment tree reached by key rather than by
+    /// address: the file holds the range from its own first byte and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_file_resolved_with_a_range_writes_only_the_range() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payload: Vec<u8> = (0..len).map(|i| ((i % 251) as u8) ^ 0x07).collect();
+        let partition = Partition::from([0x45u8; 16]);
+        let context = Context::from([0x46u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-ranged");
+
+        publish_file_under_key(handle, partition, context, key, &payload, 64 * 1024).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-ranged");
+        let start = 100_000usize;
+        let length = 300_000usize;
+        let (status, _events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    offset: start as u64,
+                    length: length as u64,
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        let on_disk = std::fs::read(&target).unwrap();
+        assert_eq!(on_disk.len(), length);
+        assert_eq!(on_disk, payload[start..start + length]);
+    }
+
+    #[tokio::test]
+    async fn get_file_resolved_with_an_offset_past_the_end_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0x47u8; 16]);
+        let context = Context::from([0x48u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-past-end");
+
+        publish_file_under_key(handle, partition, context, key, &payload, 0).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-past-end");
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    offset: 201,
+                    length: 10,
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+        );
+    }
+
+    /// A start past the end of fragmented content, where the range resolves to nothing and the
+    /// target is sized to it before the failure is reported. The single-fragment case takes a
+    /// different route to the same code, so both are pinned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_file_resolved_with_an_offset_past_a_fragmented_end_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payload: Vec<u8> = (0..len).map(|i| ((i % 251) as u8) ^ 0x0D).collect();
+        let partition = Partition::from([0x56u8; 16]);
+        let context = Context::from([0x57u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-fragmented-past-end");
+
+        publish_file_under_key(handle, partition, context, key, &payload, 64 * 1024).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-fragmented-past-end");
+        std::fs::write(&target, b"a destination the caller already had").unwrap();
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    offset: len as u64 + 1,
+                    length: 10,
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"a destination the caller already had",
+            "a rejected range must not replace the destination"
+        );
+    }
+
+    /// The single-fragment past-end case takes the whole-file write rather than the defragment
+    /// pipeline, so it reaches the same guard by a different route.
+    #[tokio::test]
+    async fn get_file_resolved_with_an_offset_past_the_end_preserves_the_destination() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0x5Eu8; 16]);
+        let context = Context::from([0x5Fu8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-past-end-preserve");
+
+        publish_file_under_key(handle, partition, context, key, &payload, 0).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-past-end-preserve");
+        std::fs::write(&target, b"a destination the caller already had").unwrap();
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    offset: 201,
+                    length: 10,
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"a destination the caller already had",
+            "a rejected range must not replace the destination"
+        );
+    }
+
+    /// A start exactly at the end selects nothing but is a legitimate empty read, so it writes the
+    /// empty file rather than being rejected — the boundary the past-end guard must not swallow.
+    /// Both routes are covered: a single fragment takes the whole-file write, a tree reaches the
+    /// defragment pipeline with an empty range.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_file_resolved_with_an_offset_at_the_end_writes_an_empty_file() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        for (tag, len, chunk) in [
+            ("at-end", 200usize, 0u64),
+            ("fragmented-at-end", 4 * FRAGMENT_SIZE_THRESHOLD, 64 * 1024),
+        ] {
+            let handle = open_in_memory_handle().await;
+            let payload: Vec<u8> = (0..len).map(|i| ((i % 251) as u8) ^ 0x2B).collect();
+            let partition = Partition::from([0x60u8; 16]);
+            let context = Context::from([0x61u8; 16]);
+            let key = Hash::hash_buffer(tag.as_bytes());
+
+            publish_file_under_key(handle, partition, context, key, &payload, chunk).await;
+
+            let (_target_guard, target) = temp_file_path(tag);
+            std::fs::write(&target, b"replaced by the empty selection").unwrap();
+            let (status, events) = get_file_resolved_items(
+                handle,
+                vec![
+                    lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                        id: 1,
+                        partition,
+                        key,
+                        context,
+                        path: LoreString::from(target.display().to_string().as_str()),
+                        offset: len as u64,
+                        length: 10,
+                        ..Default::default()
+                    },
+                ],
+            )
+            .await;
+            assert_eq!(status, 0, "{tag}");
+            assert_eq!(
+                item_code(&events),
+                Some(lore_revision::event::LoreErrorCode::None),
+                "{tag}"
+            );
+            assert!(
+                std::fs::read(&target).unwrap().is_empty(),
+                "{tag}: an empty selection at the end of the content still writes the file"
+            );
+        }
+    }
+
+    /// A publish with nothing to publish is a retraction, the same operation an empty buffer
+    /// performs in `put_resolved` — the zero hash is the mutable store's tombstone, so there is no
+    /// third state between "names content" and "names nothing".
+    #[tokio::test]
+    async fn put_file_resolved_with_an_empty_file_retracts_the_key() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x49u8; 16]);
+        let context = Context::from([0x4Au8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-retract");
+
+        publish_file_under_key(handle, partition, context, key, b"live content", 0).await;
+
+        let empty = write_temp_file(&[], "retract");
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(empty.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::None
+        );
+        assert_eq!(
+            completes[0].address.hash,
+            Hash::default(),
+            "a retraction reports the zero content hash"
+        );
+        assert_eq!(completes[0].address.context, context);
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-retracted");
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 3,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::AddressNotFound)
+        );
+        assert!(
+            !target.exists(),
+            "a resolve that finds nothing must leave the target alone rather than truncate it"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_resolved_unknown_key_reports_address_not_found_and_leaves_the_target() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let (_target_guard, target) = temp_file_path("get-file-resolved-miss");
+        std::fs::write(&target, b"existing junk").unwrap();
+
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition: Partition::from([0x4Bu8; 16]),
+                    key: Hash::hash_buffer(b"never-published"),
+                    context: Context::from([0x4Cu8; 16]),
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, -1);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::AddressNotFound)
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"existing junk",
+            "there is no zero-hash truncation here: a miss is not an address for empty content"
+        );
+    }
+
+    /// A path that cannot be read is the caller's mistake, not a delete: a typo must not retract
+    /// the key it names.
+    #[tokio::test]
+    async fn put_file_resolved_missing_file_rejects_invalid_args_without_retracting() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x4Du8; 16]);
+        let context = Context::from([0x4Eu8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-typo");
+
+        let published =
+            publish_file_under_key(handle, partition, context, key, b"still live", 0).await;
+
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from("/definitely/not/a/real/path/for/lore"),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-survives");
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 3,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(
+            item_address(&events),
+            Some(published),
+            "the key must still name what it did before the failed publish"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"still live");
+    }
+
+    /// A directory opens read-only just as a file does, and the size it reports is whatever the
+    /// filesystem chooses — zero on some. Since a zero-length source retracts the key, a directory
+    /// path must be refused on its type rather than read for its size.
+    #[tokio::test]
+    async fn put_file_resolved_directory_path_rejects_invalid_args_without_retracting() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x58u8; 16]);
+        let context = Context::from([0x59u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-directory");
+
+        let published =
+            publish_file_under_key(handle, partition, context, key, b"still live", 0).await;
+
+        let directory = tempdir("put-file-resolved-directory");
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(directory.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-directory-survives");
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(
+            item_address(&events),
+            Some(published),
+            "a directory path must leave the key naming what it did"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_directory_path_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let directory = tempdir("put-file-directory");
+
+        let (status, completes) = put_file_items(
+            handle,
+            vec![lore::storage::put_file::LoreStoragePutFileItem {
+                id: 1,
+                partition: Partition::from([0x5Au8; 16]),
+                context: Context::from([0x5Bu8; 16]),
+                path: LoreString::from(directory.path().display().to_string().as_str()),
+                remote_write: 0,
+                local_cache: 0,
+                fixed_size_chunk: 0,
+            }],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+    }
+
+    /// A path that will never open is rejected on the first attempt. The transient-failure back-off
+    /// is ten attempts over roughly ten seconds, so spending it here would stall the caller for
+    /// that long per item; the bound is loose enough not to measure the machine.
+    #[tokio::test]
+    async fn a_path_that_cannot_open_is_rejected_without_the_back_off() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let started = std::time::Instant::now();
+
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition: Partition::from([0x5Cu8; 16]),
+                    key: Hash::hash_buffer(b"file-resolved-no-back-off"),
+                    context: Context::from([0x5Du8; 16]),
+                    path: LoreString::from("/definitely/not/a/real/path/for/lore"),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "a missing path must not spend the back-off; took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_resolved_zero_key_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let source = write_temp_file(b"content for a key that is not one", "zero-key");
+
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition: Partition::from([0x4Fu8; 16]),
+                    key: Hash::default(),
+                    context: Context::from([0x50u8; 16]),
+                    path: LoreString::from(source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_resolved_zero_partition_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let source = write_temp_file(b"content for no partition", "zero-partition");
+
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition: Partition::default(),
+                    key: Hash::hash_buffer(b"file-resolved-zero-partition"),
+                    context: Context::from([0x51u8; 16]),
+                    path: LoreString::from(source.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_resolved_zero_key_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let (_target_guard, target) = temp_file_path("get-file-resolved-zero-key");
+
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 1,
+                    partition: Partition::from([0x52u8; 16]),
+                    key: Hash::default(),
+                    context: Context::from([0x53u8; 16]),
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+        );
+    }
+
+    /// An in-memory handle has no remote, so `remote_write` has nothing to honour: the content and
+    /// the mapping land locally and `stored_remote` stays clear.
+    #[tokio::test]
+    async fn put_file_resolved_local_only_publish_reports_local_placement() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let source = write_temp_file(b"never leaves this machine", "local-only");
+
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition: Partition::from([0x54u8; 16]),
+                    key: Hash::hash_buffer(b"file-resolved-local-only"),
+                    context: Context::from([0x55u8; 16]),
+                    path: LoreString::from(source.path().display().to_string().as_str()),
+                    remote_write: 1,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(completes.len(), 1);
+        assert_eq!(
+            (
+                completes[0].error_code,
+                completes[0].stored_local,
+                completes[0].stored_remote
+            ),
+            (lore_revision::event::LoreErrorCode::None, 1, 0),
         );
     }
 
@@ -4791,7 +6109,7 @@ mod open_tests {
                         payload,
                         WriteOptions::default(),
                         None,
-                        None,
+                        lore_storage::WriteContext::none(),
                         None,
                     )
                     .await
@@ -4992,7 +6310,7 @@ mod open_tests {
     /// from being arbitrarily small, so this test is structural — verify that the handle
     /// accepts the fields, the spawn does not panic, the handle survives an op cycle, and the
     /// close path tears the spawned tasks down cleanly (proves the spawn happened — without
-    /// spawn, `compact_stop` would have no counterpart to stop)
+    /// spawn, `stop_gc` would have no counterpart to stop)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_with_gc_and_cache_target_round_trips_an_op_cycle() {
         use lore_base::types::Context;

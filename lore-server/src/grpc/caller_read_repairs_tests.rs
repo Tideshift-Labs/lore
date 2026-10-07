@@ -59,7 +59,11 @@ async fn both_repository_handlers_refuse_stale_names_without_deleting_in_require
                 });
                 request.extensions_mut().insert(policy);
                 crate::grpc::repository::v1::repository_get::handler(
-                    request, None, immutable, store,
+                    request,
+                    Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+                    immutable,
+                    store,
+                    &None,
                 )
                 .await
                 .unwrap_err()
@@ -70,9 +74,14 @@ async fn both_repository_handlers_refuse_stale_names_without_deleting_in_require
                     query: Some(Query::Name("stale".into())),
                 });
                 request.extensions_mut().insert(policy);
-                crate::grpc::handlers::repository_query::handler(request, None, immutable, store)
-                    .await
-                    .unwrap_err()
+                crate::grpc::handlers::repository_query::handler(
+                    request,
+                    Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+                    immutable,
+                    store,
+                )
+                .await
+                .unwrap_err()
             };
             assert_eq!(error.code(), tonic::Code::NotFound);
             assert_eq!(
@@ -121,7 +130,13 @@ async fn both_repository_handlers_return_missing_mapping_reads_without_repair_in
                         tonic::Request::new(RepositoryGetRequest { query: Some(query) });
                     request.extensions_mut().insert(policy);
                     let result = crate::grpc::repository::v1::repository_get::handler(
-                        request, None, immutable, store,
+                        request,
+                        Arc::new(
+                            crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                        ),
+                        immutable,
+                        store,
+                        &None,
                     )
                     .await
                     .unwrap()
@@ -139,7 +154,12 @@ async fn both_repository_handlers_return_missing_mapping_reads_without_repair_in
                         tonic::Request::new(RepositoryQueryRequest { query: Some(query) });
                     request.extensions_mut().insert(policy);
                     let result = crate::grpc::handlers::repository_query::handler(
-                        request, None, immutable, store,
+                        request,
+                        Arc::new(
+                            crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                        ),
+                        immutable,
+                        store,
                     )
                     .await
                     .unwrap()

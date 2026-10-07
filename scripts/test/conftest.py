@@ -5,27 +5,37 @@ import json
 import logging
 import os
 import platform
+import shutil
 import subprocess
+import tempfile
 import typing
+import uuid
 
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
-from time import sleep
+from time import monotonic, sleep
 
 import pytest
 
+from cleanup_util import remove_tree
 from lore import Lore
 from lore_server import (
     _get_shared_tmp_dir,
     _get_worker_id,
-    _XdistControllerCleanup,
+    _SessionCleanup,
     allocate_free_port,
     generate_server_config,
     launch_lore_server,
     lore_local_server,
 )
-from service_util import service_supported
+from service_util import (
+    LORE_SERVICE_LISTENING_MESSAGE,
+    LORE_SERVICE_SOCKET_VAR,
+    MACHINE_SETTINGS_PREFIX,
+    service_supported,
+    stop_lore_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -113,15 +123,41 @@ def pytest_addoption(parser):
         default="info",
         help="RUST_LOG level for the Lore server (e.g. debug, info, warn)",
     )
+    parser.addoption(
+        "--keep-test-data",
+        action="store_true",
+        default=False,
+        help=(
+            "Leave repositories, stores and server roots on disk after the run. "
+            "Off by default: the suite writes about ten gigabytes per session, "
+            "so it is removed as it goes. Turn this on to inspect the state a "
+            "failing test left behind, including the server log."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def keep_test_data(request):
+    """Whether the run leaves its repositories and stores on disk."""
+    return request.config.getoption("--keep-test-data")
 
 
 @pytest.fixture(scope="function")
 def new_lore_repo(
-    request, lore_executable_path, lore_remote_url, tmp_path_factory, global_dir_name
+    request,
+    lore_executable_path,
+    lore_remote_url,
+    tmp_path_factory,
+    global_dir_name,
+    keep_test_data,
 ):
     """
-    Returns a function that can be used to create a new lore repo
+    Returns a function that can be used to create a new lore repo.
+
+    Every repository handed out is removed when the test ends, whether it passed
+    or failed.
     """
+    created_paths: list[str] = []
 
     def _new_lore_repo(
         name=None,
@@ -131,11 +167,21 @@ def new_lore_repo(
         remote_url=None,
         environment_vars: dict[str, str] | None = None,
         repository_admin=False,
+        remote_name=None,
     ):
+        # `remote_name` places the repository under a chosen name (for example a
+        # scoped `org/project`) on whichever server this fixture would pick by
+        # default, the managed one included. A full `remote_path` instead pins
+        # the server and opts out of the managed identity.
+        if remote_name is not None and remote_path is not None:
+            raise ValueError("Pass remote_name or remote_path, not both")
         if name is None:
             name = ""
         name = Lore.generate_random_name(name)
         path = str(tmp_path_factory.getbasetemp() / name)
+        # Recorded before the client is asked to create anything, so a
+        # repository that fails halfway through creation is still cleaned up.
+        created_paths.append(path)
         # Explicit endpoints retain their protocol/auth contract. Auth-negative
         # tests use new_authless_lore_repo rather than an implicit signed login.
         managed = None
@@ -154,6 +200,9 @@ def new_lore_repo(
                 **(environment_vars or {}),
                 **managed.environment(global_dir_name),
             }
+        if remote_name is not None:
+            base = remote_url or lore_remote_url
+            remote_path = f"{base.rstrip('/')}/{remote_name}"
         return Lore(
             lore_executable_path=lore_executable_path,
             path=path,
@@ -164,9 +213,41 @@ def new_lore_repo(
             remote_url=remote_url,
             repo_id=repo_id,
             create_repo=create_repo,
+            # Shared with the repository so anything it clones -- which lands
+            # beside it, not inside it -- is removed with the test as well.
+            created_paths=created_paths,
         )
 
-    return _new_lore_repo
+    yield _new_lore_repo
+
+    if keep_test_data:
+        return
+    # Newest first, so an instance created over another one's shared store goes
+    # before the store it points at.
+    for path in reversed(created_paths):
+        remove_tree(path, label="test repository")
+
+
+@pytest.fixture(autouse=True)
+def _remove_tmp_path(request, keep_test_data):
+    """Remove the per-test `tmp_path` when the test ends, pass or fail.
+
+    pytest has no retention policy that does this. "failed" removes the
+    directory only for tests that *passed*, and "none" governs how many previous
+    sessions' basetemps survive rather than anything per test, so a test taking
+    `tmp_path` would otherwise hold its directory until the end of the session.
+    Autouse, so this holds for tests added later without them having to know.
+
+    Read from `funcargs` rather than requested as a fixture: requesting it would
+    create a `tmp_path` for every test in the suite, and asking for it here only
+    to find out whether it exists would defeat the point.
+    """
+    yield
+    if keep_test_data:
+        return
+    tmp_path = request.node.funcargs.get("tmp_path")
+    if tmp_path is not None:
+        remove_tree(tmp_path, label="tmp_path")
 
 
 @pytest.fixture
@@ -288,7 +369,37 @@ def rest_client_credentials(thin_client_credentials, managed_cli_ports):
 
 
 @pytest.fixture(scope="function")
-def global_dir_name(tmp_path_factory):
+def scratch_dir(tmp_path_factory, keep_test_data):
+    """Returns a function handing out paths beside the test's repositories for
+    the test to create things at -- shared stores, clone targets, instances --
+    each removed when the test ends, pass or fail.
+
+    Paths are handed out rather than created, because the Lore commands under
+    test expect to create the directory themselves; pass `create=True` for the
+    cases that need it to exist first. Names are suffixed to keep them unique
+    unless `unique=False` asks for the name verbatim.
+    """
+    created: list[Path] = []
+
+    def _scratch_dir(name: str, *, unique: bool = True, create: bool = False) -> Path:
+        if unique:
+            name = Lore.generate_random_name(name)
+        path = tmp_path_factory.getbasetemp() / name
+        created.append(path)
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    yield _scratch_dir
+
+    if keep_test_data:
+        return
+    for path in reversed(created):
+        remove_tree(path, label="scratch directory")
+
+
+@pytest.fixture(scope="function")
+def global_dir_name(tmp_path_factory, keep_test_data):
     path = str(
         tmp_path_factory.getbasetemp() / Lore.generate_random_name("lore_global")
     )
@@ -297,40 +408,30 @@ def global_dir_name(tmp_path_factory):
 
     yield path
 
+    if not keep_test_data:
+        # Torn down after new_lore_repo, which depends on this fixture, so the
+        # repositories are gone before the shared stores they were using.
+        remove_tree(path, label="global directory")
 
-def _service_unreachable(output):
-    """Whether a probe failed because it could not reach the service.
 
-    On Windows the failure also carries WinSock error 10022, which is kept as a
-    separate marker rather than relying on the wrapping context alone. It is
-    scoped to Windows so that a repository path echoed back in the output cannot
-    match it by accident on the other platforms.
+def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
+    """Block until the service reports that it has bound its socket.
+
+    The service prints one line once it accepts connections, and that line is
+    what is waited for. Probing with a command would not do: a command that
+    finds no service now starts one of its own, which would race the service
+    being waited for and could leave the winner running in the wrong directory.
     """
-    if "connecting to local socket" in output:
-        return True
-    return platform.system() == "Windows" and "10022" in output
-
-
-def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
-    """Block until the background service answers a probe."""
-    probe_env = os.environ.copy()
-    probe_env["LORE_USE_SERVICE"] = "1"
-    for _ in range(attempts):
+    deadline = monotonic() + timeout
+    while monotonic() < deadline:
         if service_process.poll() is not None:
             pytest.fail(
                 "Lore service process exited during startup with code "
-                f"{service_process.returncode}"
+                f"{service_process.returncode}: {log_path.read_text(errors='replace')}"
             )
-        probe = subprocess.run(
-            [lore_executable_path, "status"],
-            capture_output=True,
-            text=True,
-            env=probe_env,
-        )
-        out = probe.stdout + probe.stderr
-        if not _service_unreachable(out):
+        if LORE_SERVICE_LISTENING_MESSAGE in log_path.read_text(errors="replace"):
             return
-        sleep(1)
+        sleep(0.1)
     pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
@@ -354,23 +455,54 @@ class TrackedServices(object):
         env["LORE_GLOBAL_PATH"] = self.global_dir_name
         env.setdefault("LORE_AUTH_PATH", self.global_dir_name)
 
+        # Redirected to a file rather than a pipe: the readiness line is read
+        # from it, and a pipe nobody drains would stall a service that outlives
+        # the wait. It also keeps the service's output for a failing test.
+        log_path = Path(self.global_dir_name) / (
+            f"lore-service-{len(self.service_processes)}.log"
+        )
         command_args = [self.lore_executable_path, "service", "run"]
         logger.info("Executing Lore service command: %s", command_args)
-        process = subprocess.Popen(command_args, cwd=directory, env=env)
-        _wait_for_service_ready(self.lore_executable_path, process)
+        with open(log_path, "w") as log_file:
+            process = subprocess.Popen(
+                command_args,
+                cwd=directory,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+            )
+        # Tracked before the wait, so that a service which fails to become ready
+        # is still ended when the test does rather than outliving the run.
         self.service_processes[directory] = process
+        _wait_for_service_ready(process, log_path)
 
         return process
 
     def terminate(self, directory: str | None = None):
         process = self.service_processes.get(directory)
-        if process is not None:
+        if process is None:
+            return
+        # Ask before waiting. Without this the wait below had nothing to wait
+        # for -- the service was never told to stop -- so it burned its whole
+        # timeout and reached the kill every time, and each service test paid
+        # ten seconds to end. Already-exited processes are handled by
+        # send_signal, which polls first and does nothing if the process is
+        # gone.
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Lore service did not exit on terminate, killing it")
+            process.kill()
             try:
+                # Reap it rather than leave a zombie for the rest of the
+                # session. Bounded, because on Windows kill() is the same
+                # TerminateProcess that has just failed to take effect.
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logger.warning("Lore service did not exit on terminate, killing it")
-                process.kill()
-            self.service_processes[directory] = None
+                logger.error("Lore service survived being killed, leaving it")
+        self.service_processes[directory] = None
 
     def terminate_all(self):
         for key in list(self.service_processes.keys()):
@@ -420,6 +552,44 @@ def background_lore_service(lore_service_runner):
     """Automatically starts a Lore service process using the service runner
     before the test begins"""
     yield lore_service_runner.start()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def lore_service_socket():
+    """Give this run a service socket of its own, so it neither disturbs a
+    service the developer is using nor collides with another run.
+
+    Set on the test process's own environment because every Lore command and
+    every service in the suite is started from a copy of it, including the
+    services a command starts on its own. Under xdist each worker is its own
+    process and so gets its own socket."""
+    socket_name = f"lore_service-test-{uuid.uuid4().hex[:12]}"
+    logger.info("Using Lore service socket %s for this run", socket_name)
+    os.environ[LORE_SERVICE_SOCKET_VAR] = socket_name
+
+    yield socket_name
+
+    del os.environ[LORE_SERVICE_SOCKET_VAR]
+
+
+@pytest.fixture(scope="function")
+def no_lore_service(lore_service_runner):
+    """Leaves no service running for a test whose commands must start one, and
+    stops whatever they started once the test ends.
+
+    Takes the service runner so that the test is skipped where services aren't
+    supported and joins the xdist_group that keeps service tests apart: this
+    run has one socket, so two such tests at once would still fight over the
+    same service."""
+    stop_lore_service(
+        lore_service_runner.lore_executable_path, lore_service_runner.global_dir_name
+    )
+
+    yield
+
+    stop_lore_service(
+        lore_service_runner.lore_executable_path, lore_service_runner.global_dir_name
+    )
 
 
 @pytest.fixture(scope="session")
@@ -516,7 +686,8 @@ def lore_remote_url(request, lore_main_server_ports):
     else:
         remote_url = f"lore://127.0.0.1:{lore_main_server_ports['quic']}"
     remote_url = remote_url if remote_url.endswith("/") else remote_url + "/"
-    # TODO: Seems like having this set as an env var is required for repo creation?
+    # The CLI no longer reads this; it is the harness's own record of which server the
+    # session is running against, which `Lore` reads back to build full repository URLs.
     os.environ["LORE_REMOTE_URL"] = remote_url
     return remote_url
 
@@ -622,7 +793,12 @@ def lore_main_server_ports(request, tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def lore_local_server_config(request, tmp_path_factory, lore_main_server_ports):
-    return generate_server_config(request, tmp_path_factory, lore_main_server_ports)
+    # remove_when_done=False: under xdist this server belongs to gw0 but serves
+    # every worker, so it is still in use when gw0's session ends. The
+    # controller's sweep takes its root once all of them have stopped.
+    return generate_server_config(
+        request, tmp_path_factory, lore_main_server_ports, remove_when_done=False
+    )
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -709,10 +885,39 @@ def auto_lore_local_server(
         yield
 
 
+def _sandbox_machine_settings(config):
+    """Keeps the machine's Lore settings out of this run.
+
+    A developer who turns the service on for their own use — `[service]
+    use_automatically` and an executable, in the user-level config — would
+    otherwise have every command in the suite carried out by that service, which
+    knows nothing of the fixture the test set up. Measured on the Rust side, that
+    is most of a crate's tests failing at once; here it reaches anything invoking
+    Lore that is not a `Lore` object, whose own environment already isolates.
+
+    Both are set on this process's environment, since every subprocess in the
+    suite starts from a copy of it, and the tests that load `liblore` in process
+    read it directly with no environment of their own to isolate them.
+
+    A test that wants the service turns it back on in its own environment, which
+    is a copy of this one — see `LORE_SERVICE_ENVIRONMENT`. Under xdist each
+    worker configures separately and so gets a directory of its own.
+    """
+    os.environ["LORE_USE_SERVICE"] = "0"
+    # Not the per-test global directory, which each `Lore` sets for itself. This
+    # one stands in for the machine's, so that reading it finds a config no
+    # developer wrote rather than theirs.
+    machine_settings = tempfile.mkdtemp(prefix=MACHINE_SETTINGS_PREFIX)
+    config.add_cleanup(lambda: shutil.rmtree(machine_settings, ignore_errors=True))
+    os.environ["LORE_GLOBAL_PATH"] = machine_settings
+    logger.info("Standing in for the machine's Lore settings with %s", machine_settings)
+
+
 def pytest_configure(config):
-    """Register the xdist controller cleanup plugin early so its
-    pytest_sessionfinish hook fires on the controller process."""
-    config.pluginmanager.register(_XdistControllerCleanup(), "lore_xdist_cleanup")
+    """Register the session cleanup plugin early so its pytest_sessionfinish
+    hook fires on the controller process."""
+    _sandbox_machine_settings(config)
+    config.pluginmanager.register(_SessionCleanup(), "lore_session_cleanup")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"
     )

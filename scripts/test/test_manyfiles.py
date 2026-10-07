@@ -10,6 +10,7 @@ import time
 import pytest
 
 from lore import Lore
+from store_layout import assert_all_index_entries_reachable
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,7 @@ def test_file(new_lore_repo, lore_executable_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=repo.sandboxed_env(),
     )
 
     # Wait for commit to announce it has started fragmenting files, then give the
@@ -193,3 +195,6 @@ def test_file(new_lore_repo, lore_executable_path):
 
     clone.stage(large_file_path, offline=True)
     clone.commit("Test commit offline after sync", offline=True)
+
+    assert_all_index_entries_reachable(repo)
+    assert_all_index_entries_reachable(clone)

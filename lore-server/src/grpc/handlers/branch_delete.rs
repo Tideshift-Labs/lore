@@ -25,6 +25,7 @@ use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::domain_intent::CanonicalIntent;
 use crate::domain_intent::canonical_intent_digest;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_repository;
@@ -107,7 +108,10 @@ pub async fn handler(
                 hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
                 return Ok(Response::new(BranchDeleteResponse {}));
             }
-            match branch::delete(repository, branch).await {
+            match branch::delete(repository, branch)
+                .await
+                .filter_slow_down()?
+            {
                 Ok(_) => {
                     debug!({BRANCH_ID} = %branch, "Branch deleted");
                     let num_branches_deleted = instrument_provider.counter("num_branches_deleted");

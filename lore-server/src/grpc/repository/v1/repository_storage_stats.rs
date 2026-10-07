@@ -12,6 +12,8 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::get_verified_token;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 
 /// `lore.repository.v1.RepositoryService.RepositoryStorageStats` handler.
@@ -33,15 +35,10 @@ use crate::grpc::handlers::repository_query::check_repository_query_authorizatio
 #[tracing::instrument(name = "RepositoryStorageStats::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryStorageStatsRequest>,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
 ) -> Result<Response<RepositoryStorageStatsResponse>, Status> {
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
-    let req = request.into_inner();
+    let (_, extensions, req) = request.into_parts();
 
     let repository_id: Context = req.id.into();
     if repository_id == Context::default() {
@@ -49,12 +46,16 @@ pub async fn handler(
     }
 
     // Scope the read to the caller's repository. RepositoryService rides the
-    // authn-only interceptor (UCS-13506), so the body repository id is not
-    // authorized upstream; re-check it via the same ReBAC callback the sibling
-    // read RPCs use. Auth-OFF (no auth_url) leaves behavior unchanged.
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, repository_id.into()).await?;
-    }
+    // authn-only interceptor, so the body repository id is not authorized
+    // before the handler; re-check it through the configured authorizer the
+    // sibling read RPCs use. Auth-OFF selects AllowAll, so behavior there is
+    // unchanged. The denial status propagates as-is (CR-016).
+    check_repository_query_authorization(
+        authorizer.as_ref(),
+        get_verified_token(&extensions).as_ref(),
+        repository_id.into(),
+    )
+    .await?;
 
     let stats = immutable_store
         .repository_stats(Partition::from(repository_id))
@@ -90,8 +91,17 @@ mod tests {
     use tonic::Request;
 
     use super::handler;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::AuthClientAuthorizer;
+    use crate::authnz::repository_authorizer::RawToken;
     use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
     use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server;
+
+    /// Auth OFF: the selection a config with no `[server.auth]` gets.
+    fn allow_all() -> Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn request_for(repository_id: RepositoryId) -> Request<RepositoryStorageStatsRequest> {
         let mut request = Request::new(RepositoryStorageStatsRequest {
@@ -100,11 +110,19 @@ mod tests {
         request
             .metadata_mut()
             .insert("authorization", "Bearer test-token".parse().unwrap());
+        // The verified halves the interceptor inserts: an identity token (no
+        // `resources` claim), so the online check is asked.
+        request
+            .extensions_mut()
+            .insert(AuthorizationToken::default());
+        request
+            .extensions_mut()
+            .insert(RawToken("test-token".into()));
         request
     }
 
-    /// Same request shape, no `authorization` metadata — used with `auth_url =
-    /// None` where the header would otherwise be unused.
+    /// Same request shape, no `authorization` metadata or token — used with
+    /// `AllowAllRepositoryAuthorizer` (auth OFF).
     fn request_no_auth(repository_id: RepositoryId) -> Request<RepositoryStorageStatsRequest> {
         Request::new(RepositoryStorageStatsRequest {
             id: repository_id.into(),
@@ -118,7 +136,12 @@ mod tests {
         let (immutable, _mutable) = new_test_stores().await;
         let auth_url = start_stub_auth_server(caller_authorized_repo).await;
 
-        let result = handler(request_for(target_repo), Some(auth_url), immutable).await;
+        let result = handler(
+            request_for(target_repo),
+            Arc::new(AuthClientAuthorizer::new(auth_url)),
+            immutable,
+        )
+        .await;
 
         // This is the headline case: the gate must run BEFORE the store is
         // ever touched. A handler that compiles and looks plausible but
@@ -134,7 +157,12 @@ mod tests {
         let (immutable, _mutable) = new_test_stores().await;
         let auth_url = start_stub_auth_server(repository_id).await;
 
-        let result = handler(request_for(repository_id), Some(auth_url), immutable).await;
+        let result = handler(
+            request_for(repository_id),
+            Arc::new(AuthClientAuthorizer::new(auth_url)),
+            immutable,
+        )
+        .await;
 
         // The authz check passes for a legitimate caller reading its own
         // repository; `LocalImmutableStore` has no `repository_stats`
@@ -152,7 +180,7 @@ mod tests {
         let repository_id = RepositoryId::from([24u8; 16]);
         let (immutable, _mutable) = new_test_stores().await;
 
-        let result = handler(request_for(repository_id), None, immutable).await;
+        let result = handler(request_for(repository_id), allow_all(), immutable).await;
 
         // Same Unimplemented outcome as the auth-ON own-repository case above
         // (no stub auth server involved at all here) — proves auth-OFF
@@ -168,7 +196,7 @@ mod tests {
             id: Default::default(),
         });
 
-        let result = handler(request, None, immutable).await;
+        let result = handler(request, allow_all(), immutable).await;
 
         let err = result.expect_err("default repository id must be rejected");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -256,7 +284,7 @@ mod tests {
             unimplemented!("not exercised by repository_storage_stats tests")
         }
 
-        async fn compact_stop(self: Arc<Self>) {
+        async fn stop_gc(self: Arc<Self>, _terminate: bool) {
             unimplemented!("not exercised by repository_storage_stats tests")
         }
 
@@ -302,7 +330,7 @@ mod tests {
             }),
         });
 
-        let response = handler(request_no_auth(repository_id), None, store)
+        let response = handler(request_no_auth(repository_id), allow_all(), store)
             .await
             .expect("stub store reports success")
             .into_inner();
@@ -325,7 +353,7 @@ mod tests {
             result: Err(lore_storage::StoreError::from(SlowDown)),
         });
 
-        let result = handler(request_no_auth(repository_id), None, store).await;
+        let result = handler(request_no_auth(repository_id), allow_all(), store).await;
 
         let err = result.expect_err("SlowDown must surface as an error");
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
@@ -340,7 +368,7 @@ mod tests {
             })),
         });
 
-        let result = handler(request_no_auth(repository_id), None, store).await;
+        let result = handler(request_no_auth(repository_id), allow_all(), store).await;
 
         let err = result.expect_err("NotSupported must surface as an error");
         assert_eq!(err.code(), tonic::Code::Unimplemented);
@@ -353,7 +381,7 @@ mod tests {
             result: Err(lore_storage::StoreError::from(NotFound)),
         });
 
-        let result = handler(request_no_auth(repository_id), None, store).await;
+        let result = handler(request_no_auth(repository_id), allow_all(), store).await;
 
         let err = result.expect_err("an unmapped store error must still surface as an error");
         assert_eq!(err.code(), tonic::Code::Internal);

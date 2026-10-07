@@ -29,6 +29,7 @@ pub enum UserInfoError {
     NoRemote,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NotSupported,
     Oversized,
     SlowDown,
@@ -103,15 +104,31 @@ pub struct LoreAuthIdentityEventData {
 /// remote path. Because the local path reads a cached token captured at
 /// login, a name change made server-side since then is not reflected until
 /// the token is refreshed.
+///
+/// An offline or local-only call emits an event for the current user alone, and
+/// only from an identity token supplied to the call: both the auth service and
+/// the auth URL the token store is keyed by come from the connection. Every
+/// other id is left for the caller to display raw.
 pub async fn resolve_user_info(
     repository: Arc<RepositoryContext>,
     ids: LoreArray<LoreString>,
 ) -> Result<(), UserInfoError> {
-    let remote = repository
-        .remote()
-        .await
-        .forward::<UserInfoError>("Not connected")?;
-    let auth_url = remote.auth_url().to_string();
+    let execution = execution_context();
+    let globals = execution.globals();
+    let current_user_id = execution.user_id().await;
+
+    let local_only = globals.offline_or_local();
+    let auth_url = if local_only {
+        lore_debug!("Resolving user info from local tokens only");
+        String::new()
+    } else {
+        repository
+            .remote()
+            .await
+            .forward::<UserInfoError>("Not connected")?
+            .auth_url()
+            .to_string()
+    };
 
     let user_ids_vec: Vec<String> = ids
         .as_slice()
@@ -119,10 +136,6 @@ pub async fn resolve_user_info(
         .map(LoreString::as_str)
         .map(ToString::to_string)
         .collect();
-
-    let execution = execution_context();
-    let globals = execution.globals();
-    let current_user_id = execution.user_id().await;
 
     // Fast path: if the current user id is in the list and a local JWT token
     // is cached for that identity, decode the name locally instead of calling
@@ -162,7 +175,7 @@ pub async fn resolve_user_info(
         }
     }
 
-    if remaining_ids.is_empty() {
+    if remaining_ids.is_empty() || local_only {
         return Ok(());
     }
 
@@ -208,6 +221,57 @@ pub async fn resolve_user_info(
     }
 
     lore_debug!("User info query successful");
+
+    Ok(())
+}
+
+/// Emits the authorization (access) token for the repository as an
+/// [`LoreEvent::AuthIdentity`] event.
+pub async fn repository_access_token(
+    repository: Arc<RepositoryContext>,
+) -> Result<(), UserInfoError> {
+    let remote = repository
+        .remote()
+        .await
+        .forward::<UserInfoError>("Not connected")?;
+    let auth_url = remote.auth_url().to_string();
+    let remote_domain = get_domain_or_empty(remote.remote_url());
+
+    let execution = execution_context();
+    let globals = execution.globals();
+    let user_id = execution.user_id().await;
+
+    lore_debug!("Get authorization token for identity {user_id} using auth url {auth_url}");
+    let token = lore_transport::auth::exchange::exchange(
+        auth_url.as_str(),
+        user_id.as_str(),
+        repository.id,
+        remote_domain,
+        globals.identity_token(),
+        globals.access_token(),
+    )
+    .await
+    .forward::<UserInfoError>("Failed authorization token exchange")?;
+
+    // Expiry and authorized domains come from the token itself, matching what
+    // `auth list` reports for stored authorization entries.
+    let (authorized_domains, expires) = match lore_credential::insecure_decode_token(&token) {
+        Ok(decoded) => (
+            decoded.claims.acceptable_root_domains().join(", "),
+            decoded.claims.expires * 1000,
+        ),
+        Err(_) => (String::new(), 0),
+    };
+
+    LoreEvent::AuthIdentity(LoreAuthIdentityEventData {
+        auth_url: auth_url.into(),
+        resource: repository.id.to_string().into(),
+        user_id: user_id.into(),
+        authorized_domains: authorized_domains.into(),
+        expires,
+        token: token.into(),
+    })
+    .send();
 
     Ok(())
 }
@@ -471,7 +535,7 @@ pub async fn user_display_name(
         )
         .await
     {
-        return Ok(user_info.name);
+        return Ok(display_name(&user_info));
     }
 
     // Obtain an authorization token from the authentication token

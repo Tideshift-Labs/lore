@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
+use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
 use lore_transport::quic::UnknownCommand;
@@ -19,8 +20,10 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::client_identify::ClientIdentify;
 use crate::protocol::storage::authorize::AuthorizeAction;
 use crate::protocol::storage::authorize::parse_authorize;
 use crate::protocol::storage::copy::handle_copy;
@@ -67,6 +70,7 @@ pub enum ParsedStorageRequestV4 {
         opcode: QuicOpCode,
         payload: Bytes,
     },
+    ClientIdentify(ClientIdentify),
 }
 
 fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
@@ -88,28 +92,36 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    // TODO(UCS-23410): read by the partition check at session start.
+    #[allow(dead_code)]
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     session_map: Arc<SessionMap>,
     enforce_write_permission: bool,
+    user_agent_filter: Arc<UserAgentFilter>,
 }
 
 impl StorageServiceV4 {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         enforce_write_permission: bool,
+        user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
             session_map: Arc::new(SessionMap::default()),
             enforce_write_permission,
+            user_agent_filter,
         }
     }
 
@@ -157,6 +169,12 @@ impl QuicService for StorageServiceV4 {
             return Err(MessageParseError::UnknownOpcode(opcode));
         }
 
+        if opcode == Command::ClientIdentify as u8 {
+            return Ok(ParsedStorageRequestV4::ClientIdentify(
+                ClientIdentify::parse(bytes, false)?,
+            ));
+        }
+
         if opcode == Command::Authorize as u8 {
             let action = parse_authorize(session_id, bytes)?;
             return match action {
@@ -185,10 +203,14 @@ impl QuicService for StorageServiceV4 {
 
     async fn run_request_handler(
         &self,
-        _context: Arc<AttributeMap>,
+        context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
         match request {
+            ParsedStorageRequestV4::ClientIdentify(msg) => {
+                msg.apply(&context, &self.user_agent_filter);
+                Ok(vec![])
+            }
             ParsedStorageRequestV4::AuthorizeStart {
                 repository,
                 correlation_id,
@@ -519,6 +541,7 @@ impl QuicService for StorageServiceV4 {
             ),
         };
 
+        let user_agent = context.get::<crate::protocol::client_identify::UserAgentValue>();
         build_storage_protocol_request_span(
             header.cmd,
             StorageProtocol::StorageV4,
@@ -526,15 +549,21 @@ impl QuicService for StorageServiceV4 {
             &repository_id,
             &correlation_id,
             &user_id,
+            user_agent
+                .as_ref()
+                .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
     use bytes::BytesMut;
     use lore_base::types::KeyType;
+    use lore_telemetry::user_agent_filter::UserAgentFilter;
     use lore_transport::quic::QuicServiceError;
+    use lore_transport::quic::command_header::CommandHeader;
     use rand::random;
     use zerocopy::IntoBytes;
 
@@ -602,6 +631,90 @@ mod tests {
         bytes.freeze()
     }
 
+    fn make_service(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+    ) -> StorageServiceV4 {
+        StorageServiceV4::new(
+            Arc::new(None),
+            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            immutable_store.clone(),
+            immutable_store.clone(),
+            mutable_store,
+            false,
+            Arc::new(UserAgentFilter::default()),
+        )
+    }
+
+    fn make_header(cmd: u8) -> CommandHeader {
+        CommandHeader {
+            cmd,
+            ..CommandHeader::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_client_identify_opcode_returns_variant() {
+        use lore_transport::quic::storage_service::Command;
+        // The stores are unused by parse_request_bytes, so a minimal service suffices.
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+
+        let header = make_header(Command::ClientIdentify as u8);
+        let payload = Bytes::from("my-client/1.0");
+
+        let parsed = service
+            .parse_request_bytes(&header, payload)
+            .expect("parsing a ClientIdentify request must succeed");
+
+        assert!(
+            matches!(parsed, ParsedStorageRequestV4::ClientIdentify(_)),
+            "expected ClientIdentify variant, got {parsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parse_client_identify_stores_value() {
+        use lore_transport::quic::storage_service::Command;
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+
+        let header = make_header(Command::ClientIdentify as u8);
+        let payload = Bytes::from("my-client/1.0");
+
+        let parsed = service
+            .parse_request_bytes(&header, payload)
+            .expect("parsing a ClientIdentify request must succeed");
+        let ParsedStorageRequestV4::ClientIdentify(ci) = parsed else {
+            panic!("wrong variant");
+        };
+        assert_eq!(ci.user_agent, Some("my-client/1.0".to_string()));
+    }
+
+    #[tokio::test]
+    async fn run_request_handler_client_identify_returns_empty_ok() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+
+        let ci = crate::protocol::client_identify::ClientIdentify {
+            user_agent: Some("my-client/1.0".to_string()),
+            is_trusted: false,
+        };
+
+        let response = service
+            .run_request_handler(
+                Arc::new(AttributeMap::default()),
+                ParsedStorageRequestV4::ClientIdentify(ci),
+            )
+            .await
+            .expect("ClientIdentify must be handled successfully");
+
+        assert!(response.is_empty(), "expected empty response vec");
+    }
+
     /// Fill the session map to capacity then attempt one more `AuthorizeStart`,
     /// verifying the handler returns `SlowDown` and that `transform_protocol_error`
     /// classifies it the same way `stream_handler` would.
@@ -610,13 +723,7 @@ mod tests {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
 
-        let service = StorageServiceV4::new(
-            Arc::new(None),
-            immutable_store.clone(),
-            immutable_store.clone(),
-            mutable_store,
-            false,
-        );
+        let service = make_service(immutable_store, mutable_store);
 
         let repo = random::<lore_revision::lore::RepositoryId>();
 
@@ -687,10 +794,12 @@ mod tests {
                 test_store_create().await.expect("Failed to create stores");
             StorageServiceV4::new(
                 jwt_verifier,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
                 immutable_store.clone(),
                 immutable_store,
                 mutable_store,
                 enforce_write_permission,
+                Arc::new(UserAgentFilter::default()),
             )
         }
 

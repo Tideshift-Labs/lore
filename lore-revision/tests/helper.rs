@@ -38,7 +38,7 @@ pub fn default_repository_creation_args(
     mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
 ) -> lore_revision::repository::RepositoryContextCreationArgs {
     lore_revision::repository::RepositoryContextCreationArgs {
-        path: None,
+        paths: None,
         immutable_store,
         mutable_store,
         id: lore_base::types::Context::from(uuid::Uuid::now_v7()).into(),
@@ -47,7 +47,6 @@ pub fn default_repository_creation_args(
             lore_base::error::NoRemote,
         )),
         filter: std::sync::Arc::default(),
-        format: lore_revision::repository::RepositoryFormat::Lore,
         filesystem_provider: None,
     }
 }
@@ -62,7 +61,6 @@ pub trait RepositoryContextCreationArgsExt {
         remote: Result<std::sync::Arc<lore_transport::Connection>, lore_transport::ProtocolError>,
     ) -> Self;
     fn with_filter(self, filter: std::sync::Arc<lore_revision::filter::Filter>) -> Self;
-    fn with_format(self, format: lore_revision::repository::RepositoryFormat) -> Self;
     fn with_filesystem_provider(
         self,
         filesystem_provider: std::sync::Arc<
@@ -73,7 +71,10 @@ pub trait RepositoryContextCreationArgsExt {
 
 impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryContextCreationArgs {
     fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
-        self.path = Some(path.as_ref().to_owned());
+        self.paths = Some(lore_revision::repository::RepositoryPaths::new(
+            path.as_ref().to_path_buf(),
+            path.as_ref().join(lore_revision::repository::DOT_LORE),
+        ));
         self
     }
 
@@ -100,11 +101,6 @@ impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryC
         self
     }
 
-    fn with_format(mut self, format: lore_revision::repository::RepositoryFormat) -> Self {
-        self.format = format;
-        self
-    }
-
     fn with_filesystem_provider(
         mut self,
         filesystem_provider: std::sync::Arc<
@@ -116,48 +112,8 @@ impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryC
     }
 }
 
-pub struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    #[allow(dead_code)]
-    pub fn new(prefix: &str) -> Self {
-        use rand::distr::SampleString;
-        let name = format!(
-            "{prefix}{}",
-            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&path).expect("Failed to create temp directory");
-        let path = std::fs::canonicalize(path).expect("Canonicalize temporary test dir");
-        Self(path)
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for TempDir {
-    type Target = std::path::Path;
-    fn deref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl AsRef<std::path::Path> for TempDir {
-    fn as_ref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // Test fixture cleanup; not subject to repository write-token discipline.
-        #[allow(clippy::disallowed_methods)]
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+#[allow(unused_imports)]
+pub use lore_base::test_util::TempDir;
 
 #[allow(dead_code)]
 pub fn generate_tempdir() -> TempDir {
@@ -225,6 +181,152 @@ pub async fn test_repository_create(
         path,
         _tempdir: tempdir,
     }
+}
+
+/// Creates (or truncates) the file at `path` and writes `contents` to it.
+///
+/// Panics on failure, since a fixture the test cannot write invalidates what it
+/// would go on to assert.
+#[allow(dead_code)]
+pub fn test_file_write(path: &std::path::Path, contents: &[u8]) {
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    std::fs::write(path, contents)
+        .unwrap_or_else(|_| panic!("Failed to write test file at {}", path.display()));
+}
+
+/// Reconciles the working tree against `state_staged`, mutating it in place as
+/// `lore status --scan` does, and returns the changes detected.
+#[allow(dead_code)]
+pub async fn test_scan(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_with_intent(
+        repository,
+        state_staged,
+        state_current,
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+    )
+    .await
+}
+
+/// [`test_scan`] under the given intent, for a walk that stages rather than marks.
+#[allow(dead_code)]
+pub async fn test_scan_with_intent(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_path_with_intent(repository, state_staged, state_current, None, intent).await
+}
+
+/// [`test_scan_with_intent`] scoped to `path`, which is what makes the walk resolve the
+/// ancestors of a path the tree does not hold.
+#[allow(dead_code)]
+pub async fn test_scan_path_with_intent(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Vec<lore_revision::change::NodeChange> {
+    let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+        repository.file_system().as_ref(),
+    )
+    .await
+    .expect("Failed to start filesystem operation");
+    let changes = lore_revision::state::diff_filesystem(
+        &operation,
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository: repository.clone(),
+            state: state_staged,
+        },
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository,
+            state: state_current,
+        },
+        path,
+        lore_revision::filter::FilterMode::Full,
+        intent,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .await
+    .expect("Failed to diff filesystem")
+    .collect()
+    .await
+    .expect("Failed to diff filesystem");
+    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+        .await
+        .expect("Failed to finish filesystem operation");
+    changes
+}
+
+/// [`test_scan`] read one change at a time, for the walk's other consumption path.
+///
+/// Answers in arrival order, which interleaves subtrees by completion, and waits for the walk so
+/// the answer is the whole of it.
+#[allow(dead_code)]
+pub async fn test_scan_streaming(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+) -> Vec<lore_revision::change::NodeChange> {
+    let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+        repository.file_system().as_ref(),
+    )
+    .await
+    .expect("Failed to start filesystem operation");
+    let mut stream = lore_revision::state::diff_filesystem(
+        &operation,
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository: repository.clone(),
+            state: state_staged,
+        },
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository,
+            state: state_current,
+        },
+        None,
+        lore_revision::filter::FilterMode::Full,
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::Report,
+        std::sync::Arc::new(Vec::new()),
+    )
+    .await
+    .expect("Failed to diff filesystem");
+
+    let mut changes = Vec::new();
+    while let Some(change) = stream.next().await {
+        changes.push(change);
+    }
+    stream.finish().await.expect("Failed to diff filesystem");
+    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+        .await
+        .expect("Failed to finish filesystem operation");
+    changes
+}
+
+/// The anchor revision's state, deserialized twice: once as the current
+/// revision and once as the staged state a scan reconciles in place.
+#[allow(dead_code)]
+pub async fn test_anchor_states(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+) -> (
+    std::sync::Arc<lore_revision::state::State>,
+    std::sync::Arc<lore_revision::state::State>,
+) {
+    let (revision, _branch) = lore_revision::instance::load_current_anchor(repository)
+        .await
+        .expect("Failed to load current anchor");
+    let current = lore_revision::state::State::deserialize(repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize current state");
+    let staged = lore_revision::state::State::deserialize(repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize staged state");
+    (current, staged)
 }
 
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {

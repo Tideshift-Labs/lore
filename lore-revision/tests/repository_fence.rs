@@ -80,7 +80,7 @@ async fn settled_children_cannot_clear_missing_body_proof_or_explicit_parent_unc
             .await
             .unwrap();
         if uncertain {
-            store.mark_parent_uncertain(parent, 194).await.unwrap();
+            store.mark_parent_uncertain(parent, 249).await.unwrap();
             assert!(store.complete_parent_body(parent).await.is_err());
         }
         drop(store);
@@ -94,7 +94,7 @@ async fn settled_children_cannot_clear_missing_body_proof_or_explicit_parent_unc
         assert_eq!(parents.len(), 1);
         assert!(!parents[0].complete);
         assert!(!parents[0].body_completed);
-        assert_eq!(parents[0].parent_uncertainty_code, uncertain.then_some(194));
+        assert_eq!(parents[0].parent_uncertainty_code, uncertain.then_some(249));
         drop(recovery);
         assert!(RepositoryMutationGuard::acquire(dir.path()).await.is_err());
     }

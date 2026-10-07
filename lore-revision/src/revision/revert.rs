@@ -211,6 +211,7 @@ pub async fn revert(
         MergeType::Revert,
         false,
         current_branch,
+        &crate::metadata::MetadataInherit::default(),
     )
     .await?;
 
@@ -241,7 +242,6 @@ pub async fn revert(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
-            stats: false,
         };
 
         Box::pin(commit::commit(repository.clone(), token, commit_options))

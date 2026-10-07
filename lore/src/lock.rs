@@ -18,9 +18,9 @@ use serde::Serialize;
 use crate::call::repository_call_read;
 use crate::call_delegation::dispatch_call;
 use crate::call_delegation::reject_undelegatable;
-use crate::call_delegation::service_delegation_requested;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
+use crate::remote::service_process::service_in_use;
 
 /// Arguments for acquiring file locks on the given paths for a branch.
 #[repr(C)]
@@ -79,13 +79,13 @@ pub async fn file_acquire_with_attempt_store(
     callback: LoreEventCallback,
     attempts: Arc<dyn AttemptStore>,
 ) -> i32 {
-    if service_delegation_requested() {
+    if service_in_use().await {
         return reject_undelegatable(
             globals,
             callback,
             "file_acquire_with_attempt_store cannot delegate to a service: the attempt store is \
              in-process, and a delegated acquire would file receipts under identities the caller \
-             never recorded. Unset LORE_USE_SERVICE, or call file_acquire and keep no journal."
+             never recorded. Turn service relaying off (LORE_USE_SERVICE=0, or [service] use_automatically = false), or call file_acquire and keep no journal."
                 .to_owned(),
         )
         .await;
@@ -347,13 +347,13 @@ pub async fn file_release_with_attempt_store(
     callback: LoreEventCallback,
     attempts: Arc<dyn AttemptStore>,
 ) -> i32 {
-    if service_delegation_requested() {
+    if service_in_use().await {
         return reject_undelegatable(
             globals,
             callback,
             "file_release_with_attempt_store cannot delegate to a service: the attempt store is \
              in-process, and a delegated release would file receipts under identities the caller \
-             never recorded. Unset LORE_USE_SERVICE, or call file_release and keep no journal."
+             never recorded. Turn service relaying off (LORE_USE_SERVICE=0, or [service] use_automatically = false), or call file_release and keep no journal."
                 .to_owned(),
         )
         .await;

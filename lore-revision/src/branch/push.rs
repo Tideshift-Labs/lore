@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -12,6 +13,7 @@ use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
+use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use lore_transport::attempt_store::AttemptStore;
@@ -146,6 +148,27 @@ pub struct LoreBranchPushFragmentEndEventData {
     pub bytes_transferred: u64,
 }
 
+/// Data for the event reporting what a push cost.
+///
+/// Emitted once, when the push finishes, at statistics level one and above. A
+/// push that failed reports what it had done by then. The counts are cumulative
+/// across every revision, link and layer the push registers, where
+/// [`LoreBranchPushFragmentProgressEventData`] reports the revision in flight.
+///
+/// A push stores no payload of its own: a fragment the peer was asked about is
+/// deduplicated, copied or put, unless the push ended before it was reached.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreBranchPushStatsEventData {
+    /// Fragments the peer already held, so nothing was registered for them.
+    pub deduplicated: u64,
+    /// Fragments the peer duplicated an association for, sending no payload.
+    pub copied: u64,
+    /// Fragments whose payload was uploaded.
+    pub put: u64,
+}
+
 /// Data for the event sent before a branch is created on the remote.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -271,7 +294,7 @@ pub enum PushError {
     OutcomeUnknown,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PushOptions {
     /// Branch to push, default to current branch if not set
     pub branch: Option<String>,
@@ -304,12 +327,165 @@ impl EventError for PushError {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct PushStatistics {
-    pub fragment_count: AtomicUsize,
-    pub fragment_complete: AtomicUsize,
-    pub bytes_transferred: AtomicU64,
-    pub bytes_total: AtomicU64,
+/// What a push does with the fragments the peer was asked about.
+///
+/// A push stores no payload of its own: the peer either already holds the
+/// fragment, duplicates an association it holds under another context, or is sent
+/// the payload. Shared behind an [`Arc`](std::sync::Arc) by every task the push
+/// spawns, and cumulative across every revision, link and layer it registers.
+pub(crate) struct PushStats {
+    deduplicated: AtomicU64,
+    copied: AtomicU64,
+    put: AtomicU64,
+    /// Payload bytes the uploads carried, which the per-revision progress event
+    /// reports rather than the statistics one.
+    put_bytes: AtomicU64,
+    /// Whether to keep the count the statistics event alone reports. `copied` and
+    /// `put` sum to the fragments a progress event reports as registered, so those
+    /// two are kept whatever the level.
+    statistics: bool,
+}
+
+impl PushStats {
+    /// Counters for one push, keeping what the call's statistics level reports.
+    pub(crate) fn new(statistics: bool) -> Self {
+        Self {
+            deduplicated: AtomicU64::new(0),
+            copied: AtomicU64::new(0),
+            put: AtomicU64::new(0),
+            put_bytes: AtomicU64::new(0),
+            statistics,
+        }
+    }
+
+    /// `count` fragments the peer already held, so nothing was registered.
+    fn deduplicated(&self, count: u64) {
+        if self.statistics {
+            self.deduplicated.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// The peer duplicated an association it already held, sending no payload.
+    fn copied(&self) {
+        self.copied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A payload was uploaded to the peer.
+    fn put(&self, payload_bytes: u64) {
+        self.put.fetch_add(1, Ordering::Relaxed);
+        self.put_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
+    }
+
+    /// Fragments registered with the peer, by copy or upload.
+    fn registered(&self) -> u64 {
+        self.copied.load(Ordering::Relaxed) + self.put.load(Ordering::Relaxed)
+    }
+
+    /// Payload bytes uploaded.
+    fn put_bytes(&self) -> u64 {
+        self.put_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The counts, as an event payload.
+    fn snapshot(&self) -> LoreBranchPushStatsEventData {
+        LoreBranchPushStatsEventData {
+            deduplicated: self.deduplicated.load(Ordering::Relaxed),
+            copied: self.copied.load(Ordering::Relaxed),
+            put: self.put.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The in-flight revision's share of the push, for the per-revision progress
+/// event.
+///
+/// Fragments registered and bytes uploaded are read out of the push-wide
+/// [`PushStats`] as a delta against the baseline this revision started from, so
+/// those facts are recorded in one place whichever event reports them.
+/// `fragment_count` and `bytes_queued` are this revision's alone: the fragments it
+/// has to register, and the payload bytes it has loaded to send.
+pub(crate) struct PushProgress {
+    fragment_count: AtomicUsize,
+    bytes_queued: AtomicU64,
+    registered_baseline: u64,
+    put_bytes_baseline: u64,
+    stats: Arc<PushStats>,
+}
+
+impl PushProgress {
+    /// Start a revision's progress from where the push-wide counters stand now.
+    pub(crate) fn new(stats: Arc<PushStats>) -> Self {
+        Self {
+            fragment_count: AtomicUsize::new(0),
+            bytes_queued: AtomicU64::new(0),
+            registered_baseline: stats.registered(),
+            put_bytes_baseline: stats.put_bytes(),
+            stats,
+        }
+    }
+
+    fn set_fragment_count(&self, count: usize) {
+        self.fragment_count.store(count, Ordering::Relaxed);
+    }
+
+    /// A payload was loaded and is about to be uploaded.
+    fn payload_queued(&self, bytes: u64) {
+        self.bytes_queued.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Fragments this revision has registered with the peer, by copy or upload.
+    pub(crate) fn complete(&self) -> u64 {
+        self.stats
+            .registered()
+            .saturating_sub(self.registered_baseline)
+    }
+
+    /// Fragments this revision has to register.
+    pub(crate) fn count(&self) -> u64 {
+        self.fragment_count.load(Ordering::Relaxed) as u64
+    }
+
+    fn event(&self) -> LoreBranchPushFragmentProgressEventData {
+        LoreBranchPushFragmentProgressEventData {
+            complete: self.complete(),
+            count: self.fragment_count.load(Ordering::Relaxed) as u64,
+            bytes_transferred: self
+                .stats
+                .put_bytes()
+                .saturating_sub(self.put_bytes_baseline),
+            bytes_total: self.bytes_queued.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Emits what the push cost when dropped.
+struct PushStatsReport;
+
+impl PushStatsReport {
+    /// A guard that emits the statistics event when dropped, so the push that
+    /// fails reports as the one that succeeds does. Reporting turned off yields
+    /// `None`.
+    fn start() -> Option<Self> {
+        execution_context().globals().stats().then_some(Self)
+    }
+}
+
+impl Drop for PushStatsReport {
+    fn drop(&mut self) {
+        if let Some(snapshot) = push_stats_event() {
+            event::LoreEvent::BranchPushStats(snapshot).send();
+        }
+    }
+}
+
+/// The push-wide counts, as an event payload, or `None` outside an execution
+/// context — which is also no context to send an event through.
+fn push_stats_event() -> Option<LoreBranchPushStatsEventData> {
+    Some(
+        crate::runtime::try_execution_context()?
+            .push_stats()
+            .snapshot(),
+    )
 }
 
 pub async fn push(
@@ -318,7 +494,8 @@ pub async fn push(
     options: PushOptions,
     attempts: Option<Arc<dyn AttemptStore>>,
 ) -> Result<(), PushError> {
-    push_with_runner(repository, token, options, attempts, None).await
+    // boxed: future is ~7 KB on the stack
+    Box::pin(push_with_runner(repository, token, options, attempts, None)).await
 }
 
 pub async fn push_with_runner(
@@ -328,6 +505,8 @@ pub async fn push_with_runner(
     attempts: Option<Arc<dyn AttemptStore>>,
     runner: Option<Arc<ManagedPushRunner>>,
 ) -> Result<(), PushError> {
+    let _stats_report = PushStatsReport::start();
+
     let branch;
     let local_latest;
     if let Some(branch_identifier) = &options.branch {
@@ -389,8 +568,7 @@ pub async fn push_with_runner(
         .forward::<PushError>("re-deserializing current state for links")?;
     if let Ok(link_list) = state_current.link_list(repository.clone()).await {
         for link_reference in link_list.iter() {
-            let link_repository =
-                Arc::new(repository.to_link_context(link_reference.repository).await);
+            let link_repository = repository.to_link_context(link_reference.repository).await;
             let link_branch_id = link_reference.resolve_branch(branch);
             let link_local_latest = branch::load_latest(link_repository.clone(), link_branch_id)
                 .await
@@ -417,6 +595,132 @@ pub async fn push_with_runner(
     }
 
     Ok(())
+}
+
+/// The revision the peer holds as latest for `branch`, remembered in `known`, or zero when
+/// the peer names none.
+///
+/// A zero branch is no branch to ask about, which a revision whose metadata cannot be read
+/// answers with. A push carries a line or two, so the answers are kept in a list rather
+/// than a map.
+async fn peer_latest_for_branch(
+    remote: Arc<Connection>,
+    repository: RepositoryId,
+    branch: BranchId,
+    known: &mut Vec<(BranchId, Hash)>,
+) -> Hash {
+    if branch.is_zero() {
+        return Hash::default();
+    }
+
+    if let Some((_branch, latest)) = known.iter().find(|(known, _)| *known == branch) {
+        return *latest;
+    }
+
+    let latest = branch::load_remote_latest(remote, repository, branch)
+        .await
+        .unwrap_or_default();
+    known.push((branch, latest));
+    latest
+}
+
+/// The revisions `history` reaches only through the second parent of a merge, newest first.
+///
+/// A merge sets `parent_self` to the revision the peer already had and `parent_other` to
+/// the line merged into it, so the branch history walk that produced `history` reaches a
+/// merge revision and stops. The revisions on that second line still have to be readable
+/// on the peer, which names them through the merge, and nothing else uploads them: an
+/// online commit uploads what it writes as it writes it, so it is a line committed offline
+/// that arrives here with nothing of it on the peer.
+///
+/// [`history::find_branch_point`] is what says where a line left the history the peer
+/// holds, and what it walks against decides how much of the line it reports. The peer's
+/// latest for the branch the line belongs to is the bound where the peer names one - the
+/// same bound the branch history walk applies to the branch being pushed, so a line the
+/// peer carries already is walked no further than the revisions it is missing, and
+/// `branch` with `remote_latest` name it for the branch being pushed. A branch the peer
+/// has never seen it names nothing for, and a walk against nothing runs to the root of the
+/// line, so those fall back on the merge's own first parent: a line and the line it was
+/// merged into meet at the branch point, which is as far as the line reaches.
+///
+/// A revision on the line may be a merge in its own right, and its second line is just as
+/// unreachable, so those are followed the same way.
+///
+/// The result is ordered to be walked in reverse, which visits each line oldest revision
+/// first. What each revision owns is collected against its own first parent whatever the
+/// order, so this is what the order buys: a fragment an older revision registers counts as
+/// durably stored before a newer revision holding the same one is collected, and drops out
+/// of that collection. Completeness does not rest on the order - every line is walked back
+/// to a revision the peer holds, so a fragment is offered by the oldest revision on the
+/// line that holds it.
+async fn collect_divergent_history(
+    repository: Arc<RepositoryContext>,
+    remote: Arc<Connection>,
+    branch: BranchId,
+    remote_latest: Hash,
+    history: &[Hash],
+) -> Result<Vec<Hash>, PushError> {
+    let mut pending = vec![];
+
+    for revision in history {
+        let state = State::deserialize(repository.clone(), *revision)
+            .await
+            .forward::<PushError>("deserializing revision state")?;
+        if !state.parent_other().is_zero() {
+            pending.push((state.parent_self(), state.parent_other()));
+        }
+    }
+
+    if pending.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut visited: HashSet<Hash> = history.iter().copied().collect();
+    let mut peer_latest = vec![(branch, remote_latest)];
+    let mut divergent = vec![];
+
+    while let Some((parent_self, parent_other)) = pending.pop() {
+        let line_branch = State::deserialize(repository.clone(), parent_other)
+            .await
+            .forward::<PushError>("deserializing merged line state")?
+            .branch(repository.clone())
+            .await;
+        let line_base =
+            peer_latest_for_branch(remote.clone(), repository.id, line_branch, &mut peer_latest)
+                .await;
+        let line_base = if line_base.is_zero() {
+            parent_self
+        } else {
+            line_base
+        };
+
+        let (_branch_point, _peer_history, line_history) =
+            history::find_branch_point(repository.clone(), line_base, parent_other)
+                .await
+                .forward::<PushError>("reconciling divergent history")?;
+
+        lore_debug!(
+            "Found {} revision(s) on the line merged from {parent_other}, against {line_base} on branch {line_branch}",
+            line_history.len()
+        );
+
+        for revision in line_history {
+            if !visited.insert(revision) {
+                continue;
+            }
+
+            let state = State::deserialize(repository.clone(), revision)
+                .await
+                .forward::<PushError>("deserializing divergent revision state")?;
+            if !state.parent_other().is_zero() {
+                pending.push((state.parent_self(), state.parent_other()));
+            }
+
+            divergent.push(revision);
+        }
+    }
+
+    Ok(divergent)
 }
 
 // Keep the explicit stage runner separate from the existing push execution inputs.
@@ -740,6 +1044,41 @@ async fn collect_fragments_and_push(
         .send();
     }
 
+    let divergent_revisions = collect_divergent_history(
+        repository.clone(),
+        remote.clone(),
+        branch,
+        remote_latest,
+        &full_local_history,
+    )
+    .await?;
+
+    for revision in divergent_revisions.iter().rev() {
+        let state = State::deserialize(repository.clone(), *revision)
+            .await
+            .forward::<PushError>("deserializing divergent revision state")?;
+
+        push_revision_links(
+            &repository,
+            token,
+            &options,
+            &state,
+            branch,
+            &attempts,
+            &runner,
+        )
+        .await?;
+        upload_revision_fragments(
+            &repository,
+            &storage_protocol,
+            remote.environment.max_query_batch(),
+            &state,
+            dry_run,
+            runner.as_ref(),
+        )
+        .await?;
+    }
+
     let mut current_latest = Hash::default();
     let mut fast_forward_merged = false;
     for current_revision in full_local_history.iter().rev() {
@@ -749,37 +1088,16 @@ async fn collect_fragments_and_push(
             .await
             .forward::<PushError>("deserializing revision state")?;
 
-        // Push links
-        if let Ok(link_list) = state.link_list(repository.clone()).await {
-            // TODO(vri): UCS-17135 - Push links in individual tasks
-            for link_reference in link_list.iter() {
-                let link_id = link_reference.repository;
-                let link_repository = Arc::new(repository.to_link_context(link_id).await);
-                let link_signature = link_reference.signature;
-                let link_state = State::deserialize(link_repository.clone(), link_signature)
-                    .await
-                    .forward::<PushError>("deserializing link state")?;
-
-                let link_branch_id = link_reference.resolve_branch(branch);
-
-                lore_debug!(
-                    "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
-                );
-
-                collect_fragments_and_push_recurse(
-                    link_repository,
-                    token.share(),
-                    options.clone(),
-                    link_state,
-                    link_branch_id,
-                    link_reference.signature,
-                    attempts.clone(),
-                    runner.clone(),
-                )
-                .await
-                .forward::<PushError>("pushing linked repository")?;
-            }
-        }
+        push_revision_links(
+            &repository,
+            token,
+            &options,
+            &state,
+            branch,
+            &attempts,
+            &runner,
+        )
+        .await?;
 
         if !current_latest.is_zero() && state.parent_self() != current_latest {
             // Rebase on new latest revision
@@ -810,96 +1128,18 @@ async fn collect_fragments_and_push(
             .send();
         }
 
-        // Load parent state
-        let state_parent = State::deserialize(repository.clone(), state.parent_self())
-            .await
-            .forward::<PushError>("deserializing parent state")?;
-
-        // Check missing fragments on server
-        lore_debug!(
-            "Calculating new fragments from {} to {}",
-            state_parent.revision(),
-            state.revision()
-        );
-        let mut fragments = state::collect_new_fragments(
-            repository.clone(),
-            state_parent.clone(),
-            state.clone(),
-            true, /* Ignore already durably stored fragments */
-        )
-        .await
-        .forward::<PushError>("collecting new fragments")?;
-
-        if !state.parent_other().is_zero() {
-            fragments.push(Address::zero_context_hash(state.parent_other()));
-        }
-
-        let stats = Arc::new(PushStatistics::default());
-        let fragments = push_query(
-            storage_protocol.clone(),
-            fragments,
+        upload_revision_fragments(
+            &repository,
+            &storage_protocol,
             remote.environment.max_query_batch(),
+            &state,
+            dry_run,
+            runner.as_ref(),
         )
         .await?;
 
-        event::LoreEvent::BranchPushFragmentBegin(LoreBranchPushFragmentBeginEventData {
-            fragments: fragments.len() as u64,
-            bytes_total: 0,
-        })
-        .send();
-
-        let ticker_stats = stats.clone();
-        let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
-            loop {
-                ticker.tick().await;
-                event::LoreEvent::BranchPushFragmentProgress(
-                    LoreBranchPushFragmentProgressEventData {
-                        complete: ticker_stats.fragment_complete.load(Ordering::Relaxed) as u64,
-                        count: ticker_stats.fragment_count.load(Ordering::Relaxed) as u64,
-                        bytes_transferred: ticker_stats.bytes_transferred.load(Ordering::Relaxed),
-                        bytes_total: ticker_stats.bytes_total.load(Ordering::Relaxed),
-                    },
-                )
-                .send();
-            }
-        }));
-
-        if !dry_run {
-            push_stage(
-                runner.as_ref(),
-                repository.id,
-                "upload-fragments",
-                push_fragments(
-                    repository.clone(),
-                    storage_protocol.clone(),
-                    fragments,
-                    stats.clone(),
-                ),
-            )
-            .await?;
-        }
-
-        drop(ticker);
-
-        // Emit a final progress event with the completed values now that the
-        // ticker has been dropped and push_fragments has finished.
-        event::LoreEvent::BranchPushFragmentProgress(LoreBranchPushFragmentProgressEventData {
-            complete: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-            count: stats.fragment_count.load(Ordering::Relaxed) as u64,
-            bytes_transferred: stats.bytes_transferred.load(Ordering::Relaxed),
-            bytes_total: stats.bytes_total.load(Ordering::Relaxed),
-        })
-        .send();
-
-        event::LoreEvent::BranchPushFragmentEnd(LoreBranchPushFragmentEndEventData {
-            fragments: stats.fragment_complete.load(Ordering::Relaxed) as u64,
-            bytes_transferred: stats.bytes_transferred.load(Ordering::Relaxed),
-        })
-        .send();
-
-        // We don't want to push revisions from any other branch than the current one,
-        // so we will early out here
+        // A revision from another branch belongs to that branch's own push. Its fragments
+        // are what the peer needs of it, and they are now up.
         if state.branch(repository.clone()).await != branch {
             continue;
         };
@@ -969,22 +1209,23 @@ async fn collect_fragments_and_push(
                     )
                     .send();
 
-                    push_revision_stage(
-                        runner.as_ref(),
-                        attempts.as_ref(),
-                        repository.id,
-                        GrpcRpc::RevisionBranchPush,
-                        revision_protocol.branch_push(
-                            branch,
-                            current_revision,
-                            force,
-                            options.fast_forward_merge,
-                        ),
-                    )
-                    .await
-                    .forward::<PushError>("pushing branch to remote")?
+                    forward_branch_push(
+                        push_revision_stage(
+                            runner.as_ref(),
+                            attempts.as_ref(),
+                            repository.id,
+                            GrpcRpc::RevisionBranchPush,
+                            revision_protocol.branch_push(
+                                branch,
+                                current_revision,
+                                force,
+                                options.fast_forward_merge,
+                            ),
+                        )
+                        .await,
+                    )?
                 }
-                result => result.forward::<PushError>("pushing branch to remote")?,
+                result => forward_branch_push(result)?,
             };
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
@@ -1104,6 +1345,26 @@ async fn collect_fragments_and_push(
     Ok(())
 }
 
+/// Forward what the peer answered a branch push with, naming the fragment where it refused for
+/// a missing one.
+///
+/// A push reaches the peer twice where the branch was deleted under it: the attempt that finds
+/// it gone and the one that follows recreating it. Either can be refused for a fragment the peer
+/// does not hold, and the address is the peer's answer rather than anything the attempt decides,
+/// so both report it the same way.
+#[track_caller]
+fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
+    match result {
+        Err(ProtocolError::AddressNotFound(missing)) => {
+            let address = Address::from(&missing.address[..]);
+            Err(ProtocolError::AddressNotFound(missing)).forward_with::<PushError, _>(|| {
+                format!("pushing branch to remote, missing fragment {address}")
+            })
+        }
+        result => result.forward::<PushError>("pushing branch to remote"),
+    }
+}
+
 async fn push_stage<T, E, F>(
     runner: Option<&Arc<ManagedPushRunner>>,
     repository: RepositoryId,
@@ -1172,9 +1433,9 @@ pub const RETRY_MAX_ATTEMPTS: usize = 10;
 /// What the peer answered about the fragments a push is about to send, split by what it takes to
 /// register each one.
 ///
-/// A full match needs nothing and appears in neither list. The rest divide by whether the peer
-/// already holds the bytes: it either has to be sent them, or it has an association for the same
-/// hash and can duplicate that instead.
+/// A full match needs no transfer, but it is still an answer worth keeping. The rest divide by
+/// whether the peer already holds the bytes: it either has to be sent them, or it has an
+/// association for the same hash and can duplicate that instead.
 #[derive(Debug, Default)]
 pub(crate) struct PushQueryResult {
     /// The peer holds nothing for these, so their payloads have to be transferred.
@@ -1182,15 +1443,16 @@ pub(crate) struct PushQueryResult {
     /// The partition already holds these hashes under another context, so an association can be
     /// duplicated rather than the payload sent again.
     pub copyable: Vec<Address>,
+    /// The peer already holds these exactly. Nothing is transferred, but the local entries still
+    /// have to be marked durable — see [`mark_present_durable`].
+    pub present: Vec<Address>,
 }
 
 impl PushQueryResult {
+    /// Counts only what has to be transferred. `present` is deliberately excluded. Drives the
+    /// fragment total in the push progress events.
     pub fn len(&self) -> usize {
         self.absent.len() + self.copyable.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.absent.is_empty() && self.copyable.is_empty()
     }
 }
 
@@ -1200,7 +1462,7 @@ impl PushQueryResult {
 fn classify_query_batch(batch: &[Address], statuses: &Bytes, queried: &mut PushQueryResult) {
     for (address, status) in batch.iter().zip(statuses.iter()) {
         match QueryStatus::from(*status) {
-            QueryStatus::ExistFullMatch => {}
+            QueryStatus::ExistFullMatch => queried.present.push(*address),
             QueryStatus::ExistPartitionMatch => queried.copyable.push(*address),
             QueryStatus::NotFound => queried.absent.push(*address),
         }
@@ -1211,6 +1473,7 @@ pub(crate) async fn push_query(
     storage: Arc<StorageSession>,
     addresses: Vec<Address>,
     max_batch_size: Option<usize>,
+    stats: &PushStats,
 ) -> Result<PushQueryResult, PushError> {
     if addresses.is_empty() {
         return Ok(PushQueryResult::default());
@@ -1298,12 +1561,17 @@ pub(crate) async fn push_query(
     queried.absent.dedup();
     queried.copyable.sort_unstable();
     queried.copyable.dedup();
+    queried.present.sort_unstable();
+    queried.present.dedup();
+
+    stats.deduplicated(queried.present.len() as u64);
 
     lore_debug!(
-        "Queried {} fragments, {} to upload, {} the peer can duplicate an association for",
+        "Queried {} fragments, {} to upload, {} the peer can duplicate an association for, {} the peer already holds",
         address_count,
         queried.absent.len(),
-        queried.copyable.len()
+        queried.copyable.len(),
+        queried.present.len()
     );
 
     Ok(queried)
@@ -1311,6 +1579,8 @@ pub(crate) async fn push_query(
 
 /// Record locally that the peer holds this address, which is what keeps the next push from
 /// offering it again.
+///
+/// The payload stays where it is, so this writes the header alone.
 async fn mark_durable(repository: &Arc<RepositoryContext>, address: Address, fragment: Fragment) {
     let mut fragment = fragment;
     fragment.flags |= fragment::FragmentFlags::PayloadStoredDurable;
@@ -1330,6 +1600,7 @@ async fn duplicate_association(
     repository: &Arc<RepositoryContext>,
     storage: &Arc<StorageSession>,
     address: Address,
+    stats: &PushStats,
 ) -> Result<bool, ProtocolError> {
     if !storage.can_copy_from(repository.id).await {
         return Ok(false);
@@ -1349,6 +1620,18 @@ async fn duplicate_association(
         return Ok(false);
     }
 
+    stats.copied();
+    mark_stored_durable(repository, address).await;
+    Ok(true)
+}
+
+/// Mark the local entry for `address` durable, looking up the fragment it needs to write back.
+///
+/// Shared by every path that learns the peer holds the address without having uploaded a payload
+/// for it in this call — a duplicated association, and a query that answered `ExistFullMatch`.
+/// Only metadata is read: the payload is already local and does not need loading to set a flag on
+/// its entry.
+async fn mark_stored_durable(repository: &Arc<RepositoryContext>, address: Address) {
     if let Ok(data) = repository
         .immutable_store()
         .get_metadata(repository.id, address)
@@ -1357,11 +1640,36 @@ async fn duplicate_association(
     {
         mark_durable(repository, address, data.fragment).await;
     }
-    Ok(true)
 }
 
-/// Register every fragment the peer is missing, transferring a payload only where it has no
-/// association to duplicate.
+/// Mark the local entries for addresses the peer already holds durable.
+///
+/// `ExistFullMatch` establishes the same fact an upload does. An entry that never records it is
+/// pinned against eviction, excluded from the store's size and capacity totals, and re-queried on
+/// every subsequent push.
+async fn mark_present_durable(repository: &Arc<RepositoryContext>, present: Vec<Address>) {
+    const MAX_PARALLEL_MARK: usize = 1000;
+
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    for address in present {
+        if address.hash.is_zero() {
+            continue;
+        }
+
+        while tasks.len() >= MAX_PARALLEL_MARK {
+            let _ = tasks.join_next().await;
+        }
+
+        let repository = repository.clone();
+        lore_spawn!(tasks, async move {
+            mark_stored_durable(&repository, address).await;
+        });
+    }
+    while tasks.join_next().await.is_some() {}
+}
+
+/// Keep the first failure of a push's fragment tasks, unless a later one is an
+/// unknown outcome (WP-120), which outranks any decisive failure.
 fn prefer_unknown(first: Option<PushError>, next: Option<PushError>) -> Option<PushError> {
     if next
         .as_ref()
@@ -1373,25 +1681,31 @@ fn prefer_unknown(first: Option<PushError>, next: Option<PushError>) -> Option<P
     }
 }
 
+/// Register every fragment the peer is missing, transferring a payload only where it has no
+/// association to duplicate. Addresses the peer already holds are marked durable alongside.
 pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,
     fragments: PushQueryResult,
-    stats: Arc<PushStatistics>,
+    progress: Arc<PushProgress>,
 ) -> Result<(), PushError> {
-    if fragments.is_empty() {
-        return Ok(());
-    }
-
     let fragment_count = fragments.len();
+    let PushQueryResult {
+        absent,
+        copyable,
+        present,
+    } = fragments;
 
-    stats
-        .fragment_count
-        .store(fragment_count, Ordering::Relaxed);
+    progress.set_fragment_count(fragment_count);
+
+    let stats = execution_context().push_stats().clone();
+    let marking = {
+        let repository = repository.clone();
+        lore_spawn!(async move { mark_present_durable(&repository, present).await })
+    };
 
     const MAX_PARALLEL_PUT: usize = 10000;
 
-    let PushQueryResult { absent, copyable } = fragments;
     let mut tasks: JoinSet<Result<(), PushError>> = JoinSet::new();
     let mut failure = None;
     for (address, duplicable) in copyable
@@ -1410,16 +1724,16 @@ pub(crate) async fn push_fragments(
         let repository = repository.clone();
         let storage = storage.clone();
         let stats = stats.clone();
+        let progress = progress.clone();
         let caller_operation = lore_transport::current_caller_operation();
         lore_spawn!(
             tasks,
             lore_transport::with_optional_caller_operation(caller_operation, async move {
                 if duplicable
-                    && duplicate_association(&repository, &storage, address)
+                    && duplicate_association(&repository, &storage, address, &stats)
                         .await
                         .forward::<PushError>("duplicating association")?
                 {
-                    stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
                     return Ok(());
                 }
 
@@ -1432,7 +1746,7 @@ pub(crate) async fn push_fragments(
                 .forward::<PushError>("loading fragment payload")?;
 
                 let payload_size = payload.len() as u64;
-                stats.bytes_total.fetch_add(payload_size, Ordering::Relaxed);
+                progress.payload_queued(payload_size);
 
                 immutable::store_raw_remote_retry(
                     storage.clone(),
@@ -1451,13 +1765,9 @@ pub(crate) async fn push_fragments(
                     }
                 })?;
 
-                stats
-                    .bytes_transferred
-                    .fetch_add(payload_size, Ordering::Relaxed);
+                stats.put(payload_size);
 
                 mark_durable(&repository, address, fragment).await;
-
-                stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
 
                 Ok(())
             })
@@ -1498,6 +1808,8 @@ pub(crate) async fn push_fragments(
         );
     }
 
+    let _ = marking.await;
+
     if let Some(err) = failure {
         return Err(err);
     }
@@ -1507,21 +1819,211 @@ pub(crate) async fn push_fragments(
     Ok(())
 }
 
+/// Push the revisions the links `state` holds name, each to the branch its reference
+/// resolves against.
+///
+/// A link travels with the revision that names it, so the linked repository is pushed
+/// before the fragments of the revision naming it go up.
+async fn push_revision_links(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: &PushOptions,
+    state: &Arc<State>,
+    branch: BranchId,
+    attempts: &Option<Arc<dyn AttemptStore>>,
+    runner: &Option<Arc<ManagedPushRunner>>,
+) -> Result<(), PushError> {
+    let Ok(link_list) = state.link_list(repository.clone()).await else {
+        return Ok(());
+    };
+
+    // TODO(vri): UCS-17135 - Push links in individual tasks
+    for link_reference in link_list.iter() {
+        let link_id = link_reference.repository;
+        let link_repository = repository.to_link_context(link_id).await;
+        let link_signature = link_reference.signature;
+        let link_state = State::deserialize(link_repository.clone(), link_signature)
+            .await
+            .forward::<PushError>("deserializing link state")?;
+
+        let link_branch_id = link_reference.resolve_branch(branch);
+
+        lore_debug!(
+            "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
+        );
+
+        // Forwarded rather than flattened to an internal error, so an unknown
+        // outcome in a linked push reaches the caller as one (WP-120).
+        collect_fragments_and_push_recurse(
+            link_repository,
+            token.share(),
+            options.clone(),
+            link_state,
+            link_branch_id,
+            link_reference.signature,
+            attempts.clone(),
+            runner.clone(),
+        )
+        .await
+        .forward::<PushError>("pushing linked repository")?;
+    }
+
+    Ok(())
+}
+
+/// Upload what `state` holds that its first parent does not, and the revision the second
+/// parent of a merge names.
+///
+/// The peer needs this of every revision a push reaches, whether the revision goes on to
+/// be offered as a new latest revision or sits on a line that is only named by a merge.
+async fn upload_revision_fragments(
+    repository: &Arc<RepositoryContext>,
+    storage: &Arc<StorageSession>,
+    max_query_batch: Option<usize>,
+    state: &Arc<State>,
+    dry_run: bool,
+    runner: Option<&Arc<ManagedPushRunner>>,
+) -> Result<(), PushError> {
+    let state_parent = State::deserialize(repository.clone(), state.parent_self())
+        .await
+        .forward::<PushError>("deserializing parent state")?;
+
+    lore_debug!(
+        "Calculating new fragments from {} to {}",
+        state_parent.revision(),
+        state.revision()
+    );
+    let mut fragments = state::collect_new_fragments(
+        repository.clone(),
+        state_parent,
+        state.clone(),
+        true, /* Ignore already durably stored fragments */
+    )
+    .await
+    .forward::<PushError>("collecting new fragments")?;
+
+    if !state.parent_other().is_zero() {
+        fragments.push(Address::zero_context_hash(state.parent_other()));
+    }
+
+    query_and_push_fragments(
+        repository.clone(),
+        storage.clone(),
+        max_query_batch,
+        fragments,
+        dry_run,
+        runner,
+    )
+    .await
+}
+
+/// Upload those of `fragments` the peer answers that it is missing, reporting progress
+/// while the upload runs. A dry run stops once the peer has answered.
+async fn query_and_push_fragments(
+    repository: Arc<RepositoryContext>,
+    storage: Arc<StorageSession>,
+    max_query_batch: Option<usize>,
+    fragments: Vec<Address>,
+    dry_run: bool,
+    runner: Option<&Arc<ManagedPushRunner>>,
+) -> Result<(), PushError> {
+    let push_stats = execution_context().push_stats().clone();
+    let progress = Arc::new(PushProgress::new(push_stats.clone()));
+    let fragments = push_query(storage.clone(), fragments, max_query_batch, &push_stats).await?;
+
+    event::LoreEvent::BranchPushFragmentBegin(LoreBranchPushFragmentBeginEventData {
+        fragments: fragments.len() as u64,
+        bytes_total: 0,
+    })
+    .send();
+
+    let ticker_progress = progress.clone();
+    let progress_interval = execution_context().globals().event_interval();
+    let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
+        let mut ticker = tokio::time::interval(progress_interval);
+        loop {
+            ticker.tick().await;
+            event::LoreEvent::BranchPushFragmentProgress(ticker_progress.event()).send();
+        }
+    }));
+
+    if !dry_run {
+        let repository_id = repository.id;
+        push_stage(
+            runner,
+            repository_id,
+            "upload-fragments",
+            push_fragments(repository, storage, fragments, progress.clone()),
+        )
+        .await?;
+    }
+
+    drop(ticker);
+
+    // Emit a final progress event with the completed values now that the
+    // ticker has been dropped and push_fragments has finished.
+    let final_progress = progress.event();
+    event::LoreEvent::BranchPushFragmentProgress(final_progress.clone()).send();
+
+    event::LoreEvent::BranchPushFragmentEnd(LoreBranchPushFragmentEndEventData {
+        fragments: final_progress.complete,
+        bytes_transferred: final_progress.bytes_transferred,
+    })
+    .send();
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn address(seed: u8) -> Address {
+        Address {
+            hash: Hash::from([seed; 32]),
+            context: crate::lore::Context::from([seed; 16]),
+        }
+    }
+
+    /// Statistics level zero reports nothing, so it keeps nothing beyond what a
+    /// progress event reads: the fragments registered, which `copied` and `put`
+    /// sum to, and the bytes uploaded.
+    #[test]
+    fn a_count_is_kept_only_where_something_reports_it() {
+        for (statistics, deduplicated) in [(false, 0), (true, 3)] {
+            let stats = PushStats::new(statistics);
+            stats.deduplicated(3);
+            stats.copied();
+            stats.put(64);
+
+            let counts = stats.snapshot();
+            assert_eq!(counts.deduplicated, deduplicated, "statistics {statistics}");
+            assert_eq!(counts.copied, 1, "statistics {statistics}");
+            assert_eq!(counts.put, 1, "statistics {statistics}");
+            assert_eq!(stats.registered(), 2, "statistics {statistics}");
+            assert_eq!(stats.put_bytes(), 64, "statistics {statistics}");
+        }
+    }
+
+    /// A fragment the peer is missing reaches the caller as the address it is, rather than as a
+    /// generic failure.
+    #[test]
+    fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
+        let result: Result<(), ProtocolError> =
+            Err(ProtocolError::from(AddressNotFound { address: [7u8; 48] }));
+
+        let error = result
+            .forward::<PushError>("pushing branch to remote, missing fragment")
+            .expect_err("an error was forwarded");
+
+        assert!(error.is_address_not_found(), "{error:?}");
+        assert!(error.translated() == LoreError::AddressNotFound);
+    }
 
     /// What the push does with a fragment is decided entirely by the status byte the peer answered
     /// with, so this is where the copy path is chosen or missed.
     mod classify {
         use super::*;
-
-        fn address(seed: u8) -> Address {
-            Address {
-                hash: Hash::from([seed; 32]),
-                context: crate::lore::Context::from([seed; 16]),
-            }
-        }
 
         fn classify(statuses: &[u8]) -> PushQueryResult {
             let batch: Vec<Address> = (0..statuses.len() as u8).map(address).collect();
@@ -1530,10 +2032,14 @@ mod tests {
             queried
         }
 
+        /// A full match transfers nothing, but the answer still has to be kept: it is what tells
+        /// the local store the payload is safe elsewhere, and an entry that never learns that is
+        /// pinned against eviction and invisible to both store caps for the rest of its life.
         #[test]
-        fn an_association_the_peer_holds_needs_nothing() {
+        fn an_association_the_peer_holds_transfers_nothing_but_is_recorded() {
             let queried = classify(&[QueryStatus::ExistFullMatch as u8]);
-            assert!(queried.is_empty());
+            assert_eq!(queried.len(), 0, "nothing to transfer");
+            assert_eq!(queried.present, vec![address(0)]);
         }
 
         /// The change this path exists for: the partition holds the hash, so the peer is asked to
@@ -1572,7 +2078,8 @@ mod tests {
             ]);
             assert_eq!(queried.absent, vec![address(0), address(3)]);
             assert_eq!(queried.copyable, vec![address(2), address(4)]);
-            assert_eq!(queried.len(), 4);
+            assert_eq!(queried.present, vec![address(1)]);
+            assert_eq!(queried.len(), 4, "len counts only what is transferred");
         }
 
         /// Each status answers the address at its own position, so a batch where only some entries
@@ -1585,7 +2092,101 @@ mod tests {
                 QueryStatus::NotFound as u8,
             ]);
             assert_eq!(queried.copyable, vec![address(0)]);
+            assert_eq!(queried.present, vec![address(1)]);
             assert_eq!(queried.absent, vec![address(2)]);
+        }
+    }
+
+    /// Recording a full match is what takes the fragment off the local store's protected list, so
+    /// this is where a push stops re-offering content the peer already holds.
+    mod mark {
+        use super::*;
+
+        const DURABLE: u32 = fragment::FragmentFlags::PayloadStoredDurable.bits();
+
+        /// A repository over in-memory stores, holding only what the test puts in it.
+        async fn null_repository() -> Arc<RepositoryContext> {
+            let immutable_store = lore_storage::local::immutable_store::create(
+                None::<&str>,
+                lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+                false,
+                lore_storage::ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("in-memory immutable store");
+            let mutable_store = lore_storage::local::mutable_store::create(
+                None::<&str>,
+                lore_storage::MutableStoreSettings::default(),
+                immutable_store.clone(),
+            )
+            .await
+            .expect("in-memory mutable store");
+
+            Arc::new(RepositoryContext::new_null_context(
+                immutable_store,
+                mutable_store,
+            ))
+        }
+
+        /// Store a payload under `address` carrying no durability, as a local commit leaves it.
+        async fn store_local(repository: &Arc<RepositoryContext>, address: Address) {
+            let payload = Bytes::from_static(b"payload");
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            repository
+                .immutable_store()
+                .put(repository.id, address, fragment, Some(payload), false)
+                .await
+                .expect("storing a local payload");
+        }
+
+        /// The flags the store holds for `address`.
+        async fn stored_flags(repository: &Arc<RepositoryContext>, address: Address) -> u32 {
+            repository
+                .immutable_store()
+                .get_metadata(repository.id, address)
+                .await
+                .expect("the store holds the address")
+                .fragment
+                .flags
+        }
+
+        /// The fact a full match establishes: the payload is safe on the peer, so the local entry
+        /// is no longer the only copy.
+        #[tokio::test]
+        async fn a_present_address_becomes_durable() {
+            let repository = null_repository().await;
+            let present = address(1);
+            store_local(&repository, present).await;
+            assert_eq!(
+                stored_flags(&repository, present).await & DURABLE,
+                0,
+                "a locally stored payload starts out non-durable"
+            );
+
+            mark_present_durable(&repository, vec![present]).await;
+
+            assert_eq!(stored_flags(&repository, present).await & DURABLE, DURABLE);
+        }
+
+        /// An address the store cannot describe answers nothing to write back, and must not cost
+        /// the addresses it can describe their record.
+        #[tokio::test]
+        async fn a_batch_marks_what_it_can_and_skips_the_rest() {
+            let repository = null_repository().await;
+            let present = address(2);
+            store_local(&repository, present).await;
+
+            mark_present_durable(&repository, vec![address(0), address(3), present]).await;
+
+            assert_eq!(
+                stored_flags(&repository, present).await & DURABLE,
+                DURABLE,
+                "a zero hash and an address the store never held are skipped, not fatal"
+            );
         }
     }
 }

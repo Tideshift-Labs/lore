@@ -24,6 +24,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
 use lore_revision::lore_error;
+use lore_revision::metadata::MetadataInherit;
 use lore_revision::metadata::branch::BranchMetadataError;
 use lore_revision::repository;
 use lore_revision::repository::BranchSwitchOptions;
@@ -37,9 +38,9 @@ use crate::call::repository_call_read;
 use crate::call::repository_call_write;
 use crate::call_delegation::dispatch_call;
 use crate::call_delegation::reject_undelegatable;
-use crate::call_delegation::service_delegation_requested;
 use crate::interface::Context;
 use crate::interface::LoreString;
+use crate::remote::service_process::service_in_use;
 
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
@@ -215,7 +216,7 @@ pub struct LoreBranchDiffArgs {
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::BranchDiffBegin`](crate::interface::LoreEvent::BranchDiffBegin) | Emitted before diff results begin streaming |
+/// | [`LoreEvent::BranchDiffBegin`](crate::interface::LoreEvent::BranchDiffBegin) | Emitted before diff results begin streaming. Includes the resolved branch names and revisions being compared |
 /// | [`LoreEvent::BranchDiffChangeBegin`](crate::interface::LoreEvent::BranchDiffChangeBegin) | Emitted before the list of changed files begins |
 /// | [`LoreEvent::BranchDiffChange`](crate::interface::LoreEvent::BranchDiffChange) | Emitted for each changed file between the two branches |
 /// | [`LoreEvent::BranchDiffChangeEnd`](crate::interface::LoreEvent::BranchDiffChangeEnd) | Emitted after all changed files have been reported |
@@ -318,6 +319,11 @@ pub struct LoreBranchMergeStartArgs {
     pub link: LoreString,
     /// Merge only the main repository, skipping all linked repositories
     pub ignore_links: u8,
+    /// Metadata keys to carry from the source revision onto the merge
+    /// revision. Empty carries nothing; the single entry `*` carries every
+    /// key that is not reserved to the merge itself.
+    #[serde(default)]
+    pub inherit_metadata: LoreArray<LoreString>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -383,6 +389,12 @@ async fn merge_start_local(
                 message: args.message.to_string(),
                 no_commit: args.no_commit != 0,
                 scope,
+                inherit_metadata: MetadataInherit::from_keys(
+                    args.inherit_metadata
+                        .as_slice()
+                        .iter()
+                        .map(LoreString::as_str),
+                ),
             };
 
             async move {
@@ -534,6 +546,11 @@ pub struct LoreBranchMergeIntoArgs {
     pub link: LoreString,
     /// Merge only the main repository, skipping all linked repositories
     pub ignore_links: u8,
+    /// Metadata keys to carry from the current branch onto the revision
+    /// created on the target branch. Empty carries nothing; the single entry
+    /// `*` carries every key that is not reserved to the merge itself.
+    #[serde(default)]
+    pub inherit_metadata: LoreArray<LoreString>,
 }
 
 /// Merges the current branch's staged changes into a target branch and auto-commits if conflict-free.
@@ -597,6 +614,12 @@ async fn merge_into_local(
                     Some(link_str)
                 },
                 ignore_links,
+                inherit_metadata: MetadataInherit::from_keys(
+                    args.inherit_metadata
+                        .as_slice()
+                        .iter()
+                        .map(LoreString::as_str),
+                ),
             };
 
             async move {
@@ -873,6 +896,7 @@ pub struct LoreBranchPushArgs {
 /// | [`LoreEvent::BranchPushRevisionPushBegin`](crate::interface::LoreEvent::BranchPushRevisionPushBegin) | Emitted when pushing a revision to the remote begins |
 /// | [`LoreEvent::BranchPushRevisionPushUpdate`](crate::interface::LoreEvent::BranchPushRevisionPushUpdate) | Emitted with progress updates during revision push |
 /// | [`LoreEvent::BranchPushRevisionPushEnd`](crate::interface::LoreEvent::BranchPushRevisionPushEnd) | Emitted when revision push completes |
+/// | [`LoreEvent::BranchPushStats`](crate::interface::LoreEvent::BranchPushStats) | Emitted once when the push finishes, with fragment dedup/copy/upload totals for the whole push. Requires `stats >= 1` on the global arguments |
 pub async fn push(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
@@ -903,13 +927,13 @@ pub async fn push_with_attempt_store(
     callback: LoreEventCallback,
     attempts: Arc<dyn AttemptStore>,
 ) -> i32 {
-    if service_delegation_requested() {
+    if service_in_use().await {
         return reject_undelegatable(
             globals,
             callback,
             "push_with_attempt_store cannot delegate to a service: the attempt store is \
              in-process, and a delegated push would file receipts under identities the caller \
-             never recorded. Unset LORE_USE_SERVICE, or call push and keep no journal."
+             never recorded. Turn service relaying off (LORE_USE_SERVICE=0, or [service] use_automatically = false), or call push and keep no journal."
                 .to_owned(),
         )
         .await;
@@ -942,7 +966,7 @@ pub async fn push_managed(
 ) -> i32 {
     if lore_transport::has_managed_caller()
         || lore_transport::current_caller_operation().is_some()
-        || (service_delegation_requested() && observer.is_some())
+        || (service_in_use().await && observer.is_some())
     {
         return reject_undelegatable(
             globals,
@@ -952,7 +976,7 @@ pub async fn push_managed(
         )
         .await;
     }
-    if service_delegation_requested() {
+    if service_in_use().await {
         // Only arguments cross IPC. The daemon opens and owns the complete
         // workflow; no caller-side observer, journal or fence is discarded.
         return crate::remote::call::service_call(
@@ -1117,7 +1141,7 @@ pub struct LoreBranchSwitchArgs {
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during file realization |
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted with the resulting revision after switch |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
-/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a partial revision reference |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
 pub async fn switch(
     globals: LoreGlobalArgs,
     args: LoreBranchSwitchArgs,
@@ -1927,6 +1951,57 @@ mod tests {
                 .is_empty(),
             "the attempt store must never be touched when the call is refused before it runs"
         );
+    }
+
+    /// An old client's payload is this one without the field it never knew, so
+    /// it is built by removing the field rather than by transcribing the shape.
+    fn without_inherit_metadata<T: serde::Serialize>(args: &T) -> serde_json::Value {
+        let mut payload = serde_json::to_value(args).expect("args must serialise");
+        payload
+            .as_object_mut()
+            .expect("args serialise to an object")
+            .remove("inherit_metadata")
+            .expect("the field must be present before it is removed");
+        payload
+    }
+
+    #[test]
+    fn merge_start_args_old_payload_missing_inherit_metadata_uses_default() {
+        // Old IPC client payload with no inherit_metadata field. The new field
+        // must be `#[serde(default)]` so old clients keep working.
+        let payload = without_inherit_metadata(&LoreBranchMergeStartArgs {
+            branch: "feature".into(),
+            message: "merge feature".into(),
+            no_commit: 0,
+            link: Default::default(),
+            ignore_links: 0,
+            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("change-request")]),
+        });
+
+        let args: LoreBranchMergeStartArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.branch.as_str(), "feature");
+        assert_eq!(args.message.as_str(), "merge feature");
+        assert!(args.inherit_metadata.as_slice().is_empty());
+    }
+
+    #[test]
+    fn merge_into_args_old_payload_missing_inherit_metadata_uses_default() {
+        let payload = without_inherit_metadata(&LoreBranchMergeIntoArgs {
+            branch: "main".into(),
+            branch_id: Default::default(),
+            message: "merge into main".into(),
+            link: Default::default(),
+            ignore_links: 0,
+            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("*")]),
+        });
+
+        let args: LoreBranchMergeIntoArgs =
+            serde_json::from_value(payload).expect("old payload must deserialise");
+
+        assert_eq!(args.branch.as_str(), "main");
+        assert!(args.inherit_metadata.as_slice().is_empty());
     }
 
     #[test]

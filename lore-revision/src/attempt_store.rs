@@ -129,13 +129,14 @@ impl RepositoryAttemptStore {
     /// The store belonging to one repository's working tree.
     ///
     /// Uses the repository's own dot directory rather than a literal `.lore`, so a repository
-    /// still in the legacy `.urc` format keeps its store beside the rest of its state.
+    /// still in the legacy `.urc` format, or one whose dot directory is kept outside the working
+    /// tree, keeps its store beside the rest of its state. A path-less context has none.
     pub fn for_repository(repository: &RepositoryContext) -> Self {
         Self {
-            path: repository.path.as_deref().map(|root| {
-                root.join(repository.format.dot_dir())
-                    .join(ATTEMPT_STORE_FILE)
-            }),
+            path: repository
+                .dot_dir_path()
+                .ok()
+                .map(|dot_directory| dot_directory.join(ATTEMPT_STORE_FILE)),
             write_guard: tokio::sync::Mutex::new(()),
         }
     }
@@ -179,12 +180,14 @@ impl RepositoryAttemptStore {
         }
         #[cfg(test)]
         let _lock = phase_diagnostics::start(Some(path), "journal_fslock_wait");
-        FSLock::acquire_file_lock(path).await.map_err(|error| {
-            ProtocolError::internal(format!(
-                "Failed to lock the attempt store {}: {error}",
-                path.display()
-            ))
-        })
+        FSLock::acquire_file_lock(path, false)
+            .await
+            .map_err(|error| {
+                ProtocolError::internal(format!(
+                    "Failed to lock the attempt store {}: {error}",
+                    path.display()
+                ))
+            })
     }
 
     /// One guarded load-modify-store span.

@@ -8,6 +8,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Once;
+use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -27,6 +28,7 @@ use zerocopy::IntoBytes;
 
 use crate::change::FileAction;
 use crate::event::LoreBytes;
+use crate::event::LoreBytesMut;
 pub use crate::event::LoreEvent;
 pub use crate::logging::LoreLogLevel;
 use crate::lore::Address;
@@ -493,7 +495,7 @@ impl<T: ValidateText> ValidateText for LoreArray<T> {
     }
 }
 
-lore_base::carries_no_text!(LoreBinary, LoreBytes, LoreMetadataType);
+lore_base::carries_no_text!(LoreBinary, LoreBytes, LoreBytesMut, LoreMetadataType);
 
 impl ValidateText for LoreGlobalArgs {
     fn validate_text(&self) -> Result<(), TextNotUtf8> {
@@ -551,12 +553,20 @@ impl<T> Default for LoreArray<T> {
     }
 }
 
+/// Elements a `Debug` rendering prints before it reports the count alone.
+/// Arguments are logged whole, and a caller's path list runs to thousands.
+const DEBUG_ELEMENT_LIMIT: usize = 16;
+
 impl<T> Debug for LoreArray<T>
 where
     T: Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:?}", self.as_slice()))
+        let elements = self.as_slice();
+        if elements.len() > DEBUG_ELEMENT_LIMIT {
+            return write!(f, "[{} items...]", elements.len());
+        }
+        f.write_fmt(format_args!("{elements:?}"))
     }
 }
 
@@ -574,6 +584,11 @@ impl<T> LoreArray<T> {
 
     /// Moves the strings from the vec in the string array
     pub fn from_vec(vec: Vec<T>) -> Self {
+        // `from_raw_parts_mut` below requires a non-null pointer even for a zero length, and
+        // `new` returns null for a zero count.
+        if vec.is_empty() {
+            return Self::default();
+        }
         let target = LoreArray::<T>::new(vec.len());
 
         // SAFETY: target is created to the same count as the vec and we're going to initialise
@@ -598,7 +613,23 @@ impl<T> LoreArray<T> {
         self.count
     }
 
+    /// Room for `count` uninitialised elements.
+    ///
+    /// `Layout::array` is zero-sized for a zero count and for any count of a zero-sized type, and
+    /// `std::alloc::alloc` is undefined behaviour for a zero-sized layout, so neither case
+    /// allocates. A zero count returns the null pointer. A zero-sized type returns a dangling
+    /// aligned pointer and keeps the count, because `as_slice` must still answer that many
+    /// elements and a slice needs a non-null aligned pointer to start from.
     fn new(count: usize) -> Self {
+        if count == 0 {
+            return Self::default();
+        }
+        if std::mem::size_of::<T>() == 0 {
+            return Self {
+                ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
+                count,
+            };
+        }
         let layout =
             std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
         unsafe {
@@ -645,9 +676,13 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                let layout = std::alloc::Layout::array::<T>(self.count)
-                    .expect("layout overflow in LoreArray<T>::drop");
-                std::alloc::dealloc(self.ptr as *mut u8, layout);
+                // A zero-sized type took no heap in `new`, which handed back a dangling pointer
+                // rather than an allocation. Every element still drops, above.
+                if std::mem::size_of::<T>() != 0 {
+                    let layout = std::alloc::Layout::array::<T>(self.count)
+                        .expect("layout overflow in LoreArray<T>::drop");
+                    std::alloc::dealloc(self.ptr as *mut u8, layout);
+                }
             }
             self.ptr = std::ptr::null();
             self.count = 0;
@@ -704,6 +739,10 @@ pub enum LoreLoadConfig {
     Default = 7,
 }
 
+/// How often an operation emits progress events when the caller names no
+/// interval, in milliseconds.
+pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
+
 /// Common options shared by repository operations.
 #[repr(C)]
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -730,8 +769,6 @@ pub struct LoreGlobalArgs {
     pub remote: u8,
     /// Dry run mode, only report what would have been changed and perform no changes to local file system
     pub dry_run: u8,
-    /// Avoid recording last access timestamps in the data stores
-    pub no_atime: u8,
     /// Maximum number of parallel connections for bulk data transfer
     pub max_connections: u32,
     /// Search limit when iterating revisions
@@ -773,6 +810,21 @@ pub struct LoreGlobalArgs {
     /// Supplying either token puts the call in external-credential mode: `identity`
     /// must be left empty, since it is read from the token.
     pub access_token: LoreString,
+    /// How much an operation reports about what it cost.
+    ///
+    /// - `0` — no statistics event, and no per-fragment counters kept for one.
+    /// - `1` — one statistics event when the operation finishes: per-action file
+    ///   counts, and the fragment, local-store and remote-store totals.
+    /// - `2` — also a `FragmentWrite` event per stored fragment, which describes
+    ///   the shape of what was written rather than its sums. One event per
+    ///   fragment is the cost of this level.
+    ///
+    /// A level above the highest known behaves as the highest known.
+    pub stats: u32,
+    /// How often an operation emits progress events, in milliseconds. Applies
+    /// whatever `stats` is set to, statistics being reported once at the end
+    /// rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
+    pub event_interval_ms: u64,
     /// The attempt identity this call's mutations are dispatched under, as a
     /// hyphenated lowercase `UUIDv7`. Empty for every caller that does not track
     /// attempts, which is the CLI and every embedder that has not opted in.
@@ -895,10 +947,6 @@ impl LoreGlobalArgs {
         self.dry_run != 0
     }
 
-    pub fn atime(&self) -> bool {
-        self.no_atime == 0
-    }
-
     pub fn search_limit(&self) -> Option<usize> {
         if self.search_limit > 0 {
             Some(self.search_limit as usize)
@@ -935,6 +983,28 @@ impl LoreGlobalArgs {
 
     pub fn cache(&self) -> bool {
         self.cache != 0
+    }
+
+    /// Whether an operation should emit statistics events at all.
+    pub fn stats(&self) -> bool {
+        self.stats > 0
+    }
+
+    /// Whether an operation should emit per-fragment detail alongside the totals.
+    pub fn stats_full(&self) -> bool {
+        self.stats > 1
+    }
+
+    /// How often to emit progress events. Zero takes the default, and the floor
+    /// keeps an interval from costing more than the operation it reports on.
+    pub fn event_interval(&self) -> std::time::Duration {
+        const MINIMUM_INTERVAL_MS: u64 = 10;
+        let interval_ms = if self.event_interval_ms == 0 {
+            DEFAULT_EVENT_INTERVAL_MS
+        } else {
+            self.event_interval_ms.max(MINIMUM_INTERVAL_MS)
+        };
+        std::time::Duration::from_millis(interval_ms)
     }
 
     /// Returns the store keep-alive duration if enabled.
@@ -1040,6 +1110,25 @@ pub struct ExecutionContext {
     user_id: Mutex<String>,
     mode: ExecutionMode,
     caller_state: Option<Arc<dyn Any + Send + Sync>>,
+    /// What this call's fragment writes cost, accumulated across every write it
+    /// performs — including the ones a background tracker task performs and the
+    /// ones inside linked and layered repositories, which run under this same
+    /// context.
+    ///
+    /// It lives here rather than being threaded through the write API because a
+    /// write that has to finish before its caller continues — serializing a
+    /// state block, say — carries no tracker to hang the counters off, and would
+    /// otherwise go unaccounted.
+    ///
+    /// Allocated on first read: at statistics level zero the write pipeline holds
+    /// no counters, and only a push reads them whatever the level.
+    fragment_stats: OnceLock<Arc<lore_storage::FragmentWriteStats>>,
+    /// What this call's push registered with the peer, accumulated across every
+    /// revision, link and layer it covers.
+    ///
+    /// Kept whatever the statistics level: the per-revision progress event reads
+    /// its share out of these, so they are load-bearing rather than diagnostic.
+    push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
 }
 
 impl ExecutionContext {
@@ -1113,6 +1202,18 @@ impl ExecutionContext {
     pub fn caller_state(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
         self.caller_state.as_ref()
     }
+
+    /// The counters this call's fragment writes report into. See the field.
+    pub fn fragment_stats(&self) -> &Arc<lore_storage::FragmentWriteStats> {
+        self.fragment_stats
+            .get_or_init(Arc::<lore_storage::FragmentWriteStats>::default)
+    }
+
+    /// The counters this call's push registers into. See the field.
+    pub(crate) fn push_stats(&self) -> &Arc<crate::branch::push::PushStats> {
+        self.push_stats
+            .get_or_init(|| Arc::new(crate::branch::push::PushStats::new(self.globals().stats())))
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1126,6 +1227,8 @@ impl Default for ExecutionContext {
             user_id: Mutex::default(),
             mode: ExecutionMode::Client,
             caller_state: None,
+            fragment_stats: OnceLock::new(),
+            push_stats: OnceLock::new(),
         }
     }
 }
@@ -1164,6 +1267,9 @@ pub enum LoreError {
     InvalidArguments = 3,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// No Lore service could be reached, and none could be started, so the
+    /// operation did not run.
+    ServiceUnavailable = 32,
     /// A content-addressable object could not be found in any store.
     AddressNotFound = 80,
     /// A payload blob could not be found with the associated hash.
@@ -1177,7 +1283,7 @@ pub enum LoreError {
     ///
     /// Not a failure and not a success: the server may or may not have applied it.
     /// Never retry on this code. Read authoritative state first.
-    OutcomeUnknown = 193,
+    OutcomeUnknown = 248,
 
     // Legacy error categories (transitional, will be removed). They sit in the
     // 100–109 range that `lore_base::error` reserves for them, so no discrete
@@ -1584,6 +1690,88 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty array holds a null pointer whichever constructor built it. `Drop` frees only a
+    /// non-null pointer with a count above zero, so any other pairing leaks.
+    #[test]
+    fn an_empty_array_holds_no_buffer() {
+        let from_empty_vec = LoreArray::<u32>::from_vec(Vec::new());
+
+        assert!(
+            from_empty_vec.ptr.is_null(),
+            "from_vec allocated for an empty vec, and Drop's `count > 0` guard skips that buffer"
+        );
+        assert_eq!(from_empty_vec.count, 0);
+        assert_eq!(from_empty_vec, LoreArray::default());
+    }
+
+    /// A zero-sized element type gives a zero-sized layout at every count, so nothing is
+    /// allocated, yet the count and the elements must survive.
+    #[test]
+    fn a_zero_sized_element_type_keeps_its_count_without_allocating() {
+        let array = LoreArray::<()>::from_vec(vec![(); 3]);
+
+        // The dangling pointer is the observable proof that nothing was allocated: an allocator
+        // would not answer the alignment as an address. A slice also needs it non-null.
+        assert_eq!(
+            array.ptr,
+            std::ptr::NonNull::<()>::dangling().as_ptr(),
+            "a zero-sized type must take a dangling pointer, not an allocation"
+        );
+        assert_eq!(array.len(), 3);
+        assert_eq!(array.as_slice(), [(), (), ()]);
+        assert_eq!(array.clone().as_slice(), [(), (), ()]);
+    }
+
+    /// Skipping the allocation must not skip the elements: `Drop` still runs each one.
+    #[test]
+    fn a_zero_sized_element_type_still_drops_every_element() {
+        static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+        struct Counted;
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        drop(LoreArray::from_vec(vec![Counted, Counted, Counted]));
+
+        assert_eq!(
+            DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "every element must drop even though nothing was allocated"
+        );
+    }
+
+    /// Deserializing an empty sequence routes through `from_vec`.
+    #[test]
+    fn a_deserialized_empty_array_holds_no_buffer() {
+        let decoded: LoreArray<u32> =
+            serde_json::from_str("[]").expect("an empty sequence deserializes");
+
+        assert!(
+            decoded.ptr.is_null(),
+            "deserializing an empty array allocated a buffer Drop will not free"
+        );
+    }
+
+    /// Arguments are logged whole, so a rendering that named every element of a
+    /// caller's path list would be the bulk of a log.
+    #[test]
+    fn a_long_array_renders_as_its_count() {
+        let at_limit = LoreArray::from_vec(vec![7u32; DEBUG_ELEMENT_LIMIT]);
+        assert_eq!(
+            format!("{at_limit:?}"),
+            format!("{:?}", [7u32; DEBUG_ELEMENT_LIMIT])
+        );
+
+        let over_limit = LoreArray::from_vec(vec![7u32; DEBUG_ELEMENT_LIMIT + 1]);
+        assert_eq!(
+            format!("{over_limit:?}"),
+            format!("[{} items...]", DEBUG_ELEMENT_LIMIT + 1)
+        );
+    }
 
     /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
     const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
@@ -2003,5 +2191,43 @@ mod binary_tests {
     fn json_text_that_is_not_base64_fails_to_read() {
         let result: Result<LoreBinary, _> = serde_json::from_str(r#""not base64!""#);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod event_interval_tests {
+    use super::*;
+
+    fn globals(event_interval_ms: u64) -> LoreGlobalArgs {
+        LoreGlobalArgs {
+            event_interval_ms,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unset_interval_takes_the_default() {
+        assert_eq!(
+            globals(0).event_interval(),
+            std::time::Duration::from_millis(DEFAULT_EVENT_INTERVAL_MS)
+        );
+    }
+
+    /// A caller asking for a sub-millisecond tick would spend more on reporting
+    /// than on the commit, so the floor holds regardless of what was asked.
+    #[test]
+    fn an_interval_below_the_floor_is_raised_to_it() {
+        assert_eq!(
+            globals(1).event_interval(),
+            std::time::Duration::from_millis(10)
+        );
+    }
+
+    #[test]
+    fn an_explicit_interval_is_used_as_given() {
+        assert_eq!(
+            globals(2500).event_interval(),
+            std::time::Duration::from_millis(2500)
+        );
     }
 }

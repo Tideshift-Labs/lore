@@ -929,7 +929,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lore-base"
-version = "0.9.1-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "lore-fragment-provider"
-version = "0.9.1-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "blake3",
  "hex",
@@ -986,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.9.1-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "bytes",
  "io-uring",
@@ -997,7 +997,7 @@ dependencies = [
 
 [[package]]
 name = "lore-object-dispatch"
-version = "0.9.1-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "base64",
  "blake3",
@@ -1035,7 +1035,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.9.1-nightly"
+version = "0.10.1-nightly"
 dependencies = [
  "axum",
  "http",

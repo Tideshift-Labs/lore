@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::types::Context;
@@ -19,18 +21,32 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
-use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
+use crate::grpc::no_repository_access_status;
+use crate::grpc::timeout_grpc;
 
 #[derive(Clone)]
 pub struct NotificationService {
     sender: Arc<crate::notification::local::NotificationSender>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    /// Bound on the subscribe authorization check, the request-handler
+    /// timeout: a stalled online authorizer must not park subscribers.
+    authorization_timeout: Duration,
 }
 
 impl NotificationService {
-    pub fn new(sender: Arc<crate::notification::local::NotificationSender>) -> Self {
-        Self { sender }
+    pub fn new(
+        sender: Arc<crate::notification::local::NotificationSender>,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        authorization_timeout: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            authorizer,
+            authorization_timeout,
+        }
     }
 }
 
@@ -46,24 +62,30 @@ impl lore_notification::NotificationService for NotificationService {
         &self,
         request: Request<lore_proto::lore::notification::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        let (_, extensions, subscribe_request) = request.into_parts();
+        let (_, extensions, message) = request.into_parts();
         let user_id = get_user_id(&extensions);
-        let repository: RepositoryId = Context::from(subscribe_request.repository).into();
+        let repository: RepositoryId = Context::from(message.repository).into();
 
         if repository.is_zero() {
             return Err(Status::failed_precondition("invalid stream"));
         }
 
-        // The JWT interceptor authorizes the repository named in the request
-        // metadata, but the subscription targets the repository named in the
-        // request body — re-check the token against the body repository so a
-        // token for one repository cannot stream another repository's events.
-        // No token in extensions means auth is OFF (the service is registered
-        // without the interceptor), where there is nothing to enforce.
-        if let Some(authorization) = extensions.get::<AuthorizationToken>() {
-            verify_authorization(authorization, repository).map_err(|_err| {
-                Status::permission_denied("Not authorized to subscribe to this repository")
-            })?;
+        // Checked against the partition in the request *body*. The
+        // default authorization middleware validates access using the
+        // request metadata fields. The services passing a repository
+        // in the body need custom verification logic. Denials are flattened
+        // inside the timed check, so the only error escaping `timeout_grpc`
+        // is the timeout's own status.
+        let permitted = timeout_grpc(self.authorization_timeout, async {
+            Ok(self
+                .authorizer
+                .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
+                .await
+                .is_ok())
+        })
+        .await?;
+        if !permitted {
+            return Err(no_repository_access_status());
         }
 
         let rx = self.sender.register(repository);
@@ -94,6 +116,107 @@ impl lore_notification::NotificationService for NotificationService {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use lore_notification::NotificationService as _;
+    use lore_proto::lore::notification::SubscribeRequest;
+    use lore_transport::grpc::PARTITION_ID_KEY;
+    use tonic::Code;
+
+    use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::RawToken;
+    use crate::authnz::repository_authorizer::VerifiedToken;
+
+    /// Denies everything and records which partition it was asked about.
+    struct DenyingAuthorizer {
+        asked: Mutex<Vec<RepositoryId>>,
+    }
+
+    #[async_trait]
+    impl RepositoryAuthorizer for DenyingAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), Status> {
+            self.asked.lock().unwrap().push(repository_id);
+            Err(Status::permission_denied("no grant"))
+        }
+    }
+
+    fn repository(id: u8) -> RepositoryId {
+        let mut data = [0u8; 16];
+        data[15] = id;
+        Context::from(data).into()
+    }
+
+    /// A subscribe whose *metadata* names one partition and whose *body*
+    /// names another: only the body value — the one the stream registers
+    /// on — may decide, so the check must be asked about it.
+    #[tokio::test]
+    async fn subscribe_is_decided_by_the_body_partition_not_the_metadata() {
+        let authorizer = Arc::new(DenyingAuthorizer {
+            asked: Mutex::new(Vec::new()),
+        });
+        let service = NotificationService::new(
+            Arc::new(crate::notification::local::NotificationSender::default()),
+            authorizer.clone(),
+            Duration::from_secs(5),
+        );
+
+        let body_partition = repository(1);
+        let metadata_partition = repository(2);
+        let mut request = Request::new(SubscribeRequest {
+            repository: Context::from(body_partition).into(),
+        });
+        request.metadata_mut().insert_bin(
+            PARTITION_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(metadata_partition.data()),
+        );
+        request
+            .extensions_mut()
+            .insert(AuthorizationToken::default());
+        request.extensions_mut().insert(RawToken("raw.jwt".into()));
+
+        let denied = match service.subscribe(request).await {
+            Err(status) => status,
+            Ok(_) => panic!("an ungranted subscribe must be denied"),
+        };
+
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        assert_eq!(*authorizer.asked.lock().unwrap(), vec![body_partition]);
+    }
+
+    /// A no-auth configuration selects `AllowAllRepositoryAuthorizer`, under
+    /// which subscribe stays open.
+    #[tokio::test]
+    async fn subscribe_stays_open_under_the_allow_all_authorizer() {
+        let service = NotificationService::new(
+            Arc::new(crate::notification::local::NotificationSender::default()),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            Duration::from_secs(5),
+        );
+        let request = Request::new(SubscribeRequest {
+            repository: Context::from(repository(1)).into(),
+        });
+
+        service
+            .subscribe(request)
+            .await
+            .expect("a no-auth server's subscribe is open");
+    }
+}
+
+/// FORK-LOCAL (Tideshift, CR-010): the body-repository re-check, pinned against
+/// the claim-reading authorizer Lorehub cells select (`ResourceGrants` with the
+/// default `urc-{id}` / `urc-*` shape; `AuthClient` answers a claim-carrying
+/// token the same way). Ported from the pre-v0.10.0 `verify_authorization`
+/// tests; the denial message is now the uniform `Unauthorized`.
+#[cfg(test)]
+mod fork_tests {
     use std::time::Duration;
 
     use bytes::Bytes;
@@ -108,8 +231,26 @@ mod tests {
     use tonic::Request;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
     use crate::auth::jwt::ResourcePermission;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::RawToken;
+    use crate::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
     use crate::notification::local::NotificationSender;
+
+    fn claim_service(sender: Arc<NotificationSender>) -> NotificationService {
+        NotificationService::new(
+            sender,
+            Arc::new(ResourceGrantsAuthorizer::new(
+                "resources".to_string(),
+                "resource_id".to_string(),
+                None,
+                "urc-{id}".to_string(),
+                "urc-*".to_string(),
+            )),
+            Duration::from_secs(5),
+        )
+    }
 
     fn token_with_resources(resources: Vec<ResourcePermission>) -> AuthorizationToken {
         AuthorizationToken {
@@ -140,20 +281,24 @@ mod tests {
         })
     }
 
+    /// Inserts both verified halves, as the interceptor does.
+    fn with_token<T>(mut request: Request<T>, token: AuthorizationToken) -> Request<T> {
+        request.extensions_mut().insert(token);
+        request.extensions_mut().insert(RawToken("raw.jwt".into()));
+        request
+    }
+
     #[tokio::test]
     async fn subscribe_denies_body_repository_not_covered_by_token() {
         let authorized_repository = random::<RepositoryId>();
         let requested_repository = random::<RepositoryId>();
 
-        let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender);
+        let service = claim_service(Arc::new(NotificationSender::default()));
 
-        let mut request = subscribe_request(requested_repository);
-        request
-            .extensions_mut()
-            .insert(token_with_resources(vec![resource_for(
-                authorized_repository,
-            )]));
+        let request = with_token(
+            subscribe_request(requested_repository),
+            token_with_resources(vec![resource_for(authorized_repository)]),
+        );
 
         let error = service
             .subscribe(request)
@@ -162,23 +307,16 @@ mod tests {
             .expect("subscribe should be denied for an unauthorized body repository");
 
         assert_eq!(error.code(), Code::PermissionDenied);
-        assert_eq!(
-            error.message(),
-            "Not authorized to subscribe to this repository"
-        );
+        assert_eq!(error.message(), "Unauthorized");
     }
 
     #[tokio::test]
     async fn subscribe_denies_token_with_no_granted_resources() {
         let repository = random::<RepositoryId>();
 
-        let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender);
+        let service = claim_service(Arc::new(NotificationSender::default()));
 
-        let mut request = subscribe_request(repository);
-        request
-            .extensions_mut()
-            .insert(AuthorizationToken::default());
+        let request = with_token(subscribe_request(repository), AuthorizationToken::default());
 
         let error = service
             .subscribe(request)
@@ -187,10 +325,7 @@ mod tests {
             .expect("subscribe should be denied for a token with no granted resources");
 
         assert_eq!(error.code(), Code::PermissionDenied);
-        assert_eq!(
-            error.message(),
-            "Not authorized to subscribe to this repository"
-        );
+        assert_eq!(error.message(), "Unauthorized");
     }
 
     #[tokio::test]
@@ -198,12 +333,12 @@ mod tests {
         let repository = random::<RepositoryId>();
 
         let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender.clone());
+        let service = claim_service(sender.clone());
 
-        let mut request = subscribe_request(repository);
-        request
-            .extensions_mut()
-            .insert(token_with_resources(vec![resource_for(repository)]));
+        let request = with_token(
+            subscribe_request(repository),
+            token_with_resources(vec![resource_for(repository)]),
+        );
 
         let response = service
             .subscribe(request)
@@ -232,13 +367,12 @@ mod tests {
     async fn subscribe_accepts_wildcard_token_for_any_repository() {
         let repository = random::<RepositoryId>();
 
-        let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender);
+        let service = claim_service(Arc::new(NotificationSender::default()));
 
-        let mut request = subscribe_request(repository);
-        request
-            .extensions_mut()
-            .insert(token_with_resources(vec![wildcard_resource()]));
+        let request = with_token(
+            subscribe_request(repository),
+            token_with_resources(vec![wildcard_resource()]),
+        );
 
         service
             .subscribe(request)
@@ -246,32 +380,31 @@ mod tests {
             .expect("a wildcard token should authorize any repository");
     }
 
+    /// Auth OFF selects `AllowAllRepositoryAuthorizer` and inserts no token.
     #[tokio::test]
     async fn subscribe_unaffected_when_auth_is_off() {
         let repository = random::<RepositoryId>();
 
-        let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender);
-
-        // No AuthorizationToken extension is inserted, matching the auth-OFF
-        // registration path where no interceptor runs.
-        let request = subscribe_request(repository);
+        let service = NotificationService::new(
+            Arc::new(NotificationSender::default()),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            Duration::from_secs(5),
+        );
 
         service
-            .subscribe(request)
+            .subscribe(subscribe_request(repository))
             .await
             .expect("subscribe should succeed unchanged when auth is off");
     }
 
     #[tokio::test]
     async fn subscribe_rejects_zero_repository_with_token() {
-        let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender);
+        let service = claim_service(Arc::new(NotificationSender::default()));
 
-        let mut request = subscribe_request(RepositoryId::default());
-        request
-            .extensions_mut()
-            .insert(token_with_resources(vec![wildcard_resource()]));
+        let request = with_token(
+            subscribe_request(RepositoryId::default()),
+            token_with_resources(vec![wildcard_resource()]),
+        );
 
         let error = service
             .subscribe(request)
@@ -284,13 +417,14 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_rejects_zero_repository_without_token() {
-        let sender = Arc::new(NotificationSender::default());
-        let service = NotificationService::new(sender);
-
-        let request = subscribe_request(RepositoryId::default());
+        let service = NotificationService::new(
+            Arc::new(NotificationSender::default()),
+            Arc::new(AllowAllRepositoryAuthorizer),
+            Duration::from_secs(5),
+        );
 
         let error = service
-            .subscribe(request)
+            .subscribe(subscribe_request(RepositoryId::default()))
             .await
             .err()
             .expect("a zero repository should be rejected");
