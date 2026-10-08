@@ -1930,7 +1930,7 @@ impl PostgresImmutableStore {
                 },
             )
             .await
-            .map_err(|error| counted_refusal(domain_store_err(error), "coordinator"))?;
+            .map_err(begin_stage_err)?;
         let intent = match begin {
             BeginOutcome::AlreadyReadable(witness) => return Ok(*witness),
             // Retryable backpressure, not an error, on both arms. `Fenced`
@@ -2545,6 +2545,18 @@ fn domain_store_err(error: crate::domain::errors::DomainError) -> StoreError {
         StoreError::from(SlowDown)
     } else {
         StoreError::internal_with_context(error, "fragment lifecycle coordinator failed")
+    }
+}
+
+/// Map a `begin_stage` failure. The stage ledger's capacity refusal is
+/// retryable backpressure like the admission refusals before it: the begin
+/// transaction rolled back, so no preparation fences the retry. Every other
+/// failure keeps [`domain_store_err`]'s class.
+fn begin_stage_err(error: crate::domain::errors::DomainError) -> StoreError {
+    if crate::domain::fragments::coordinator::is_stage_capacity_exhausted(&error) {
+        staged_put_refusal("ledger_capacity")
+    } else {
+        counted_refusal(domain_store_err(error), "coordinator")
     }
 }
 
@@ -3475,6 +3487,38 @@ mod tests {
         };
         PostgresImmutableStore::validate_put_candidate(address, fragment, &at_limit, "staged")
             .expect("a payload at the threshold passes preflight");
+    }
+
+    /// Only the stage ledger's capacity refusal becomes `SlowDown`. A different
+    /// `NotReady` from the same `begin_stage`, or a corruption `Internal`, keeps
+    /// its permanent class, so the mapping cannot hide one as backpressure.
+    #[test]
+    fn begin_stage_maps_only_the_ledger_capacity_refusal_to_slow_down() {
+        let capacity = DomainError::NotReady("stage capacity exhausted".into());
+        assert!(begin_stage_err(capacity.clone()).is_slow_down());
+        assert!(
+            !domain_store_err(capacity).is_slow_down(),
+            "control: the generic mapping alone leaves it permanent"
+        );
+        for permanent in [
+            DomainError::NotReady("stage policy absent or expired".into()),
+            DomainError::NotReady("stage capacity exhausted ".into()),
+            DomainError::Internal("stage usage or policy row missing".into()),
+            DomainError::Internal("stage reservation exceeds the stage policy".into()),
+            DomainError::Internal("stage capacity exhausted".into()),
+            DomainError::InvalidInput("stage payload exceeds fragment cap".into()),
+            DomainError::OutcomeUnknown("publication begin commit".into()),
+        ] {
+            let mapped = begin_stage_err(permanent.clone());
+            assert!(
+                matches!(mapped, StoreError::Internal(_)),
+                "{permanent:?} must stay Internal, got {mapped:?}"
+            );
+        }
+        assert!(
+            begin_stage_err(DomainError::Transient("pool".into())).is_slow_down(),
+            "a transient failure keeps its retryable class"
+        );
     }
 
     #[cfg(unix)]

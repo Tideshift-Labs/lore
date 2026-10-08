@@ -368,6 +368,237 @@ async fn admission_lost_root_with_no_pending_staged_bytes_falls_back_to_direct_w
     );
 }
 
+/// Observe until `done` holds for one observation, and return it.
+async fn observe_until(
+    fixture: &Fixture,
+    why: &str,
+    done: impl Fn(&WriteBehindObservation) -> bool,
+) -> WriteBehindObservation {
+    tokio::time::timeout(SETTLE, async {
+        loop {
+            let observation = fixture.handle.observe().await.unwrap();
+            if done(&observation) {
+                return observation;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{why}; mode {:?}", fixture.handle.mode()))
+}
+
+/// Lost drain spool root. The spool writer pins its root by device and inode,
+/// so a moved root, and an empty directory put in its place, both read as
+/// unusable: `free_space_unknown` is a capacity predicate that refuses at once.
+/// Staging refuses with `SlowDown` and no direct write, the drain sends nothing,
+/// and the staged source stays readable. Restoring the original root restores
+/// admission, and the drain then promotes what was pending.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn admission_lost_drain_spool_root_refuses_staging_and_sends_nothing() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    bind_repository(&fixture).await;
+    fixture.handle.note_drain_heartbeat();
+    let observation = observe_until(&fixture, "control: a healthy tier settles", |o| {
+        o.capacity_available
+    })
+    .await;
+    assert!(observation.roots_usable);
+    assert_eq!(observation.pending_files, 1, "the fixture's own source");
+    assert_eq!(fixture.handle.mode(), StagingMode::Stage, "control");
+
+    let spool = fixture.root.join("spool");
+    let detached = fixture.root.join("detached-spool");
+    std::fs::rename(&spool, &detached).unwrap();
+    for (why, replace) in [("moved spool root", false), ("replaced spool root", true)] {
+        if replace {
+            std::fs::create_dir(&spool).unwrap();
+        }
+        let lost = observe_until(&fixture, why, |o| !o.roots_usable).await;
+        assert!(!lost.capacity_available, "{why}: {:?}", lost.capacity);
+        assert!(
+            lost.capacity.failing.contains(&"free_space_unknown"),
+            "{why}: {:?}",
+            lost.capacity
+        );
+        assert!(
+            fixture.stage.snapshot().root_available,
+            "{why}: the staging root itself is intact"
+        );
+        assert_eq!(fixture.handle.mode(), StagingMode::Refuse, "{why}");
+        let refused = fragment_bytes("spool-lost");
+        accept(&fixture, &refused);
+        assert_refused_without_side_effects(&fixture, &refused, why).await;
+        let drained = fixture.handle.drain_pass(8).await;
+        assert!(
+            !matches!(drained, Ok(promoted) if promoted > 0),
+            "{why}: no promotion completes without a spool, got {drained:?}"
+        );
+        assert_eq!(
+            fixture.port.puts.load(Ordering::SeqCst),
+            0,
+            "{why}: the drain cannot spool a body, so it sends nothing"
+        );
+        assert_eq!(
+            readable_state(&fixture, &payload()).await,
+            Some(FragmentLifecycleState::Staged),
+            "{why}: the pending source stays readable from the stage"
+        );
+    }
+    std::fs::remove_dir(&spool).unwrap();
+    std::fs::rename(&detached, &spool).unwrap();
+
+    observe_until(&fixture, "a restored spool root clears capacity", |o| {
+        o.roots_usable && o.capacity_available
+    })
+    .await;
+    fixture.handle.note_drain_heartbeat();
+    assert_eq!(fixture.handle.mode(), StagingMode::Stage);
+    let retried = fragment_bytes("spool-lost");
+    put(&fixture.store, &retried)
+        .await
+        .expect("the same PUT is admitted once the spool root is back");
+    assert_eq!(
+        readable_state(&fixture, &retried).await,
+        Some(FragmentLifecycleState::Staged)
+    );
+    let mut promoted = 0;
+    tokio::time::timeout(SETTLE, async {
+        while fixture.port.puts.load(Ordering::SeqCst) < 2 {
+            promoted += fixture.handle.drain_pass(8).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("forward progress: the drain promotes both staged fragments");
+    assert_eq!(promoted, 2);
+}
+
+/// The ledger backstop. Admission's occupancy is stale (no observation since
+/// the control staged), so it still reads `Stage`, and the PUT reaches
+/// `begin_stage`, whose ledger has no room under the published count. That
+/// refusal is retryable backpressure: `SlowDown`, no direct write, and the
+/// rolled-back begin leaves no preparation to fence the retry.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn admission_stale_occupancy_ledger_refusal_is_slow_down() {
+    let fixture = ledger_full_fixture().await;
+    let refused = fragment_bytes("ledger-full");
+    accept(&fixture, &refused);
+    assert_refused_without_side_effects(&fixture, &refused, "ledger backstop").await;
+}
+
+/// A missing stage usage row also charges zero rows at `begin_stage`. That is
+/// corruption, not pressure, so it must not read as the retryable capacity
+/// refusal: the PUT fails `Internal`, with no direct write.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn admission_missing_stage_usage_row_is_internal_not_slow_down() {
+    let fixture = ledger_full_fixture().await;
+    fixture
+        .admin
+        .execute("DELETE FROM lore_fragment_stage_usage", &[])
+        .await
+        .unwrap();
+    let corrupt = fragment_bytes("usage-missing");
+    accept(&fixture, &corrupt);
+    let result = put(&fixture.store, &corrupt).await;
+    assert!(
+        matches!(&result, Err(StoreError::Internal(_))),
+        "a missing usage row is permanent, got {result:?}"
+    );
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 0);
+    for (table, count) in rows_for(&fixture, &corrupt).await {
+        assert_eq!(count, 0, "the failed begin writes no {table} row");
+    }
+}
+
+/// A reservation larger than the published byte limit never fits, even in an
+/// empty ledger, so it stays `Internal` rather than an endless `SlowDown`. The
+/// control, a fragment exactly at the limit refused only because the ledger is
+/// full, is the retryable `SlowDown`.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn admission_reservation_over_the_stage_policy_is_internal_not_slow_down() {
+    // The fixture's own source fills the ledger's bytes exactly.
+    let hard_bytes = payload().len() as u64;
+    let fixture = Fixture::open_tuned(
+        PutResult::Created,
+        FragmentGetResponse::NotFound,
+        payload(),
+        false,
+        |settings| {
+            settings.watermarks.low_bytes = 0;
+            settings.watermarks.high_bytes = hard_bytes;
+            settings.watermarks.hard_bytes = hard_bytes;
+        },
+    )
+    .await;
+    bind_repository(&fixture).await;
+    fixture.handle.note_drain_heartbeat();
+    assert_eq!(
+        fixture.handle.mode(),
+        StagingMode::Stage,
+        "occupancy is stale"
+    );
+
+    // Boundary control: exactly the byte limit fits an empty ledger, so a full
+    // ledger refusing it is retryable.
+    let fits = Bytes::from(vec![b'f'; payload().len()]);
+    assert_eq!(fits.len() as u64, hard_bytes);
+    accept(&fixture, &fits);
+    assert_refused_without_side_effects(&fixture, &fits, "control: full ledger at the limit").await;
+
+    let oversized = Bytes::from("oversized reservation ".repeat(2048));
+    assert!((oversized.len() as u64) > hard_bytes);
+    accept(&fixture, &oversized);
+    let result = put(&fixture.store, &oversized).await;
+    assert!(
+        matches!(&result, Err(StoreError::Internal(_))),
+        "a reservation over the policy is permanent, got {result:?}"
+    );
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 0);
+    for (table, count) in rows_for(&fixture, &oversized).await {
+        assert_eq!(count, 0, "the failed begin writes no {table} row");
+    }
+}
+
+/// A fixture whose stage ledger holds exactly its published file count (the
+/// source plus a control), while admission has observed no occupancy.
+async fn ledger_full_fixture() -> Fixture {
+    const HARD_COUNT: u64 = 2;
+    let fixture = Fixture::open_tuned(
+        PutResult::Created,
+        FragmentGetResponse::NotFound,
+        payload(),
+        false,
+        |settings| {
+            settings.watermarks.low_count = 0;
+            settings.watermarks.high_count = HARD_COUNT;
+            settings.watermarks.hard_count = HARD_COUNT;
+        },
+    )
+    .await;
+    bind_repository(&fixture).await;
+    fixture.handle.note_drain_heartbeat();
+    let control = fragment_bytes("control");
+    put(&fixture.store, &control)
+        .await
+        .expect("control: the ledger admits up to its count");
+    assert_eq!(
+        readable_state(&fixture, &control).await,
+        Some(FragmentLifecycleState::Staged)
+    );
+    let snapshot = fixture.stage.snapshot();
+    assert_eq!(
+        fixture.handle.mode(),
+        StagingMode::Stage,
+        "admission's occupancy is stale: {snapshot:?}"
+    );
+    assert!(snapshot.staged_count < HARD_COUNT, "{snapshot:?}");
+    fixture
+}
+
 /// Pressure from occupancy the observer measured. Before any observation the
 /// tier stages a control fragment; once `observe()` records the two staged
 /// sources, the ceiling `tune` set refuses the next PUT with no direct write.
@@ -375,9 +606,8 @@ async fn admission_lost_root_with_no_pending_staged_bytes_falls_back_to_direct_w
 /// The hard limits are also the published stage policy, which the database
 /// ledger enforces at `begin_stage`. Here admission refuses first, from the
 /// observed occupancy, so the refused PUT never reaches that backstop. A PUT
-/// that does reach it (occupancy stale between observations) gets the ledger's
-/// `NotReady`, which `domain_store_err` maps to `Internal`, not `SlowDown`; no
-/// case here pins that class.
+/// that does reach it (occupancy stale between observations) is pinned by
+/// `admission_stale_occupancy_ledger_refusal_is_slow_down`.
 async fn assert_occupancy_ceiling_refuses(
     tune: impl FnOnce(&mut WriteBehindWatermarks),
     ceiling: impl Fn(&AdmissionSnapshot) -> bool,

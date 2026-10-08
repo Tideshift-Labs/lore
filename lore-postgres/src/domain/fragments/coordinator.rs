@@ -75,6 +75,7 @@ use deadpool_postgres::Transaction;
 pub use stage_custody::StageCleanupIntent;
 pub use stage_custody::StageObservation;
 pub use stage_custody::StageReservationInput;
+pub use stage_custody::is_stage_capacity_exhausted;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::coordinator::CommittedVersions;

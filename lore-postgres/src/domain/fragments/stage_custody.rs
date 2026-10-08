@@ -45,6 +45,19 @@ pub struct StageObservation {
 const FULL_METADATA_BYTES: i64 = 1024;
 const COMPACT_METADATA_BYTES: i64 = 256;
 
+/// The ledger backstop's refusal: the published policy has no room for this
+/// reservation. Admission refuses first from observed occupancy; a PUT reaches
+/// this only when that occupancy is stale between observations.
+const STAGE_CAPACITY_EXHAUSTED: &str = "stage capacity exhausted";
+
+/// Whether `error` is exactly the ledger backstop's capacity refusal, which a
+/// later attempt clears once the drain frees room. Every other refusal,
+/// including a missing ledger row or a reservation the policy can never hold,
+/// stays a permanent error.
+pub fn is_stage_capacity_exhausted(error: &DomainError) -> bool {
+    matches!(error, DomainError::NotReady(detail) if detail == STAGE_CAPACITY_EXHAUSTED)
+}
+
 pub(super) async fn reserve_stage_locked(
     tx: &Transaction<'_>,
     sequence: &mut LockSequence,
@@ -88,7 +101,28 @@ pub(super) async fn reserve_stage_locked(
         &[&size,&FULL_METADATA_BYTES],
     ).await.map_err(|e| DomainError::from_pg("stage capacity reserve",e))?;
     if charged != 1 {
-        return Err(DomainError::NotReady("stage capacity exhausted".into()));
+        // Zero rows is retryable pressure only when an empty ledger could hold
+        // this reservation. A missing usage or policy row is corruption, and a
+        // payload larger than `max_bytes` never fits; neither clears by
+        // retrying, so neither may read as the capacity refusal. The policy's
+        // CHECK constraints already guarantee room for one file and one full
+        // metadata charge, so only the byte limit decides.
+        let fits = tx
+            .query_opt(
+                "SELECT p.max_bytes >= $1 \
+                 FROM lore_fragment_stage_usage AS u, lore_fragment_stage_policy AS p \
+                 WHERE u.singleton AND p.singleton",
+                &[&size],
+            )
+            .await
+            .map_err(|e| DomainError::from_pg("stage capacity classification", e))?;
+        return Err(match fits.map(|row| row.get::<_, bool>(0)) {
+            None => DomainError::Internal("stage usage or policy row missing".into()),
+            Some(false) => {
+                DomainError::Internal("stage reservation exceeds the stage policy".into())
+            }
+            Some(true) => DomainError::NotReady(STAGE_CAPACITY_EXHAUSTED.into()),
+        });
     }
     Ok(())
 }
