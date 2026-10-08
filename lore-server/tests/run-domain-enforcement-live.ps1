@@ -9,7 +9,7 @@ databases.
 
 .DESCRIPTION
 The Rust cases remain `#[ignore]`. This runner verifies the fixed fully-qualified inventory across
-two packages (`lore-server`'s `lib` and `p12_live` targets, and `lore-postgres`'s
+two packages (`lore-server`'s `unit` and `p12_live` test targets, and `lore-postgres`'s
 `domain_receipts_lifecycle` target), runs each exact case in its own fresh database, and reports
 PASS, FAIL, and NOT RUN distinctly. The container and anonymous volume are removed only after their
 exact random ownership label is checked.
@@ -40,15 +40,15 @@ $runPassed = $false
 $setupError = $null
 
 $expectedTests = @(
-    'plugins::postgres::tests::configured_domain_enforcement_reaches_the_published_postgres_mutable_store',
-    'grpc::handlers::branch_push::tests::enforcing_cell_rejects_before_legacy_branch_push_body',
-    'grpc::revision::v1::branch_push::test::enforcing_cell_rejects_before_v1_branch_push_body',
-    'grpc::handlers::branch_metadata_set::test::enforcing_cell_rejects_before_legacy_metadata_cas_body',
-    'grpc::revision::v1::branch_metadata_set::test::enforcing_cell_rejects_before_v1_metadata_cas_body',
-    'grpc::handlers::obliterate::tests::enforcing_cell_rejects_before_obliterate_body',
-    'grpc::handlers::branch_delete::test::enforcing_cell_rejects_before_legacy_branch_delete_body',
-    'grpc::revision::v1::branch_delete::test::enforcing_cell_rejects_before_v1_branch_delete_body',
-    'domain::tests::a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation'
+    'plugins::postgres::configured_domain_enforcement_reaches_the_published_postgres_mutable_store',
+    'grpc::handlers::branch_push::enforcing_cell_rejects_before_legacy_branch_push_body',
+    'grpc::revision::v1::branch_push::enforcing_cell_rejects_before_v1_branch_push_body',
+    'grpc::handlers::branch_metadata_set::enforcing_cell_rejects_before_legacy_metadata_cas_body',
+    'grpc::revision::v1::branch_metadata_set::enforcing_cell_rejects_before_v1_metadata_cas_body',
+    'grpc::handlers::obliterate::enforcing_cell_rejects_before_obliterate_body',
+    'grpc::handlers::branch_delete::enforcing_cell_rejects_before_legacy_branch_delete_body',
+    'grpc::revision::v1::branch_delete::enforcing_cell_rejects_before_v1_branch_delete_body',
+    'domain::a_mediated_prepare_key_cannot_be_consumed_by_a_repository_scoped_governed_mutation'
 )
 $p12IntegrationTest = 'exact_mediated_obliterate_consumes_while_tuple_tamper_preserves_prepared'
 # The receipt lane's `client_attempt_id` half (Lore afaf928/611a031/dc6f895): a
@@ -65,7 +65,7 @@ $results = @(
             Package = if ($name -eq $domainReceiptsTest) { 'lore-postgres' } else { 'lore-server' }
             Target  = if ($name -eq $p12IntegrationTest) { 'p12_live' }
             elseif ($name -eq $domainReceiptsTest) { 'domain_receipts_lifecycle' }
-            else { 'lib' }
+            else { 'unit' }
             Status  = 'NOT RUN'
             Passed  = 0
             Failed  = 0
@@ -98,7 +98,7 @@ function Get-EnforcementTestCatalog {
     )
     Push-Location $loreRoot
     try {
-        $targetArgs = if ($Target -eq 'lib') { @('--lib') } else { @('--test', $Target) }
+        $targetArgs = @('--test', $Target)
         $catalogArgs = @('test', '-p', $Package) + $targetArgs + @('--', '--ignored', '--list')
         $output = & cargo @catalogArgs 2>&1 | Out-String
         $exitCode = $LASTEXITCODE
@@ -120,13 +120,13 @@ function Get-EnforcementTestCatalog {
 }
 
 function Assert-ExpectedCatalog {
-    $libCatalog = @(Get-EnforcementTestCatalog -Target 'lib')
+    $libCatalog = @(Get-EnforcementTestCatalog -Target 'unit')
     $p12Catalog = @(Get-EnforcementTestCatalog -Target 'p12_live')
     $receiptsCatalog = @(Get-EnforcementTestCatalog -Package 'lore-postgres' -Target 'domain_receipts_lifecycle')
     $missing = @($expectedTests | Where-Object { $_ -notin $libCatalog })
     if ($expectedTests.Count -ne 9 -or $missing.Count -ne 0 -or $p12IntegrationTest -notin $p12Catalog -or
         $domainReceiptsTest -notin $receiptsCatalog) {
-        throw ("expected nine library tests plus the P12 integration test plus the domain-receipts " +
+        throw ("expected nine unit-binary tests plus the P12 integration test plus the domain-receipts " +
             "attempt-id test; missing=[$($missing -join ', ')]; p12Present=$($p12IntegrationTest -in $p12Catalog); " +
             "receiptsPresent=$($domainReceiptsTest -in $receiptsCatalog)")
     }
@@ -204,7 +204,7 @@ try {
             )
             Write-Host "Running $($result.Test)..."
             try {
-                $targetArgs = if ($result.Target -eq 'lib') { @('--lib') } else { @('--test', $result.Target) }
+                $targetArgs = @('--test', $result.Target)
                 $cargoArgs = @('test', '-p', $result.Package) + $targetArgs + @('--', '--ignored', '--exact', $result.Test, '--test-threads=1')
                 $output = & cargo @cargoArgs 2>&1 | Out-String
                 $exitCode = $LASTEXITCODE

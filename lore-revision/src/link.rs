@@ -191,9 +191,16 @@ impl LinkTracker {
         self.links.insert(link_context, false);
     }
 
-    pub fn on_node_changed(&self, repository_id: RepositoryId) {
+    /// Marks the links into `repository` as needing rehashing.
+    ///
+    /// A link's target is always a repository reached through a link, so for any other
+    /// repository this returns before iterating the map, which allocates for every shard.
+    pub fn on_node_changed(&self, repository: &RepositoryContext) {
+        if !repository.is_link() {
+            return;
+        }
         for mut entry in self.links.iter_mut() {
-            if entry.key().link_repository_id == repository_id {
+            if entry.key().link_repository_id == repository.id {
                 *entry.value_mut() = true;
             }
         }
@@ -1116,7 +1123,7 @@ pub async fn restore_link_paths_from_state(
         return Ok(());
     }
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         for link_relative in paths {
             let mount_path = link_path.join(link_relative.as_str());
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
@@ -1139,7 +1146,7 @@ pub async fn restore_link_paths_from_state(
             crate::fs::realize::realize_file(
                 link_context.clone(),
                 operation.clone(),
-                &mount_path,
+                mount_path,
                 node,
                 Arc::default(),
             )
@@ -1331,7 +1338,7 @@ pub async fn realize_link_pin_change(
 ) -> Result<(), LinkError> {
     let diff = link_pin_diff(&link_context, link_path, old_sig, new_sig, linked_node).await?;
 
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         realize_link_pin_diff(&operation, repository, link_context, new_sig, diff).await
     })
     .await

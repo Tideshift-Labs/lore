@@ -18,7 +18,7 @@ class DeferredCreateTests(unittest.TestCase):
                 "fixture-cli",
                 directory,
                 "fixture",
-                directory,
+                {},
                 repo_id="11111111111111111111111111111111",
                 create_repo=False,
             )
@@ -52,7 +52,7 @@ class DeferredCreateTests(unittest.TestCase):
                 "fixture-cli",
                 directory,
                 "fixture",
-                directory,
+                {},
                 repo_id="22222222222222222222222222222222",
                 create_repo=False,
             )

@@ -126,7 +126,3 @@ impl<B: Body> Body for GrpcDrainBody<B> {
         self.inner.size_hint()
     }
 }
-
-#[cfg(test)]
-#[path = "drain_tests.rs"]
-mod tests;

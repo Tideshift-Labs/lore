@@ -4,7 +4,9 @@ import logging
 import os
 import pytest
 import re
+import subprocess
 import tomllib
+from pathlib import Path
 from lore import Lore
 from lore_parsers import (
     parse_complete_json,
@@ -14,6 +16,7 @@ from lore_parsers import (
     parse_status_json,
     parse_status_summary_json,
 )
+from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 
 
 logger = logging.getLogger(__name__)
@@ -1215,6 +1218,43 @@ def test_layer_commit_invalid_message_errors(new_lore_repo):
             layer_messages={"not-a-real-layer": "bogus"},
             non_interactive=True,
         )
+
+
+@pytest.mark.smoke
+def test_layer_commit_message_reports_an_unreachable_service(
+    new_lore_repo, stops_background_services, global_dir_name
+):
+    """Checking a `--layer-message` path lists the configured layers, which the
+    service does when one is in use. With none reachable the commit reports
+    that, rather than rejecting the path as matching no configured layer."""
+    repo: Lore = new_lore_repo()
+    env = repo.sandboxed_env(
+        **LORE_SERVICE_ENVIRONMENT,
+        LORE_SERVICE_EXECUTABLE=str(Path(global_dir_name) / "no-such-lore-binary"),
+    )
+
+    committed = subprocess.run(
+        [
+            repo.lore_executable_path,
+            "--repository",
+            repo.path,
+            "--non-interactive",
+            "commit",
+            "Main message",
+            "--layer-message",
+            "lay",
+            "Layer message",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=repo.path,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+    output = committed.stdout + committed.stderr
+    assert committed.returncode == SERVICE_UNAVAILABLE, output
+    assert "does not match" not in output, output
 
 
 @pytest.mark.smoke

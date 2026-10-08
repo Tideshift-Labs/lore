@@ -15,9 +15,10 @@ use lore_telemetry::tracing::fields::USER_ID;
 use serde::Deserialize;
 use tracing::Span;
 
-use super::jwt;
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::http::server::ServerState;
 
 #[derive(Deserialize)]
@@ -38,8 +39,22 @@ pub async fn jwt_axum_verify_authorization(
                     Context::from_str(params.repository_id.as_str())
                         .unwrap_or_default()
                         .into();
-                if jwt::verify_authorization(&user_info, repository).is_ok() {
-                    Span::current().record(USER_ID, &user_info.user_id);
+                let token = VerifiedToken {
+                    raw: &accesstoken,
+                    claims: &user_info,
+                };
+                if let Ok(grants) = state
+                    .repository_authorizer
+                    .granted_access(Some(&token), repository)
+                    .await
+                {
+                    Span::current().record(USER_ID, user_info.identity());
+                    if let Some(grants) = grants {
+                        request.extensions_mut().insert(PartitionGrants {
+                            repository_id: repository,
+                            grants,
+                        });
+                    }
                     // Set `user_info` as a request extension so it can be used down the stack
                     request.extensions_mut().insert(RawToken(accesstoken));
                     request.extensions_mut().insert(Some(user_info));

@@ -58,6 +58,7 @@ impl Get {
     }
 }
 
+#[lore_macro::test_pub]
 fn serialize_response(data: StoreGetData) -> Vec<Bytes> {
     let match_made: u8 = data.match_made.into();
     let mut response = vec![
@@ -139,90 +140,5 @@ impl RequestHandler for GetHandler {
             .await?;
 
         Ok(serialize_response(result))
-    }
-}
-
-#[cfg(test)]
-pub mod tests {
-    use lore_base::types::Context;
-    use lore_revision::fragment;
-    use rand::random;
-    use uuid::Uuid;
-
-    use super::*;
-    use crate::quic::tests::collapse_bytes;
-    use crate::quic::tests::collapse_bytes_without_header;
-
-    mod request {
-        use super::*;
-
-        #[test]
-        fn parsing_works() {
-            let repository = random::<Context>();
-            let (_, address, _) = fragment::generate_random();
-
-            let input = Get {
-                header: ReplicationHeader {
-                    correlation_id: Uuid::new_v4(),
-                    repository,
-                },
-                address,
-            };
-            let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-
-            let output = Get::parse(input_bytes).expect("parse should work");
-            assert_eq!(input, output);
-        }
-
-        #[test]
-        fn parsing_fails_if_too_small() {
-            let repository = random::<Context>();
-
-            let input = Get {
-                header: ReplicationHeader {
-                    correlation_id: Uuid::new_v4(),
-                    repository,
-                },
-                address: Address::default(),
-            };
-            let input_bytes = collapse_bytes_without_header(&input.to_quic_chunks());
-
-            let output = Get::parse(input_bytes.slice(0..input_bytes.len() - 1))
-                .expect_err("parse should fail");
-            assert_eq!(output, MessageParseError::InvalidFieldLength);
-        }
-    }
-
-    mod response {
-        use super::*;
-
-        #[test]
-        fn serialize_response_has_four_chunks() {
-            let (fragment, _, payload) = fragment::generate_random();
-            let data = StoreGetData {
-                fragment,
-                match_made: StoreMatch::MatchFull,
-                partition: random::<lore_base::types::Partition>(),
-                payload: Some(payload),
-            };
-            assert_eq!(serialize_response(data).len(), 4);
-        }
-
-        #[test]
-        fn response_roundtrips() {
-            let (fragment, _, payload) = fragment::generate_random();
-            let original = StoreGetData {
-                fragment,
-                match_made: StoreMatch::MatchFull,
-                partition: random::<lore_base::types::Partition>(),
-                payload: Some(payload),
-            };
-            let bytes = serialize_response(original.clone());
-            let reparsed = parse_response(collapse_bytes(&bytes)).expect("parse should work");
-            assert_eq!(reparsed.fragment, original.fragment);
-            assert_eq!(reparsed.match_made, original.match_made);
-            assert_eq!(reparsed.partition, original.partition);
-            assert_eq!(reparsed.payload, original.payload);
-        }
     }
 }

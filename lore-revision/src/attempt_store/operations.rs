@@ -18,10 +18,10 @@ impl AttemptStore for RepositoryAttemptStore {
         {
             return Err(ProtocolError::internal("managed child identity mismatch"));
         }
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let wait = phase_diagnostics::start(self.path.as_deref(), "record_mutex_wait");
         let _local = self.write_guard.lock().await;
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(wait);
         let guard = self.guard().await?;
         let mut document = self.load_for_write(&guard)?;
@@ -235,10 +235,10 @@ impl AttemptStore for RepositoryAttemptStore {
         attempt: &AttemptId,
         resolution: AttemptResolution,
     ) -> Result<(), ProtocolError> {
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let wait = phase_diagnostics::start(self.path.as_deref(), "resolve_mutex_wait");
         let _local = self.write_guard.lock().await;
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(wait);
         let guard = self.guard().await?;
         let document = self.load(&guard)?;

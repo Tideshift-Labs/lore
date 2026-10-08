@@ -117,24 +117,32 @@ impl Instruments {
 }
 
 /// The bounded delivery-class label set.
+#[lore_macro::test_pub]
 pub(crate) const CLASS_LIVE_HINT: &str = "live_hint";
+#[lore_macro::test_pub]
 pub(crate) const CLASS_SHADOW: &str = "shadow_observation";
+#[lore_macro::test_pub]
 pub(crate) const CLASS_DURABLE: &str = "durable_invalidation";
 
 /// The bounded enqueue-failure reason set.
+#[lore_macro::test_pub]
 pub(crate) const ENQUEUE_QUEUE_FULL: &str = "queue_full";
+#[lore_macro::test_pub]
 pub(crate) const ENQUEUE_SHUTTING_DOWN: &str = "shutting_down";
 
+#[lore_macro::test_pub]
 pub(crate) fn record_queue_depth_delta(delta: i64) {
     Instruments::instance().queue_depth.add(delta, &[]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_enqueue_failure(reason: &'static str) {
     Instruments::instance()
         .enqueue_failures
         .add(1, &[KeyValue::new("reason", reason)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_publish_result(
     delivery_class: &'static str,
     family: &'static str,
@@ -150,12 +158,14 @@ pub(crate) fn record_publish_result(
     );
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_publish_retry(delivery_class: &'static str) {
     Instruments::instance()
         .publish_retries
         .add(1, &[KeyValue::new("delivery_class", delivery_class)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_dropped_hint(delivery_class: &'static str, class: &'static str) {
     Instruments::instance().dropped_hints.add(
         1,
@@ -166,6 +176,7 @@ pub(crate) fn record_dropped_hint(delivery_class: &'static str, class: &'static 
     );
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_ack_latency_ms(delivery_class: &'static str, millis: f64) {
     Instruments::instance()
         .ack_latency_ms
@@ -176,6 +187,7 @@ pub(crate) fn record_ack_latency_ms(delivery_class: &'static str, millis: f64) {
 ///
 /// `reason` comes from `super::receiver`'s closed readiness-reason set, which
 /// is where the cardinality bound lives.
+#[lore_macro::test_pub]
 pub(crate) fn record_receiver_bootstrap(reason: &'static str) {
     Instruments::instance()
         .receiver_bootstrap_failures
@@ -183,6 +195,7 @@ pub(crate) fn record_receiver_bootstrap(reason: &'static str) {
 }
 
 /// One durable invalidation disposition.
+#[lore_macro::test_pub]
 pub(crate) fn record_receiver_outcome(outcome: &'static str) {
     Instruments::instance()
         .receiver_outcomes
@@ -190,48 +203,9 @@ pub(crate) fn record_receiver_outcome(outcome: &'static str) {
 }
 
 /// One checkpoint report result.
+#[lore_macro::test_pub]
 pub(crate) fn record_receiver_checkpoint(outcome: &'static str) {
     Instruments::instance()
         .receiver_checkpoints
         .add(1, &[KeyValue::new("outcome", outcome)]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An `OTel` counter's recorded value cannot be read back here: the meter
-    /// lives behind a process-global `SdkMeterProvider` cached in a `OnceLock`,
-    /// so a test can only prove the classification, never the emitted number.
-    /// What it CAN prove is that no label is built by interpolation, which is
-    /// the property the contract's label prohibition actually needs.
-    #[test]
-    fn every_label_value_comes_from_the_closed_static_set() {
-        for label in [
-            CLASS_LIVE_HINT,
-            CLASS_SHADOW,
-            CLASS_DURABLE,
-            ENQUEUE_QUEUE_FULL,
-            ENQUEUE_SHUTTING_DOWN,
-        ] {
-            assert!(!label.is_empty());
-            assert!(label.is_ascii());
-            assert!(!label.contains(' '));
-        }
-    }
-
-    #[test]
-    fn recording_is_infallible_and_never_affects_the_caller() {
-        // Fire-and-forget by construction: none of these return anything.
-        record_queue_depth_delta(1);
-        record_queue_depth_delta(-1);
-        record_enqueue_failure(ENQUEUE_QUEUE_FULL);
-        record_publish_result(CLASS_LIVE_HINT, "transient", "timeout");
-        record_publish_retry(CLASS_LIVE_HINT);
-        record_dropped_hint(CLASS_LIVE_HINT, "timeout");
-        record_ack_latency_ms(CLASS_DURABLE, 12.5);
-        record_receiver_bootstrap("placement_moved");
-        record_receiver_outcome("applied");
-        record_receiver_checkpoint("applied");
-    }
 }

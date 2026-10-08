@@ -33,6 +33,7 @@ pub fn assemble_resource_for_path(path: &str, branch: BranchId) -> lock::LockRes
 ///
 /// One `matches!` per error type rather than a check at each caller, so a future non-decisive
 /// variant has exactly one place per verb to be added.
+#[lore_macro::test_pub]
 pub(crate) trait BatchSetError: Sized {
     /// Whether this failure settles what happened to the request that produced it.
     fn is_decisive(&self) -> bool;
@@ -45,6 +46,7 @@ pub(crate) trait BatchSetError: Sized {
 ///
 /// Passed rather than derived so the log line and the fallback message stay each verb's own words,
 /// and a reader of a log or an error message still learns which verb produced it.
+#[lore_macro::test_pub]
 pub(crate) struct BatchSetLabels {
     /// Named in the "Failed to {verb} N batch(es) out of M" log line.
     pub verb: &'static str,
@@ -68,6 +70,7 @@ pub(crate) struct BatchSetLabels {
 /// accumulator to scope its rollback to what it actually took; `release` reads it to clear the
 /// tokens of what the server confirmed released.
 #[derive(Debug)]
+#[lore_macro::test_pub]
 pub(crate) struct SetFailure<E> {
     pub error: E,
     /// True only when every batch in the set answered decisively.
@@ -85,6 +88,7 @@ pub(crate) struct SetFailure<E> {
 /// caller still has to report. Dropping it made `acquire` tell a caller `Internal` for a batch the
 /// server had refused with a reason.
 #[derive(Debug)]
+#[lore_macro::test_pub]
 pub(crate) struct SetSuccess<E> {
     /// How many batches answered successfully. Fewer than `num_batches` means the set succeeded
     /// only in part, which is the difference `release` tolerates and `acquire` undoes.
@@ -109,6 +113,7 @@ pub(crate) struct SetSuccess<E> {
 ///
 /// On success a [`SetSuccess`] is returned rather than nothing, because a set can succeed
 /// partially: `release` tolerates that and `acquire` undoes it, and only the caller knows which.
+#[lore_macro::test_pub]
 pub(crate) fn classify_batch_set<T, E: BatchSetError>(
     outcomes: Vec<Result<Vec<T>, E>>,
     task_failure: Option<E>,
@@ -224,56 +229,4 @@ pub fn fold_batch_results<T, E>(
     }
 
     (items, num_success, first_error)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fold_batch_results_collects_every_batch() {
-        let (items, num_success, first_error) =
-            fold_batch_results::<u32, String>(vec![Ok(vec![1, 2]), Ok(vec![]), Ok(vec![3])], 3);
-
-        assert_eq!(items, vec![1, 2, 3]);
-        assert_eq!(num_success, 3);
-        assert!(first_error.is_none());
-    }
-
-    #[test]
-    fn fold_batch_results_reserves_the_requested_capacity() {
-        let (items, _, _) = fold_batch_results::<u32, String>(vec![Ok(vec![1])], 64);
-
-        assert!(
-            items.capacity() >= 64,
-            "capacity {} was not reserved up front",
-            items.capacity()
-        );
-    }
-
-    #[test]
-    fn fold_batch_results_keeps_one_error_and_the_successful_items() {
-        let (items, num_success, first_error) = fold_batch_results::<u32, String>(
-            vec![
-                Ok(vec![1]),
-                Err("first".to_string()),
-                Err("second".to_string()),
-                Ok(vec![2]),
-            ],
-            2,
-        );
-
-        assert_eq!(items, vec![1, 2]);
-        assert_eq!(num_success, 2);
-        assert_eq!(first_error, Some("first".to_string()));
-    }
-
-    #[test]
-    fn fold_batch_results_reports_no_error_without_batches() {
-        let (items, num_success, first_error) = fold_batch_results::<u32, String>(vec![], 0);
-
-        assert!(items.is_empty());
-        assert_eq!(num_success, 0);
-        assert!(first_error.is_none());
-    }
 }

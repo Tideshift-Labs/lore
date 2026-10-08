@@ -143,11 +143,11 @@ mod tests {
         }
 
         async fn commit(&self, message: &str) -> Hash {
-            Box::pin(commit::commit(
+            commit::commit_boxed(
                 self.repository.clone(),
                 &self.write_token,
                 CommitOptions::new(message.to_string()),
-            ))
+            )
             .await
             .expect("commit staged state")
         }
@@ -168,7 +168,7 @@ mod tests {
             )
             .await
             .expect("create branch");
-            let (_, branch) = lore_revision::instance::load_current_anchor(&self.repository)
+            let (_, branch) = lore_revision::instance::load_current_anchor_boxed(&self.repository)
                 .await
                 .expect("load branch anchor");
             branch
@@ -442,7 +442,8 @@ mod tests {
         fixture.write_file("Content/Bulk", b"now a file\n");
         let metadata = std::fs::metadata(fixture.absolute("Content/Bulk"))
             .expect("read transitioned file metadata");
-        let expected_mode = lore_revision::util::fs::metadata_to_mode(&metadata, 0);
+        let expected_mode =
+            lore_revision::fs::filesystem_provider::FileInfo::from_metadata(&metadata).mode(0);
         let expected_size = metadata.len();
 
         let selected = ["Content/Bulk".to_string()];

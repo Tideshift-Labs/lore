@@ -15,7 +15,7 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::attempt_store::repository_attempt_store;
 use lore_revision::event::LoreCompleteEventData;
-use lore_revision::instance::load_current_anchor;
+use lore_revision::instance::load_current_anchor_boxed;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreEvent;
@@ -2206,7 +2206,7 @@ fn seed_pre_held_ownership(
 ) {
     runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
         let repository = fixture.connect(RepositoryAccess::ReadOnly).await;
-        let (_, branch) = load_current_anchor(&repository)
+        let (_, branch) = load_current_anchor_boxed(&repository)
             .await
             .expect("reading the fixture's current anchor");
         let ownership = repository_attempt_store(&repository);

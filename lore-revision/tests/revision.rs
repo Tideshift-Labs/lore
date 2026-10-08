@@ -59,10 +59,13 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let err =
-                    revision::resolve(repository, "no-such-branch@5", ResolveSearchLocation::Local)
-                        .await
-                        .expect_err("resolve should fail for unknown branch");
+                let err = revision::resolve_boxed(
+                    repository,
+                    "no-such-branch@5",
+                    ResolveSearchLocation::Local,
+                )
+                .await
+                .expect_err("resolve should fail for unknown branch");
                 assert!(
                     err.is_revision_not_found(),
                     "expected RevisionNotFound, got {err:?}"
@@ -81,9 +84,10 @@ mod tests {
             .scope(execution, async move {
                 let repository = make_repo_context().await;
                 let signature = format!("{}@5", uuid::Uuid::now_v7());
-                let err = revision::resolve(repository, signature, ResolveSearchLocation::Local)
-                    .await
-                    .expect_err("resolve should fail for unknown revision number");
+                let err =
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should fail for unknown revision number");
                 assert!(
                     err.is_revision_not_found(),
                     "expected RevisionNotFound, got {err:?}"
@@ -102,7 +106,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let err = revision::resolve(
+                let err = revision::resolve_boxed(
                     repository,
                     "not-a-hash-and-no-at",
                     ResolveSearchLocation::Local,
@@ -127,9 +131,10 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let err = revision::resolve(repository, "abc123", ResolveSearchLocation::Local)
-                    .await
-                    .expect_err("resolve should refuse a partial hash signature");
+                let err =
+                    revision::resolve_boxed(repository, "abc123", ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should refuse a partial hash signature");
                 assert!(err.is_not_supported(), "expected NotSupported, got {err:?}");
                 assert!(!err.is_internal());
             })
@@ -145,9 +150,10 @@ mod tests {
             .scope(execution, async move {
                 let repository = make_repo_context().await;
                 let signature = format!("{}@abc123", uuid::Uuid::now_v7());
-                let err = revision::resolve(repository, signature, ResolveSearchLocation::Local)
-                    .await
-                    .expect_err("resolve should refuse a partial hash signature");
+                let err =
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should refuse a partial hash signature");
                 assert!(err.is_not_supported(), "expected NotSupported, got {err:?}");
                 assert!(!err.is_internal());
             })
@@ -164,7 +170,7 @@ mod tests {
                 let repository = make_repo_context().await;
                 let signature = "1".repeat(lore_base::types::HASH_STRING_LENGTH);
                 let revision =
-                    revision::resolve(repository, &signature, ResolveSearchLocation::Local)
+                    revision::resolve_boxed(repository, &signature, ResolveSearchLocation::Local)
                         .await
                         .expect("a whole signature resolves to itself");
                 assert_eq!(revision.to_string(), signature);
@@ -181,9 +187,10 @@ mod tests {
             .scope(execution, async move {
                 let repository = make_repo_context().await;
                 let signature = format!("{}@0", uuid::Uuid::now_v7());
-                let err = revision::resolve(repository, signature, ResolveSearchLocation::Local)
-                    .await
-                    .expect_err("resolve should fail for revision number zero");
+                let err =
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should fail for revision number zero");
                 assert!(
                     err.is_revision_not_found(),
                     "expected RevisionNotFound, got {err:?}"
@@ -204,9 +211,10 @@ mod tests {
             .scope(execution, async move {
                 let repository = make_repo_context().await;
                 let signature = format!("{}@LATEST", uuid::Uuid::now_v7());
-                let err = revision::resolve(repository, signature, ResolveSearchLocation::Local)
-                    .await
-                    .expect_err("resolve should fail for unknown branch latest");
+                let err =
+                    revision::resolve_boxed(repository, signature, ResolveSearchLocation::Local)
+                        .await
+                        .expect_err("resolve should fail for unknown branch latest");
                 assert!(
                     err.is_revision_not_found(),
                     "expected RevisionNotFound, got {err:?}"
@@ -290,7 +298,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let change = diff_change(
                     &repository,
                     &state,
@@ -315,7 +323,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = make_repo_context().await;
-                let state = Arc::new(State::new());
+                let state = State::new();
                 let change = diff_change(
                     &repository,
                     &state,

@@ -35,10 +35,6 @@ use crate::types::RevisionItem;
 use crate::types::RevisionListResponse;
 use crate::types::RevisionListStart;
 
-#[cfg(test)]
-#[path = "revision_client/adoption_tests.rs"]
-mod adoption_tests;
-
 #[derive(Clone)]
 pub struct RevisionService {
     client: RevisionServiceClient<AuthorizedService>,

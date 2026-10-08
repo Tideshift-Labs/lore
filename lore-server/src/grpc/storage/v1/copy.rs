@@ -32,11 +32,12 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::map_message_handle_error_to_status;
 use crate::protocol::storage::copy::handle_copy;
@@ -56,13 +57,16 @@ const METRICS_STREAMING_MESSAGE_HANDLER_LATENCY: &str = "stream.message.handler.
 /// missing source fragment in particular is an expected outcome that the caller's tier-2 upload
 /// fallback pattern-matches on, so it must not be fatal to the stream.
 ///
-/// The authorization check happens here rather than via the `SessionMap` that `handle_copy`
-/// uses for QUIC v4 callers, because on the urc/0.2 path gRPC carries the JWT in the request
-/// extensions.
+/// The source-partition check happens here rather than via the `SessionMap` that `handle_copy`
+/// uses for QUIC v4 callers, because on the gRPC path the JWT rides in the request extensions.
+/// The partition-access layer already checked the destination (the metadata partition); each
+/// item's source is this handler's own question to the shared authorizer.
+#[lore_macro::test_pub]
 async fn copy_item(
     request: Result<storage_v1::CopyRequest, Status>,
     destination_repository: RepositoryId,
-    auth_token: Option<crate::auth::jwt::AuthorizationToken>,
+    auth_token: Option<Arc<VerifiedTokenOwned>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     correlation_id: String,
     user_id: String,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
@@ -79,10 +83,17 @@ async fn copy_item(
     };
     let source_repository: RepositoryId = request.source_repository_id.clone().into();
 
-    let outcome = if let Some(token) = auth_token.as_ref()
-        && let Err(err) = verify_authorization(token, source_repository)
-    {
-        Err(Status::new(Code::PermissionDenied, err.to_string()))
+    // A cross-partition copy needs to authorize also the source partition
+    let source_check = if source_repository == destination_repository {
+        Ok(())
+    } else {
+        let token = auth_token.as_deref().map(VerifiedTokenOwned::as_token);
+        repository_authorizer
+            .check_repository_access(token.as_ref(), source_repository, None)
+            .await
+    };
+    let outcome = if let Err(status) = source_check {
+        Err(status)
     } else {
         match handle_copy(
             source_repository,
@@ -91,7 +102,6 @@ async fn copy_item(
             target_context,
             correlation_id,
             user_id,
-            None,
             immutable_store,
         )
         .await
@@ -131,10 +141,13 @@ async fn copy_item(
 pub async fn handler(
     request: Request<Streaming<storage_v1::CopyRequest>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<CopyResponseStream>, Status> {
     let destination_repository = get_repository(request.metadata())?;
-    let auth_token = get_authorization(request.extensions()).ok();
+    // Owned halves of the verified token: the per-item tasks outlive the
+    // request extensions the borrowed form points into.
+    let auth_token = get_verified_token(request.extensions()).map(|token| Arc::new(token.owned()));
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
@@ -160,6 +173,7 @@ pub async fn handler(
                     };
 
                     let immutable_store = immutable_store.clone();
+                    let repository_authorizer = repository_authorizer.clone();
                     let tx = tx.clone();
                     let correlation_id = correlation_id.clone();
                     let user_id = user_id.clone();
@@ -186,6 +200,7 @@ pub async fn handler(
                                 req,
                                 destination_repository,
                                 auth_token,
+                                repository_authorizer,
                                 correlation_id,
                                 user_id,
                                 immutable_store,

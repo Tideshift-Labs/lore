@@ -8,7 +8,7 @@
 //! the two handler call sites and the ordering seams that executable Postgres component tests cannot
 //! observe. Behavioral capture and transaction-local revalidation are exercised by
 //! `lore-postgres/tests/domain_lock_fencing.rs`; the fenced push comparison itself by
-//! `lore-server/src/grpc/handlers/branch_push/governed_tests.rs`.
+//! `lore-server/tests/unit/grpc/handlers/branch_push/governed_tests.rs`.
 
 use std::path::Path;
 
@@ -147,7 +147,7 @@ fn a_zero_revision_is_rejected_before_any_witness_capture() {
 /// bypass without ever writing `.name(`.
 ///
 /// Files that are themselves test code — declared `#[cfg(test)] mod <name>;` by
-/// a parent module, like `branch_push/governed_tests.rs` — are excluded, since
+/// a parent module, like lore-postgres's `store/fragment_transport/tests.rs` — are excluded, since
 /// a bypass call there is exactly what the bypass is for.
 #[test]
 fn only_tests_bypass_the_public_mutation_contract_gate() {
@@ -163,11 +163,13 @@ fn only_tests_bypass_the_public_mutation_contract_gate() {
     }
     // Without this, a detector that silently stopped resolving module paths
     // would excuse every file rather than none, and the gate would pass by
-    // scanning nothing.
+    // scanning nothing. The anchor is a lore-postgres whole-file test module:
+    // lore-server's own (`branch_push/governed_tests.rs`) moved to
+    // `tests/unit` when upstream v0.10.1 set `[lib] test = false`.
     assert!(
         test_only
             .iter()
-            .any(|path| path.ends_with("branch_push/governed_tests.rs")),
+            .any(|path| path.ends_with("store/fragment_transport/tests.rs")),
         "the test-only module detector resolved no path for a known whole-file test module, so \
          its exclusions cannot be trusted; found: {test_only:?}"
     );

@@ -5,14 +5,13 @@ use std::io::Write;
 use lore_base::error::ServiceUnavailable;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
-use lore_revision::event::EventError;
+use lore_revision::event::LoreErrorDetail;
 use lore_revision::event::LoreEvent;
-use lore_revision::interface::LoreError;
 use lore_revision::relay::EventDispatcher;
 
-use crate::args::LoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::remote::command::LoreCommand;
 use crate::remote::message::MessageToClient;
 use crate::remote::message::MessageToServer;
 use crate::remote::message::SerializationType;
@@ -26,22 +25,6 @@ use crate::remote::service_process::connect_or_spawn_service;
 #[error_set]
 pub enum ServiceCallError {
     ServiceUnavailable,
-}
-
-impl EventError for ServiceCallError {
-    fn translated(&self) -> LoreError {
-        match self {
-            // Carried through from resolving the service, and the only failure
-            // here that means the call never reached one. Everything else went
-            // wrong while talking to a service that was there.
-            Self::ServiceUnavailable(_) => LoreError::ServiceUnavailable,
-            Self::Internal(_) => LoreError::Internal,
-        }
-    }
-
-    fn inner(&self) -> String {
-        self.to_string()
-    }
 }
 
 /// Records the directory the service resolves this call's relative paths
@@ -61,12 +44,12 @@ fn fill_working_directory(globals: &mut LoreGlobalArgs) {
 }
 
 /// Runs the call on the service, starting one when none is running.
-pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
+pub async fn service_call(
     globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    run_service_call(None, globals, args, callback).await
+    run_service_call(None, globals, command, callback).await
 }
 
 /// Runs the call over a connection the caller already holds, rather than one
@@ -75,52 +58,52 @@ pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
 /// A caller that acts on the service only when one is already running connects
 /// itself, so that its check for a service and the call it makes cannot
 /// disagree about whether there was one to act on.
-pub async fn service_call_over<ArgsType: LoreArgs + Clone + Send + 'static>(
+pub async fn service_call_over(
     connection: UdsStream,
     globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
-    run_service_call(Some(connection), globals, args, callback).await
+    run_service_call(Some(connection), globals, command, callback).await
 }
 
-async fn run_service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
+async fn run_service_call(
     connection: Option<UdsStream>,
     mut globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     callback: LoreEventCallback,
 ) -> i32 {
     fill_working_directory(&mut globals);
     let mut event_dispatcher = EventDispatcher::new(callback);
 
-    let status = service_call_impl(&mut event_dispatcher, globals, args, connection)
-        .await
-        .unwrap_or_else(|err| {
-            // The failure's own code, not a flat 1: a caller has to be able to
-            // tell a call that never reached a service from one the service ran
-            // and reported on, and 1 is also the CLI's own general failure, which
-            // would make a routed failure indistinguishable from any other.
-            let status = err.ffi_code();
+    match service_call_impl(&mut event_dispatcher, globals, command, connection).await {
+        Ok(status) => {
+            // The read loop returns on the result, leaving events queued for this
+            // process's forwarder. Drained so a caller reading what its callback
+            // collected sees all of it; a local call's `complete` does the same.
+            event_dispatcher.drain().await;
+            status
+        }
+        Err(err) => {
+            // No service completed the command, so it completes here as a failing
+            // command does, with the failure's own code: a caller has to be able
+            // to tell a call that never reached a service from one the service
+            // ran and reported on.
             event_dispatcher.send(LoreEvent::Log(EventDispatcher::make_log(
                 LoreLogLevel::Error,
                 format!("Failed to send command to Lore service because: {err}"),
             )));
-            event_dispatcher.send_error(err);
-            status
-        });
-
-    // The read loop returns on the result, leaving events queued for this
-    // process's forwarder. Drained so a caller reading what its callback
-    // collected sees all of it; a local call's `complete` does the same.
-    event_dispatcher.drain().await;
-
-    status
+            event_dispatcher
+                .complete(LoreErrorDetail::from_error(&err))
+                .await
+        }
+    }
 }
 
-pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
+pub async fn service_call_impl(
     event_dispatcher: &mut EventDispatcher,
     globals: LoreGlobalArgs,
-    args: ArgsType,
+    command: LoreCommand,
     connection: Option<UdsStream>,
 ) -> Result<i32, ServiceCallError> {
     if !uds_supported() {
@@ -142,10 +125,7 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     let connection = lore_base::lore_spawn_blocking!(move || {
         let mut connection = connection;
 
-        let message = MessageToServer {
-            globals,
-            command: args.to_command(),
-        };
+        let message = MessageToServer { globals, command };
 
         let message_bytes = write_v1_message(message, SerializationType::Json)
             .forward::<ServiceCallError>("serializing message")?;

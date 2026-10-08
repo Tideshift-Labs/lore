@@ -76,11 +76,13 @@ use uuid::Uuid;
 use crate::repository::RepositoryContext;
 
 mod operations;
+#[cfg(feature = "test-util")]
+pub mod persistence;
+#[cfg(not(feature = "test-util"))]
 mod persistence;
-#[cfg(test)]
-mod phase_diagnostics;
-#[cfg(test)]
-mod publication_tests;
+/// Path-scoped phase timings, read by the publication tests in `tests/unit/attempt_store`.
+#[cfg(feature = "test-util")]
+pub mod phase_diagnostics;
 
 pub(crate) use persistence::BOOTSTRAP_LOCK_FILE;
 pub(crate) use persistence::ensure_directory;
@@ -174,11 +176,11 @@ impl RepositoryAttemptStore {
     async fn guard(&self) -> Result<FSLock, ProtocolError> {
         let path = self.require_path()?;
         if let Some(parent) = path.parent() {
-            #[cfg(test)]
+            #[cfg(feature = "test-util")]
             let _ensure = phase_diagnostics::start(Some(path), "ensure_directory_inclusive");
             ensure_directory(parent).await?;
         }
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let _lock = phase_diagnostics::start(Some(path), "journal_fslock_wait");
         FSLock::acquire_file_lock(path, false)
             .await
@@ -229,6 +231,7 @@ pub fn repository_attempt_store(repository: &RepositoryContext) -> Arc<dyn Attem
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Deserialize, Serialize)]
+#[lore_macro::test_pub]
 struct StoredDocument {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     generation: Option<String>,
@@ -270,6 +273,7 @@ pub struct ManagedNamespace {
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[lore_macro::test_pub]
 struct StoredManagedIntent {
     attempt: String,
     parent: String,
@@ -278,6 +282,7 @@ struct StoredManagedIntent {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[lore_macro::test_pub]
 struct StoredAttempt {
     attempt_id: String,
     state: StoredState,
@@ -291,6 +296,7 @@ struct StoredAttempt {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
+#[lore_macro::test_pub]
 enum StoredState {
     Unresolved,
     AdjudicatedUnknown,
@@ -305,6 +311,7 @@ impl StoredState {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[lore_macro::test_pub]
 enum StoredResolution {
     Applied,
     NotApplied,
@@ -312,6 +319,7 @@ enum StoredResolution {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[lore_macro::test_pub]
 struct StoredReceipt {
     org_uuid: String,
     /// Hex. Every byte string on this rail is hex rather than base64 so a stored record can be
@@ -328,6 +336,7 @@ struct StoredReceipt {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[lore_macro::test_pub]
 struct StoredOwnership {
     attempt_id: String,
     /// Hex branch id.

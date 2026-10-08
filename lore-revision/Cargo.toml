@@ -6,6 +6,7 @@ publish = false
 
 [lib]
 name = "lore_revision"
+test = false
 
 [dependencies]
 async-stream = { workspace = true }
@@ -78,6 +79,8 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 bitcode = { workspace = true }
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+# `test_seams` for the fork's `live_fixture` tests in tests/unit (WP-120).
+lore-revision = { workspace = true, features = ["test-util", "test_seams"] }
 lore-storage = { workspace = true }
 # `VolatileAttemptStore` (CR-030, WP-120), for tests exercising `lock::file::acquire`/`release`'s
 # ownership-token threading without a durable `RepositoryAttemptStore`. Unifies with the plain
@@ -110,6 +113,7 @@ test_seams = ["lore-transport/test_seams"]
 trace_log = ["lore-base/trace_log"]
 vfs = []
 swfs = []
+test-util = []
 
 [[test]]
 name = "compile_fail"

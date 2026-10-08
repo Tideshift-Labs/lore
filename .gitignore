@@ -4,6 +4,9 @@
 target-*/
 *.dSYM
 
+# mkdocs build output
+/site/
+
 # Local files
 lore-server/config/local*.toml
 **/.grafana.local.yaml
@@ -156,6 +159,9 @@ xcuserdata
 *.local.*
 .claude/
 .claude-worktrees/
+context/
+AGENTS.md
+CLAUDE.md
 
 # test report
 ctrf/

@@ -24,12 +24,14 @@ const MAX_RAW_REQUEST_LEN: usize = 16 * 1024;
 const MAX_ISSUER_OR_SUBJECT_LEN: usize = 256;
 const MAX_SIGNED_JWT_LEN: usize = 8 * 1024;
 
+#[lore_macro::test_pub]
 #[derive(Clone, Copy)]
 enum RawWire {
     Varint,
     LengthDelimited(usize),
 }
 
+#[lore_macro::test_pub]
 #[derive(Clone, Copy)]
 struct RawField {
     tag: u32,
@@ -37,6 +39,7 @@ struct RawField {
     presence: RawPresence,
 }
 
+#[lore_macro::test_pub]
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum RawPresence {
     Required,
@@ -51,6 +54,7 @@ const fn ld(tag: u32, maximum: usize) -> RawField {
     }
 }
 
+#[lore_macro::test_pub]
 const fn varint(tag: u32) -> RawField {
     RawField {
         tag,
@@ -102,6 +106,7 @@ fn read_raw_varint(raw: &[u8], offset: &mut usize) -> Result<u64, Status> {
     Err(Status::invalid_argument("overflow protobuf varint"))
 }
 
+#[lore_macro::test_pub]
 fn validate_raw_fields(raw: &[u8], rules: &[RawField]) -> Result<(u64, [u64; 64]), Status> {
     if raw.len() > MAX_RAW_REQUEST_LEN {
         return Err(Status::invalid_argument(
@@ -208,6 +213,7 @@ const FINALIZE_FIELDS: &[RawField] = &[
 
 /// Reject malformed stale-finalize raw bytes before Prost can discard unknown
 /// or duplicate singular fields and before auth-grpc can claim a permit.
+#[lore_macro::test_pub]
 pub(super) fn validate_verified_stale_finalize_raw(raw: &[u8]) -> Result<(), Status> {
     validate_raw_fields(raw, FINALIZE_FIELDS)?;
     Ok(())
@@ -247,6 +253,7 @@ const ATTACH_FIELDS: &[RawField] = &[
 ];
 
 /// Strict raw validation for the two-phase terminal-status attachment request.
+#[lore_macro::test_pub]
 pub(super) fn validate_terminal_status_attach_raw(raw: &[u8]) -> Result<(), Status> {
     let (seen, values) = validate_raw_fields(raw, ATTACH_FIELDS)?;
     match values[14] {
@@ -305,6 +312,7 @@ const MATERIALIZE_FIELDS: &[RawField] = &[
 ];
 
 /// Strict raw validation for proof-namespace materialization.
+#[lore_macro::test_pub]
 pub(super) fn validate_proof_namespace_materialize_raw(raw: &[u8]) -> Result<(), Status> {
     validate_raw_fields(raw, MATERIALIZE_FIELDS)?;
     Ok(())
@@ -332,12 +340,14 @@ const RETIRE_FIELDS: &[RawField] = &[
 ];
 
 /// Strict raw validation for proof-namespace retirement.
+#[lore_macro::test_pub]
 pub(super) fn validate_proof_namespace_retire_raw(raw: &[u8]) -> Result<(), Status> {
     validate_raw_fields(raw, RETIRE_FIELDS)?;
     Ok(())
 }
 
 /// Exact caller-known receipt binding after all wire bounds are checked.
+#[lore_macro::test_pub]
 #[derive(Debug, Clone)]
 pub(super) struct ValidatedBinding {
     pub(super) org_uuid: Vec<u8>,
@@ -352,11 +362,13 @@ pub(super) struct ValidatedBinding {
     pub(super) authorization_revision: u64,
 }
 
+#[lore_macro::test_pub]
 pub(super) struct ValidatedPrepare {
     pub(super) binding: ValidatedBinding,
     pub(super) preclaim_ticket: Vec<u8>,
 }
 
+#[lore_macro::test_pub]
 pub(super) struct ValidatedReceiptGet {
     pub(super) binding: ValidatedBinding,
     pub(super) consumed_ticket_sha256: Vec<u8>,
@@ -511,6 +523,7 @@ fn validate_binding(
     })
 }
 
+#[lore_macro::test_pub]
 pub(super) fn validate_prepare(
     request: DomainOperationPrepareRequest,
 ) -> Result<ValidatedPrepare, Status> {
@@ -543,6 +556,7 @@ pub(super) fn validate_prepare(
 /// The v7 check is not cosmetic. The receipt rail orders and classifies attempts by a UUID's
 /// embedded timestamp, so a value of any other version could never have been filed as one and
 /// asking for it is a caller error rather than a miss.
+#[lore_macro::test_pub]
 pub(super) fn validate_attempt_receipt_get(
     request: &DomainOperationAttemptReceiptGetRequest,
 ) -> Result<Uuid, Status> {
@@ -565,6 +579,7 @@ pub(super) fn validate_attempt_receipt_get(
     Ok(attempt)
 }
 
+#[lore_macro::test_pub]
 pub(super) fn validate_receipt_get(
     request: DomainOperationReceiptGetRequest,
 ) -> Result<ValidatedReceiptGet, Status> {
@@ -621,6 +636,7 @@ fn validate_verified_identity(
     Ok(())
 }
 
+#[lore_macro::test_pub]
 pub(super) fn validate_verified_stale_finalize(
     request: &DomainOperationVerifiedStaleFinalizeRequest,
 ) -> Result<(), Status> {
@@ -688,6 +704,7 @@ pub(super) fn validate_verified_stale_finalize(
     Ok(())
 }
 
+#[lore_macro::test_pub]
 pub(super) fn validate_terminal_status_attach(
     request: &DomainOperationTerminalStatusAttachRequest,
 ) -> Result<(), Status> {
@@ -830,6 +847,7 @@ pub(super) fn validate_terminal_status_attach(
     Ok(())
 }
 
+#[lore_macro::test_pub]
 pub(super) fn validate_proof_namespace_materialize(
     request: &DomainOperationProofNamespaceMaterializeRequestV1,
 ) -> Result<(), Status> {
@@ -862,6 +880,7 @@ pub(super) fn validate_proof_namespace_materialize(
     Ok(())
 }
 
+#[lore_macro::test_pub]
 pub(super) fn validate_proof_namespace_retire(
     request: &DomainOperationProofNamespaceRetireRequestV1,
 ) -> Result<(), Status> {
@@ -907,19 +926,4 @@ pub(super) fn validate_proof_namespace_retire(
         MAX_SIGNED_JWT_LEN,
     )?;
     Ok(())
-}
-
-#[cfg(test)]
-mod raw_field_tests {
-    use super::*;
-
-    #[test]
-    fn varint_rule_above_tag_thirty_cannot_index_panic() {
-        // tag 63, wire type 0 => key 504 => canonical varint f8 03.
-        let raw = [0xf8, 0x03, 0x01];
-        let (seen, values) = validate_raw_fields(&raw, &[varint(63)])
-            .expect("a declared high varint tag must validate without indexing past the array");
-        assert_eq!(seen, 1u64 << 63);
-        assert_eq!(values[63], 1);
-    }
 }

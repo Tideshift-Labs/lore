@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -11,6 +10,10 @@ use crate::file::stage::is_path_under_layer_mask;
 use crate::file::stage::route_layer_paths;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::FileInfo;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::layer;
@@ -126,8 +129,24 @@ pub async fn dirty(
 /// replaying tracked paths against a freshly committed revision) can hand
 /// them in directly.
 ///
-/// Wraps [`dirty_relative_paths_in`] with the instance anchor I/O.
+/// Wraps [`dirty_relative_paths_in_operation`] with the instance anchor I/O, under the one
+/// filesystem operation the walk reads the working tree through and finalizes as having
+/// changed nothing, the markers it leaves being state alone.
 pub(crate) async fn dirty_relative_paths(
+    repository: Arc<RepositoryContext>,
+    paths: Vec<RelativePath>,
+) -> Result<Hash, DirtyError> {
+    with_operation(repository.file_system(), async |operation| {
+        dirty_relative_paths_in_operation(&operation, repository, paths).await
+    })
+    .await
+}
+
+/// [`dirty_relative_paths`] against `operation`, which covers the parent's whole working tree
+/// and every layer mounted in it, so one call reads through one operation however many trees it
+/// marks. For a caller that already holds one.
+pub(crate) async fn dirty_relative_paths_in_operation(
+    operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
@@ -147,6 +166,7 @@ pub(crate) async fn dirty_relative_paths(
     let mask = (!layers.is_empty()).then(|| Arc::new(layer::target_paths(&layers)));
 
     let signature = dirty_relative_paths_in_masked(
+        operation,
         repository.clone(),
         state_current,
         state_staged,
@@ -156,7 +176,13 @@ pub(crate) async fn dirty_relative_paths(
     .await?;
 
     for (layer_index, remains) in layer_jobs {
-        dirty_into_layer(repository.clone(), &layers[layer_index], &remains).await?;
+        dirty_into_layer(
+            operation,
+            repository.clone(),
+            &layers[layer_index],
+            &remains,
+        )
+        .await?;
     }
 
     // Current is never anchored as staged, and matching either input state
@@ -174,11 +200,11 @@ pub(crate) async fn dirty_relative_paths(
 /// below its source. The subtree is named by its node in each of the layer's trees, so the walk
 /// carries the mount path alone and the layer's own spelling never leaves this function.
 async fn dirty_into_layer(
+    operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     layer: &layer::Layer,
     remains: &[RelativePath],
 ) -> Result<(), DirtyError> {
-    let mount_root = repository.require_path()?.join(&layer.target_path);
     let mount_path = RelativePath::new_from_initial_path(&layer.target_path)
         .forward_with::<DirtyError, _>(|| {
             format!("Invalid layer target path {}", layer.target_path)
@@ -196,6 +222,7 @@ async fn dirty_into_layer(
     let current_revision = layer_state.state_current.revision();
 
     let walk = DirtyWalk {
+        operation: operation.clone(),
         repository: layer_state.repository.clone(),
         state_current: layer_state.state_current.clone(),
         state_staged: layer_state.state_staged.clone(),
@@ -215,7 +242,6 @@ async fn dirty_into_layer(
 
     for remain in remains {
         let path = mount_path.join(remain.as_str());
-        let absolute_path = remain.to_absolute_path(&mount_root);
 
         let parent_states = walk.repository.filter.parent_exclusion_states(&path);
         let (states, excluded) = walk.repository.filter.child_emit_excludes_unless_forced(
@@ -235,7 +261,6 @@ async fn dirty_into_layer(
             dirty_nodes_below(&walk, source_root, remain).await,
             StagedParent::below(source_root.staged, remain.parent()),
             &path,
-            &absolute_path,
             DiskState::Unknown,
             states,
         )
@@ -290,18 +315,35 @@ async fn dirty_into_layer(
 /// anchors. Pass a clone of `state_current` as `state_staged` when nothing is
 /// staged yet. Returns `state_staged`'s own revision when no path produced a
 /// marker.
+///
+/// Reads the working tree through one filesystem operation, finalized as having changed
+/// nothing, the markers it leaves being state alone.
+#[lore_macro::test_pub]
 pub(crate) async fn dirty_relative_paths_in(
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
-    dirty_relative_paths_in_masked(repository, state_current, state_staged, paths, None).await
+    with_operation(repository.file_system(), async |operation| {
+        dirty_relative_paths_in_masked(
+            &operation,
+            repository,
+            state_current,
+            state_staged,
+            paths,
+            None,
+        )
+        .await
+    })
+    .await
 }
 
 /// [`dirty_relative_paths_in`] with the layer mount subtrees the parent walk must not descend
-/// into, so layer content is never enqueued as parent nodes.
+/// into, so layer content is never enqueued as parent nodes, against `operation`, the one the
+/// call reads the working tree through.
 async fn dirty_relative_paths_in_masked(
+    operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
@@ -309,9 +351,9 @@ async fn dirty_relative_paths_in_masked(
     mask: Option<Arc<Vec<String>>>,
 ) -> Result<Hash, DirtyError> {
     let current_revision = state_current.revision();
-    let repository_path = repository.require_path()?.to_path_buf();
 
     let walk = DirtyWalk {
+        operation: operation.clone(),
         repository: repository.clone(),
         state_current: state_current.clone(),
         state_staged: state_staged.clone(),
@@ -338,13 +380,11 @@ async fn dirty_relative_paths_in_masked(
             continue;
         }
 
-        let absolute_path = relative_path.to_absolute_path(&repository_path);
         dirty_path(
             &walk,
             dirty_nodes_below(&walk, root, relative_path).await,
             StagedParent::below(root.staged, relative_path.parent()),
             relative_path,
-            &absolute_path,
             DiskState::Unknown,
             states,
         )
@@ -384,14 +424,32 @@ async fn dirty_relative_paths_in_masked(
     Ok(signature)
 }
 
-/// What a caller already established about a path on disk, so that a scan asks once per path.
+/// What a caller already established about a path in the working tree, so that a scan asks once
+/// per path.
 enum DiskState {
     /// Described by the listing that found it.
-    Present(std::fs::Metadata),
+    Present(FileInfo),
     /// Established absent, which is why the path is being visited at all.
     Absent,
     /// Not looked at; [`dirty_path`] asks.
     Unknown,
+}
+
+impl DiskState {
+    /// What the working tree holds at `path`, read through `walk` where the caller established
+    /// nothing. A path the operation cannot describe holds nothing the walk can mark, which is
+    /// the answer an absent one gives.
+    async fn info(self, walk: &DirtyWalk, path: &RelativePath) -> FileInfo {
+        match self {
+            DiskState::Present(info) => info,
+            DiskState::Absent => FileInfo::NotExist,
+            DiskState::Unknown => walk
+                .operation
+                .file_info(path)
+                .await
+                .unwrap_or(FileInfo::NotExist),
+        }
+    }
 }
 
 /// The trees a dirty walk marks and what every step of it shares.
@@ -401,7 +459,12 @@ enum DiskState {
 /// the working-tree paths the filesystem and the filter answer for, whatever the tree being
 /// marked spells them as — which is what a layer drawn from somewhere other than its mount
 /// needs.
+#[lore_macro::test_pub]
 struct DirtyWalk {
+    /// The operation the whole call reads the working tree through. A layer's walk marks the
+    /// layer's trees while its paths and its filesystem are the parent's, so this is the
+    /// parent's operation whatever `repository` names.
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
@@ -410,6 +473,7 @@ struct DirtyWalk {
 }
 
 /// The node a path names in each tree, `INVALID_NODE` where a tree holds none.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy)]
 struct DirtyNodes {
     current: NodeID,
@@ -417,12 +481,12 @@ struct DirtyNodes {
 }
 
 impl DirtyNodes {
-    /// The child named `name` of each of these, for a walk stepping into a directory.
+    /// The child `name_hash` names in each of these, for a walk stepping into a directory.
+    /// Named by hash because a listing carries one per entry.
     ///
     /// A staged tree with nothing staged in it shares its storage with the current one, so both
     /// sides answer alike and the lookup is taken once.
-    async fn child(self, walk: &DirtyWalk, name: &str) -> Self {
-        let name_hash = crate::hash::hash_string(name);
+    async fn child(self, walk: &DirtyWalk, name_hash: u64) -> Self {
         let current = subnode(
             &walk.state_current,
             &walk.repository,
@@ -465,8 +529,8 @@ async fn dirty_nodes_below(walk: &DirtyWalk, base: DirtyNodes, names: &RelativeP
     let mut nodes = base;
     let mut remaining = names.clone();
     while !remaining.is_empty() {
-        let name = remaining.pop_root();
-        nodes = nodes.child(walk, name).await;
+        let name_hash = crate::hash::hash_string(remaining.pop_root());
+        nodes = nodes.child(walk, name_hash).await;
     }
     nodes
 }
@@ -538,19 +602,16 @@ async fn dirty_directory_node(
 /// Process a single path and determine the dirty action.
 ///
 /// `nodes` names the path in each tree and `parent` reaches the staged directory it is a child
-/// of, both established by the caller. `absolute_path` is passed in rather than derived from
-/// `relative_path` because the working tree is the parent's while the trees marked can be a
-/// layer's.
+/// of, both established by the caller. `relative_path` is the working tree's path, which the
+/// walk's operation answers for, while the trees marked can be a layer's.
 ///
 /// `states` is the filter verdict the caller reached for `relative_path`, which
 /// the recursions below inherit instead of folding the path again per node.
-#[allow(clippy::too_many_arguments)]
 async fn dirty_path(
     walk: &DirtyWalk,
     nodes: DirtyNodes,
     parent: StagedParent<'_>,
     relative_path: &RelativePath,
-    absolute_path: &Path,
     disk_state: DiskState,
     states: FilterStates,
 ) -> Result<(), DirtyError> {
@@ -569,15 +630,8 @@ async fn dirty_path(
         return Ok(());
     }
 
-    let (exists_on_disk, is_dir) = match disk_state {
-        DiskState::Present(metadata) => (true, metadata.is_dir()),
-        DiskState::Absent => (false, false),
-        DiskState::Unknown => {
-            let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await;
-            let is_dir = metadata.as_ref().is_ok_and(|metadata| metadata.is_dir());
-            (metadata.is_ok(), is_dir)
-        }
-    };
+    let info = disk_state.info(walk, relative_path).await;
+    let (exists_on_disk, is_dir) = (info.exists(), info.is_dir());
 
     let staged_node = nodes
         .staged
@@ -615,7 +669,6 @@ async fn dirty_path(
                 staged: staged_node,
             },
             relative_path,
-            absolute_path,
             states,
         )
         .await?;
@@ -685,28 +738,9 @@ async fn dirty_path(
             .await
             .forward::<DirtyError>("Failed to discard reverted dirty add node")?;
 
-            // Clean up parent dirty flags if no dirty children remain
-            let parent_id = node.parent;
-            if parent_id.is_valid_or_root_node_id()
-                && !state_staged
-                    .node_has_dirty_children(repository.clone(), parent_id)
-                    .await
-                    .forward::<DirtyError>("Failed to check dirty children")?
-            {
-                let parent_block_index = NodeBlock::index(parent_id);
-                let parent_node_index = Node::index(parent_id);
-                let parent_block = state_staged
-                    .block(repository.clone(), parent_block_index)
-                    .await
-                    .forward::<DirtyError>("Failed to get parent block")?;
-                {
-                    let mut writer = parent_block.write();
-                    writer.node(parent_node_index).clear_dirty_flags();
-                    writer.mark_dirty();
-                }
-                state_staged.block_modified(parent_block, parent_block_index);
-                state_staged.mark_dirty();
-            }
+            crate::state::clear_propagation(state_staged, repository, node.parent)
+                .await
+                .forward::<DirtyError>("Failed to clear the marks above a reverted add")?;
 
             stats.delete_count.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -984,32 +1018,34 @@ async fn mark_children_dirty_moved(
 /// resolved from `dir_path`, which is the working-tree path the filter and the listing answer for.
 ///
 /// `states` is the filter verdict for `dir_path`, which each child steps from.
+///
+/// The listing names everything the working tree holds here, so the pass that follows settles
+/// which of the current revision's children are deletes from those names rather than by reading
+/// the working tree a second time. The names are collected ahead of the filter, a child the
+/// filter leaves out standing on disk all the same.
+#[lore_macro::test_pub]
 fn dirty_directory<'a>(
     walk: &'a DirtyWalk,
     nodes: DirtyNodes,
     dir_path: &'a RelativePath,
-    absolute_path: &'a std::path::Path,
     states: FilterStates,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = lore_io::IoDriver::global()
-            .read_dir(absolute_path)
+        let mut entries = walk
+            .operation
+            .read_directory(dir_path)
             .await
-            .map_err(|e| {
-                DirtyError::internal_with_context(
-                    e,
-                    &format!("Failed to read directory {}", absolute_path.display()),
-                )
-            })?;
+            .forward_with::<DirtyError, _>(|| format!("Failed to read directory {dir_path}"))?;
 
+        let deletes_to_find = nodes.current.is_valid_or_root_node_id();
+        let mut present = Vec::new();
         let force = execution_context().globals().force();
         while let Some(entry) = entries.next().await {
-            let entry = entry.map_err(|e| {
-                DirtyError::internal_with_context(e, "Failed to read directory entry")
-            })?;
-            let name_str = crate::util::fs::entry_name(entry.file_name)
-                .forward::<DirtyError>("Unusable directory entry")?;
-            let child_path = dir_path.push_into_buf(&name_str).freeze();
+            let entry = entry.forward::<DirtyError>("Failed to read directory entry")?;
+            if deletes_to_find {
+                present.push(entry.name_hash);
+            }
+            let child_path = dir_path.push_into_buf(&entry.name).freeze();
 
             let (child_states, excluded) =
                 walk.repository.filter.child_emit_excludes_unless_forced(
@@ -1025,20 +1061,17 @@ fn dirty_directory<'a>(
 
             dirty_path(
                 walk,
-                nodes.child(walk, name_str.as_str()).await,
+                nodes.child(walk, entry.name_hash).await,
                 StagedParent::node(nodes.staged),
                 &child_path,
-                &absolute_path.join(name_str.as_str()),
-                entry
-                    .metadata
-                    .map_or(DiskState::Unknown, DiskState::Present),
+                DiskState::Present(entry.info),
                 child_states,
             )
             .await?;
         }
 
-        // Also check for files in the current revision that are NOT on disk (deletes)
-        if nodes.current.is_valid_or_root_node_id() {
+        if deletes_to_find {
+            present.sort_unstable();
             let children = walk
                 .state_current
                 .node_children(walk.repository.clone(), nodes.current)
@@ -1052,16 +1085,9 @@ fn dirty_directory<'a>(
                     .await
                     .forward::<DirtyError>("Failed to get child name")?;
 
-                let child_path_buf = dir_path.push_into_buf(&child_name);
-                let child_abs = absolute_path.join(&child_name);
-
-                // Only process children that are NOT on disk (deletes)
-                if lore_io::IoDriver::global()
-                    .metadata(&child_abs)
-                    .await
-                    .is_err()
-                {
-                    let child_rel = child_path_buf.freeze();
+                let name_hash = crate::hash::hash_string(&child_name);
+                if present.binary_search(&name_hash).is_err() {
+                    let child_rel = dir_path.push_into_buf(&child_name).freeze();
                     // Deletes are reported whatever the filter says, so the step
                     // is taken only to carry the verdict into the recursion.
                     let (child_states, _) = walk.repository.filter.child_excludes_tree(
@@ -1078,7 +1104,7 @@ fn dirty_directory<'a>(
                             &walk.state_staged,
                             &walk.repository,
                             nodes.staged,
-                            crate::hash::hash_string(&child_name),
+                            name_hash,
                         )
                         .await,
                     };
@@ -1087,7 +1113,6 @@ fn dirty_directory<'a>(
                         child_nodes,
                         StagedParent::node(nodes.staged),
                         &child_rel,
-                        &child_abs,
                         DiskState::Absent,
                         child_states,
                     )

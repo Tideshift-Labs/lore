@@ -333,6 +333,7 @@ impl EventError for PushError {
 /// fragment, duplicates an association it holds under another context, or is sent
 /// the payload. Shared behind an [`Arc`](std::sync::Arc) by every task the push
 /// spawns, and cumulative across every revision, link and layer it registers.
+#[lore_macro::test_pub]
 pub(crate) struct PushStats {
     deduplicated: AtomicU64,
     copied: AtomicU64,
@@ -348,6 +349,7 @@ pub(crate) struct PushStats {
 
 impl PushStats {
     /// Counters for one push, keeping what the call's statistics level reports.
+    #[lore_macro::test_pub]
     pub(crate) fn new(statistics: bool) -> Self {
         Self {
             deduplicated: AtomicU64::new(0),
@@ -359,6 +361,7 @@ impl PushStats {
     }
 
     /// `count` fragments the peer already held, so nothing was registered.
+    #[lore_macro::test_pub]
     fn deduplicated(&self, count: u64) {
         if self.statistics {
             self.deduplicated.fetch_add(count, Ordering::Relaxed);
@@ -366,27 +369,32 @@ impl PushStats {
     }
 
     /// The peer duplicated an association it already held, sending no payload.
+    #[lore_macro::test_pub]
     fn copied(&self) {
         self.copied.fetch_add(1, Ordering::Relaxed);
     }
 
     /// A payload was uploaded to the peer.
+    #[lore_macro::test_pub]
     fn put(&self, payload_bytes: u64) {
         self.put.fetch_add(1, Ordering::Relaxed);
         self.put_bytes.fetch_add(payload_bytes, Ordering::Relaxed);
     }
 
     /// Fragments registered with the peer, by copy or upload.
+    #[lore_macro::test_pub]
     fn registered(&self) -> u64 {
         self.copied.load(Ordering::Relaxed) + self.put.load(Ordering::Relaxed)
     }
 
     /// Payload bytes uploaded.
+    #[lore_macro::test_pub]
     fn put_bytes(&self) -> u64 {
         self.put_bytes.load(Ordering::Relaxed)
     }
 
     /// The counts, as an event payload.
+    #[lore_macro::test_pub]
     fn snapshot(&self) -> LoreBranchPushStatsEventData {
         LoreBranchPushStatsEventData {
             deduplicated: self.deduplicated.load(Ordering::Relaxed),
@@ -488,7 +496,7 @@ fn push_stats_event() -> Option<LoreBranchPushStatsEventData> {
     )
 }
 
-pub async fn push(
+pub(crate) async fn push(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: PushOptions,
@@ -595,6 +603,16 @@ pub async fn push_with_runner(
     }
 
     Ok(())
+}
+
+/// Boxed version of [`push`] for cross-crate use.
+pub fn push_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: PushOptions,
+) -> crate::BoxFuture<'_, Result<(), PushError>> {
+    // `None`: no caller attempt store; the transport mints its own id per dispatch (WP-120).
+    Box::pin(push(repository, token, options, None))
 }
 
 /// The revision the peer holds as latest for `branch`, remembered in `known`, or zero when
@@ -1436,6 +1454,7 @@ pub const RETRY_MAX_ATTEMPTS: usize = 10;
 /// A full match needs no transfer, but it is still an answer worth keeping. The rest divide by
 /// whether the peer already holds the bytes: it either has to be sent them, or it has an
 /// association for the same hash and can duplicate that instead.
+#[lore_macro::test_pub]
 #[derive(Debug, Default)]
 pub(crate) struct PushQueryResult {
     /// The peer holds nothing for these, so their payloads have to be transferred.
@@ -1448,6 +1467,8 @@ pub(crate) struct PushQueryResult {
     pub present: Vec<Address>,
 }
 
+// `len` counts only what has to be transferred, so an `is_empty` beside it would mislead.
+#[allow(clippy::len_without_is_empty)]
 impl PushQueryResult {
     /// Counts only what has to be transferred. `present` is deliberately excluded. Drives the
     /// fragment total in the push progress events.
@@ -1459,6 +1480,7 @@ impl PushQueryResult {
 /// Sort one batch's answers into what the peer needs from us: nothing for an association it
 /// already holds, a duplicated association where it holds the hash under another context, and the
 /// payload where it holds neither.
+#[lore_macro::test_pub]
 fn classify_query_batch(batch: &[Address], statuses: &Bytes, queried: &mut PushQueryResult) {
     for (address, status) in batch.iter().zip(statuses.iter()) {
         match QueryStatus::from(*status) {
@@ -1647,6 +1669,7 @@ async fn mark_stored_durable(repository: &Arc<RepositoryContext>, address: Addre
 /// `ExistFullMatch` establishes the same fact an upload does. An entry that never records it is
 /// pinned against eviction, excluded from the store's size and capacity totals, and re-queried on
 /// every subsequent push.
+#[lore_macro::test_pub]
 async fn mark_present_durable(repository: &Arc<RepositoryContext>, present: Vec<Address>) {
     const MAX_PARALLEL_MARK: usize = 1000;
 
@@ -1972,221 +1995,4 @@ async fn query_and_push_fragments(
     .send();
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn address(seed: u8) -> Address {
-        Address {
-            hash: Hash::from([seed; 32]),
-            context: crate::lore::Context::from([seed; 16]),
-        }
-    }
-
-    /// Statistics level zero reports nothing, so it keeps nothing beyond what a
-    /// progress event reads: the fragments registered, which `copied` and `put`
-    /// sum to, and the bytes uploaded.
-    #[test]
-    fn a_count_is_kept_only_where_something_reports_it() {
-        for (statistics, deduplicated) in [(false, 0), (true, 3)] {
-            let stats = PushStats::new(statistics);
-            stats.deduplicated(3);
-            stats.copied();
-            stats.put(64);
-
-            let counts = stats.snapshot();
-            assert_eq!(counts.deduplicated, deduplicated, "statistics {statistics}");
-            assert_eq!(counts.copied, 1, "statistics {statistics}");
-            assert_eq!(counts.put, 1, "statistics {statistics}");
-            assert_eq!(stats.registered(), 2, "statistics {statistics}");
-            assert_eq!(stats.put_bytes(), 64, "statistics {statistics}");
-        }
-    }
-
-    /// A fragment the peer is missing reaches the caller as the address it is, rather than as a
-    /// generic failure.
-    #[test]
-    fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
-        let result: Result<(), ProtocolError> =
-            Err(ProtocolError::from(AddressNotFound { address: [7u8; 48] }));
-
-        let error = result
-            .forward::<PushError>("pushing branch to remote, missing fragment")
-            .expect_err("an error was forwarded");
-
-        assert!(error.is_address_not_found(), "{error:?}");
-        assert!(error.translated() == LoreError::AddressNotFound);
-    }
-
-    /// What the push does with a fragment is decided entirely by the status byte the peer answered
-    /// with, so this is where the copy path is chosen or missed.
-    mod classify {
-        use super::*;
-
-        fn classify(statuses: &[u8]) -> PushQueryResult {
-            let batch: Vec<Address> = (0..statuses.len() as u8).map(address).collect();
-            let mut queried = PushQueryResult::default();
-            classify_query_batch(&batch, &Bytes::copy_from_slice(statuses), &mut queried);
-            queried
-        }
-
-        /// A full match transfers nothing, but the answer still has to be kept: it is what tells
-        /// the local store the payload is safe elsewhere, and an entry that never learns that is
-        /// pinned against eviction and invisible to both store caps for the rest of its life.
-        #[test]
-        fn an_association_the_peer_holds_transfers_nothing_but_is_recorded() {
-            let queried = classify(&[QueryStatus::ExistFullMatch as u8]);
-            assert_eq!(queried.len(), 0, "nothing to transfer");
-            assert_eq!(queried.present, vec![address(0)]);
-        }
-
-        /// The change this path exists for: the partition holds the hash, so the peer is asked to
-        /// duplicate the association rather than sent the payload it already has.
-        #[test]
-        fn a_partition_match_is_copied_rather_than_uploaded() {
-            let queried = classify(&[QueryStatus::ExistPartitionMatch as u8]);
-            assert_eq!(queried.copyable, vec![address(0)]);
-            assert!(queried.absent.is_empty());
-        }
-
-        #[test]
-        fn a_miss_is_uploaded() {
-            let queried = classify(&[QueryStatus::NotFound as u8]);
-            assert_eq!(queried.absent, vec![address(0)]);
-            assert!(queried.copyable.is_empty());
-        }
-
-        /// A status the client does not know must not be read as "the peer has it" — that would
-        /// drop the fragment from the push and leave the revision unreadable on the peer.
-        #[test]
-        fn an_unknown_status_is_uploaded() {
-            let queried = classify(&[2, 7, 255]);
-            assert_eq!(queried.absent.len(), 3);
-            assert!(queried.copyable.is_empty());
-        }
-
-        #[test]
-        fn a_batch_is_split_by_status_in_order() {
-            let queried = classify(&[
-                QueryStatus::NotFound as u8,
-                QueryStatus::ExistFullMatch as u8,
-                QueryStatus::ExistPartitionMatch as u8,
-                QueryStatus::NotFound as u8,
-                QueryStatus::ExistPartitionMatch as u8,
-            ]);
-            assert_eq!(queried.absent, vec![address(0), address(3)]);
-            assert_eq!(queried.copyable, vec![address(2), address(4)]);
-            assert_eq!(queried.present, vec![address(1)]);
-            assert_eq!(queried.len(), 4, "len counts only what is transferred");
-        }
-
-        /// Each status answers the address at its own position, so a batch where only some entries
-        /// are copyable must not shift the rest.
-        #[test]
-        fn statuses_line_up_with_the_addresses_they_answer() {
-            let queried = classify(&[
-                QueryStatus::ExistPartitionMatch as u8,
-                QueryStatus::ExistFullMatch as u8,
-                QueryStatus::NotFound as u8,
-            ]);
-            assert_eq!(queried.copyable, vec![address(0)]);
-            assert_eq!(queried.present, vec![address(1)]);
-            assert_eq!(queried.absent, vec![address(2)]);
-        }
-    }
-
-    /// Recording a full match is what takes the fragment off the local store's protected list, so
-    /// this is where a push stops re-offering content the peer already holds.
-    mod mark {
-        use super::*;
-
-        const DURABLE: u32 = fragment::FragmentFlags::PayloadStoredDurable.bits();
-
-        /// A repository over in-memory stores, holding only what the test puts in it.
-        async fn null_repository() -> Arc<RepositoryContext> {
-            let immutable_store = lore_storage::local::immutable_store::create(
-                None::<&str>,
-                lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
-                false,
-                lore_storage::ImmutableStoreSettings::default(),
-            )
-            .await
-            .expect("in-memory immutable store");
-            let mutable_store = lore_storage::local::mutable_store::create(
-                None::<&str>,
-                lore_storage::MutableStoreSettings::default(),
-                immutable_store.clone(),
-            )
-            .await
-            .expect("in-memory mutable store");
-
-            Arc::new(RepositoryContext::new_null_context(
-                immutable_store,
-                mutable_store,
-            ))
-        }
-
-        /// Store a payload under `address` carrying no durability, as a local commit leaves it.
-        async fn store_local(repository: &Arc<RepositoryContext>, address: Address) {
-            let payload = Bytes::from_static(b"payload");
-            let fragment = Fragment {
-                flags: 0,
-                size_payload: payload.len() as u32,
-                size_content: payload.len() as u64,
-            };
-            repository
-                .immutable_store()
-                .put(repository.id, address, fragment, Some(payload), false)
-                .await
-                .expect("storing a local payload");
-        }
-
-        /// The flags the store holds for `address`.
-        async fn stored_flags(repository: &Arc<RepositoryContext>, address: Address) -> u32 {
-            repository
-                .immutable_store()
-                .get_metadata(repository.id, address)
-                .await
-                .expect("the store holds the address")
-                .fragment
-                .flags
-        }
-
-        /// The fact a full match establishes: the payload is safe on the peer, so the local entry
-        /// is no longer the only copy.
-        #[tokio::test]
-        async fn a_present_address_becomes_durable() {
-            let repository = null_repository().await;
-            let present = address(1);
-            store_local(&repository, present).await;
-            assert_eq!(
-                stored_flags(&repository, present).await & DURABLE,
-                0,
-                "a locally stored payload starts out non-durable"
-            );
-
-            mark_present_durable(&repository, vec![present]).await;
-
-            assert_eq!(stored_flags(&repository, present).await & DURABLE, DURABLE);
-        }
-
-        /// An address the store cannot describe answers nothing to write back, and must not cost
-        /// the addresses it can describe their record.
-        #[tokio::test]
-        async fn a_batch_marks_what_it_can_and_skips_the_rest() {
-            let repository = null_repository().await;
-            let present = address(2);
-            store_local(&repository, present).await;
-
-            mark_present_durable(&repository, vec![address(0), address(3), present]).await;
-
-            assert_eq!(
-                stored_flags(&repository, present).await & DURABLE,
-                DURABLE,
-                "a zero hash and an address the store never held are skipped, not fatal"
-            );
-        }
-    }
 }

@@ -23,7 +23,6 @@ mod tests {
     use lore_revision::filter::FilterMode;
     use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
     use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
-    use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
@@ -69,7 +68,7 @@ mod tests {
         .await
         .expect("Failed to diff filesystem");
         operation
-            .finalize(false)
+            .finalize()
             .await
             .expect("Failed to finish filesystem operation");
         changes
@@ -209,10 +208,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Create a new directory
                 // - dir_added
@@ -266,7 +264,7 @@ mod tests {
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -456,10 +454,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Modify a file
                 // - dir_modified/modified/inner/file_modified.txt
@@ -482,7 +479,7 @@ mod tests {
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 
@@ -596,10 +593,9 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let _signature =
-                    Box::pin(commit::commit(repository.clone(), &write_token, options))
-                        .await
-                        .expect("Failed to commit revision");
+                let _signature = commit::commit_boxed(repository.clone(), &write_token, options)
+                    .await
+                    .expect("Failed to commit revision");
 
                 // Modify a file
                 // - dir_modified/modified/inner/file_modified.txt
@@ -646,7 +642,7 @@ mod tests {
                 );
 
                 let (current_revision, _current_branch) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Failed to load current anchor");
 

@@ -3,15 +3,14 @@
 //! Real startup construction must bind the initialized object namespace before dispatch setup.
 
 use lore_postgres::domain::fragments::FragmentProcessPoolInventory;
-
-use super::FragmentProviderActivation;
-use super::connect_immutable_store;
-use crate::auth::jwk::JWKServiceSettings;
-use crate::domain::operator::DomainCommand;
-use crate::domain::operator::run;
-use crate::settings::AuthSettings;
-use crate::settings::LockStoreSettings;
-use crate::settings::Settings;
+use lore_server::auth::jwk::JWKServiceSettings;
+use lore_server::domain::operator::DomainCommand;
+use lore_server::domain::operator::run;
+use lore_server::plugins::postgres::FragmentProviderActivation;
+use lore_server::plugins::postgres::connect_immutable_store;
+use lore_server::settings::AuthSettings;
+use lore_server::settings::LockStoreSettings;
+use lore_server::settings::Settings;
 
 const REVISION: &str = "clean-init-test-writer-v1";
 

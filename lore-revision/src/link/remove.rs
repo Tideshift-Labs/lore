@@ -32,7 +32,7 @@ use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
-pub async fn remove(
+pub(crate) async fn remove(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     link_path: RelativePath,
@@ -90,7 +90,7 @@ pub async fn remove(
 
     // One operation covers the removal: the working tree read to find local changes is the one
     // the mount is then deleted from.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         if !execution_context().globals().force() {
             verify_no_local_changes_under_link(
                 &operation,
@@ -176,6 +176,15 @@ pub async fn remove(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`remove`] for cross-crate use.
+pub fn remove_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    link_path: RelativePath,
+) -> crate::BoxFuture<'_, Result<(), LinkError>> {
+    Box::pin(remove(repository, token, link_path))
 }
 
 /// Removing a link deletes its mounted directory from disk, taking any

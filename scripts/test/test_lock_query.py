@@ -71,7 +71,10 @@ def test_lock_query(new_lore_repo):
     with pytest.raises(LockInvalidPath):
         repo.run(["lock", "query", "--branch", "main", "--path", outside_repo_path])
 
-    # A signed caller can query an owner with no matching locks.
+    # FORK-LOCAL (Tideshift): the fork suite runs with `--use-grpc`, so this
+    # repository is on the managed, signed server. Its locks belong to the
+    # signed subject, not upstream's authless `<unknown>` placeholder, so a
+    # query for that placeholder matches nothing.
     assert repo.lock_query("main", owner="<unknown>") == []
 
     # Selecting an identity with no stored credential must still fail closed.
@@ -85,3 +88,60 @@ def test_lock_query(new_lore_repo):
         repo.lock_query("notdev")
 
     assert len(repo.lock_query("release", path="subdir_b/file_c.txt")) == 0
+
+
+def _unsigned_jwt(claims: dict) -> str:
+    """A JWT with a placeholder signature. The client only decodes it for
+    its claims here, and the authless server never reads it."""
+    import base64
+    import json
+
+    def part(obj: dict) -> str:
+        raw = json.dumps(obj, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return f"{part({'alg': 'HS256', 'typ': 'JWT'})}.{part(claims)}.signature"
+
+
+@pytest.mark.smoke
+def test_lock_query_owner_name_resolves_from_a_supplied_identity_token(
+    new_authless_lore_repo,
+):
+    """Against the authless server the token-only user service is the only
+    directory, and a caller who supplied `--identity-token` alone is the one
+    bearer it can name. Querying locks by that token's display name must
+    resolve to the token's subject, not treat the name as the ID.
+
+    FORK-LOCAL (Tideshift): under `--use-grpc`, `new_lore_repo` hands out a
+    repository on the managed, signed server, which rejects this unsigned
+    token. The authless fixture keeps the authless server this test needs.
+    The fork's managed push needs a signed credential, so the authless server
+    refuses a push ("managed dispatch cannot bind credential namespace"); the
+    test does not push, as the query needs only the created repository. The
+    managed server cannot stand in: it advertises an auth endpoint, which the
+    client then asks as its user directory, so the token-only service is
+    never reached there."""
+    repo: Lore = new_authless_lore_repo(name="LockQueryOwner")
+    with repo.open_file("file.txt", "w") as output_file:
+        output_file.write("content")
+    repo.stage(scan=True)
+    repo.commit()
+
+    token = _unsigned_jwt(
+        {
+            "iss": "lore",
+            "sub": "token-subject",
+            "name": "Token Bearer",
+            "preferred_username": "token.bearer",
+            "exp": 2_000_000_000,
+            "aud": ["127.0.0.1"],
+        }
+    )
+
+    output = repo.run(
+        ["lock", "query", "--owner", "Token Bearer"],
+        identity_token=token,
+        debug=True,
+    )
+
+    assert "Token Bearer resolved to user id token-subject" in output

@@ -16,7 +16,14 @@ embedded engine is client-relevant.
 
 ## How tests are organized
 
-- Unit tests live in crate-local `#[cfg(test)]` modules. Run `cargo test -p <crate> --lib`.
+- Upstream crates with `[lib] test = false` (lore-server, lore-revision, lore, lore-transport,
+  lore-base, lore-storage and the other upstream crates) keep unit tests in one `tests/unit/`
+  binary per crate, where the crate has unit tests. Run `cargo test -p <crate> --test unit`. A test's name drops the old
+  `tests::` segment: `plugins::postgres::tests::x` is now `plugins::postgres::x`. Private items
+  are reached through the crate's `test-util` feature. `scripts/test/test_unit_test_layout.py`
+  fails if such a crate keeps a `#[cfg(test)]` under `src/`.
+- The fork-only crates (lore-postgres, lore-object-dispatch, lore-fragment-provider) still keep
+  crate-local `#[cfg(test)]` modules. Run `cargo test -p <crate> --lib`.
 - Integration tests live under each crate's `tests/` and in `lore-integration-tests`.
 - Infrastructure-gated Postgres/S3 tests are `#[ignore]`; run them with `-- --ignored` and the
   documented environment variables. An unset environment must never report an infra test as passed.

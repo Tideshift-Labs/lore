@@ -24,6 +24,8 @@ use tracing::debug;
 use tracing::info;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::matching_permissions;
+use crate::auth::jwt::write_permission_granted;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -36,6 +38,37 @@ struct ResponseData {
 #[derive(Serialize)]
 struct ResponseSuccess {
     data: ResponseData,
+}
+
+/// FORK-LOCAL (Tideshift, ADR-00011): the write gate for a content upload.
+///
+/// The route layer asks the configured `RepositoryAuthorizer` only whether the
+/// repository is reachable, which under `AuthClient` admits an identity token
+/// (no `resources` claim) that `CheckUserPermission` answered. Writes keep the
+/// fork claim reader shared with the gRPC (`require_permission`) and QUIC
+/// (`require_write`) surfaces: the token's own `resources` claim must grant
+/// `write` on this repository. Auth off (no verifier, no token) and
+/// `enforce_write_permission = false` stay open, as on those surfaces.
+fn write_permitted(
+    state: &ServerState,
+    repository_id: &str,
+    user_info: Option<&AuthorizationToken>,
+) -> bool {
+    let Some(token) = user_info else {
+        // The route layer inserts a token whenever a verifier is configured,
+        // so no token means auth is off.
+        return state.jwt_verifier.is_none();
+    };
+    let Ok(repository) = repository_id.parse::<Context>() else {
+        // Not a repository at all: the handler answers 400 before any write,
+        // which keeps the existing "Wrong repository" response.
+        return true;
+    };
+    write_permission_granted(
+        state.jwt_verifier.is_some(),
+        state.enforce_write_permission,
+        &matching_permissions(token, repository.into()),
+    )
 }
 
 pub async fn handler(
@@ -55,6 +88,16 @@ pub async fn handler(
         .get(CORRELATION_ID_HEADER)
         .and_then(|header_value| header_value.to_str().map(str::to_string).ok())
         .unwrap_or_default();
+
+    if !write_permitted(&state, &repository_id, user_info.as_ref()) {
+        debug!("Refusing content upload to {repository_id}: no write permission");
+        return (
+            StatusCode::FORBIDDEN,
+            header_error,
+            Body::from("Permission denied"),
+        )
+            .into_response();
+    }
 
     let user_id = get_user_id_from_token(user_info);
     let execution = setup_execution(module_path!(), correlation_id, user_id);

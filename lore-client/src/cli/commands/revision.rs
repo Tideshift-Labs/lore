@@ -8,9 +8,8 @@ use std::sync::atomic::Ordering;
 
 use clap::Args;
 use clap::Subcommand;
-use lore::auth;
 use lore::auth::LoreAuthUserInfoArgs;
-use lore::branch;
+use lore::call_delegation::run_command;
 use lore::interface::Context;
 use lore::interface::FRAGMENT_SIZE_THRESHOLD;
 use lore::interface::FragmentFlags;
@@ -25,6 +24,7 @@ use lore::interface::LoreMetadata;
 use lore::interface::LoreMetadataEventData;
 use lore::interface::LoreMetadataType;
 use lore::interface::LoreRevisionAmendArgs;
+use lore::interface::LoreRevisionBisectArgs;
 use lore::interface::LoreRevisionBisectEventData;
 use lore::interface::LoreRevisionCommitArgs;
 use lore::interface::LoreRevisionCommitRevisionEventData;
@@ -44,10 +44,9 @@ use lore::interface::LoreRevisionSyncFileEventData;
 use lore::interface::LoreRevisionSyncRevisionEventData;
 use lore::interface::LoreString;
 use lore::interface::metadata;
+use lore::remote::command::LoreCommand;
 use lore::revision;
-use lore::revision::LoreRevisionBisectArgs;
 use lore::revision::LoreRevisionFindArgs;
-use lore::runtime;
 use parking_lot::Mutex;
 
 use super::file::print_metadata;
@@ -221,6 +220,11 @@ pub struct RevisionSyncArgs {
     /// Maximum dependency traversal depth (0 means unlimited)
     #[clap(long, value_name = "depth", default_value = "0")]
     dependency_depth_limit: u32,
+
+    /// View filter file to leave the working files materialized under, changing which subset of
+    /// the repository is on disk. Without it the instance keeps the view it holds
+    #[clap(long, value_name = "file")]
+    view: Option<String>,
 }
 
 #[derive(Args)]
@@ -588,8 +592,7 @@ pub fn handle_revision_history(globals: LoreGlobalArgs, args: &RevisionHistoryAr
             .with_defaults(),
     ));
 
-    let list_result =
-        runtime().block_on(revision::history(globals.clone(), list_args, callback)) as u8;
+    let list_result = run_command(globals.clone(), list_args.into(), callback) as u8;
 
     // If the revision list returned an error then don't bother resolving usernames
     if list_result != 0 {
@@ -716,8 +719,7 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
             .with_defaults(),
     ));
 
-    let info_result =
-        runtime().block_on(revision::info(globals.clone(), info_args, callback)) as u8;
+    let info_result = run_command(globals.clone(), info_args.into(), callback) as u8;
 
     // If the revision info returned an error then don't bother resolving usernames
     if info_result != 0 {
@@ -903,6 +905,20 @@ impl ChunkSizeHistogram {
     }
 }
 
+/// Runs a listing the per-link or per-layer commit messages are resolved against. A nonzero status
+/// is the error, so the commit stops with the listing's failure rather than acting on entries it
+/// never received.
+fn run_listing(
+    globals: &LoreGlobalArgs,
+    command: impl Into<LoreCommand>,
+    callback: LoreEventCallback,
+) -> Result<(), u8> {
+    match run_command(globals.clone(), command.into(), callback) {
+        0 => Ok(()),
+        status => Err(status as u8),
+    }
+}
+
 fn resolve_link_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
@@ -941,7 +957,11 @@ fn resolve_link_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::link::list_staged(globals.clone(), discovery_callback));
+        run_listing(
+            globals,
+            lore::link::LoreLinkListStagedArgs {},
+            discovery_callback,
+        )?;
 
         let links = discovered_links.lock().clone();
         if !links.is_empty() {
@@ -1016,10 +1036,11 @@ fn resolve_link_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::link::list_staged(
-            globals.clone(),
+        run_listing(
+            globals,
+            lore::link::LoreLinkListStagedArgs {},
             validation_callback,
-        ));
+        )?;
 
         let valid_paths = discovered_paths.lock().clone();
         for path in link_paths.iter() {
@@ -1073,11 +1094,11 @@ fn resolve_layer_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::layer::layer_list_staged(
-            globals.clone(),
+        run_listing(
+            globals,
             lore::layer::LoreLayerListStagedArgs {},
             discovery_callback,
-        ));
+        )?;
 
         let layers = discovered_layers.lock().clone();
         if !layers.is_empty() {
@@ -1155,11 +1176,11 @@ fn resolve_layer_messages(
                 .with_defaults(),
         );
 
-        runtime().block_on(lore::layer::layer_list(
-            globals.clone(),
+        run_listing(
+            globals,
             lore::layer::LoreLayerListArgs {},
             validation_callback,
-        ));
+        )?;
 
         let valid_paths = configured_layers.lock().clone();
         for path in layer_paths.iter() {
@@ -1297,8 +1318,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
             .with_defaults(),
     ));
 
-    let commit_result =
-        runtime().block_on(revision::commit(globals.clone(), commit_args, callback)) as u8;
+    let commit_result = run_command(globals.clone(), commit_args.into(), callback) as u8;
 
     // If the revision commit returned an error then don't bother resolving usernames
     if commit_result != 0 {
@@ -1359,8 +1379,7 @@ pub fn handle_revision_amend(globals: LoreGlobalArgs, args: &RevisionAmendArgs) 
             .with_defaults(),
     ));
 
-    let amend_result =
-        runtime().block_on(revision::amend(globals.clone(), amend_args, callback)) as u8;
+    let amend_result = run_command(globals.clone(), amend_args.into(), callback) as u8;
 
     // If the revision amend returned an error then don't bother resolving usernames
     if amend_result != 0 {
@@ -1496,6 +1515,7 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        view: args.view.as_ref().into(),
     };
 
     let progress_bar = ProgressBar::new(0);
@@ -1507,7 +1527,7 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::sync(globals, sync_args, callback)) as u8;
+    return run_command(globals, sync_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_bisect(globals: LoreGlobalArgs, args: &RevisionBisectArgs) -> u8 {
@@ -1562,7 +1582,7 @@ pub fn handle_revision_bisect(globals: LoreGlobalArgs, args: &RevisionBisectArgs
         }) as EventCallbackFn)
             .with_defaults(),
     ));
-    runtime().block_on(revision::bisect(globals, bisect_args, callback)) as u8
+    run_command(globals, bisect_args.into(), callback) as u8
 }
 
 pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) -> u8 {
@@ -1609,7 +1629,7 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::diff(globals, diff_args, callback)) as u8;
+    return run_command(globals, diff_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_find(globals: LoreGlobalArgs, args: &RevisionFindArgs) -> u8 {
@@ -1644,7 +1664,7 @@ pub fn handle_revision_find(globals: LoreGlobalArgs, args: &RevisionFindArgs) ->
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::find(globals, find_args, callback)) as u8;
+    return run_command(globals, find_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreArgs) -> u8 {
@@ -1704,7 +1724,7 @@ pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreAr
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::restore(globals, restore_args, callback)) as u8;
+    return run_command(globals, restore_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherryPickArgs) -> u8 {
@@ -1781,7 +1801,7 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
             }) as EventCallbackFn)
                 .with_defaults(),
         ));
-        runtime().block_on(revision::cherry_pick(globals, cherry_pick_args, callback)) as u8
+        run_command(globals, cherry_pick_args.into(), callback) as u8
     }
 }
 
@@ -1817,11 +1837,7 @@ fn handle_revision_cherry_pick_abort(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_abort(
-        globals,
-        cherry_pick_abort_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_abort_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_unresolve(
@@ -1869,11 +1885,7 @@ fn handle_revision_cherry_pick_unresolve(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_unresolve(
-        globals,
-        cherry_pick_unresolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_unresolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_restart(
@@ -1895,11 +1907,7 @@ fn handle_revision_cherry_pick_restart(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_restart(
-        globals,
-        cherry_pick_restart_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_restart_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_resolve(
@@ -1966,11 +1974,7 @@ fn handle_revision_cherry_pick_resolve_impl(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_resolve(
-        globals,
-        cherry_pick_resolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_resolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_resolve_mine(
@@ -1992,11 +1996,7 @@ fn handle_revision_cherry_pick_resolve_mine(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_resolve_mine(
-        globals,
-        cherry_pick_resolve_mine_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_resolve_mine_args.into(), callback) as u8;
 }
 
 fn handle_revision_cherry_pick_resolve_theirs(
@@ -2019,11 +2019,7 @@ fn handle_revision_cherry_pick_resolve_theirs(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::cherry_pick_resolve_theirs(
-        globals,
-        cherry_pick_resolve_theirs_args,
-        callback,
-    )) as u8;
+    return run_command(globals, cherry_pick_resolve_theirs_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs) -> u8 {
@@ -2101,7 +2097,7 @@ pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs
             }) as EventCallbackFn)
                 .with_defaults(),
         ));
-        runtime().block_on(revision::revert(globals, revert_args, callback)) as u8
+        run_command(globals, revert_args.into(), callback) as u8
     }
 }
 
@@ -2137,7 +2133,7 @@ fn handle_revision_revert_abort(globals: LoreGlobalArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_abort(globals, revert_abort_args, callback)) as u8;
+    return run_command(globals, revert_abort_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_unresolve(
@@ -2181,11 +2177,7 @@ fn handle_revision_revert_unresolve(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_unresolve(
-        globals,
-        revert_unresolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_unresolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_restart(globals: LoreGlobalArgs, args: &RevisionRevertRestartArgs) -> u8 {
@@ -2204,11 +2196,7 @@ fn handle_revision_revert_restart(globals: LoreGlobalArgs, args: &RevisionRevert
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_restart(
-        globals,
-        revert_restart_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_restart_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_resolve(globals: LoreGlobalArgs, args: &RevisionRevertResolveArgs) -> u8 {
@@ -2268,11 +2256,7 @@ fn handle_revision_revert_resolve_impl(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_resolve(
-        globals,
-        revert_resolve_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_resolve_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_resolve_mine(
@@ -2294,11 +2278,7 @@ fn handle_revision_revert_resolve_mine(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_resolve_mine(
-        globals,
-        revert_resolve_mine_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_resolve_mine_args.into(), callback) as u8;
 }
 
 fn handle_revision_revert_resolve_theirs(
@@ -2320,11 +2300,7 @@ fn handle_revision_revert_resolve_theirs(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::revert_resolve_theirs(
-        globals,
-        revert_resolve_theirs_args,
-        callback,
-    )) as u8;
+    return run_command(globals, revert_resolve_theirs_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_metadata_clear(
@@ -2347,7 +2323,7 @@ pub fn handle_revision_metadata_clear(
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::metadata_clear(globals, clear_args, callback)) as u8;
+    return run_command(globals, clear_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_metadata_get(globals: LoreGlobalArgs, args: &RevisionMetadataGetArgs) -> u8 {
@@ -2369,7 +2345,7 @@ pub fn handle_revision_metadata_get(globals: LoreGlobalArgs, args: &RevisionMeta
                 .with_defaults(),
         ));
 
-        return runtime().block_on(revision::metadata_get(globals, get_args, callback)) as u8;
+        return run_command(globals, get_args.into(), callback) as u8;
     } else {
         let list_args = LoreRevisionMetadataListArgs {
             revision: LoreString::from(&args.revision),
@@ -2387,7 +2363,7 @@ pub fn handle_revision_metadata_get(globals: LoreGlobalArgs, args: &RevisionMeta
                 .with_defaults(),
         ));
 
-        runtime().block_on(revision::metadata_list(globals, list_args, callback)) as u8
+        run_command(globals, list_args.into(), callback) as u8
     }
 }
 
@@ -2435,7 +2411,7 @@ pub fn handle_revision_metadata_set(globals: LoreGlobalArgs, args: &RevisionMeta
             .with_defaults(),
     ));
 
-    return runtime().block_on(revision::metadata_set(globals, set_args, callback)) as u8;
+    return run_command(globals, set_args.into(), callback) as u8;
 }
 
 pub fn handle_revision_metadata_commands(
@@ -2632,7 +2608,7 @@ fn resolve_revision_user_ids(
             _ => (),
         })));
 
-    let result = runtime().block_on(auth::resolve_user_info(globals, auth_args, callback)) as u8;
+    let result = run_command(globals, auth_args.into(), callback) as u8;
 
     // If there was an error resolving names, don't bother doing anything else
     if result != 0 {
@@ -2709,7 +2685,7 @@ fn fetch_branch_id_for_revision(globals: LoreGlobalArgs, revision: Hash) -> Opti
             _ => (),
         })));
 
-    let result = runtime().block_on(revision::info(globals, info_args, callback)) as u8;
+    let result = run_command(globals, info_args.into(), callback) as u8;
     if result != 0 {
         return None;
     }
@@ -2737,7 +2713,7 @@ fn fetch_branch_name(globals: LoreGlobalArgs, branch_id: Context) -> Option<Stri
             _ => (),
         })));
 
-    let result = runtime().block_on(branch::info(globals, info_args, callback)) as u8;
+    let result = run_command(globals, info_args.into(), callback) as u8;
     if result != 0 {
         return None;
     }

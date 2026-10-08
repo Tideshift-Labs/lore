@@ -30,12 +30,12 @@ $results = [Collections.Generic.List[object]]::new()
 $targets = @(
     @{ Package = 'lore-postgres'; Target = 'domain_fragment_clean_init'; Kind = 'test'; Prefix = ''; Source = 'lore-postgres/tests/domain_fragment_clean_init.rs' },
     @{ Package = 'lore-server'; Target = 'fragment_clean_init_operator'; Kind = 'test'; Prefix = ''; Source = 'lore-server/tests/fragment_clean_init_operator.rs' },
-    @{ Package = 'lore-server'; Target = 'lore_server'; Kind = 'lib'; Prefix = 'plugins::postgres::clean_init_construction_tests::'; Source = 'lore-server/tests/common/clean_init_construction.rs' }
+    @{ Package = 'lore-server'; Target = 'unit'; Kind = 'test'; Prefix = 'plugins::postgres::clean_init_construction_tests::'; Source = 'lore-server/tests/common/clean_init_construction.rs' }
 )
 $featureArgs = @()
 if ($PublicationRaceOnly) {
     $featureArgs = @('--features', 'failure_generator')
-    $targets = @(@{ Package = 'lore-server'; Target = 'lore_server'; Kind = 'lib'; Prefix = 'plugins::postgres::clean_init_construction_tests::publication_race::'; Source = 'lore-server/tests/common/clean_init_publication_race.rs' })
+    $targets = @(@{ Package = 'lore-server'; Target = 'unit'; Kind = 'test'; Prefix = 'plugins::postgres::clean_init_construction_tests::publication_race::'; Source = 'lore-server/tests/common/clean_init_publication_race.rs' })
 }
 $savedEnv = @{}
 foreach ($key in @('LORE_FRAGMENT_FAILPOINTS', 'LORE_FRAGMENT_FAILPOINT_DIR', 'LORE_TEST_PG_URL', 'LORE_TEST_S3_ENDPOINT', 'LORE_TEST_S3_REGION', 'LORE_TEST_CLEAN_INIT_CA_PATH', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_EC2_METADATA_DISABLED')) {

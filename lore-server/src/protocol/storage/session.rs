@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
@@ -9,6 +10,12 @@ use dashmap::DashMap;
 use dashmap::DashSet;
 use lore_revision::lore::RepositoryId;
 
+use crate::authnz::repository_authorizer::Grants;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+
+#[lore_macro::test_pub]
+#[lore_macro::test_pub]
 pub(crate) const MAX_CONCURRENT_SESSIONS: u32 = 10_000;
 
 /// Session ids come from one process-wide sequence, not from a counter per [`SessionMap`].
@@ -56,23 +63,61 @@ pub struct SessionEntry {
     /// from the verified token at `AuthorizeStart` (union across matching
     /// resources, wildcard included). Empty when auth is off or the token
     /// carried no matching `permission` entries. Storage commands have no
-    /// per-request token, so write-permission enforcement reads this.
+    /// per-request token, so the fork's write-permission enforcement reads
+    /// this (FORK-LOCAL: upstream has no `write` action; `grants` below is
+    /// upstream's per-action answer and does not replace it).
     pub permissions: Vec<String>,
+    /// The caller's grants on `repository`, when the authorizer could
+    /// enumerate them at session start. `None` means per-action checks fall
+    /// back to the authorizer with `token`.
+    pub grants: Option<Grants>,
+    /// The verified token the session was authorized with. `None` on a
+    /// server with no verifier configured. Shared: the dispatch clones it per
+    /// command, so the clone must stay a refcount bump.
+    pub token: Option<Arc<VerifiedTokenOwned>>,
+    /// Source repositories a cross-partition copy has already cleared with
+    /// `token`. A repeated copy from the same source consults this set
+    /// instead of re-asking the authorizer, which for the online authorizer
+    /// spares a `CheckUserPermission` round trip per copy. Scoped to the
+    /// session, so does not leak permissions for a shared Connection.
+    pub authorized_sources: Arc<DashSet<RepositoryId>>,
+}
+
+impl SessionEntry {
+    /// Whether the session's caller may perform `action` on the session's
+    /// repository — the per-operation check for an action-gated storage
+    /// command. Same contract as `RepositoryAuthorizer::permits`: answered
+    /// from the grants enumerated at session start, asked of the authorizer
+    /// when they were not enumerable, and without a verified token nothing
+    /// is granted.
+    pub async fn permits(&self, authorizer: &dyn RepositoryAuthorizer, action: &str) -> bool {
+        if let Some(grants) = &self.grants {
+            return grants.permits(action);
+        }
+        let Some(token) = &self.token else {
+            return false;
+        };
+        authorizer
+            .check_repository_access(Some(&token.as_token()), self.repository, Some(action))
+            .await
+            .is_ok()
+    }
 }
 
 /// Per-connection session state for the `lore-storage/0.4` protocol.
 ///
-/// Tracks active sessions mapping session IDs to repository, correlation ID, and user ID tuples,
-/// with a set of authorized repositories for Copy checks. Each `start()` always allocates a new
-/// session ID — deduplication is handled client-side by `StorageConnector`.
+/// Tracks active sessions mapping session IDs to repository, correlation ID, and user ID tuples.
+/// Each `start()` always allocates a new session ID — deduplication is handled client-side by
+/// `StorageConnector`. Copy-source authorization is cached per session
+/// ([`SessionEntry::authorized_sources`]), not per connection.
 ///
 /// The ID comes from [`NEXT_SESSION_ID`], one sequence for the whole process, so no two maps in
 /// this process issue the same number and an ID this map did not issue resolves to nothing here.
 /// See that constant for the two cases where that stops being true.
+#[lore_macro::test_pub]
 #[derive(Default)]
 pub struct SessionMap {
     entries: DashMap<u32, SessionEntry>,
-    authorized_repos: DashSet<RepositoryId>,
     /// Admission slots claimed before allocation. Unlike `DashMap::len` followed by insert, the
     /// compare-and-swap makes the limit one atomic decision across concurrent starts.
     active_sessions: AtomicU32,
@@ -112,6 +157,7 @@ impl SessionMap {
     /// pre-fill the map to drive the redraw and [`SessionError::CounterExhausted`] — the paths
     /// that stop a wrapped id from replacing a live session, and which would otherwise ship
     /// unexercised.
+    #[lore_macro::test_pub]
     fn allocate_from(
         &self,
         sequence: &AtomicU32,
@@ -144,6 +190,8 @@ impl SessionMap {
         correlation_id: String,
         user_id: String,
         permissions: Vec<String>,
+        grants: Option<Grants>,
+        token: Option<Arc<VerifiedTokenOwned>>,
     ) -> Result<(u32, String), SessionError> {
         self.start_from(
             &NEXT_SESSION_ID,
@@ -151,10 +199,17 @@ impl SessionMap {
             correlation_id,
             user_id,
             permissions,
+            grants,
+            token,
         )
     }
 
     /// [`SessionMap::start`] against an arbitrary sequence for deterministic allocation tests.
+    #[lore_macro::test_pub]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "start's arguments plus the injected sequence; a struct would exist only for tests"
+    )]
     fn start_from(
         &self,
         sequence: &AtomicU32,
@@ -162,6 +217,8 @@ impl SessionMap {
         correlation_id: String,
         user_id: String,
         permissions: Vec<String>,
+        grants: Option<Grants>,
+        token: Option<Arc<VerifiedTokenOwned>>,
     ) -> Result<(u32, String), SessionError> {
         self.active_sessions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -175,9 +232,6 @@ impl SessionMap {
             correlation_id
         };
 
-        // Allocated before the repository is authorized, so a failure to allocate leaves nothing
-        // behind. Authorizing first would add the repository to this connection's Copy-source
-        // scope for a session that then failed to exist.
         let session_id = match self.allocate_from(
             sequence,
             SessionEntry {
@@ -185,6 +239,9 @@ impl SessionMap {
                 correlation_id: correlation_id.clone(),
                 user_id,
                 permissions,
+                grants,
+                token,
+                authorized_sources: Arc::new(DashSet::new()),
             },
         ) {
             Ok(session_id) => session_id,
@@ -194,13 +251,10 @@ impl SessionMap {
             }
         };
 
-        self.authorized_repos.insert(repository);
-
         Ok((session_id, correlation_id))
     }
 
-    /// Stop an active session. The repository remains in the authorized set
-    /// for Copy source-repo checks.
+    /// Stop an active session.
     pub fn stop(&self, session_id: u32) -> Result<(), SessionError> {
         match self.entries.remove(&session_id) {
             Some(_) => {
@@ -213,448 +267,5 @@ impl SessionMap {
 
     pub fn get(&self, session_id: u32) -> Option<dashmap::mapref::one::Ref<'_, u32, SessionEntry>> {
         self.entries.get(&session_id)
-    }
-
-    /// O(1) check whether a repository has been authorized on this connection
-    /// (i.e. had at least one session started for it).
-    pub fn is_repository_authorized(&self, repository: RepositoryId) -> bool {
-        self.authorized_repos.contains(&repository)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-    use std::sync::Barrier;
-
-    use rand::random;
-
-    use super::*;
-
-    #[test]
-    fn start_returns_a_nonzero_id() {
-        let map = SessionMap::default();
-        let (id, _) = map
-            .start(random(), "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        // A weaker claim than the name this test used to have
-        // (`start_never_assigns_the_reserved_zero_id`): with `NEXT_SESSION_ID` randomly seeded,
-        // this alone passes with probability ~1 whether or not the zero skip in `allocate_from`
-        // exists at all. `allocate_from_skips_a_drawn_zero_id_and_retries` below is the actual
-        // pin for that skip; this one stays as a cheap, honestly-named sanity check.
-        assert_ne!(id, 0, "0 is the wire's 'no session' value and names none");
-    }
-
-    /// The actual zero-skip pin, using [`SessionMap::allocate_from`] to drive a local sequence
-    /// right up to its wrap point deterministically -- resetting the real process-wide
-    /// [`NEXT_SESSION_ID`] would corrupt every other test drawing from it in this binary.
-    #[test]
-    fn allocate_from_skips_a_drawn_zero_id_and_retries() {
-        let map = SessionMap::default();
-        let sequence = AtomicU32::new(u32::MAX);
-
-        let first = map
-            .allocate_from(
-                &sequence,
-                SessionEntry {
-                    repository: random(),
-                    correlation_id: "first".into(),
-                    user_id: String::new(),
-                    permissions: Vec::new(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            first,
-            u32::MAX,
-            "the draw right before the wrap must still return its own (nonzero) value"
-        );
-
-        // The sequence's internal counter is now 0 (u32::MAX + 1 wrapped). The very next draw
-        // would be exactly the reserved zero id if the skip did not exist.
-        let second = map
-            .allocate_from(
-                &sequence,
-                SessionEntry {
-                    repository: random(),
-                    correlation_id: "second".into(),
-                    user_id: String::new(),
-                    permissions: Vec::new(),
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            second, 1,
-            "a draw landing on the wrapped zero id must be skipped and retried, landing on 1"
-        );
-    }
-
-    /// The redraw-on-collision pin (INV-EO-adjacent): after a wrap, a reused number must not
-    /// silently replace a live session already in THIS map. The client-side generation check
-    /// gives no cover here -- the client's id is genuinely current, and it is the server that
-    /// reassigned the number underneath it.
-    #[test]
-    fn allocate_from_redraws_past_a_collision_and_leaves_the_occupant_untouched() {
-        let map = SessionMap::default();
-        let sequence = AtomicU32::new(100);
-        let occupant_repository = random::<RepositoryId>();
-
-        // Occupy the id the next draw would produce, exactly as a live session already would.
-        map.entries.insert(
-            100,
-            SessionEntry {
-                repository: occupant_repository,
-                correlation_id: "occupant".into(),
-                user_id: "occupant-user".into(),
-                permissions: vec!["read".into()],
-            },
-        );
-
-        let new_repository = random::<RepositoryId>();
-        let allocated = map
-            .allocate_from(
-                &sequence,
-                SessionEntry {
-                    repository: new_repository,
-                    correlation_id: "new".into(),
-                    user_id: String::new(),
-                    permissions: Vec::new(),
-                },
-            )
-            .unwrap();
-
-        assert_eq!(
-            allocated, 101,
-            "a collision on the first draw must redraw to the next id, not overwrite the \
-             occupied one"
-        );
-        let occupant = map
-            .get(100)
-            .expect("the pre-existing occupant must survive the redraw");
-        assert_eq!(
-            occupant.repository, occupant_repository,
-            "the occupant's own fields must be exactly what was there before -- not silently \
-             replaced by the new allocation"
-        );
-        assert_eq!(occupant.correlation_id, "occupant");
-    }
-
-    /// [`SessionError::CounterExhausted`] when every one of the bounded draws collides. This is
-    /// what stands between a wrapped id and silently overwriting a live session once redrawing
-    /// itself is exhausted: refuse the allocation rather than fall through to an insert.
-    #[test]
-    fn allocate_from_exhausts_after_eight_consecutive_collisions() {
-        let map = SessionMap::default();
-        let sequence = AtomicU32::new(500);
-        for id in 500..508 {
-            map.entries.insert(
-                id,
-                SessionEntry {
-                    repository: random(),
-                    correlation_id: format!("occupant-{id}"),
-                    user_id: String::new(),
-                    permissions: Vec::new(),
-                },
-            );
-        }
-
-        let result = map.allocate_from(
-            &sequence,
-            SessionEntry {
-                repository: random(),
-                correlation_id: "never-inserted".into(),
-                user_id: String::new(),
-                permissions: Vec::new(),
-            },
-        );
-
-        assert_eq!(result, Err(SessionError::CounterExhausted));
-        for id in 500..508 {
-            assert_eq!(
-                map.get(id)
-                    .expect("every pre-filled occupant must survive")
-                    .correlation_id,
-                format!("occupant-{id}"),
-                "no pre-existing occupant may be overwritten by the exhausted allocation attempt"
-            );
-        }
-    }
-
-    /// Advances, but no assertion on *by how much*: the sequence is process-wide and every other
-    /// test in this binary draws from it concurrently, so `id1 + 1` would be a flake, not a pin.
-    #[test]
-    fn start_advances_the_session_id() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id1, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        let (id2, _) = map
-            .start(repo, "corr-2".into(), String::new(), Vec::new())
-            .unwrap();
-        assert_ne!(id1, id2);
-    }
-
-    /// The INV-EO P0 pin. Two maps are two accepted connections; an id issued by one must not
-    /// resolve in the other, or a command carrying it executes under the wrong session's
-    /// repository and permissions.
-    #[test]
-    fn two_maps_never_issue_the_same_session_id() {
-        let first = SessionMap::default();
-        let second = SessionMap::default();
-        let repo = random::<RepositoryId>();
-
-        let (id1, _) = first
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        let (id2, _) = second
-            .start(random(), "corr-2".into(), String::new(), Vec::new())
-            .unwrap();
-
-        assert_ne!(id1, id2);
-        assert!(
-            second.get(id1).is_none(),
-            "an id issued by another connection's map must resolve to nothing here"
-        );
-        assert_eq!(second.stop(id1), Err(SessionError::NotFound));
-        assert!(
-            second.get(id2).is_some(),
-            "the stale stop must not have removed this map's own live session"
-        );
-    }
-
-    #[test]
-    fn start_always_allocates_new_id() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id1, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        let (id2, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn start_empty_correlation_generates_uuid() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id1, corr1) = map
-            .start(repo, String::new(), String::new(), Vec::new())
-            .unwrap();
-        let (id2, corr2) = map
-            .start(repo, String::new(), String::new(), Vec::new())
-            .unwrap();
-        assert_ne!(id1, id2);
-        assert!(!corr1.is_empty());
-        assert!(!corr2.is_empty());
-        assert_ne!(corr1, corr2);
-    }
-
-    #[test]
-    fn stop_removes_session() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        assert!(map.get(id).is_some());
-        map.stop(id).unwrap();
-        assert!(map.get(id).is_none());
-    }
-
-    #[test]
-    fn stop_unknown_returns_not_found() {
-        let map = SessionMap::default();
-        assert_eq!(map.stop(999), Err(SessionError::NotFound));
-        assert_eq!(map.active_sessions.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn stop_already_stopped_returns_not_found() {
-        let map = SessionMap::default();
-        let (id, _) = map
-            .start(random(), "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        map.stop(id).unwrap();
-        assert_eq!(map.active_sessions.load(Ordering::Acquire), 0);
-        assert_eq!(map.stop(id), Err(SessionError::NotFound));
-        assert_eq!(
-            map.active_sessions.load(Ordering::Acquire),
-            0,
-            "a second stop must not decrement the admission count below zero"
-        );
-    }
-
-    #[test]
-    fn start_after_stop_allocates_new_id() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id1, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        map.stop(id1).unwrap();
-        let (id2, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        assert_ne!(id1, id2);
-    }
-
-    #[test]
-    fn get_returns_entry_with_user_id() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id, _) = map
-            .start(
-                repo,
-                "corr-1".into(),
-                "user-42".into(),
-                vec!["read".into(), "write".into()],
-            )
-            .unwrap();
-        let entry = map.get(id).unwrap();
-        assert_eq!(entry.repository, repo);
-        assert_eq!(entry.correlation_id, "corr-1");
-        assert_eq!(entry.user_id, "user-42");
-        assert_eq!(entry.permissions, vec!["read", "write"]);
-    }
-
-    #[test]
-    fn get_returns_none_for_unknown() {
-        let map = SessionMap::default();
-        assert!(map.get(42).is_none());
-    }
-
-    #[test]
-    fn is_repository_authorized() {
-        let map = SessionMap::default();
-        let repo_a = random::<RepositoryId>();
-        let repo_b = random::<RepositoryId>();
-        map.start(repo_a, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-
-        assert!(map.is_repository_authorized(repo_a));
-        assert!(!map.is_repository_authorized(repo_b));
-    }
-
-    #[test]
-    fn stop_does_not_remove_authorized_repo() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let (id, _) = map
-            .start(repo, "corr-1".into(), String::new(), Vec::new())
-            .unwrap();
-        map.stop(id).unwrap();
-        assert!(map.is_repository_authorized(repo));
-    }
-
-    #[test]
-    fn concurrent_session_limit() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        for i in 0..MAX_CONCURRENT_SESSIONS {
-            map.start(repo, format!("corr-{i}"), String::new(), Vec::new())
-                .unwrap();
-        }
-        assert_eq!(
-            map.start(repo, "one-more".into(), String::new(), Vec::new()),
-            Err(SessionError::LimitReached)
-        );
-    }
-
-    #[test]
-    fn limit_freed_by_stop() {
-        let map = SessionMap::default();
-        let repo = random::<RepositoryId>();
-        let mut ids = Vec::new();
-        for i in 0..MAX_CONCURRENT_SESSIONS {
-            let (id, _) = map
-                .start(repo, format!("corr-{i}"), String::new(), Vec::new())
-                .unwrap();
-            ids.push(id);
-        }
-        assert_eq!(
-            map.start(repo, "blocked".into(), String::new(), Vec::new()),
-            Err(SessionError::LimitReached)
-        );
-        map.stop(ids[0]).unwrap();
-        map.start(repo, "freed".into(), String::new(), Vec::new())
-            .unwrap();
-    }
-
-    /// A length check followed by insert lets every caller below the limit pass at once. Seed one
-    /// slot below the cap and release a group together: exactly one may claim the final slot.
-    #[test]
-    fn concurrent_starts_cannot_overbook_the_session_limit() {
-        const CONTENDERS: usize = 32;
-        let map = Arc::new(SessionMap::default());
-        map.active_sessions
-            .store(MAX_CONCURRENT_SESSIONS - 1, Ordering::Release);
-        let barrier = Arc::new(Barrier::new(CONTENDERS));
-
-        let successes = std::thread::scope(|scope| {
-            let handles = (0..CONTENDERS)
-                .map(|index| {
-                    let map = map.clone();
-                    let barrier = barrier.clone();
-                    scope.spawn(move || {
-                        barrier.wait();
-                        map.start(
-                            random(),
-                            format!("concurrent-{index}"),
-                            String::new(),
-                            Vec::new(),
-                        )
-                        .is_ok()
-                    })
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|handle| handle.join().unwrap())
-                .filter(|success| *success)
-                .count()
-        });
-
-        assert_eq!(successes, 1, "only the final admission slot may be claimed");
-        assert_eq!(
-            map.active_sessions.load(Ordering::Acquire),
-            MAX_CONCURRENT_SESSIONS
-        );
-    }
-
-    #[test]
-    fn allocation_failure_refunds_the_claimed_session_slot() {
-        const OCCUPIED: u32 = 8;
-        let map = SessionMap::default();
-        let sequence = AtomicU32::new(500);
-        for id in 500..500 + OCCUPIED {
-            map.entries.insert(
-                id,
-                SessionEntry {
-                    repository: random(),
-                    correlation_id: format!("occupant-{id}"),
-                    user_id: String::new(),
-                    permissions: Vec::new(),
-                },
-            );
-        }
-        map.active_sessions.store(OCCUPIED, Ordering::Release);
-
-        let result = map.start_from(
-            &sequence,
-            random(),
-            "must-fail".into(),
-            String::new(),
-            Vec::new(),
-        );
-
-        assert_eq!(result, Err(SessionError::CounterExhausted));
-        assert_eq!(
-            map.active_sessions.load(Ordering::Acquire),
-            OCCUPIED,
-            "failed allocation must refund the admission slot it claimed"
-        );
     }
 }

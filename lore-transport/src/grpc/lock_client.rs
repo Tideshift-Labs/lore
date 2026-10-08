@@ -371,7 +371,3 @@ impl LockService {
         Ok(resources.into_iter().map(Into::into).collect())
     }
 }
-
-#[cfg(test)]
-#[path = "lock_client_tests.rs"]
-mod tests;

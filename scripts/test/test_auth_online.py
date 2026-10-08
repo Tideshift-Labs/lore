@@ -34,7 +34,12 @@ import grpc
 import pytest
 from error_types import LoreException
 from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
-from protobuf_wire import encode_bytes_field
+from protobuf_wire import (
+    encode_bytes_field,
+    field_int,
+    field_message,
+    parse_fields,
+)
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -54,10 +59,13 @@ from mock_auth_server import (
     MockUser,
     check_user_permission_response,
     empty_response,
+    lookup_user_permissions_response,
     start_auth_session_response,
     tamper_token,
+    user_info_response,
     user_token_response,
 )
+from thin_client import revision_tree
 
 from lore import Lore
 
@@ -273,9 +281,9 @@ def script_partition_access(
         bearer=login_token,
         resource_id=resource_id,
     ).respond(user_token_response(user, authz_token))
-    mock.on(
-        "CheckUserPermission", bearer=login_token, resource_id=resource_id
-    ).respond(check_user_permission_response(resource_id, permissions))
+    mock.on("CheckUserPermission", bearer=login_token, resource_id=resource_id).respond(
+        check_user_permission_response(resource_id, permissions)
+    )
 
 
 def script_repository_lifecycle(mock: MockAuthServer, resource_id: str) -> None:
@@ -493,6 +501,61 @@ def test_granted_user_can_access_shared_repository(auth_env, make_actor, scratch
 
 
 @pytest.mark.smoke
+def test_user_names_come_from_the_auth_service_without_a_separate_directory(
+    auth_env, make_actor, lore_library_path
+):
+    """A server advertising no `user_url` keeps its auth service as
+    the user directory: another user's name is a `GetUserInfo` call there,
+    carrying the partition-scoped token the CLI exchanged for it."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "owner", USER1)
+    mock.on(
+        "GetUserInfo", bearer=owner.authz_token, resource_id=owner.resource_id
+    ).respond(user_info_response(USER2))
+
+    result = owner.repo.auth_user_info_capi(lore_library_path, USER2.user_id)
+
+    assert result == 0, (
+        f"resolving through the auth service failed with FFI code {result}"
+    )
+    assert mock.calls["GetUserInfo"] == 1
+    assert list(mock.requests_for("GetUserInfo")[0]["user_id"]) == [USER2.user_id]
+
+
+@pytest.mark.smoke
+def test_repository_list_is_the_auth_services_answer(auth_env, make_actor):
+    """`lore repository list` on the legacy tier asks `LookupUserPermissions`
+    once, with the `urc` filter and no paging, and lists exactly the
+    partitions the answer names: a second repository the same user created
+    but the answer omits is not listed, and entries that are not partitions
+    are skipped."""
+    mock = auth_env.mock
+    owner = provision_owner(auth_env, make_actor, "lister", USER1)
+
+    unlisted_id = uuid.uuid4().hex
+    script_repository_lifecycle(mock, f"urc-{unlisted_id}")
+    unlisted = owner.actor.make_repo(repo_id=unlisted_id)
+    unlisted.repository_create(repo_id=unlisted_id, identity=USER1.user_id)
+
+    mock.on("LookupUserPermissions", bearer=owner.login_token).respond(
+        lookup_user_permissions_response(
+            owner.resource_id, "urc-not-a-partition", "something-else"
+        )
+    )
+
+    listing = owner.repo.repository_list().splitlines()
+
+    assert f"{owner.repo.name} ({owner.repo.get_id()})" in listing
+    assert not any(unlisted.get_id() in line for line in listing), (
+        "a partition the auth service did not name must not be listed"
+    )
+    lookups = mock.requests_for("LookupUserPermissions")
+    assert len(lookups) == 1
+    assert lookups[0]["resource_filter"] == "urc"
+    assert lookups[0]["page_token"] == "", "the first page carries no token"
+
+
+@pytest.mark.smoke
 def test_each_user_owns_their_created_repositories(auth_env, make_actor):
     """USER2 creates repository C with an API-key login: the rebac
     registration carries USER2's credential, not USER1's."""
@@ -681,9 +744,7 @@ def subscribe_code(target: str, repo_id_hex: str, token: str) -> grpc.StatusCode
 
 
 @pytest.mark.smoke
-def test_every_partition_scoped_service_enforces_partition_access(
-    auth_env, make_actor
-):
+def test_every_partition_scoped_service_enforces_partition_access(auth_env, make_actor):
     """Every partition-scoped gRPC service sits behind the partition-access
     check: on each one, a verifiable token holding no grant for the partition
     answers PERMISSION_DENIED, the owner's granted token never does, and the
@@ -741,6 +802,167 @@ def test_every_partition_scoped_service_enforces_partition_access(
     )
 
 
+STORAGE_COPY = "/lore.storage.v1.StorageService/Copy"
+
+# google.rpc.Code values as `ItemStatus.code` carries them.
+CODE_NOT_FOUND = 5
+CODE_PERMISSION_DENIED = 7
+
+
+def copy_item_code(
+    target: str, destination_hex: str, source_hex: str, token: str
+) -> int:
+    """One item through the v1 Copy stream, reporting its `ItemStatus.code`.
+
+    The destination rides in the metadata (the partition-access layer's
+    check); each item's source rides in its body, and a denied source answers
+    in-band in the item's status with the stream itself OK. A stream-level
+    error (the destination check) folds into the same numeric code so the
+    caller reads one verdict either way."""
+    address = encode_bytes_field(1, b"\x00" * 32) + encode_bytes_field(2, b"\x00" * 16)
+    request = encode_bytes_field(1, bytes.fromhex(source_hex)) + encode_bytes_field(
+        2, address
+    )
+    metadata = repository_metadata(destination_hex) + (
+        ("authorization", f"Bearer {token}"),
+    )
+    with grpc.insecure_channel(target) as channel:
+        invoke = channel.stream_stream(STORAGE_COPY, lambda b: b, lambda b: b)
+        stream = invoke(iter([request]), metadata=metadata, timeout=10.0)
+        try:
+            item = next(stream)
+        except grpc.RpcError as error:
+            return error.code().value[0]
+    error = field_message(parse_fields(item), 3)
+    return field_int(error, 1) if error else 0
+
+
+@pytest.mark.smoke
+def test_cross_partition_copy_requires_a_source_grant(auth_env):
+    """Cross-partition copy authorizes its *source* partition per item: an
+    access token granting the destination alone is denied, and one granting
+    both partitions reaches the store — which answers NOT_FOUND for the absent
+    address, proving the denial above was the missing grant rather than the
+    missing fragment. Both verdicts come from the token's own `resources`
+    claim: no CheckUserPermission rule is scripted, and the stub's records
+    prove nothing asked for one."""
+    mock = auth_env.mock
+    target = grpc_target(auth_env.remote_url)
+    destination = uuid.uuid4().hex
+    source = uuid.uuid4().hex
+
+    destination_only = mock.mint_token(
+        USER1, resources=authz_resources(f"urc-{destination}")
+    )
+    both = mock.mint_token(
+        USER1,
+        resources=authz_resources(f"urc-{destination}")
+        + authz_resources(f"urc-{source}"),
+    )
+
+    denied = copy_item_code(target, destination, source, destination_only)
+    assert denied == CODE_PERMISSION_DENIED, (
+        f"a source the caller holds no grant for must be denied, got code {denied}"
+    )
+
+    granted = copy_item_code(target, destination, source, both)
+    assert granted == CODE_NOT_FOUND, (
+        f"a granted source must pass the check and reach the store, got code {granted}"
+    )
+
+    assert not mock.requests_for("CheckUserPermission"), (
+        "both verdicts must come from the access token's resources claim, "
+        "not an online check"
+    )
+
+
+LINKER_API_KEY = "linker-api-key"
+
+
+@pytest.mark.smoke
+def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor):
+    """A revision tree walk follows a link into another partition only when
+    the caller's token grants that partition: with the parent's grant alone
+    the link node is reported and nothing beneath it, with both grants the
+    linked content streams. The walk asks the authorizer synchronously, so
+    both verdicts must come from the access token's own `resources` claim:
+    no CheckUserPermission rule is scripted for either probe token, and the
+    stub's records prove nothing asked for one."""
+    mock = auth_env.mock
+    parent_id, linked_id = uuid.uuid4().hex, uuid.uuid4().hex
+    parent_resource, linked_resource = f"urc-{parent_id}", f"urc-{linked_id}"
+    login_token = mock.mint_token(USER1)
+    # The CLI's setup work — creating both repositories, mounting the link —
+    # exchanges for one partition at a time; a token granting both keeps
+    # the mount's read of the linked partition working whichever one it
+    # exchanged for.
+    setup_token = mock.mint_token(
+        USER1,
+        resources=authz_resources(parent_resource) + authz_resources(linked_resource),
+    )
+    script_api_key_login(mock, USER1, login_token, LINKER_API_KEY)
+    for resource in (parent_resource, linked_resource):
+        script_repository_lifecycle(mock, resource)
+        script_partition_access(mock, USER1, login_token, resource, setup_token)
+
+    actor = make_actor("linker")
+    login_api_key(actor.make_repo(), auth_env.remote_url, LINKER_API_KEY)
+    # FORK-LOCAL (Tideshift): both repositories push, and the fork's managed
+    # push refuses QUIC, so they use the gRPC remote (same server and port).
+    linked = actor.make_repo(remote_url=auth_env.write_url, repo_id=linked_id)
+    linked.repository_create(repo_id=linked_id, identity=USER1.user_id)
+    commit_file(linked, "inner.txt", "linked content")
+    parent = actor.make_repo(remote_url=auth_env.write_url, repo_id=parent_id)
+    parent.repository_create(repo_id=parent_id, identity=USER1.user_id)
+    commit_file(parent, "own.txt", "parent content")
+    parent.link_add("linked", linked_id, "/")
+    parent.commit("mount the link")
+    parent.push()
+
+    latest = parent.branch_info().local_latest
+    assert len(latest) == 64, f"expected a full revision signature, got {latest!r}"
+    target = grpc_target(auth_env.remote_url)
+    repository_id, signature = bytes.fromhex(parent_id), bytes.fromhex(latest)
+
+    parent_only = mock.mint_token(USER1, resources=authz_resources(parent_resource))
+    both = mock.mint_token(
+        USER1,
+        resources=authz_resources(parent_resource) + authz_resources(linked_resource),
+    )
+
+    def tree_paths(token: str) -> set[str]:
+        return {
+            node.path
+            for node in revision_tree(
+                target, repository_id, signature, authorization=token
+            )
+        }
+
+    granted = tree_paths(both)
+    assert {"own.txt", "linked", "linked/inner.txt"} <= granted, (
+        f"a token granting both partitions must see the linked content, got {granted}"
+    )
+
+    denied = tree_paths(parent_only)
+    assert {"own.txt", "linked"} <= denied, (
+        f"the parent's own files and the link node must still be reported, got {denied}"
+    )
+    assert not [path for path in denied if path.startswith("linked/")], (
+        f"a token without the linked partition's grant must not see beneath the "
+        f"link, got {denied}"
+    )
+
+    probed = [
+        check
+        for check in mock.requests_for("CheckUserPermission")
+        if check["bearer"] in (parent_only, both)
+    ]
+    assert not probed, (
+        "the link-read verdicts must come from the access token's resources "
+        f"claim, not an online check: {probed}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI operations against the authorization rules
 # ---------------------------------------------------------------------------
@@ -777,9 +999,7 @@ def provision_member(
     login_api_key(seed, auth_env.remote_url, USER2_API_KEY)
     repo = seed.clone()
     repo.environment_vars.update(seed.environment_vars)
-    return SimpleNamespace(
-        repo=repo, login_token=login_token, authz_token=authz_token
-    )
+    return SimpleNamespace(repo=repo, login_token=login_token, authz_token=authz_token)
 
 
 def revoke(mock, member, resource_id: str) -> None:

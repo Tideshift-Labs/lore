@@ -108,11 +108,11 @@ async fn subscribe_local(
 }
 
 /// Unsubscribe to events for the repository.
-async fn unsubscribe_local(
+fn unsubscribe_local(
     globals: LoreGlobalArgs,
     args: LoreNotificationUnsubscribeArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_no_store(
         globals,
         callback,
@@ -120,5 +120,4 @@ async fn unsubscribe_local(
         unsubscribe,
         move |repository, _args| lore_revision::notification::unsubscribe(repository),
     )
-    .await
 }

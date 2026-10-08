@@ -16,9 +16,9 @@
 //! | [`ScriptedResponse::Status`] | 429 (`RESOURCE_EXHAUSTED`), the 5xx equivalent (`UNAVAILABLE`), terminal `INVALID_ARGUMENT` / `PERMISSION_DENIED`, and `DEADLINE_EXCEEDED` |
 //! | [`ScriptedResponse::Hang`] | a gateway that never answers, so the client's own deadline fires |
 //!
-//! This is compiled unconditionally rather than behind `#[cfg(test)]`, because
+//! This is compiled unconditionally rather than test-only, because
 //! `lore-server` has no test-support feature and an integration test under
-//! `tests/` cannot see a `#[cfg(test)]` item. It is small, server-only, and
+//! `tests/` cannot see a test-only item. It is small, server-only, and
 //! reachable from no production path: nothing outside a test constructs one.
 
 use std::sync::Arc;

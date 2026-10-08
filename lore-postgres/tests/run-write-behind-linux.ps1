@@ -20,10 +20,10 @@ zero tests, not a failure:
     adapter, and first staged-PUT cases. Feature-enabled acknowledgement-loss and active-token
     process-takeover cases have their own exact catalog checks below.
 
-  * The `lore-server` LIB target's Unix-only write-behind case --
-    `plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_linux`, paired with a
+  * The `lore-server` `unit` test binary's Unix-only write-behind case --
+    `plugins::postgres::the_same_write_behind_block_is_accepted_on_linux`, paired with a
     differently-named `cfg(not(target_os = "linux"))` twin. NOTE the
-    count differential CANNOT detect this one: the `lore-server` lib catalog is IDENTICAL on both
+    count differential CANNOT detect this one: the `lore-server` unit catalog is IDENTICAL on both
     platforms, because each platform drops one case and gains the other. The discriminating
     evidence is name presence, which is what this runner now pins.
 
@@ -699,18 +699,18 @@ try {
     # arms are a `cfg(unix)`/`cfg(not(unix))` PAIR with DIFFERENT NAMES: each platform drops one
     # case and gains the other, so the total never moves. The only evidence that discriminates is
     # "was this exact name in the catalog", which is what the pin below asserts.
-    Write-Host 'Enumerating lore-server lib ...'
+    Write-Host 'Enumerating lore-server --test unit ...'
     $providerIgnored = @(Get-Catalog -Kind 'lib' -Package 'lore-fragment-provider' -IgnoredOnly)
     if (@($providerIgnored | Where-Object { $_ -eq $providerLiveCase }).Count -ne 1) {
         throw "provider live case must be enumerated exactly once: $providerLiveCase"
     }
-    $serverCatalog = @(Get-Catalog -Kind 'lib' -Package 'lore-server')
-    $serverUnixOnly = 'plugins::postgres::tests::the_same_write_behind_block_is_accepted_on_linux'
-    $serverNonUnixOnly = 'plugins::postgres::tests::an_otherwise_valid_write_behind_block_is_refused_at_boot_off_linux'
+    $serverCatalog = @(Get-Catalog -Kind 'test' -Target 'unit' -Package 'lore-server')
+    $serverUnixOnly = 'plugins::postgres::the_same_write_behind_block_is_accepted_on_linux'
+    $serverNonUnixOnly = 'plugins::postgres::an_otherwise_valid_write_behind_block_is_refused_at_boot_off_linux'
     foreach ($suffix in @($serverUnixOnly)) {
         $matched = @($serverCatalog | Where-Object { $_ -eq $suffix -or $_.EndsWith(":$suffix") })
         if ($matched.Count -ne 1) {
-            throw "lore-server lib catalog must contain the Unix-only case '$suffix' exactly once; found $($matched.Count)"
+            throw "lore-server unit catalog must contain the Unix-only case '$suffix' exactly once; found $($matched.Count)"
         }
     }
     # The negative half, and it is not decoration: it is what proves the positive pin above
@@ -720,10 +720,10 @@ try {
     if ($nonUnixPresent.Count -ne 0) {
         throw "the cfg(not(unix)) twin '$serverNonUnixOnly' must be ABSENT from a Linux catalog; found $($nonUnixPresent.Count)"
     }
-    Write-Host "lore-server lib: Linux enumerates $($serverCatalog.Count); the Unix-only case is present and its non-Unix twin is absent."
+    Write-Host "lore-server unit: Linux enumerates $($serverCatalog.Count); the Unix-only case is present and its non-Unix twin is absent."
 
-    Write-Host 'Running lore-server --lib ...'
-    $serverRun = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-server', '--lib')
+    Write-Host 'Running lore-server --test unit ...'
+    $serverRun = Invoke-InContainer -Command @('cargo', 'test', '-p', 'lore-server', '--test', 'unit')
     Write-Host $serverRun.Output
     $serverCounts = Read-TestCounts -Output $serverRun.Output
     # `Ran -eq $serverCatalog.Count` for the same reason the `lore-postgres` lib row uses it: it
@@ -731,7 +731,7 @@ try {
     # filtered-to-zero run that an exit code alone would call green.
     $serverStatus = if ($serverRun.ExitCode -eq 0 -and $serverCounts.Failed -eq 0 -and
         $serverCounts.Passed -gt 0 -and $serverCounts.Ran -eq $serverCatalog.Count) { 'PASS' } else { 'FAIL' }
-    Add-Result -Target 'lore-server lib' -Case '(non-ignored)' -Status $serverStatus `
+    Add-Result -Target 'lore-server unit' -Case '(non-ignored)' -Status $serverStatus `
         -Enumerated $serverCatalog.Count -Ran $serverCounts.Ran -Passed $serverCounts.Passed `
         -Failed $serverCounts.Failed `
         -Note "carries the cfg(unix) write-behind arm; $($serverCounts.Ignored) ignored"

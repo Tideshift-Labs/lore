@@ -56,6 +56,7 @@ use crate::telemetry::Transport;
 /// between v0 (`LoreStorageService`) and v4 (`StorageServiceV4`); the caller
 /// passes its `StorageProtocol` so v0 and v4 are distinguishable in traces via
 /// the `protocol` attribute.
+#[lore_macro::test_pub]
 pub(crate) fn build_storage_protocol_request_span(
     cmd: QuicOpCode,
     protocol: StorageProtocol,
@@ -262,7 +263,7 @@ fn request_identifiers_from_context(
     let correlation_id =
         correlation_id.map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
     let user_id = authorization_token
-        .map(|token| token.user_id.clone())
+        .map(|token| token.identity().to_string())
         .filter(|user_id| !user_id.is_empty())
         .unwrap_or_else(|| NO_USER_ID.to_string());
     (
@@ -446,8 +447,6 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
-    // TODO(UCS-23410): read by the partition check at connect.
-    #[allow(dead_code)]
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -560,7 +559,11 @@ impl QuicService for StorageService {
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
-                    .handle_auth(context, self.jwt_verifier.clone())
+                    .handle_auth(
+                        context,
+                        self.jwt_verifier.clone(),
+                        self.repository_authorizer.clone(),
+                    )
                     .await
             }
             ParsedStorageRequest::MutableLoad(_)
@@ -571,9 +574,23 @@ impl QuicService for StorageService {
                     .await
             }
             ParsedStorageRequest::Verify(verify) => {
-                verify.handle(context, self.local_store.clone()).await
+                verify
+                    .handle(
+                        context,
+                        self.local_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
             }
-            other => other.handle(context, self.immutable_store.clone()).await,
+            other => {
+                other
+                    .handle(
+                        context,
+                        self.immutable_store.clone(),
+                        self.repository_authorizer.clone(),
+                    )
+                    .await
+            }
         }?;
 
         Ok(lore_response.data())
@@ -628,148 +645,5 @@ impl QuicService for StorageService {
                 .as_ref()
                 .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_base::types::Hash;
-    use lore_base::types::KeyType;
-    use rand::random;
-
-    use super::*;
-    use crate::auth::jwk::JWKService;
-    use crate::auth::jwk::JWKServiceError;
-    use crate::quic::QuicService;
-    use crate::store::test_store_create;
-
-    /// A `JWKService` that must never be called — `require_write`'s
-    /// fail-closed checks never reach `verify_token`/`get_key`; only
-    /// `jwt_verifier.is_some()` matters for these tests.
-    #[derive(Debug)]
-    struct UnusedJwkService;
-
-    #[async_trait]
-    impl JWKService for UnusedJwkService {
-        async fn get_key(
-            &self,
-            _kid: &str,
-        ) -> Result<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm), JWKServiceError> {
-            unreachable!("require_write's fail-closed path never verifies a token")
-        }
-
-        fn get_cached_key(
-            &self,
-            _kid: &str,
-        ) -> Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)> {
-            unreachable!("require_write's fail-closed path never reads a cached key")
-        }
-
-        async fn refresh_key(
-            &self,
-            _kid: &str,
-        ) -> Result<Option<(jsonwebtoken::DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>
-        {
-            unreachable!("require_write's fail-closed path never refreshes a key")
-        }
-    }
-
-    fn verifier_present() -> Arc<Option<JwtVerifier>> {
-        Arc::new(Some(JwtVerifier {
-            jwk_service: Arc::new(UnusedJwkService),
-            jwt_issuer: None,
-            jwt_audience: None,
-        }))
-    }
-
-    async fn service_with_enforcement() -> StorageService {
-        let (immutable_store, mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-        StorageService::new(
-            verifier_present(),
-            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
-            immutable_store.clone(),
-            immutable_store,
-            mutable_store,
-            true,
-        )
-    }
-
-    fn mutable_store_op() -> ParsedStorageRequest {
-        ParsedStorageRequest::MutableStoreOp(requests::MutableStoreOp {
-            key: Hash::default(),
-            value: Hash::default(),
-            key_type: KeyType::Untyped,
-        })
-    }
-
-    /// CR-018 legacy (urc/0.2) path: `require_write` fails closed when a
-    /// verifier is configured and enforcement is on, but the connection
-    /// context carries neither a `RepositoryId` nor an `AuthorizationToken`
-    /// (the Connect handshake that would populate them never happened, or
-    /// was skipped). A write op must be denied, not silently let through.
-    mod require_write_fails_closed {
-        use super::*;
-
-        #[tokio::test]
-        async fn denies_write_when_repository_and_token_are_both_missing() {
-            let service = service_with_enforcement().await;
-            let context = Arc::new(AttributeMap::default());
-
-            let err = service
-                .run_request_handler(context, mutable_store_op())
-                .await
-                .expect_err("missing repository and token must fail closed");
-
-            assert!(
-                matches!(err, MessageHandleError::NotConnected),
-                "expected NotConnected, got {err:?}"
-            );
-        }
-
-        #[tokio::test]
-        async fn denies_write_when_token_is_missing_but_repository_is_present() {
-            let service = service_with_enforcement().await;
-            let context = Arc::new(AttributeMap::default());
-            context.insert(random::<RepositoryId>());
-
-            let err = service
-                .run_request_handler(context, mutable_store_op())
-                .await
-                .expect_err("missing authorization token must fail closed");
-
-            assert!(
-                matches!(err, MessageHandleError::AuthorizationFailure(_)),
-                "expected AuthorizationFailure, got {err:?}"
-            );
-        }
-
-        #[tokio::test]
-        async fn allows_write_when_enforcement_is_disabled_despite_missing_token() {
-            // Same context shape as `denies_write_when_token_is_missing_but_
-            // repository_is_present` (repository present, token absent) but
-            // enforce_write_permission = false: fail-closed is itself gated
-            // on the flag, mirroring the v4 dispatch gate's decision table.
-            // (RepositoryId must still be present — that's a hard requirement
-            // of the mutable-store handler itself, not the write-permission
-            // gate under test here.)
-            let (immutable_store, mutable_store, _execution) =
-                test_store_create().await.expect("Failed to create stores");
-            let service = StorageService::new(
-                verifier_present(),
-                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
-                immutable_store.clone(),
-                immutable_store,
-                mutable_store,
-                false,
-            );
-            let context = Arc::new(AttributeMap::default());
-            context.insert(random::<RepositoryId>());
-
-            service
-                .run_request_handler(context, mutable_store_op())
-                .await
-                .expect("enforcement disabled must bypass the fail-closed check");
-        }
     }
 }

@@ -33,12 +33,10 @@ use crate::metadata::MetadataType;
 use crate::metadata::RESTORED_FROM;
 use crate::node::Node;
 use crate::node::NodeBlock;
-use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
 use crate::state;
-use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
@@ -222,7 +220,7 @@ pub struct RestoreOptions {
     pub message: Option<String>,
 }
 
-pub async fn restore(
+pub(crate) async fn restore(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     options: RestoreOptions,
@@ -451,29 +449,15 @@ pub async fn restore(
         .await
         .forward::<RestoreError>("pruning dirty nodes before rehash")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    let modified_times = commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<RestoreError>("rehashing state")?;
-    drain_result.forward::<RestoreError>("draining rehash tracker")?;
+    .await
+    .forward::<RestoreError>("rehashing state")?;
     lore_debug!("Rehashed state");
 
     let new_state = state_staged;
@@ -633,4 +617,13 @@ pub async fn restore(
     .send();
 
     Ok(())
+}
+
+/// Boxed version of [`restore`] for cross-crate use.
+pub fn restore_boxed(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: RestoreOptions,
+) -> crate::BoxFuture<'_, Result<(), RestoreError>> {
+    Box::pin(restore(repository, token, options))
 }

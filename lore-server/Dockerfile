@@ -18,11 +18,11 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-# build-helper.rs reads LORE_BUILD_VERSION_NAME at build-script time and bakes
-# "{CARGO_PKG_VERSION}+{name}" into VERGEN_LORE_LIBRARY_VERSION_NAME, which is
-# what ServerInfoResponse.version, the OTel resource and the user-agent report.
+# The build name is not compiled in: an unstamped binary reports
+# "{CARGO_PKG_VERSION}+local". `lore-stamp` writes LORE_REVISION into the built
+# loreserver, so ServerInfoResponse.version, the OTel resource and the
+# user-agent report "{CARGO_PKG_VERSION}+{LORE_REVISION}" (see CONTRIBUTING.md).
 ARG LORE_REVISION
-ENV LORE_BUILD_VERSION_NAME=${LORE_REVISION}
 
 # arm64 always builds Graviton3+/Neoverse V1-tuned.
 ARG TARGETARCH
@@ -30,12 +30,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     if [ "$TARGETARCH" = "arm64" ]; then \
-        cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure \
+        cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure --bin lore-stamp \
             --config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb; \
     else \
-        cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure; \
+        cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure --bin lore-stamp; \
     fi && \
     cp /build/target/release/loreserver /build/loreserver-bin && \
+    /build/target/release/lore-stamp --build "$LORE_REVISION" /build/loreserver-bin && \
     cp /build/target/release/cell-schema-install /build/cell-schema-install-bin && \
     cp /build/target/release/cell-budget-configure /build/cell-budget-configure-bin && \
     cp /build/target/release/cell-drain-policy-configure /build/cell-drain-policy-configure-bin

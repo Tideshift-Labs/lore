@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: MIT
 """Minimal gRPC client for `lore.thin_client.v1.ThinClientService`.
 
-The CLI never calls this service, so tests call it directly. Use the repository's
-actual server and a scoped repository token for authenticated fixtures. Only the
-fields the tests assert on are decoded.
+The CLI never calls this service, so a test asserting what reaches its wire has
+to talk to it directly. The test server runs gRPC in plaintext, so an insecure
+channel carrying the repository-id metadata works; against an auth-enabled
+server the caller also passes the bearer token. Only the fields the tests assert
+on are decoded.
 """
 
 import logging
@@ -16,6 +18,7 @@ from protobuf_wire import (
     field_bool,
     field_bytes,
     field_int,
+    field_message,
     field_string,
     parse_fields,
 )
@@ -46,6 +49,7 @@ _DIFF_RESPONSE_PARTITION = 4
 
 _TREE_NODE_PATH = 1
 _TREE_NODE_NODE_TYPE = 2
+_TREE_NODE_ADDRESS = 3
 _TREE_NODE_TRACKING = 6
 
 _DIFF_CHANGE_PATH = 1
@@ -53,9 +57,22 @@ _DIFF_CHANGE_ACTION = 3
 _DIFF_CHANGE_NODE_TYPE = 4
 _DIFF_CHANGE_LINK_REPOSITORY_INDEX = 8
 _DIFF_CHANGE_TRACKING = 9
+_DIFF_CHANGE_CONTENT_FROM = 10
+_DIFF_CHANGE_CONTENT_TO = 11
 
 _DIFF_PARTITION_INDEX = 1
 _DIFF_PARTITION_LINK_PARTITION = 2
+
+_ADDRESS_HASH = 1
+_ADDRESS_CONTEXT = 2
+
+
+@dataclass(frozen=True)
+class ContentAddress:
+    """A decoded `lore.model.v1.Address`, both halves hex-encoded."""
+
+    hash: str
+    context: str
 
 
 @dataclass(frozen=True)
@@ -65,6 +82,7 @@ class TreeNode:
     path: str
     node_type: int
     tracking: bool
+    address: ContentAddress | None
 
 
 @dataclass(frozen=True)
@@ -76,6 +94,8 @@ class DiffChange:
     node_type: int
     tracking: bool
     partition: str
+    content_from: ContentAddress | None
+    content_to: ContentAddress | None
 
 
 class _PartitionTable:
@@ -107,12 +127,23 @@ def _payloads(response: bytes, payload_field: int) -> list[dict]:
     ]
 
 
+def _content_address(message: dict, field_number: int) -> ContentAddress | None:
+    address = field_message(message, field_number)
+    if address is None:
+        return None
+    return ContentAddress(
+        hash=field_bytes(address, _ADDRESS_HASH).hex(),
+        context=field_bytes(address, _ADDRESS_CONTEXT).hex(),
+    )
+
+
 def _tree_nodes(response: bytes) -> list[TreeNode]:
     return [
         TreeNode(
             path=field_string(node, _TREE_NODE_PATH),
             node_type=field_int(node, _TREE_NODE_NODE_TYPE),
             tracking=field_bool(node, _TREE_NODE_TRACKING),
+            address=_content_address(node, _TREE_NODE_ADDRESS),
         )
         for node in _payloads(response, _TREE_RESPONSE_NODE)
     ]
@@ -130,6 +161,8 @@ def _diff_changes(response: bytes, partitions: _PartitionTable) -> list[DiffChan
             partition=partitions.resolve(
                 field_int(change, _DIFF_CHANGE_LINK_REPOSITORY_INDEX)
             ),
+            content_from=_content_address(change, _DIFF_CHANGE_CONTENT_FROM),
+            content_to=_content_address(change, _DIFF_CHANGE_CONTENT_TO),
         )
         for change in _payloads(response, _DIFF_RESPONSE_CHANGE)
     ]
@@ -147,22 +180,20 @@ def _collect_stream(
     repository_id: bytes,
     deserializer,
     timeout: float,
-    authorization: str | None = None,
+    authorization: str | None,
 ) -> list:
+    metadata: tuple[tuple[str, str | bytes], ...] = (
+        (_REPOSITORY_ID_METADATA_KEY, repository_id),
+    )
+    if authorization is not None:
+        metadata += (("authorization", f"Bearer {authorization}"),)
     with grpc.insecure_channel(grpc_target) as channel:
         call = channel.unary_stream(
             method,
             request_serializer=_already_encoded,
             response_deserializer=deserializer,
         )
-        metadata = ((_REPOSITORY_ID_METADATA_KEY, repository_id),)
-        if authorization is not None:
-            metadata += (("authorization", "Bearer " + authorization),)
-        responses = call(
-            request,
-            timeout=timeout,
-            metadata=metadata,
-        )
+        responses = call(request, timeout=timeout, metadata=metadata)
         return [item for message in responses for item in message]
 
 
@@ -171,10 +202,10 @@ def revision_tree(
     repository_id: bytes,
     signature: bytes,
     timeout: float = 30.0,
-    *,
     authorization: str | None = None,
 ) -> list[TreeNode]:
-    """Every `TreeNode` the server streams for `signature`, in stream order."""
+    """Every `TreeNode` the server streams for `signature`, in stream order.
+    `authorization` is the bearer token for an auth-enabled server."""
     nodes = _collect_stream(
         grpc_target,
         _REVISION_TREE_METHOD,
@@ -194,11 +225,11 @@ def revision_diff(
     signature_from: bytes,
     signature_to: bytes,
     timeout: float = 30.0,
-    *,
     authorization: str | None = None,
 ) -> list[DiffChange]:
     """Every `DiffChange` the server streams between the two revisions, in
-    stream order."""
+    stream order. `authorization` is the bearer token for an auth-enabled
+    server."""
     request = encode_bytes_field(
         _DIFF_REQUEST_SIGNATURE_FROM, signature_from
     ) + encode_bytes_field(_DIFF_REQUEST_SIGNATURE_TO, signature_to)

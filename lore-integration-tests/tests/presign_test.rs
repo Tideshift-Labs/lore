@@ -110,6 +110,7 @@ mod presign_tests {
             repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             max_file_size: 10 * 1024 * 1024,
             presign_config: Some(test_presign_config()),
+            enforce_write_permission: true,
         };
 
         let health = ServerHealth::new_without_availability(state.immutable_store.clone());

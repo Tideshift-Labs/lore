@@ -13,3 +13,4 @@ pub mod repository;
 pub mod revision;
 pub mod storage;
 pub mod thin_client;
+pub mod user;

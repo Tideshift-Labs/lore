@@ -3,20 +3,27 @@
 #[cfg(test)]
 mod tests {
     use std::io::Write;
+    use std::mem::size_of;
+    use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
+    use lore_base::types::Address;
+    use lore_base::types::Hash;
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
+    use lore_revision::immutable;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::ROOT_NODE;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
+    use zerocopy::FromBytes;
 
     include!("helper.rs");
 
@@ -62,11 +69,11 @@ mod tests {
                 .expect("Stage failed");
 
                 // Commit to create a base revision with the file
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -190,11 +197,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -295,11 +302,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -360,11 +367,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -480,11 +487,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -569,11 +576,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -670,11 +677,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -811,11 +818,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -912,11 +919,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -983,6 +990,849 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// Stages `target`, a path relative to the repository root, the way `lore stage` does.
+    async fn stage_target(fixture: &TestRepository, target: &str, scan: bool) {
+        file::stage::stage(
+            fixture.repository.clone(),
+            &fixture.write_token,
+            LoreArray::from_vec(vec![LoreString::from(
+                fixture.path.join(target).to_string_lossy().as_ref(),
+            )]),
+            StageOptions {
+                scan,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("Stage of {target:?} failed: {err}"));
+    }
+
+    async fn dirty_paths(fixture: &TestRepository, paths: &[&str]) {
+        file::dirty::dirty(
+            fixture.repository.clone(),
+            LoreArray::from_vec(
+                paths
+                    .iter()
+                    .map(|path| {
+                        LoreString::from(fixture.path.join(path).to_string_lossy().as_ref())
+                    })
+                    .collect(),
+            ),
+        )
+        .await
+        .expect("Dirty failed");
+    }
+
+    /// The staged tree, which holds no node at any of `absent` and records no change at the root,
+    /// so a status reports nothing for it.
+    async fn assert_nothing_recorded(fixture: &TestRepository, absent: &[&str], case: &str) {
+        let repository = fixture.repository.clone();
+        let (_, state_staged, _) = State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Deserialize failed");
+        let Some(state_staged) = state_staged else {
+            return;
+        };
+        for path in absent {
+            assert!(
+                state_staged
+                    .find_node_link(repository.clone(), path)
+                    .await
+                    .is_err(),
+                "{case}: the staged tree still holds {path}, which no commit and no file holds"
+            );
+        }
+        let root = state_staged
+            .node(repository.clone(), ROOT_NODE)
+            .await
+            .expect("Root node");
+        assert!(
+            !root.is_staged() && !root.is_dirty(),
+            "{case}: the staged tree still records a change (root flags {:#x})",
+            root.flags
+        );
+    }
+
+    /// A file created, marked dirty and removed again was never tracked, so staging it stages
+    /// nothing and unstaging afterwards leaves nothing behind, whether staging names the file,
+    /// collects it from the dirty markers, or scans for it.
+    #[tokio::test]
+    async fn staging_a_removed_dirty_add_stages_nothing() {
+        for (case, target, scan) in [
+            ("named", "temp.txt", false),
+            ("dirty markers", "", false),
+            ("scan", "", true),
+        ] {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    test_file_write(&fixture.path.join("base.txt"), b"base");
+                    test_commit_tree(&fixture, "Initial").await;
+
+                    test_file_write(&fixture.path.join("temp.txt"), b"temporary");
+                    dirty_paths(&fixture, &["temp.txt"]).await;
+                    std::fs::remove_file(fixture.path.join("temp.txt")).expect("Delete failed");
+
+                    stage_target(&fixture, target, scan).await;
+                    assert_nothing_recorded(&fixture, &["temp.txt"], case).await;
+
+                    file::unstage::unstage(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                        file::unstage::UnstageOptions { single_node: false },
+                    )
+                    .await
+                    .expect("Unstage failed");
+                    assert_nothing_recorded(&fixture, &["temp.txt"], case).await;
+                }))
+                .await
+                .expect("Test task failed");
+        }
+    }
+
+    /// `dirty` creates the directory a new file sits in when it marks the file. Once both are
+    /// removed neither was ever tracked, so staging drops the directory along with the file.
+    #[tokio::test]
+    async fn staging_a_removed_dirty_add_drops_the_directory_created_for_it() {
+        for (case, target, scan) in [
+            ("named", "new/temp.txt", false),
+            ("dirty markers", "", false),
+            ("scan", "", true),
+        ] {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    test_file_write(&fixture.path.join("base.txt"), b"base");
+                    test_commit_tree(&fixture, "Initial").await;
+
+                    std::fs::create_dir(fixture.path.join("new")).expect("Create dir failed");
+                    test_file_write(&fixture.path.join("new/temp.txt"), b"temporary");
+                    dirty_paths(&fixture, &["new/temp.txt"]).await;
+                    std::fs::remove_dir_all(fixture.path.join("new")).expect("Delete failed");
+
+                    stage_target(&fixture, target, scan).await;
+                    assert_nothing_recorded(&fixture, &["new", "new/temp.txt"], case).await;
+                }))
+                .await
+                .expect("Test task failed");
+        }
+    }
+
+    /// Only what no commit holds is dropped: in the same stage, a committed file that was removed
+    /// is staged for delete and a committed directory that still holds files stays in the tree.
+    #[tokio::test]
+    async fn staging_a_removed_dirty_add_still_stages_committed_deletes() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                std::fs::create_dir(fixture.path.join("dir")).expect("Create dir failed");
+                test_file_write(&fixture.path.join("dir/kept.txt"), b"kept");
+                test_file_write(&fixture.path.join("dir/gone.txt"), b"gone");
+                test_commit_tree(&fixture, "Initial").await;
+
+                test_file_write(&fixture.path.join("dir/temp.txt"), b"temporary");
+                dirty_paths(&fixture, &["dir/temp.txt"]).await;
+                std::fs::remove_file(fixture.path.join("dir/temp.txt")).expect("Delete failed");
+                std::fs::remove_file(fixture.path.join("dir/gone.txt")).expect("Delete failed");
+                dirty_paths(&fixture, &["dir/gone.txt"]).await;
+
+                stage_target(&fixture, "", false).await;
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("Should have staged state");
+                assert!(
+                    state_staged
+                        .find_node_link(repository.clone(), "dir/temp.txt")
+                        .await
+                        .is_err(),
+                    "dir/temp.txt was never tracked and should be gone"
+                );
+                let gone = state_staged
+                    .find_node(repository.clone(), "dir/gone.txt")
+                    .await
+                    .expect("dir/gone.txt is committed and stays until the commit");
+                assert!(
+                    gone.is_staged_delete(),
+                    "dir/gone.txt should be staged for delete"
+                );
+                let dir = state_staged
+                    .find_node(repository.clone(), "dir")
+                    .await
+                    .expect("dir is committed and still holds kept.txt");
+                assert!(
+                    !dir.is_staged_delete(),
+                    "dir should not be staged for delete"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The staged tree's children of the root that are named `name`.
+    async fn root_children_named(fixture: &TestRepository, name: &str) -> Vec<Node> {
+        let repository = fixture.repository.clone();
+        let (_, state_staged, _) = State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Deserialize failed");
+        let state_staged = state_staged.expect("Should have staged state");
+        let mut named = Vec::new();
+        for child in state_staged
+            .node_children(repository.clone(), ROOT_NODE)
+            .await
+            .expect("Root children")
+        {
+            let child_name = state_staged
+                .node_name_clone(repository.clone(), child)
+                .await
+                .expect("Child name");
+            if child_name == name {
+                named.push(
+                    state_staged
+                        .node(repository.clone(), child)
+                        .await
+                        .expect("Child node"),
+                );
+            }
+        }
+        named
+    }
+
+    /// A committed file replaced by a directory and staged leaves two nodes of one name in the
+    /// staged tree: the file staged for delete and the directory staged for add. Once the
+    /// directory is removed as well, staging again drops the directory, which no commit holds,
+    /// and keeps the committed file's delete, whichever way staging reaches them.
+    #[tokio::test]
+    async fn staging_a_removed_replacement_of_a_committed_file_keeps_only_its_delete() {
+        let mut failures = Vec::new();
+        for (case, target, scan) in [
+            ("dirty markers", "", false),
+            ("scan", "", true),
+            ("named directory", "item", false),
+            ("named child", "item/child.txt", false),
+        ] {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            let (staged, unstaged) = runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    test_file_write(&fixture.path.join("item"), b"committed");
+                    test_commit_tree(&fixture, "Initial").await;
+
+                    std::fs::remove_file(fixture.path.join("item")).expect("Delete failed");
+                    std::fs::create_dir(fixture.path.join("item")).expect("Create dir failed");
+                    test_file_write(&fixture.path.join("item/child.txt"), b"replacement");
+                    stage_target(&fixture, "item", false).await;
+                    assert_eq!(
+                        root_children_named(&fixture, "item").await.len(),
+                        2,
+                        "{case}: staging the replacement holds the file and the directory"
+                    );
+
+                    std::fs::remove_dir_all(fixture.path.join("item")).expect("Delete failed");
+                    stage_target(&fixture, target, scan).await;
+                    let staged = root_children_named(&fixture, "item").await;
+
+                    file::unstage::unstage(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                        file::unstage::UnstageOptions { single_node: false },
+                    )
+                    .await
+                    .expect("Unstage failed");
+                    (staged, root_children_named(&fixture, "item").await)
+                }))
+                .await
+                .expect("Test task failed");
+
+            let flags = |nodes: &[Node]| nodes.iter().map(|node| node.flags).collect::<Vec<_>>();
+            if !(staged.len() == 1 && staged[0].is_file() && staged[0].is_staged_delete()) {
+                failures.push(format!(
+                    "{case}: stage should leave only the committed file staged for delete, \
+                     flags {:?}",
+                    flags(&staged)
+                ));
+            }
+            if !(unstaged.len() == 1
+                && unstaged[0].is_file()
+                && !unstaged[0].is_staged()
+                && unstaged[0].is_dirty_delete())
+            {
+                failures.push(format!(
+                    "{case}: unstage should leave only the committed file's delete, unstaged, \
+                     flags {:?}",
+                    flags(&unstaged)
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A committed file keeps its node however staging has since changed it, so removing it and
+    /// staging again stages its delete rather than dropping it: once respelled, once deleted and
+    /// added back, and once moved into a directory staging added and removed along with it.
+    #[tokio::test]
+    async fn staging_a_removed_committed_file_stages_its_delete_whatever_staging_did_to_it() {
+        let mut failures = Vec::new();
+        for case in [
+            "respelled",
+            "deleted and added back",
+            "moved into a new directory",
+        ] {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            let outcome = runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    let repository = fixture.repository.clone();
+                    let path = fixture.path.clone();
+                    test_file_write(&path.join("Item.txt"), b"committed");
+                    let committed = test_commit_tree(&fixture, "Initial").await;
+                    let committed_id = committed
+                        .find_node_link(repository.clone(), "Item.txt")
+                        .await
+                        .expect("Item.txt is committed")
+                        .node;
+
+                    let staged_path = match case {
+                        "respelled" => {
+                            std::fs::rename(path.join("Item.txt"), path.join("item.txt"))
+                                .expect("Rename failed");
+                            file::stage::stage(
+                                repository.clone(),
+                                &fixture.write_token,
+                                LoreArray::from_vec(vec![LoreString::from(
+                                    path.join("item.txt").to_string_lossy().as_ref(),
+                                )]),
+                                StageOptions {
+                                    case_change: stage::StageCaseChange::Rename,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("Stage of the respelling failed");
+                            std::fs::remove_file(path.join("item.txt")).expect("Delete failed");
+                            stage_target(&fixture, "", true).await;
+                            "item.txt"
+                        }
+                        "deleted and added back" => {
+                            std::fs::remove_file(path.join("Item.txt")).expect("Delete failed");
+                            stage_target(&fixture, "Item.txt", false).await;
+                            test_file_write(&path.join("Item.txt"), b"added back");
+                            stage_target(&fixture, "Item.txt", false).await;
+                            std::fs::remove_file(path.join("Item.txt")).expect("Delete failed");
+                            stage_target(&fixture, "", false).await;
+                            "Item.txt"
+                        }
+                        _ => {
+                            std::fs::create_dir(path.join("new")).expect("Create dir failed");
+                            test_file_write(&path.join("new/keep.txt"), b"new");
+                            stage_target(&fixture, "new", false).await;
+                            std::fs::rename(path.join("Item.txt"), path.join("new/Item.txt"))
+                                .expect("Move failed");
+                            file::stage::stage_move(
+                                repository.clone(),
+                                &fixture.write_token,
+                                path.join("Item.txt").to_string_lossy().into_owned(),
+                                path.join("new/Item.txt").to_string_lossy().into_owned(),
+                                StageOptions::default(),
+                            )
+                            .await
+                            .expect("Stage of the move failed");
+                            std::fs::remove_dir_all(path.join("new")).expect("Delete failed");
+                            stage_target(&fixture, "", false).await;
+                            "new/Item.txt"
+                        }
+                    };
+
+                    let (_, state_staged, _) =
+                        State::deserialize_current_and_staged(repository.clone())
+                            .await
+                            .expect("Deserialize failed");
+                    let state_staged = state_staged.expect("Should have staged state");
+                    let Ok(link) = state_staged
+                        .find_node_link(repository.clone(), staged_path)
+                        .await
+                    else {
+                        return Some(format!("{case}: the committed file was dropped"));
+                    };
+                    let node = state_staged
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("Staged node");
+                    (link.node != committed_id || !node.is_staged_delete()).then(|| {
+                        format!(
+                            "{case}: {staged_path} should be the committed node staged for \
+                             delete, node {} (committed {committed_id}) flags {:#x}",
+                            link.node, node.flags
+                        )
+                    })
+                }))
+                .await
+                .expect("Test task failed");
+            failures.extend(outcome);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Removes `path` below the fixture, a file or a whole directory.
+    // Test fixture writes; not subject to repository write-token discipline.
+    #[allow(clippy::disallowed_methods)]
+    fn remove_path(fixture: &TestRepository, path: &str) {
+        let path = fixture.path.join(path);
+        if path.is_dir() {
+            std::fs::remove_dir_all(path).expect("Delete failed");
+        } else {
+            std::fs::remove_file(path).expect("Delete failed");
+        }
+    }
+
+    /// Writes `path` below the fixture, creating the directories it sits in.
+    fn write_path(fixture: &TestRepository, path: &str, contents: &[u8]) {
+        let path = fixture.path.join(path);
+        std::fs::create_dir_all(path.parent().expect("A parent")).expect("Create dir failed");
+        test_file_write(&path, contents);
+    }
+
+    /// What the fixture still holds staged under `dir`, which a commit has to find nothing in.
+    async fn staged_marks_left(fixture: &TestRepository, case: &str) -> Vec<String> {
+        let repository = fixture.repository.clone();
+        let mut failures = Vec::new();
+        let (_, state_staged, _) = State::deserialize_current_and_staged(repository.clone())
+            .await
+            .expect("Deserialize failed");
+        if let Some(state_staged) = state_staged {
+            let root = state_staged
+                .node(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Root node");
+            let dir = state_staged
+                .find_node(repository.clone(), "dir")
+                .await
+                .expect("dir is committed");
+            if root.is_staged() || dir.is_staged() {
+                failures.push(format!(
+                    "{case}: the staged state still marks staged the root (flags {:#x}) or dir \
+                     (flags {:#x})",
+                    root.flags, dir.flags
+                ));
+            }
+        }
+        match commit::commit_boxed(
+            repository.clone(),
+            &fixture.write_token,
+            CommitOptions::new("Nothing".to_string()),
+        )
+        .await
+        {
+            Err(err) if err.is_nothing_staged() => {}
+            Err(err) => failures.push(format!("{case}: commit failed: {err}")),
+            Ok(_) => failures.push(format!("{case}: commit found something to commit")),
+        }
+        failures
+    }
+
+    /// Staging a new file marks every directory above it staged. Once the file is removed and
+    /// staging drops it, those marks go with it, whichever way staging reaches the file: nothing
+    /// is left staged, and a commit finds nothing to commit.
+    #[tokio::test]
+    async fn staging_a_removed_staged_add_clears_what_staging_it_propagated() {
+        let mut failures = Vec::new();
+        for (case, added, removed, target, scan) in [
+            ("named", "dir/temp", "dir/temp", "dir/temp", false),
+            ("dirty markers", "dir/temp", "dir/temp", "", false),
+            ("scan", "dir/temp", "dir/temp", "", true),
+            (
+                "deeper chain",
+                "dir/sub/temp",
+                "dir/sub",
+                "dir/sub/temp",
+                false,
+            ),
+        ] {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            let outcome = runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    write_path(&fixture, "dir/base", b"committed");
+                    test_commit_tree(&fixture, "Initial").await;
+
+                    write_path(&fixture, added, b"temporary");
+                    stage_target(&fixture, added, false).await;
+                    remove_path(&fixture, removed);
+                    stage_target(&fixture, target, scan).await;
+                    staged_marks_left(&fixture, case).await
+                }))
+                .await
+                .expect("Test task failed");
+            failures.extend(outcome);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Marking a removed staged add dirty drops it as staging does, and the marks staging it
+    /// carried up to the directories above it go with it.
+    #[tokio::test]
+    async fn marking_a_removed_staged_add_dirty_clears_what_staging_it_propagated() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        let failures = runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                write_path(&fixture, "dir/base", b"committed");
+                test_commit_tree(&fixture, "Initial").await;
+
+                write_path(&fixture, "dir/temp", b"temporary");
+                stage_target(&fixture, "dir/temp", false).await;
+                remove_path(&fixture, "dir/temp");
+                dirty_paths(&fixture, &["dir/temp"]).await;
+                staged_marks_left(&fixture, "marked dirty").await
+            }))
+            .await
+            .expect("Test task failed");
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// Only the marks nothing else accounts for go: a directory that still holds a staged change,
+    /// or that is itself a staged add, stays staged when a staged add below it is dropped.
+    #[tokio::test]
+    async fn staging_a_removed_staged_add_keeps_what_is_still_staged() {
+        let mut failures = Vec::new();
+        for (case, added, sibling, still_staged) in [
+            ("sibling staged change", "dir/temp", true, "dir/base"),
+            (
+                "new directory still on disk",
+                "dir/sub/temp",
+                false,
+                "dir/sub",
+            ),
+        ] {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+            #[allow(clippy::disallowed_methods)]
+            let outcome = runtime()
+                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    let fixture =
+                        test_repository_create(immutable_store, mutable_store, repository_id).await;
+                    let repository = fixture.repository.clone();
+                    write_path(&fixture, "dir/base", b"committed");
+                    test_commit_tree(&fixture, "Initial").await;
+
+                    if sibling {
+                        write_path(&fixture, "dir/base", b"modified");
+                        stage_target(&fixture, "dir/base", false).await;
+                    }
+                    write_path(&fixture, added, b"temporary");
+                    stage_target(&fixture, added, false).await;
+                    remove_path(&fixture, added);
+                    stage_target(&fixture, "", false).await;
+
+                    let (_, state_staged, _) =
+                        State::deserialize_current_and_staged(repository.clone())
+                            .await
+                            .expect("Deserialize failed");
+                    let state_staged = state_staged.expect("Should have staged state");
+                    let mut failures = Vec::new();
+                    if state_staged
+                        .find_node_link(repository.clone(), added)
+                        .await
+                        .is_ok()
+                    {
+                        failures.push(format!("{case}: {added} should be dropped"));
+                    }
+                    for path in [still_staged, "dir"] {
+                        let node = state_staged
+                            .find_node(repository.clone(), path)
+                            .await
+                            .unwrap_or_else(|_| panic!("{case}: {path} should remain"));
+                        if !node.is_staged() {
+                            failures.push(format!(
+                                "{case}: {path} should stay staged, flags {:#x}",
+                                node.flags
+                            ));
+                        }
+                    }
+                    failures
+                }))
+                .await
+                .expect("Test task failed");
+            failures.extend(outcome);
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// A stage that cannot read the committed tree fails, rather than taking a committed file it
+    /// cannot see for one no commit holds and dropping its delete.
+    #[tokio::test]
+    async fn staging_a_removed_file_fails_when_the_committed_tree_cannot_be_read() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store.clone(), mutable_store, repository_id)
+                        .await;
+                let repository = fixture.repository.clone();
+                write_path(&fixture, "item.txt", b"committed");
+                let block_list = test_commit_tree(&fixture, "Initial")
+                    .await
+                    .tree(repository.clone())
+                    .await
+                    .expect("Committed tree")
+                    .hash_node;
+
+                remove_path(&fixture, "item.txt");
+                dirty_paths(&fixture, &["item.txt"]).await;
+
+                let block_hashes = immutable::read(
+                    repository.clone(),
+                    Address::zero_context_hash(block_list),
+                    None,
+                    immutable::read_options_from_repository(&repository),
+                )
+                .await
+                .expect("Committed block list");
+                let first_block = Hash::read_from_bytes(&block_hashes[..size_of::<Hash>()])
+                    .expect("Committed block hash");
+                immutable_store
+                    .obliterate(
+                        repository.id,
+                        Address::zero_context_hash(first_block),
+                        Arc::default(),
+                    )
+                    .await
+                    .expect("Obliterate failed");
+
+                let staged = file::stage::stage(
+                    repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        fixture.path.join("item.txt").to_string_lossy().as_ref(),
+                    )]),
+                    StageOptions::default(),
+                )
+                .await;
+                assert!(
+                    staged.is_err(),
+                    "staging must fail when the committed block cannot be read"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// On a case-sensitive file system a removed add named in another spelling than the one on
+    /// disk is dropped alone: the directory holding it is found in its own spelling, so its other
+    /// staged add stays.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn staging_a_removed_add_named_in_another_case_drops_only_that_file() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                write_path(&fixture, "base.txt", b"committed");
+                test_commit_tree(&fixture, "Initial").await;
+
+                write_path(&fixture, "Assets/a.txt", b"kept");
+                write_path(&fixture, "Assets/b.txt", b"removed");
+                stage_target(&fixture, "Assets", false).await;
+                remove_path(&fixture, "Assets/b.txt");
+                stage_target(&fixture, "assets/b.txt", false).await;
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("Should have staged state");
+                assert!(
+                    state_staged
+                        .find_node_link(repository.clone(), "Assets/b.txt")
+                        .await
+                        .is_err(),
+                    "Assets/b.txt was never committed and should be dropped"
+                );
+                let kept = state_staged
+                    .find_node(repository.clone(), "Assets/a.txt")
+                    .await
+                    .expect("Assets/a.txt is on disk and should stay");
+                assert!(
+                    kept.is_staged_add(),
+                    "Assets/a.txt should stay staged for add"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Under `--case keep` a removed add below a directory that several marked paths share is
+    /// dropped, as it is under the other case modes.
+    #[tokio::test]
+    async fn staging_a_removed_dirty_add_below_a_shared_directory_drops_it_under_case_keep() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                write_path(&fixture, "dir/a.txt", b"committed");
+                test_commit_tree(&fixture, "Initial").await;
+
+                write_path(&fixture, "dir/a.txt", b"modified");
+                write_path(&fixture, "dir/phantom.txt", b"temporary");
+                dirty_paths(&fixture, &["dir/a.txt", "dir/phantom.txt"]).await;
+                remove_path(&fixture, "dir/phantom.txt");
+
+                file::stage::stage(
+                    repository.clone(),
+                    &fixture.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&fixture.path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Keep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("Stage failed");
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("Should have staged state");
+                assert!(
+                    state_staged
+                        .find_node_link(repository.clone(), "dir/phantom.txt")
+                        .await
+                        .is_err(),
+                    "dir/phantom.txt was never committed and should be dropped"
+                );
+                let modified = state_staged
+                    .find_node(repository.clone(), "dir/a.txt")
+                    .await
+                    .expect("dir/a.txt is committed");
+                assert!(
+                    modified.is_staged_modify(),
+                    "dir/a.txt should be staged for modify"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A removed add named on its own is dropped even where the new directory holding it also
+    /// holds a committed file moved into it, which keeps that directory in the staged tree.
+    #[tokio::test]
+    async fn staging_a_removed_add_beside_a_moved_committed_file_drops_the_add() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let path = fixture.path.clone();
+                write_path(&fixture, "Item.txt", b"committed");
+                test_commit_tree(&fixture, "Initial").await;
+
+                write_path(&fixture, "new/keep.txt", b"new");
+                stage_target(&fixture, "new", false).await;
+                std::fs::rename(path.join("Item.txt"), path.join("new/Item.txt"))
+                    .expect("Move failed");
+                file::stage::stage_move(
+                    repository.clone(),
+                    &fixture.write_token,
+                    path.join("Item.txt").to_string_lossy().into_owned(),
+                    path.join("new/Item.txt").to_string_lossy().into_owned(),
+                    StageOptions::default(),
+                )
+                .await
+                .expect("Stage of the move failed");
+                remove_path(&fixture, "new");
+                stage_target(&fixture, "new/keep.txt", false).await;
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("Should have staged state");
+                assert!(
+                    state_staged
+                        .find_node_link(repository.clone(), "new/keep.txt")
+                        .await
+                        .is_err(),
+                    "new/keep.txt was never committed and should be dropped"
+                );
+                assert!(
+                    state_staged
+                        .find_node_link(repository.clone(), "new/Item.txt")
+                        .await
+                        .is_ok(),
+                    "new/Item.txt is committed and keeps new in the staged tree"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
     #[tokio::test]
     async fn dirty_move_relocates_node_and_propagates() {
         let (immutable_store, mutable_store, execution) =
@@ -1030,11 +1880,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1132,11 +1982,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1219,11 +2069,11 @@ mod tests {
                 .await
                 .expect("Stage failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1338,11 +2188,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1446,11 +2296,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1557,11 +2407,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1689,11 +2539,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1804,11 +2654,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -1955,11 +2805,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2045,11 +2895,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2096,11 +2946,11 @@ mod tests {
                 .expect("Stage committed.txt failed");
 
                 // Commit — committed.txt should be committed, dirty_only.txt preserved
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Second commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2195,11 +3045,11 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2240,11 +3090,11 @@ mod tests {
                 .await
                 .expect("Stage nested/committed.txt failed");
 
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Second commit".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
@@ -2350,16 +3200,16 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
                 let (current_revision, _) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Load current anchor failed");
 
@@ -2391,6 +3241,7 @@ mod tests {
                     repository.clone(),
                     staged_revision,
                     current_revision,
+                    false,
                 )
                 .await
                 .expect("Rebase failed")
@@ -2464,16 +3315,16 @@ mod tests {
                 )
                 .await
                 .expect("Stage failed");
-                Box::pin(commit::commit(
+                commit::commit_boxed(
                     repository.clone(),
                     write_token,
                     CommitOptions::new("Initial".to_string()),
-                ))
+                )
                 .await
                 .expect("Commit failed");
 
                 let (current_revision, _) =
-                    lore_revision::instance::load_current_anchor(&repository)
+                    lore_revision::instance::load_current_anchor_boxed(&repository)
                         .await
                         .expect("Load current anchor failed");
 
@@ -2482,6 +3333,7 @@ mod tests {
                     repository.clone(),
                     current_revision,
                     current_revision,
+                    false,
                 )
                 .await
                 .expect("Rebase failed");

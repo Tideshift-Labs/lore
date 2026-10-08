@@ -172,6 +172,7 @@ def test_sync_survives_mid_flight_disconnect(
     global_dir_name,
     lore_executable_path,
     lore_server_executable_path,
+    lore_subprocess_env,
     new_lore_repo,
     reconnect_auth,
 ):
@@ -256,11 +257,10 @@ def test_sync_survives_mid_flight_disconnect(
         # read_into_file -> remote_get_retry path as branch switch.
         target_path = scratch_dir(f"target-{source.name}", unique=False, create=True)
 
-        client_env = os.environ.copy()
+        client_env = lore_subprocess_env.copy()
         client_env.update(reconnect_auth.environment(global_dir_name))
         client_env.pop("SSL_CERT_DIR", None)
         client_env["LORE_REMOTE_URL"] = test_remote_url
-        client_env["LORE_GLOBAL_PATH"] = global_dir_name
         client_env.setdefault("RUST_LOG", "info")
         quic_repository_url = test_remote_url + source.name
         assert source.remote_path == setup_remote_url + source.name

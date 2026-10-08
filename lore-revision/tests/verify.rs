@@ -112,7 +112,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let dir = add(
                     &state,
@@ -152,7 +152,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 add(
                     &state,
@@ -192,7 +192,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let dir = add(
                     &state,
@@ -236,7 +236,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let going = add(
                     &state,
@@ -278,7 +278,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let node_id = add(
                     &state,
@@ -325,7 +325,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let settled = add(
                     &state,
@@ -369,7 +369,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let dir = add(
                     &state,
@@ -408,7 +408,7 @@ mod tests {
             .spawn(LORE_CONTEXT.scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let repository = test_repository(tempdir.path(), mutable).await;
-                let state = Arc::new(State::new());
+                let state = State::new();
 
                 let settled_dir = add(
                     &state,

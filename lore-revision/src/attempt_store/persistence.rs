@@ -12,8 +12,9 @@ pub(crate) const BOOTSTRAP_FILE: &str = ".lore-workflow.bootstrap";
 pub(crate) const BOOTSTRAP_LOCK_FILE: &str = ".lore-workflow.bootstrap.lock";
 const DIRECTORY_TEMP_PREFIX: &str = ".lore-workflow.directory.";
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[lore_macro::test_pub]
 pub(super) enum PublicationPoint {
     AfterWrite,
     AfterSync,
@@ -24,23 +25,24 @@ pub(super) enum PublicationPoint {
     AfterRename,
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 type PublicationCallback =
     Arc<dyn Fn(PublicationPoint, &Path, &Path) -> Result<(), ProtocolError> + Send + Sync>;
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 fn publication_probes() -> &'static std::sync::Mutex<HashMap<PathBuf, PublicationCallback>> {
     static PROBES: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, PublicationCallback>>> =
         std::sync::OnceLock::new();
     PROBES.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
+#[lore_macro::test_pub]
 pub(super) struct PublicationProbe {
     root: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 impl Drop for PublicationProbe {
     fn drop(&mut self) {
         if let Ok(mut probes) = publication_probes().lock() {
@@ -49,7 +51,8 @@ impl Drop for PublicationProbe {
     }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
+#[lore_macro::test_pub]
 pub(super) fn install_publication_probe(
     root: PathBuf,
     callback: impl Fn(PublicationPoint, &Path, &Path) -> Result<(), ProtocolError>
@@ -68,7 +71,7 @@ pub(super) fn install_publication_probe(
     PublicationProbe { root }
 }
 
-#[cfg(test)]
+#[cfg(feature = "test-util")]
 fn publication_point(
     point: PublicationPoint,
     source: &Path,
@@ -139,7 +142,7 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
     // A prior publisher can leave a visible ancestor and then fail its directory sync.
     // Repair journal-created ancestors before using that visibility as authority. Existing
     // bootstrap sidecars identify their parents without creating files in system ancestors.
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let repair = phase_diagnostics::start(
         Some(&absolute),
         if cfg!(windows) {
@@ -148,7 +151,7 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
             "ancestor_repair_unix"
         },
     );
-    #[cfg(any(not(windows), test))]
+    #[cfg(any(not(windows), feature = "test-util"))]
     for ancestor in parent.parent().into_iter().flat_map(Path::ancestors) {
         let bootstrap = ancestor.join(BOOTSTRAP_LOCK_FILE);
         match std::fs::metadata(&bootstrap) {
@@ -162,14 +165,14 @@ pub(crate) async fn ensure_directory(path: &Path) -> Result<(), ProtocolError> {
             Err(error) => return Err(io_error("inspect ancestor bootstrap", &bootstrap, error)),
         }
     }
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(repair);
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let wait = phase_diagnostics::start(Some(&absolute), "bootstrap_fslock_wait");
     let _bootstrap = FSLock::acquire_file_lock(parent.join(BOOTSTRAP_FILE), false)
         .await
         .map_err(|error| io_error("lock bootstrap for", &absolute, error))?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(wait);
     match std::fs::metadata(&absolute) {
         Ok(metadata) if metadata.is_dir() => sync_directory(Some(parent)),
@@ -209,9 +212,9 @@ fn publish_directory(path: &Path) -> Result<(), ProtocolError> {
 /// locked operation reload disk state; callers must not dispatch after this error.
 #[allow(clippy::disallowed_methods)]
 fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), ProtocolError> {
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let _publication = phase_diagnostics::start(Some(destination), "publication_inclusive");
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(PublicationPoint::BeforeRename, source, destination)?;
     #[cfg(windows)]
     {
@@ -250,7 +253,7 @@ fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), Proto
     // On Unix this is the actual visible-rename/before-directory-sync boundary. Windows
     // combines publication and write-through in the native call above; its test hook only
     // simulates the split protocol and is not evidence of a native durability failure.
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(
         PublicationPoint::AfterRenameBeforeDirectorySync,
         source,
@@ -260,7 +263,7 @@ fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), Proto
     if source.parent() != destination.parent() {
         sync_directory(source.parent())?;
     }
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(PublicationPoint::AfterRename, source, destination)?;
     Ok(())
 }
@@ -268,7 +271,7 @@ fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), Proto
 fn sync_directory(directory: Option<&Path>) -> Result<(), ProtocolError> {
     let directory =
         directory.ok_or_else(|| ProtocolError::internal("journal path has no parent"))?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(PublicationPoint::BeforeDirectorySync, directory, directory)?;
     #[cfg(not(windows))]
     std::fs::File::open(directory)
@@ -277,14 +280,14 @@ fn sync_directory(directory: Option<&Path>) -> Result<(), ProtocolError> {
     // Windows publication uses checked MoveFileExW(WRITE_THROUGH), not directory handles.
     #[cfg(windows)]
     let _ = directory;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(PublicationPoint::AfterDirectorySync, directory, directory)?;
     Ok(())
 }
 
 #[allow(clippy::disallowed_methods)]
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let preparation = phase_diagnostics::start(Some(path), "temporary_prepare_remove");
     let mut name = path.as_os_str().to_owned();
     name.push(TEMP_SUFFIX);
@@ -296,7 +299,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
         Err(error) => return Err(io_error("remove temporary", &temporary, error)),
     }
     let mut options = std::fs::OpenOptions::new();
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(preparation);
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -304,33 +307,33 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let create = phase_diagnostics::start(Some(path), "temporary_create");
     let mut file = options
         .open(&temporary)
         .map_err(|error| io_error("create temporary", &temporary, error))?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(create);
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let write = phase_diagnostics::start(Some(path), "temporary_write");
     file.write_all(bytes)
         .map_err(|error| io_error("write temporary", &temporary, error))?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(write);
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(PublicationPoint::AfterWrite, &temporary, path)?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let sync = phase_diagnostics::start(Some(path), "temporary_sync");
     file.sync_all()
         .map_err(|error| io_error("flush temporary", &temporary, error))?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(sync);
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     publication_point(PublicationPoint::AfterSync, &temporary, path)?;
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     let close = phase_diagnostics::start(Some(path), "temporary_close");
     drop(file);
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     drop(close);
     publish(&temporary, path, true)
 }
@@ -338,7 +341,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), ProtocolError> {
 impl RepositoryAttemptStore {
     pub(super) fn load(&self, guard: &FSLock) -> Result<StoredDocument, ProtocolError> {
         let path = self.require_path()?;
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let read = phase_diagnostics::start(Some(path), "root_read");
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
@@ -366,9 +369,9 @@ impl RepositoryAttemptStore {
             }
             Err(error) => return Err(io_error("read", path, error)),
         };
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(read);
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let parse = phase_diagnostics::start(Some(path), "root_parse");
         let (version, body) = bytes
             .split_first()
@@ -380,9 +383,9 @@ impl RepositoryAttemptStore {
         }
         let document: StoredDocument =
             serde_json::from_slice(body).map_err(|error| io_error("parse", path, error))?;
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(parse);
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let _validation = phase_diagnostics::start(Some(path), "root_validate_repair_inclusive");
         if *version == 1 {
             return self.migrate(guard, document);
@@ -523,7 +526,7 @@ impl RepositoryAttemptStore {
 
     #[allow(
         clippy::unused_self,
-        reason = "the test build reads self.path for phase diagnostics"
+        reason = "the test-util build reads self.path for phase diagnostics"
     )]
     fn validate_child(
         &self,
@@ -531,7 +534,7 @@ impl RepositoryAttemptStore {
         child: &StoredChild,
         id: &str,
     ) -> Result<(), ProtocolError> {
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let _validation = phase_diagnostics::start(self.path.as_deref(), "child_validate");
         if child.version != ATTEMPT_STORE_VERSION || child.attempt.attempt_id != id {
             return Err(ProtocolError::internal(
@@ -562,20 +565,20 @@ impl RepositoryAttemptStore {
         path: &Path,
         id: &str,
     ) -> Result<Option<StoredChild>, ProtocolError> {
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let read = phase_diagnostics::start(Some(path), "child_read");
         let bytes = match std::fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(io_error("read child", path, error)),
         };
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(read);
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let parse = phase_diagnostics::start(Some(path), "child_parse");
         let child: StoredChild =
             serde_json::from_slice(&bytes).map_err(|error| io_error("parse child", path, error))?;
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(parse);
         self.validate_child(document, &child, id)?;
         Ok(Some(child))
@@ -665,11 +668,11 @@ impl RepositoryAttemptStore {
     }
 
     fn write_child_at(path: &Path, child: &StoredChild) -> Result<(), ProtocolError> {
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         let serialize = phase_diagnostics::start(Some(path), "child_serialize");
         let bytes =
             serde_json::to_vec(child).map_err(|error| io_error("serialize child", path, error))?;
-        #[cfg(test)]
+        #[cfg(feature = "test-util")]
         drop(serialize);
         write_atomic(path, &bytes)
     }

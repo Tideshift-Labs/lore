@@ -188,7 +188,7 @@ pub async fn resolve_path(
 pub(super) async fn flush_state(
     repository: &Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
-    state: &State,
+    state: &Arc<State>,
     current_revision: Hash,
     staged_revision: Hash,
 ) -> Result<(), DependencyError> {

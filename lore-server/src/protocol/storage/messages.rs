@@ -18,6 +18,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::responses;
 
@@ -133,6 +134,7 @@ pub trait Message: Debug + Send + Sync {
         &self,
         _context: Arc<AttributeMap>,
         _immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         Err(MessageHandleError::NotImplemented)
     }
@@ -141,6 +143,7 @@ pub trait Message: Debug + Send + Sync {
         &self,
         _context: Arc<AttributeMap>,
         _jwt_verifier: Arc<Option<JwtVerifier>>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         Err(MessageHandleError::NotImplemented)
     }

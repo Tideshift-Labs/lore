@@ -141,11 +141,11 @@ mod tests {
 
         async fn seed_commit(&self, message: &str) -> Hash {
             self.stage_all().await;
-            Box::pin(commit::commit(
+            commit::commit_boxed(
                 self.repository.clone(),
                 &self.write_token,
                 CommitOptions::new(message.to_string()),
-            ))
+            )
             .await
             .expect("commit fixture baseline")
         }
@@ -171,7 +171,7 @@ mod tests {
 
         async fn anchors(&self) -> Anchors {
             Anchors {
-                current: lore_revision::instance::load_current_anchor(&self.repository)
+                current: lore_revision::instance::load_current_anchor_boxed(&self.repository)
                     .await
                     .expect("load current anchor")
                     .0,
@@ -719,11 +719,11 @@ mod tests {
                     )
                     .await
                     .expect("seed committed file metadata");
-                    let baseline = Box::pin(commit::commit(
+                    let baseline = commit::commit_boxed(
                         fixture.repository.clone(),
                         &fixture.write_token,
                         CommitOptions::new("metadata baseline".to_string()),
-                    ))
+                    )
                     .await
                     .expect("commit metadata baseline");
                     let (committed_hash, committed_metadata) =
@@ -829,11 +829,11 @@ mod tests {
                     )
                     .await
                     .expect("seed baseline file metadata");
-                    let baseline = Box::pin(commit::commit(
+                    let baseline = commit::commit_boxed(
                         fixture.repository.clone(),
                         &fixture.write_token,
                         CommitOptions::new("metadata baseline".to_string()),
-                    ))
+                    )
                     .await
                     .expect("commit metadata baseline");
                     let (delete_metadata_hash, _) =

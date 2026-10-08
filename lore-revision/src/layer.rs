@@ -490,7 +490,7 @@ pub async fn add(
     let target_states = layer_repository.filter.mount_states(&target_path);
     // The target directory and the files cloned under it are in the same filesystem, so one
     // operation covers both.
-    with_operation(layer_repository.file_system(), true, async |operation| {
+    with_operation(layer_repository.file_system(), async |operation| {
         operation
             .create_dir_all(&target_path)
             .await
@@ -644,7 +644,7 @@ pub async fn remove(
 
     let force = execution_context().globals().force();
     // The walk reads the same files the removal then deletes, so one operation covers both.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         walk_layer_subtree(
             &operation,
             layer_repository.clone(),
@@ -846,7 +846,7 @@ pub struct StagedLayerInfo {
 ///
 /// Mirrors `link::list::list_staged` for use by the CLI's per-layer message
 /// prompt.
-pub async fn list_staged(
+pub(crate) async fn list_staged(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<StagedLayerInfo>, LayerError> {
     let layers = list(repository.clone()).await?;
@@ -894,19 +894,32 @@ pub async fn list_staged(
     Ok(result)
 }
 
-pub async fn sync(
+/// Boxed version of [`list_staged`] for cross-crate use.
+pub fn list_staged_boxed(
     repository: Arc<RepositoryContext>,
+) -> crate::BoxFuture<'static, Result<Vec<StagedLayerInfo>, LayerError>> {
+    Box::pin(list_staged(repository))
+}
+
+/// Carries the layer's mount to `state_target`, and to the view `repository_target` holds.
+///
+/// `repository_current` is the layer context the mount stands under, which is `repository_target`
+/// itself for a sync carrying the mount between revisions under one view.
+pub async fn sync(
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     target_path: RelativePath,
     source_path: RelativePath,
     options: SyncOptions,
 ) -> Result<(), LayerError> {
-    let filesystem = repository.file_system();
-    with_operation(filesystem, true, async |operation| {
+    let filesystem = repository_target.file_system();
+    with_operation(filesystem, async |operation| {
         sync_in_operation(
             operation,
-            repository,
+            repository_current,
+            repository_target,
             state_current,
             state_target,
             target_path,
@@ -922,7 +935,8 @@ pub async fn sync(
 #[allow(clippy::too_many_arguments)]
 async fn sync_in_operation(
     operation: Arc<InstanceOperationImpl>,
-    repository: Arc<RepositoryContext>,
+    repository_current: Arc<RepositoryContext>,
+    repository_target: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     target_path: RelativePath,
@@ -930,9 +944,20 @@ async fn sync_in_operation(
     options: SyncOptions,
 ) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
-    let current =
-        drawn_subtree_state(&repository, &state_current, &source_path, &target_path).await;
-    let target = drawn_subtree_state(&repository, &state_target, &source_path, &target_path).await;
+    let current = drawn_subtree_state(
+        &repository_current,
+        &state_current,
+        &source_path,
+        &target_path,
+    )
+    .await;
+    let target = drawn_subtree_state(
+        &repository_target,
+        &state_target,
+        &source_path,
+        &target_path,
+    )
+    .await;
     let current_tree = NodeMapping {
         repository: current.mapping.repository.clone(),
         state: current.mapping.state.clone(),
@@ -994,10 +1019,10 @@ async fn sync_in_operation(
             changes.len()
         );
         sync::sync_verify_filesystem(
-            repository.clone(),
+            repository_target.clone(),
             Arc::new(sync::SyncVerifyArgs {
                 changes: changes.clone(),
-                repository_current: repository.clone(),
+                repository_current,
                 operation: operation.clone(),
                 current: current_tree,
                 options: options.clone(),
@@ -1010,7 +1035,7 @@ async fn sync_in_operation(
     };
 
     crate::fs::realize::realize_changes(
-        repository.clone(),
+        repository_target.clone(),
         operation.clone(),
         changes,
         None,
@@ -1290,18 +1315,12 @@ pub async fn store_staged_or_clear(
     layer: &Layer,
     state: &LayerState,
 ) -> Result<Hash, LayerError> {
-    let has_staged = state
+    let signature = if state
         .state_staged
-        .node_has_staged_children(state.repository.clone(), crate::node::ROOT_NODE)
+        .node_has_staged_or_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
         .await
-        .forward::<LayerError>("Failed to check staged nodes")?;
-    let has_dirty = state
-        .state_staged
-        .node_has_dirty_children(state.repository.clone(), crate::node::ROOT_NODE)
-        .await
-        .forward::<LayerError>("Failed to check dirty nodes")?;
-
-    let signature = if has_staged || has_dirty {
+        .forward::<LayerError>("Failed to check staged and dirty nodes")?
+    {
         state.state_staged.mark_dirty();
         state
             .state_staged

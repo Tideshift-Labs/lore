@@ -93,20 +93,20 @@ pub async fn file_acquire_with_attempt_store(
     file_acquire_journalled(globals, args, callback, Some(attempts)).await
 }
 
-async fn file_acquire_local(
+fn file_acquire_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    file_acquire_journalled(globals, args, callback, None).await
+) -> impl Future<Output = i32> {
+    file_acquire_journalled(globals, args, callback, None)
 }
 
-async fn file_acquire_journalled(
+fn file_acquire_journalled(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
     callback: LoreEventCallback,
     attempts: Option<Arc<dyn AttemptStore>>,
-) -> i32 {
+) -> impl Future<Output = i32> {
     crate::call::repository_call_mutation_read(
         globals,
         callback,
@@ -136,7 +136,6 @@ async fn file_acquire_journalled(
             }
         },
     )
-    .await
 }
 
 pub async fn file_acquire_as_owner(
@@ -205,11 +204,11 @@ pub async fn file_status(
     dispatch_call(globals, args, callback, file_status_local).await
 }
 
-async fn file_status_local(
+fn file_status_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileStatusArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -224,7 +223,6 @@ async fn file_status_local(
             lore_revision::lock::file::status::status(repository, options)
         },
     )
-    .await
 }
 
 /// Arguments for querying file locks on a branch, optionally filtered by owner and path.
@@ -269,11 +267,11 @@ pub async fn file_query(
     dispatch_call(globals, args, callback, file_query_local).await
 }
 
-async fn file_query_local(
+fn file_query_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileQueryArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -289,7 +287,6 @@ async fn file_query_local(
             lore_revision::lock::file::query::query(repository, options)
         },
     )
-    .await
 }
 
 /// Arguments for releasing file locks on the given paths for a branch and owner.
@@ -361,20 +358,20 @@ pub async fn file_release_with_attempt_store(
     file_release_journalled(globals, args, callback, Some(attempts)).await
 }
 
-async fn file_release_local(
+fn file_release_local(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    file_release_journalled(globals, args, callback, None).await
+) -> impl Future<Output = i32> {
+    file_release_journalled(globals, args, callback, None)
 }
 
-async fn file_release_journalled(
+fn file_release_journalled(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
     attempts: Option<Arc<dyn AttemptStore>>,
-) -> i32 {
+) -> impl Future<Output = i32> {
     crate::call::repository_call_mutation_read(
         globals,
         callback,
@@ -400,134 +397,4 @@ async fn file_release_journalled(
             }
         },
     )
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    use lore_base::error::InvalidArguments;
-    use lore_error_set::FfiError;
-    use lore_revision::interface::LoreEventCallbackConfig;
-    use lore_transport::VolatileAttemptStore;
-
-    use super::*;
-    use crate::call_delegation::tests::service_env_child;
-
-    /// The same status shape `crate::call_delegation::reject_call` uses for every other
-    /// pre-command rejection, so this refusal cannot be told apart from one of those by a
-    /// caller inspecting the status alone.
-    fn undelegatable_status() -> i32 {
-        InvalidArguments {
-            reason: String::new(),
-        }
-        .ffi_code()
-    }
-
-    fn no_callback() -> LoreEventCallback {
-        lore_revision::event::convert_event_callback(LoreEventCallbackConfig {
-            user_context: 0,
-            func: None,
-        })
-    }
-
-    /// `file_acquire_with_attempt_store` must refuse under `LORE_USE_SERVICE` rather than
-    /// delegate -- see the function's own doc comment for why a delegated acquire would strand
-    /// the caller's journal. The repository path is deliberately nonexistent and the store
-    /// deliberately records every call it receives: either one being touched would mean the
-    /// refusal ran too late, after the code had already started the operation it exists to
-    /// prevent.
-    #[test]
-    fn file_acquire_with_attempt_store_refuses_when_delegation_is_requested() {
-        if !service_env_child(
-            "lock::tests::file_acquire_with_attempt_store_refuses_when_delegation_is_requested",
-            &[Some("1")],
-        ) {
-            return;
-        }
-
-        let globals = LoreGlobalArgs {
-            repository_path: LoreString::from_str(
-                "Z:/lore-file-acquire-with-attempt-store-test-nonexistent-7d1e4b",
-            ),
-            ..LoreGlobalArgs::default()
-        };
-        let args = LoreLockFileAcquireArgs {
-            paths: LoreArray::default(),
-            branch: LoreString::default(),
-        };
-        let store = Arc::new(VolatileAttemptStore::new());
-        let attempts: Arc<dyn AttemptStore> = store.clone();
-
-        let status = crate::runtime().block_on(file_acquire_with_attempt_store(
-            globals,
-            args,
-            no_callback(),
-            attempts,
-        ));
-
-        assert_eq!(
-            status,
-            undelegatable_status(),
-            "the refusal must use the same status shape every other pre-command rejection uses"
-        );
-        assert!(
-            crate::runtime()
-                .block_on(store.unresolved())
-                .expect("unresolved() must succeed on a fresh store")
-                .is_empty(),
-            "the attempt store must never be touched when the call is refused before it runs"
-        );
-    }
-
-    /// `file_release_with_attempt_store` must refuse under `LORE_USE_SERVICE` rather than
-    /// delegate, for the same reason as the acquire entry point above: the store is in-process
-    /// and a delegated release would file receipts under identities the caller never recorded.
-    /// The repository path is deliberately nonexistent, so a refusal that ran too late would
-    /// still show up here as a failure, just not this one -- the status assertion below is what
-    /// tells the two apart, and the store assertion is what proves the refusal ran before the
-    /// release ever touched anything.
-    #[test]
-    fn file_release_with_attempt_store_refuses_when_delegation_is_requested() {
-        if !service_env_child(
-            "lock::tests::file_release_with_attempt_store_refuses_when_delegation_is_requested",
-            &[Some("1")],
-        ) {
-            return;
-        }
-
-        let globals = LoreGlobalArgs {
-            repository_path: LoreString::from_str(
-                "Z:/lore-file-release-with-attempt-store-test-nonexistent-2a9f6c",
-            ),
-            ..LoreGlobalArgs::default()
-        };
-        let args = LoreLockFileReleaseArgs {
-            paths: LoreArray::default(),
-            branch: LoreString::default(),
-            owner: LoreString::default(),
-            owner_id: LoreString::default(),
-        };
-        let store = Arc::new(VolatileAttemptStore::new());
-        let attempts: Arc<dyn AttemptStore> = store.clone();
-
-        let status = crate::runtime().block_on(file_release_with_attempt_store(
-            globals,
-            args,
-            no_callback(),
-            attempts,
-        ));
-
-        assert_eq!(
-            status,
-            undelegatable_status(),
-            "the refusal must use the same status shape every other pre-command rejection uses"
-        );
-        assert!(
-            crate::runtime()
-                .block_on(store.unresolved())
-                .expect("unresolved() must succeed on a fresh store")
-                .is_empty(),
-            "the attempt store must never be touched when the call is refused before it runs"
-        );
-    }
 }

@@ -31,7 +31,7 @@ mod tests {
     use lore_revision::repository::RepositoryContextCreationArgs;
     use lore_revision::repository::RepositoryWriteToken;
     use lore_revision::revision::info::InfoOptions;
-    use lore_revision::revision::info::info;
+    use lore_revision::revision::info::info_boxed;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
@@ -144,7 +144,7 @@ mod tests {
 
         let revision = runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let state = Arc::new(State::new());
+                let state = State::new();
                 // Install the in-memory zeroed tree (hash_tree is zero on a
                 // fresh state) so `set_delta_block`'s `tree_readonly()` call
                 // has a tree to mutate.
@@ -171,7 +171,7 @@ mod tests {
                     delta: true,
                     metadata: false,
                 };
-                info(repository.clone(), options).await.expect(
+                info_boxed(repository.clone(), options).await.expect(
                     "info() must still return Ok(()) when the delta block can't be read \
                      (a mid-stream Error event is reported instead of a hard failure)",
                 );
@@ -224,7 +224,7 @@ mod tests {
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let state = Arc::new(State::new());
+                let state = State::new();
                 state
                     .tree(repository.clone())
                     .await
@@ -243,7 +243,7 @@ mod tests {
                     delta: true,
                     metadata: false,
                 };
-                info(repository.clone(), options)
+                info_boxed(repository.clone(), options)
                     .await
                     .expect("info() must return Ok(()) for a genuinely empty revision");
             }))
@@ -378,20 +378,17 @@ mod tests {
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
                 };
-                let revision = Box::pin(commit::commit(
-                    repository.clone(),
-                    &write_token,
-                    commit_options,
-                ))
-                .await
-                .expect("Failed to commit revision");
+                let revision =
+                    commit::commit_boxed(repository.clone(), &write_token, commit_options)
+                        .await
+                        .expect("Failed to commit revision");
 
                 let info_options = InfoOptions {
                     signature: Some(revision.to_string()),
                     delta: true,
                     metadata: false,
                 };
-                info(repository.clone(), info_options)
+                info_boxed(repository.clone(), info_options)
                     .await
                     .expect("info() must return Ok(()) for a healthy revision");
             }))

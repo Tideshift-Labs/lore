@@ -6,6 +6,7 @@ publish = false
 
 [lib]
 name = "lore_transport"
+test = false
 
 [dependencies]
 lore-base = { workspace = true }
@@ -38,6 +39,7 @@ url = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 webpki-roots = { workspace = true }
 zerocopy = { workspace = true }
+lore-macro = { workspace = true }
 
 [dev-dependencies]
 # Paused/advanceable clock for the retry-budget tests in
@@ -47,9 +49,11 @@ zerocopy = { workspace = true }
 # arithmetic and the test instant. Same reason, and same one-feature addition,
 # as `lore-server`'s dev-dependency on it.
 tokio = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 
 [features]
 trace_log = ["lore-base/trace_log"]
+test-util = []
 # Exposes seams a test in another crate needs and production must not have. Today: forging a
 # session-id-to-connection-generation binding, which is exactly what the QUIC write boundary
 # exists to make impossible (INV-EO P0-1). The WP-108 regression suite forges one deliberately,

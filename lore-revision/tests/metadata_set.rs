@@ -48,6 +48,7 @@ mod tests {
     use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
     use lore_revision::util::path::RelativePath;
+    use lore_storage::ImmutableStore;
     use lore_transport::ProtocolError;
 
     include!("helper.rs");
@@ -67,10 +68,207 @@ mod tests {
         branch_latest: Hash,
     }
 
+    /// FORK-LOCAL (Tideshift): forwards every call to `inner`, yielding to the scheduler once
+    /// before each async one. A task that reads the store therefore always gives way at that
+    /// read, so a sibling task that never touches the store runs (and finishes) first, on any
+    /// worker count. Used to order two per-path task failures without timing.
+    struct YieldingStore {
+        inner: Arc<dyn ImmutableStore>,
+    }
+
+    impl std::fmt::Debug for YieldingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "YieldingStore")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ImmutableStore for YieldingStore {
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn isolates_partitions(&self) -> bool {
+            self.inner.isolates_partitions()
+        }
+
+        fn read_scope(&self) -> lore_storage::store_types::StoreMatch {
+            self.inner.read_scope()
+        }
+
+        fn query_scope(&self) -> lore_storage::store_types::StoreMatch {
+            self.inner.query_scope()
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            address: lore_storage::Address,
+        ) -> Result<lore_storage::store_types::StoreGetData, lore_storage::StoreError> {
+            tokio::task::yield_now().await;
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn get_into(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            address: lore_storage::Address,
+            dst: &mut lore_storage::CallerBuffer,
+        ) -> Result<
+            (
+                lore_base::types::Fragment,
+                lore_storage::store_types::PayloadRead,
+            ),
+            lore_storage::StoreError,
+        > {
+            tokio::task::yield_now().await;
+            self.inner.clone().get_into(partition, address, dst).await
+        }
+
+        async fn is_available(self: Arc<Self>, timeout: Duration) -> bool {
+            self.inner.clone().is_available(timeout).await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            addresses: &[lore_storage::Address],
+            results: &mut [lore_storage::store_types::StoreMatchResult],
+        ) -> Result<(), lore_storage::StoreError> {
+            tokio::task::yield_now().await;
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            address: lore_storage::Address,
+        ) -> Result<lore_storage::store_types::StoreGetData, lore_storage::StoreError> {
+            tokio::task::yield_now().await;
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            address: lore_storage::Address,
+            fragment: lore_base::types::Fragment,
+            payload: Option<bytes::Bytes>,
+            force: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            tokio::task::yield_now().await;
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            address: lore_storage::Address,
+            stats: Arc<lore_storage::store_types::StoreObliterateStats>,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn stop_gc(self: Arc<Self>, terminate: bool) {
+            self.inner.clone().stop_gc(terminate).await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn fragment_count(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().fragment_count().await
+        }
+
+        async fn repository_stats(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+        ) -> Result<lore_storage::store_types::StoreRepositoryStats, lore_storage::StoreError>
+        {
+            self.inner.clone().repository_stats(partition).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: lore_storage::Partition,
+            source_address: lore_storage::Address,
+            destination_partition: lore_storage::Partition,
+            destination_context: lore_storage::Context,
+            durable: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
+                )
+                .await
+        }
+    }
+
     impl Fixture {
         async fn new(file_names: &[&str]) -> Self {
+            Self::with_store(file_names, |store| store).await
+        }
+
+        /// As [`Fixture::new`], with the repository's immutable store replaced by `wrap(store)`.
+        async fn with_store(
+            file_names: &[&str],
+            wrap: impl FnOnce(Arc<dyn ImmutableStore>) -> Arc<dyn ImmutableStore>,
+        ) -> Self {
             let (immutable_store, mutable_store, _execution) =
                 test_store_create().await.expect("Failed to create stores");
+            let immutable_store = wrap(immutable_store);
             let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
             let branch = BranchId::from(uuid::Uuid::now_v7());
             let tempdir = generate_tempdir();
@@ -132,7 +330,7 @@ mod tests {
 
         async fn anchors(&self) -> Anchors {
             Anchors {
-                current: lore_revision::instance::load_current_anchor(&self.repository)
+                current: lore_revision::instance::load_current_anchor_boxed(&self.repository)
                     .await
                     .expect("Failed to load current anchor")
                     .0,
@@ -184,7 +382,7 @@ mod tests {
         write_token: &RepositoryWriteToken,
         message: &str,
     ) -> Hash {
-        Box::pin(commit::commit(
+        commit::commit_boxed(
             repository,
             write_token,
             CommitOptions {
@@ -194,7 +392,7 @@ mod tests {
                 layer_messages: HashMap::new(),
                 layer: None,
             },
-        ))
+        )
         .await
         .expect("Failed to commit fixture")
     }
@@ -312,11 +510,13 @@ mod tests {
     #[tokio::test]
     async fn file_set_rejects_failed_task_without_partial_anchor() {
         run_test(async move {
-            let fixture = Fixture::new(&["good.bin", "bad.bin"]).await;
+            let fixture = Fixture::new(&["good.bin"]).await;
             let before = fixture.anchors().await;
             let good_path = fixture.root.join("good.bin");
-            let bad_path = fixture.root.join("bad.bin");
-            let missing_source = fixture.root.join("missing-metadata.bin");
+            // Re-pinned after upstream c737d457: a missing binary source now fails before any
+            // per-path task starts, so it no longer exercises a task failure. An untracked path
+            // fails inside its own task, beside a sibling task that succeeds.
+            let bad_path = fixture.root.join("not-tracked.bin");
 
             metadata::set::set_file(
                 fixture.repository.clone(),
@@ -326,8 +526,8 @@ mod tests {
                     bad_path.to_string_lossy().as_ref(),
                 ],
                 &[b"status", b"audit"],
-                &[b"ready", missing_source.to_string_lossy().as_bytes()],
-                &[MetadataType::String, MetadataType::Binary],
+                &[b"ready", b"value"],
+                &[MetadataType::String, MetadataType::String],
                 &[1, 1],
             )
             .await
@@ -341,30 +541,90 @@ mod tests {
     #[tokio::test]
     async fn file_set_returns_lowest_input_index_error_deterministically() {
         run_test(async move {
-            let fixture = Fixture::new(&["tracked.bin"]).await;
-            let invalid_path = fixture.root.join("not-tracked.bin");
-            let tracked_path = fixture.root.join("tracked.bin");
-            let missing_source = fixture.root.join("missing-metadata.bin");
+            let fixture =
+                Fixture::with_store(&["tracked.bin"], |inner| Arc::new(YieldingStore { inner }))
+                    .await;
+            // Re-pinned after upstream c737d457: a missing binary source now fails before any
+            // per-path task starts, so it cannot test the order of task failures. Two task-phase
+            // failures that finish in a forced order do:
+            // - fast: a path outside the repository fails before its task awaits anything
+            //   ("invalid path");
+            // - slow: a tracked path that already has metadata reads it from the store first,
+            //   and `YieldingStore` makes that read give way to the scheduler, so the fast task
+            //   runs before the slow one goes on. It then sets `HEAVY_ENTRIES` keys (each set
+            //   scans the entries before it, so the work is quadratic) and only then fails on
+            //   an oversized last value ("exceeds the whole ... limit").
+            // Both orders run: with the slow task at index 0, "first to finish wins" reports the
+            // fast error; with it at index 1, "last to finish wins" reports the slow one. Only
+            // "lowest index wins" passes both.
+            const HEAVY_ENTRIES: usize = 4096;
+            let tracked = fixture.root.join("tracked.bin");
+            metadata::set::set_file(
+                fixture.repository.clone(),
+                &fixture.write_token,
+                &[tracked.to_string_lossy().as_ref()],
+                &[b"existing"],
+                &[b"value"],
+                &[MetadataType::String],
+                &[1],
+            )
+            .await
+            .expect("seed metadata so the slow task reads it from the store");
+            let outside = fixture
+                .root
+                .parent()
+                .expect("the fixture root has a parent")
+                .join("outside-the-repository.bin");
+            let tracked = tracked.to_string_lossy();
+            let outside = outside.to_string_lossy();
 
-            for _ in 0..32 {
-                let error = metadata::set::set_file(
-                    fixture.repository.clone(),
-                    &fixture.write_token,
-                    &[
-                        tracked_path.to_string_lossy().as_ref(),
-                        invalid_path.to_string_lossy().as_ref(),
-                    ],
-                    &[b"first", b"second"],
-                    &[missing_source.to_string_lossy().as_bytes(), b"value"],
-                    &[MetadataType::Binary, MetadataType::String],
-                    &[1, 1],
-                )
-                .await
-                .expect_err("both failing tasks must reject");
-                assert!(
-                    error.to_string().contains("Invalid path"),
-                    "lowest-index error must win, got {error}"
-                );
+            let heavy_keys: Vec<Vec<u8>> = (0..HEAVY_ENTRIES)
+                .map(|index| format!("key-{index}").into_bytes())
+                .collect();
+            let oversized = vec![b'x'; metadata::METADATA_MAX_SIZE + 1];
+            let mut heavy_values: Vec<&[u8]> = vec![b"v".as_slice(); HEAVY_ENTRIES - 1];
+            heavy_values.push(&oversized);
+            let heavy: Vec<(&[u8], &[u8])> = heavy_keys
+                .iter()
+                .map(Vec::as_slice)
+                .zip(heavy_values.iter().copied())
+                .collect();
+            let fast: Vec<(&[u8], &[u8])> = vec![(b"fast".as_slice(), b"v".as_slice())];
+
+            for (paths, groups, expected) in [
+                (
+                    [tracked.as_ref(), outside.as_ref()],
+                    [&heavy, &fast],
+                    "exceeds the whole",
+                ),
+                (
+                    [outside.as_ref(), tracked.as_ref()],
+                    [&fast, &heavy],
+                    "invalid path",
+                ),
+            ] {
+                let keys: Vec<&[u8]> = groups.iter().flat_map(|g| g.iter().map(|e| e.0)).collect();
+                let values: Vec<&[u8]> =
+                    groups.iter().flat_map(|g| g.iter().map(|e| e.1)).collect();
+                let formats = vec![MetadataType::String; keys.len()];
+                let entries = groups.map(|group| group.len() as u32);
+                for _ in 0..4 {
+                    let error = metadata::set::set_file(
+                        fixture.repository.clone(),
+                        &fixture.write_token,
+                        &paths,
+                        &keys,
+                        &values,
+                        &formats,
+                        &entries,
+                    )
+                    .await
+                    .expect_err("both failing tasks must reject");
+                    assert!(
+                        error.to_string().to_lowercase().contains(expected),
+                        "the lowest-index error ({expected}) must win for {paths:?}, got {error}"
+                    );
+                }
             }
         })
         .await;
@@ -501,7 +761,7 @@ mod tests {
             let fixture = Fixture::new(&["tracked.bin"]).await;
             let before = fixture.anchors().await;
             let missing_source = fixture.root.join("missing-revision-metadata.bin");
-            metadata::set::set_revision(
+            metadata::set::set_revision_boxed(
                 fixture.repository.clone(),
                 &fixture.write_token,
                 &[b"audit"],

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -24,13 +25,26 @@ DROPPED_FRAGMENT_HASHES = (
 
 
 @pytest.fixture()
-def missing_fragments_remote_url(
-    request, tmp_path_factory, lore_server_executable_path
+def missing_fragments_repo(
+    request,
+    tmp_path_factory,
+    lore_server_executable_path,
+    lore_executable_path,
+    global_dir_name,
+    new_lore_repo,
 ):
-    """Yield a remote URL pointing to a dedicated loreserver that silently
+    """Yield a factory for repositories on a dedicated loreserver that silently
     drops writes for the test's known fragment hashes. Runs alongside the
     autouse server on its own allocated ports so a single pytest invocation
-    can exercise both normal-server tests and this missing-fragment scenario."""
+    can exercise both normal-server tests and this missing-fragment scenario.
+
+    FORK-LOCAL (Tideshift): the fork CLI pushes only over gRPC, and only with a
+    signed credential ("managed mutations require the gRPC transport", then
+    "managed dispatch cannot bind credential namespace"). So the server gets
+    the same owned signed auth as the `managed_cli_server` fixture, and each
+    repository is granted to a logged-in fixture identity, as there."""
+    from managed_auth import ManagedAuth
+
     shared_port = allocate_free_port()
     ports = {
         "quic": shared_port,
@@ -38,14 +52,16 @@ def missing_fragments_remote_url(
         "http": allocate_free_port(),
         "internal": allocate_free_port(),
     }
+    auth = ManagedAuth(tmp_path_factory.mktemp("missing-fragments-auth"))
     server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
+    auth.configure_server(server_root, server_env)
     server_env["LORE_MISS_FRAGMENT_WRITES"] = ",".join(DROPPED_FRAGMENT_HASHES)
     proc, log_path, log_fd = launch_lore_server(
         server_root, server_env, lore_server_executable_path
     )
     # This is a dedicated server we launch locally on OS-allocated ports
     # (allocate_free_port only supports loopback), so the host is always
-    # loopback for both the gRPC feature query and the yielded QUIC URL.
+    # loopback for both the gRPC feature query and the yielded URL.
     host = "127.0.0.1"
     try:
         # LORE_MISS_FRAGMENT_WRITES is only honored when the server is built with
@@ -57,15 +73,41 @@ def missing_fragments_remote_url(
                 "server not built with the 'failure_generator' feature "
                 "(build loreserver with --features failure_generator)"
             )
-        yield f"lore://{host}:{ports['quic']}/"
+        remote_url = f"grpc://{host}:{ports['grpc']}/"
+        token = auth.identity()
+        auth.login(lore_executable_path, global_dir_name, remote_url, token)
+
+        def make_repo() -> Lore:
+            repo_id = Lore.generate_id()
+            auth.grant(token, repo_id)
+            return new_lore_repo(
+                remote_url=remote_url,
+                repo_id=repo_id,
+                environment_vars=auth.environment(global_dir_name),
+            )
+
+        yield make_repo
     finally:
         _kill_server_by_pid(proc.pid, log_path, label="missing-fragments server")
         log_fd.close()
+        auth.close()
+        # The login's credential files, removed as `managed_cli_identity` does.
+        for name in (
+            "auth.json",
+            "tokenstore.toml",
+            "tokens.toml",
+            "sec-tokenstore_encryption_key",
+        ):
+            path = Path(global_dir_name) / name
+            if path.is_symlink():
+                raise RuntimeError("Refusing redirected fixture credential cleanup")
+            path.unlink(missing_ok=True)
 
 
 @pytest.mark.smoke
-def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
-    repo: Lore = new_lore_repo(remote_url=missing_fragments_remote_url)
+@pytest.mark.requires_instrumented_lore
+def test_push_missing_fragments(missing_fragments_repo):
+    repo: Lore = missing_fragments_repo()
     # Generate some files
     text_file = "text-File.txt"
     other_file = "some_other.uasset"
@@ -107,7 +149,7 @@ def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
     ), "Push did not report an injected fragment as missing"
 
     # Create source repository
-    repo = new_lore_repo(remote_url=missing_fragments_remote_url)
+    repo = missing_fragments_repo()
 
     # Generate some files
     text_file = "text-File.txt"

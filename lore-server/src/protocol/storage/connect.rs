@@ -10,7 +10,10 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::auth::jwt::JwtVerifier;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::PartitionGrants;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
@@ -58,6 +61,7 @@ impl Message for Connect {
         &self,
         context: Arc<AttributeMap>,
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         // Make sure a correlation ID exists
         if context.get::<CorrelationId>().is_none() {
@@ -84,8 +88,25 @@ impl Message for Connect {
                         .verify_token(auth_token)
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-                    verify_authorization(&authorization, self.repository)
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                    let token = VerifiedToken {
+                        raw: auth_token,
+                        claims: &authorization,
+                    };
+                    let grants = repository_authorizer
+                        .granted_access(Some(&token), self.repository)
+                        .await
+                        .map_err(|status| {
+                            MessageHandleError::AuthorizationFailure(status.message().to_string())
+                        })?;
+                    if let Some(grants) = grants {
+                        context.insert(PartitionGrants {
+                            repository_id: self.repository,
+                            grants,
+                        });
+                    }
+                    // Both halves of the verified token, so a later command's
+                    // check (copy's source) can rebuild a `VerifiedToken`.
+                    context.insert(RawToken(auth_token.clone()));
                     context.insert(authorization.clone());
                     if let Some(span) = context.get::<tracing::Span>() {
                         span.record(USER_ID, get_user_id_from_token(Some(authorization)));
@@ -117,97 +138,5 @@ pub struct ConnectResponse {}
 impl Response for ConnectResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rand::random;
-    use zerocopy::IntoBytes;
-
-    use super::*;
-
-    #[test]
-    fn test_parse() {
-        let repository = random::<RepositoryId>();
-        let auth_token: String = "my_auth_token".to_string();
-
-        let message = Connect {
-            repository,
-            auth_token: Some(auth_token.clone()),
-        };
-
-        let mut message_bytes = bytes::BytesMut::new();
-        message_bytes.extend_from_slice(repository.as_bytes());
-        message_bytes.extend_from_slice(auth_token.as_bytes());
-
-        assert_eq!(Connect::parse(message_bytes.freeze()), Ok(message));
-    }
-
-    #[tokio::test]
-    async fn test_handle() {
-        let repository = random::<RepositoryId>();
-
-        let message = Connect {
-            repository,
-            auth_token: None,
-        };
-
-        let context = Arc::new(AttributeMap::default());
-
-        assert_eq!(
-            LoreResponse::Connect(ConnectResponse::default()),
-            message
-                .handle_auth(context.clone(), Arc::new(None))
-                .await
-                .unwrap()
-        );
-
-        assert_eq!(repository, *context.get::<RepositoryId>().unwrap());
-    }
-
-    #[test]
-    fn test_set_repository_not_enough_bytes() {
-        let hash = random::<[u8; 12]>();
-        let bytes = Bytes::copy_from_slice(hash.as_bytes());
-        Connect::parse(bytes)
-            .expect_err("Should have failed to parse, provided repo hash was not long enough");
-    }
-
-    #[tokio::test]
-    async fn test_set_repository_already_set() {
-        let message = Connect {
-            repository: random::<RepositoryId>(),
-            auth_token: None,
-        };
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(random::<RepositoryId>());
-
-        assert!(matches!(
-            message
-                .handle_auth(context, Arc::new(None))
-                .await
-                .expect_err("expected error"),
-            MessageHandleError::AlreadyConnected,
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_set_repository_already_set_value_matched() {
-        let repository = random::<RepositoryId>();
-
-        let context = Arc::new(AttributeMap::default());
-        context.insert(repository);
-
-        let message = Connect {
-            repository,
-            auth_token: None,
-        };
-
-        assert_eq!(
-            LoreResponse::Connect(ConnectResponse::default()),
-            message.handle_auth(context, Arc::new(None)).await.unwrap()
-        );
     }
 }

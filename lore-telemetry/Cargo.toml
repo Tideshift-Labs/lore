@@ -5,6 +5,9 @@ version.workspace = true
 publish = false
 description = "Telemetry and observability utilities for Lore"
 
+[lib]
+test = false
+
 [dependencies]
 axum = { workspace = true }
 http = { workspace = true }

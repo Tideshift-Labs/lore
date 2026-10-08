@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub mod exchange;
+pub mod token_only;
 pub mod ucs_auth;
 
 use std::collections::HashMap;
@@ -11,6 +12,29 @@ use parking_lot::Mutex;
 
 use crate::error::ProtocolError;
 use crate::traits::Authentication;
+use crate::traits::UserService;
+
+static REGISTER_BUILTIN: Once = Once::new();
+
+fn register_builtin() {
+    REGISTER_BUILTIN.call_once(|| {
+        let ucs_auth = Arc::new(ucs_auth::UcsAuthentication);
+        for scheme in ucs_auth::SCHEMES {
+            let _ = authentication::add(scheme, ucs_auth.clone());
+            let _ = user_service::add(scheme, ucs_auth.clone());
+        }
+    });
+}
+
+/// Extracts the scheme from an auth URL (the part before `://`).
+pub fn parse_scheme(auth_url: &str) -> Result<&str, ProtocolError> {
+    auth_url
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .ok_or_else(|| {
+            ProtocolError::internal(format!("invalid auth URL (missing scheme): '{auth_url}'"))
+        })
+}
 
 /// Scheme-based registry for `Authentication` implementations.
 ///
@@ -24,33 +48,13 @@ pub mod authentication {
     static AUTHENTICATION_MAP: Mutex<Option<HashMap<String, Arc<dyn Authentication>>>> =
         Mutex::new(None);
 
-    static REGISTER_BUILTIN_AUTHENTICATION: Once = Once::new();
-
-    /// Extracts the scheme from an auth URL (the part before `://`).
-    pub fn parse_scheme(auth_url: &str) -> Result<&str, ProtocolError> {
-        auth_url
-            .split_once("://")
-            .map(|(scheme, _)| scheme)
-            .ok_or_else(|| {
-                ProtocolError::internal(format!("invalid auth URL (missing scheme): '{auth_url}'"))
-            })
-    }
-
     /// Finds the `Authentication` implementation for the given auth URL by
     /// parsing its scheme. Registers builtin implementations on first call.
     ///
     /// The full auth URL (including scheme) is passed to trait methods as-is --
     /// the implementation decides how to interpret it.
     pub fn find(auth_url: &str) -> Result<Arc<dyn Authentication>, ProtocolError> {
-        REGISTER_BUILTIN_AUTHENTICATION.call_once(|| {
-            let ucs_auth = Arc::new(ucs_auth::UcsAuthentication);
-            let _ = add("ucs-auth", ucs_auth.clone());
-            let _ = add("https", ucs_auth.clone()); // transition fallback
-            // Local test auth services. The implementation only honours
-            // plaintext for loopback hosts. Any other http URL is upgraded
-            // to https (see `ucs_auth::grpc_endpoint`).
-            let _ = add("http", ucs_auth);
-        });
+        register_builtin();
 
         let scheme = parse_scheme(auth_url)?;
         // The lookup and the scheme list the error reports share one lock
@@ -89,5 +93,43 @@ pub mod authentication {
             Some(m) => m.keys().cloned().collect(),
             None => Vec::new(),
         }
+    }
+}
+
+/// Scheme-based registry for `UserService` implementations, keyed like
+/// [`authentication`] but on the service URL, which a server may advertise
+/// separately from its auth URL.
+///
+/// Unlike authentication, a service is optional: a scheme with none
+/// registered gets [`token_only::TokenOnlyUserService`], which names the
+/// bearer from their own token and echoes every other ID.
+pub mod user_service {
+    use super::*;
+
+    static USER_SERVICE_MAP: Mutex<Option<HashMap<String, Arc<dyn UserService>>>> =
+        Mutex::new(None);
+
+    /// The `UserService` for the given user service URL.
+    /// Registers builtin implementations on first call.
+    pub fn find(user_url: &str) -> Arc<dyn UserService> {
+        register_builtin();
+
+        let registered = parse_scheme(user_url).ok().and_then(|scheme| {
+            USER_SERVICE_MAP
+                .lock()
+                .as_ref()
+                .and_then(|m| m.get(scheme).cloned())
+        });
+        registered.unwrap_or_else(|| Arc::new(token_only::TokenOnlyUserService))
+    }
+
+    /// Registers a `UserService` implementation for the given scheme.
+    pub fn add(scheme: &str, service: Arc<dyn UserService>) -> Result<(), ProtocolError> {
+        let mut map = USER_SERVICE_MAP.lock();
+        if map.is_none() {
+            *map = Some(HashMap::new());
+        }
+        map.as_mut().unwrap().insert(scheme.to_string(), service);
+        Ok(())
     }
 }

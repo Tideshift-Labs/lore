@@ -30,16 +30,18 @@ mod storage_copy_on_write_tests {
     use lore_base::types::Partition;
     use lore_revision::environment::EnvironmentConfig;
     use lore_revision::event::LoreBytes;
-    use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
+    use lore_server::grpc::server::GrpcTimeouts;
     use lore_server::hooks::HookDispatcher;
+    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
     use lore_storage::StoreError;
     use lore_storage::StoreGetData;
@@ -190,7 +192,7 @@ mod storage_copy_on_write_tests {
                 let complete_sink = completions.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event| {
                     if let LoreEvent::StoragePutItemComplete(data) = event {
-                        sink.lock().unwrap().push((data.id, data.error_code));
+                        sink.lock().unwrap().push((data.id, data.error.error_code));
                     }
                     if let LoreEvent::Complete(data) = event {
                         complete_sink.lock().unwrap().push(serde_json::to_string(data).unwrap());
@@ -256,11 +258,15 @@ mod storage_copy_on_write_tests {
                 );
                 let mut observed = events.lock().unwrap().clone();
                 observed.sort_by_key(|(id, _)| *id);
-                let mut expected = vec![(1, LoreErrorCode::OutcomeUnknown)];
+                // Per-item events carry the error's own FFI code since upstream a3a90fd0.
+                let mut expected = vec![(
+                    1,
+                    lore_revision::interface::LoreError::OutcomeUnknown as i32,
+                )];
                 if mixed_batch {
                     expected.extend([
-                        (2, LoreErrorCode::InvalidArguments),
-                        (3, LoreErrorCode::None),
+                        (2, lore_revision::interface::LoreError::InvalidArguments as i32),
+                        (3, 0),
                     ]);
                 }
                 assert_eq!(observed, expected);
@@ -779,6 +785,11 @@ mod storage_copy_on_write_tests {
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
+            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
+                BaselineAccess::Reachable,
+                served.clone(),
+                mutable.clone(),
+            ));
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
@@ -796,12 +807,20 @@ mod storage_copy_on_write_tests {
                 .with_http2_config(
                     None,
                     None,
-                    Duration::from_secs(30),
+                    GrpcTimeouts {
+                        request_handler: Duration::from_secs(30),
+                        authorization: Duration::from_secs(30),
+                    },
                     Default::default(),
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None, false, Arc::new(AllowAllRepositoryAuthorizer))
+                .with_jwt_verifier(
+                    None,
+                    false,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    repository_catalog,
+                )
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;
@@ -909,11 +928,13 @@ mod storage_copy_on_write_tests {
         chunk: u64,
         token: &str,
     ) -> Address {
-        let captured: Arc<Mutex<Vec<(Address, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured: Arc<Mutex<Vec<(Address, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = captured.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             if let LoreEvent::StoragePutItemComplete(data) = event {
-                sink.lock().unwrap().push((data.address, data.error_code));
+                sink.lock()
+                    .unwrap()
+                    .push((data.address, data.error.error_code));
             }
         }));
         let status = lore::storage::put::put(
@@ -942,7 +963,7 @@ mod storage_copy_on_write_tests {
         assert_eq!(status, 0, "put must succeed");
         let events = captured.lock().unwrap().clone();
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].1, LoreErrorCode::None);
+        assert_eq!(events[0].1, 0);
         events[0].0
     }
 

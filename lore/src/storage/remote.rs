@@ -24,6 +24,7 @@ use tokio::sync::Mutex;
 /// remote configured. Internally caches one `Arc<Connection>` per partition for both the
 /// storage-session and admin paths so repeated ops against the same partition share the
 /// connection.
+#[lore_macro::test_pub]
 pub(crate) struct RemoteEndpoint {
     remote_url: String,
     identity: Option<String>,

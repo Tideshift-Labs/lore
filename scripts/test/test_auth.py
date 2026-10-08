@@ -4,6 +4,7 @@
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ from lore_server import (
     generate_server_config,
     launch_lore_server,
 )
+from service_util import LORE_SERVICE_ENVIRONMENT
 
 from lore import Lore
 
@@ -47,30 +49,65 @@ def test_auth_info_not_supported_without_auth_endpoint(new_authless_lore_repo):
 
 
 @pytest.mark.smoke
-def test_auth_user_info_not_supported_without_auth_endpoint(
+@pytest.mark.parametrize(
+    "command",
+    [
+        ["auth", "info"],
+        ["auth", "login", "--no-browser"],
+        ["auth", "login", "--token-type", "lore", "--token", "unused"],
+        ["auth", "logout"],
+    ],
+    ids=["info", "login", "login-with-token", "logout"],
+)
+def test_auth_resolves_a_relative_repository_against_the_caller(
+    new_authless_lore_repo, lore_service_runner, tmp_path, command
+):
+    """These commands read the remote from the repository at `--repository`.
+    The service runs in a directory unrelated to the caller's, so it must
+    resolve a relative path where the caller ran and reach the authless test
+    server, which answers `NotSupported`.
+
+    FORK-LOCAL (Tideshift): the authless fixture, because under `--use-grpc`
+    `new_lore_repo` places the repository on the managed server, which has an
+    auth endpoint."""
+    service_directory = tmp_path / "service_elsewhere"
+    service_directory.mkdir()
+    lore_service_runner.start(str(service_directory))
+
+    repo: Lore = new_authless_lore_repo(
+        environment_vars=LORE_SERVICE_ENVIRONMENT.copy()
+    )
+
+    with pytest.raises(NotSupportedError):
+        repo.run(
+            urc_args=command,
+            path=os.path.basename(repo.path),
+            cwd=os.path.dirname(repo.path),
+        )
+
+
+@pytest.mark.smoke
+def test_auth_user_info_answers_from_the_token_only_service_without_auth_endpoint(
     new_authless_lore_repo, lore_library_path
 ):
-    """`authUserInfo` (remote user-info resolution) must fail with
-    `NotSupported` against the authless test server, not `NotAuthenticated`:
-    the real failure is that the server has no auth endpoint at all, and
-    replacing it with `NotAuthenticated` sends consumers chasing login state
-    that cannot exist.
+    """`authUserInfo` (remote user-info resolution) succeeds against the
+    authless test server. With no auth service and no directory advertised
+    there is nothing to exchange a token with and nothing to ask, so the
+    token-only service answers: every ID is its own display name. Failing
+    here, with `NotSupported` or worse `NotAuthenticated`, would send SDK
+    consumers chasing login state that cannot exist on this server.
 
-    No CLI command surfaces this call's errors (the CLI only uses it to
-    decorate output with display names and deliberately ignores failures), so
-    the test calls the public C API — the surface the SDK's `authUserInfo`
-    binding is built on — and asserts on the returned FFI code."""
+    No CLI command surfaces this call's result directly (the CLI only uses it
+    to decorate output with display names), so the test calls the public C
+    API — the surface the SDK's `authUserInfo` binding is built on — and
+    asserts on the returned FFI code."""
 
     repo: Lore = new_authless_lore_repo()
 
     result = repo.auth_user_info_capi(lore_library_path, "some-other-user")
 
-    assert result != 0, "resolving a user against an authless server must fail"
-    assert result != NOT_AUTHENTICATED, (
-        "the authless failure must not be masked as NotAuthenticated"
-    )
-    assert result == NOT_SUPPORTED, (
-        f"expected NotSupported ({NOT_SUPPORTED}), got FFI code {result}"
+    assert result == 0, (
+        f"the token-only service answers an authless server; got FFI code {result}"
     )
 
 

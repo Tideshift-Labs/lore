@@ -10,6 +10,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
@@ -23,7 +24,9 @@ pub struct Correlate {
     pub correlation_id: Option<String>,
 }
 
+#[lore_macro::test_pub]
 const MIN_CORRELATION_ID_LENGTH: usize = 4;
+#[lore_macro::test_pub]
 const MAX_CORRELATION_ID_LENGTH: usize = 150;
 
 impl Correlate {
@@ -54,6 +57,7 @@ impl Message for Correlate {
         &self,
         context: Arc<AttributeMap>,
         _immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let correlation_id = match self.correlation_id.as_ref() {
             Some(correlation_id) => {
@@ -101,173 +105,5 @@ pub struct CorrelateResponse {
 impl Response for CorrelateResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![Bytes::copy_from_slice(self.correlation_id.as_bytes())]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::str::FromStr;
-
-    use super::*;
-    use crate::store::test_store_create;
-
-    #[test]
-    fn test_parse() {
-        let correlation_id = uuid::Uuid::new_v4().to_string();
-
-        let bytes = bytes::Bytes::from(correlation_id.clone());
-
-        assert_eq!(
-            Correlate::parse(bytes),
-            Ok(Correlate {
-                correlation_id: Some(correlation_id)
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_correlation_id_too_short() {
-        assert_eq!(
-            Correlate::parse(bytes::Bytes::from(
-                "a".repeat(MIN_CORRELATION_ID_LENGTH - 1),
-            )),
-            Ok(Correlate {
-                correlation_id: None
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_correlation_id_too_long() {
-        assert_eq!(
-            Correlate::parse(bytes::Bytes::from(
-                "a".repeat(MAX_CORRELATION_ID_LENGTH + 1),
-            )),
-            Ok(Correlate {
-                correlation_id: None
-            })
-        );
-    }
-
-    #[test]
-    fn test_parse_correlation_id_non_ascii() {
-        assert_eq!(
-            Correlate::parse(bytes::Bytes::from("🙅‍♂️🙋‍♂️🔑".repeat(3),)),
-            Ok(Correlate {
-                correlation_id: None
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle() {
-        let correlation_id = uuid::Uuid::new_v4().to_string();
-
-        let message = Correlate {
-            correlation_id: Some(correlation_id.clone()),
-        };
-
-        let context = Arc::new(AttributeMap::default());
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        let response = message
-            .handle(context.clone(), immutable_store)
-            .await
-            .unwrap();
-        assert_eq!(
-            LoreResponse::Correlate(CorrelateResponse {
-                correlation_id: correlation_id.clone()
-            }),
-            response
-        );
-
-        assert_eq!(correlation_id, **context.get::<CorrelationId>().unwrap());
-
-        assert_eq!(
-            vec![Bytes::copy_from_slice(correlation_id.as_bytes())],
-            response.data()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_correlation_id_already_set() {
-        let context = Arc::new(AttributeMap::default());
-        context.insert(CorrelationId::new(uuid::Uuid::new_v4()));
-
-        let correlation_id = uuid::Uuid::new_v4().to_string();
-        let message = Correlate {
-            correlation_id: Some(correlation_id.clone()),
-        };
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        assert_eq!(
-            LoreResponse::Correlate(CorrelateResponse {
-                correlation_id: correlation_id.clone()
-            }),
-            message
-                .handle(context.clone(), immutable_store)
-                .await
-                .unwrap()
-        );
-
-        assert_eq!(correlation_id, **context.get::<CorrelationId>().unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_handle_correlation_id_missing() {
-        let message = Correlate {
-            correlation_id: None,
-        };
-
-        let context = Arc::new(AttributeMap::default());
-        let correlation_id = uuid::Uuid::new_v4();
-        context.insert(CorrelationId::new(correlation_id));
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        assert_eq!(
-            LoreResponse::Correlate(CorrelateResponse {
-                correlation_id: correlation_id.to_string()
-            }),
-            message
-                .handle(context.clone(), immutable_store)
-                .await
-                .unwrap()
-        );
-
-        assert_eq!(
-            correlation_id.to_string(),
-            **context.get::<CorrelationId>().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_handle_correlation_id_missing_not_set_in_context() {
-        let message = Correlate {
-            correlation_id: None,
-        };
-
-        let context = Arc::new(AttributeMap::default());
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        match message
-            .handle(context.clone(), immutable_store)
-            .await
-            .unwrap()
-        {
-            LoreResponse::Correlate(CorrelateResponse { correlation_id }) => {
-                uuid::Uuid::from_str(&correlation_id).expect("Correlation id was invalid");
-            }
-            default => {
-                panic!("Unexpected response from Correlate::handle: {default:?}");
-            }
-        }
     }
 }

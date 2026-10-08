@@ -370,12 +370,12 @@ pub async fn dump(
     dispatch_call(globals, args, callback, dump_local).await
 }
 
-async fn dump_local(
+fn dump_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryDumpArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    repository_call_read(globals, callback, args, dump, dump_impl).await
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, dump, dump_impl)
 }
 
 async fn dump_impl(
@@ -386,7 +386,7 @@ async fn dump_impl(
     let revision = if args.revision.is_empty() {
         None
     } else {
-        revision::resolve(
+        revision::resolve_boxed(
             repository.clone(),
             args.revision.as_str(),
             execution_context().globals().search_location(),
@@ -405,7 +405,7 @@ async fn dump_impl(
         None
     };
 
-    lore_revision::repository::dump::dump(repository, revision, path, args.max_depth).await
+    lore_revision::repository::dump::dump_boxed(repository, revision, path, args.max_depth).await
 }
 
 /// Arguments for creating a new repository.
@@ -509,7 +509,7 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         vfs_options: args.vfs.to_config(),
     };
 
-    lore_revision::repository::create::create(repository_url, repository_path, options).await
+    lore_revision::repository::create::create_boxed(repository_url, repository_path, options).await
 }
 
 /// Optional creator and creation-time metadata to record on a new repository.
@@ -577,7 +577,7 @@ async fn create_with_metadata_impl(
         created: metadata.created,
     });
 
-    lore_revision::repository::create::create_with_metadata(
+    lore_revision::repository::create::create_with_metadata_boxed(
         repository_url,
         repository_path,
         options,
@@ -588,37 +588,48 @@ async fn create_with_metadata_impl(
 
 /// Arguments for deleting a remote repository.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[handler(delete_local)]
 pub struct LoreRepositoryDeleteArgs {
-    /// URL of the remote repository to delete
+    /// URL of the remote repository to delete, or a name or ID resolved against the remote of
+    /// the repository at `repository_path`
     pub repository_url: LoreString,
 }
 
+/// Deletes a remote repository.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn delete(
     globals: LoreGlobalArgs,
     args: LoreRepositoryDeleteArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let execution = setup_execution(globals, callback);
+    dispatch_call(globals, args, callback, delete_local).await
+}
 
-    LORE_CONTEXT
-        .scope(execution, async move {
-            log_command_info(&delete, &args);
-
-            let time_start = Instant::now();
-
-            let repository_url = args.repository_url.as_str();
-
-            let result = lore_revision::repository::delete::delete(
-                repository_url,
-                execution_context().globals().identity().unwrap_or_default(),
-            )
-            .await;
-
-            log_command_done(&delete, time_start);
-            execution_context().dispatcher.complete_result(result).await
-        })
+fn delete_local(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryDeleteArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    no_repository_call(globals, callback, args, delete, |args| async move {
+        repository::delete::delete(
+            args.repository_url.as_str(),
+            execution_context().globals().identity().unwrap_or_default(),
+        )
         .await
+    })
 }
 
 /// Arguments for releasing cached store references for the repository path.
@@ -654,11 +665,11 @@ pub async fn release(
     dispatch_call(globals, args, callback, release_local).await
 }
 
-async fn release_local(
+fn release_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryReleaseArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     no_repository_call(globals, callback, args, release, move |_args| {
         let path = execution_context().globals().repository_path().to_string();
         async move {
@@ -666,7 +677,6 @@ async fn release_local(
             Ok::<(), RepositoryError>(())
         }
     })
-    .await
 }
 
 /// Arguments for waiting on outstanding asynchronous repository tasks.
@@ -972,7 +982,7 @@ async fn status_impl(
         None
     };
 
-    lore_revision::repository::status::status(repository, paths, options).await
+    lore_revision::repository::status::status_boxed(repository, paths, options).await
 }
 
 /// Arguments for verifying the integrity of the local repository state.
@@ -1048,7 +1058,7 @@ async fn verify_state_impl(
     } else {
         None
     };
-    lore_revision::repository::verify::verify(repository, path, args.heal != 0).await
+    lore_revision::repository::verify::verify_boxed(repository, path, args.heal != 0).await
 }
 
 /// Arguments for verifying a single fragment in the local store.
@@ -1072,11 +1082,11 @@ pub async fn verify_fragment(
     dispatch_call(globals, args, callback, verify_fragment_local).await
 }
 
-async fn verify_fragment_local(
+fn verify_fragment_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryVerifyFragmentArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -1084,7 +1094,6 @@ async fn verify_fragment_local(
         verify_fragment,
         verify_fragment_impl,
     )
-    .await
 }
 
 async fn verify_fragment_impl(
@@ -1096,7 +1105,7 @@ async fn verify_fragment_impl(
         context: args.context,
         heal: args.heal != 0,
     };
-    lore_revision::repository::verify::verify_fragment(repository, core_args).await
+    lore_revision::repository::verify::verify_fragment_boxed(repository, core_args).await
 }
 
 /// Arguments for querying the local immutable store by fragment address.
@@ -1138,11 +1147,11 @@ pub async fn store_immutable_query(
     dispatch_call(globals, args, callback, store_immutable_query_local).await
 }
 
-async fn store_immutable_query_local(
+fn store_immutable_query_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryStoreImmutableQueryArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -1157,7 +1166,6 @@ async fn store_immutable_query_local(
             )
         },
     )
-    .await
 }
 
 /// Arguments for retrieving repository metadata.
@@ -1179,11 +1187,11 @@ pub async fn metadata_get(
     dispatch_call(globals, args, callback, metadata_get_local).await
 }
 
-async fn metadata_get_local(
+fn metadata_get_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -1196,7 +1204,7 @@ async fn metadata_get_local(
                 Some(args.key.to_string())
             };
             async move {
-                lore_revision::metadata::repository::get(
+                lore_revision::metadata::repository::get_boxed(
                     repository,
                     key.as_deref(),
                     execution_context().globals().local(),
@@ -1205,7 +1213,6 @@ async fn metadata_get_local(
             }
         },
     )
-    .await
 }
 
 /// Arguments for setting metadata key-value pairs on the current repository.
@@ -1230,11 +1237,11 @@ pub async fn metadata_set(
     dispatch_call(globals, args, callback, metadata_set_local).await
 }
 
-async fn metadata_set_local(
+fn metadata_set_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1242,7 +1249,6 @@ async fn metadata_set_local(
         metadata_set,
         |repository, _token, args| metadata_set_impl(repository, args),
     )
-    .await
 }
 
 async fn metadata_set_impl(
@@ -1279,7 +1285,7 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::repository::set(repository, &keys, &values, &formats).await
+    lore_revision::metadata::repository::set_boxed(repository, &keys, &values, &formats).await
 }
 
 /// Arguments for removing metadata keys from the current repository.
@@ -1300,11 +1306,11 @@ pub async fn metadata_clear(
     dispatch_call(globals, args, callback, metadata_clear_local).await
 }
 
-async fn metadata_clear_local(
+fn metadata_clear_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1314,11 +1320,10 @@ async fn metadata_clear_local(
             let keys: Vec<String> = args.keys.as_slice().iter().map(|k| k.to_string()).collect();
             async move {
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::repository::clear(repository, &key_refs).await
+                lore_revision::metadata::repository::clear_boxed(repository, &key_refs).await
             }
         },
     )
-    .await
 }
 
 // --- Instance management commands ---
@@ -1337,11 +1342,11 @@ pub async fn instance_list(
     dispatch_call(globals, args, callback, instance_list_local).await
 }
 
-async fn instance_list_local(
+fn instance_list_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryInstanceListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -1349,7 +1354,6 @@ async fn instance_list_local(
         instance_list,
         move |repository, _args| lore_revision::instance::instance_list(repository),
     )
-    .await
 }
 
 /// Arguments for pruning stale instances of the repository.
@@ -1366,11 +1370,11 @@ pub async fn instance_prune(
     dispatch_call(globals, args, callback, instance_prune_local).await
 }
 
-async fn instance_prune_local(
+fn instance_prune_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryInstancePruneArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1378,7 +1382,6 @@ async fn instance_prune_local(
         instance_prune,
         move |repository, _token, _args| lore_revision::instance::instance_prune(repository),
     )
-    .await
 }
 
 /// Arguments for updating the recorded path of the current repository instance.
@@ -1395,11 +1398,11 @@ pub async fn repository_update_path(
     dispatch_call(globals, args, callback, update_path_local).await
 }
 
-async fn update_path_local(
+fn update_path_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryUpdatePathArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1407,7 +1410,6 @@ async fn update_path_local(
         repository_update_path,
         move |repository, _token, _args| lore_revision::instance::update_path(repository),
     )
-    .await
 }
 
 /// Arguments for reading a value from the repository config.
@@ -1427,11 +1429,11 @@ pub async fn config_get(
     dispatch_call(globals, args, callback, config_get_local).await
 }
 
-async fn config_get_local(
+fn config_get_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryConfigGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_no_store(
         globals,
         callback,
@@ -1471,30 +1473,4 @@ async fn config_get_local(
             }
         },
     )
-    .await
-}
-
-#[cfg(test)]
-mod tests {
-    // Scans the handler modules for any `send_error` call on a terminal arm,
-    // so a regression that re-emits a mid-stream `Error` event fails the build.
-    const MIGRATED_SOURCES: &[(&str, &str)] = &[
-        ("repository.rs", include_str!("repository.rs")),
-        ("auth.rs", include_str!("auth.rs")),
-    ];
-
-    #[test]
-    fn migrated_terminal_arms_have_no_send_error_call() {
-        // Build the needle from parts so this scanning test does not match its
-        // own source when it scans `repository.rs`.
-        let needle = format!(".{}(", "send_error");
-        for (name, source) in MIGRATED_SOURCES {
-            assert!(
-                !source.contains(&needle),
-                "{name} still calls the dispatcher error sink on a terminal arm; \
-                 the migrated handler must route the error through `complete` \
-                 instead of emitting a mid-stream `Error` event"
-            );
-        }
-    }
 }

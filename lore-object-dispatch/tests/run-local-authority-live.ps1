@@ -452,6 +452,9 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_postgres_cell_schema_revokes_service_privileges_after_replacement',
         'live_postgres_cell_schema_measure_catalog_manifest',
         'live_drain_policy_publication_is_maintenance_only_and_replays_exactly',
+        # Same runner: the installer binary's own plaintext and pinned-CA cases.
+        'live_cell_schema_install_binary_installs_and_attests_over_explicit_plaintext',
+        'live_cell_schema_install_binary_verifies_a_pinned_ca_and_refuses_plaintext',
         # Cell-schema forward upgrade -- run-cell-schema-forward-upgrade-live.ps1
         'live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_double_give_back',
         'live_fresh_install_and_upgraded_cell_attest_identical_manifests',

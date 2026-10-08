@@ -10,6 +10,7 @@ autobins = false
 [dependencies]
 http-body = "1.0.1"
 anyhow = { workspace = true }
+async-channel = { workspace = true }
 async-stream = { workspace = true }
 base64 = { workspace = true }
 blake3 = { workspace = true }
@@ -87,14 +88,16 @@ lore-telemetry = { workspace = true }
 uuid = { workspace = true }
 x509-parser = { workspace = true }
 zerocopy = { workspace = true }
+# Stands in for the replication client in this crate's own tests, behind `test-util`.
+mockall = { workspace = true, optional = true }
 
 [build-dependencies]
-anyhow = { workspace = true }
 tonic-prost-build = { workspace = true }
 vergen = { workspace = true }
 
 [dev-dependencies]
 aws-sdk-s3 = { version = "1.121.0", default-features = false, features = ["rt-tokio"] }
+# The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 axum-test = "18.1.0"
@@ -110,9 +113,11 @@ temp-env = { workspace = true }
 # windows.
 tokio = { workspace = true, features = ["test-util"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+lore-server = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
+test-util = ["dep:mockall"]
 # `lore-postgres/oodle` is forwarded too, and must stay forwarded. It gates
 # nothing but a DIAGNOSTIC: CR-031's lifecycle coordinator has to tell a damaged
 # payload from an intact one this build has no codec for. Enabling the codec in
@@ -140,9 +145,12 @@ failure_generator = ["lore-storage/failure_generator", "lore-postgres/failure_ge
 
 [[bin]]
 name = "loreserver"
+# The binary holds no unit tests; the library it drives does.
+test = false
 
 [lib]
 name = "lore_server"
+test = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }

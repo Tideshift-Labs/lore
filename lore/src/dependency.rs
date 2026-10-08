@@ -59,11 +59,11 @@ pub async fn dependency_add(
     dispatch_call(globals, args, callback, dependency_add_local).await
 }
 
-async fn dependency_add_local(
+fn dependency_add_local(
     globals: LoreGlobalArgs,
     args: LoreFileDependencyAddArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -71,7 +71,6 @@ async fn dependency_add_local(
         dependency_add,
         |repository, token, args| async move { dependency_add_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn dependency_add_impl(
@@ -172,11 +171,11 @@ pub async fn dependency_remove(
     dispatch_call(globals, args, callback, dependency_remove_local).await
 }
 
-async fn dependency_remove_local(
+fn dependency_remove_local(
     globals: LoreGlobalArgs,
     args: LoreFileDependencyRemoveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -184,7 +183,6 @@ async fn dependency_remove_local(
         dependency_remove,
         |repository, token, args| async move { dependency_remove_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn dependency_remove_impl(
@@ -283,11 +281,11 @@ pub async fn dependency_list(
     dispatch_call(globals, args, callback, dependency_list_local).await
 }
 
-async fn dependency_list_local(
+fn dependency_list_local(
     globals: LoreGlobalArgs,
     args: LoreFileDependencyListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(
         globals,
         callback,
@@ -295,7 +293,6 @@ async fn dependency_list_local(
         dependency_list,
         dependency_list_impl,
     )
-    .await
 }
 
 async fn dependency_list_impl(

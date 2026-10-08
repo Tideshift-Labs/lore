@@ -7,8 +7,8 @@ use std::sync::Arc;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
-use lore::auth;
 use lore::auth::LoreAuthUserInfoArgs;
+use lore::call_delegation::run_command;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
@@ -181,8 +181,7 @@ fn handle_lock_status(globals: LoreGlobalArgs, args: &FileLockStatusArgs) -> u8 
             .with_defaults(),
     ));
 
-    let result_status =
-        runtime().block_on(lock::file_status(globals.clone(), status_args, callback)) as u8;
+    let result_status = run_command(globals.clone(), status_args.into(), callback) as u8;
 
     let display_path = util::cwd_relativizer(&globals);
 
@@ -233,8 +232,7 @@ fn handle_lock_query(globals: LoreGlobalArgs, args: &FileLockQueryArgs) -> u8 {
             .with_defaults(),
     ));
 
-    let result_query =
-        runtime().block_on(lock::file_query(globals.clone(), query_args, callback)) as u8;
+    let result_query = run_command(globals.clone(), query_args.into(), callback) as u8;
 
     let display_path = util::cwd_relativizer(&globals);
 
@@ -348,11 +346,7 @@ fn resolve_user_ids(
             _ => (),
         })));
 
-    let _result = runtime().block_on(auth::resolve_user_info(
-        globals.clone(),
-        auth_args,
-        callback,
-    )) as u8;
+    let _result = run_command(globals.clone(), auth_args.into(), callback) as u8;
 
     auth_data
 }

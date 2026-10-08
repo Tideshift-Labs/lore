@@ -346,6 +346,3 @@ pub fn canonical_intent_digest(
         .as_bytes()
         .to_vec())
 }
-
-#[cfg(test)]
-mod tests;

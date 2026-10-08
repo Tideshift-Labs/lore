@@ -47,12 +47,12 @@ $setupError = $null
 # `Exact` means the target may hold no other ignored case, so a case added
 # without updating this list is a setup failure rather than a silent skip.
 #
-# The `lore-server` library also holds ignored cases owned by other packages, so
+# The `lore-server` `unit` test binary also holds ignored cases owned by other packages, so
 # it cannot be exact wholesale. `ExactPrefixes` narrows the same guarantee to the
 # modules this runner OWNS: a live case added under one of them without joining
 # this inventory is a setup failure, not a silent NOT RUN. A pinned case can
 # still sit outside every prefix when its module is shared with other packages
-# (`grpc::handlers::branch_push::tests::` holds WP-116's cases too), in which
+# (`grpc::handlers::branch_push::` holds WP-116's cases too), in which
 # case only that exact case is policed.
 $inventory = @(
     [pscustomobject]@{
@@ -132,7 +132,7 @@ $inventory = @(
     },
     [pscustomobject]@{
         Package       = 'lore-server'
-        Target        = 'lib'
+        Target        = 'unit'
         Exact         = $false
         # The prefix narrowed twice, both times for the same reason: a claim
         # asserts this runner owns EVERY live case beneath it, so a case another
@@ -161,8 +161,8 @@ $inventory = @(
         )
         Cases         = @(
             'grpc::handlers::branch_push::governed_tests::refusal_handler_tests::both_push_handlers_terminalize_actual_early_store_slowdown_without_publication',
-            'domain::tests::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',
-            'grpc::handlers::branch_push::tests::real_witness_capture_precedes_both_cr019_bypass_conditions',
+            'domain::a_never_migrated_postgres_cell_boots_on_the_legacy_lock_route',
+            'grpc::handlers::branch_push::real_witness_capture_precedes_both_cr019_bypass_conditions',
             'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_blocks_a_push_from_a_foreign_owner_pair',
             'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_does_not_block_the_lock_holders_own_push',
             'grpc::handlers::branch_push::governed_tests::enforce_fenced_locks_treats_same_subject_under_a_different_issuer_as_foreign',

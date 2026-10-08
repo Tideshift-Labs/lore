@@ -1028,7 +1028,7 @@ impl LiveRepository {
         .await
         .expect("staging the fixture file");
 
-        let committed_revision = Box::pin(crate::commit::commit(
+        let committed_revision = Box::pin(crate::commit::commit_boxed(
             repository.clone(),
             &token,
             crate::commit::CommitOptions {

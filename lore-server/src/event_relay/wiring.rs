@@ -138,6 +138,7 @@ const REMOTE_NOTIFICATION_MODE: &str = "remote";
 /// It stays a constant rather than a knob because it is derived from the number
 /// of borrowers above, not from capacity: an operator who changes it is not
 /// tuning a pool, they are asserting a different set of concurrent loops.
+#[lore_macro::test_pub]
 pub(crate) const RELAY_POOL_MAX: u32 = 5;
 
 /// What server composition keeps after the relay is wired.

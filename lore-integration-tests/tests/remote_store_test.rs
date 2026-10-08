@@ -17,12 +17,15 @@ mod remote_store_tests {
     use lore_revision::store::remote::RemoteImmutableStore;
     use lore_revision::store::remote::RemoteMutableStore;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
+    use lore_server::grpc::server::GrpcTimeouts;
     use lore_server::hooks::HookDispatcher;
     use lore_server::quic::quinn::QuinnConfigBuilder;
     use lore_server::quic::quinn::QuinnServer;
     use lore_server::quic::tests::TestHandlerFactory;
+    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::StoreGetData;
@@ -93,6 +96,11 @@ mod remote_store_tests {
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
+            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
+                BaselineAccess::Reachable,
+                served_immutable.clone(),
+                served_mutable.clone(),
+            ));
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
@@ -110,14 +118,22 @@ mod remote_store_tests {
                 .with_http2_config(
                     None,
                     None,
-                    Duration::from_secs(30),
+                    GrpcTimeouts {
+                        request_handler: Duration::from_secs(30),
+                        authorization: Duration::from_secs(30),
+                    },
                     Default::default(),
                     Default::default(),
                     None,
                 )
                 // Auth-OFF harness: no verifier, so `enforce_write_permission` no-ops
                 // regardless (see `with_jwt_verifier`'s doc comment) -- `false` for clarity.
-                .with_jwt_verifier(None, false, Arc::new(AllowAllRepositoryAuthorizer))
+                .with_jwt_verifier(
+                    None,
+                    false,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    repository_catalog,
+                )
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;

@@ -172,18 +172,26 @@ impl Instruments {
 }
 
 /// The bounded compare-and-set operation label set.
+#[lore_macro::test_pub]
 pub(crate) const CAS_ACCEPT: &str = "record_broker_accepted";
+#[lore_macro::test_pub]
 pub(crate) const CAS_RETRY: &str = "release_for_retry";
+#[lore_macro::test_pub]
 pub(crate) const CAS_DEAD_LETTER: &str = "dead_letter";
+#[lore_macro::test_pub]
 pub(crate) const CAS_RENEW: &str = "renew_claim";
 
 /// The bounded compare-and-set outcome label set. These mirror
 /// `lore_postgres::domain::outbox::CasOutcome`'s variants, and
 /// `super::worker::cas_label` is the only place the two are related, so a new
 /// variant is a compile error there rather than a silently unlabelled increment.
+#[lore_macro::test_pub]
 pub(crate) const CAS_APPLIED: &str = "applied";
+#[lore_macro::test_pub]
 pub(crate) const CAS_STALE_CLAIM: &str = "stale_claim";
+#[lore_macro::test_pub]
 pub(crate) const CAS_ALREADY_ACCEPTED: &str = "already_accepted";
+#[lore_macro::test_pub]
 pub(crate) const CAS_VANISHED: &str = "vanished";
 
 /// The publish-outcome family label for a successful publish.
@@ -192,19 +200,28 @@ pub(crate) const CAS_VANISHED: &str = "vanished";
 /// has no variant for success, so the fourth value is declared here and joins
 /// the closed-set test below rather than being an inline literal at the call
 /// site.
+#[lore_macro::test_pub]
 pub(crate) const FAMILY_ACCEPTED: &str = "accepted";
 /// The class label within that family. Success has exactly one.
+#[lore_macro::test_pub]
 pub(crate) const CLASS_ACCEPTED: &str = "broker_accepted";
 
 /// The bounded label set for a row left to its lease.
+#[lore_macro::test_pub]
 pub(crate) const DEFERRED_RETRY_POOL: &str = "retry_pool";
+#[lore_macro::test_pub]
 pub(crate) const DEFERRED_RETRY_WRITE: &str = "retry_write";
+#[lore_macro::test_pub]
 pub(crate) const DEFERRED_DEAD_LETTER_POOL: &str = "dead_letter_pool";
+#[lore_macro::test_pub]
 pub(crate) const DEFERRED_DEAD_LETTER_WRITE: &str = "dead_letter_write";
 
 /// The bounded admission-limit label set.
+#[lore_macro::test_pub]
 pub(crate) const ADMISSION_AGE: &str = "oldest_pending_age";
+#[lore_macro::test_pub]
 pub(crate) const ADMISSION_ROWS: &str = "pending_rows";
+#[lore_macro::test_pub]
 pub(crate) const ADMISSION_BYTES: &str = "pending_bytes";
 
 /// The bounded evaluation-block label set. These mirror
@@ -212,11 +229,17 @@ pub(crate) const ADMISSION_BYTES: &str = "pending_bytes";
 /// wraps; `super::evaluator_task::block_label` is the only place the two are
 /// related, so a new variant is a compile error there rather than a silently
 /// unlabelled increment.
+#[lore_macro::test_pub]
 pub(crate) const BLOCK_CELL_UNKNOWN: &str = "cell_unknown";
+#[lore_macro::test_pub]
 pub(crate) const BLOCK_RESET_IN_PROGRESS: &str = "reset_in_progress";
+#[lore_macro::test_pub]
 pub(crate) const BLOCK_NO_PLACEMENT: &str = "no_current_placement";
+#[lore_macro::test_pub]
 pub(crate) const BLOCK_EMPTY_MEMBERSHIP: &str = "empty_required_membership";
+#[lore_macro::test_pub]
 pub(crate) const BLOCK_MEMBER_NOT_READY: &str = "member_not_ready";
+#[lore_macro::test_pub]
 pub(crate) const BLOCK_MISSING_CHECKPOINT: &str = "missing_checkpoint";
 
 /// The bounded retention-sweep outcome label set (WP-119 Phase 8).
@@ -226,58 +249,80 @@ pub(crate) const BLOCK_MISSING_CHECKPOINT: &str = "missing_checkpoint";
 /// reapable — while a failed one is a database or pool fault. Collapsing them
 /// would make a wedged cell and a healthy lagging one look the same on the one
 /// signal that could tell them apart.
+#[lore_macro::test_pub]
 pub(crate) const SWEEP_COMPLETED: &str = "completed";
+#[lore_macro::test_pub]
 pub(crate) const SWEEP_BLOCKED: &str = "blocked";
 /// A sweep that stopped early because the process is draining. Distinct from
 /// `completed` so a rolling restart does not read as a run of full sweeps that
 /// happened to reap nothing.
+#[lore_macro::test_pub]
 pub(crate) const SWEEP_DRAINED: &str = "drained";
+#[lore_macro::test_pub]
 pub(crate) const SWEEP_FAILED: &str = "failed";
+#[lore_macro::test_pub]
 pub(crate) const SWEEP_UNAVAILABLE: &str = "pool_unavailable";
 
 /// The bounded prune-table label set.
+#[lore_macro::test_pub]
 pub(crate) const PRUNED_EVENTS: &str = "events";
 /// Consumer-safe rows reaped at a placement the cell has left, proven by the
 /// cleared reset chain rather than by the current frontier. Separate from
 /// `events` because the two have different proofs and different blockers: a
 /// cell with a stuck reset reaps nothing here while `events` keeps draining
 /// normally, and one counter would hide that.
+#[lore_macro::test_pub]
 pub(crate) const PRUNED_SUPERSEDED: &str = "superseded_events";
+#[lore_macro::test_pub]
 pub(crate) const PRUNED_DEAD_LETTERS: &str = "dead_letters";
 
 /// The bounded stream-reset outcome label set. Every value the reset service
 /// records, and nothing derived from a report's own fields: a detection ID or a
 /// broker identity as a label would be exactly the unbounded cardinality the
 /// contract prohibits.
+#[lore_macro::test_pub]
 pub(crate) const RESET_ACCEPTED: &str = "accepted";
+#[lore_macro::test_pub]
 pub(crate) const RESET_REPLAYED: &str = "replayed";
+#[lore_macro::test_pub]
 pub(crate) const RESET_DETECTION_MISMATCH: &str = "detection_mismatch";
+#[lore_macro::test_pub]
 pub(crate) const RESET_PLACEMENT_MISMATCH: &str = "placement_mismatch";
+#[lore_macro::test_pub]
 pub(crate) const RESET_STALE_OLD_STREAM: &str = "stale_old_stream";
+#[lore_macro::test_pub]
 pub(crate) const RESET_INVALID_SUCCESSOR: &str = "invalid_successor";
+#[lore_macro::test_pub]
 pub(crate) const RESET_CELL_UNKNOWN: &str = "cell_unknown";
 /// The three pre-receipt rejections (WP-119 Phase 8). Previously uncounted:
 /// they return before `receipt` runs, so a cell whose reports were all failing
 /// authentication or derivation recorded no reset outcome at all and looked
 /// identical to a cell nobody was reporting to.
+#[lore_macro::test_pub]
 pub(crate) const RESET_UNAUTHENTICATED: &str = "unauthenticated";
+#[lore_macro::test_pub]
 pub(crate) const RESET_UNAUTHORIZED: &str = "unauthorized";
+#[lore_macro::test_pub]
 pub(crate) const RESET_MALFORMED: &str = "malformed";
 
+#[lore_macro::test_pub]
 pub(crate) fn record_claimed_rows(rows: u64) {
     Instruments::instance().claimed_rows.add(rows, &[]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_empty_claim() {
     Instruments::instance().empty_claims.add(1, &[]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_lease_renewal(outcome: &'static str) {
     Instruments::instance()
         .lease_renewals
         .add(1, &[KeyValue::new("outcome", outcome)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_publish_result(family: &'static str, class: &'static str) {
     Instruments::instance().publish_results.add(
         1,
@@ -288,6 +333,7 @@ pub(crate) fn record_publish_result(family: &'static str, class: &'static str) {
     );
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_cas_outcome(operation: &'static str, outcome: &'static str) {
     Instruments::instance().cas_outcomes.add(
         1,
@@ -298,24 +344,28 @@ pub(crate) fn record_cas_outcome(operation: &'static str, outcome: &'static str)
     );
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_dead_letter(terminal_class: &'static str) {
     Instruments::instance()
         .dead_letters
         .add(1, &[KeyValue::new("class", terminal_class)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_publish_latency_ms(family: &'static str, millis: f64) {
     Instruments::instance()
         .publish_latency_ms
         .record(millis, &[KeyValue::new("family", family)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_deferred(site: &'static str) {
     Instruments::instance()
         .deferred_rows
         .add(1, &[KeyValue::new("site", site)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_backlog(oldest_age_seconds: f64, pending_rows: u64, dead_letters: u64) {
     let instruments = Instruments::instance();
     instruments
@@ -325,28 +375,33 @@ pub(crate) fn record_backlog(oldest_age_seconds: f64, pending_rows: u64, dead_le
     instruments.backlog_dead_letters.record(dead_letters, &[]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_admission_rejection(limit: &'static str) {
     Instruments::instance()
         .admission_rejections
         .add(1, &[KeyValue::new("limit", limit)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_consumer_safe_rows(rows: u64) {
     Instruments::instance().consumer_safe_rows.add(rows, &[]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_evaluation_block(reason: &'static str) {
     Instruments::instance()
         .evaluation_blocks
         .add(1, &[KeyValue::new("reason", reason)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_pruned_rows(table: &'static str, rows: u64) {
     Instruments::instance()
         .pruned_rows
         .add(rows, &[KeyValue::new("table", table)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_prune_sweep(outcome: &'static str) {
     Instruments::instance()
         .prune_sweeps
@@ -360,153 +415,21 @@ pub(crate) fn record_prune_sweep(outcome: &'static str) {
 /// emitter identity as a label is exactly the unbounded cardinality CR-032
 /// prohibits, and this counter exists because a misbehaving emitter is
 /// generating that cardinality in the first place.
+#[lore_macro::test_pub]
 pub(crate) fn record_quarantined_reset_report(outcome: &'static str) {
     Instruments::instance()
         .quarantined_reset_reports
         .add(1, &[KeyValue::new("outcome", outcome)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_reset_report(outcome: &'static str) {
     Instruments::instance()
         .reset_reports
         .add(1, &[KeyValue::new("outcome", outcome)]);
 }
 
+#[lore_macro::test_pub]
 pub(crate) fn record_receiver_lag_rows(rows: u64) {
     Instruments::instance().receiver_lag_rows.record(rows, &[]);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An `OTel` counter's recorded value cannot be read back here: the meter
-    /// lives behind a process-global provider cached in a `OnceLock`, so a test
-    /// can prove the classification but never the emitted number. What it CAN
-    /// prove is that no label is built by interpolation, which is the property
-    /// the contract's prohibition actually needs.
-    #[test]
-    fn every_label_value_comes_from_the_closed_static_set() {
-        for label in [
-            CAS_ACCEPT,
-            CAS_RETRY,
-            CAS_DEAD_LETTER,
-            CAS_RENEW,
-            CAS_APPLIED,
-            CAS_STALE_CLAIM,
-            CAS_ALREADY_ACCEPTED,
-            CAS_VANISHED,
-            ADMISSION_AGE,
-            ADMISSION_ROWS,
-            ADMISSION_BYTES,
-            FAMILY_ACCEPTED,
-            CLASS_ACCEPTED,
-            DEFERRED_RETRY_POOL,
-            DEFERRED_RETRY_WRITE,
-            DEFERRED_DEAD_LETTER_POOL,
-            DEFERRED_DEAD_LETTER_WRITE,
-            BLOCK_CELL_UNKNOWN,
-            BLOCK_RESET_IN_PROGRESS,
-            BLOCK_NO_PLACEMENT,
-            BLOCK_EMPTY_MEMBERSHIP,
-            BLOCK_MEMBER_NOT_READY,
-            BLOCK_MISSING_CHECKPOINT,
-            PRUNED_EVENTS,
-            PRUNED_SUPERSEDED,
-            PRUNED_DEAD_LETTERS,
-            RESET_ACCEPTED,
-            RESET_REPLAYED,
-            RESET_DETECTION_MISMATCH,
-            RESET_PLACEMENT_MISMATCH,
-            RESET_STALE_OLD_STREAM,
-            RESET_INVALID_SUCCESSOR,
-            RESET_CELL_UNKNOWN,
-        ] {
-            assert!(!label.is_empty());
-            assert!(label.is_ascii());
-            assert!(!label.contains(' '));
-        }
-    }
-
-    #[test]
-    fn recording_is_infallible_and_never_affects_the_caller() {
-        record_claimed_rows(3);
-        record_empty_claim();
-        record_lease_renewal(CAS_APPLIED);
-        record_publish_result("transient", "timeout");
-        record_cas_outcome(CAS_ACCEPT, CAS_STALE_CLAIM);
-        record_dead_letter("scope_mismatch");
-        record_publish_latency_ms(FAMILY_ACCEPTED, 12.5);
-        record_deferred(DEFERRED_RETRY_POOL);
-        record_backlog(1.0, 2, 0);
-        record_admission_rejection(ADMISSION_AGE);
-        record_consumer_safe_rows(4);
-        record_evaluation_block(BLOCK_RESET_IN_PROGRESS);
-        record_pruned_rows(PRUNED_EVENTS, 7);
-        record_reset_report(RESET_ACCEPTED);
-        record_receiver_lag_rows(3);
-    }
-
-    /// The reset-outcome labels are a closed set that must stay distinct: two
-    /// outcomes sharing a label would silently merge two different operator
-    /// signals into one series.
-    #[test]
-    fn the_reset_outcome_labels_are_distinct() {
-        let mut labels = vec![
-            RESET_ACCEPTED,
-            RESET_REPLAYED,
-            RESET_DETECTION_MISMATCH,
-            RESET_PLACEMENT_MISMATCH,
-            RESET_STALE_OLD_STREAM,
-            RESET_INVALID_SUCCESSOR,
-            RESET_CELL_UNKNOWN,
-        ];
-        let total = labels.len();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), total);
-    }
-
-    #[test]
-    fn the_evaluation_block_labels_are_distinct() {
-        let mut labels = vec![
-            BLOCK_CELL_UNKNOWN,
-            BLOCK_RESET_IN_PROGRESS,
-            BLOCK_NO_PLACEMENT,
-            BLOCK_EMPTY_MEMBERSHIP,
-            BLOCK_MEMBER_NOT_READY,
-            BLOCK_MISSING_CHECKPOINT,
-        ];
-        let total = labels.len();
-        labels.sort_unstable();
-        labels.dedup();
-        assert_eq!(labels.len(), total);
-    }
-
-    /// The publish-outcome family label set spans four values, and only three
-    /// of them come from `PublishFailure`. A success recorded under an inline
-    /// literal would sit outside every check in this file.
-    #[test]
-    fn the_publish_family_labels_are_the_three_failure_families_plus_accepted() {
-        use crate::plugins::remote_notification::NotAcceptedReason;
-        use crate::plugins::remote_notification::PublishFailure;
-        use crate::plugins::remote_notification::TerminalClass;
-        use crate::plugins::remote_notification::TransientClass;
-
-        let mut families = vec![FAMILY_ACCEPTED];
-        families.extend(
-            [
-                PublishFailure::NotAccepted(NotAcceptedReason::UnversionedResponse),
-                PublishFailure::Transient(TransientClass::Timeout),
-                PublishFailure::Terminal(TerminalClass::ScopeMismatch),
-            ]
-            .into_iter()
-            .map(PublishFailure::family_label),
-        );
-        let total = families.len();
-        families.sort_unstable();
-        families.dedup();
-        assert_eq!(families.len(), total, "families must be distinct");
-        assert_eq!(total, 4);
-    }
 }

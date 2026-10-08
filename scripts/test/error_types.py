@@ -143,6 +143,9 @@ class NothingStagedError(LoreException): ...
 class LinkConflicts(LoreException): ...
 
 
+class UnresolvedConflictError(CommitFailed): ...
+
+
 class NotALinkError(LoreException): ...
 
 
@@ -216,6 +219,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     # one string only it carries rather than by the generic "Operation not
     # supported" further down.
     ("partial revision hash signature", NotSupportedError),
+    ("is still in conflict", UnresolvedConflictError),
     ("Unable to commit", CommitFailed),
     (
         "Target branch to merge into has a newer revision, merge target branch first",

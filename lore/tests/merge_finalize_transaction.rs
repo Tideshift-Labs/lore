@@ -638,9 +638,10 @@ mod tests {
                     )
                     .await
                     .expect("load competitor repository");
-                    let (current, _) = lore_revision::instance::load_current_anchor(&repository)
-                        .await
-                        .expect("load competitor current anchor");
+                    let (current, _) =
+                        lore_revision::instance::load_current_anchor_boxed(&repository)
+                            .await
+                            .expect("load competitor current anchor");
                     drop(repository);
                     repository::repository_release(&competing_path);
                     current

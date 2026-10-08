@@ -89,11 +89,11 @@ pub async fn create(
     dispatch_call(globals, args, callback, create_local).await
 }
 
-async fn create_local(
+fn create_local(
     globals: LoreGlobalArgs,
     args: LoreBranchCreateArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -116,7 +116,6 @@ async fn create_local(
             .await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -158,11 +157,11 @@ pub async fn info(
     dispatch_call(globals, args, callback, info_local).await
 }
 
-async fn info_local(
+fn info_local(
     globals: LoreGlobalArgs,
     args: LoreBranchInfoArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, info, move |repository, args| {
         let branch_name = args.branch.to_string();
         let link_path = args.link.to_string();
@@ -176,10 +175,9 @@ async fn info_local(
                     .forward::<lore_revision::branch::info::InfoError>("resolving link path")?
             };
 
-            lore_revision::branch::info::info(repository, branch_name).await
+            lore_revision::branch::info::info_boxed(repository, branch_name).await
         }
     })
-    .await
 }
 
 #[repr(C)]
@@ -232,11 +230,11 @@ pub async fn diff(
     dispatch_call(globals, args, callback, diff_local).await
 }
 
-async fn diff_local(
+fn diff_local(
     globals: LoreGlobalArgs,
     args: LoreBranchDiffArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, diff, move |repository, args| {
         lore_revision::branch::diff::diff(
             repository,
@@ -246,7 +244,6 @@ async fn diff_local(
             args.auto_resolve != 0,
         )
     })
-    .await
 }
 
 #[repr(C)]
@@ -288,11 +285,11 @@ pub async fn list(
     dispatch_call(globals, args, callback, list_local).await
 }
 
-async fn list_local(
+fn list_local(
     globals: LoreGlobalArgs,
     args: LoreBranchListArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_read(globals, callback, args, list, move |repository, args| {
         branch::list_output(
             repository,
@@ -301,7 +298,6 @@ async fn list_local(
             args.archived != 0,
         )
     })
-    .await
 }
 
 #[repr(C)]
@@ -365,11 +361,11 @@ pub async fn merge_start(
     dispatch_call(globals, args, callback, merge_start_local).await
 }
 
-async fn merge_start_local(
+fn merge_start_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeStartArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -406,7 +402,6 @@ async fn merge_start_local(
             }
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -450,11 +445,11 @@ pub async fn merge_abort(
     dispatch_call(globals, args, callback, merge_abort_local).await
 }
 
-async fn merge_abort_local(
+fn merge_abort_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeAbortArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -473,7 +468,6 @@ async fn merge_abort_local(
             }
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -514,11 +508,11 @@ pub async fn merge_unresolve(
     dispatch_call(globals, args, callback, merge_unresolve_local).await
 }
 
-async fn merge_unresolve_local(
+fn merge_unresolve_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeUnresolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -528,7 +522,6 @@ async fn merge_unresolve_local(
             branch::merge::branch_merge_unresolve(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -593,11 +586,11 @@ pub async fn merge_into(
     dispatch_call(globals, args, callback, merge_into_local).await
 }
 
-async fn merge_into_local(
+fn merge_into_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeIntoArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -631,7 +624,6 @@ async fn merge_into_local(
             }
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -673,11 +665,11 @@ pub async fn merge_restart(
     dispatch_call(globals, args, callback, merge_restart_local).await
 }
 
-async fn merge_restart_local(
+fn merge_restart_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeRestartArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -687,7 +679,6 @@ async fn merge_restart_local(
             branch::merge::merge_restart(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -728,11 +719,11 @@ pub async fn merge_resolve(
     dispatch_call(globals, args, callback, merge_resolve_local).await
 }
 
-async fn merge_resolve_local(
+fn merge_resolve_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeResolveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -742,7 +733,6 @@ async fn merge_resolve_local(
             branch::merge::branch_merge_resolve(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -783,11 +773,11 @@ pub async fn merge_resolve_mine(
     dispatch_call(globals, args, callback, merge_resolve_mine_local).await
 }
 
-async fn merge_resolve_mine_local(
+fn merge_resolve_mine_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeResolveMineArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -797,7 +787,6 @@ async fn merge_resolve_mine_local(
             branch::merge::merge_resolve_mine(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -838,11 +827,11 @@ pub async fn merge_resolve_theirs(
     dispatch_call(globals, args, callback, merge_resolve_theirs_local).await
 }
 
-async fn merge_resolve_theirs_local(
+fn merge_resolve_theirs_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeResolveTheirsArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -852,7 +841,6 @@ async fn merge_resolve_theirs_local(
             branch::merge::merge_resolve_theirs(repository, &token, args.paths).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -949,6 +937,7 @@ pub struct LoreManagedBranchPushArgs {
     pub args: LoreBranchPushArgs,
 }
 
+#[lore_macro::test_pub]
 async fn push_managed_service_local(
     globals: LoreGlobalArgs,
     args: LoreManagedBranchPushArgs,
@@ -981,7 +970,7 @@ pub async fn push_managed(
         // workflow; no caller-side observer, journal or fence is discarded.
         return crate::remote::call::service_call(
             globals,
-            LoreManagedBranchPushArgs { args },
+            LoreManagedBranchPushArgs { args }.into(),
             callback,
         )
         .await;
@@ -1037,20 +1026,20 @@ async fn push_managed_local(
         .await
 }
 
-async fn push_local(
+fn push_local(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
-) -> i32 {
-    push_journalled(globals, args, callback, None).await
+) -> impl Future<Output = i32> {
+    push_journalled(globals, args, callback, None)
 }
 
-async fn push_journalled(
+fn push_journalled(
     globals: LoreGlobalArgs,
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
     attempts: Option<Arc<dyn AttemptStore>>,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1060,7 +1049,6 @@ async fn push_journalled(
             push_impl(repository, &token, args, attempts).await
         },
     )
-    .await
 }
 
 async fn push_impl(
@@ -1096,8 +1084,14 @@ async fn push_impl_with_runner(
     // dispatch exactly as it did before. An embedder that keeps one reaches here through
     // `push_with_attempt_store`, which is what makes the id it recorded the id the server files a
     // receipt under.
-    lore_revision::branch::push::push_with_runner(repository, token, options, attempts, runner)
-        .await
+    //
+    // Boxed for the reason upstream's `push_boxed` gives (v0.10.1): the push future is large, and
+    // boxing it here keeps it off every caller's frame. The fork's attempt store and managed
+    // runner are what `push_boxed` cannot carry.
+    Box::pin(lore_revision::branch::push::push_with_runner(
+        repository, token, options, attempts, runner,
+    ))
+    .await
 }
 
 #[repr(C)]
@@ -1150,11 +1144,11 @@ pub async fn switch(
     dispatch_call(globals, args, callback, switch_local).await
 }
 
-async fn switch_local(
+fn switch_local(
     globals: LoreGlobalArgs,
     args: LoreBranchSwitchArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1176,7 +1170,6 @@ async fn switch_local(
             repository::branch_switch(repository, &token, branch, options).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -1216,11 +1209,11 @@ pub async fn protect(
     dispatch_call(globals, args, callback, protect_local).await
 }
 
-async fn protect_local(
+fn protect_local(
     globals: LoreGlobalArgs,
     args: LoreBranchProtectArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1232,7 +1225,6 @@ async fn protect_local(
             branch::protect(repository, branch.id).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -1272,11 +1264,11 @@ pub async fn unprotect(
     dispatch_call(globals, args, callback, unprotect_local).await
 }
 
-async fn unprotect_local(
+fn unprotect_local(
     globals: LoreGlobalArgs,
     args: LoreBranchUnprotectArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1288,7 +1280,6 @@ async fn unprotect_local(
             branch::unprotect(repository, branch.id).await
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -1344,11 +1335,11 @@ pub async fn archive(
     dispatch_call(globals, args, callback, archive_local).await
 }
 
-async fn archive_local(
+fn archive_local(
     globals: LoreGlobalArgs,
     args: LoreBranchArchiveArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1356,7 +1347,6 @@ async fn archive_local(
         archive,
         |repository, _token, args| archive_impl(repository, args),
     )
-    .await
 }
 
 async fn archive_impl(
@@ -1376,7 +1366,7 @@ async fn archive_impl(
     // Make sure branch is not current
     let mut local_current = false;
     if let Ok((_revision, current_branch)) =
-        lore_revision::instance::load_current_anchor(&repository).await
+        lore_revision::instance::load_current_anchor_boxed(&repository).await
         && current_branch == branch.id
     {
         lore_error!("Cannot archive the current branch");
@@ -1443,6 +1433,7 @@ async fn archive_impl(
 
 /// A layer or link is a separate repository owning its own branch lifecycle, and
 /// archiving deletes, so the cascade is asked for rather than assumed.
+#[lore_macro::test_pub]
 #[derive(Debug)]
 enum CascadeScope {
     OuterOnly,
@@ -1454,6 +1445,7 @@ impl CascadeScope {
     /// The CLI rejects the pair at the parser, but the IPC and C ABI callers
     /// reach these fields directly, where silently preferring one would archive
     /// somewhere the caller did not ask for.
+    #[lore_macro::test_pub]
     fn new(
         path: &LoreString,
         include_all: u8,
@@ -1594,11 +1586,11 @@ pub async fn reset(
     dispatch_call(globals, args, callback, reset_local).await
 }
 
-async fn reset_local(
+fn reset_local(
     globals: LoreGlobalArgs,
     args: LoreBranchResetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1606,7 +1598,6 @@ async fn reset_local(
         reset,
         |repository, token, args| async move { reset_impl(repository, &token, args).await },
     )
-    .await
 }
 
 async fn reset_impl(
@@ -1624,7 +1615,8 @@ async fn reset_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[handler(latest_list_local)]
 /// Arguments for listing a branch's LATEST revision history.
 pub struct LoreBranchLatestListArgs {
     /// Branch to list, current branch if empty
@@ -1633,11 +1625,39 @@ pub struct LoreBranchLatestListArgs {
     pub limit: u32,
 }
 
+/// Lists a branch's LATEST revision history, most recent first.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Branch Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::BranchLatestListEntry`](crate::interface::LoreEvent::BranchLatestListEntry) | Emitted for each revision the branch LATEST has held, most recent first |
 pub async fn latest_list(
     globals: LoreGlobalArgs,
     args: LoreBranchLatestListArgs,
     callback: LoreEventCallback,
 ) -> i32 {
+    dispatch_call(globals, args, callback, latest_list_local).await
+}
+
+fn latest_list_local(
+    globals: LoreGlobalArgs,
+    args: LoreBranchLatestListArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1645,7 +1665,6 @@ pub async fn latest_list(
         latest_list,
         |repository, _token, args| latest_list_impl(repository, args),
     )
-    .await
 }
 
 async fn latest_list_impl(
@@ -1681,11 +1700,12 @@ async fn resolve_branch_id_or_current(
     branch: &str,
 ) -> Result<BranchId, BranchMetadataError> {
     if branch.is_empty() {
-        let (_revision, current_branch) = lore_revision::instance::load_current_anchor(&repository)
-            .await
-            .map_err(|_err| lore_base::error::InvalidArguments {
-                reason: "no current branch to operate on; specify --branch".into(),
-            })?;
+        let (_revision, current_branch) =
+            lore_revision::instance::load_current_anchor_boxed(&repository)
+                .await
+                .map_err(|_err| lore_base::error::InvalidArguments {
+                    reason: "no current branch to operate on; specify --branch".into(),
+                })?;
         return Ok(current_branch);
     }
 
@@ -1707,11 +1727,11 @@ pub async fn metadata_get(
     dispatch_call(globals, args, callback, metadata_get_local).await
 }
 
-async fn metadata_get_local(
+fn metadata_get_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMetadataGetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1728,7 +1748,7 @@ async fn metadata_get_local(
                 let branch_id =
                     resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
-                lore_revision::metadata::branch::get(
+                lore_revision::metadata::branch::get_boxed(
                     repository,
                     branch_id,
                     key.as_deref(),
@@ -1738,7 +1758,6 @@ async fn metadata_get_local(
             }
         },
     )
-    .await
 }
 
 #[repr(C)]
@@ -1765,11 +1784,11 @@ pub async fn metadata_set(
     dispatch_call(globals, args, callback, metadata_set_local).await
 }
 
-async fn metadata_set_local(
+fn metadata_set_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMetadataSetArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1777,7 +1796,6 @@ async fn metadata_set_local(
         metadata_set,
         |repository, _token, args| metadata_set_impl(repository, args),
     )
-    .await
 }
 
 async fn metadata_set_impl(
@@ -1816,7 +1834,8 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::branch::set(repository, branch_id, &keys, &values, &formats).await
+    lore_revision::metadata::branch::set_boxed(repository, branch_id, &keys, &values, &formats)
+        .await
 }
 
 #[repr(C)]
@@ -1839,11 +1858,11 @@ pub async fn metadata_clear(
     dispatch_call(globals, args, callback, metadata_clear_local).await
 }
 
-async fn metadata_clear_local(
+fn metadata_clear_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMetadataClearArgs,
     callback: LoreEventCallback,
-) -> i32 {
+) -> impl Future<Output = i32> {
     repository_call_write(
         globals,
         callback,
@@ -1857,211 +1876,8 @@ async fn metadata_clear_local(
                     resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::branch::clear(repository, branch_id, &key_refs).await
+                lore_revision::metadata::branch::clear_boxed(repository, branch_id, &key_refs).await
             }
         },
     )
-    .await
 }
-
-#[cfg(test)]
-mod tests {
-    use lore_base::error::InvalidArguments;
-    use lore_error_set::FfiError;
-    use lore_revision::interface::LoreEventCallbackConfig;
-    use lore_transport::VolatileAttemptStore;
-
-    use super::*;
-    use crate::call_delegation::tests::service_env_child;
-
-    // Accepted as a source-level fact, not tested: `push` (via `push_local`) still reaches
-    // `push_journalled` with `None`, exactly as it did before `push_with_attempt_store` existed.
-    // The claim is one literal at one call site (`push_local`'s `push_journalled(globals, args,
-    // callback, None)`, above in this file). Getting it wrong costs an extra attempt record, not
-    // lost correctness -- the cheap direction of that failure -- so it does not earn a live tier.
-    // Ruled by team-lead and the receipt-client-binding lane, 2026-09.
-    //
-    // The reason recorded here in that ruling -- that no live-connected `RepositoryContext`
-    // fixture existed anywhere in this codebase -- no longer holds. One exists now
-    // (`lore_revision::live_fixture`), and the sibling claim it was blocking, that
-    // `push_with_attempt_store` forwards the store it was given, is proven against it in
-    // `lore/tests/live_push_journal.rs`. This literal is still not worth a live test, but for the
-    // reason above rather than for want of a fixture.
-
-    /// The same status shape `crate::call_delegation::reject_call` uses for every other
-    /// pre-command rejection, so this refusal cannot be told apart from one of those by a
-    /// caller inspecting the status alone.
-    fn undelegatable_status() -> i32 {
-        InvalidArguments {
-            reason: String::new(),
-        }
-        .ffi_code()
-    }
-
-    fn no_callback() -> LoreEventCallback {
-        lore_revision::event::convert_event_callback(LoreEventCallbackConfig {
-            user_context: 0,
-            func: None,
-        })
-    }
-
-    /// `push_with_attempt_store` must refuse under `LORE_USE_SERVICE` rather than delegate --
-    /// see the function's own doc comment for why a delegated push would strand the caller's
-    /// journal. The repository path is deliberately nonexistent and the store deliberately
-    /// records every call it receives: either one being touched would mean the refusal ran too
-    /// late, after the code had already started the operation it exists to prevent.
-    #[test]
-    fn push_with_attempt_store_refuses_when_delegation_is_requested() {
-        if !service_env_child(
-            "branch::tests::push_with_attempt_store_refuses_when_delegation_is_requested",
-            &[Some("1")],
-        ) {
-            return;
-        }
-
-        let globals = LoreGlobalArgs {
-            repository_path: LoreString::from_str(
-                "Z:/lore-push-with-attempt-store-test-nonexistent-9f3c2a",
-            ),
-            ..LoreGlobalArgs::default()
-        };
-        let args = LoreBranchPushArgs {
-            branch: LoreString::default(),
-            fast_forward_merge: 0,
-        };
-        let store = Arc::new(VolatileAttemptStore::new());
-        let attempts: Arc<dyn AttemptStore> = store.clone();
-
-        let status = crate::runtime().block_on(push_with_attempt_store(
-            globals,
-            args,
-            no_callback(),
-            attempts,
-        ));
-
-        assert_eq!(
-            status,
-            undelegatable_status(),
-            "the refusal must use the same status shape every other pre-command rejection uses"
-        );
-        assert!(
-            crate::runtime()
-                .block_on(store.unresolved())
-                .expect("unresolved() must succeed on a fresh store")
-                .is_empty(),
-            "the attempt store must never be touched when the call is refused before it runs"
-        );
-    }
-
-    /// An old client's payload is this one without the field it never knew, so
-    /// it is built by removing the field rather than by transcribing the shape.
-    fn without_inherit_metadata<T: serde::Serialize>(args: &T) -> serde_json::Value {
-        let mut payload = serde_json::to_value(args).expect("args must serialise");
-        payload
-            .as_object_mut()
-            .expect("args serialise to an object")
-            .remove("inherit_metadata")
-            .expect("the field must be present before it is removed");
-        payload
-    }
-
-    #[test]
-    fn merge_start_args_old_payload_missing_inherit_metadata_uses_default() {
-        // Old IPC client payload with no inherit_metadata field. The new field
-        // must be `#[serde(default)]` so old clients keep working.
-        let payload = without_inherit_metadata(&LoreBranchMergeStartArgs {
-            branch: "feature".into(),
-            message: "merge feature".into(),
-            no_commit: 0,
-            link: Default::default(),
-            ignore_links: 0,
-            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("change-request")]),
-        });
-
-        let args: LoreBranchMergeStartArgs =
-            serde_json::from_value(payload).expect("old payload must deserialise");
-
-        assert_eq!(args.branch.as_str(), "feature");
-        assert_eq!(args.message.as_str(), "merge feature");
-        assert!(args.inherit_metadata.as_slice().is_empty());
-    }
-
-    #[test]
-    fn merge_into_args_old_payload_missing_inherit_metadata_uses_default() {
-        let payload = without_inherit_metadata(&LoreBranchMergeIntoArgs {
-            branch: "main".into(),
-            branch_id: Default::default(),
-            message: "merge into main".into(),
-            link: Default::default(),
-            ignore_links: 0,
-            inherit_metadata: LoreArray::from_vec(vec![LoreString::from("*")]),
-        });
-
-        let args: LoreBranchMergeIntoArgs =
-            serde_json::from_value(payload).expect("old payload must deserialise");
-
-        assert_eq!(args.branch.as_str(), "main");
-        assert!(args.inherit_metadata.as_slice().is_empty());
-    }
-
-    #[test]
-    fn archive_args_old_payload_missing_cascade_fields_uses_defaults() {
-        // Old IPC client payload with no layer or link fields. The new fields
-        // must be `#[serde(default)]` so old clients keep working.
-        let payload = r#"{ "branch": "feature" }"#;
-
-        let args: LoreBranchArchiveArgs =
-            serde_json::from_str(payload).expect("old payload must deserialise");
-
-        assert_eq!(args.branch.as_str(), "feature");
-        assert_eq!(args.layer.as_str(), "");
-        assert_eq!(args.include_layers, 0);
-        assert_eq!(args.link.as_str(), "");
-        assert_eq!(args.include_links, 0);
-    }
-
-    #[test]
-    fn archive_args_layer_payload_missing_link_fields_uses_defaults() {
-        // A client that knows the layer fields but not the link ones.
-        let payload = r#"{ "branch": "feature", "layer": "lay", "include_layers": 1 }"#;
-
-        let args: LoreBranchArchiveArgs =
-            serde_json::from_str(payload).expect("layer payload must deserialise");
-
-        assert_eq!(args.layer.as_str(), "lay");
-        assert_eq!(args.include_layers, 1);
-        assert_eq!(args.link.as_str(), "");
-        assert_eq!(args.include_links, 0);
-    }
-
-    #[test]
-    fn cascade_scope_maps_each_field_combination() {
-        assert!(matches!(
-            CascadeScope::new(&LoreString::from(""), 0, "link", "include_links"),
-            Ok(CascadeScope::OuterOnly)
-        ));
-        assert!(matches!(
-            CascadeScope::new(&LoreString::from(""), 1, "link", "include_links"),
-            Ok(CascadeScope::All)
-        ));
-        assert!(matches!(
-            CascadeScope::new(&LoreString::from("lnk"), 0, "link", "include_links"),
-            Ok(CascadeScope::Single(path)) if path == "lnk"
-        ));
-    }
-
-    #[test]
-    fn cascade_scope_rejects_a_path_together_with_include_all() {
-        let scope = CascadeScope::new(&LoreString::from("lnk"), 1, "link", "include_links");
-
-        let err = scope.expect_err("a path with include_all must be refused");
-        assert!(
-            err.to_string().contains("link and include_links"),
-            "expected the conflicting fields to be named, got: {err}"
-        );
-    }
-}
-
-#[cfg(test)]
-#[path = "branch_managed_service_tests.rs"]
-mod managed_service_tests;

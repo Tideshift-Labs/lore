@@ -14,10 +14,8 @@ pub mod query;
 pub mod service;
 pub mod verify;
 
-#[cfg(test)]
-pub(crate) mod test_utils;
-
 /// Backpressure limit for streaming storage handlers — matches the QUIC public stream handler's 500 per stream × 8 streams = 4000 per connection so gRPC (single stream per connection) gets equivalent per-connection parallelism.
+#[lore_macro::test_pub]
 pub(crate) const STREAM_PROCESS_LIMIT: usize = 4000;
 
 /// Shared by the streaming handlers because each reports an item's outcome from two places —
@@ -114,6 +112,7 @@ pub(crate) fn put_task_concurrency() -> usize {
 /// zero) is warned about and falls back — otherwise a dev misconfig would silently
 /// re-manifest as the very 0 B/s `LocalStack` livelock CR-013 exists to prevent,
 /// rather than surfacing. Absent = the normal prod path, no warning.
+#[lore_macro::test_pub]
 fn parse_put_concurrency(raw: Option<String>) -> usize {
     let Some(value) = raw else {
         return STREAM_PROCESS_LIMIT;
@@ -128,42 +127,5 @@ fn parse_put_concurrency(raw: Option<String>) -> usize {
             );
             STREAM_PROCESS_LIMIT
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::STREAM_PROCESS_LIMIT;
-    use super::parse_put_concurrency;
-
-    #[test]
-    fn parses_a_positive_override() {
-        assert_eq!(parse_put_concurrency(Some("32".to_string())), 32);
-    }
-
-    #[test]
-    fn absent_falls_back_to_default() {
-        assert_eq!(parse_put_concurrency(None), STREAM_PROCESS_LIMIT);
-    }
-
-    #[test]
-    fn invalid_present_values_fall_back_to_default() {
-        // zero, negative, non-numeric, and empty all revert to the default.
-        assert_eq!(
-            parse_put_concurrency(Some("0".to_string())),
-            STREAM_PROCESS_LIMIT
-        );
-        assert_eq!(
-            parse_put_concurrency(Some("-4".to_string())),
-            STREAM_PROCESS_LIMIT
-        );
-        assert_eq!(
-            parse_put_concurrency(Some("nope".to_string())),
-            STREAM_PROCESS_LIMIT
-        );
-        assert_eq!(
-            parse_put_concurrency(Some(String::new())),
-            STREAM_PROCESS_LIMIT
-        );
     }
 }

@@ -114,7 +114,7 @@ def test_amend_updates_committer_keeps_creator(new_lore_repo):
 
 @pytest.mark.smoke
 def test_clone_persists_explicit_identity_to_config(
-    new_lore_repo, managed_cli_identity
+    new_lore_repo, managed_cli_identity, global_dir_name
 ):
     """
     `lore clone --identity X` writes `identity = "X"` into the new clone's
@@ -134,9 +134,9 @@ def test_clone_persists_explicit_identity_to_config(
         subject = auth.subject(alternate)
         assert subject != original_subject
         auth.grant(alternate, repo.get_id())
-        auth.login(repo.lore_executable_path, repo.global_dir, remote, alternate)
+        auth.login(repo.lore_executable_path, global_dir_name, remote, alternate)
         # Re-select the original default so ignoring --identity cannot pass.
-        auth.login(repo.lore_executable_path, repo.global_dir, remote, token)
+        auth.login(repo.lore_executable_path, global_dir_name, remote, token)
         cloned = repo.clone(identity=subject)
         assert _read_identity_in_config(cloned) == subject
     finally:

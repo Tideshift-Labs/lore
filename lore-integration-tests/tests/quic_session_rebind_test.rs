@@ -50,8 +50,11 @@ mod quic_session_rebind_tests {
     use lore_server::auth::jwk::JWKServiceError;
     use lore_server::auth::jwt::JwtVerifier;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+    use lore_server::authnz::repository_catalog::BaselineRepositoryCatalog;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
+    use lore_server::grpc::server::GrpcTimeouts;
     use lore_server::hooks::HookDispatcher;
     use lore_server::protocol::attribute_map::AttributeMap;
     use lore_server::protocol::attribute_map::ConnectionId;
@@ -71,6 +74,7 @@ mod quic_session_rebind_tests {
     use lore_server::quic::stream_handler::StreamHandler;
     use lore_server::quic::tests::TEST_PROTOCOL_V4;
     use lore_server::quic::tests::server_certs;
+    use lore_server::settings::BaselineAccess;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
@@ -382,13 +386,14 @@ mod quic_session_rebind_tests {
             hold_answered_error: Option<HoldAnsweredError>,
             jwt_verifier: Arc<Option<JwtVerifier>>,
         ) -> Self {
+            let repository_authorizer = production_authorizer(jwt_verifier.as_ref().is_some());
             let mut service_store = ServiceStore::default();
             service_store.add_service(
                 TEST_PROTOCOL_V4,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let inner = StorageServiceV4::new(
                         jwt_verifier.clone(),
-                        Arc::new(AllowAllRepositoryAuthorizer),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         immutable_store.clone(),
                         mutable_store.clone(),
@@ -439,7 +444,8 @@ mod quic_session_rebind_tests {
     // Every other QUIC suite in this crate runs auth-OFF, so there is no live authorization
     // decision in them to force closed. What follows is the smallest harness that gives
     // `AuthorizeStart` a REAL decision to make: `lore_server`'s own `JwtVerifier`, its own
-    // `verify_token`, and its own `verify_authorization`. Nothing here reimplements
+    // `verify_token`, and the `RepositoryAuthorizer` production builds for this configuration
+    // (`production_authorizer`). Nothing here reimplements
     // verification -- the only test-local part is where the signing key comes from and how a
     // token's claims are minted.
     //
@@ -516,14 +522,37 @@ mod quic_session_rebind_tests {
     /// credential under test.
     const TEST_JWT_AUDIENCE: &str = "wp108-b4-audience";
 
-    /// A verifier with the audience pinned and the issuer left open, so the only things it can
-    /// reject a well-formed token for are the two B4 cares about: an expired `exp`, and a
-    /// `resources` list that does not cover the repository the session is being started for.
+    /// The repository authorizer a production server builds for this fixture's configuration,
+    /// through the same constructor startup uses. Auth off (no verifier) selects `AllowAll`. With a
+    /// verifier, upstream v0.10.1 decides repository reach in the authorizer, not the verifier,
+    /// so pairing a verifier with `AllowAll` would admit a token for any repository. The fixture's
+    /// tokens carry a `resources` claim, which is the fork's `ResourceGrants` configuration
+    /// (`resource_claim = "resources"`).
+    fn production_authorizer(auth_on: bool) -> Arc<dyn RepositoryAuthorizer> {
+        if !auth_on {
+            return Arc::new(AllowAllRepositoryAuthorizer);
+        }
+        let auth: lore_server::settings::AuthSettings = serde_json::from_value(serde_json::json!({
+            "jwt_issuer": "wp108-b4-issuer",
+            "jwt_audience": [TEST_JWT_AUDIENCE],
+            "resource_claim": "resources",
+        }))
+        .expect("the fixture's [server.auth] settings parse");
+        lore_server::authnz::repository_authorizer::repository_authorizer(Some(&auth), None)
+            .expect("ResourceGrants is a valid selection")
+    }
+
+    /// A verifier with the audience pinned and the issuer left open, so the only thing it can
+    /// reject a well-formed token for is the one B4 arm 1 cares about: an expired `exp`. A
+    /// `resources` list that does not cover the repository is refused by the authorizer instead.
     fn test_jwt_verifier() -> Arc<Option<JwtVerifier>> {
         Arc::new(Some(JwtVerifier {
             jwk_service: Arc::new(StaticJwkService),
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_JWT_AUDIENCE.to_string()]),
+            // Upstream v0.10.1 fields: no `typ` check, and the default `sub` identity claim.
+            jwt_typ: None,
+            identity_claim: lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
         }))
     }
 
@@ -537,8 +566,9 @@ mod quic_session_rebind_tests {
     /// Mint a token carrying every claim `AuthorizationToken` declares, so `verify_token` takes
     /// its primary decode path rather than the `JWTUserInfo` fallback.
     ///
-    /// `authorized_repositories` become `resources` entries, which is what
-    /// `verify_authorization` matches against `urc-{repository}`. `expires_at` is an absolute
+    /// `authorized_repositories` become `resources` entries, which the session's
+    /// `ResourceGrantsAuthorizer` (see [`production_authorizer`]) matches against
+    /// `urc-{repository}`. `expires_at` is an absolute
     /// unix second: a value in the past is an expired credential, with no clock to control and
     /// nothing to wait for.
     fn mint_token(authorized_repositories: &[RepositoryId], expires_at: u64) -> String {
@@ -680,6 +710,11 @@ mod quic_session_rebind_tests {
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
+            let repository_catalog = Arc::new(BaselineRepositoryCatalog::new(
+                BaselineAccess::Reachable,
+                immutable.clone(),
+                mutable.clone(),
+            ));
             let outcome = GrpcServerBuilder::new()
                 .with_environment(environment)
                 .with_feature(FeatureSettings::default())
@@ -695,12 +730,20 @@ mod quic_session_rebind_tests {
                 .with_http2_config(
                     None,
                     None,
-                    Duration::from_secs(30),
+                    GrpcTimeouts {
+                        request_handler: Duration::from_secs(30),
+                        authorization: Duration::from_secs(30),
+                    },
                     Default::default(),
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None, false, Arc::new(AllowAllRepositoryAuthorizer))
+                .with_jwt_verifier(
+                    None,
+                    false,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    repository_catalog,
+                )
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;
@@ -1309,7 +1352,7 @@ mod quic_session_rebind_tests {
             .expect("the initial session_start must be authorized by the initial credential");
 
         // Epoch N is genuinely authorized: this succeeds only because the server verified the
-        // token AND `verify_authorization` matched the repository. Without it, a later failure
+        // token AND the repository authorizer matched the repository. Without it, a later failure
         // could just as well mean the harness never authorized anything in the first place.
         let (fragment, address, payload) = random_fragment();
         session
@@ -1468,7 +1511,8 @@ mod quic_session_rebind_tests {
     // re-runs `session_start`, and `session_start` is where the server re-checks authorization.
     // The two arms below drive the two failures `lore_server`'s own verifier can make
     // deterministically -- an expired `exp` rejected by `JwtVerifier::verify_token`, and a
-    // `resources` list that no longer covers the repository, rejected by `verify_authorization`.
+    // `resources` list that no longer covers the repository, rejected by the repository
+    // authorizer (`ResourceGrantsAuthorizer`).
     // Both are absolute facts about the token, so neither arm waits for anything or depends on
     // how long a step took.
     //
@@ -1510,7 +1554,7 @@ mod quic_session_rebind_tests {
 
     /// B4 arm 2: a credential that is still valid but no longer covers this repository -- a
     /// revocation of the grant rather than of the token -- fails the replacement `session_start`
-    /// closed at `verify_authorization`.
+    /// closed at the repository authorizer.
     #[tokio::test]
     async fn b4_replacement_authorization_fails_closed_on_a_revoked_grant() -> TestResult {
         let execution = setup_execution("test".to_string());
@@ -1523,7 +1567,7 @@ mod quic_session_rebind_tests {
                         .await;
 
                 // Unexpired, correctly signed, and authorized for some OTHER repository. Only
-                // `verify_authorization` can refuse this one.
+                // the repository authorizer can refuse this one.
                 let revoked = mint_token(&[random::<RepositoryId>()], now + 3600);
                 let (result, log, observations) =
                     run_after_credential_change(scenario, &revoked).await;

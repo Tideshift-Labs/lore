@@ -183,6 +183,99 @@ pub async fn test_repository_create(
     }
 }
 
+/// A context over `instance` whose view holds `globs` and whose ignore slot is empty, a leading
+/// `!` re-including as it does in a view file.
+///
+/// Each call mints its own filter, so two contexts hold different ones whether or not their
+/// rules agree -- which is what a diff reads as two views.
+#[allow(dead_code)]
+pub fn test_view_context(
+    instance: &TestRepository,
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    globs: &[&str],
+) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+    test_filter_context(instance, immutable_store, mutable_store, &[], globs)
+}
+
+/// [`test_view_context`] with `ignore` in the ignore slot, for a test that has to tell the two
+/// slots apart. A repository opened for real holds rules in both.
+#[allow(dead_code)]
+pub fn test_filter_context(
+    instance: &TestRepository,
+    immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    ignore: &[&str],
+    view: &[&str],
+) -> std::sync::Arc<lore_revision::repository::RepositoryContext> {
+    let mut filter = lore_revision::filter::Filter::default();
+    for (slot, globs) in [(&mut filter.ignore, ignore), (&mut filter.view, view)] {
+        for glob in globs {
+            match glob.strip_prefix('!') {
+                Some(inclusion) => slot.add_inclusion(inclusion).expect("Filter inclusion"),
+                None => slot.add_exclusion(glob).expect("Filter exclusion"),
+            }
+        }
+    }
+    std::sync::Arc::new(lore_revision::repository::RepositoryContext::new(
+        default_repository_creation_args(immutable_store, mutable_store)
+            .with_path(&instance.path)
+            .with_id(instance.repository.id)
+            .with_instance_id(instance.repository.instance_id)
+            .with_filter(std::sync::Arc::new(filter)),
+    ))
+}
+
+/// Stages the whole working tree of `instance` and commits it, answering the state of the
+/// revision that produced.
+///
+/// Scans rather than reading dirty flags, so a fixture that wrote its files directly is staged
+/// whole.
+#[allow(dead_code)]
+pub async fn test_commit_tree(
+    instance: &TestRepository,
+    message: &str,
+) -> std::sync::Arc<lore_revision::state::State> {
+    lore_revision::file::stage::stage(
+        instance.repository.clone(),
+        &instance.write_token,
+        lore_revision::interface::LoreArray::from_vec(vec![
+            lore_revision::interface::LoreString::from(&instance.path),
+        ]),
+        lore_revision::stage::StageOptions {
+            scan: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to stage the fixture");
+    test_commit(instance, message).await
+}
+
+/// Commits what `instance` holds staged, answering the state of the revision that produced.
+///
+/// For a fixture that staged something narrower than the whole tree, such as a move.
+#[allow(dead_code)]
+pub async fn test_commit(
+    instance: &TestRepository,
+    message: &str,
+) -> std::sync::Arc<lore_revision::state::State> {
+    lore_revision::commit::commit_boxed(
+        instance.repository.clone(),
+        &instance.write_token,
+        lore_revision::commit::CommitOptions::new(message.to_string()),
+    )
+    .await
+    .expect("Commit failed");
+    let (revision, _branch) =
+        lore_revision::instance::load_current_anchor_boxed(&instance.repository)
+            .await
+            .expect("Failed to load current anchor");
+    lore_revision::state::State::deserialize(instance.repository.clone(), revision)
+        .await
+        .expect("Failed to deserialize the committed state")
+}
+
 /// Creates (or truncates) the file at `path` and writes `contents` to it.
 ///
 /// Panics on failure, since a fixture the test cannot write invalidates what it
@@ -258,7 +351,8 @@ pub async fn test_scan_path_with_intent(
     .collect()
     .await
     .expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -302,7 +396,8 @@ pub async fn test_scan_streaming(
         changes.push(change);
     }
     stream.finish().await.expect("Failed to diff filesystem");
-    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+    operation
+        .finalize()
         .await
         .expect("Failed to finish filesystem operation");
     changes
@@ -317,7 +412,7 @@ pub async fn test_anchor_states(
     std::sync::Arc<lore_revision::state::State>,
     std::sync::Arc<lore_revision::state::State>,
 ) {
-    let (revision, _branch) = lore_revision::instance::load_current_anchor(repository)
+    let (revision, _branch) = lore_revision::instance::load_current_anchor_boxed(repository)
         .await
         .expect("Failed to load current anchor");
     let current = lore_revision::state::State::deserialize(repository.clone(), revision)
@@ -337,4 +432,21 @@ pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::Execut
             "test-user".to_string(),
         ),
     )
+}
+
+/// The action letter against the path for each change, as a walk's consumers read it.
+///
+/// The action is carried because two sides route a path by which of them admits it, and a path
+/// alone does not say which route it took.
+#[allow(dead_code)]
+pub fn test_reported(changes: &[lore_revision::change::NodeChange]) -> Vec<(String, String)> {
+    changes
+        .iter()
+        .map(|change| {
+            (
+                change.action.as_string_short().to_string(),
+                change.path().as_str().to_string(),
+            )
+        })
+        .collect()
 }

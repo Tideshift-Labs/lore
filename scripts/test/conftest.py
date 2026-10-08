@@ -19,7 +19,7 @@ from time import monotonic, sleep
 import pytest
 
 from cleanup_util import remove_tree
-from lore import Lore
+from lore import Lore, lore_test_env
 from lore_server import (
     _get_shared_tmp_dir,
     _get_worker_id,
@@ -32,7 +32,6 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
-    MACHINE_SETTINGS_PREFIX,
     service_supported,
     stop_lore_service,
 )
@@ -149,6 +148,7 @@ def new_lore_repo(
     lore_remote_url,
     tmp_path_factory,
     global_dir_name,
+    lore_subprocess_env,
     keep_test_data,
 ):
     """
@@ -207,7 +207,7 @@ def new_lore_repo(
             lore_executable_path=lore_executable_path,
             path=path,
             name=name,
-            global_dir=global_dir_name,
+            base_env=lore_subprocess_env,
             environment_vars=environment_vars,
             remote_path=remote_path,
             remote_url=remote_url,
@@ -414,6 +414,22 @@ def global_dir_name(tmp_path_factory, keep_test_data):
         remove_tree(path, label="global directory")
 
 
+@pytest.fixture(scope="function")
+def lore_subprocess_env(global_dir_name):
+    """Environment for spawning Lore as a subprocess outside the `Lore` wrapper.
+
+    Use this when a test needs to spawn the Lore binary directly, such as when
+    killing a process mid-operation or reading streaming output. The returned
+    environment isolates the command to this test's global directory and
+    credentials.
+
+    For commands run through a `Lore` instance, use `repo.sandboxed_env()`
+    instead, which includes repository-specific environment variables and
+    names the service executable when `LORE_USE_SERVICE` is set.
+    """
+    return lore_test_env(global_dir_name)
+
+
 def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
     """Block until the service reports that it has bound its socket.
 
@@ -437,9 +453,14 @@ def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
 
 class TrackedServices(object):
     def __init__(
-        self, lore_executable_path: str, global_dir_name: str, environment_vars=None
+        self,
+        lore_executable_path: str,
+        lore_subprocess_env: dict[str, str],
+        global_dir_name: str,
+        environment_vars: dict[str, str] | None = None,
     ):
         self.lore_executable_path = lore_executable_path
+        self.lore_subprocess_env = lore_subprocess_env
         self.global_dir_name = global_dir_name
         self.environment_vars = environment_vars or {}
         self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
@@ -450,10 +471,10 @@ class TrackedServices(object):
         where the client looks for them."""
         assert self.service_processes.get(directory) is None
 
-        env = os.environ.copy()
+        env = self.lore_subprocess_env.copy()
+        # The managed identity's settings (its CA bundle and the same global and
+        # auth paths) layer over the isolated base environment.
         env.update(self.environment_vars)
-        env["LORE_GLOBAL_PATH"] = self.global_dir_name
-        env.setdefault("LORE_AUTH_PATH", self.global_dir_name)
 
         # Redirected to a file rather than a pipe: the readiness line is read
         # from it, and a pipe nobody drains would stall a service that outlives
@@ -524,7 +545,9 @@ class TrackedServices(object):
         )
     ],
 )
-def lore_service_runner(request, lore_executable_path, global_dir_name):
+def lore_service_runner(
+    request, lore_executable_path, lore_subprocess_env, global_dir_name
+):
     """Provides a utility able to start the Lore service process, and cleans up any un-terminated service when the test
     ends.
     Automatically marks any test using this as skipped if services aren't supported and as part of the lore_service
@@ -539,7 +562,7 @@ def lore_service_runner(request, lore_executable_path, global_dir_name):
         auth, _, _ = request.getfixturevalue("managed_cli_identity")
         environment_vars = auth.environment(global_dir_name)
     tracked_services = TrackedServices(
-        lore_executable_path, global_dir_name, environment_vars
+        lore_executable_path, lore_subprocess_env, global_dir_name, environment_vars
     )
 
     yield tracked_services
@@ -573,7 +596,7 @@ def lore_service_socket():
 
 
 @pytest.fixture(scope="function")
-def no_lore_service(lore_service_runner):
+def stops_background_services(lore_service_runner):
     """Leaves no service running for a test whose commands must start one, and
     stops whatever they started once the test ends.
 
@@ -883,6 +906,11 @@ def auto_lore_local_server(
         else:
             pytest.fail("Timed out waiting for Lore server to start on gw0")
         yield
+
+
+# Names the directory the suite stands in for the machine's Lore settings with,
+# so that a test can tell it apart from a developer's own.
+MACHINE_SETTINGS_PREFIX = "lore_machine_settings_"
 
 
 def _sandbox_machine_settings(config):

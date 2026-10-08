@@ -181,8 +181,17 @@ pub struct MessageToServer {
 }
 
 impl MessageToServer {
-    pub async fn invoke(self, callback: LoreEventCallback) -> i32 {
-        self.command.invoke_local(self.globals, callback).await
+    /// Starts the command's handler in this process. The caller pins the future before awaiting
+    /// it, for the reason `LoreCommand::invoke_local` gives.
+    ///
+    /// Resolves a relative repository path against the caller's working directory first, since
+    /// this process runs in a directory unrelated to the caller's. An empty path names no
+    /// repository and is left empty.
+    pub fn invoke(mut self, callback: LoreEventCallback) -> impl Future<Output = i32> {
+        if !self.globals.repository_path.is_empty() {
+            crate::call::resolve_repository_path(&mut self.globals);
+        }
+        self.command.invoke_local(self.globals, callback)
     }
 }
 

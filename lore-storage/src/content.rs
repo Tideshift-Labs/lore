@@ -97,12 +97,12 @@ impl<'a> ContentSource<'a> {
             })
     }
 
-    /// The whole content at once, naming it rather than opening it, for a comparison that
-    /// settles without a handle. A caller holding one reads through
-    /// [`ContentHandle::read_all`] instead of naming the content twice.
+    /// The whole content at once, naming it rather than opening it, which reads it in one
+    /// dispatch. A caller already holding a handle reads through [`ContentHandle::read_all`]
+    /// instead of naming the content twice.
     ///
     /// The caller budgets for holding the content resident.
-    pub(crate) async fn read_all(&self) -> Result<Bytes, StorageError> {
+    pub async fn read_all(&self) -> Result<Bytes, StorageError> {
         let path = self.host_path();
         lore_io::IoDriver::global()
             .read_file_bytes(path)
@@ -120,6 +120,7 @@ impl<'a> ContentSource<'a> {
     /// internal fault for what is an argument error. Both are `InvalidArguments` on the first
     /// attempt. Everything else keeps the back-off, which is there for a reader holding the file
     /// open on Windows.
+    #[lore_macro::test_pub]
     pub(crate) async fn open(&self) -> Result<(ContentHandle, u64), StorageError> {
         let path = self.host_path();
         let mut retry = crate::retry(10, 10_000, 10);
@@ -245,6 +246,7 @@ impl ContentHandle {
 /// `IsADirectory`. Without this, a directory spends the whole back-off and ends as an internal
 /// fault instead of `InvalidArguments`. The path stat runs only on those two failure kinds, so a
 /// successful open still costs nothing extra. Upstream PR candidate.
+#[lore_macro::test_pub]
 async fn names_something_not_a_file(path: &Path, err: &std::io::Error) -> bool {
     if !matches!(
         err.kind(),
@@ -277,106 +279,4 @@ async fn open_read(path: &Path) -> std::io::Result<(lore_io::IoFile, u64)> {
         ));
     }
     Ok((file, metadata.len()))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Error;
-    use std::io::ErrorKind;
-    use std::time::Duration;
-    use std::time::Instant;
-
-    use super::*;
-    use crate::test_util::TempDir;
-
-    // `open` has no failure-injection seam: it calls the process-global IO driver directly. So the
-    // retryable branch is pinned by testing the classifier `open` consults, with the failure kinds
-    // the branch keys on, and the directory branch is pinned end to end through `open`.
-
-    #[tokio::test]
-    async fn permission_denied_on_a_regular_file_is_not_a_not_a_file_verdict() {
-        let dir = TempDir::new("lore-storage-content-test-");
-        let path = dir.path().join("regular");
-        std::fs::write(&path, b"content").expect("write test file");
-
-        for kind in [ErrorKind::PermissionDenied, ErrorKind::IsADirectory] {
-            assert!(
-                !names_something_not_a_file(&path, &Error::from(kind)).await,
-                "{kind:?} on a regular file must stay on the retryable path"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn permission_denied_on_a_missing_path_is_not_a_not_a_file_verdict() {
-        let dir = TempDir::new("lore-storage-content-test-");
-        let path = dir.path().join("missing");
-
-        assert!(
-            !names_something_not_a_file(&path, &Error::from(ErrorKind::PermissionDenied)).await,
-            "a failed stat proves nothing, so the error must stay retryable"
-        );
-    }
-
-    #[tokio::test]
-    async fn other_error_kinds_skip_the_path_stat_even_on_a_directory() {
-        let dir = TempDir::new("lore-storage-content-test-");
-
-        for kind in [
-            ErrorKind::Other,
-            ErrorKind::TimedOut,
-            ErrorKind::Interrupted,
-        ] {
-            assert!(
-                !names_something_not_a_file(dir.path(), &Error::from(kind)).await,
-                "{kind:?} is not a not-a-file failure and must keep the back-off"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn permission_denied_on_a_directory_is_a_not_a_file_verdict() {
-        let dir = TempDir::new("lore-storage-content-test-");
-
-        for kind in [ErrorKind::PermissionDenied, ErrorKind::IsADirectory] {
-            assert!(
-                names_something_not_a_file(dir.path(), &Error::from(kind)).await,
-                "{kind:?} on a directory must be classified as not a regular file"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn open_on_a_directory_is_invalid_arguments_without_back_off() {
-        let dir = TempDir::new("lore-storage-content-test-");
-        let source = ContentSource::file(dir.path());
-
-        let started = Instant::now();
-        let result = source.open().await;
-        let elapsed = started.elapsed();
-
-        let err = result.err().expect("opening a directory must fail");
-        assert!(
-            err.is_invalid_arguments(),
-            "a directory must be InvalidArguments, got: {err:?}"
-        );
-        // The retry schedule spends about ten seconds; a first-attempt verdict is far inside this.
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "a directory must not spend the back-off, took {elapsed:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn open_on_a_regular_file_succeeds_with_its_size() {
-        let dir = TempDir::new("lore-storage-content-test-");
-        let path = dir.path().join("regular");
-        std::fs::write(&path, b"content").expect("write test file");
-
-        let (_, size) = ContentSource::file(&path)
-            .open()
-            .await
-            .expect("a regular file opens");
-        assert_eq!(size, 7);
-    }
 }

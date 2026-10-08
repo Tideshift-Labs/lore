@@ -405,6 +405,7 @@ where
 
 /// Serving must not expose the legacy Postgres stats path, which repairs shared metering.
 /// `coordinated` comes from the constructed store's route, not its requested configuration.
+#[lore_macro::test_pub]
 pub(crate) fn validate_serving_fragment_route(
     policy: CallerCapabilityPolicy,
     postgres: bool,
@@ -473,7 +474,3 @@ pub fn validate_settings(settings: &crate::settings::Settings) -> anyhow::Result
     }
     Ok(())
 }
-
-#[cfg(test)]
-#[path = "caller_capabilities_tests.rs"]
-pub(crate) mod tests;

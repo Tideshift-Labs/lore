@@ -22,7 +22,7 @@ Scope: `set_event_plane`'s offline switch mechanics (pending-row refusal, verbat
 `AlreadyCurrent` rerun, the durable-with-rows refusal, the numbackends and ACCESS EXCLUSIVE NOWAIT
 contention gates) and `read_boot_facts`. The pure resolution matrix
 (`[notification] event_plane` parsing, `outbox_production_enabled`, `check_marker`) is proven by
-unit tests in `lore-server/src/event_relay/plane.rs` and
+unit tests in `lore-server/tests/unit/event_relay/plane.rs` and
 `lore-postgres/src/domain/outbox/event_plane.rs` and is not re-run here. This runner does not cover
 a live, end-to-end proof that every CR-032 producer site appends zero rows under `live_only` through
 the real `DomainContext`/`Governed*` wrapper types -- see the test file's own module docs for what

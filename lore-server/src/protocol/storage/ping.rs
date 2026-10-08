@@ -7,6 +7,7 @@ use bytes::Bytes;
 use lore_storage::ImmutableStore;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
@@ -42,6 +43,7 @@ impl Message for Ping {
         &self,
         _context: Arc<AttributeMap>,
         _immutable_store: Arc<dyn ImmutableStore>,
+        _repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
         Ok(LoreResponse::Ping(PingResponse { value: self.value }))
     }
@@ -55,38 +57,5 @@ pub struct PingResponse {
 impl Response for PingResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![Bytes::copy_from_slice(&self.value.to_le_bytes())]
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use rand::random;
-
-    use super::*;
-    use crate::store::test_store_create;
-
-    #[test]
-    fn test_parse() {
-        let value = random::<i64>();
-        let bytes = Bytes::copy_from_slice(&value.to_le_bytes());
-
-        assert_eq!(Ping::parse(bytes), Ok(Ping { value }));
-    }
-
-    #[tokio::test]
-    async fn test_handle() {
-        let value = random::<i64>();
-        let ping_message = Ping { value };
-
-        let (immutable_store, _mutable_store, _execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        match ping_message
-            .handle(Arc::new(AttributeMap::default()), immutable_store)
-            .await
-        {
-            Ok(LoreResponse::Ping(response)) => assert_eq!(response, PingResponse { value }),
-            default => panic!("Got unexpected response from handling ping message: {default:?}"),
-        }
     }
 }

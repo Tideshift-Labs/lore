@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use lore_base::lore_spawn;
@@ -50,12 +49,14 @@ use crate::util::path::shared_component_depth;
 
 /// The node of each shared ancestor already created, borrowed from the list they
 /// are created from.
+#[lore_macro::test_pub]
 type AncestorNodes<'a> = std::collections::HashMap<&'a str, crate::node::NodeID>;
 
 /// The deepest strict ancestor of `path` that has a node, and that node.
 ///
 /// Starts at the parent, never at `path` itself: the caller is about to stage
 /// `path`, and starting its walk on top of it would skip it.
+#[lore_macro::test_pub]
 fn longest_ancestor<'a>(
     path: &'a str,
     nodes: &AncestorNodes<'_>,
@@ -84,6 +85,7 @@ struct TreeWalkPath {
 
 /// Where the walk for a target starts. Neither answer is a failure: a target with no created
 /// ancestor is walked whole from the repository root.
+#[lore_macro::test_pub]
 enum WalkStart {
     /// The deepest ancestor that already has a node, spelled as the case resolved it, and what is
     /// left of the target below it.
@@ -105,6 +107,7 @@ enum WalkStart {
 ///
 /// Takes `target` by value so what is left below the start is a view of it rather than a second
 /// path built from its bytes.
+#[lore_macro::test_pub]
 fn walk_start(
     mut target: RelativePath,
     ancestor_nodes: &AncestorNodes<'_>,
@@ -178,6 +181,7 @@ fn collect_precreate<'a>(
 ///
 /// The result is prefix-closed and holds one case variation of each entry, so a
 /// depth is a set of distinct nodes whose parents the depth above holds.
+#[lore_macro::test_pub]
 fn shared_ancestors(targets: &[RelativePath]) -> Vec<DepthPath> {
     let mut shared: Vec<DepthPath> = Vec::new();
     let mut preceding = 0;
@@ -347,6 +351,7 @@ async fn resolve_shared_prefixes(
 async fn precreate_shared_ancestors<'a>(
     walk: &StageWalk,
     shared_ancestors: &'a [DepthPath],
+    discards: &Arc<stage::DiscardQueue>,
 ) -> Result<AncestorNodes<'a>, StageError> {
     let mut options = walk.options;
     options.no_children = true;
@@ -372,8 +377,9 @@ async fn precreate_shared_ancestors<'a>(
             let stats = walk.stats.clone();
             let link_tracker = walk.link_tracker.clone();
             let global_mask = walk.global_mask.clone();
+            let discards = discards.clone();
             lore_spawn!(level_tasks, async move {
-                let result = Box::pin(stage::stage_filesystem_path(
+                let result = stage::stage_filesystem_path(
                     operation,
                     walk_path.at,
                     walk_path.remainder,
@@ -382,8 +388,8 @@ async fn precreate_shared_ancestors<'a>(
                     Some(link_tracker),
                     global_mask,
                     walk_path.prefixes,
-                    None, // Pre-create stages no children, so it reaches no boundary
-                ))
+                    Some(discards),
+                )
                 .await;
                 (index, result)
             });
@@ -418,7 +424,7 @@ async fn spawn_target_walks(
     walk: &StageWalk,
     antichain: Vec<RelativePath>,
     ancestors: &AncestorNodes<'_>,
-    discards: &Arc<Mutex<Vec<crate::node::NodeID>>>,
+    discards: &Arc<stage::DiscardQueue>,
     tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
 ) -> Option<StageError> {
     let mut failure = None;
@@ -618,7 +624,9 @@ pub(crate) async fn stage_state(
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
     let link_tracker = LinkTracker::new();
-    let discards: Arc<Mutex<Vec<crate::node::NodeID>>> = Arc::new(Mutex::new(Vec::new()));
+    // Where nothing is staged yet `state` is `state_current` itself, which still answers
+    // exactly: a walk adds nodes only for entries the file system holds.
+    let discards = Arc::new(stage::DiscardQueue::new(state_current.clone()));
 
     // Every layer mount is staged by its own task, never the parent walk, so
     // masking every layer subtree on every main-repo walk is correct: an entry
@@ -657,7 +665,7 @@ pub(crate) async fn stage_state(
 
     // One filesystem operation covers the whole stage: a layer or link at a subpath
     // is a subtree of the same filesystem and takes the operation its parent holds.
-    with_operation(repository.file_system(), true, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         let walk = StageWalk {
             prefixes: resolve_shared_prefixes(&operation, &repository, &shared_ancestors, options)
                 .await?,
@@ -670,7 +678,7 @@ pub(crate) async fn stage_state(
             options,
         };
 
-        let ancestors = precreate_shared_ancestors(&walk, &shared_ancestors).await?;
+        let ancestors = precreate_shared_ancestors(&walk, &shared_ancestors, &discards).await?;
 
         let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
         let mut failure =
@@ -685,14 +693,11 @@ pub(crate) async fn stage_state(
     })
     .await?;
 
-    let queued = discards
-        .lock()
-        .map(|mut queued| std::mem::take(&mut *queued))
-        .unwrap_or_default();
+    let queued = discards.take();
     let discarded = !queued.is_empty();
     state::apply_pending_discards(state.clone(), repository.clone(), queued)
         .await
-        .forward::<StageError>("Failed to discard nested repository entries")?;
+        .forward::<StageError>("Failed to discard entries no commit holds")?;
 
     let layer_staged: Vec<_> = staged_layers
         .into_iter()
@@ -718,7 +723,16 @@ pub(crate) async fn stage_state(
     // current_revision purely from set_revision_number/set_parent_self
     // metadata writes, tricking commit into trying to commit an empty parent.
     let parent_mutated = main_count > 0 && (state.is_dirty() || link_tracker.has_modifications());
-    if parent_mutated {
+    if discarded && leaves_nothing_staged(&repository, &state, &link_tracker).await? {
+        // A discard can leave nothing staged or dirty, which an unstage leaves with no staged
+        // state at all.
+        if !execution_context().globals().dry_run() {
+            crate::instance::delete_staged_anchor(&repository)
+                .await
+                .forward::<StageError>("Failed to remove staged anchor")?;
+        }
+        staged_revision = current_revision;
+    } else if parent_mutated {
         // Process links that need reserialization due to downstream changes
         stage::process_link_updates(
             repository.clone(),
@@ -821,6 +835,22 @@ pub(crate) async fn stage_state(
     }
 
     Ok(staged_revision)
+}
+
+/// Whether `state` is left with nothing to keep a staged state for: no staged or dirty node, no
+/// link change still to be staged on its link node, and no merge, cherry-pick or revert, which is
+/// staged whatever its nodes hold.
+async fn leaves_nothing_staged(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    link_tracker: &LinkTracker,
+) -> Result<bool, StageError> {
+    Ok(!link_tracker.has_modifications()
+        && !state.is_merge_or_cherry_pick_or_revert()
+        && !state
+            .node_has_staged_or_dirty_children(repository.clone(), ROOT_NODE)
+            .await
+            .forward::<StageError>("Failed to read the staged root")?)
 }
 
 /// What a stage target list resolved to.
@@ -1156,7 +1186,7 @@ pub async fn stage_merge(
     let stats = Arc::new(StageStats::default());
     // One operation covers every path: one per path would freeze a filesystem per path.
     // Nothing is written: the conflict is recorded in the staged state.
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         stage_merge_paths(
             &operation,
             &repository,
@@ -1276,7 +1306,7 @@ pub async fn stage_move(
     let mut parent_options = options;
     parent_options.no_children = true;
 
-    let parent_node_link = with_operation(repository.file_system(), true, async |operation| {
+    let parent_node_link = with_operation(repository.file_system(), async |operation| {
         let to_info = operation
             .file_info(&to_path)
             .await
@@ -1598,6 +1628,7 @@ pub async fn stage_move(
 /// to the parent only.
 ///
 /// Layer indices refer into the slice passed to [`classify_stage_path`].
+#[lore_macro::test_pub]
 #[derive(Debug, PartialEq)]
 pub(crate) enum LayerRoute {
     Inside {
@@ -1613,6 +1644,7 @@ pub(crate) enum LayerRoute {
 /// Classifies a stage path against a list of layer mount paths (`target_path`s).
 ///
 /// Assumes non-overlapping layers (no layer's `target_path` is a prefix of another's).
+#[lore_macro::test_pub]
 pub(crate) fn classify_stage_path(relative_path: &str, layer_target_paths: &[&str]) -> LayerRoute {
     if relative_path.is_empty() {
         return if layer_target_paths.is_empty() {
@@ -1732,6 +1764,7 @@ pub(crate) fn route_layer_paths(
 /// (production: layer target paths) or `&[&str]` (tests). This avoids the
 /// per-call Vec<&str> rebuild that the previous `&[&str]`-only signature
 /// forced on the production hot path.
+#[lore_macro::test_pub]
 pub(crate) fn is_path_under_layer_mask<S: AsRef<str>>(relative_path: &str, mask: &[S]) -> bool {
     for entry in mask {
         let entry = entry.as_ref();
@@ -1748,373 +1781,4 @@ pub(crate) fn is_path_under_layer_mask<S: AsRef<str>>(relative_path: &str, mask:
         }
     }
     false
-}
-
-#[cfg(test)]
-mod mask_tests {
-    use super::*;
-
-    #[test]
-    fn empty_mask_never_masks() {
-        let empty: [&str; 0] = [];
-        assert!(!is_path_under_layer_mask("external/lib", &empty));
-        assert!(!is_path_under_layer_mask("", &empty));
-    }
-
-    #[test]
-    fn exact_mask_match_is_masked() {
-        assert!(is_path_under_layer_mask("external/lib", &["external/lib"]));
-    }
-
-    #[test]
-    fn path_inside_masked_subtree_is_masked() {
-        assert!(is_path_under_layer_mask(
-            "external/lib/src/foo.rs",
-            &["external/lib"]
-        ));
-    }
-
-    #[test]
-    fn ancestor_of_masked_path_is_not_masked() {
-        // Walker entering "external" should still descend; the mask kicks in
-        // when it reaches "external/lib".
-        assert!(!is_path_under_layer_mask("external", &["external/lib"]));
-    }
-
-    #[test]
-    fn disjoint_path_is_not_masked() {
-        assert!(!is_path_under_layer_mask("src/main.rs", &["external/lib"]));
-    }
-
-    #[test]
-    fn empty_path_with_mask_is_not_masked() {
-        // The parent's root is never itself masked.
-        assert!(!is_path_under_layer_mask("", &["external/lib"]));
-    }
-
-    #[test]
-    fn prefix_string_match_without_separator_is_not_masked() {
-        assert!(!is_path_under_layer_mask(
-            "external_other/file.rs",
-            &["external"]
-        ));
-    }
-
-    #[test]
-    fn multiple_mask_entries_any_match_is_masked() {
-        let mask = ["external/lib", "vendor/foo"];
-        assert!(is_path_under_layer_mask("vendor/foo/x.rs", &mask));
-        assert!(is_path_under_layer_mask("external/lib", &mask));
-        assert!(!is_path_under_layer_mask("src/main.rs", &mask));
-    }
-}
-
-#[cfg(test)]
-mod shared_ancestor_tests {
-    use super::*;
-
-    fn antichain(targets: &[&str]) -> Vec<RelativePath> {
-        RelativePath::dedup_to_supersets(
-            targets
-                .iter()
-                .map(|path| RelativePath::new_from_initial_path(path).expect("Path init failed"))
-                .collect(),
-        )
-    }
-
-    fn derived(targets: &[&str]) -> Vec<String> {
-        shared_ancestors(&antichain(targets))
-            .iter()
-            .map(|ancestor| ancestor.path().to_string())
-            .collect()
-    }
-
-    /// Every ancestor of every target, counted. What the scan over neighbours
-    /// arrives at without the counting.
-    fn counted(targets: &[RelativePath]) -> Vec<String> {
-        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for target in targets {
-            let mut ancestor = target.clone();
-            ancestor.pop();
-            while !ancestor.is_empty() {
-                *counts.entry(ancestor.as_str().to_string()).or_insert(0) += 1;
-                ancestor.pop();
-            }
-        }
-        let mut shared: Vec<String> = counts
-            .into_iter()
-            .filter_map(|(path, count)| (count >= 2).then_some(path))
-            .collect();
-        shared.sort_unstable_by(|a, b| path_depth(a).cmp(&path_depth(b)).then_with(|| a.cmp(b)));
-        shared
-    }
-
-    #[test]
-    fn only_a_directory_two_targets_share_is_returned() {
-        assert!(derived(&[]).is_empty());
-        assert!(derived(&["a/b/c"]).is_empty());
-        assert!(derived(&["a/x", "b/y"]).is_empty());
-        assert_eq!(derived(&["a/x", "a/y"]), vec!["a"]);
-    }
-
-    #[test]
-    fn the_result_is_prefix_closed() {
-        assert_eq!(derived(&["a/b/c/x", "a/b/c/y"]), vec!["a", "a/b", "a/b/c"]);
-    }
-
-    #[test]
-    fn one_depth_is_a_contiguous_range_shallowest_first() {
-        let shared = shared_ancestors(&antichain(&[
-            "a/p/x", "a/p/y", "a/q/x", "a/q/y", "b/p/x", "b/p/y",
-        ]));
-        let paths: Vec<&str> = shared.iter().map(DepthPath::path).collect();
-        assert_eq!(paths, vec!["a", "b", "a/p", "a/q", "b/p"]);
-        let depths: Vec<usize> = shared.iter().map(DepthPath::depth).collect();
-        assert!(depths.windows(2).all(|pair| pair[0] <= pair[1]));
-    }
-
-    /// Two case variations of one directory would be two ancestors naming one
-    /// node, and the depth holding both would add it twice. The target set they
-    /// are taken from settles on one, and that is what carries into here.
-    #[test]
-    fn targets_on_one_case_variation_give_ancestors_on_one() {
-        assert_eq!(
-            derived(&["Assets/Meshes/a", "assets/meshes/b", "ASSETS/Meshes/c"]),
-            vec!["Assets", "Assets/Meshes"]
-        );
-    }
-
-    /// The scan reads neighbours, so the shapes that matter are the ones where
-    /// lexicographic order puts something unrelated between two targets, or
-    /// where a shared string prefix stops inside a component.
-    #[test]
-    fn it_agrees_with_counting_every_ancestor() {
-        for targets in [
-            &[][..],
-            &["a/b/c"],
-            &["a/x", "a/y"],
-            &["a/x", "b/y"],
-            &["a/b/c/d/x", "a/b/c/d/y"],
-            &["a/p/x", "a/p/y", "a/q/x", "a/q/y", "b/p/x", "b/p/y"],
-            // '-' sorts below '/', so this lands between "a" and its subtree.
-            &["a/x", "a-foo/y", "a/z"],
-            // '0' sorts above '/', so this lands after the subtree.
-            &["a/x", "a0/y", "a/z"],
-            // A shared string prefix that stops inside a component.
-            &["a/b/x", "a/bc/y", "a/b/z"],
-            // A directory target covering the files beneath it.
-            &["a/b", "a/b/x", "a/b/y", "a/c/x", "a/c/y"],
-            // Three levels, and a lone target beside them.
-            &["t/m/l/f", "t/m/l/g", "t/m/n/f", "t/m/n/g", "u/v/w/x"],
-        ] {
-            let antichain = antichain(targets);
-            let derived: Vec<String> = shared_ancestors(&antichain)
-                .iter()
-                .map(|ancestor| ancestor.path().to_string())
-                .collect();
-            assert_eq!(derived, counted(&antichain), "{targets:?}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod walk_base_tests {
-    use super::*;
-
-    const NODE_A: crate::node::NodeID = 11;
-    const NODE_AB: crate::node::NodeID = 22;
-
-    fn created<'a>(entries: &[(&'a str, crate::node::NodeID)]) -> AncestorNodes<'a> {
-        entries.iter().copied().collect()
-    }
-
-    fn resolved(entries: &[(&str, &str)]) -> Arc<crate::util::fs::ResolvedPrefixes> {
-        let mut prefixes = crate::util::fs::ResolvedPrefixes::default();
-        for (path, variation) in entries {
-            prefixes.insert((*path).to_string(), (*variation).to_string());
-        }
-        Arc::new(prefixes)
-    }
-
-    #[test]
-    fn longest_ancestor_takes_the_deepest_one_created() {
-        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
-        assert_eq!(longest_ancestor("a/b/c/d", &nodes), Some(("a/b", NODE_AB)));
-        // In the map, but a walk about to stage it has to start above it.
-        assert_eq!(longest_ancestor("a/b", &nodes), Some(("a", NODE_A)));
-        assert_eq!(longest_ancestor("a", &nodes), None);
-        assert_eq!(longest_ancestor("x/y", &nodes), None);
-    }
-
-    fn path(path: &str) -> RelativePath {
-        RelativePath::new_from_clean_parts(path, "")
-    }
-
-    fn below_ancestor(start: WalkStart) -> (RelativePath, crate::node::NodeID, RelativePath) {
-        match start {
-            WalkStart::BelowAncestor {
-                path,
-                node,
-                remainder,
-            } => (path, node, remainder),
-            WalkStart::FromRoot(_) => panic!("an ancestor was created"),
-        }
-    }
-
-    #[test]
-    fn walk_start_starts_at_that_ancestor_with_the_rest_below_it() {
-        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
-
-        let (path_at, node, remainder) = below_ancestor(walk_start(path("a/b/c"), &nodes, None));
-        assert_eq!(path_at.as_str(), "a/b");
-        assert_eq!(node, NODE_AB);
-        assert_eq!(remainder.as_str(), "c");
-
-        let (path_at, node, remainder) = below_ancestor(walk_start(path("a/x/y/z"), &nodes, None));
-        assert_eq!(path_at.as_str(), "a");
-        assert_eq!(node, NODE_A);
-        assert_eq!(remainder.as_str(), "x/y/z");
-    }
-
-    /// The remainder is a view of the target, so its lowercase form has to be
-    /// advanced along with it rather than left naming the whole path.
-    #[test]
-    fn walk_start_leaves_the_remainder_lowercased_from_the_start_down() {
-        let nodes = created(&[("Assets", NODE_A)]);
-
-        let (_, _, remainder) =
-            below_ancestor(walk_start(path("Assets/Meshes/Rock"), &nodes, None));
-        assert_eq!(remainder.as_str(), "Meshes/Rock");
-        assert_eq!(remainder.as_lowercase_str(), "meshes/rock");
-    }
-
-    #[test]
-    fn walk_start_takes_the_whole_target_from_the_root_when_no_ancestor_was_created() {
-        let nodes = created(&[("x", NODE_A)]);
-
-        let WalkStart::FromRoot(returned) = walk_start(path("a/b"), &nodes, None) else {
-            panic!("no ancestor was created");
-        };
-        assert_eq!(returned.as_str(), "a/b", "the target comes back untouched");
-
-        assert!(matches!(
-            walk_start(path("a"), &nodes, None),
-            WalkStart::FromRoot(_)
-        ));
-        assert!(matches!(
-            walk_start(path("a"), &created(&[]), None),
-            WalkStart::FromRoot(_)
-        ));
-    }
-
-    #[test]
-    fn walk_start_takes_the_case_the_prefix_resolved_to() {
-        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
-        let prefixes = resolved(&[("a", "A"), ("a/b", "A/B")]);
-
-        let (path_at, node, remainder) =
-            below_ancestor(walk_start(path("a/b/c"), &nodes, Some(&prefixes)));
-        assert_eq!(path_at.as_str(), "A/B");
-        assert_eq!(node, NODE_AB);
-        assert_eq!(remainder.as_str(), "c", "the remainder is not recased");
-    }
-
-    /// A prefix resolves as a whole or not at all: the map answers for the
-    /// longest prefix it holds, and a shorter one answers for a shorter path.
-    #[test]
-    fn walk_start_ignores_a_resolution_covering_only_part_of_the_prefix() {
-        let nodes = created(&[("a", NODE_A), ("a/b", NODE_AB)]);
-        let prefixes = resolved(&[("a", "A")]);
-
-        let (path_at, node, _) = below_ancestor(walk_start(path("a/b/c"), &nodes, Some(&prefixes)));
-        assert_eq!(path_at.as_str(), "a/b");
-        assert_eq!(node, NODE_AB);
-    }
-}
-
-#[cfg(test)]
-mod classify_tests {
-    use super::*;
-
-    #[test]
-    fn empty_path_no_layers_is_disjoint() {
-        assert_eq!(classify_stage_path("", &[]), LayerRoute::Disjoint);
-    }
-
-    #[test]
-    fn empty_path_with_layers_is_ancestor_of_all() {
-        let layers = ["external/lib", "vendor/foo"];
-        assert_eq!(
-            classify_stage_path("", &layers),
-            LayerRoute::AncestorOf {
-                layer_indices: vec![0, 1],
-            }
-        );
-    }
-
-    #[test]
-    fn exact_layer_match_is_inside_with_empty_remain() {
-        let layers = ["external/lib"];
-        assert_eq!(
-            classify_stage_path("external/lib", &layers),
-            LayerRoute::Inside {
-                layer_index: 0,
-                remain: RelativePath::new(),
-            }
-        );
-    }
-
-    #[test]
-    fn path_inside_layer_is_inside_with_remain() {
-        let layers = ["external/lib"];
-        assert_eq!(
-            classify_stage_path("external/lib/src/foo.rs", &layers),
-            LayerRoute::Inside {
-                layer_index: 0,
-                remain: RelativePath::new_from_clean_parts("src/foo.rs", ""),
-            }
-        );
-    }
-
-    #[test]
-    fn path_ancestor_of_one_layer_is_ancestor_of_that_layer() {
-        let layers = ["external/lib", "src/main.rs"];
-        assert_eq!(
-            classify_stage_path("external", &layers),
-            LayerRoute::AncestorOf {
-                layer_indices: vec![0],
-            }
-        );
-    }
-
-    #[test]
-    fn path_ancestor_of_multiple_layers_lists_them_all() {
-        let layers = ["vendor/a", "vendor/b", "external/lib"];
-        assert_eq!(
-            classify_stage_path("vendor", &layers),
-            LayerRoute::AncestorOf {
-                layer_indices: vec![0, 1],
-            }
-        );
-    }
-
-    #[test]
-    fn disjoint_path_with_layers_is_disjoint() {
-        let layers = ["external/lib", "vendor/foo"];
-        assert_eq!(
-            classify_stage_path("src/main.rs", &layers),
-            LayerRoute::Disjoint
-        );
-    }
-
-    #[test]
-    fn prefix_string_match_without_separator_is_disjoint_not_inside() {
-        // "external" is a string prefix of "external_other" but not a path-prefix.
-        // Confirms we check '/' boundary, not bare string prefix.
-        let layers = ["external"];
-        assert_eq!(
-            classify_stage_path("external_other", &layers),
-            LayerRoute::Disjoint
-        );
-    }
 }

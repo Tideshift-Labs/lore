@@ -15,10 +15,6 @@ use lore_transport::DomainAttemptReceipt;
 use lore_transport::ProtocolError;
 use uuid::Uuid;
 
-#[cfg(test)]
-#[path = "operation_tests.rs"]
-mod tests;
-
 #[derive(clap::Args)]
 pub struct OperationArgs {
     #[command(subcommand)]
@@ -58,6 +54,7 @@ async fn status(globals: &LoreGlobalArgs) -> Result<(), lore_transport::Protocol
     Ok(())
 }
 
+#[lore_macro::test_pub]
 async fn status_lines(fence: &RepositoryMutationGuard) -> Result<Vec<String>, ProtocolError> {
     let mut lines = Vec::new();
     for (source, store) in fence.recovery_stores() {
@@ -95,6 +92,7 @@ async fn reconcile(globals: LoreGlobalArgs) -> Result<(), lore_transport::Protoc
     .await
 }
 
+#[lore_macro::test_pub]
 async fn reconcile_stores<F, Fut>(
     fence: &RepositoryMutationGuard,
     lookup: F,

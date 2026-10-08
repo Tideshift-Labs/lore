@@ -1,6 +1,6 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
-//! Test-only path-scoped elapsed counters. Nested totals are inclusive, not additive wall time.
+//! Test-util-only path-scoped elapsed counters. Nested totals are inclusive, not additive wall time.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -12,7 +12,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(super) struct Metric {
+pub struct Metric {
     pub count: usize,
     pub total: Duration,
     pub max: Duration,
@@ -24,7 +24,7 @@ fn registry() -> &'static Mutex<BTreeMap<PathBuf, Counters>> {
     REGISTRY.get_or_init(Default::default)
 }
 
-pub(super) struct Probe {
+pub struct Probe {
     root: PathBuf,
     counters: Counters,
 }

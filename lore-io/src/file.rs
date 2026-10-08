@@ -67,6 +67,7 @@ impl OpenOptions {
     /// does, and this API exists to run many at once on one shared handle. So the handle is
     /// overlapped and the data path issues its own `OVERLAPPED`; `crate::overlapped` records why
     /// `std`'s positional calls cannot be used on such a handle.
+    #[lore_macro::test_pub]
     pub(crate) fn to_std(&self) -> std::fs::OpenOptions {
         #[cfg(not(target_family = "windows"))]
         return self.to_std_blocking();

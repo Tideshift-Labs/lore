@@ -43,7 +43,6 @@ use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
 use crate::metadata::Metadata;
-use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
@@ -192,13 +191,7 @@ impl LoreRepositoryStatusFileEventData {
         } else {
             change.from.flags
         };
-        let node_type = if node_type.contains(NodeFlags::File) {
-            LoreNodeType::File
-        } else if node_type.contains(NodeFlags::Link) {
-            LoreNodeType::Link
-        } else {
-            LoreNodeType::Directory
-        };
+        let node_type = node_type.node_type();
         LoreRepositoryStatusFileEventData {
             path: LoreString::from(change.path()),
             size,
@@ -508,6 +501,10 @@ async fn file_size_from_node_change_path(
 ///
 /// Reads to the end rather than stopping at a failure: the walk marks dirty as it goes, and its
 /// marks are what a status run leaves behind whether or not every change could be reported.
+///
+/// Each change is taken by a `let`-`else` rather than a `while let`, whose scrutinee would stay
+/// reserved beside the change while it is reported.
+#[lore_macro::test_pub]
 async fn report_scan_changes(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
@@ -516,7 +513,10 @@ async fn report_scan_changes(
 ) -> (usize, Option<StatusError>) {
     let mut reported = 0;
     let mut failure = None;
-    while let Some(change) = changes.next().await {
+    loop {
+        let Some(change) = changes.next().await else {
+            break;
+        };
         reported += 1;
         if let Err(err) = report_scan_change(operation, repository, summary, &change).await {
             failure.get_or_insert(err);
@@ -528,6 +528,7 @@ async fn report_scan_changes(
 /// Reports one scanned change: a staged one is the caller's own doing and only traced, and every
 /// other is counted into the summary and emitted for display. Dirty flags are set and cleared by
 /// the walk itself.
+#[lore_macro::test_pub]
 async fn report_scan_change(
     operation: &InstanceOperationImpl,
     repository: &Arc<RepositoryContext>,
@@ -1159,6 +1160,7 @@ async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError
 ///
 /// Returns `(latest, authorized, available)`, where `available` reflects
 /// connectivity, not query success — a reachable remote that errors is still available.
+#[lore_macro::test_pub]
 async fn resolve_remote_latest(
     repository: &Arc<RepositoryContext>,
     branch_id: BranchId,
@@ -1298,6 +1300,7 @@ async fn scan_paths(
 
 /// What a status run reads out of the trees it has: the comparison against the staged state, the
 /// scan against the working tree, or both.
+#[lore_macro::test_pub]
 #[derive(Clone, Copy)]
 struct TreeDiffPlan {
     /// Whether a staged state was asked for and exists to compare the current one against.
@@ -1327,6 +1330,7 @@ impl TreeDiffPlan {
 /// One operation covers whichever phases `plan` asks for. Beginning an operation freezes a
 /// provider's view of the working tree, so a run that both checks dirty flags and scans reads a
 /// single snapshot rather than two that may disagree; a run reading neither opens none.
+#[lore_macro::test_pub]
 #[allow(clippy::too_many_arguments)]
 async fn report_tree_diffs(
     repository: &Arc<RepositoryContext>,
@@ -1341,7 +1345,6 @@ async fn report_tree_diffs(
     with_operation_if(
         repository.file_system(),
         plan.reads_working_tree(),
-        false, /* Reads the working tree, writes only the staged tree */
         async |operation| {
             if plan.compare_staged {
                 let diff = StagedDiff {
@@ -1376,7 +1379,7 @@ async fn report_tree_diffs(
     .await
 }
 
-pub async fn status(
+pub(crate) async fn status(
     repository: Arc<RepositoryContext>,
     paths: Option<Vec<RelativePath>>,
     options: StatusOptions,
@@ -1845,187 +1848,11 @@ pub async fn status(
     Ok(())
 }
 
-#[cfg(test)]
-mod remote_resolve_tests {
-    use lore_transport::ProtocolError;
-
-    use super::*;
-    use crate::errors::Disconnected;
-    use crate::lore::BranchId;
-    use crate::repository::RemoteState;
-    use crate::repository::RepositoryContext;
-    use crate::repository::create_client_memory_stores;
-
-    fn disconnected() -> ProtocolError {
-        ProtocolError::from(Disconnected)
-    }
-
-    async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
-        let (immutable, mutable) = create_client_memory_stores()
-            .await
-            .expect("in-memory stores should be creatable");
-        Arc::new(RepositoryContext::new_with_state(
-            None,
-            immutable,
-            mutable,
-            crate::lore::RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            state,
-            Arc::default(),
-            None,
-        ))
-    }
-
-    #[tokio::test]
-    async fn offline_remote_resolves_to_unavailable() {
-        let ctx = context_with_state(RemoteState::Offline).await;
-
-        let result = resolve_remote_latest(&ctx, BranchId::default()).await;
-
-        assert_eq!(
-            result,
-            (None, false, false),
-            "offline should degrade to unavailable"
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_remote_resolves_to_unavailable() {
-        let ctx = context_with_state(RemoteState::Failed(disconnected())).await;
-
-        let result = resolve_remote_latest(&ctx, BranchId::default()).await;
-
-        assert_eq!(
-            result,
-            (None, false, false),
-            "failed remote should degrade to unavailable"
-        );
-    }
-}
-
-#[cfg(test)]
-mod tree_diff_operation_tests {
-    use lore_base::runtime::LORE_CONTEXT;
-
-    use super::*;
-    use crate::fs::filesystem_provider::tests::TestFilesystemProvider;
-    use crate::fs::filesystem_provider::tests::test_store_create;
-    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
-    use crate::repository::test_helpers::default_repository_creation_args;
-
-    /// Runs `plan` over a repository whose states are empty and whose working tree holds what they
-    /// do, and answers how many operations it began and what each finalize reported.
-    ///
-    /// Empty states leave every phase with nothing to report, which is what isolates the count from
-    /// the reporting.
-    async fn operations_begun(plan: TreeDiffPlan) -> (usize, Vec<bool>) {
-        let filesystem = Arc::new(TestFilesystemProvider::new());
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Making test stores");
-        let repository = Arc::new(RepositoryContext::new(
-            default_repository_creation_args(immutable_store, mutable_store)
-                .with_filesystem_provider(filesystem.clone()),
-        ));
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let state = Arc::new(State::new());
-                report_tree_diffs(
-                    &repository,
-                    &[None],
-                    &state,
-                    &state,
-                    &[],
-                    &Arc::new(Vec::new()),
-                    &Arc::new(StatusSummaryStats::default()),
-                    plan,
-                )
-                .await
-                .expect("The diff succeeded");
-            })
-            .await;
-
-        let finalizes = filesystem.finalize_events.lock().clone();
-        (filesystem.begins(), finalizes)
-    }
-
-    #[tokio::test]
-    async fn a_staged_comparison_alone_reads_no_working_tree() {
-        let (begins, finalizes) = operations_begun(TreeDiffPlan {
-            compare_staged: true,
-            check_dirty: false,
-            scan: false,
-            has_staged: true,
-        })
-        .await;
-
-        assert_eq!(
-            0, begins,
-            "A comparison of two states read the working tree"
-        );
-        assert!(finalizes.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_dirty_check_without_a_staged_comparison_reads_no_working_tree() {
-        let (begins, _) = operations_begun(TreeDiffPlan {
-            compare_staged: false,
-            check_dirty: true,
-            scan: false,
-            has_staged: false,
-        })
-        .await;
-
-        assert_eq!(
-            0, begins,
-            "A dirty check with no comparison to check for opened an operation"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_dirty_check_opens_one_operation() {
-        let (begins, finalizes) = operations_begun(TreeDiffPlan {
-            compare_staged: true,
-            check_dirty: true,
-            scan: false,
-            has_staged: true,
-        })
-        .await;
-
-        assert_eq!(1, begins);
-        assert_eq!(vec![false], finalizes);
-    }
-
-    #[tokio::test]
-    async fn a_scan_opens_one_operation() {
-        let (begins, finalizes) = operations_begun(TreeDiffPlan {
-            compare_staged: false,
-            check_dirty: false,
-            scan: true,
-            has_staged: false,
-        })
-        .await;
-
-        assert_eq!(1, begins);
-        assert_eq!(vec![false], finalizes);
-    }
-
-    /// The snapshot a dirty check reads is the one the scan reads, which holds only while both run
-    /// within a single operation.
-    #[tokio::test]
-    async fn a_dirty_check_and_a_scan_share_one_operation() {
-        let (begins, finalizes) = operations_begun(TreeDiffPlan {
-            compare_staged: true,
-            check_dirty: true,
-            scan: true,
-            has_staged: true,
-        })
-        .await;
-
-        assert_eq!(
-            1, begins,
-            "Checking dirty flags and scanning read separate snapshots"
-        );
-        assert_eq!(vec![false], finalizes);
-    }
+/// Boxed version of [`status`] for cross-crate use.
+pub fn status_boxed(
+    repository: Arc<RepositoryContext>,
+    paths: Option<Vec<RelativePath>>,
+    options: StatusOptions,
+) -> crate::BoxFuture<'static, Result<(), StatusError>> {
+    Box::pin(status(repository, paths, options))
 }

@@ -1,0 +1,558 @@
+// Copyright 2026 Khurram Virani
+// SPDX-License-Identifier: MIT
+//! Live-wire coverage against an in-process `tonic` double: does the auth interceptor actually
+//! put the caller's bearer token and repository id on the wire, does every receipt status decode
+//! through a real protobuf round trip (not just a hand-built `decode_receipt` call), does a
+//! human-JWT-shaped `PermissionDenied` (the real server's answer for a non-service-account
+//! caller against this control-plane-only RPC, per `lore-server`'s `authenticated_service`)
+//! surface as a typed error rather than a panic, and does an invalid query short-circuit before
+//! ever reaching the double. Follows `storage_client.rs`'s test-module convention: a real
+//! `tonic::transport::Server` on an ephemeral port, a real `Channel`, no mock framework.
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+
+use bytes::Bytes;
+use lore_base::types::RepositoryId;
+use lore_proto::lore::domain::v1::DomainOperationClockGetRequest;
+use lore_proto::lore::domain::v1::DomainOperationClockGetResponse;
+use lore_proto::lore::domain::v1::DomainOperationOutcome;
+use lore_proto::lore::domain::v1::DomainOperationPrepareRequest;
+use lore_proto::lore::domain::v1::DomainOperationPrepareResponse;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeReceiptV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceMaterializeRequestV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireAckV1;
+use lore_proto::lore::domain::v1::DomainOperationProofNamespaceRetireRequestV1;
+use lore_proto::lore::domain::v1::DomainOperationReceiptGetRequest;
+use lore_proto::lore::domain::v1::DomainOperationReceiptGetResponse;
+use lore_proto::lore::domain::v1::DomainOperationReceiptStatus;
+use lore_proto::lore::domain::v1::DomainOperationTerminalStatusAttachRequest;
+use lore_proto::lore::domain::v1::DomainOperationTerminalStatusAttachmentAckV1;
+use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeRequest;
+use lore_proto::lore::domain::v1::DomainOperationVerifiedStaleFinalizeResponse;
+use lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperationService as DomainOperationServiceTrait;
+use lore_proto::lore::domain::v1::domain_operation_service_server::DomainOperationServiceServer;
+use lore_transport::domain_receipt::DomainReceiptOutcome;
+use lore_transport::domain_receipt::DomainReceiptQuery;
+use lore_transport::domain_receipt::DomainReceiptState;
+use lore_transport::grpc::GRPCAuthRef;
+use lore_transport::grpc::domain_operation_client::DomainOperationService;
+use tonic::Request;
+use tonic::Response;
+use tonic::Status;
+use uuid::Uuid;
+
+fn digest(fill: u8) -> Bytes {
+    Bytes::from(vec![fill; 32])
+}
+
+fn query() -> DomainReceiptQuery {
+    DomainReceiptQuery {
+        org_uuid: Uuid::now_v7(),
+        initiating_principal_namespace: Bytes::from_static(b"principal-v1\0user"),
+        operation_id: Uuid::now_v7(),
+        method: "RevisionService.BranchCreate".to_string(),
+        scope: Bytes::from_static(b"scope"),
+        fingerprint_version: 1,
+        fingerprint: digest(0xAA),
+        canonical_intent_digest: digest(0xBB),
+        authorization_revision: 3,
+        consumed_ticket_sha256: digest(0xCC),
+    }
+}
+
+fn wire_response(status: DomainOperationReceiptStatus) -> DomainOperationReceiptGetResponse {
+    DomainOperationReceiptGetResponse {
+        status: status as i32,
+        outcome: DomainOperationOutcome::Unspecified as i32,
+        reason_version: None,
+        reason: String::new(),
+        from_future_marker: false,
+        prepared_at_unix_millis: None,
+        hard_expires_at_unix_millis: None,
+        verification_nonce: digest(1),
+        bound_fields_digest: digest(2),
+        consumed_ticket_sha256: digest(3),
+        authorization_revision: 3,
+    }
+}
+
+/// What the double answers a `domain_operation_receipt_get` call with, and what it can be
+/// told to do instead for the failure-shaped tests.
+#[derive(Clone)]
+enum ReceiptGetBehavior {
+    Respond(DomainOperationReceiptGetResponse),
+    Fail(tonic::Code, &'static str),
+}
+
+/// Implements only `domain_operation_receipt_get`; every other `DomainOperationService`
+/// method is unreachable from this client binding by design (see this module's own doc
+/// comment) and returns `Unimplemented` if a regression ever calls one.
+struct FakeDomainOperationServer {
+    behavior: ReceiptGetBehavior,
+    calls: Arc<AtomicUsize>,
+    seen_authorization: Arc<Mutex<Option<String>>>,
+    seen_repository_id: Arc<Mutex<Option<Vec<u8>>>>,
+    seen_authorization_id_equals_operation_id: Arc<Mutex<Option<bool>>>,
+}
+
+#[tokio::test]
+async fn namespace_snapshot_is_explicitly_unimplemented_by_receipt_get_double() {
+    let server = FakeDomainOperationServer {
+        behavior: ReceiptGetBehavior::Fail(tonic::Code::Aborted, "receipt-get only"),
+        calls: Arc::new(AtomicUsize::new(0)),
+        seen_authorization: Arc::new(Mutex::new(None)),
+        seen_repository_id: Arc::new(Mutex::new(None)),
+        seen_authorization_id_equals_operation_id: Arc::new(Mutex::new(None)),
+    };
+    let request = lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1 {
+        protocol_revision: 2,
+        org_uuid: vec![0x11; 16].into(),
+        initiating_principal_namespace: b"principal-v1\0aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            .as_slice()
+            .into(),
+        namespace_epoch: vec![0x22; 16].into(),
+        namespace_claim_revision: 7,
+        namespace_claim_nonce: vec![0x33; 32].into(),
+    };
+    let error = server
+        .domain_operation_proof_namespace_state_get(Request::new(request))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unimplemented);
+    assert_eq!(server.calls.load(Ordering::SeqCst), 0);
+    assert!(server.seen_authorization.lock().unwrap().is_none());
+    assert!(server.seen_repository_id.lock().unwrap().is_none());
+    assert!(
+        server
+            .seen_authorization_id_equals_operation_id
+            .lock()
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tonic::async_trait]
+impl DomainOperationServiceTrait for FakeDomainOperationServer {
+    async fn domain_operation_proof_namespace_state_get(
+        &self,
+        _request: Request<
+            lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1,
+        >,
+    ) -> Result<
+        Response<lore_proto::lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1>,
+        Status,
+    > {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_clock_get(
+        &self,
+        _request: Request<DomainOperationClockGetRequest>,
+    ) -> Result<Response<DomainOperationClockGetResponse>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_prepare(
+        &self,
+        _request: Request<DomainOperationPrepareRequest>,
+    ) -> Result<Response<DomainOperationPrepareResponse>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_attempt_receipt_get(
+        &self,
+        _request: Request<lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetRequest>,
+    ) -> Result<
+        Response<lore_proto::lore::domain::v1::DomainOperationAttemptReceiptGetResponse>,
+        Status,
+    > {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_receipt_get(
+        &self,
+        request: Request<DomainOperationReceiptGetRequest>,
+    ) -> Result<Response<DomainOperationReceiptGetResponse>, Status> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+
+        let authorization = request
+            .metadata()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        *self.seen_authorization.lock().unwrap() = authorization;
+
+        let repository_id = request
+            .metadata()
+            .get_bin(lore_transport::grpc::REPOSITORY_ID_KEY)
+            .and_then(|value| value.to_bytes().ok())
+            .map(|bytes| bytes.to_vec());
+        *self.seen_repository_id.lock().unwrap() = repository_id;
+
+        let body = request.get_ref();
+        *self
+            .seen_authorization_id_equals_operation_id
+            .lock()
+            .unwrap() = Some(body.authorization_id == body.operation_id);
+
+        match self.behavior.clone() {
+            ReceiptGetBehavior::Respond(response) => Ok(Response::new(response)),
+            ReceiptGetBehavior::Fail(code, message) => Err(Status::new(code, message)),
+        }
+    }
+
+    async fn domain_operation_verified_stale_finalize(
+        &self,
+        _request: Request<DomainOperationVerifiedStaleFinalizeRequest>,
+    ) -> Result<Response<DomainOperationVerifiedStaleFinalizeResponse>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_terminal_status_attach(
+        &self,
+        _request: Request<DomainOperationTerminalStatusAttachRequest>,
+    ) -> Result<Response<DomainOperationTerminalStatusAttachmentAckV1>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_proof_namespace_materialize(
+        &self,
+        _request: Request<DomainOperationProofNamespaceMaterializeRequestV1>,
+    ) -> Result<Response<DomainOperationProofNamespaceMaterializeReceiptV1>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+
+    async fn domain_operation_proof_namespace_retire(
+        &self,
+        _request: Request<DomainOperationProofNamespaceRetireRequestV1>,
+    ) -> Result<Response<DomainOperationProofNamespaceRetireAckV1>, Status> {
+        Err(Status::unimplemented("not used by this test"))
+    }
+}
+
+struct TestDomainOperations {
+    client: DomainOperationService,
+    calls: Arc<AtomicUsize>,
+    seen_authorization: Arc<Mutex<Option<String>>>,
+    seen_repository_id: Arc<Mutex<Option<Vec<u8>>>>,
+    seen_authorization_id_equals_operation_id: Arc<Mutex<Option<bool>>>,
+}
+
+/// Stand up a real `DomainOperationService` gRPC server on an ephemeral port and a client
+/// bound to it through the same `AuthzInterceptor` production traffic goes through -- no
+/// mock, no shortcut around the interceptor.
+async fn start_test_domain_operations(
+    behavior: ReceiptGetBehavior,
+    auth_token: &str,
+    repository: RepositoryId,
+) -> TestDomainOperations {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen_authorization = Arc::new(Mutex::new(None));
+    let seen_repository_id = Arc::new(Mutex::new(None));
+    let seen_authorization_id_equals_operation_id = Arc::new(Mutex::new(None));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    let server = FakeDomainOperationServer {
+        behavior,
+        calls: calls.clone(),
+        seen_authorization: seen_authorization.clone(),
+        seen_repository_id: seen_repository_id.clone(),
+        seen_authorization_id_equals_operation_id: seen_authorization_id_equals_operation_id
+            .clone(),
+    };
+
+    #[allow(clippy::disallowed_methods)] // Test-local server task.
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(DomainOperationServiceServer::new(server))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .expect("connect to test server");
+    let channel = tower::ServiceBuilder::new()
+        .layer(lore_transport::grpc::RequestLoggerLayer {})
+        .service(channel);
+
+    let auth: GRPCAuthRef = Arc::new(parking_lot::RwLock::new(lore_transport::grpc::GRPCAuth {
+        authorization_token: auth_token.to_string(),
+        ..Default::default()
+    }));
+
+    TestDomainOperations {
+        client: DomainOperationService::new(channel, repository, auth),
+        calls,
+        seen_authorization,
+        seen_repository_id,
+        seen_authorization_id_equals_operation_id,
+    }
+}
+
+/// The interceptor that wraps this client's `DomainOperationServiceClient` is the same
+/// `AuthzInterceptor` every other client in this module uses -- this proves it actually runs
+/// for `DomainOperationReceiptGet`, not just that it compiles against the type.
+#[tokio::test]
+async fn the_bearer_token_and_repository_id_reach_the_server() {
+    let repository = RepositoryId::from([0x42u8; 16]);
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Respond(wire_response(DomainOperationReceiptStatus::NotFound)),
+        "test-lore-jwt",
+        repository,
+    )
+    .await;
+
+    let result = harness.client.receipt_get(&query()).await;
+    assert!(result.is_ok(), "expected a decoded receipt: {result:?}");
+
+    assert_eq!(
+        harness.seen_authorization.lock().unwrap().as_deref(),
+        Some("Bearer test-lore-jwt"),
+        "AuthzInterceptor must attach the caller's bearer token to the wire request"
+    );
+    assert_eq!(
+        harness.seen_repository_id.lock().unwrap().as_deref(),
+        Some(repository.data().as_slice()),
+        "AuthzInterceptor must attach the repository id to the wire request"
+    );
+}
+
+/// `the_request_binds_authorization_id_to_the_operation_id` (in this file's own `mod tests`)
+/// proves `build_request` sets the two fields equal. This is the companion the lane asked
+/// for: proving that equality survives an actual protobuf encode/decode round trip over a
+/// real connection, not just the in-memory struct `build_request` returns.
+#[tokio::test]
+async fn the_wire_request_binds_authorization_id_to_the_operation_id() {
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Respond(wire_response(DomainOperationReceiptStatus::NotFound)),
+        "test-lore-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+
+    harness
+        .client
+        .receipt_get(&query())
+        .await
+        .expect("expected a decoded receipt");
+
+    assert_eq!(
+        *harness
+            .seen_authorization_id_equals_operation_id
+            .lock()
+            .unwrap(),
+        Some(true),
+        "authorization_id must equal operation_id as received by the server, not just as \
+         built client-side"
+    );
+}
+
+/// Every status this client's vocabulary covers, decoded through a REAL protobuf
+/// serialize/deserialize round trip rather than a hand-built response passed directly to
+/// `decode_receipt` (which the file's own `mod tests` already covers). `NotFound` is the
+/// pinned "absent maps to absent, not error" case: the call must return `Ok`, never `Err`.
+#[tokio::test]
+async fn every_receipt_status_decodes_through_a_real_wire_round_trip() {
+    let cases: Vec<(DomainOperationReceiptStatus, DomainReceiptState)> = vec![
+        (
+            DomainOperationReceiptStatus::Mismatch,
+            DomainReceiptState::Mismatch,
+        ),
+        (
+            DomainOperationReceiptStatus::Expired,
+            DomainReceiptState::Expired,
+        ),
+        (
+            DomainOperationReceiptStatus::ExpiredOrUnknown,
+            DomainReceiptState::ExpiredOrUnknown,
+        ),
+        (
+            DomainOperationReceiptStatus::NotFound,
+            DomainReceiptState::NotFound,
+        ),
+    ];
+
+    for (wire_status, expected_state) in cases {
+        let harness = start_test_domain_operations(
+            ReceiptGetBehavior::Respond(wire_response(wire_status)),
+            "test-lore-jwt",
+            RepositoryId::from([0x01u8; 16]),
+        )
+        .await;
+
+        let receipt = harness
+            .client
+            .receipt_get(&query())
+            .await
+            .unwrap_or_else(|err| panic!("{wire_status:?} must decode, got {err:?}"));
+
+        assert_eq!(
+            receipt.state, expected_state,
+            "wire status {wire_status:?} must decode to {expected_state:?}"
+        );
+        assert!(
+            !receipt.state.is_attributive(),
+            "{expected_state:?} must not be attributive"
+        );
+    }
+
+    let mut prepared = wire_response(DomainOperationReceiptStatus::Prepared);
+    prepared.prepared_at_unix_millis = Some(10);
+    prepared.hard_expires_at_unix_millis = Some(20);
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Respond(prepared),
+        "test-lore-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+    let receipt = harness.client.receipt_get(&query()).await.unwrap();
+    assert_eq!(
+        receipt.state,
+        DomainReceiptState::Prepared {
+            prepared_at_unix_millis: 10,
+            hard_expires_at_unix_millis: 20,
+        }
+    );
+
+    let mut committed = wire_response(DomainOperationReceiptStatus::Committed);
+    committed.outcome = DomainOperationOutcome::Applied as i32;
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Respond(committed),
+        "test-lore-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+    let receipt = harness.client.receipt_get(&query()).await.unwrap();
+    assert_eq!(
+        receipt.state,
+        DomainReceiptState::Committed {
+            outcome: DomainReceiptOutcome::Applied,
+            from_future_marker: false,
+        }
+    );
+    assert!(receipt.state.is_attributive());
+}
+
+/// Companion to `mod tests`'s `a_not_applied_receipt_without_a_reason_version_is_refused` at
+/// the wire level: only this suite can build an unversioned `NOT_APPLIED` as bytes a real
+/// server would put on the wire and drive it through the actual `tonic` decode path, rather
+/// than constructing the in-memory response struct directly. WP-120 makes `NOT_APPLIED`
+/// decisive only when versioned; an unversioned one is a response the contract does not
+/// describe, and this client must refuse it rather than resolve a durable record on it.
+#[tokio::test]
+async fn an_unversioned_not_applied_is_refused_over_a_real_wire_round_trip() {
+    let mut committed = wire_response(DomainOperationReceiptStatus::Committed);
+    committed.outcome = DomainOperationOutcome::NotApplied as i32;
+    committed.reason_version = None;
+    committed.reason = "BRANCH_PROTECTED".to_string();
+
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Respond(committed),
+        "test-lore-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+
+    let error = harness
+        .client
+        .receipt_get(&query())
+        .await
+        .expect_err("an unversioned NOT_APPLIED must not decode as a successful receipt");
+
+    assert!(
+        format!("{error}").contains("no reason version"),
+        "expected the missing-reason-version refusal, got: {error}"
+    );
+}
+
+/// The real server rejects a caller whose verified JWT is not the control-plane service
+/// account (`lore-server/src/grpc/domain/v1/service.rs`'s `authenticated_service`), which is
+/// exactly what a human-principal desktop caller is against this RPC today. That refusal
+/// must surface as this client's typed `NotAuthorized`, never as a panic or a silently
+/// swallowed error.
+#[tokio::test]
+async fn a_permission_denied_status_surfaces_as_a_typed_not_authorized_error() {
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Fail(
+            tonic::Code::PermissionDenied,
+            "Repository operation rail requires a verified service account",
+        ),
+        "human-principal-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+
+    let error = harness
+        .client
+        .receipt_get(&query())
+        .await
+        .expect_err("a PermissionDenied status must not decode as a successful receipt");
+
+    assert!(
+        error.is_not_authorized(),
+        "PermissionDenied must map to ProtocolError::NotAuthorized, got {error:?}"
+    );
+}
+
+/// A real connection failure (the code an h2 stream reset produces) must surface as this
+/// client's typed `Disconnected`, not a panic and not a successful decode.
+#[tokio::test]
+async fn a_connection_failure_status_surfaces_as_a_typed_disconnected_error() {
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Fail(tonic::Code::Unavailable, "connection reset"),
+        "test-lore-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+
+    let error = harness
+        .client
+        .receipt_get(&query())
+        .await
+        .expect_err("an Unavailable status must not decode as a successful receipt");
+
+    assert!(
+        error.is_disconnected(),
+        "Unavailable must map to ProtocolError::Disconnected, got {error:?}"
+    );
+}
+
+/// `receipt_get` validates before it dispatches. A structurally impossible query must never
+/// reach the wire at all -- proven here by a double that would happily answer but never sees
+/// a call.
+#[tokio::test]
+async fn a_structurally_invalid_query_never_reaches_the_server() {
+    let harness = start_test_domain_operations(
+        ReceiptGetBehavior::Respond(wire_response(DomainOperationReceiptStatus::NotFound)),
+        "test-lore-jwt",
+        RepositoryId::from([0x01u8; 16]),
+    )
+    .await;
+
+    let mut invalid = query();
+    invalid.fingerprint_version = 0;
+
+    let error = harness
+        .client
+        .receipt_get(&invalid)
+        .await
+        .expect_err("a structurally invalid query must be rejected client-side");
+
+    assert!(
+        format!("{error}").contains("fingerprint_version"),
+        "expected the validation failure to name the offending field, got: {error}"
+    );
+    assert_eq!(
+        harness.calls.load(Ordering::SeqCst),
+        0,
+        "an invalid query must never reach the server"
+    );
+}

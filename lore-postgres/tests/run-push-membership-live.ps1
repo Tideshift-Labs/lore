@@ -38,7 +38,7 @@ $setupError = $null
 # `Exact` means the target may hold no other ignored case, so a case added
 # without updating this list is a setup failure rather than a silent skip.
 $inventory = @(
-    [pscustomobject]@{ Package='lore-server'; Kind='lib'; Target='lore_server'; Exact=$false; ExactPrefixes=@('grpc::handlers::branch_push::governed_tests::membership_tests::'); Cases=@(
+    [pscustomobject]@{ Package='lore-server'; Kind='test'; Target='unit'; Exact=$false; ExactPrefixes=@('grpc::handlers::branch_push::governed_tests::membership_tests::'); Cases=@(
             'grpc::handlers::branch_push::governed_tests::membership_tests::v0_fresh_addition_after_preflight_publishes_on_first_attempt',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v1_fresh_addition_after_preflight_publishes_on_first_attempt',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v0_required_retirement_after_preflight_refuses',

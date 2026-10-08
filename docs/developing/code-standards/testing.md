@@ -6,32 +6,155 @@ This document defines the standard patterns for testing across the Lore codebase
 
 | Type | Location | Framework | Purpose |
 | --- | --- | --- | --- |
-| **Unit tests** | Inline `#[cfg(test)]` modules | Rust/tokio | Module-level testing |
+| **Unit tests** | `tests/unit/` in each crate | Rust/tokio | Module-level testing |
 | **Integration tests** | `lore-revision/tests/` | Rust/tokio | Cross-module testing |
 | **Smoke tests** | `scripts/test/` | Python/pytest | CLI and server testing |
 | **Load tests** | Internal infrastructure | Internal harness | Performance testing |
 
 ---
 
-## 1. Rust unit tests
+## 1. Target risk at the cheapest tier that can find the fault
 
-Inline in source modules with `#[cfg(test)]`:
+Test effort follows risk, not line count. Business logic — session state, ordering guarantees, allocation and placement decisions — earns thorough tests. Plumbing and trivial code earn few or none. A test that restates the implementation costs maintenance and finds nothing.
+
+Then split by what you are checking:
+
+- **Edge cases, variants, boundaries, and error paths → unit tests.** They are cheap, so be exhaustive.
+- **Happy paths → tests that run against real things.** Mocks cannot tell you whether this works wired to a real dependency or assembled into the binary we ship, and it is not worth asking twenty times over.
+
+Assert on outcomes, not on wording. Check `Ok` or `Err` and the error variant, never a substring of the message. Message text is presentation: it changes for readability and the test fails for no reason, or it stops matching a real regression and passes for no reason.
+
+### The tiers
+
+Cheapest first. Cost tracks how much must be standing before the test can run.
+
+| Tier | Answers | Location | Needs |
+| --- | --- | --- | --- |
+| Unit | Is this logic correct across all its cases? | `tests/unit/` | Nothing |
+| Smoke | Does a real user flow work across the binaries? | `scripts/test/`, `@pytest.mark.smoke` | `lore` and `loreserver` binaries built |
+
+Edge cases belong in unit tests. The smoke test covers the happy path only.
+
+---
+
+## 2. Rust unit tests
+
+Unit tests live in the crate's `tests/unit/` directory, not in inline `#[cfg(test)]` modules. Cargo builds the directory as one test binary, which links the library like any other user of it:
+
+```text
+lore-telemetry/
+├── Cargo.toml              # [lib] test = false
+├── src/
+│   └── observe.rs
+└── tests/
+    └── unit/
+        ├── main.rs         # mod observe; mod user_agent_filter;
+        ├── observe.rs
+        └── user_agent_filter.rs
+```
 
 ```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
+// tests/unit/observe.rs
+use lore_telemetry::observe::ObserveResult;
 
-    #[test]
-    fn test_sync_example() {
-        // synchronous test
+#[tokio::test]
+async fn can_observe_success_no_callback() {
+    // test code
+}
+```
+
+An inline `#[cfg(test)]` module makes cargo compile the whole crate a second time, with `--test`. That compile produces an executable, which the build cache cannot store, so CI repeats it on every run. Tests in `tests/unit/` use the library build every other crate already shares, and the build cache serves it.
+
+Set `[lib] test = false` in the crate's `Cargo.toml` once no inline test is left. Without it cargo still compiles the crate a second time, as an empty test harness. The setting covers the whole crate, so move all of a crate's inline modules together. Crates that still carry inline modules move them when next worked on.
+
+### One binary, unless a test needs its own process
+
+All tests in `tests/unit/` share one process, as the tests of an inline module do. A test that needs a process of its own goes in a separate `tests/<name>.rs` file, which cargo builds as its own binary: one that changes process-wide state other tests would observe, or that exercises process-level behavior such as the library's shutdown. Keep these few. Every file directly in `tests/` is another binary to compile and link, and none of that is cached.
+
+### Test helpers
+
+Put helpers that only the crate's own tests use in `tests/unit/` as well, as modules beside the tests: mocks, factories, fixtures. Their dependencies go in `[dev-dependencies]`. A `mockall::mock!` of a public trait works there as it does inside the crate.
+
+Helpers that other crates' tests use are the exception. Another crate cannot import a module from `tests/`, so these live in the library behind the crate's `test-util` feature, as `lore_base::test_util::TempDir` does (see [Scratch space on disk](#scratch-space-on-disk)).
+
+So is a test double that library code has to name itself, such as the type behind a variant of a closed enum. It lives in the library behind `test-util` as well, as `lore_revision::fs::filesystem_provider::test_util::TestOperation` does, and the rest of the fixture stays in `tests/unit/`.
+
+### When a test needs something private
+
+Look for the public way first: a trait method, a constructor, a re-export. A test that needs private access often checks an implementation detail.
+
+When a test does need an item that is not public, make it public for tests only, behind the crate's `test-util` feature, and enable the feature from the crate's own dev-dependencies:
+
+```toml
+[dependencies]
+lore-macro = { workspace = true }
+
+[features]
+test-util = []
+
+[dev-dependencies]
+lore-foo = { workspace = true, features = ["test-util"] }
+```
+
+Mark the item with `#[lore_macro::test_pub]`. Built with `test-util`, the item is `pub`, and so are a struct's fields. Built without it, the item is exactly as written. It applies to functions and methods, structs, enums, constants, `static` items, type aliases, and traits. Put it first among the item's attributes, above any `#[derive]`:
+
+```rust
+// lore-storage/src/local/immutable_store/info.rs
+#[lore_macro::test_pub]
+const INFO_MAGIC: u32 = u32::from_le_bytes(*b"IS_I");
+
+#[lore_macro::test_pub]
+#[repr(C)]
+#[derive(Debug, IntoBytes, FromBytes, Immutable)]
+pub struct ImmutableStoreInfo {
+    magic: u32,
+    version: u32,
+    pub next_group_index_to_migrate_oodle: i32,
+}
+```
+
+When a test needs read access or a wrapper rather than a wider item, add one gated `test_util` child module beside the private items instead. A child module sees its parent's private items, and an inherent `impl` may live anywhere in the crate, so accessors, constructors, and wrappers all fit in it and the production code stays as it is:
+
+```rust
+// lore-credential/src/token_store.rs
+#[cfg(feature = "test-util")]
+pub mod test_util {
+    use super::IdentityToken;
+    use super::TokenStoreError;
+
+    impl IdentityToken {
+        pub fn user_id(&self) -> &str {
+            &self.user_id
+        }
+    }
+
+    pub fn seal_token(key: &[u8], user_token: &str) -> Result<String, TokenStoreError> {
+        super::seal_token(key, user_token)
     }
 }
 ```
 
+To make a private module public, switch its declaration. The attribute cannot do this, because it does not apply to a module declared in its own file. A module that already has a `cfg` keeps it in both declarations:
+
+```rust
+#[cfg(not(feature = "test-util"))]
+mod internals;
+#[cfg(feature = "test-util")]
+pub mod internals;
+
+#[cfg(all(feature = "oodle", not(feature = "test-util")))]
+mod oodle_migration;
+#[cfg(all(feature = "oodle", feature = "test-util"))]
+pub mod oodle_migration;
+```
+
+`cfg(test)` is set only when cargo compiles the crate itself as a test. The tests in `tests/unit/` link the library as built normally, so a `#[cfg(test)]` item or a `#[cfg_attr(test, ...)]` in library code is not there for them. When moving inline tests out, change each one to `feature = "test-util"`.
+
+Used this way the feature adds access and nothing else: wider visibility, accessors, constructors, and wrappers over code that already exists. Helper code stays in `tests/unit/` and its dependencies in `[dev-dependencies]`. Release builds never see it: cargo applies a dev-dependency's features only to builds that include the dev-dependencies. Do not make an item `pub` unconditionally for a test. It becomes API other crates can reach, and the compiler stops reporting it once it falls out of use.
+
 ---
 
-## 2. Rust async tests
+## 3. Rust async tests
 
 **Frameworks:** `tokio`, `mockall`, `async-trait`
 
@@ -128,9 +251,24 @@ tests in a module would otherwise share it.
 it to another crate: a second guard type is a second set of rules, and it does not
 honour `LORE_KEEP_TEST_DATA`.
 
+### Polling for async state
+
+Poll for a condition instead of sleeping. Fixed sleeps are flaky on slow CI, wasteful on fast machines, and opaque — a failure does not say whether the timeout was wrong or the code is broken.
+
+```rust
+// BAD
+sleep(Duration::from_millis(500)).await;
+// GOOD
+wait_for_condition(|| async { manager.session_count() == 2 }, Duration::from_secs(5))
+    .await
+    .expect("sessions should appear within 5 seconds");
+```
+
+Fixed sleeps are acceptable only for time-based behavior such as TTL expiry, or pauses under 20ms to let a spawned task start.
+
 ---
 
-## 3. Smoke tests (`scripts/test/`)
+## 4. Smoke tests (`scripts/test/`)
 
 **Framework:** pytest
 
@@ -251,19 +389,22 @@ is legitimately slower.
 
 ---
 
-## 4. Load tests
+## 5. Load tests
 
 Lore has a load-testing suite that exercises concurrent clone, commit, sync, lock, and compaction workloads. It runs on internal infrastructure and isn't part of the open-source repository, so its harness and scenarios aren't documented here.
 
 ---
 
-## 5. Best practices
+## 6. Best practices
 
-1. **All Lore commands must have smoke tests** in `scripts/test/`.
-2. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
-3. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
-4. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
+1. **Target risk, not line count** — spend test effort on business logic; leave plumbing and trivial code with few or no tests.
+2. **All Lore commands must have smoke tests** in `scripts/test/`.
+3. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
+4. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
+5. **Poll instead of sleeping** for async state; reserve fixed sleeps for time-based behavior or sub-20ms task startup.
+6. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
    a test creates outside its repository — both remove what they hand out.
-5. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
-6. **Use `offline=True`** for operations that don't need the server.
-7. **Feature-gate integration tests** that require external dependencies.
+7. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
+8. **Use `offline=True`** for operations that don't need the server.
+9. **Feature-gate integration tests** that require external dependencies.
+10. **Put Rust unit tests in `tests/unit/`**, with `[lib] test = false`. Give a test its own `tests/*.rs` binary only when it needs its own process, and reach private items only through the `test-util` feature, usually with `#[lore_macro::test_pub]`.

@@ -585,7 +585,7 @@ async fn merge_repository(
 
     // Diff over the full tree. A view-scoped diff drops the other branch's
     // out-of-view changes and leaves this branch divergent from it.
-    let diff = Box::pin(branch::diff3_collect_with_graft(
+    let diff = branch::diff3_collect_with_graft(
         full_tree_context(&repository),
         source_branch,
         revision,
@@ -597,7 +597,7 @@ async fn merge_repository(
         // The view decides which subtrees are out of view. The walk stays
         // full-tree.
         Some(repository.filter.clone()),
-    ))
+    )
     .await
     .forward::<MergeError>("running diff3 for merge")?;
 
@@ -754,13 +754,13 @@ pub async fn merge_start(
             let state_source = state::State::deserialize(repository.clone(), endpoints.source)
                 .await
                 .forward::<MergeError>("deserializing diff source state")?;
-            Box::pin(link::classify_link_pins(
+            link::classify_link_pins(
                 repository.clone(),
                 &state_staged,
                 &state_source,
                 link::LinkPinResolution::ThreeWay(state_base),
                 &[],
-            ))
+            )
             .await
             .forward::<MergeError>("comparing link pins")?;
 
@@ -990,7 +990,7 @@ async fn merge_start_link(
             layer_messages: std::collections::HashMap::new(),
             layer: None,
         };
-        let signature = Box::pin(commit::commit(repository, token, commit_options))
+        let signature = commit::commit_boxed(repository, token, commit_options)
             .await
             .forward::<MergeError>("auto-committing merge")?;
         return Ok(signature);
@@ -1637,23 +1637,23 @@ async fn finalize_main_merge(
     let state_source = state::State::deserialize(repository.clone(), endpoints.source)
         .await
         .forward::<MergeError>("deserializing diff source state")?;
-    let planned = Box::pin(link::classify_link_pins(
+    let planned = link::classify_link_pins(
         repository.clone(),
         &state_staged,
         &state_source,
         link::LinkPinResolution::ThreeWay(state_base),
         &merged_nodes,
-    ))
+    )
     .await
     .forward::<MergeError>("comparing link pins with the merged branch")?;
 
     if !dry_run {
-        Box::pin(link::apply_link_pins(
+        link::apply_link_pins(
             repository.clone(),
             &state_staged,
             planned,
             link::LinkPinRealize::WorkingTree,
-        ))
+        )
         .await
         .forward::<MergeError>("carrying link pins from the merged branch")?;
 
@@ -1693,7 +1693,7 @@ async fn auto_commit_merge(
         layer_messages: std::collections::HashMap::new(),
         layer: None,
     };
-    Box::pin(commit::commit(repository, token, commit_options))
+    commit::commit_boxed(repository, token, commit_options)
         .await
         .forward::<MergeError>("auto-committing merge")
 }
@@ -1999,15 +1999,15 @@ async fn verify_diff_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
-    changes: &Arc<Vec<NodeChange>>,
-    conflicts: &Arc<Vec<(NodeChange, NodeChange)>>,
+    changes: &mut [NodeChange],
+    conflicts: &mut [(NodeChange, NodeChange)],
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
     verify_changes_against_filesystem(
         operation,
         repository,
         state_current,
-        changes.iter(),
+        changes.iter_mut().collect(),
         merge_type,
     )
     .await?;
@@ -2015,7 +2015,10 @@ async fn verify_diff_against_filesystem(
         operation,
         repository,
         state_current,
-        conflicts.iter().map(|(_, change_to)| change_to),
+        conflicts
+            .iter_mut()
+            .map(|(_, change_to)| change_to)
+            .collect(),
         merge_type,
     )
     .await?;
@@ -2025,40 +2028,46 @@ async fn verify_diff_against_filesystem(
 
 /// Verify one set of changes, reporting the first failure once every task in flight has
 /// drained: a task is reading the working copy and has to finish reading it.
-async fn verify_changes_against_filesystem<'a>(
+///
+/// What the verify settles on a change is carried back onto it, since the merge realizes every
+/// change it verified rather than the ones the working copy still needs.
+async fn verify_changes_against_filesystem(
     operation: &Arc<InstanceOperationImpl>,
     repository: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
-    changes: impl Iterator<Item = &'a NodeChange>,
+    mut changes: Vec<&mut NodeChange>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
     fn collect(
-        joined: Result<Result<Option<NodeChange>, MergeError>, tokio::task::JoinError>,
+        joined: Result<Result<(usize, change::Flags), MergeError>, tokio::task::JoinError>,
+        changes: &mut [&mut NodeChange],
         failure: &mut Option<MergeError>,
     ) {
         let result = joined
             .map_err(|e| MergeError::internal_with_context(e, "task failure"))
             .and_then(|result| result);
-        if let Err(err) = result {
-            *failure = failure.take().or(Some(err));
+        match result {
+            Ok((index, flags)) => changes[index].flags = flags,
+            Err(err) => *failure = failure.take().or(Some(err)),
         }
     }
 
     let stats = Arc::new(sync::SyncVerifyStats::default());
     let mut tasks = JoinSet::new();
     let mut failure = None;
-    for change in changes {
+    for index in 0..changes.len() {
+        let change = changes[index].clone();
         lore_spawn!(tasks, {
             let stats = stats.clone();
-            let change = change.clone();
             let repository = repository.clone();
             let operation = operation.clone();
             let state_current = state_current.clone();
             async move {
+                let mut change = change;
                 let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
                 let no_force_hash_check = false;
-                Box::pin(crate::fs::realize::verify_filesystem(
-                    change,
+                crate::fs::realize::verify_filesystem(
+                    &mut change,
                     repository.clone(),
                     operation,
                     crate::state::NodeMapping::root(repository, state_current),
@@ -2066,19 +2075,21 @@ async fn verify_changes_against_filesystem<'a>(
                     no_force_hash_check,
                     stats,
                     FilterMode::Full,
-                ))
+                )
                 .await
-                .forward::<MergeError>("verifying filesystem for change")
+                .forward::<MergeError>("verifying filesystem for change")?;
+
+                Ok((index, change.flags))
             }
         });
         while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(joined) = tasks.join_next().await
         {
-            collect(joined, &mut failure);
+            collect(joined, &mut changes, &mut failure);
         }
     }
     while let Some(joined) = tasks.join_next().await {
-        collect(joined, &mut failure);
+        collect(joined, &mut changes, &mut failure);
     }
     match failure {
         Some(err) => Err(err),
@@ -2302,22 +2313,24 @@ pub async fn apply_diff(
     // non-link contexts. For a link context the set is unfiltered and the
     // diff paths are link-root-relative.
     let stats = Arc::new(sync::SyncRealizeStats::default());
-    let changes = Arc::new(diff.changes);
-    let conflicts = Arc::new(diff.conflicts);
+    let mut changes = diff.changes;
+    let mut conflicts = diff.conflicts;
     let dry_run = execution_context().globals().dry_run();
 
     // One operation covers the whole diff: every path it verifies and realizes is in the
     // same filesystem, and one opened per change would freeze and thaw it once per file.
-    with_operation(repository.file_system(), true, async |operation| {
+    let (changes, conflicts) = with_operation(repository.file_system(), async |operation| {
         verify_diff_against_filesystem(
             &operation,
             &repository,
             &state_current,
-            &changes,
-            &conflicts,
+            &mut changes,
+            &mut conflicts,
             merge_type,
         )
         .await?;
+        let changes = Arc::new(changes);
+        let conflicts = Arc::new(conflicts);
         apply_diff_grafts(&repository, &state_staged, &grafts).await?;
         link::check_incoming_mount_overlaps(repository.clone(), &state_current, &changes)
             .await
@@ -2335,7 +2348,9 @@ pub async fn apply_diff(
             stats: &stats,
             skip_filesystem: dry_run || skip_filesystem,
         })
-        .await
+        .await?;
+
+        Ok::<_, MergeError>((changes, conflicts))
     })
     .await?;
 
@@ -2359,7 +2374,7 @@ pub async fn apply_diff(
                 // Set file/revision metadata
                 merge_metadata(
                     repository.clone(),
-                    Arc::new(changes.to_vec()),
+                    changes.clone(),
                     state_from.clone(),
                     state_staged.clone(),
                     inherit,
@@ -2390,7 +2405,7 @@ pub async fn apply_diff(
 
                 merge_metadata(
                     repository.clone(),
-                    Arc::new(changes.to_vec()),
+                    changes.clone(),
                     state_from.clone(),
                     state_staged.clone(),
                     inherit,
@@ -2425,7 +2440,7 @@ pub async fn apply_diff(
 
                 merge_metadata(
                     repository.clone(),
-                    Arc::new(changes.to_vec()),
+                    changes.clone(),
                     state_from.clone(),
                     state_staged.clone(),
                     inherit,
@@ -3028,7 +3043,7 @@ pub async fn merge_abort(
     let dry_run = execution_context().globals().dry_run();
     // One operation covers the abort: the merge artifacts it removes and the changes it
     // reverts are in the same working tree.
-    let modified_times = with_operation(repository.file_system(), true, async |operation| {
+    let modified_times = with_operation(repository.file_system(), async |operation| {
         if !dry_run {
             for change in changes.iter() {
                 sync::unlink_merge_artifacts(&operation, change.path()).await;
@@ -3209,7 +3224,7 @@ pub async fn apply_restart_diff(
         let conflicts = Arc::new(conflicts);
 
         // One operation covers the restart, as it covers a whole diff application.
-        with_operation(repository.file_system(), true, async |operation| {
+        with_operation(repository.file_system(), async |operation| {
             restart_reset_conflicts(&operation, &repository, &conflicts, dry_run).await?;
             realize_diff_over_filesystem(RealizeDiff {
                 operation: &operation,
@@ -3833,7 +3848,7 @@ pub async fn merge_resolve(
     // One operation covers every path: resolving reads the working copy to tell a conflict
     // still marked up from one settled. Nothing is written: the resolution is recorded in the
     // staged state.
-    with_operation(repository.file_system(), false, async |operation| {
+    with_operation(repository.file_system(), async |operation| {
         resolve_paths(
             &operation,
             &repository,
@@ -3955,78 +3970,85 @@ pub struct MergeIntoOptions {
     pub inherit_metadata: MetadataInherit,
 }
 
-async fn merge_metadata_task(
+/// Copies the file metadata `path` has in `state_source` onto `path` in `state_staged`, where
+/// both states hold it.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn merge_metadata_task(
     repository: Arc<RepositoryContext>,
-    change: NodeChange,
+    path: RelativePath,
     state_source: Arc<State>,
     state_staged: Arc<State>,
-) -> Result<(), MergeError> {
-    let metadata_hash;
+) -> impl Future<Output = Result<(), MergeError>> {
+    async move {
+        let metadata_hash;
 
-    if let Ok(node_link) = state_source
-        .find_node_link(repository.clone(), change.path().as_str())
-        .await
-        && node_link.is_valid()
-    {
-        let metadata_node = node::node_to_file_metadata(node_link.node);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node);
-
-        let metadata_block = state_source
-            .block_file_metadata(repository.clone(), metadata_block_index)
+        if let Ok(node_link) = state_source
+            .find_node_link(repository.clone(), path.as_str())
             .await
-            .forward::<MergeError>("deserializing metadata block")?;
+            && node_link.is_valid()
+        {
+            let metadata_node = node::node_to_file_metadata(node_link.node);
+            let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
+            let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
-        let block_reader = metadata_block.read();
-        let node = block_reader.node(metadata_node_index);
+            let metadata_block = state_source
+                .block_file_metadata(repository.clone(), metadata_block_index)
+                .await
+                .forward::<MergeError>("deserializing metadata block")?;
 
-        metadata_hash = node.metadata;
-    } else {
-        lore_debug!(
-            "Merge metadata skipped due to missing 'source' node for {}",
-            change.path()
-        );
-        return Ok(());
-    }
+            let block_reader = metadata_block.read();
+            let node = block_reader.node(metadata_node_index);
 
-    if let Ok(node_link) = state_staged
-        .find_node_link(repository.clone(), change.path().as_str())
-        .await
-        && node_link.is_valid()
-    {
-        let metadata_node = node::node_to_file_metadata(node_link.node);
-        let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
-        let metadata_node_index = NodeFileMetadata::index(metadata_node);
-
-        let metadata_block = state_staged
-            .block_file_metadata(repository.clone(), metadata_block_index)
-            .await
-            .forward::<MergeError>("deserializing staged metadata block")?;
-
-        let dirtied = {
-            let mut block_writer = metadata_block.write();
-            let node = block_writer.node(metadata_node_index);
-
-            node.metadata = metadata_hash;
-
-            block_writer.mark_dirty()
-        };
-
-        if dirtied {
-            state_staged.block_file_metadata_modified(metadata_block, metadata_block_index);
-            state_staged.mark_dirty();
+            metadata_hash = node.metadata;
+        } else {
+            lore_debug!(
+                "Merge metadata skipped due to missing 'source' node for {}",
+                path
+            );
+            return Ok(());
         }
 
-        lore_trace!("Merged metadata for {}", change.path());
-    } else {
-        lore_debug!(
-            "Merge metadata skipped due to missing 'staged' node for {}",
-            change.path()
-        );
-        return Ok(());
-    }
+        if let Ok(node_link) = state_staged
+            .find_node_link(repository.clone(), path.as_str())
+            .await
+            && node_link.is_valid()
+        {
+            let metadata_node = node::node_to_file_metadata(node_link.node);
+            let metadata_block_index = NodeFileMetadataBlock::index(metadata_node);
+            let metadata_node_index = NodeFileMetadata::index(metadata_node);
 
-    Ok(())
+            let metadata_block = state_staged
+                .block_file_metadata(repository.clone(), metadata_block_index)
+                .await
+                .forward::<MergeError>("deserializing staged metadata block")?;
+
+            let dirtied = {
+                let mut block_writer = metadata_block.write();
+                let node = block_writer.node(metadata_node_index);
+
+                node.metadata = metadata_hash;
+
+                block_writer.mark_dirty()
+            };
+
+            if dirtied {
+                state_staged.block_file_metadata_modified(metadata_block, metadata_block_index);
+                state_staged.mark_dirty();
+            }
+
+            lore_trace!("Merged metadata for {}", path);
+        } else {
+            lore_debug!(
+                "Merge metadata skipped due to missing 'staged' node for {}",
+                path
+            );
+            return Ok(());
+        }
+
+        Ok(())
+    }
 }
 
 async fn merge_file_metadata(
@@ -4037,14 +4059,15 @@ async fn merge_file_metadata(
 ) -> Result<(), MergeError> {
     let mut tasks = JoinSet::new();
     for change in changes.iter() {
-        let repository = repository.clone();
-        let state_source = state_source.clone();
-        let state_staged = state_staged.clone();
-        let change = change.clone();
-
-        lore_spawn!(tasks, {
-            async move { merge_metadata_task(repository, change, state_source, state_staged).await }
-        });
+        lore_spawn!(
+            tasks,
+            merge_metadata_task(
+                repository.clone(),
+                change.path().clone(),
+                state_source.clone(),
+                state_staged.clone(),
+            )
+        );
     }
 
     let mut failure = None;
@@ -4207,30 +4230,16 @@ async fn merge_into_link(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<MergeError>("rehashing commit")?;
-    modified_times.discard();
-    drain_result.forward::<MergeError>("draining rehash tracker")?;
+    .await
+    .forward::<MergeError>("rehashing commit")?
+    .discard();
 
     let state_new = state_staged;
     state_new.reset_merge_conflict_flags();
@@ -4327,6 +4336,10 @@ async fn merge_into_link(
     Ok(())
 }
 
+/// Merges the current branch into `branch` and pushes the result.
+///
+/// The link-only merge `--link` asks for is boxed. Only that option reaches it, and inline it
+/// would make every merge's future as large as its own.
 pub async fn merge_into(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -4406,7 +4419,7 @@ pub async fn merge_into(
     // instead of diffing all changes. This avoids applying internal link changes
     // through the parent diff machinery.
     if let Some(ref link_path) = options.link {
-        return merge_into_link(
+        return Box::pin(merge_into_link(
             repository,
             token,
             branch,
@@ -4416,7 +4429,7 @@ pub async fn merge_into(
             branch_latest,
             link_path,
             &options.inherit_metadata,
-        )
+        ))
         .await;
     }
 
@@ -4518,14 +4531,14 @@ pub async fn merge_into(
     // branch's rows are the newer ones. The working tree stays on the current
     // branch, so nothing is realized on disk.
     if !options.ignore_links {
-        Box::pin(link::merge_link_pins(
+        link::merge_link_pins(
             repository.clone(),
             &state_staged,
             &state_current,
             link::LinkPinResolution::Incoming,
             link::LinkPinRealize::StateOnly,
             &[],
-        ))
+        )
         .await
         .forward::<MergeError>("carrying link pins into the target branch")?;
     }
@@ -4568,30 +4581,16 @@ pub async fn merge_into(
     .await
     .forward::<MergeError>("preparing commit metadata")?;
 
-    // Own tracker scoped to this rehash step: await_all always runs before
-    // propagating the rehash result so no spawned leader outlives the
-    // function holding references to local state.
-    let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
-    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
-    let rehash_result = commit::commit_files_and_rehash(
+    commit::rehash_tree_in_operation(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        RelativePath::new(),
-        ROOT_NODE,
         metadata.clone(),
-        std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
-        rehash_tracker.clone(),
-        modified_times.clone(),
-        commit::CommitStats::new(),
-        execution_context().globals().event_interval(),
     )
-    .await;
-    let drain_result = rehash_tracker.await_all().await;
-    rehash_result.forward::<MergeError>("rehashing commit")?;
-    modified_times.discard();
-    drain_result.forward::<MergeError>("draining rehash tracker")?;
+    .await
+    .forward::<MergeError>("rehashing commit")?
+    .discard();
     lore_debug!("Rehashed state");
 
     let state_new = state_staged;

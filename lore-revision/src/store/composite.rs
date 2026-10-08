@@ -57,7 +57,26 @@ use crate::store::query_one;
 use crate::util::inflight::InflightOutput;
 use crate::util::inflight::RequestRole;
 
-const METRICS_REPLICA_TYPE_LABEL: &str = "replica_type";
+pub const METRICS_REPLICA_TYPE_LABEL: &str = "replica_type";
+
+/// Which of the two replica lists a target belongs to.
+///
+/// A peer serving both roles is held as two targets with a connection each, so anything recorded
+/// per connection carries this to keep the two apart.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ReplicaType {
+    Read,
+    Write,
+}
+
+impl ReplicaType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReplicaType::Read => "read",
+            ReplicaType::Write => "write",
+        }
+    }
+}
 
 type InflightGetsKey = (Partition, Address);
 
@@ -395,12 +414,15 @@ impl CompositeStoreBuilder {
                 topology_refresh_duration: provider
                     .latency_histogram_ms("topology.refresh.iteration.duration"),
                 counter_get_inflight_receiver: provider.counter("get.inflight.receiver"),
+                counter_get_metadata_inflight_receiver: provider
+                    .counter("get_metadata.inflight.receiver"),
                 counter_local_caching: provider.counter("local.caching_total"),
                 counter_replication: provider.counter("replication.fanout_total"),
 
                 provider,
             },
             inflight_gets: Default::default(),
+            inflight_get_metadatas: Default::default(),
         })
     }
 }
@@ -451,6 +473,7 @@ pub struct CompositeStore {
     instruments: CompositeStoreInstruments,
 
     inflight_gets: InflightOutput<InflightGetsKey, Result<StoreGetData, StoreError>>,
+    inflight_get_metadatas: InflightOutput<InflightGetsKey, Result<StoreGetData, StoreError>>,
 }
 
 pub struct ReevaluatePeersSummary {
@@ -622,11 +645,17 @@ impl CompositeStore {
         }
         self.instruments.gauge_num_replicas.record(
             self.write_replicas.read().await.len() as u64,
-            &[KeyValue::new(METRICS_REPLICA_TYPE_LABEL, "write")],
+            &[KeyValue::new(
+                METRICS_REPLICA_TYPE_LABEL,
+                ReplicaType::Write.as_str(),
+            )],
         );
         self.instruments.gauge_num_replicas.record(
             self.read_replicas.read().await.len() as u64,
-            &[KeyValue::new(METRICS_REPLICA_TYPE_LABEL, "read")],
+            &[KeyValue::new(
+                METRICS_REPLICA_TYPE_LABEL,
+                ReplicaType::Read.as_str(),
+            )],
         );
 
         refresh_result
@@ -800,6 +829,100 @@ impl CompositeStore {
         }
 
         Err(error_to_return)
+    }
+
+    async fn get_metadata_from_remotes(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError> {
+        let mut fan_out = CompositeOperation::new();
+        let queries = &mut fan_out.queries;
+
+        if !self.local_durable {
+            let cancel_token = fan_out.cancellation_token.clone();
+            let delay = self.get_durable_delay_for_operation().await;
+            let durable_store = self.durable.target.clone();
+            lore_spawn!(queries, async move {
+                tokio::time::sleep(delay).await;
+                if cancel_token.is_cancelled() {
+                    (true, Err(StoreError::internal("cancelled")))
+                } else {
+                    let durable_result = durable_store
+                        .get_metadata(partition, address)
+                        .await
+                        .map(CompositeStoreHit::Durable);
+                    (true, durable_result)
+                }
+            });
+        }
+        {
+            let read_replicas = self.read_replicas.read().await;
+            for replica in read_replicas.iter() {
+                let replica_store = replica.target.clone();
+                lore_spawn!(queries, async move {
+                    let replica_result = replica_store
+                        .get_metadata(partition, address)
+                        .await
+                        .map(CompositeStoreHit::Replica);
+                    (false, replica_result)
+                });
+            }
+        }
+
+        let mut best_result = CompositeStoreHit::Miss(StoreGetData::default());
+
+        while let Some(join_result) = queries.join_next().await {
+            let Ok((is_durable, query_result)) = join_result else {
+                continue;
+            };
+            match query_result {
+                Ok(result) => {
+                    let result_match = result.inner().match_made;
+                    if result_match > best_result.inner().match_made {
+                        best_result = result;
+                        if result_match >= StoreMatch::MatchFull {
+                            break;
+                        }
+                    }
+                    if is_durable {
+                        // durable is the source of truth — replicas will not be able to do better
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if is_durable && !error.is_slow_down() && !error.is_internal() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if self.cache_metadata
+            && best_result.inner().match_made == StoreMatch::MatchFull
+            // If the durable store was the first to answer, then either the
+            // replicas are too slow or don't have the fragment, so we should build up
+            // our own local cache
+            && matches!(best_result, CompositeStoreHit::Durable(_))
+            && !self.local_durable
+        {
+            let local_store = self.local.store();
+            let fragment = best_result.inner().fragment;
+            let partition = best_result.inner().partition;
+            let cache_counter = self.instruments.counter_local_caching.clone();
+            lore_spawn!(async move {
+                let put_result = local_store
+                    .put(
+                        partition, address, fragment, None,  /* payload */
+                        false, /* force */
+                    )
+                    .await;
+                count_result("put_after_get_metadata", &cache_counter, &put_result);
+                put_result
+            });
+        }
+
+        best_result.into_counted_result(&self.instruments.counter_get_metadata)
     }
 }
 
@@ -982,6 +1105,10 @@ impl ImmutableStore for CompositeStore {
     ///
     /// A representation that had to come from elsewhere is written back to the local store without
     /// its payload, so the next caller finds it in process.
+    ///
+    /// Callers that miss locally on the same partition and address while a fan-out is already in
+    /// flight wait on that one rather than starting their own, and every one of them observes the
+    /// same outcome, success or failure.
     async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,
@@ -1000,93 +1127,27 @@ impl ImmutableStore for CompositeStore {
             return result.into_counted_result(&self.instruments.counter_get_metadata);
         }
 
-        let mut fan_out = CompositeOperation::new();
-        let queries = &mut fan_out.queries;
-
-        if !self.local_durable {
-            let cancel_token = fan_out.cancellation_token.clone();
-            let delay = self.get_durable_delay_for_operation().await;
-            let durable_store = self.durable.target.clone();
-            lore_spawn!(queries, async move {
-                tokio::time::sleep(delay).await;
-                if cancel_token.is_cancelled() {
-                    (true, Err(StoreError::internal("cancelled")))
-                } else {
-                    let durable_result = durable_store
-                        .get_metadata(partition, address)
-                        .await
-                        .map(CompositeStoreHit::Durable);
-                    (true, durable_result)
-                }
-            });
-        }
-        {
-            let read_replicas = self.read_replicas.read().await;
-            for replica in read_replicas.iter() {
-                let replica_store = replica.target.clone();
-                lore_spawn!(queries, async move {
-                    let replica_result = replica_store
-                        .get_metadata(partition, address)
-                        .await
-                        .map(CompositeStoreHit::Replica);
-                    (false, replica_result)
-                });
-            }
-        }
-
-        let mut best_result = CompositeStoreHit::Miss(StoreGetData::default());
-
-        while let Some(join_result) = queries.join_next().await {
-            let Ok((is_durable, query_result)) = join_result else {
-                continue;
-            };
-            match query_result {
-                Ok(result) => {
-                    let result_match = result.inner().match_made;
-                    if result_match > best_result.inner().match_made {
-                        best_result = result;
-                        if result_match >= StoreMatch::MatchFull {
-                            break;
-                        }
-                    }
-                    if is_durable {
-                        // durable is the source of truth — replicas will not be able to do better
-                        break;
-                    }
-                }
-                Err(error) => {
-                    if is_durable && !error.is_slow_down() && !error.is_internal() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        if self.cache_metadata
-            && best_result.inner().match_made == StoreMatch::MatchFull
-            // If the durable store was the first to answer, then either the
-            // replicas are too slow or don't have the fragment, so we should build up
-            // our own local cache
-            && matches!(best_result, CompositeStoreHit::Durable(_))
-            && !self.local_durable
-        {
-            let local_store = self.local.store();
-            let fragment = best_result.inner().fragment;
-            let partition = best_result.inner().partition;
-            let cache_counter = self.instruments.counter_local_caching.clone();
-            lore_spawn!(async move {
-                let put_result = local_store
-                    .put(
-                        partition, address, fragment, None,  /* payload */
-                        false, /* force */
-                    )
+        match self.inflight_get_metadatas.request((partition, address)) {
+            RequestRole::RequestMaker(guard) => {
+                let result = self
+                    .clone()
+                    .get_metadata_from_remotes(partition, address)
                     .await;
-                count_result("put_after_get_metadata", &cache_counter, &put_result);
-                put_result
-            });
+                guard.broadcast(&result);
+                result
+            }
+            RequestRole::ResultAwaiter(mut receiver) => {
+                self.instruments
+                    .counter_get_metadata_inflight_receiver
+                    .add(1, &[]);
+                receiver.recv().await.unwrap_or_else(|receive_error| {
+                    Err(StoreError::internal_with_context(
+                        receive_error,
+                        "Failed to get_metadata inflight result",
+                    ))
+                })
+            }
         }
-
-        best_result.into_counted_result(&self.instruments.counter_get_metadata)
     }
 
     async fn get(
@@ -1386,6 +1447,7 @@ fn count_result<T, E>(context: &'static str, counter: &Counter<u64>, result: &Re
 /// expected (a peer-made replica cannot carry a copy), logs at debug and leaves the state alone.
 ///
 /// Returns the level it logged at, if any.
+#[lore_macro::test_pub]
 fn report_replication(
     operation: &'static str,
     replica: &str,
@@ -1442,139 +1504,7 @@ struct CompositeStoreInstruments {
     topology_refresh_num_peer_errors: Counter<u64>,
     topology_refresh_duration: Histogram<f64>,
     counter_get_inflight_receiver: Counter<u64>,
+    counter_get_metadata_inflight_receiver: Counter<u64>,
     counter_local_caching: Counter<u64>,
     counter_replication: Counter<u64>,
-}
-
-#[cfg(test)]
-mod report_replication_tests {
-    use opentelemetry::Value;
-    use opentelemetry::metrics::MeterProvider as _;
-    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
-    use opentelemetry_sdk::metrics::SdkMeterProvider;
-    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
-    use opentelemetry_sdk::metrics::data::MetricData;
-
-    use super::*;
-
-    /// A counter on a meter of its own, so the counts read back are this test's alone rather than
-    /// the process-wide provider's.
-    struct RecordedCounter {
-        provider: SdkMeterProvider,
-        exporter: InMemoryMetricExporter,
-        counter: Counter<u64>,
-    }
-
-    impl RecordedCounter {
-        fn new() -> Self {
-            let exporter = InMemoryMetricExporter::default();
-            let provider = SdkMeterProvider::builder()
-                .with_periodic_exporter(exporter.clone())
-                .build();
-            let counter = provider.meter("test").u64_counter("fanout").build();
-            Self {
-                provider,
-                exporter,
-                counter,
-            }
-        }
-
-        fn count(&self, success: bool) -> u64 {
-            self.provider.force_flush().expect("flush the test meter");
-            let metrics = self.exporter.get_finished_metrics().expect("read metrics");
-            let Some(last) = metrics.last() else {
-                return 0;
-            };
-            last.scope_metrics()
-                .flat_map(|scope| scope.metrics())
-                .map(|metric| match metric.data() {
-                    AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
-                        .data_points()
-                        .filter(|point| {
-                            point.attributes().any(|attribute| {
-                                attribute.key.as_str() == METRICS_SUCCESS_ATTRIBUTE_NAME
-                                    && attribute.value == Value::Bool(success)
-                            })
-                        })
-                        .map(|point| point.value())
-                        .sum::<u64>(),
-                    data => panic!("expected a u64 sum, got {data:?}"),
-                })
-                .sum()
-        }
-    }
-
-    fn report(
-        failing: &AtomicBool,
-        counter: &RecordedCounter,
-        result: Result<(), StoreError>,
-    ) -> Option<LoreLogLevel> {
-        report_replication(
-            "put",
-            "replica",
-            Address::default(),
-            failing,
-            &counter.counter,
-            &result,
-        )
-    }
-
-    fn failure() -> Result<(), StoreError> {
-        Err(StoreError::internal("replica down"))
-    }
-
-    fn refusal() -> Result<(), StoreError> {
-        Err(StoreError::from(crate::errors::NotSupported {
-            operation: "copy".to_string(),
-        }))
-    }
-
-    #[test]
-    fn a_persistent_failure_warns_only_when_the_state_changes() {
-        let failing = AtomicBool::new(false);
-        let counter = RecordedCounter::new();
-
-        assert_eq!(report(&failing, &counter, Ok(())), None);
-        assert_eq!(
-            report(&failing, &counter, failure()),
-            Some(LoreLogLevel::Warn)
-        );
-        assert_eq!(
-            report(&failing, &counter, failure()),
-            Some(LoreLogLevel::Debug)
-        );
-        assert_eq!(
-            report(&failing, &counter, failure()),
-            Some(LoreLogLevel::Debug)
-        );
-        assert_eq!(report(&failing, &counter, Ok(())), Some(LoreLogLevel::Warn));
-        assert_eq!(report(&failing, &counter, Ok(())), None);
-
-        assert_eq!(counter.count(true), 3);
-        assert_eq!(counter.count(false), 3);
-    }
-
-    #[test]
-    fn a_refusal_logs_at_debug_and_leaves_the_state_alone() {
-        let failing = AtomicBool::new(false);
-        let counter = RecordedCounter::new();
-
-        assert_eq!(
-            report(&failing, &counter, refusal()),
-            Some(LoreLogLevel::Debug)
-        );
-        assert!(!failing.load(Ordering::Relaxed));
-        assert_eq!(
-            report(&failing, &counter, failure()),
-            Some(LoreLogLevel::Warn)
-        );
-        assert_eq!(
-            report(&failing, &counter, refusal()),
-            Some(LoreLogLevel::Debug)
-        );
-        assert!(failing.load(Ordering::Relaxed));
-
-        assert_eq!(counter.count(true), 0);
-        assert_eq!(counter.count(false), 3);
-    }
 }

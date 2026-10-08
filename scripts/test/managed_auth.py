@@ -177,7 +177,7 @@ class ManagedAuth:
         self.http.server_close()
         self.thread.join(5)
 
-    def sign(self, subject, resources=None):
+    def sign(self, subject, resources=None, *, service_account=False):
         now = int(time.time())
         claims = {
             "sub": subject,
@@ -191,7 +191,7 @@ class ManagedAuth:
             ],
             "name": "Python fixture",
             "preferred_username": "Python fixture",
-            "is_service_account": False,
+            "is_service_account": service_account,
             "idp": "python-fixture",
             "env": "test",
             "groups": [],

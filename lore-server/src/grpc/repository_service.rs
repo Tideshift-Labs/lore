@@ -16,6 +16,7 @@ use super::handlers::repository_metadata_get;
 use super::handlers::repository_metadata_set;
 use super::handlers::repository_query;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_catalog::RepositoryCatalog;
 use crate::domain::DomainContext;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -25,13 +26,26 @@ use crate::legacy::rpc::repository_service_server::RepositoryService;
 pub struct LoreRepositoryService {
     environment: EnvironmentConfig,
     authorizer: Arc<dyn RepositoryAuthorizer>,
+    repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
-    /// CR-029 domain coordinator, when this cell has one. `None` is the legacy
-    /// path, not an error.
-    domain_context: Option<Arc<DomainContext>>,
+    /// FORK-LOCAL (Tideshift, CR-029): see [`DomainBinding`].
+    domain: DomainBinding,
+}
+
+/// FORK-LOCAL (Tideshift, CR-029): whether this cell's domain coordinator was
+/// attached. Upstream's `new` cannot take it without going over the argument
+/// limit, so [`LoreRepositoryService::with_domain_context`] attaches it. A
+/// service built with `new` alone is `Unbound`, and the handlers that route
+/// through the coordinator refuse with `Internal` rather than silently taking
+/// the legacy path, which a governed cell must not take.
+#[derive(Clone)]
+enum DomainBinding {
+    Unbound,
+    /// `None` is the legacy path (a cell with no coordinator), not an error.
+    Bound(Option<Arc<DomainContext>>),
 }
 
 impl InstrumentProvider for LoreRepositoryService {
@@ -44,20 +58,41 @@ impl LoreRepositoryService {
     pub fn new(
         environment: EnvironmentConfig,
         authorizer: Arc<dyn RepositoryAuthorizer>,
+        repository_catalog: Arc<dyn RepositoryCatalog>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
-        domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         Self {
             environment,
             authorizer,
+            repository_catalog,
             immutable_store,
             mutable_store,
             hook_dispatcher,
             rpc_timeout,
-            domain_context,
+            domain: DomainBinding::Unbound,
+        }
+    }
+
+    /// FORK-LOCAL (Tideshift, CR-029): attaches the cell's domain coordinator,
+    /// `None` for a cell without one. Required: see [`DomainBinding`].
+    #[must_use]
+    pub fn with_domain_context(mut self, domain_context: Option<Arc<DomainContext>>) -> Self {
+        self.domain = DomainBinding::Bound(domain_context);
+        self
+    }
+
+    fn domain_context(&self) -> Result<Option<&Arc<DomainContext>>, Status> {
+        match &self.domain {
+            DomainBinding::Bound(domain_context) => Ok(domain_context.as_ref()),
+            DomainBinding::Unbound => {
+                tracing::error!("repository service built without with_domain_context");
+                Err(Status::internal(
+                    "repository service was built without a domain binding",
+                ))
+            }
         }
     }
 }
@@ -68,6 +103,7 @@ impl RepositoryService for LoreRepositoryService {
         &self,
         request: Request<lore_proto::RepositoryCreateRequest>,
     ) -> Result<Response<lore_proto::RepositoryCreateResponse>, Status> {
+        let domain_context = self.domain_context()?;
         timeout_grpc(
             self.rpc_timeout,
             repository_create::handler(
@@ -80,7 +116,7 @@ impl RepositoryService for LoreRepositoryService {
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
                 self,
-                self.domain_context.as_ref(),
+                domain_context,
             ),
         )
         .await
@@ -90,6 +126,7 @@ impl RepositoryService for LoreRepositoryService {
         &self,
         request: Request<lore_proto::RepositoryDeleteRequest>,
     ) -> Result<Response<lore_proto::RepositoryDeleteResponse>, Status> {
+        let domain_context = self.domain_context()?;
         timeout_grpc(
             self.rpc_timeout,
             repository_delete::handler(
@@ -101,7 +138,7 @@ impl RepositoryService for LoreRepositoryService {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self,
-                self.domain_context.as_ref(),
+                domain_context,
             ),
         )
         .await
@@ -131,10 +168,8 @@ impl RepositoryService for LoreRepositoryService {
             self.rpc_timeout,
             repository_list::handler(
                 request,
-                self.environment
-                    .endpoint
-                    .as_ref()
-                    .and_then(|endpoint| endpoint.auth_url.clone()),
+                self.repository_catalog.clone(),
+                self.rpc_timeout,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -162,6 +197,7 @@ impl RepositoryService for LoreRepositoryService {
         &self,
         request: Request<lore_proto::RepositoryMetadataSetRequest>,
     ) -> Result<Response<lore_proto::RepositoryMetadataSetResponse>, Status> {
+        let domain_context = self.domain_context()?;
         timeout_grpc(
             self.rpc_timeout,
             repository_metadata_set::handler(
@@ -169,7 +205,7 @@ impl RepositoryService for LoreRepositoryService {
                 self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
-                self.domain_context.as_ref(),
+                domain_context,
             ),
         )
         .await

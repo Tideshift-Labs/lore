@@ -114,7 +114,7 @@ async fn real_loreserver_binary_initializes_and_emits_parseable_json() {
         "lock_store".into(),
         toml::from_str::<toml::Value>("mode = 'postgres'").unwrap(),
     );
-    config["server"].as_table_mut().unwrap().insert("auth".into(), toml::from_str::<toml::Value>("jwt_issuer = 'https://issuer.invalid'\nenforce_write_permission = true\n[jwk]\nendpoint = 'https://issuer.invalid/jwks'").unwrap());
+    config["server"].as_table_mut().unwrap().insert("auth".into(), toml::from_str::<toml::Value>("jwt_issuer = 'https://issuer.invalid'\njwt_audience = ['lore']\nresource_claim = 'resources'\nenforce_write_permission = true\n[jwk]\nendpoint = 'https://issuer.invalid/jwks'").unwrap());
     config.as_table_mut().unwrap().insert(
         "plugins".into(),
         toml::Value::try_from(&fixture.settings.plugins).unwrap(),

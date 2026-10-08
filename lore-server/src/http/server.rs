@@ -70,6 +70,11 @@ pub struct ServerState {
     pub repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
+    /// FORK-LOCAL (Tideshift, ADR-00011): the `enforce_write_permission`
+    /// setting. Every route that mutates repository state checks the fork
+    /// claim reader for `write` (see `put_repository_content`); upstream's
+    /// authorizer only decides whether the repository is reachable.
+    pub enforce_write_permission: bool,
 }
 
 /// The readiness facets `/event_readiness` reports, grouped so [`serve`]'s
@@ -167,13 +172,17 @@ pub struct LoreHttpServerSettings {
     pub presign: PresignSettings,
     /// User-agent filter applied to HTTP metrics labels.
     pub user_agent_filter: Arc<UserAgentFilter>,
+    /// FORK-LOCAL (Tideshift, ADR-00011): copied into
+    /// [`ServerState::enforce_write_permission`]. The launcher sets it from
+    /// `[server.auth]`, as it does for the gRPC and QUIC surfaces.
+    pub enforce_write_permission: bool,
 }
 
 impl LoreHttpServerSettings {
     /// Settings suitable for unit tests: generous timeouts so a zero-duration
     /// `TimeoutLayer` (the result of `u64::default() == 0`) does not race
     /// against async handlers
-    #[cfg(test)]
+    #[cfg(feature = "test-util")]
     pub fn test_default() -> Self {
         Self {
             request_timeout_seconds: 30,
@@ -181,6 +190,24 @@ impl LoreHttpServerSettings {
             ..Self::default()
         }
     }
+}
+
+#[lore_macro::test_pub]
+fn apply_presigned_transport_limits(
+    router: Router,
+    max_file_size: u64,
+    settings: &LoreHttpServerSettings,
+) -> Router {
+    // This route bypasses `authenticated_router`, so it needs its own transport limits.
+    router
+        .layer(DefaultBodyLimit::max(max_file_size as usize))
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(settings.request_timeout_seconds),
+        ))
+        .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+            Duration::from_secs(settings.request_body_timeout_seconds),
+        ))
 }
 
 // Expose a testable router factory
@@ -233,10 +260,13 @@ pub fn create_router(
         .nest("/v1", authenticated_router);
 
     if shared_state.presign_config.is_some() {
-        router = router.nest(
-            "/v1/presigned",
+        let presigned_router = apply_presigned_transport_limits(
             presigned::create_router(Arc::new(shared_state.clone())),
+            shared_state.max_file_size,
+            settings,
         );
+
+        router = router.nest("/v1/presigned", presigned_router);
     }
 
     router
@@ -261,6 +291,7 @@ fn presign_content_type_field(field: PolicyField) -> &'static str {
 }
 
 /// Renders the resolved allowlist for the startup log.
+#[lore_macro::test_pub]
 fn describe_allowed_types(types: &[String]) -> String {
     if types.is_empty() {
         "<none>".to_string()
@@ -269,6 +300,7 @@ fn describe_allowed_types(types: &[String]) -> String {
     }
 }
 
+#[lore_macro::test_pub]
 fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConfig>> {
     let Some(key_hex) = settings.hmac_key.as_deref() else {
         return Ok(None);
@@ -456,6 +488,7 @@ impl LoreHttpServer {
             repository_authorizer,
             max_file_size: settings.max_file_size,
             presign_config,
+            enforce_write_permission: settings.enforce_write_permission,
         };
 
         let app = create_router(shared_state, health, &settings);
@@ -471,157 +504,5 @@ impl LoreHttpServer {
         .await??;
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::security_headers::DEFAULT_ALLOWED_CONTENT_TYPES;
-    use super::*;
-
-    /// 32 bytes of hex, the minimum `build_presign_config` accepts.
-    const TEST_HMAC_KEY: &str = "32d0bd7711276da5a4d73e1211ba3884ad1819aa0b4727b8ee5d695e9c3199de";
-
-    fn settings_with_policy(policy: ContentTypePolicy) -> PresignSettings {
-        PresignSettings {
-            hmac_key: Some(TEST_HMAC_KEY.to_string()),
-            content_type_policy: policy,
-            ..PresignSettings::default()
-        }
-    }
-
-    fn types(list: &[&str]) -> Vec<String> {
-        list.iter().map(|t| (*t).to_string()).collect()
-    }
-
-    /// The test that catches a settings field added but never threaded into
-    /// `PresignConfig`.
-    #[test]
-    fn build_presign_config_threads_extra_content_types() {
-        let config = build_presign_config(&settings_with_policy(ContentTypePolicy {
-            extra: types(&["application/zip"]),
-            denied: Vec::new(),
-        }))
-        .expect("config should build")
-        .expect("presign should be enabled");
-
-        assert!(config.content_type_allowlist.is_allowed("application/zip"));
-        assert!(config.content_type_allowlist.is_allowed("image/png"));
-    }
-
-    #[test]
-    fn build_presign_config_threads_denied_content_types() {
-        let config = build_presign_config(&settings_with_policy(ContentTypePolicy {
-            extra: Vec::new(),
-            denied: types(&["application/pdf"]),
-        }))
-        .expect("config should build")
-        .expect("presign should be enabled");
-
-        assert!(!config.content_type_allowlist.is_allowed("application/pdf"));
-    }
-
-    /// A browser-executable extra type stops the server from starting.
-    #[test]
-    fn build_presign_config_rejects_never_allowed_extra_type() {
-        let result = build_presign_config(&settings_with_policy(ContentTypePolicy {
-            extra: types(&["text/html"]),
-            denied: Vec::new(),
-        }));
-
-        // Matched rather than `expect_err`, which would need `Debug` on
-        // `PresignConfig` for tests alone.
-        let Err(error) = result else {
-            panic!("startup must fail on a browser-executable extra type");
-        };
-
-        assert!(
-            error.to_string().contains("text/html"),
-            "error must name the type, got: {error}"
-        );
-    }
-
-    /// The policy must not accidentally enable the feature.
-    #[test]
-    fn build_presign_config_without_hmac_key_is_none() {
-        let config = build_presign_config(&PresignSettings {
-            hmac_key: None,
-            content_type_policy: ContentTypePolicy {
-                extra: types(&["application/zip"]),
-                denied: Vec::new(),
-            },
-            ..PresignSettings::default()
-        })
-        .expect("config should build");
-
-        assert!(config.is_none());
-    }
-
-    /// The derived `Default` must leave the policy empty, so programmatic
-    /// construction resolves to the built-in set like an absent config key. Sets
-    /// only `hmac_key`, so the policy comes from `Default` rather than the caller.
-    #[test]
-    fn presign_settings_default_resolves_to_builtin_set() {
-        let config = build_presign_config(&PresignSettings {
-            hmac_key: Some(TEST_HMAC_KEY.to_string()),
-            ..PresignSettings::default()
-        })
-        .expect("config should build")
-        .expect("presign should be enabled");
-
-        let mut expected = types(DEFAULT_ALLOWED_CONTENT_TYPES);
-        expected.sort_unstable();
-        assert_eq!(config.content_type_allowlist.allowed_types(), expected);
-    }
-
-    /// An operator needs to know which of the two lists holds the bad entry.
-    #[test]
-    fn build_presign_config_error_names_the_extra_content_types_field() {
-        let result = build_presign_config(&settings_with_policy(ContentTypePolicy {
-            extra: types(&["text/html"]),
-            denied: Vec::new(),
-        }));
-
-        let Err(error) = result else {
-            panic!("startup must fail on a browser-executable extra type");
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("presigned_url_extra_content_types"),
-            "error must name the field, got: {error}"
-        );
-    }
-
-    #[test]
-    fn build_presign_config_error_names_the_denied_content_types_field() {
-        let result = build_presign_config(&settings_with_policy(ContentTypePolicy {
-            extra: Vec::new(),
-            denied: types(&["image/png,image/gif"]),
-        }));
-
-        let Err(error) = result else {
-            panic!("startup must fail on a malformed denied entry");
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("presigned_url_denied_content_types"),
-            "error must name the field, got: {error}"
-        );
-    }
-
-    /// An empty set would otherwise render as nothing at all in the startup log.
-    #[test]
-    fn describe_allowed_types_marks_an_empty_set() {
-        assert_eq!(describe_allowed_types(&[]), "<none>");
-    }
-
-    #[test]
-    fn describe_allowed_types_joins_the_set() {
-        assert_eq!(
-            describe_allowed_types(&types(&["image/png", "text/plain"])),
-            "image/png, text/plain"
-        );
     }
 }

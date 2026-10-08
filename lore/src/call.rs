@@ -44,6 +44,7 @@ use crate::util::log_command_info;
 /// its later lookup would answer "no such receipt" forever while appearing to work perfectly.
 /// Failing the call is loud, local, and costs one reissued operation; the alternative is silent
 /// and permanent.
+#[lore_macro::test_pub]
 fn dispatch_attempt(globals: &LoreGlobalArgs) -> Result<Option<AttemptId>, InvalidArguments> {
     let Some(text) = globals.attempt_id() else {
         return Ok(None);
@@ -77,6 +78,7 @@ fn dispatch_attempt(globals: &LoreGlobalArgs) -> Result<Option<AttemptId>, Inval
 /// `auth.rs`, `branch.rs` and their siblings fails with "implementation of `Send` is not general
 /// enough". Measured, not guessed: written as an `async fn` first, and that is the error it
 /// produced.
+#[lore_macro::test_pub]
 fn in_dispatch_attempt<F>(
     attempt: Option<AttemptId>,
     operation: F,
@@ -196,29 +198,26 @@ where
                 log_command_info(&caller, &args);
                 let time_start = Instant::now();
 
-                let detail;
-                let mut weak_repository = None;
-                match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::ReadOnly,
-                    None,
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        detail = LoreErrorDetail::from_result(
-                            lore_transport::with_optional_caller_operation(
-                                lore_transport::caller_operation_for_repository(repository.id),
-                                command(repository.clone(), args),
-                            )
-                            .await,
-                        );
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                    }
-                    Err(err) => {
-                        detail = LoreErrorDetail::from_error(&err);
-                    }
-                }
+                let (detail, weak_repository) = 'call: {
+                    let repository = match repository::load_and_connect_with_token(
+                        &repository_path,
+                        RepositoryAccess::ReadOnly,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
+                    };
+                    let detail = LoreErrorDetail::from_result(
+                        lore_transport::with_optional_caller_operation(
+                            lore_transport::caller_operation_for_repository(repository.id),
+                            command(repository.clone(), args),
+                        )
+                        .await,
+                    );
+                    (detail, Some(post_command_cleanup(repository).await))
+                };
 
                 check_no_lingering_repository(weak_repository);
 
@@ -270,39 +269,36 @@ where
             }
         };
 
-    let token = RepositoryWriteToken::acquire(&repository_path).await;
-    let context_token = token.share();
-
     fence
         .run(LORE_CONTEXT.scope(
             execution,
             in_dispatch_attempt(attempt, async move {
+                let token = RepositoryWriteToken::acquire(&repository_path).await;
+                let context_token = token.share();
+
                 log_command_info(&caller, &args);
                 let time_start = Instant::now();
 
-                let detail;
-                let mut weak_repository = None;
-                match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::ReadWrite,
-                    Some(context_token),
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        detail = LoreErrorDetail::from_result(
-                            lore_transport::with_optional_caller_operation(
-                                lore_transport::caller_operation_for_repository(repository.id),
-                                command(repository.clone(), token, args),
-                            )
-                            .await,
-                        );
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                    }
-                    Err(err) => {
-                        detail = LoreErrorDetail::from_error(&err);
-                    }
-                }
+                let (detail, weak_repository) = 'call: {
+                    let repository = match repository::load_and_connect_with_token(
+                        &repository_path,
+                        RepositoryAccess::ReadWrite,
+                        Some(context_token),
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
+                    };
+                    let detail = LoreErrorDetail::from_result(
+                        lore_transport::with_optional_caller_operation(
+                            lore_transport::caller_operation_for_repository(repository.id),
+                            command(repository.clone(), token, args),
+                        )
+                        .await,
+                    );
+                    (detail, Some(post_command_cleanup(repository).await))
+                };
 
                 check_no_lingering_repository(weak_repository);
 
@@ -430,29 +426,26 @@ where
                 log_command_info(&caller, &args);
                 let time_start = Instant::now();
 
-                let detail;
-                let mut weak_repository = None;
-                match repository::load_and_connect_with_token(
-                    &repository_path,
-                    RepositoryAccess::NoStore,
-                    None,
-                )
-                .await
-                {
-                    Ok(repository) => {
-                        detail = LoreErrorDetail::from_result(
-                            lore_transport::with_optional_caller_operation(
-                                lore_transport::caller_operation_for_repository(repository.id),
-                                command(repository.clone(), args),
-                            )
-                            .await,
-                        );
-                        weak_repository = Some(post_command_cleanup(repository).await);
-                    }
-                    Err(err) => {
-                        detail = LoreErrorDetail::from_error(&err);
-                    }
-                }
+                let (detail, weak_repository) = 'call: {
+                    let repository = match repository::load_and_connect_with_token(
+                        &repository_path,
+                        RepositoryAccess::NoStore,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(repository) => repository,
+                        Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
+                    };
+                    let detail = LoreErrorDetail::from_result(
+                        lore_transport::with_optional_caller_operation(
+                            lore_transport::caller_operation_for_repository(repository.id),
+                            command(repository.clone(), args),
+                        )
+                        .await,
+                    );
+                    (detail, Some(post_command_cleanup(repository).await))
+                };
 
                 check_no_lingering_repository(weak_repository);
 
@@ -463,20 +456,27 @@ where
         .await
 }
 
+/// Resolves `globals.repository_path` against the call's working directory and records the result
+/// in `globals`. Left as given when it cannot be resolved.
+pub(crate) fn resolve_repository_path(globals: &mut LoreGlobalArgs) -> PathBuf {
+    match util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(Path::new),
+    ) {
+        Ok(path) => {
+            globals.repository_path = path.display().to_string().into();
+            path
+        }
+        Err(_) => PathBuf::from(globals.repository_path.as_str()),
+    }
+}
+
 /// On `Err`, the error has already been dispatched to the callback.
 async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Result<(PathBuf, Arc<ExecutionContext>, Option<AttemptId>), i32> {
-    let repository_path = if let Ok(path) = util::path::make_absolute_from(
-        globals.repository_path.as_str(),
-        globals.working_directory().map(Path::new),
-    ) {
-        globals.repository_path = path.display().to_string().into();
-        path
-    } else {
-        PathBuf::from(globals.repository_path.as_str())
-    };
+    let repository_path = resolve_repository_path(&mut globals);
 
     // Read before `globals` is moved into the execution context, and refused here rather than
     // deeper so a bad value costs nothing but this call.
@@ -533,15 +533,7 @@ async fn prepare_repository_call_result<ErrT>(
 where
     ErrT: EventError + FfiError + HasTrace + From<RepositoryError>,
 {
-    let repository_path = if let Ok(path) = util::path::make_absolute_from(
-        globals.repository_path.as_str(),
-        globals.working_directory().map(Path::new),
-    ) {
-        globals.repository_path = path.display().to_string().into();
-        path
-    } else {
-        PathBuf::from(globals.repository_path.as_str())
-    };
+    let repository_path = resolve_repository_path(&mut globals);
 
     // Same refusal as the untyped path, reported through this one's structured error.
     let attempt = dispatch_attempt(&globals);
@@ -638,7 +630,7 @@ pub async fn no_repository_call<Arg, T, F, Fut, ResT, ErrT>(
     command: F,
 ) -> i32
 where
-    ErrT: EventError + FfiError + HasTrace,
+    ErrT: FfiError + HasTrace + std::fmt::Display,
     Arg: std::fmt::Debug,
     F: FnOnce(Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
@@ -657,360 +649,4 @@ where
             execution_context().dispatcher.complete(detail).await
         })
         .await
-}
-
-/// Shared test harness for the dispatch wrappers. The storage and
-/// revision-tree dispatch helpers capture the same callback event shape, so
-/// the capture enum and sink helpers live here once.
-#[cfg(test)]
-pub(crate) mod test_support {
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
-    use lore_revision::event::LoreCompleteEventData;
-    use lore_revision::event::LoreEvent;
-
-    use crate::interface::LoreEventCallback;
-
-    /// The full event a callback receives, kept verbatim so a test can read the
-    /// `Complete` detail (code, message, trace) a real consumer would see.
-    #[derive(Clone)]
-    pub(crate) enum CapturedEvent {
-        Error,
-        Complete(LoreCompleteEventData),
-        Other,
-    }
-
-    impl CapturedEvent {
-        pub(crate) fn from_event(event: &LoreEvent) -> Self {
-            match event {
-                LoreEvent::Error(_) => Self::Error,
-                LoreEvent::Complete(data) => Self::Complete(data.clone()),
-                _ => Self::Other,
-            }
-        }
-    }
-
-    /// Build a callback that pushes each event into the shared sink.
-    pub(crate) fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-        Some(Box::new(move |event: &LoreEvent| {
-            sink.lock().unwrap().push(CapturedEvent::from_event(event));
-        }))
-    }
-
-    /// Collect just the `Complete` event payloads from a captured sink.
-    pub(crate) fn completes(events: &[CapturedEvent]) -> Vec<LoreCompleteEventData> {
-        events
-            .iter()
-            .filter_map(|e| match e {
-                CapturedEvent::Complete(data) => Some(data.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    pub(crate) fn has_error_event(events: &[CapturedEvent]) -> bool {
-        events.iter().any(|e| matches!(e, CapturedEvent::Error))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use lore_base::error::NotFound;
-    use lore_error_set::Location;
-    use lore_error_set::prelude::*;
-    use lore_revision::event::LoreEvent;
-    use lore_revision::interface::LoreGlobalArgs;
-
-    use super::*;
-
-    fn globals_with_attempt(attempt: &str) -> LoreGlobalArgs {
-        LoreGlobalArgs {
-            attempt_id: attempt.into(),
-            ..Default::default()
-        }
-    }
-
-    /// The ordinary case, and the one every existing caller is in.
-    #[test]
-    fn no_attempt_id_supplied_is_not_an_error() {
-        let parsed = dispatch_attempt(&LoreGlobalArgs::default())
-            .expect("supplying nothing must not be an error");
-        assert!(parsed.is_none());
-    }
-
-    /// The supplied identity survives parsing byte for byte. If it did not, the caller would
-    /// journal one id and the server would file the receipt under another.
-    #[test]
-    fn a_supplied_v7_attempt_is_preserved_exactly() {
-        let uuid = uuid::Uuid::now_v7();
-        let parsed = dispatch_attempt(&globals_with_attempt(&uuid.to_string()))
-            .expect("a v7 uuid must be accepted")
-            .expect("a supplied value must be present");
-
-        assert_eq!(parsed.as_uuid(), uuid);
-    }
-
-    /// Refused rather than ignored. Ignoring it would dispatch the mutation under an identity
-    /// the caller never wrote down, and its later lookup would answer absent forever.
-    #[test]
-    fn a_malformed_attempt_is_refused_rather_than_dropped() {
-        let error = dispatch_attempt(&globals_with_attempt("not-a-uuid"))
-            .expect_err("a malformed attempt id must refuse the call");
-
-        assert!(error.reason.contains("not a UUID"), "got: {}", error.reason);
-    }
-
-    /// A v4 is a well-formed UUID and still wrong: the receipt rail orders attempts by the
-    /// timestamp a v7 embeds, so a v4 could never have been filed as one.
-    #[test]
-    fn a_non_v7_attempt_is_refused() {
-        let error = dispatch_attempt(&globals_with_attempt(&uuid::Uuid::new_v4().to_string()))
-            .expect_err("a non-v7 uuid must refuse the call");
-
-        assert!(error.reason.contains("version 4"), "got: {}", error.reason);
-    }
-
-    /// The property this whole change exists for: the id the caller supplied is the id the
-    /// dispatch sees. The transport reuses whatever is in scope and mints only when nothing is,
-    /// and a separate suite already proves what is in scope is what reaches the wire, so this
-    /// closes the chain from the caller's journal to the server's receipt.
-    #[tokio::test]
-    async fn the_supplied_attempt_is_what_the_dispatch_scope_sees() {
-        let uuid = uuid::Uuid::now_v7();
-        let attempt = dispatch_attempt(&globals_with_attempt(&uuid.to_string()))
-            .expect("a v7 uuid must be accepted");
-
-        let seen = in_dispatch_attempt(attempt, async {
-            lore_transport::outcome::current_dispatch_attempt()
-        })
-        .await;
-
-        assert_eq!(seen.map(|a| a.as_uuid()), Some(uuid));
-    }
-
-    /// And a caller that supplies nothing leaves the scope empty, so the transport mints its own
-    /// exactly as it did before this existed.
-    #[tokio::test]
-    async fn supplying_no_attempt_leaves_the_dispatch_scope_empty() {
-        let seen = in_dispatch_attempt(None, async {
-            lore_transport::outcome::current_dispatch_attempt()
-        })
-        .await;
-
-        assert!(seen.is_none());
-    }
-
-    // A concrete `#[error_set]` error for the wrapper closures. Its `NotFound`
-    // variant wraps `lore_base::error::NotFound`, which carries error code 79, so
-    // the failure path has a known non-internal code to assert against.
-    #[error_set]
-    enum SampleError {
-        NotFound,
-    }
-
-    impl EventError for SampleError {}
-
-    // The full event a callback receives, kept verbatim so a test can read the
-    // `Complete` detail (code, message, trace) a real consumer would see.
-    #[derive(Clone)]
-    enum CapturedEvent {
-        Error,
-        Complete(lore_revision::event::LoreCompleteEventData),
-        Other,
-    }
-
-    impl CapturedEvent {
-        fn from_event(event: &LoreEvent) -> Self {
-            match event {
-                LoreEvent::Error(_) => Self::Error,
-                LoreEvent::Complete(data) => Self::Complete(data.clone()),
-                _ => Self::Other,
-            }
-        }
-    }
-
-    fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
-        Some(Box::new(move |event: &LoreEvent| {
-            sink.lock().unwrap().push(CapturedEvent::from_event(event));
-        }))
-    }
-
-    #[tokio::test]
-    async fn failing_op_completes_with_error_code_and_no_error_event() {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = no_repository_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            (),
-            "failing_op",
-            |()| async move { Err::<(), SampleError>(NotFound.into()) },
-        )
-        .await;
-
-        let events = sink.lock().unwrap().clone();
-
-        assert!(
-            !events.iter().any(|e| matches!(e, CapturedEvent::Error)),
-            "no Error event must be emitted on terminal failure"
-        );
-
-        // Exactly one `Complete` event.
-        let completes: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                CapturedEvent::Complete(data) => Some(data.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(completes.len(), 1, "exactly one Complete event");
-
-        // The status holds the error code (79 for `NotFound`) and the detail is
-        // populated with that code and the error's message.
-        let data = &completes[0];
-        let expected_code = SampleError::from(NotFound).ffi_code();
-        // The synchronous return equals the error code, matching `Complete.status`.
-        assert_eq!(status, expected_code);
-        assert_eq!(data.status, expected_code);
-        assert_eq!(data.error.error_code, expected_code);
-        assert_eq!(
-            data.error.message.as_str(),
-            SampleError::from(NotFound).to_string()
-        );
-    }
-
-    #[tokio::test]
-    async fn succeeding_op_completes_with_status_zero_and_empty_detail() {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = no_repository_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            (),
-            "succeeding_op",
-            |()| async move { Ok::<(), SampleError>(()) },
-        )
-        .await;
-
-        assert_eq!(status, 0);
-
-        let events = sink.lock().unwrap().clone();
-        let completes: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                CapturedEvent::Complete(data) => Some(data.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(completes.len(), 1, "exactly one Complete event");
-
-        let data = &completes[0];
-        assert_eq!(data.status, 0);
-        assert_eq!(data.error.error_code, 0);
-        assert!(data.error.message.is_empty());
-        assert!(data.error.trace_locations.is_empty());
-    }
-
-    #[tokio::test]
-    async fn missing_repository_completes_with_real_ffi_code() {
-        // A path with no repository fails in `prepare_repository_call` before
-        // any command runs. The failure must report the real
-        // repository-not-found error code (45), not the old flat `1`.
-        let temp = std::env::temp_dir().join(format!(
-            "lore-missing-repo-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let globals = LoreGlobalArgs {
-            repository_path: temp.display().to_string().into(),
-            ..LoreGlobalArgs::default()
-        };
-
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = repository_call_read(
-            globals,
-            make_callback(sink.clone()),
-            (),
-            "missing_repo",
-            |_repo, ()| async move { Ok::<(), SampleError>(()) },
-        )
-        .await;
-
-        let events = sink.lock().unwrap().clone();
-        let completes: Vec<_> = events
-            .iter()
-            .filter_map(|e| match e {
-                CapturedEvent::Complete(data) => Some(data.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(completes.len(), 1, "exactly one Complete event");
-
-        let expected_code = RepositoryError::from(RepositoryNotFound {
-            repository: temp.display().to_string(),
-        })
-        .ffi_code();
-        assert_ne!(expected_code, 1, "must report a real code, not the flat 1");
-        assert_ne!(expected_code, 0);
-
-        let data = &completes[0];
-        // status, the synchronous return, and the detail all carry the real code.
-        assert_eq!(status, expected_code);
-        assert_eq!(data.status, expected_code);
-        assert_eq!(data.error.error_code, expected_code);
-        assert!(
-            !data.error.message.is_empty(),
-            "the detail must carry the error message"
-        );
-    }
-
-    #[tokio::test]
-    async fn failing_op_lets_consumer_read_trace_locations() {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let _status = no_repository_call(
-            LoreGlobalArgs::default(),
-            make_callback(sink.clone()),
-            (),
-            "trace_op",
-            |()| async move {
-                // Add a known trace entry so the consumer can read it back from
-                // the `Complete` detail.
-                let mut err: SampleError = NotFound.into();
-                err.push_trace(Location::with_context(
-                    "src/trace_op.rs",
-                    7,
-                    3,
-                    std::sync::Arc::from("running trace op"),
-                ));
-                Err::<(), SampleError>(err)
-            },
-        )
-        .await;
-
-        let events = sink.lock().unwrap().clone();
-        let data = events
-            .iter()
-            .find_map(|e| match e {
-                CapturedEvent::Complete(data) => Some(data.clone()),
-                _ => None,
-            })
-            .expect("a Complete event must be emitted");
-
-        // The pushed location is reconstructable from the trace; with
-        // `track-locations` on, the `From` conversion prepends its own caller
-        // location, so the entry we pushed is the last one.
-        let locations = data.error.trace_locations.as_slice();
-        assert!(
-            !locations.is_empty(),
-            "trace must carry at least one location"
-        );
-        let last = locations.last().unwrap();
-        assert_eq!(last.file.as_str(), "src/trace_op.rs");
-        assert_eq!(last.line, 7);
-        assert_eq!(last.column, 3);
-        assert_eq!(last.context.as_str(), "running trace op");
-    }
 }

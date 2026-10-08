@@ -9,6 +9,9 @@ publish = false
 default = ["track-locations"]
 track-locations = []
 
+[lib]
+test = false
+
 [dependencies]
 lore-error-set-macro = { workspace = true }
 
