@@ -59,6 +59,8 @@ try {
     if (-not (Test-Path -LiteralPath $env:LORE_TEST_SINGLE_RPC_SERVER)) { throw 'release loreserver missing' }
     Write-Host ('Server release SHA256: ' + (Get-FileHash -Algorithm SHA256 -LiteralPath $env:LORE_TEST_SINGLE_RPC_SERVER).Hash)
     $env:LORE_TEST_SINGLE_RPC_LOG = Join-Path (Split-Path -Parent $loreRoot) '.codex/tmp/single-rpc-server.log'
+    # The log directory sits outside the repository; create it rather than assume it exists.
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $env:LORE_TEST_SINGLE_RPC_LOG) | Out-Null
     foreach ($target in $targets) {
         $targetArgs = if ($target.Kind -eq 'lib') { @('--lib') } else { @('--test', $target.Target) }
         $arguments = @('test', '-j', '4', '-p', $target.Package) + $targetArgs + @('--', '--ignored', '--list')
