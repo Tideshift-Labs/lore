@@ -56,6 +56,7 @@ use lore_object_dispatch::SpoolObjectKind;
 use lore_object_dispatch::UnwiredChargeAuthority;
 use lore_object_dispatch::UnwiredProviderTransport;
 use lore_object_dispatch::bind_durable_put_body;
+use lore_object_dispatch::budget_provenance::documented_provider_revision;
 use lore_object_dispatch::build_no_dispatch_proof;
 use lore_object_dispatch::plan_put_object;
 use lore_object_dispatch::validate_and_encode_object_store_provider_attempt_audit;
@@ -2966,6 +2967,193 @@ async fn a_successful_refresh_stays_sticky_for_the_next_execute_on_the_same_clie
         pins[2], refreshed,
         "the second attempt opens with the refreshed pin, not the original"
     );
+}
+
+/// A documented-provider pin: the tagged revision names its fence and hard expiry.
+fn documented_pin(fence: u64, hard_expires_at_unix_ms: i64) -> BudgetPin {
+    BudgetPin::new(
+        &documented_provider_revision(fence, hard_expires_at_unix_ms),
+        fence,
+    )
+    .expect("a derived documented-provider revision is a valid pin")
+}
+
+#[test]
+fn budget_pin_new_accepts_the_exact_documented_token_and_refuses_a_malformed_tagged_one() {
+    let valid = BudgetPin::new("owner-decision-f7-x1767225600000", 7).unwrap();
+    assert_eq!(valid.fence, 7);
+    for (revision, fence) in [
+        // Wrong fence for the token.
+        ("owner-decision-f7-x1767225600000", 8),
+        ("owner-decision-f07-x1767225600000", 7),
+        ("owner-decision-f7-x01767225600000", 7),
+        ("owner-decision-f7-x0", 7),
+        ("owner-decision-f7-x", 7),
+        ("owner-decision-f7", 7),
+        ("owner-decision-", 7),
+        ("owner-decision-f7-x1767225600000-extra", 7),
+        ("owner-decision-f7-x99999999999999999999", 7),
+    ] {
+        assert_eq!(
+            BudgetPin::new(revision, fence).unwrap_err(),
+            ProviderClientError::InvalidBudgetPin,
+            "{revision} at fence {fence}"
+        );
+    }
+    // An untagged token is a local pin and stays valid, including near misses of the tag.
+    for revision in ["budget-v1", "owner-decisionx", "owner-decision"] {
+        assert!(BudgetPin::new(revision, 7).is_ok(), "{revision}");
+    }
+}
+
+#[tokio::test]
+async fn authorize_refuses_a_malformed_tagged_pin_and_accepts_a_documented_one() {
+    let client = client_with(
+        ProviderCapabilities::none(),
+        UnwiredChargeAuthority,
+        UnwiredProviderTransport,
+    );
+    let mut malformed = attempt_request_for(ProviderAttemptClass::Readiness);
+    malformed.budget_pin.revision = "owner-decision-f9-x1".to_string();
+    malformed.budget_pin.fence = 42;
+    assert_eq!(
+        client.validate_attempt(&malformed),
+        Err(ProviderClientError::InvalidBudgetPin)
+    );
+    let mut well_formed = attempt_request_for(ProviderAttemptClass::Readiness);
+    well_formed.budget_pin = documented_pin(42, 1_767_225_600_000);
+    assert!(client.validate_attempt(&well_formed).is_ok());
+}
+
+/// Run one rejected-then-refreshed attempt from `initial` to `refreshed`, returning the outcome,
+/// the charge count and the pins each charge carried.
+async fn refresh_between_classes(
+    initial: BudgetPin,
+    refreshed: BudgetPin,
+) -> (
+    Result<ProviderAttemptOutcome, ProviderClientError>,
+    u32,
+    u32,
+    Vec<BudgetPin>,
+) {
+    let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            |call, request| {
+                if call == 1 {
+                    Err(ProviderChargeError::BudgetPinRejected)
+                } else {
+                    Ok(binding_grant(request))
+                }
+            },
+            move |_boundary| Ok(refreshed.clone()),
+        );
+    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut request = base_request(ProviderAttemptClass::Readiness);
+    request.budget_pin = initial;
+    let mut ledger = new_ledger();
+    let outcome = client.execute(&mut ledger, &request).await;
+    let pins = observed_pins.lock().expect("test mutex").clone();
+    (outcome, charge_calls.get(), refresh_calls.get(), pins)
+}
+
+/// Both the local-to-documented and the documented-to-local successor sit at the exact next fence
+/// with a fresh revision, so only the provenance-class rule can refuse them. Neither is retried.
+#[tokio::test]
+async fn refresh_across_provenance_classes_is_refused_without_a_retry() {
+    let local = budget_pin();
+    let documented = documented_pin(local.fence + 1, 1_767_225_600_000);
+    let (outcome, charges, refreshes, pins) =
+        refresh_between_classes(local.clone(), documented).await;
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        )),
+        "local to documented"
+    );
+    assert_eq!((charges, refreshes), (1, 1), "local to documented");
+    assert_eq!(pins, vec![local], "the foreign class is never charged");
+
+    let documented = documented_pin(42, 1_767_225_600_000);
+    let local_successor = BudgetPin::new("local-successor-rev", 43).unwrap();
+    let (outcome, charges, refreshes, pins) =
+        refresh_between_classes(documented.clone(), local_successor).await;
+    assert_eq!(
+        outcome,
+        Err(ProviderClientError::ChargeRefused(
+            ProviderChargeError::BudgetPinRejected
+        )),
+        "documented to local"
+    );
+    assert_eq!((charges, refreshes), (1, 1), "documented to local");
+    assert_eq!(pins, vec![documented], "the foreign class is never charged");
+}
+
+/// A successor that carries the documented tag but is off-grammar (fence mismatch, zero expiry,
+/// non-canonical digits, trailing text) is refused, not read as local or adopted, even at the
+/// exact next fence with a fresh revision.
+#[tokio::test]
+async fn refresh_from_a_documented_pin_to_a_malformed_tagged_successor_is_refused() {
+    for revision in [
+        "owner-decision-f2-x0",
+        "owner-decision-f43-x0",
+        "owner-decision-f2-x1767312000000",
+        "owner-decision-f44-x1767312000000",
+        "owner-decision-f043-x1767312000000",
+        "owner-decision-f43-x01767312000000",
+        "owner-decision-f43-x1767312000000-extra",
+        "owner-decision-f43",
+        "owner-decision-",
+    ] {
+        let initial = documented_pin(42, 1_767_225_600_000);
+        let successor = BudgetPin {
+            revision: revision.to_string(),
+            fence: 43,
+        };
+        let (outcome, charges, refreshes, pins) =
+            refresh_between_classes(initial.clone(), successor).await;
+        assert_eq!(
+            outcome,
+            Err(ProviderClientError::ChargeRefused(
+                ProviderChargeError::BudgetPinRejected
+            )),
+            "{revision}"
+        );
+        assert_eq!((charges, refreshes), (1, 1), "{revision}");
+        assert_eq!(
+            pins,
+            vec![initial],
+            "{revision}: never charged, never adopted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_from_a_documented_pin_to_a_documented_successor_is_adopted() {
+    let initial = documented_pin(42, 1_767_225_600_000);
+    let successor = documented_pin(43, 1_767_312_000_000);
+    let (outcome, charges, refreshes, pins) =
+        refresh_between_classes(initial.clone(), successor.clone()).await;
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!((charges, refreshes), (2, 1));
+    assert_eq!(pins, vec![initial, successor]);
+}
+
+#[tokio::test]
+async fn refresh_from_a_local_pin_to_a_local_successor_is_still_adopted() {
+    // The class rule must not regress the retained same-class path.
+    let (outcome, charges, refreshes, pins) =
+        refresh_between_classes(budget_pin(), refreshed_pin()).await;
+    assert_eq!(outcome, Ok(ProviderAttemptOutcome::Decisive));
+    assert_eq!((charges, refreshes), (2, 1));
+    assert_eq!(pins, vec![budget_pin(), refreshed_pin()]);
 }
 
 /// Case 7: every refusal other than `BudgetPinRejected` must never enter the refresh branch.

@@ -11,6 +11,10 @@
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::Gauge;
+
+use crate::budget_provenance::BudgetPinProvenance;
+use crate::budget_provenance::classify_budget_pin;
 
 /// The closed set of operations the cell dispatch authority admits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,6 +97,39 @@ pub(crate) fn record_drain_authority_failure(procedure: &'static str, cause: &'s
                 KeyValue::new("cause", cause),
             ],
         );
+}
+
+struct BudgetInstrumentProvider;
+
+impl InstrumentProvider for BudgetInstrumentProvider {
+    fn namespace(&self) -> &'static str {
+        "urc.fragment.provider"
+    }
+}
+
+/// Record the hard expiry, in unix seconds, that a documented-provider budget pin names. Label
+/// free. The value is the expiry instant, not the time left, so a single record stays true until
+/// the pin moves; the alert subtracts its own clock. A local pin carries no expiry and records
+/// nothing: absence is not zero. Called at boot and when a CR-034 refresh adopts a successor.
+/// The pin is the publisher's statement; the cell database still enforces the real expiry.
+pub fn record_budget_pin_hard_expiry(pin: &crate::provider_client::BudgetPin) {
+    static EXPIRY: std::sync::OnceLock<Gauge<i64>> = std::sync::OnceLock::new();
+    if let Ok(BudgetPinProvenance::DocumentedProvider {
+        hard_expires_at_unix_ms,
+    }) = classify_budget_pin(pin)
+    {
+        EXPIRY
+            .get_or_init(|| {
+                let provider = BudgetInstrumentProvider;
+                provider
+                    .meter()
+                    .i64_gauge(provider.scope_name("budget_hard_expiry_unix_seconds"))
+                    .with_unit("seconds")
+                    .with_description("Unix time at which the pinned object-store budget expires")
+                    .build()
+            })
+            .record(hard_expires_at_unix_ms.div_euclid(1000), &[]);
+    }
 }
 
 impl DispatchMetricRecorder for DispatchMetrics {

@@ -27,7 +27,9 @@ use std::time::Duration;
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
+use lore_object_dispatch::budget_provenance::check_budget_pin_endpoint;
 use lore_object_dispatch::cell_retention::CellRetentionSettings;
+use lore_object_dispatch::metrics::record_budget_pin_hard_expiry;
 use lore_postgres::domain::DatabaseIdentity;
 pub(crate) use lore_postgres::domain::DomainPoolLayout;
 use lore_postgres::domain::PostgresDomainStore;
@@ -633,6 +635,20 @@ fn enabled_fragment_provider_config(
             format!("enabled fragment_provider has an invalid budget pin: {error}"),
         )
     })?;
+    // The pin names its provenance type; each type may govern only the endpoint class its
+    // contract allows (object-store-budget-v1, 2026-10-08 amendment).
+    check_budget_pin_endpoint(
+        &budget_pin,
+        object_store.endpoint_url.as_deref(),
+        &endpoint_host,
+    )
+    .map_err(|error| {
+        config_error(
+            name,
+            format!("enabled fragment_provider budget pin does not fit its endpoint: {error}"),
+        )
+    })?;
+    record_budget_pin_hard_expiry(&budget_pin);
     let provider_write_authority_revision = raw
         .provider_write_authority_revision
         .as_deref()

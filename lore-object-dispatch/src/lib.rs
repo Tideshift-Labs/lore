@@ -9,6 +9,7 @@
 //! and migration artifacts remain source-dark until their later activation work supplies an
 //! explicit composition path.
 
+pub mod budget_provenance;
 pub mod cell_budget_configure;
 pub mod cell_retention;
 pub mod cell_schema_install;

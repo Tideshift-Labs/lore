@@ -24,14 +24,22 @@ const REQUIRED_ENABLED_FIELDS: [&str; 13] = [
     "budget_fence",
 ];
 
+/// The local fixture endpoint every pre-provenance fixture now uses: a plain `budget-v1` pin may
+/// govern only a local `http` endpoint.
+const LOCAL_ENDPOINT: &str = "http://minio:9000";
+
 fn base_config(fragment_provider: &str) -> toml::Value {
+    base_config_at(fragment_provider, LOCAL_ENDPOINT)
+}
+
+fn base_config_at(fragment_provider: &str, endpoint_url: &str) -> toml::Value {
     let text = format!(
         r#"
 url = "postgresql://store.example/cell?sslmode=verify-full"
 
 [object_store]
 bucket = "fragment-bucket"
-endpoint_url = "https://objects.example.com"
+endpoint_url = "{endpoint_url}"
 region = "us-test-1"
 timeout_millis = 5000
 
@@ -53,7 +61,7 @@ dispatch_statement_timeout_millis = 2000
 dispatch_lock_timeout_millis = 3000
 provider_late_effect_bound_millis = 4000
 provider_boundary_id = "cell.primary"
-endpoint_host = "objects.example.com"
+endpoint_host = "minio"
 region = "us-test-1"
 budget_revision = "budget-v1"
 budget_fence = 1"#
@@ -186,8 +194,8 @@ fn numeric_identity_target_and_budget_values_fail_closed() {
             "provider boundary",
         ),
         (
-            "endpoint_host = \"objects.example.com\"",
-            "endpoint_host = \"https://objects.example.com/path\"",
+            "endpoint_host = \"minio\"",
+            "endpoint_host = \"https://minio/path\"",
             "provider boundary",
         ),
         (
@@ -320,7 +328,7 @@ fn fragment_provider_debug_and_validation_errors_redact_secrets() {
         "postgresql://dispatcher:dispatch-secret@dispatch.example:5432/cell?sslmode=require";
     let secret_ca = "C:/secrets/dispatch-ca.pem";
     let secret_boundary = "cell.primary";
-    let secret_host = "objects.example.com";
+    let secret_host = "minio";
     let secret_region = "us-test-1";
     let secret_revision = "budget-v1";
     let config = base_config(&enabled_block());
@@ -349,4 +357,127 @@ fn fragment_provider_debug_and_validation_errors_redact_secrets() {
     assert!(!error.contains(secret_url));
     assert!(!error.contains("dispatch-secret"));
     assert!(!error.contains(secret_ca));
+}
+
+const SFO3_URL: &str = "https://sfo3.digitaloceanspaces.com";
+const SFO3_HOST: &str = "sfo3.digitaloceanspaces.com";
+const DOCUMENTED_REVISION: &str = "owner-decision-f1-x1767225600000";
+
+fn documented_block(host: &str) -> String {
+    enabled_block()
+        .replace(
+            "endpoint_host = \"minio\"",
+            &format!("endpoint_host = \"{host}\""),
+        )
+        .replace(
+            "budget_revision = \"budget-v1\"",
+            &format!("budget_revision = \"{DOCUMENTED_REVISION}\""),
+        )
+}
+
+#[test]
+fn a_documented_pin_is_accepted_only_on_the_exact_sfo3_endpoint() {
+    validate(&base_config_at(&documented_block(SFO3_HOST), SFO3_URL))
+        .expect("documented pin on the bound sfo3 endpoint and host must be accepted");
+
+    let refused = [
+        ("local minio endpoint", LOCAL_ENDPOINT, SFO3_HOST),
+        (
+            "other provider region (nyc3)",
+            "https://nyc3.digitaloceanspaces.com",
+            "nyc3.digitaloceanspaces.com",
+        ),
+        (
+            "trailing slash",
+            "https://sfo3.digitaloceanspaces.com/",
+            SFO3_HOST,
+        ),
+        ("port", "https://sfo3.digitaloceanspaces.com:443", SFO3_HOST),
+        (
+            "plain http",
+            "http://sfo3.digitaloceanspaces.com",
+            SFO3_HOST,
+        ),
+        ("bound endpoint, minio host", SFO3_URL, "minio"),
+        (
+            "bound endpoint, other host",
+            SFO3_URL,
+            "objects.example.com",
+        ),
+    ];
+    for (name, url, host) in refused {
+        let error = validate(&base_config_at(&documented_block(host), url))
+            .expect_err(&format!("documented pin must be refused: {name}"));
+        assert!(
+            error.contains("budget pin does not fit its endpoint"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_local_pin_is_refused_on_a_non_local_endpoint() {
+    // The retained plain pin still passes on the local endpoint.
+    validate(&base_config(&enabled_block())).expect("local pin on a local endpoint");
+
+    let cases = [
+        (
+            "https objects.example.com",
+            "https://objects.example.com",
+            "objects.example.com",
+        ),
+        ("the documented sfo3 endpoint", SFO3_URL, SFO3_HOST),
+        (
+            "local url, non-local host",
+            LOCAL_ENDPOINT,
+            "objects.example.com",
+        ),
+        ("https minio", "https://minio:9000", "minio"),
+    ];
+    for (name, url, host) in cases {
+        let block = enabled_block().replace(
+            "endpoint_host = \"minio\"",
+            &format!("endpoint_host = \"{host}\""),
+        );
+        let error = validate(&base_config_at(&block, url))
+            .expect_err(&format!("local pin must be refused: {name}"));
+        assert!(
+            error.contains("budget pin does not fit its endpoint"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn a_local_pin_with_no_configured_endpoint_is_refused() {
+    // No endpoint_url means the SDK default endpoint, which is never local and never the bound one.
+    let mut config = base_config(&enabled_block());
+    config["object_store"]
+        .as_table_mut()
+        .expect("object_store table")
+        .remove("endpoint_url");
+    let error = validate(&config).expect_err("an SDK default endpoint is not local");
+    assert!(
+        error.contains("budget pin does not fit its endpoint"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_malformed_tagged_revision_is_refused_as_an_invalid_budget_pin() {
+    for revision in [
+        "owner-decision-f2-x1767225600000", // fence in the token differs from budget_fence = 1
+        "owner-decision-f1-x0",
+        "owner-decision-f1",
+        "owner-decision-",
+    ] {
+        let block = documented_block(SFO3_HOST).replace(DOCUMENTED_REVISION, revision);
+        let error = validate(&base_config_at(&block, SFO3_URL))
+            .expect_err(&format!("{revision} must be refused"));
+        assert!(error.contains("budget pin"), "{revision}: {error}");
+        assert!(
+            !error.contains("does not fit its endpoint"),
+            "{revision} must fail at pin construction, got {error}"
+        );
+    }
 }

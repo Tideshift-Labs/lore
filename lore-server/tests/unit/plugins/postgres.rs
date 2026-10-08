@@ -546,7 +546,7 @@ url = "postgresql://immutable@db.example/cell"
 pool_max = 1
 [object_store]
 bucket = "fragments"
-endpoint_url = "https://objects.example.com"
+endpoint_url = "http://minio:9000"
 region = "us-test-1"
 timeout_millis = 5000
 [fragment_provider]
@@ -559,7 +559,7 @@ dispatch_acquire_timeout_millis = 1000
 dispatch_statement_timeout_millis = 2000
 dispatch_lock_timeout_millis = 3000
 provider_boundary_id = "cell.primary"
-endpoint_host = "objects.example.com"
+endpoint_host = "minio"
 region = "us-test-1"
 budget_revision = "budget-v1"
 budget_fence = 7
@@ -769,7 +769,7 @@ url = "postgresql://immutable@db.example/cell"
 pool_max = 1
 [object_store]
 bucket = "fragments"
-endpoint_url = "https://objects.example.com"
+endpoint_url = "http://minio:9000"
 region = "us-test-1"
 timeout_millis = 5000
 [fragment_provider]
@@ -782,7 +782,7 @@ dispatch_acquire_timeout_millis = 1000
 dispatch_statement_timeout_millis = 2000
 dispatch_lock_timeout_millis = 3000
 provider_boundary_id = "cell.primary"
-endpoint_host = "objects.example.com"
+endpoint_host = "minio"
 region = "us-test-1"
 budget_revision = "budget-v1"
 budget_fence = 7

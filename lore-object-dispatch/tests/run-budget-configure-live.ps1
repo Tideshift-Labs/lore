@@ -23,7 +23,8 @@ $tests = @(
  'live_budget_wrong_role_tls_and_database_identity_refuse',
  'live_budget_renewal_carries_depletion_without_reset',
  'live_budget_legacy_replay_and_v2_successor_preserve_old_identity_and_depletion',
- 'live_budget_expired_reconcile_is_read_only_and_allows_successor'
+ 'live_budget_expired_reconcile_is_read_only_and_allows_successor',
+ 'live_budget_documented_publish_verify_reconcile_and_successor'
 )
 function Invoke-Checked {
  param([string]$Command, [string[]]$Arguments)

@@ -512,6 +512,7 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_budget_renewal_carries_depletion_without_reset',
         'live_budget_legacy_replay_and_v2_successor_preserve_old_identity_and_depletion',
         'live_budget_expired_reconcile_is_read_only_and_allows_successor',
+        'live_budget_documented_publish_verify_reconcile_and_successor',
         # Cell retention -- run-cell-retention-live.ps1
         'live_cell_retention_removes_children_atomically_and_preserves_both_horizons',
         'live_cell_retention_blockers_fail_readiness_and_recover_after_drain',

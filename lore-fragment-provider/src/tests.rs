@@ -2592,6 +2592,8 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         provider_endpoint: "http://minio:9000".into(),
         provider_bucket: "cell-alpha-fragments".into(),
         evidence_reference: "owned drain seam fixture".into(),
+        provider_region: None,
+        ruling_reference: None,
         system_identifier: system,
         database_oid: oid,
         allocation_revision: pin().revision,

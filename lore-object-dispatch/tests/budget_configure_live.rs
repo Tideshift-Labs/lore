@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MIT
 
 use lore_object_dispatch::DispatchTlsMode;
+use lore_object_dispatch::budget_provenance::DOCUMENTED_PROVIDER_BUDGET_PROVENANCE;
+use lore_object_dispatch::budget_provenance::LOCAL_BUDGET_PROVENANCE;
+use lore_object_dispatch::budget_provenance::documented_provider_revision;
 use lore_object_dispatch::cell_budget_configure::BudgetAction;
 use lore_object_dispatch::cell_budget_configure::BudgetConfigureError;
 use lore_object_dispatch::cell_budget_configure::BudgetPredecessor;
+use lore_object_dispatch::cell_budget_configure::CellConfigBinding;
 use lore_object_dispatch::cell_budget_configure::LEGACY_LOCAL_BUDGET_REVISION;
 use lore_object_dispatch::cell_budget_configure::LOCAL_BUDGET_REVISION;
 use lore_object_dispatch::cell_budget_configure::LocalBudgetConfiguration;
 use lore_object_dispatch::cell_budget_configure::configure_budget;
+use lore_object_dispatch::cell_budget_configure::configure_budget_for_cell;
 use uuid::Uuid;
 #[path = "common/budget_configuration.rs"]
 mod configuration;
@@ -24,6 +29,40 @@ async fn config(f: &BudgetFixture) -> LocalBudgetConfiguration {
         .unwrap()
         .get(0);
     configuration::config(f.system_identifier, f.database_oid, now)
+}
+
+async fn documented_config(f: &BudgetFixture) -> LocalBudgetConfiguration {
+    let now: i64 = f
+        .admin
+        .query_one("SELECT object_store_retention.clock_unix_ms_v1()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    configuration::documented_config(f.system_identifier, f.database_oid, now)
+}
+
+fn binding_for(c: &LocalBudgetConfiguration) -> CellConfigBinding {
+    CellConfigBinding {
+        bucket: Some(c.provider_bucket.clone()),
+        endpoint_url: Some(c.provider_endpoint.clone()),
+        provider_boundary_id: Some(c.provider_boundary_id.clone()),
+        endpoint_host: Some("sfo3.digitaloceanspaces.com".into()),
+    }
+}
+
+async fn apply_for_cell(
+    f: &BudgetFixture,
+    c: &LocalBudgetConfiguration,
+    action: BudgetAction,
+) -> Result<lore_object_dispatch::cell_budget_configure::BudgetReceipt, BudgetConfigureError> {
+    configure_budget_for_cell(
+        c,
+        &binding_for(c),
+        &f.maintenance_url(),
+        DispatchTlsMode::PinnedRootCa(f.pem.clone()),
+        action,
+    )
+    .await
 }
 
 async fn apply(
@@ -71,10 +110,15 @@ async fn charge(f: &BudgetFixture, c: &LocalBudgetConfiguration, count: usize) {
 async fn live_budget_publish_verify_replay_preserves_depletion() {
     let f = BudgetFixture::new().await;
     let c = config(&f).await;
-    assert_eq!(
-        apply(&f, &c, BudgetAction::Publish).await.unwrap().result,
-        "PUBLISHED"
-    );
+    let published = apply(&f, &c, BudgetAction::Publish).await.unwrap();
+    assert_eq!(published.result, "PUBLISHED");
+    assert_eq!(published.provenance, LOCAL_BUDGET_PROVENANCE);
+    for action in [BudgetAction::Verify, BudgetAction::Reconcile] {
+        assert_eq!(
+            apply(&f, &c, action).await.unwrap().provenance,
+            LOCAL_BUDGET_PROVENANCE
+        );
+    }
     charge(&f, &c, 1).await;
     let before = f.snapshot().await;
     assert_ne!(before, "[]");
@@ -421,4 +465,145 @@ async fn live_budget_expired_reconcile_is_read_only_and_allows_successor() {
             .unwrap()
             .expired
     );
+}
+
+#[tokio::test]
+#[ignore = "requires the owned TLS PostgreSQL runner"]
+async fn live_budget_documented_publish_verify_reconcile_and_successor() {
+    let f = BudgetFixture::new().await;
+    let c = documented_config(&f).await;
+    assert_eq!(
+        apply_for_cell(&f, &c, BudgetAction::Verify)
+            .await
+            .unwrap_err(),
+        BudgetConfigureError::NotPublished
+    );
+    assert_eq!(f.snapshot().await, "[]");
+    // Without the cell configuration a documented record is never published.
+    assert_eq!(
+        apply(&f, &c, BudgetAction::Publish).await.unwrap_err(),
+        BudgetConfigureError::CellBindingMismatch
+    );
+    assert_eq!(f.snapshot().await, "[]");
+
+    let receipt = apply_for_cell(&f, &c, BudgetAction::Publish).await.unwrap();
+    assert_eq!(receipt.result, "PUBLISHED");
+    assert_eq!(receipt.provenance, DOCUMENTED_PROVIDER_BUDGET_PROVENANCE);
+    assert_eq!(receipt.allocation_revision, c.allocation_revision);
+    assert!(!receipt.expired);
+
+    // The digests are the documented domains over the canonical bytes, computed here
+    // independently, and they cannot equal the local chain over the same bytes.
+    let canonical = serde_json::to_vec(&c).unwrap();
+    let chain = |core: &str, disposition: &str, envelope: &str| {
+        let core = blake3::derive_key(core, &canonical);
+        let disposition = blake3::derive_key(disposition, &core);
+        let envelope = blake3::derive_key(envelope, &disposition);
+        (
+            blake3::Hash::from(disposition).to_hex().to_string(),
+            blake3::Hash::from(envelope).to_hex().to_string(),
+        )
+    };
+    let (documented_disposition, documented_envelope) = chain(
+        "Commit0 documented provider budget core v1",
+        "Commit0 documented provider no-cache disposition v1",
+        "Commit0 documented provider budget envelope v1",
+    );
+    let (local_disposition, local_envelope) = chain(
+        "Commit0 local development budget core v1",
+        "Commit0 local development no-cache disposition v1",
+        "Commit0 local development budget envelope v1",
+    );
+    assert_eq!(receipt.disposition_digest, documented_disposition);
+    assert_eq!(receipt.envelope_digest, documented_envelope);
+    assert_ne!(receipt.disposition_digest, local_disposition);
+    assert_ne!(receipt.envelope_digest, local_envelope);
+
+    // The stored limiter dimension names the documented type, not the local one.
+    let dimensions: Vec<String> = f
+        .admin
+        .query(
+            "SELECT dimension_id FROM object_store_retention.object_dispatch_budget_dimensions WHERE allocation_fence=1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        dimensions,
+        vec!["documented-provider-operations".to_string()]
+    );
+
+    charge(&f, &c, 1).await;
+    let before = f.snapshot().await;
+    assert_ne!(before, "[]");
+    for (action, result) in [
+        (BudgetAction::Verify, "VERIFIED"),
+        (BudgetAction::Reconcile, "RECONCILED"),
+        (BudgetAction::Publish, "REPLAY"),
+    ] {
+        let replay = apply_for_cell(&f, &c, action).await.unwrap();
+        assert_eq!(replay.result, result);
+        assert_eq!(replay.provenance, DOCUMENTED_PROVIDER_BUDGET_PROVENANCE);
+        assert_eq!(replay.disposition_id, receipt.disposition_id);
+        assert_eq!(replay.disposition_digest, receipt.disposition_digest);
+        assert_eq!(replay.envelope_digest, receipt.envelope_digest);
+        assert_eq!(
+            f.snapshot().await,
+            before,
+            "{result} must not refill spent budget"
+        );
+    }
+
+    // A documented successor at fence 2 carries depletion forward from the receipt predecessor.
+    let mut successor = c.clone();
+    successor.allocation_fence = 2;
+    successor.hard_expires_at_unix_ms += 60_000;
+    successor.allocation_revision =
+        documented_provider_revision(2, successor.hard_expires_at_unix_ms);
+    successor.predecessor = Some(BudgetPredecessor {
+        allocation_fence: 1,
+        disposition_id: receipt.disposition_id.clone(),
+        disposition_digest: receipt.disposition_digest.clone(),
+        envelope_digest: receipt.envelope_digest.clone(),
+    });
+    assert_eq!(
+        apply_for_cell(&f, &successor, BudgetAction::Verify)
+            .await
+            .unwrap_err(),
+        BudgetConfigureError::NotPublished
+    );
+    let next = apply_for_cell(&f, &successor, BudgetAction::Publish)
+        .await
+        .unwrap();
+    assert_eq!(next.result, "PUBLISHED");
+    assert_eq!(next.provenance, DOCUMENTED_PROVIDER_BUDGET_PROVENANCE);
+    assert_eq!(next.allocation_fence, 2);
+    let successor_dimensions: Vec<String> = f
+        .admin
+        .query(
+            "SELECT dimension_id FROM object_store_retention.object_dispatch_budget_dimensions WHERE allocation_fence=2",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        successor_dimensions,
+        vec!["documented-provider-operations".to_string()]
+    );
+    let depleted: bool = f.admin.query_one("SELECT available_scaled < 800 * 1000 * 1000 FROM object_store_retention.object_dispatch_budget_bucket_state WHERE cap_class=1 AND allocation_fence=2", &[]).await.unwrap().get(0);
+    assert!(
+        depleted,
+        "a documented renewal carries spent budget forward"
+    );
+    let verified = apply_for_cell(&f, &successor, BudgetAction::Verify)
+        .await
+        .unwrap();
+    assert_eq!(verified.result, "VERIFIED");
+    assert_eq!(verified.disposition_digest, next.disposition_digest);
 }

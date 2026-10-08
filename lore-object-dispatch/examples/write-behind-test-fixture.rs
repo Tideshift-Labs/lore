@@ -46,6 +46,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_endpoint: "http://minio:9000".into(),
         provider_bucket: "adapter-fragments".into(),
         evidence_reference: "disposable adapter test".into(),
+        provider_region: None,
+        ruling_reference: None,
         system_identifier: system.clone(),
         database_oid: oid,
         allocation_revision: "adapter-budget-v1".into(),

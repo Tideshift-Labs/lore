@@ -66,6 +66,8 @@ use std::sync::RwLock;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use thiserror::Error;
 
+use crate::budget_provenance::BudgetPinProvenance;
+use crate::budget_provenance::classify_budget_pin;
 use crate::compaction::ObjectStoreProviderAttemptAudit;
 use crate::compaction::provider_attempt_audit_is_valid;
 use crate::contract::canonical_uuid_v7_timestamp;
@@ -2114,9 +2116,27 @@ where
                     // higher is a generation whose accounting this writer never saw, and a fence
                     // that did not move forward is not a renewal at all. Both stay a typed
                     // decisive refusal and still need the restart cutover.
+                    // A renewal also keeps the provenance class. A local pin never refreshes
+                    // into a documented-provider one, or back: the class was checked against
+                    // this cell's endpoint at boot, and a head of the other class was published
+                    // for some other endpoint.
                     let successor = charge_request.budget_pin().fence.checked_add(1);
+                    let same_class = matches!(
+                        (
+                            classify_budget_pin(charge_request.budget_pin()),
+                            classify_budget_pin(&refreshed),
+                        ),
+                        (
+                            Ok(BudgetPinProvenance::Local),
+                            Ok(BudgetPinProvenance::Local)
+                        ) | (
+                            Ok(BudgetPinProvenance::DocumentedProvider { .. }),
+                            Ok(BudgetPinProvenance::DocumentedProvider { .. })
+                        )
+                    );
                     if Some(refreshed.fence) != successor
                         || refreshed.revision == charge_request.budget_pin().revision
+                        || !same_class
                     {
                         return Err(ProviderClientError::ChargeRefused(
                             ProviderChargeError::BudgetPinRejected,
@@ -2166,6 +2186,7 @@ where
                 .as_ref()
                 .is_none_or(|current| pin.fence > current.fence)
             {
+                crate::metrics::record_budget_pin_hard_expiry(&pin);
                 *guard = Some(pin);
             }
         }
@@ -2477,6 +2498,9 @@ fn validate_budget_pin(pin: &BudgetPin) -> Result<(), ProviderClientError> {
     if pin.fence == 0 {
         return Err(ProviderClientError::InvalidBudgetPin);
     }
+    // A token carrying the documented-provider tag must be exactly that type's grammar for this
+    // fence. It is never read as a local token.
+    classify_budget_pin(pin).map_err(|_err| ProviderClientError::InvalidBudgetPin)?;
     Ok(())
 }
 
