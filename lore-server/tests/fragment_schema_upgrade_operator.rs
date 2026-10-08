@@ -195,7 +195,7 @@ async fn real_loreserver_binary_upgrades_a_revision_4_clean_cell_and_emits_parse
     config["server"].as_table_mut().unwrap().insert(
         "auth".into(),
         toml::from_str::<toml::Value>(
-            "jwt_issuer = 'https://issuer.invalid'\nenforce_write_permission = true\n[jwk]\nendpoint = 'https://issuer.invalid/jwks'",
+            "jwt_issuer = 'https://issuer.invalid'\njwt_audience = ['lore']\nresource_claim = 'resources'\nenforce_write_permission = true\n[jwk]\nendpoint = 'https://issuer.invalid/jwks'",
         )
         .unwrap(),
     );
