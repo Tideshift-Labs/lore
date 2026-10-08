@@ -4,9 +4,9 @@ This is the per-module map from our fork's deltas to their most useful automated
 For detailed historical context, gotchas, and design invariants, see the [Appendix](testing-fork-delta-inventory-appendix.md).
 
 - **CR-004 write-permission enforcement [SERVER]**: mutating revision RPCs require write permission.
-  Gate: `cargo test -p lore-server --lib grpc::revision::v1::service`.
+  Gate: `cargo test -p lore-server --test unit grpc::revision::v1::service`.
 - **CR-006 protected branch surfacing [SERVER]**: v1 branch reads expose the protected flag.
-  Gate: `cargo test -p lore-server --lib grpc::revision::v1::branch_get`.
+  Gate: `cargo test -p lore-server --test unit grpc::revision::v1::branch_get`.
 - **CR-007 Postgres stores [SERVER]**: Postgres lock/mutable/immutable stores with S3 payloads.
   Offline gates: `cargo test -p lore-postgres --lib`. Live gates are
   `tests/{lock_store,mutable_store,immutable_store,concurrency}.rs` with
@@ -20,24 +20,24 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `cargo test -p lore-aws --lib permanent_service_error -j 4`.
 - **CR-005 and CR-015 Lorehub hooks [SERVER]**: branch transitions plus resource lock/unlock emit
   `lorehub_notify`; lock hashes disambiguate event ids without changing payload shape.
-  Gate: `cargo test -p lore-server --lib hooks` and
-  `cargo test -p lore-server --lib grpc::lock_service`.
+  Gate: `cargo test -p lore-server --test unit hooks` and
+  `cargo test -p lore-server --test unit grpc::lock_service`.
 - **No-op push side-effect suppression [SERVER]**: a successful re-push of the current head emits no
   notification, hook, `branch_pushed`, or pushed-counter increment. Gates:
-  `grpc::handlers::branch_push::tests` and `grpc::revision::v1::branch_push::test`.
+  `grpc::handlers::branch_push` and `grpc::revision::v1::branch_push::test`.
 - **WP-066 hook observability and bounded retry [SERVER]**: delivery counters label terminal
   outcomes; retry handles transport failures, timeouts, 429, and 5xx with bounded backoff while other
-  4xx responses fail fast. Gate: `cargo test -p lore-server --lib hooks::lorehub_notify`.
+  4xx responses fail fast. Gate: `cargo test -p lore-server --test unit hooks::lorehub_notify`.
 - **CR-009 graceful drain [SERVER]**: QUIC, public gRPC, and HTTP participate in bounded drain;
   `/health_check` returns 503 while draining and `/drain_status` exposes state. Gates:
-  `drain::`, `server::tests::wait_for_shutdown_tests`, `settings::tests`, `health_check::`, and
+  `drain::`, `server::wait_for_shutdown_tests`, `settings::`, `health_check::`, and
   `drain_status::`. Cross-process signal behavior remains a live/e2e responsibility.
 - **CR-010 notification subscription authorization [SERVER]**: the repository in the subscribe body
   must match token authorization. Gate: `grpc::notification_service::tests`.
 - **CR-011 repository metadata authorization [SERVER]**: v0/v1 metadata get/set and storage stats
   share `RepositoryAuthorizer`; auth-off remains allow-all. Gate:
-  `cargo test -p lore-server --lib repository_metadata` and
-  `cargo test -p lore-server --lib repository_storage_stats`.
+  `cargo test -p lore-server --test unit repository_metadata` and
+  `cargo test -p lore-server --test unit repository_storage_stats`.
 - **CR-016 repository storage stats [SERVER]**: exact per-repository counts use associations plus the
   rebuildable Postgres metering projection. Cross-repository reuse counts independently for each
   repository. Gates: the Postgres immutable-store live tests and repository-storage-stats handler
@@ -58,7 +58,7 @@ For detailed historical context, gotchas, and design invariants, see the [Append
 - **CR-033 cell dispatch authority: continuity family and separate-process service shell removed   [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-cell-dispatch-authority-continuity-family-and-separate-process-service-shell-removed-server). Gates: `cargo test -p lore-object-dispatch
   --test no_dispatch --test reserve_put --test upload -j 4` `cargo test -p lore-object-dispatch --test terminal_result -j 4` `cargo test -p lore-object-dispatch --test result_ack -j 4` `cargo test -p lore-object-dispatch --test result_discard -j 4` `cargo test -p lore-object-dispatch --test result_disposition -j 4` `cargo test -p lore-object-dispatch --test fetch_lease --test result_disposition --test
   payload_purge -j 4` `cargo test -p lore-object-dispatch --test cell_schema_install` `cargo test -p lore-object-dispatch --test provider_client -j 4` `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` `lore-object-dispatch/tests/run-provider-charge-live.ps1` `lore-object-dispatch/tests/run-budget-pin-refresh-live.ps1`
-- **CR-033 charge-admission deadline horizon guard [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-charge-admission-deadline-horizon-guard-server). Gates: `cargo test -p lore-server --lib -- charge_bound`
+- **CR-033 charge-admission deadline horizon guard [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-charge-admission-deadline-horizon-guard-server). Gates: `cargo test -p lore-server --test unit -- charge_bound`
 - **CR-038 cell schema forward upgrade and spool metadata true-up [SERVER]**: migration 0028 trues
   up a released spool row's metadata charge to its actual retained size (was a flat 16,384-byte
   charge, never given back — the slot-31 wedge); `upgrade_cell_schema` moves an attested R27 cell to
@@ -136,35 +136,35 @@ For detailed historical context, gotchas, and design invariants, see the [Append
 - **CR-021 fragment/read overload propagation [CLIENT-relevant]**: `SlowDown` survives fragment
   walks and the local-with-remote fallback boundary; genuine absence remains `AddressNotFound`.
   Gates: `cargo test -p lore-revision --test state -j 4` and
-  `cargo test -p lore-storage --lib read::tests:: -j 4`.
+  `cargo test -p lore-storage --test unit read:: -j 4`.
 - **CR-017/CR-020 authentication refresh [CLIENT]**: token pairs persist atomically, refresh is
   provider-neutral, failed refresh cannot publish partial credentials, and a full reset clears QUIC,
   gRPC, and exchanged-auth caches even when one cache is already empty. Gates:
-  `cargo test -p lore-transport --lib`, `cargo test -p lore-credential --lib`, and
+  `cargo test -p lore-transport --test unit`, `cargo test -p lore-credential --test unit`, and
   `cargo test -p lore-revision --test auth --test auth_exchange`.
 - **Native TLS roots [CLIENT]**: UCS auth trusts native OS roots while using the upstream network
-  runtime. `cargo test -p lore-transport --lib` is a smoke gate; retain live TLS coverage.
+  runtime. `cargo test -p lore-transport --test unit` is a smoke gate; retain live TLS coverage.
 - **Remote-proven explicit sync [CLIENT]**: the in-process Rust facade can mark an exact target as
   already verified remote. Only a same-branch, non-merge, first-parent advance repairs `LATEST` and
   last-sync, including a working-tree no-op. Generic explicit sync, CLI behavior, service
   serialization, and the C ABI are unchanged. Gate:
   `cargo test -p lore-revision --test sync -j 4` (backward, no-op, older-target, cross-branch, and
   forward-advance controls).
-- **Exact-selection commit transaction [CLIENT]**: See [Appendix](testing-fork-delta-inventory-appendix.md#exact-selection-commit-transaction-client). Gates: `cargo test -p lore-revision --test exact_selection_transaction -j 4 -- --test-threads=1` `cargo test -p lore-revision --lib exact_selection::tests -j 4` `cargo test -p lore-revision --lib commit::tests -j 4` `cargo test -p lore --test exact_selection_transaction -j 4 -- --test-threads=1`
+- **Exact-selection commit transaction [CLIENT]**: See [Appendix](testing-fork-delta-inventory-appendix.md#exact-selection-commit-transaction-client). Gates: `cargo test -p lore-revision --test exact_selection_transaction -j 4 -- --test-threads=1` `cargo test -p lore-revision --test unit exact_selection -j 4` `cargo test -p lore-revision --test unit commit -j 4` `cargo test -p lore --test exact_selection_transaction -j 4 -- --test-threads=1`
 - **Upstream revision-tree integration suite [mixed]**: the in-memory suite exercises batch fan-out,
   event ordering, multi-level/mixed-parent batches, concurrency, atomic rejection, and entry fields.
   Gate: `cargo test -p lore-integration-tests revision_tree_test -j 4`.
 - **State-block local retention on remote fetch [CLIENT]**: See [Appendix](testing-fork-delta-inventory-appendix.md#state-block-local-retention-on-remote-fetch-client). Gates: `cargo test -p lore-integration-tests --features integration_tests storage_remote_tests -j 4`
 - **Tree-block local retention [CLIENT], companion to the entry above**: See [Appendix](testing-fork-delta-inventory-appendix.md#tree-block-local-retention-client-companion-to-the-entry-above). Gates: See Appendix.
-- **`revision info --delta`'s delta-read-failure surfacing [CLIENT]**: See [Appendix](testing-fork-delta-inventory-appendix.md#revision-info-delta-s-delta-read-failure-surfacing-client). Gates: `cargo test -p lore-revision --test info -j 4` `cargo test -p lore-storage --lib read::tests::zero_hash_address_short_circuits_to_empty_without_touching_store -j 4`
+- **`revision info --delta`'s delta-read-failure surfacing [CLIENT]**: See [Appendix](testing-fork-delta-inventory-appendix.md#revision-info-delta-s-delta-read-failure-surfacing-client). Gates: `cargo test -p lore-revision --test info -j 4` `cargo test -p lore-storage --test unit read::zero_hash_address_short_circuits_to_empty_without_touching_store -j 4`
 - **CR-029 domain schema, receipts, outbox-base, backfill, bypass guard [SERVER, WP-116 Phase 2/3]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-029-domain-schema-receipts-outbox-base-backfill-bypass-guard-server-wp-116-phase-2-3). Gates: `cargo test -p lore-postgres --test domain_schema --test domain_receipts --test domain_outbox \
   --test domain_backfill --test domain_migration_parity --test domain_mediated \
   --test domain_bypass --test domain_receipts_lifecycle --test domain_obliterate_fence \
   -- --ignored`
 - **CR-029 D2 amendment: platform-ordered completion sequencing [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-029-d2-amendment-platform-ordered-completion-sequencing-server). Gates: `cargo test -p lore-postgres -j 1 --test domain_maintenance -- --ignored --test-threads=1`
-- **CR-030 lock fencing [SERVER, WP-117]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-030-lock-fencing-server-wp-117). Gates: `cargo test` `cargo test -p lore-server --lib -- is_self_force_unlock_tests`
-- **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate   [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-029-wp-116-phase-4-grpc-metadata-carriage-status-mapping-and-the-admission-gate-server). Gates: `cargo test -p lore-server --lib grpc::domain_operation_metadata
-  grpc::tests::domain_error_mapping_tests domain::tests grpc::handlers::repository_metadata_set
+- **CR-030 lock fencing [SERVER, WP-117]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-030-lock-fencing-server-wp-117). Gates: `cargo test` `cargo test -p lore-server --test unit -- is_self_force_unlock_tests`
+- **CR-029 WP-116 Phase 4, gRPC metadata carriage, status mapping, and the admission gate   [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-029-wp-116-phase-4-grpc-metadata-carriage-status-mapping-and-the-admission-gate-server). Gates: `cargo test -p lore-server --test unit grpc::domain_operation_metadata
+  grpc::domain_error_mapping_tests domain grpc::handlers::repository_metadata_set
   grpc::repository::v1::repository_metadata_set grpc::handlers::repository_query
   grpc::handlers::branch_list grpc::repository::v1::repository_get`
 - **CR-032 superseded-epoch outbox pruning [SERVER, WP-119 Step C/Phase 8]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-032-superseded-epoch-outbox-pruning-server-wp-119-step-c-phase-8). Gates: `cargo test -p lore-postgres --test domain_outbox_prune -- --ignored --test-threads=1` `cargo test -p lore-postgres --lib domain::outbox::prune::tests`
@@ -182,7 +182,7 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `lore-integration-tests/tests/active_active_two_process_test.rs` via
   `run-active-active-two-process-live.ps1`, against two real `loreserver` processes sharing one
   cell Postgres/MinIO over the real gateway/mTLS/JetStream. Gates:
-  `cargo clippy -p lore-server --lib --features failure_generator --no-deps -- -D warnings` (and
+  `cargo clippy -p lore-server --lib --test unit --features failure_generator --no-deps -- -D warnings` (and
   the same without the feature); live: `pwsh -File
   lore-integration-tests/tests/run-active-active-two-process-live.ps1` with `LORE_RECEIVER_FAULTS`
   armed for cases n/o/p/q, `PASS=5 FAIL=0 NOT RUN=0 EXPECTED=5` at last run.
@@ -198,7 +198,7 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `AlreadyCurrent` rerun, durable-with-rows refusal, the `numbackends` and `ACCESS EXCLUSIVE
   NOWAIT` contention gates) are live-proven in `lore-postgres/tests/domain_outbox_event_plane.rs`
   (7/7 PASS, `run-event-plane-live.ps1`). Gates: `cargo test -p lore-postgres --lib
-  domain::outbox::event_plane::tests` `cargo test -p lore-server --lib event_relay::plane::tests`;
+  domain::outbox::event_plane::tests` `cargo test -p lore-server --test unit event_relay::plane`;
   live: `pwsh -File lore-postgres/tests/run-event-plane-live.ps1`,
   `PASS=7 FAIL=0 NOT RUN=0 EXPECTED=7` at last run. Durable-mode regression reconfirmed unaffected:
   `run-outbox-initialization-live.ps1` 10/10, `run-outbox-producers-live.ps1` 29/29,
@@ -214,11 +214,11 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `[write_behind]`. Gates: `cargo test -p lore-postgres --test write_behind_drain_reserve --test
   write_behind_source_pins` (paused-time gate cases through the public API; pins for permit scope,
   the gated-only call site, and the retry set being exactly Unavailable and Contended against the
-  seven `DrainError` variants) and `cargo test -p lore-server --lib drain_reserve`. The abandon
+  seven `DrainError` variants) and `cargo test -p lore-server --test unit drain_reserve`. The abandon
   counter has no test readback, so `permit_timeout` is pinned by label constant and call-site scan.
 - **WP-114 CD-6/CD-7 write-behind store adapter [SERVER, `lore-postgres/src/store/write_behind/`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-114-cd-6-cd-7-write-behind-store-adapter-server-lore-postgres-src-store-write-behind). Gates: `cargo test -p lore-postgres --test write_behind_stage --test
     write_behind_source_pins`
-- **CR-035 write-behind backpressure is not unreadiness [SERVER,   `lore-server/src/fragment_write_behind.rs`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-035-write-behind-backpressure-is-not-unreadiness-server-lore-server-src-fragment-write-behind-rs). Gates: `cargo test -p lore-server --lib fragment_write_behind`
+- **CR-035 write-behind backpressure is not unreadiness [SERVER,   `lore-server/src/fragment_write_behind.rs`]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-035-write-behind-backpressure-is-not-unreadiness-server-lore-server-src-fragment-write-behind-rs). Gates: `cargo test -p lore-server --test unit fragment_write_behind`
 - **WP-122 L5 [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#wp-122-l5-server). Gates: See Appendix.
 - **Pool-acquisition latency instrument [SERVER, `lore-telemetry/src/pool_acquire.rs`]**: checkout-wait
   histogram/tally, distinct from `operation_duration` and the `pool_waiting`/`pool_available` gauges;
@@ -228,7 +228,7 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `?`-early-return or a dropped future is still measured — because those are the longest waits and
   dropping them silently biases the quantile low exactly when the pool is under pressure. `Abandoned`
   is excluded from the bucket tally/quantile like `Failed`, with its own `abandoned()`/
-  `abandoned_max_ms()` on the snapshot. Gate: `cargo test -p lore-telemetry --lib pool_acquire`.
+  `abandoned_max_ms()` on the snapshot. Gate: `cargo test -p lore-telemetry --test unit pool_acquire`.
   `lore-telemetry` has no runtime dependency on `lore-base`; the crate's `[dev-dependencies]` carries
   it solely so tests can use `lore_base::lore_spawn!` (the workspace `clippy.toml`, resolved from the
   nearest ancestor since the crate has no `clippy.toml` of its own, forbids raw

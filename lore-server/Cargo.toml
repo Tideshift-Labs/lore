@@ -124,7 +124,7 @@ test-util = ["dep:mockall"]
 # `lore-revision` without telling `lore-postgres` gives a server that can decode
 # a legacy Oodle2 object while reporting it unrepairable, which is the exact
 # misdiagnosis the distinction exists to prevent. Pinned by
-# `plugins::postgres::tests::the_oodle_feature_chain_reaches_lore_postgres`.
+# `plugins::postgres::the_oodle_feature_chain_reaches_lore_postgres`.
 oodle = ["lore-revision/oodle", "lore-postgres/oodle"]
 integration_tests = []
 test_random = []
@@ -140,7 +140,7 @@ seeding = ["lore-revision/seeding"]
 # harness that sets LORE_FRAGMENT_FAILPOINTS gets a silent no-op rather than a
 # barrier — a proof that reports green having raced nothing. Cargo cannot
 # express that the two features move together, so this is pinned by
-# `plugins::postgres::tests::the_failpoint_feature_chain_reaches_lore_postgres`.
+# `plugins::postgres::the_failpoint_feature_chain_reaches_lore_postgres`.
 failure_generator = ["lore-storage/failure_generator", "lore-postgres/failure_generator"]
 
 [[bin]]

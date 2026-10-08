@@ -83,7 +83,7 @@ This file contains detailed historical context and architectural invariants extr
   `lore-postgres` deliberately can't name (see this file's crate-layout doc), so proving "a shift
   can never land outside the horizon under a *validated* config" end-to-end is not cheaply
   expressible from `lore-server`'s or `lore-postgres`'s own test tiers; not attempted here.
-  Gate: `cargo test -p lore-server --lib -- charge_bound` (also runs the pre-existing
+  Gate: `cargo test -p lore-server --test unit -- charge_bound` (also runs the pre-existing
   impossible/valid/default charge-bound cases in the same file; libtest's filter is one substring,
   not a name list).
 
@@ -94,18 +94,18 @@ This file contains detailed historical context and architectural invariants extr
   semantic admission failures, anchor preservation, immutable capture, token lifetime, staged-state
   repair, input limits before metadata reads, and committed-state deserialization. Private
   unreachable authority/map, exact byte-boundary, capped binary-read, and admission-before-publication
-  branches are pinned by `exact_selection::tests`, including the production finalize-error mapping
+  branches are pinned by `exact_selection`, including the production finalize-error mapping
   to the serialized public kind and stable code. Its real-store restoration cases wrap a
   tempdir-backed `LocalMutableStore`, inject failures at the production `store()` boundary, flush,
   drop and reopen the store, then reload branch/current/staged through their production loaders.
   A one-shot publication failure proves the durable originals and `anchors_restored: true`; a
-  repeated restoration failure proves `false` and the durable partial state. `commit::tests` drives
+  repeated restoration failure proves `false` and the durable partial state. `commit` unit tests drive
   the narrower compensation helper, injecting failure at each authoritative anchor write.
   The Rust facade's independently acquired CLIENT token/context lifetime is pinned in
   `lore/tests/exact_selection_transaction.rs`. Gates:
   `cargo test -p lore-revision --test exact_selection_transaction -j 4 -- --test-threads=1` and
-  `cargo test -p lore-revision --lib exact_selection::tests -j 4`,
-  `cargo test -p lore-revision --lib commit::tests -j 4`, and
+  `cargo test -p lore-revision --test unit exact_selection -j 4`,
+  `cargo test -p lore-revision --test unit commit -j 4`, and
   `cargo test -p lore --test exact_selection_transaction -j 4 -- --test-threads=1`. Its actor-sized validation-only
   reread+MD5 measurement is deliberately `#[ignore]`; run the fully qualified test with
   `-- --ignored --exact --nocapture` and report environment/cache posture with descriptive timings.
@@ -184,7 +184,7 @@ a failed
   (`lore-storage/src/read.rs`'s `zero_hash_address_short_circuits_to_empty_without_touching_store`
   pins this, proven with a store wrapper that fails every `get()` and asserting zero calls).
   Gates: `cargo test -p lore-revision --test info -j 4` and
-  `cargo test -p lore-storage --lib read::tests::zero_hash_address_short_circuits_to_empty_without_touching_store -j 4`.
+  `cargo test -p lore-storage --test unit read::zero_hash_address_short_circuits_to_empty_without_touching_store -j 4`.
 
 
 ## CR-029 domain schema, receipts, outbox-base, backfill, bypass guard [SERVER, WP-116 Phase 2/3]
@@ -287,7 +287,7 @@ a failed
   set. Each gets a fresh database, and `Assert-ExpectedCatalog` fails the run when the compiled
   catalog and the inventory disagree — fully for the three `lore-postgres` targets, and for the
   shared `lore-server` library only under the module prefixes this runner owns, so a case added
-  under a module it shares with another package (`grpc::handlers::branch_push::tests::`) is still
+  under a module it shares with another package (`grpc::handlers::branch_push::`) is still
   policed only if pinned by name. A case outside the inventory is NOT RUN however green a plain
   `cargo test` looks; that is exactly how INV-EE P1-3's
   broken regression stayed unexecuted. Batch tests need distinct earlier-sorted keys plus a shared later
@@ -301,7 +301,7 @@ a failed
   every `branch_push_commit` input, every other method `unreachable!()`).
   **D8 (2026-09-15): `ForceUnlock`'s gate gained a second arm.** `owner` OR "the caller IS the
   lock's recorded holder" (`is_self_force_unlock`, `lore-server/src/grpc/mod.rs`). Unit gate:
-  `cargo test -p lore-server --lib -- is_self_force_unlock_tests`. A self-force still audits as
+  `cargo test -p lore-server --test unit -- is_self_force_unlock_tests`. A self-force still audits as
   `LockTransition::ForceReleased` (`lock.force_released`, not `lock.released`) — the discriminator
   is `lore_outbox_events.event_kind`, not the RPC's return code, so a positive case must assert the
   event kind, not just `Ok`. Existing owner/migrate-gate refusal tests
@@ -347,8 +347,8 @@ offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BL
   are deliberately ungated because they swallow their write error; that swallow is now pinned
   per-site with a `FailStoreWritesMutableStore`-style wrapper (delegates every method except `store()`)
   proving the RPC still returns `Ok` — a companion to the guard-rejects-the-write proof already in
-  `lore-postgres/tests/domain_bypass.rs`. Gate: `cargo test -p lore-server --lib grpc::domain_operation_metadata
-  grpc::tests::domain_error_mapping_tests domain::tests grpc::handlers::repository_metadata_set
+  `lore-postgres/tests/domain_bypass.rs`. Gate: `cargo test -p lore-server --test unit grpc::domain_operation_metadata
+  grpc::domain_error_mapping_tests domain grpc::handlers::repository_metadata_set
   grpc::repository::v1::repository_metadata_set grpc::handlers::repository_query
   grpc::handlers::branch_list grpc::repository::v1::repository_get`.
   **A scope-key/receipt-key disagreement can be a carriage gap, not a derivation gap — verify which
@@ -515,7 +515,7 @@ offline, no Postgres. `domain_operation_metadata.rs`'s `extract`/`require` (R-BL
   genuine wedge ages out to `worker_stale`/`cleanup_stale` unchanged. The two new
   sustained-backpressure reasons sit below the stale-clock checks in `readiness_reason`'s
   first-match order, so a real wedge still outranks them, and the two loops (drain/cleanup) track
-  independently. Gate: `cargo test -p lore-server --lib fragment_write_behind`.
+  independently. Gate: `cargo test -p lore-server --test unit fragment_write_behind`.
 
 
 ## WP-122 L5 [SERVER]

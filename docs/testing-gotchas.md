@@ -103,7 +103,7 @@ Durable, recurring testing lessons grouped by topic.
   only checks the implementation against itself. Use sample counts spanning `n*q` fractional
   (discriminates `ceil` vs `floor`) and exact-integer cases, and place values mid-bucket (not on a
   boundary) unless the test's specific point is boundary inclusivity. See
-  `lore-telemetry/src/pool_acquire.rs::tests::record_ranked_samples` /`wait_in_bucket`.
+  `lore-telemetry/tests/unit/pool_acquire.rs::record_ranked_samples` /`wait_in_bucket`.
 
 ## CR-038 forward-upgrade fixture gotchas
 

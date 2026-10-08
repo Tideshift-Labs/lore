@@ -22,6 +22,7 @@ embedded engine is client-relevant.
   `tests::` segment: `plugins::postgres::tests::x` is now `plugins::postgres::x`. Private items
   are reached through the crate's `test-util` feature. `scripts/test/test_unit_test_layout.py`
   fails if such a crate keeps a `#[cfg(test)]` under `src/`.
+  Fork tests in these crates follow the same layout: put them in `tests/unit/<module path>.rs` and expose the private item with `#[lore_macro::test_pub]` (public under `test-util`). Do not add a `#[cfg(test)]` module to `src/`; the gate matches comments too, so reword doc comments that quote it. Run the gate with `uv run pytest scripts/test/test_unit_test_layout.py`.
 - The fork-only crates (lore-postgres, lore-object-dispatch, lore-fragment-provider) still keep
   crate-local `#[cfg(test)]` modules. Run `cargo test -p <crate> --lib`.
 - Integration tests live under each crate's `tests/` and in `lore-integration-tests`.
