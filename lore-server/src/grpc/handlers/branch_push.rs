@@ -5,6 +5,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use lore_base::error::AddressNotFound;
+use lore_base::lore_drain_tasks;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -40,6 +41,7 @@ use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::address_not_found_status;
+use parking_lot::Mutex;
 use tokio::task::JoinSet;
 use tonic::Request;
 use tonic::Response;
@@ -1267,6 +1269,86 @@ async fn load_other_parent_state(
     Ok(Some(other_parent_state))
 }
 
+#[lore_macro::test_pub]
+async fn collect_new_addresses(
+    repository: Arc<RepositoryContext>,
+    parent_state: Arc<State>,
+    other_parent_state: Option<Arc<State>>,
+    state: Arc<State>,
+) -> Result<Vec<Address>, Status> {
+    // Each walk appends what it found rather than returning it, so the drain below can
+    // be the shared one: it joins every task before reporting a failure. A walk must
+    // never be aborted part-way.
+    let collected: Arc<Mutex<Vec<Address>>> = Default::default();
+
+    let collect = async |parent_state: Arc<State>,
+                         repository: Arc<RepositoryContext>,
+                         to_state: Arc<State>,
+                         collected: Arc<Mutex<Vec<Address>>>| {
+        let mut fragments = state::collect_new_fragments(
+            repository,
+            parent_state,
+            to_state,
+            true, /* Ignore already durably stored fragments */
+        )
+            .instrument(span!(Level::DEBUG, "collect_new_addresses"))
+            .await
+            .filter_slow_down()
+            .map_err(|status| push_store_refusal("fragment_collect", status))?
+            .warn_map_err(|err| {
+                if let Some(converted_error) = err.as_address_not_found() {
+                    return address_not_found_status(
+                        converted_error,
+                        format!(
+                            "Failed to collect new fragments for verification. Missing address '{converted_error}'"
+                        ),
+                    );
+                }
+
+                Status::internal(format!(
+                    "Failed to collect new fragments for verification: {err}"
+                ))
+            })?;
+
+        collected.lock().append(&mut fragments);
+        Ok(())
+    };
+
+    let mut collect_tasks = JoinSet::default();
+    lore_spawn!(
+        collect_tasks,
+        collect(
+            parent_state,
+            repository.clone(),
+            state.clone(),
+            collected.clone()
+        )
+        .in_current_span()
+    );
+    if let Some(other_parent_state) = other_parent_state {
+        collected
+            .lock()
+            .push(Address::zero_context_hash(state.parent_other()));
+        lore_spawn!(
+            collect_tasks,
+            collect(other_parent_state, repository, state, collected.clone()).in_current_span()
+        );
+    }
+    lore_drain_tasks!(
+        collect_tasks,
+        Status::internal("Error with collect_new_addresses task")
+    )?;
+
+    let mut new_fragments = std::mem::take(&mut *collected.lock());
+
+    // each address vec appended is already sorted, so `sort()` can detect the linear runs
+    // better than `sort_unstable()`
+    new_fragments.sort();
+    new_fragments.dedup();
+
+    Ok(new_fragments)
+}
+
 /// Verify that all new fragments between `parent_state` and `state` exist in the
 /// immutable store. Also includes the other parent hash if the state is a merge.
 /// Returns an error if any fragment is missing.
@@ -1286,42 +1368,8 @@ async fn verify_fragments(
     other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
 ) -> Result<(), Status> {
-    let collect = async |parent_state: Arc<State>| {
-        state::collect_new_fragments(
-            repository.clone(),
-            parent_state,
-            state.clone(),
-            true, /* Ignore already durably stored fragments */
-        )
-        .instrument(span!(Level::DEBUG, "collect_new_fragments"))
-        .await
-        .filter_slow_down()
-        .map_err(|status| push_store_refusal("fragment_collect", status))?
-        .warn_map_err(|err| {
-            if let Some(converted_error) = err.as_address_not_found() {
-                return address_not_found_status(
-                    converted_error,
-                    format!(
-                        "Failed to collect new fragments for verification. Missing address '{converted_error}'"
-                    ),
-                );
-            }
-
-            Status::internal(format!(
-                "Failed to collect new fragments for verification: {err}"
-            ))
-        })
-    };
-
-    let mut new_fragments = collect(parent_state).await?;
-
-    if let Some(other_parent_state) = other_parent_state {
-        new_fragments.append(&mut collect(other_parent_state).await?);
-        new_fragments.push(Address::zero_context_hash(state.parent_other()));
-    }
-
-    new_fragments.sort_unstable();
-    new_fragments.dedup();
+    let mut new_fragments =
+        collect_new_addresses(repository.clone(), parent_state, other_parent_state, state).await?;
 
     let mut retry = lore_revision::util::time::retry(
         push::RETRY_START_DURATION,

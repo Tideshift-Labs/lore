@@ -3011,6 +3011,176 @@ def test_link_remove_of_committed_link_deletes_the_mount_directory(new_lore_repo
     )
 
 
+_LINK_MOUNT_TREE = [_DEFAULT_PARENT_FILE, "libs/shared/inner.txt"]
+
+
+@pytest.mark.smoke
+def test_link_scan_keeps_a_mount_missing_from_the_working_tree(new_lore_repo):
+    """A scan reports the work it was given and leaves the link mounted."""
+    link_path = "libs/shared"
+    sibling = "libs/notes.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"inner.txt": "linked content\n"},
+        {_DEFAULT_PARENT_FILE: "baseline\n", sibling: "sibling\n"},
+    )
+    clone = parent_repo.clone()
+    assert clone.file_exists(f"{link_path}/inner.txt"), (
+        "Setup: the clone realizes the mount"
+    )
+
+    clone.rmtree(link_path)
+    clone.remove_file(sibling)
+    clone.write_files({_DEFAULT_PARENT_FILE: "edited\n"})
+
+    clone.status(scan=True)
+    scanned = [entry["path"] for entry in unstaged_entries(clone)]
+    assert scanned == [_DEFAULT_PARENT_FILE, sibling], (
+        f"A scan reports the edit and the deletion, got {scanned}"
+    )
+
+    clone.stage(scan=True)
+    assert _staged_paths(clone) == [_DEFAULT_PARENT_FILE, sibling], (
+        f"A scan stages the edit and the deletion, got {_staged_paths(clone)}"
+    )
+
+    clone.commit("Edit one file and delete another")
+    clone.push()
+
+    verify = parent_repo.clone()
+    assert working_tree_files(verify) == _LINK_MOUNT_TREE, (
+        f"The branch keeps the link mounted, got {working_tree_files(verify)}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_scan_keeps_a_mount_whose_parent_directory_is_missing(new_lore_repo):
+    """A directory holding only a mount survives a scan that cannot see it."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"inner.txt": "linked content\n"}
+    )
+    clone = parent_repo.clone()
+
+    clone.rmtree("libs")
+    clone.write_files({_DEFAULT_PARENT_FILE: "edited\n"})
+
+    clone.stage(scan=True)
+    assert _staged_paths(clone) == [_DEFAULT_PARENT_FILE], (
+        f"A scan stages the edited file alone, got {_staged_paths(clone)}"
+    )
+
+    clone.commit("Edit the parent file")
+    clone.push()
+
+    verify = parent_repo.clone()
+    assert working_tree_files(verify) == _LINK_MOUNT_TREE, (
+        f"The branch keeps the link mounted, got {working_tree_files(verify)}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_scan_scoped_to_a_missing_directory_keeps_the_mount(new_lore_repo):
+    """A scan given a path the tree no longer holds records what was below it.
+
+    Node lookup is case-insensitive, so the path answers for the mount however
+    the caller spelled it.
+    """
+    link_path = "libs/shared"
+    sibling = "libs/notes.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"inner.txt": "linked content\n"},
+        {_DEFAULT_PARENT_FILE: "baseline\n", sibling: "sibling\n"},
+    )
+    clone = parent_repo.clone()
+
+    clone.rmtree("libs")
+
+    scanned = [
+        (entry["path"], entry["action"])
+        for entry in parse_status_json(clone.status("LIBS", scan=True, json=True))
+    ]
+    assert scanned == [("LIBS/notes.txt", "delete")], (
+        f"A scan of a case variant reports the deletion below it, got {scanned}"
+    )
+
+    clone.stage("libs", scan=True)
+    assert _staged_paths(clone) == [sibling], (
+        f"A scan of the missing path stages the deletion below it, got "
+        f"{_staged_paths(clone)}"
+    )
+
+    clone.commit("Delete the sibling file")
+    clone.push()
+
+    verify = parent_repo.clone()
+    assert working_tree_files(verify) == _LINK_MOUNT_TREE, (
+        f"The branch keeps the link mounted, got {working_tree_files(verify)}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_scan_keeps_a_nested_mount_missing_from_the_working_tree(new_lore_repo):
+    """A scan crossing into a linked repository keeps the link that one holds."""
+    repo_a, _repo_b, _repo_c, b_mount, _nested = _build_nested_link_repos_at(
+        new_lore_repo, "b", "sub/c"
+    )
+    sibling = f"{b_mount}/sub/notes.txt"
+    repo_a.write_files({sibling: "sibling\n"})
+    repo_a.stage(sibling)
+    repo_a.commit("Add a file beside the nested mount")
+    repo_a.push()
+
+    clone = repo_a.clone()
+    clone.rmtree(f"{b_mount}/sub")
+
+    clone.status(scan=True)
+    scanned = [entry["path"] for entry in unstaged_entries(clone)]
+    assert scanned == [sibling], (
+        f"A scan reports the deletion beside the nested mount, got {scanned}"
+    )
+
+    clone.stage(scan=True)
+    clone.commit("Delete the file beside the nested mount")
+    clone.push()
+
+    verify = repo_a.clone()
+    assert working_tree_files(verify) == [
+        "a-root.txt",
+        f"{b_mount}/b-root.txt",
+        f"{b_mount}/sub/c/c-data/inner.txt",
+    ], f"The branch keeps the nested link mounted, got {working_tree_files(verify)}"
+
+
+@pytest.mark.smoke
+def test_link_scan_removes_the_directory_a_removed_link_emptied(new_lore_repo):
+    """A link on its way out keeps nothing: the scan finishes what `link remove` started."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"inner.txt": "linked content\n"}
+    )
+    clone = parent_repo.clone()
+
+    clone.link_remove(link_path)
+    clone.rmtree("libs")
+
+    clone.stage(scan=True)
+    assert _staged_paths(clone) == ["libs"], (
+        f"A scan stages the emptied directory, got {_staged_paths(clone)}"
+    )
+
+    clone.commit("Remove the link")
+    clone.push()
+
+    verify = parent_repo.clone()
+    assert working_tree_files(verify) == [_DEFAULT_PARENT_FILE], (
+        f"The branch holds the parent's own file alone, got {working_tree_files(verify)}"
+    )
+
+
 @pytest.mark.smoke
 def test_link_remove_on_branch_merge_start(new_lore_repo):
     """A link removed on a branch is gone from the registry after merging."""

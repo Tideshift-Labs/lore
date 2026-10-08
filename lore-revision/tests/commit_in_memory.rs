@@ -190,6 +190,81 @@ mod tests {
             .expect("Task failed");
     }
 
+    /// `first`, holding a file and the directory `inner`, beside `second`: the freeze must reach
+    /// all three. A directory it skipped would leave its file staged, which the commit refuses.
+    #[tokio::test]
+    async fn commit_in_memory_revision_freezes_every_directory_of_a_nested_tree() {
+        let (_immutable, mutable, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(mutable).await;
+                let branch = branch_id();
+                let state = State::new();
+                let first = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("first"),
+                    "first",
+                )
+                .await;
+                add(&state, repository.clone(), first, file("a.bin"), "a.bin").await;
+                let inner = add(
+                    &state,
+                    repository.clone(),
+                    first,
+                    directory("inner"),
+                    "inner",
+                )
+                .await;
+                add(&state, repository.clone(), inner, file("b.bin"), "b.bin").await;
+                let second = add(
+                    &state,
+                    repository.clone(),
+                    ROOT_NODE,
+                    directory("second"),
+                    "second",
+                )
+                .await;
+                add(&state, repository.clone(), second, file("c.bin"), "c.bin").await;
+
+                let revision = commit_in_memory_revision(
+                    repository.clone(),
+                    &token(),
+                    state,
+                    metadata_on(branch),
+                    Hash::default(),
+                    branch,
+                )
+                .await
+                .expect("a nested tree must commit");
+
+                let published = State::deserialize(repository.clone(), revision)
+                    .await
+                    .expect("the committed revision must deserialize");
+                for path in ["first/a.bin", "first/inner/b.bin", "second/c.bin"] {
+                    let link = published
+                        .find_node_link(repository.clone(), path)
+                        .await
+                        .unwrap_or_else(|err| {
+                            panic!("the committed tree must hold {path}: {err:?}")
+                        });
+                    let node = published
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("the node must read back");
+                    assert!(
+                        !node.is_dirty_or_staged(),
+                        "{path} must carry no change flags, got 0x{:x}",
+                        node.flags
+                    );
+                }
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     /// The freeze treats a staged link exactly like a file — there is nothing to
     /// fragment and no subtree of its own to walk, since that lives in the linked
     /// repository. What has to survive is its identity as a link: the address is the

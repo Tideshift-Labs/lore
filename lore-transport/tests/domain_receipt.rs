@@ -174,7 +174,7 @@ fn consumed_ticket_sha256_must_be_exactly_the_digest_length() {
     assert_eq!(exact.validate(), Ok(()));
 }
 
-/// `operation_id` is reused for the lookup and must be the same UUIDv7 the attempt was minted
+/// `operation_id` is reused for the lookup and must be the same `UUIDv7` the attempt was minted
 /// with -- a v4 (or any non-v7) id can never have been a real attempt id, so `validate()` rejects
 /// it before a round trip can discover the same thing the hard way.
 #[test]

@@ -29,6 +29,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 use rand::random;
 
 use crate::store::test_support::test_store_create;
@@ -164,7 +165,7 @@ impl ImmutableStore for MockCopyFailStore {
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(StoreError::from(AddressNotFound::from(_source_address)))
     }
@@ -265,7 +266,7 @@ impl ImmutableStore for MockCopySuccessStore {
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Ok(())
     }

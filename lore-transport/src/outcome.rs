@@ -88,7 +88,7 @@ pub const ATTEMPT_ID_METADATA_KEY: &str = "lore-attempt-id";
 
 /// The identity one attempt at a mutable operation was dispatched under.
 ///
-/// UUIDv7 so it sorts by mint time, which is what makes a journal of unresolved attempts
+/// `UUIDv7` so it sorts by mint time, which is what makes a journal of unresolved attempts
 /// readable in the order they were tried. It is minted *before* dispatch; an id created when
 /// the failure was observed would name the observation, not the attempt, and could not be
 /// matched against a server-side receipt.
@@ -274,6 +274,8 @@ impl GrpcRpc {
 /// halves of the same operation cannot drift into different answers. The classification is the
 /// operation's effect, not the transport's: `Put` over gRPC is `MutableNoReplay` for exactly
 /// the reason `Put` over QUIC is, and `Verify` carries the heal flag on both.
+// Rows that share a class keep separate arms so each carries its own reason.
+#[allow(clippy::match_same_arms)]
 pub fn grpc_replay_class(rpc: GrpcRpc) -> ReplayClass {
     match rpc {
         // Side-effect-free reads. A second identical request returns the same answer.

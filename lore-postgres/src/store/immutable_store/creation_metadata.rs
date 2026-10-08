@@ -14,6 +14,7 @@ use lore_storage::StoreGetData;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::gc_event::GcEventSinkRef;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::StoreError;
 
 use super::CoordinatedProvider;
@@ -201,7 +202,7 @@ impl ImmutableStore for CreationMetadataStore {
         _: Address,
         _: Partition,
         _: Context,
-        _: bool,
+        _: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(unsupported())
     }

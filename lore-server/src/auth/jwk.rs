@@ -21,6 +21,7 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
+use lore_transport::auth::oidc::body_excerpt;
 use lore_transport::user_agent;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
@@ -120,26 +121,11 @@ const JWKS_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 #[lore_macro::test_pub]
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Cap on the JWKS document this server will hold in memory. Generous beside any real key
-/// set — even a large provider publishes single-digit kilobytes — so the only documents it
-/// refuses are ones no identity provider would send. [`JWKS_REQUEST_TIMEOUT`] bounds how
-/// long a fetch may run, which is not the same as bounding what it delivers.
+/// Cap on the JWKS and discovery documents this server will hold in memory.
+/// [`JWKS_REQUEST_TIMEOUT`] bounds how long a fetch may run, which is not the same as
+/// bounding what it delivers.
 #[lore_macro::test_pub]
-const JWKS_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-
-/// How much of a rejected response body reaches the log. The body is whatever the endpoint
-/// chose to send, so it is neither trustworthy nor necessarily small.
-#[lore_macro::test_pub]
-const LOGGED_BODY_LIMIT: usize = 512;
-
-/// The head of a response body, for diagnostics.
-#[lore_macro::test_pub]
-fn body_excerpt(body: &str) -> String {
-    match body.char_indices().nth(LOGGED_BODY_LIMIT) {
-        Some((end, _)) => format!("{}… ({} bytes total)", &body[..end], body.len()),
-        None => body.to_string(),
-    }
-}
+const JWKS_MAX_RESPONSE_BYTES: usize = lore_transport::auth::oidc::MAX_RESPONSE_BYTES;
 
 /// Read a response body, refusing anything past [`JWKS_MAX_RESPONSE_BYTES`].
 ///

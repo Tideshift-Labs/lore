@@ -361,6 +361,7 @@ impl Fixture {
             self.journal.clone(),
         )
     }
+    #[allow(clippy::unused_self)] // Reads as a method of the fixture beside its siblings.
     fn context(&self) -> GrpcSessionContext {
         GrpcSessionContext {
             partition: Partition::from(Context::from([0x11; 16])),

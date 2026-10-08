@@ -152,5 +152,5 @@ test = false
 name = "lore_server"
 test = false
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+[lints]
+workspace = true

@@ -828,5 +828,7 @@ async fn authentication_refresh_lease_child_process_holder() {
     let _lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
         .await
         .expect("child acquires refresh lease");
+    // The child process exits while holding the lease, so the parent observes its release by exit.
+    #[allow(clippy::exit)]
     std::process::exit(0);
 }

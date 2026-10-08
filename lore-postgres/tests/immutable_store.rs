@@ -1097,7 +1097,13 @@ async fn copy_fragment() {
     let dst_context: Context = rand::random();
 
     s.clone()
-        .copy(src_partition, src_addr, dst_partition, dst_context, false)
+        .copy(
+            src_partition,
+            src_addr,
+            dst_partition,
+            dst_context,
+            lore_storage::immutable_store::CopyBehavior::default(),
+        )
         .await
         .expect("copy");
 
@@ -1140,7 +1146,7 @@ async fn copy_fragment() {
             },
             wildcard_dst_partition,
             wildcard_dst_context,
-            false,
+            lore_storage::immutable_store::CopyBehavior::default(),
         )
         .await
         .expect_err("partition-match copy must not cross source partitions");
@@ -1155,7 +1161,7 @@ async fn copy_fragment() {
             },
             wildcard_dst_partition,
             wildcard_dst_context,
-            false,
+            lore_storage::immutable_store::CopyBehavior::default(),
         )
         .await
         .expect("copy from partition match");
@@ -1167,6 +1173,99 @@ async fn copy_fragment() {
         .await
         .expect("get after partition-match copy");
     assert_eq!(payload, wildcard_payload);
+}
+
+/// `copy` is a pure association write, so every `CopyBehavior` combination
+/// (`durable` x `do_not_replicate`) must give the same observable result: the
+/// destination reads back `MatchFull` with `PayloadStoredDurable` set and the
+/// same bytes, and an unassociated source partition refuses with
+/// `AddressNotFound`. The source is put without the durable flag, so the flag
+/// seen on the destination is the store's own.
+#[tokio::test]
+#[ignore = "needs live Postgres + S3 env (see module docs); run with -- --ignored"]
+#[serial]
+async fn copy_fragment_is_identical_under_every_copy_behavior() {
+    use lore_storage::immutable_store::CopyBehavior;
+
+    let Some((pg, ep, bucket, region)) = env_config() else {
+        eprintln!(
+            "LORE_TEST_PG_URL / LORE_TEST_S3_ENDPOINT / LORE_TEST_S3_BUCKET unset; \
+             skipping Postgres immutable-store test"
+        );
+        return;
+    };
+    let s = make_store(&pg, &ep, &bucket, &region).await;
+
+    let src_partition: Partition = rand::random();
+    let src_addr: Address = rand::random();
+    let (frag, payload) = put_fragment(s.clone(), src_partition, src_addr, 3000).await;
+    assert_eq!(frag.flags & FragmentFlags::PayloadStoredDurable.bits(), 0);
+
+    for durable in [false, true] {
+        for do_not_replicate in [false, true] {
+            let behavior = CopyBehavior {
+                durable,
+                do_not_replicate,
+            };
+            for source_context in [src_addr.context, Context::default()] {
+                let source = Address {
+                    hash: src_addr.hash,
+                    context: source_context,
+                };
+                let dst_partition: Partition = rand::random();
+                let dst_context: Context = rand::random();
+                let dst = Address {
+                    hash: src_addr.hash,
+                    context: dst_context,
+                };
+
+                s.clone()
+                    .copy(src_partition, source, dst_partition, dst_context, behavior)
+                    .await
+                    .unwrap_or_else(|err| panic!("copy under {behavior:?}: {err:?}"));
+
+                let metadata = s
+                    .clone()
+                    .get_metadata(dst_partition, dst)
+                    .await
+                    .unwrap_or_else(|err| panic!("get_metadata under {behavior:?}: {err:?}"));
+                assert_eq!(
+                    metadata.match_made,
+                    StoreMatch::MatchFull,
+                    "{behavior:?}: destination must read back MatchFull"
+                );
+                assert_ne!(
+                    metadata.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
+                    0,
+                    "{behavior:?}: destination must carry PayloadStoredDurable"
+                );
+                let (fragment_out, payload_out) = get_payload(s.clone(), dst_partition, dst)
+                    .await
+                    .unwrap_or_else(|err| panic!("get under {behavior:?}: {err:?}"));
+                assert_eq!(fragment_out, stored_durable(frag), "{behavior:?}");
+                assert_eq!(payload, payload_out, "{behavior:?}: bytes must match");
+            }
+
+            let unassociated_error = s
+                .clone()
+                .copy(
+                    rand::random(),
+                    Address {
+                        hash: src_addr.hash,
+                        context: Context::default(),
+                    },
+                    rand::random(),
+                    rand::random(),
+                    behavior,
+                )
+                .await
+                .expect_err("an unassociated source partition must refuse");
+            assert!(
+                unassociated_error.is_address_not_found(),
+                "{behavior:?}: expected AddressNotFound, got {unassociated_error:?}"
+            );
+        }
+    }
 }
 
 /// 6a. `obliterate` with a single association: after obliteration, `get` errors
@@ -1631,7 +1730,7 @@ async fn copy_racing_last_association_obliterate_never_dangles() {
                     source_address,
                     destination_partition,
                     destination_context,
-                    false,
+                    lore_storage::immutable_store::CopyBehavior::default(),
                 )
                 .await
         }

@@ -18,6 +18,7 @@ use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -440,7 +441,7 @@ where
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(StoreError::internal("copy not supported on read replica"))
     }

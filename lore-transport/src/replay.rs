@@ -144,6 +144,8 @@ pub const ATTEMPT_BUDGET: u32 = 2;
 /// Exhaustive by construction: there is no wildcard arm, so a new [`Command`] variant does not
 /// compile until it is classified here. This is the single construction boundary — every
 /// recovery path reads the class from this function rather than deciding locally.
+// Rows that share a class keep separate arms so each carries its own reason.
+#[allow(clippy::match_same_arms)]
 pub fn storage_replay_class(command: Command) -> ReplayClass {
     match command {
         // Side-effect-free reads. A second identical request returns the same answer.

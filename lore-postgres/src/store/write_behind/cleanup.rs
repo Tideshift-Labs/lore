@@ -119,6 +119,7 @@ impl StageFileScanner {
     }
 
     #[cfg(not(unix))]
+    #[allow(clippy::unused_self)] // Keeps the unix signature.
     fn scan_inner(
         &mut self,
         _stage: &WriteBehindStage,

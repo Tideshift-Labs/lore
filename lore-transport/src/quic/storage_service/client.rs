@@ -346,8 +346,8 @@ impl StorageClient {
         Ok(MutableOutcome::Applied(Hash::from(&payload[..])))
     }
 
-    /// Wire payload layout for Copy is: source_partition (16) + source_address (32+16) +
-    /// target_context (16) = 80 bytes. The target_context tail allows the destination's dedup
+    /// Wire payload layout for Copy is: `source_partition` (16) + `source_address` (32+16) +
+    /// `target_context` (16) = 80 bytes. The `target_context` tail allows the destination's dedup
     /// tag to differ from the source's without transferring the payload.
     async fn send_copy(
         &self,
@@ -442,6 +442,8 @@ impl ServiceClient for StorageClient {
         Self::ALPN
     }
 
+    // Distinct failures may map to the same error; each keeps its own arm and reason.
+    #[allow(clippy::match_same_arms)]
     fn map_send_error(
         &self,
         failed_request: Self::RequestType,

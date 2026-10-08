@@ -46,10 +46,9 @@ use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::resolve_user_paths;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::is_reserved_node_name;
 use crate::revision;
 use crate::revision::sync::SyncRealizeStats;
 use crate::runtime::execution_context;
@@ -1680,16 +1679,6 @@ async fn reset_walk_directory(
     let mut cycle = SiblingCycleGuard::new(node_id);
 
     while let Some(child_node_id) = child_node_iter {
-        let child_node_name = state_target
-            .node_name_clone(repository.clone(), child_node_id)
-            .await
-            .forward::<ResetError>("Failed to get node name")?;
-
-        let child_node_path = directory_path.join(&child_node_name);
-        if options.purge {
-            node_children_names.push(child_node_name.clone());
-        }
-
         let Ok(child_node) = state_target.node(repository.clone(), child_node_id).await else {
             failure = Some(ResetError::internal(
                 "Failed deserializing state node block",
@@ -1703,6 +1692,20 @@ async fn reset_walk_directory(
         {
             failure = Some(err);
             break;
+        }
+
+        let Some(child_node_name) = state_target
+            .node_name_clone_or_skip(repository.clone(), child_node_id)
+            .await
+            .forward::<ResetError>("Failed to get node name")?
+        else {
+            child_node_iter = child_node.sibling();
+            continue;
+        };
+
+        let child_node_path = directory_path.join(&child_node_name);
+        if options.purge {
+            node_children_names.push(child_node_name.clone());
         }
 
         if child_node.is_directory() || child_node.is_link() {
@@ -1840,7 +1843,7 @@ async fn purge_untracked_children(
     while let Some(filesystem_child) = filesystem_children.next().await {
         let filesystem_child =
             filesystem_child.forward_any::<ResetError>("Unusable directory entry")?;
-        if filesystem_child.name == DOT_URC || filesystem_child.name == DOT_LORE {
+        if is_reserved_node_name(&filesystem_child.name) {
             continue;
         }
 

@@ -48,6 +48,7 @@ mod storage_copy_on_write_tests {
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
@@ -244,8 +245,7 @@ mod storage_copy_on_write_tests {
                 let completion_snapshot = completions.lock().unwrap().clone();
                 let unresolved_snapshot = journal.unresolved().await.unwrap();
                 assert_eq!(server.counted.traffic().copies, 1,
-                    "fixture must reach Copy before testing response-loss propagation; status={status}, events={:?}, unresolved={:?}, completions={:?}",
-                    event_snapshot, unresolved_snapshot, completion_snapshot);
+                    "fixture must reach Copy before testing response-loss propagation; status={status}, events={event_snapshot:?}, unresolved={unresolved_snapshot:?}, completions={completion_snapshot:?}");
                 assert_eq!(
                     status,
                     lore_revision::interface::LoreError::OutcomeUnknown as i32,
@@ -640,7 +640,7 @@ mod storage_copy_on_write_tests {
             source_address: Address,
             destination_partition: Partition,
             destination_context: Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             self.copies.fetch_add(1, Ordering::SeqCst);
             self.copy_sources
@@ -660,7 +660,7 @@ mod storage_copy_on_write_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await;
             if self.lose_copy_response.load(Ordering::SeqCst) {

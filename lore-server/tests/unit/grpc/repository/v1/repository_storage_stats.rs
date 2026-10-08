@@ -239,7 +239,7 @@ impl ImmutableStore for StatsStubStore {
         _source_address: lore_storage::Address,
         _destination_partition: lore_storage::Partition,
         _destination_context: lore_storage::Context,
-        _durable: bool,
+        _behavior: lore_storage::immutable_store::CopyBehavior,
     ) -> Result<(), lore_storage::StoreError> {
         unimplemented!("not exercised by repository_storage_stats tests")
     }

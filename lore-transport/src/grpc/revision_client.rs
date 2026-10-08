@@ -100,7 +100,7 @@ impl RevisionService {
                         .await
                         .map_err(ProtocolError::from)?
                         .into_inner();
-                    decode_created_branch(response, branch).map_err(|_| {
+                    decode_created_branch(response, branch).map_err(|_err| {
                         crate::outcome::outcome_unknown("BranchCreate malformed response", &attempt)
                     })
                 },

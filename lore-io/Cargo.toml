@@ -65,3 +65,6 @@ windows-sys = { workspace = true, features = [
 
 [features]
 test-util = []
+
+[lints]
+workspace = true

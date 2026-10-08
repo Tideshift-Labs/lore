@@ -49,7 +49,7 @@ fn dispatch_attempt(globals: &LoreGlobalArgs) -> Result<Option<AttemptId>, Inval
     let Some(text) = globals.attempt_id() else {
         return Ok(None);
     };
-    let uuid = Uuid::parse_str(text.trim()).map_err(|_| InvalidArguments {
+    let uuid = Uuid::parse_str(text.trim()).map_err(|_err| InvalidArguments {
         reason: "attempt_id is not a UUID".to_owned(),
     })?;
     // v7 because the receipt rail orders and classifies attempts by a UUID's embedded timestamp.

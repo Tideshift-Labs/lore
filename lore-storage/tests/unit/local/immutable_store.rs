@@ -15,6 +15,7 @@ use lore_storage::FragmentReference;
 use lore_storage::Hash;
 use lore_storage::Partition;
 use lore_storage::hash;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::local::immutable_store::info::info_path_for_store_root;
 use lore_storage::store_types::StoreMatch;
@@ -1365,7 +1366,10 @@ async fn copy_adopts_source_payload_and_decompresses_through_target_partition() 
             source_address,
             target_partition,
             source_address.context,
-            false,
+            CopyBehavior {
+                durable: false,
+                do_not_replicate: false,
+            },
         )
         .await
         .unwrap();
@@ -1436,7 +1440,16 @@ async fn copy_same_partition_new_context_adopts_payload_without_transfer() {
     // destination tuple gets its own entry that points at the source's payload data.
     store
         .clone()
-        .copy(partition, source_address, partition, target_context, false)
+        .copy(
+            partition,
+            source_address,
+            partition,
+            target_context,
+            CopyBehavior {
+                durable: false,
+                do_not_replicate: false,
+            },
+        )
         .await
         .unwrap();
 
@@ -2058,7 +2071,10 @@ mod copy_source {
                 Address::zero_context_hash(address.hash),
                 partition,
                 wanted,
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect("a partition holding the hash must answer a source naming no context");
@@ -2093,7 +2109,10 @@ mod copy_source {
                 Address::zero_context_hash(address.hash),
                 destination,
                 wanted,
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect("copy from a source partition naming no context");
@@ -2128,7 +2147,10 @@ mod copy_source {
                 Address::zero_context_hash(address.hash),
                 Partition::from([0x34u8; 16]),
                 Context::from([0x35u8; 16]),
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect_err("a partition holding nothing has no association to name");
@@ -2154,7 +2176,10 @@ mod copy_source {
                 },
                 partition,
                 Context::from([0x44u8; 16]),
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect_err("a context the partition does not hold must not resolve to a sibling");
@@ -2322,7 +2347,10 @@ mod copy_source {
                 Address::zero_context_hash(address.hash),
                 partition,
                 wanted,
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect("the surviving association is the one to copy from");
@@ -2370,7 +2398,10 @@ mod copy_source {
                     named,
                     partition,
                     Context::from([0x63u8; 16]),
-                    false,
+                    CopyBehavior {
+                        durable: false,
+                        do_not_replicate: false,
+                    },
                 )
                 .await
                 .expect_err("a tombstone is not an association to copy from");
@@ -2423,7 +2454,10 @@ mod copy_source {
                 Address::zero_context_hash(address.hash),
                 partition,
                 wanted,
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect("the representation alone is still a source");
@@ -2471,7 +2505,10 @@ mod copy_source {
                 resolved.source_address(address.hash),
                 partition,
                 wanted,
-                false,
+                CopyBehavior {
+                    durable: false,
+                    do_not_replicate: false,
+                },
             )
             .await
             .expect("the source a match named must be one copy resolves");

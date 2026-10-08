@@ -126,7 +126,7 @@ mod active_active_two_process_tests {
 
     /// A fresh 16-byte identity.
     ///
-    /// UUIDv7 rather than a counter so two cases that somehow shared a database
+    /// `UUIDv7` rather than a counter so two cases that somehow shared a database
     /// could not collide silently, and so a repository id read out of a failure
     /// message is traceable to when it was minted.
     fn id16() -> [u8; 16] {
@@ -2152,7 +2152,7 @@ mod active_active_two_process_tests {
     /// again touch a checkpoint once its successor exists.
     ///
     /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
-    /// "DURABLE_INVALIDATION" ("A hard-dead member may be retired only by
+    /// "`DURABLE_INVALIDATION`" ("A hard-dead member may be retired only by
     /// compare-and-set after a replacement with a newer generation proves an
     /// authoritative baseline and persisted checkpoint. Name reuse never
     /// inherits an old checkpoint.") and `report_checkpoint`'s own fenced
@@ -2417,7 +2417,7 @@ mod active_active_two_process_tests {
     /// sequence could otherwise have been acknowledged.
     ///
     /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
-    /// "DURABLE_INVALIDATION" ("Each receiver frontier is contiguous: an
+    /// "`DURABLE_INVALIDATION`" ("Each receiver frontier is contiguous: an
     /// unresolved gap ... blocks advancement even when a later event was
     /// acknowledged") and `report_checkpoint`'s own doc comment
     /// (`lore-postgres/src/domain/outbox/checkpoint.rs:14-20`): "A receiver
@@ -2436,7 +2436,7 @@ mod active_active_two_process_tests {
     /// A genuine broker-sequence gap in `receiver.rs`'s own tracking
     /// (`frontier.rs`'s `AckFrontier`) requires the broker to actually skip a
     /// delivery to this consumer while delivering a later one — something a
-    /// single JetStream durable consumer does not do under ordinary
+    /// single `JetStream` durable consumer does not do under ordinary
     /// operation, and which this crate exposes no failpoint to force:
     /// `LORE_FRAGMENT_FAILPOINTS` only reaches the outbox claim/accept sites
     /// cases D and E use, and there is no receiver-side equivalent. **This
@@ -2623,7 +2623,7 @@ mod active_active_two_process_tests {
     /// message.
     ///
     /// Deliberately far above [`RECEIVER_DEADLINE`]: redelivery is gated on
-    /// JetStream's own `ack_wait`, which the gateway provisions at 30 seconds,
+    /// `JetStream`'s own `ack_wait`, which the gateway provisions at 30 seconds,
     /// and a bound under that would report a correct receiver as a failure.
     const REDELIVERY_DEADLINE: Duration = Duration::from_secs(150);
 
@@ -2852,7 +2852,7 @@ mod active_active_two_process_tests {
     /// repository and aggregate ordinal.
     ///
     /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
-    /// "DURABLE_INVALIDATION".
+    /// "`DURABLE_INVALIDATION`".
     ///
     /// # Why the traced target, and not just the frontier
     ///
@@ -2955,7 +2955,7 @@ mod active_active_two_process_tests {
     /// then recovers when the broker redelivers the missing message.
     ///
     /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
-    /// "DURABLE_INVALIDATION" ("Each receiver frontier is contiguous: an
+    /// "`DURABLE_INVALIDATION`" ("Each receiver frontier is contiguous: an
     /// unresolved gap ... blocks advancement even when a later event was
     /// acknowledged"), and the receiver's own rule
     /// (`plugins/remote_notification/receiver.rs`): "a gap or an incomparable
@@ -2966,7 +2966,7 @@ mod active_active_two_process_tests {
     ///
     /// All of it, which is the point. The three pushes are real governed
     /// mutations on process A; the events reach process B through the real
-    /// relay, the real gateway, and real JetStream; B's receiver is the shipped
+    /// relay, the real gateway, and real `JetStream`; B's receiver is the shipped
     /// one, unmodified. The single injected fact is that B's durable stream
     /// never hands ONE delivery to the receiver — the shape a lost delivery
     /// has from inside a consumer — and because that message is therefore never
@@ -3345,7 +3345,7 @@ mod active_active_two_process_tests {
     ///
     /// This is the one case where the injected fault and the real broker do
     /// half the work each: the ack failure is injected, and the redelivery that
-    /// follows is JetStream's own, on its own `ack_wait`. Nothing in the
+    /// follows is `JetStream`'s own, on its own `ack_wait`. Nothing in the
     /// harness replays the message.
     #[tokio::test]
     #[ignore = "two live loreserver processes; run tests/run-active-active-two-process-live.ps1"]
@@ -3453,7 +3453,7 @@ mod active_active_two_process_tests {
     /// that reason.
     ///
     /// Contract: `lorehub/docs/contracts/lore-notification-plane.md`,
-    /// "DURABLE_INVALIDATION" ("invalid scope, malformed identity, or
+    /// "`DURABLE_INVALIDATION`" ("invalid scope, malformed identity, or
     /// unsupported version follows the poison path"), and the receiver's own
     /// outcome matrix (`plugins/remote_notification/receiver.rs`): "poison |
     /// park, fail readiness | no".
@@ -3462,7 +3462,7 @@ mod active_active_two_process_tests {
     ///
     /// Everything but one field. The push is a real governed mutation on
     /// process A, relayed by the real relay through the real gateway and real
-    /// JetStream to process B's real receiver. The single injected fact is that
+    /// `JetStream` to process B's real receiver. The single injected fact is that
     /// B's durable stream raises that one envelope's `payload_version` out of
     /// range before handing it over, which is what an event published by a
     /// newer cell than this build looks like from inside a consumer. The

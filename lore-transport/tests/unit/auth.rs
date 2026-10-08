@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 mod exchange;
+mod oidc;
 mod token_only;
 mod ucs_auth;
 

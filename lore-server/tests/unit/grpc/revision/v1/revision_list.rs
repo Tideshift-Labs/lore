@@ -1750,9 +1750,9 @@ async fn forward_cursor_survives_an_evicted_anchor_list_cache() {
 /// A step boundary can go missing below a boundary that is still
 /// present — the seal write is best-effort, and the key type has been
 /// renamed once already, orphaning older entries. The forward cursor
-/// must still find the real successor rather than treat the missing
-/// boundary as proof its band is empty and anchor on a boundary
-/// further up, which would silently skip every revision in between.
+/// must still return the real successor: a missing boundary is not
+/// proof its band is empty, so the gap above it has to be walked
+/// rather than assumed to hold nothing.
 /// The missing pointer is also repaired as a side effect, so a
 /// second call resolves the fast path directly rather than repeating
 /// the gap descent.
@@ -1813,15 +1813,14 @@ async fn forward_cursor_repairs_a_missing_skip_pointer_below_a_found_anchor() {
     .await;
 }
 
-/// When the missing boundary is the very first one `forward_anchor`
-/// probes (not one it only reaches after a fast binary-search hit),
-/// the gap descent walks the full, uncapped distance down to
-/// `first_number` and — since that distance is exactly what it walks
-/// — necessarily crosses and repairs that same boundary. A second,
-/// identical request then takes the fast path directly, for both the
-/// page resolution and the forward cursor: the first call's cost
-/// heals the exact spot future requests need, not just spots nearer
-/// the branch's latest revision.
+/// The gap descent runs down to `first_number`, so it crosses and
+/// repairs the boundary immediately above it — the one a page anchored
+/// this deep probes first — even when that is the very boundary whose
+/// absence sent the request down the gap descent in the first place. A
+/// second, identical request then takes the fast path directly, for both
+/// the page resolution and the forward cursor: the first call's cost
+/// heals the exact spot future requests need, not just spots nearer the
+/// branch's latest revision.
 #[tokio::test]
 async fn forward_cursor_repairs_the_boundary_nearest_first_number() {
     let repository = random::<RepositoryId>();
@@ -1881,7 +1880,7 @@ async fn forward_cursor_repairs_the_boundary_nearest_first_number() {
         assert_eq!(first_response.items[0].number, 50);
         let forward = first_response
             .signature_forward
-            .expect("forward cursor via the full, uncapped gap descent");
+            .expect("forward cursor via the gap descent");
         assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 51]);
 
         // The descent crossed boundary 100 on its way down and
@@ -1921,6 +1920,225 @@ async fn forward_cursor_repairs_the_boundary_nearest_first_number() {
             .signature_forward
             .expect("forward cursor via the now-repaired boundary");
         assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 51]);
+    }))
+    .await;
+}
+
+/// The widest gap the open latest band can present is exactly
+/// `history_step_size` revisions, which the band walk covers in
+/// `history_step_size + 1` items — its entire budget. A page anchored
+/// that far below an unsealed latest revision must still resolve its
+/// cursor rather than exhaust the walk and fail the request.
+#[tokio::test]
+async fn forward_cursor_resolves_a_page_a_full_band_below_latest() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        // Revision 200 is the branch's latest, so boundary 200 is
+        // unsealed: sealing it waits on a revision above it. A page
+        // anchored at revision 100 sits a full band below it.
+        let (branch_id, signatures) = create_branch_with_history(&repository_context, 200).await;
+
+        // The list cache would serve the segment headed at 100 and lift
+        // the page's first item above revision 100.
+        let acceleration = lore_server::grpc::server::RevisionListAcceleration {
+            step_keys: true,
+            list_cache: false,
+        };
+
+        let response = handler(
+            make_request_identifier(repository, branch_id, 100),
+            immutable_store,
+            mutable_store,
+            DEFAULT_HISTORY_STEP_SIZE,
+            acceleration,
+            &make_instruments(),
+        )
+        .await
+        .expect("Request failed")
+        .into_inner();
+        assert_eq!(response.items[0].number, 100);
+        let forward = response
+            .signature_forward
+            .expect("forward cursor across the full band");
+        assert_eq!(Hash::from(forward.as_ref()), signatures[200 - 101]);
+    }))
+    .await;
+}
+
+/// A skip pointer missing at the first boundary probed leaves the binary
+/// search above it intact: the descent anchors on the lowest boundary
+/// that search still proves sealed, not on the branch's latest revision.
+/// Boundaries above that anchor stay untouched — a descent from the
+/// latest revision would cross and rewrite every one of them — so the
+/// one evicted above the anchor is still missing afterwards.
+#[tokio::test]
+async fn forward_cursor_binary_searches_past_a_missing_first_boundary() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (branch_id, signatures) = create_branch_with_history(&repository_context, 350).await;
+
+        let step_key = |boundary: u64| {
+            branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                boundary,
+                DEFAULT_HISTORY_STEP_SIZE,
+            )
+        };
+
+        // Boundary 100 is the first one probed for a page anchored at
+        // revision 50. Boundary 300 sits above the anchor the search
+        // settles on, so only a descent from the latest revision reaches
+        // it.
+        for boundary in [100, 300] {
+            let (key, key_type) = step_key(boundary);
+            mutable_store
+                .clone()
+                .store(repository, key, Hash::default(), key_type)
+                .await
+                .expect("evict skip pointer");
+        }
+
+        // The list cache would serve the whole segment headed at 100 and
+        // lift `first_number` above the evicted boundary.
+        let acceleration = lore_server::grpc::server::RevisionListAcceleration {
+            step_keys: true,
+            list_cache: false,
+        };
+
+        let response = handler(
+            make_request_identifier(repository, branch_id, 50),
+            immutable_store,
+            mutable_store.clone(),
+            DEFAULT_HISTORY_STEP_SIZE,
+            acceleration,
+            &make_instruments(),
+        )
+        .await
+        .expect("Request failed")
+        .into_inner();
+        assert_eq!(response.items[0].number, 50);
+        let forward = response
+            .signature_forward
+            .expect("forward cursor across the missing pointer");
+        assert_eq!(Hash::from(forward.as_ref()), signatures[350 - 51]);
+
+        let (key, key_type) = step_key(100);
+        let repaired = mutable_store
+            .clone()
+            .load(repository, key, key_type)
+            .await
+            .expect("boundary 100 lies on the descent");
+        assert_eq!(repaired, signatures[350 - 100]);
+
+        let (key, key_type) = step_key(300);
+        let err = mutable_store
+            .load(repository, key, key_type)
+            .await
+            .expect_err("boundary 300 lies above the descent's anchor");
+        assert!(err.is_address_not_found(), "{err:?}");
+    }))
+    .await;
+}
+
+/// A skip pointer missing part-way through the binary search narrows the
+/// search upward instead of ending it, so the descent still anchors on a
+/// boundary proven sealed above the gap rather than on the branch's
+/// latest revision. The cursor it returns also pins that such a gap is
+/// never reported as a single band: the anchor here sits 350 revisions
+/// above the page, far past the one-band walk a sealed answer licenses.
+#[tokio::test]
+async fn forward_cursor_binary_searches_past_a_missing_mid_boundary() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (branch_id, signatures) = create_branch_with_history(&repository_context, 550).await;
+
+        let step_key = |boundary: u64| {
+            branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                boundary,
+                DEFAULT_HISTORY_STEP_SIZE,
+            )
+        };
+
+        // For a page anchored at revision 50 the search probes 100, then
+        // 300, then 400. Evicting the first two makes 300 the mid-search
+        // gap; 500 is never probed and sits above the anchor, so only a
+        // descent from the latest revision reaches it.
+        for boundary in [100, 300, 500] {
+            let (key, key_type) = step_key(boundary);
+            mutable_store
+                .clone()
+                .store(repository, key, Hash::default(), key_type)
+                .await
+                .expect("evict skip pointer");
+        }
+
+        let acceleration = lore_server::grpc::server::RevisionListAcceleration {
+            step_keys: true,
+            list_cache: false,
+        };
+
+        let response = handler(
+            make_request_identifier(repository, branch_id, 50),
+            immutable_store,
+            mutable_store.clone(),
+            DEFAULT_HISTORY_STEP_SIZE,
+            acceleration,
+            &make_instruments(),
+        )
+        .await
+        .expect("Request failed")
+        .into_inner();
+        assert_eq!(response.items[0].number, 50);
+        let forward = response
+            .signature_forward
+            .expect("forward cursor across the missing pointers");
+        assert_eq!(Hash::from(forward.as_ref()), signatures[550 - 51]);
+
+        for boundary in [100, 300] {
+            let (key, key_type) = step_key(boundary);
+            let repaired = mutable_store
+                .clone()
+                .load(repository, key, key_type)
+                .await
+                .unwrap_or_else(|err| panic!("boundary {boundary} lies on the descent: {err:?}"));
+            assert_eq!(repaired, signatures[550 - boundary as usize]);
+        }
+
+        let (key, key_type) = step_key(500);
+        let err = mutable_store
+            .load(repository, key, key_type)
+            .await
+            .expect_err("boundary 500 lies above the descent's anchor");
+        assert!(err.is_address_not_found(), "{err:?}");
     }))
     .await;
 }

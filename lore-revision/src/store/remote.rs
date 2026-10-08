@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lore_error_set::prelude::*;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_transport::Admin;
 use lore_transport::Connection;
@@ -234,9 +235,10 @@ impl store::ImmutableStore for RemoteImmutableStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        // The remote service tracks durability on its own side; the local-flag bookkeeping that
-        // `durable` controls happens in the local-store leg of a composite copy.
-        _durable: bool,
+        // The remote service decides both for itself: durability is tracked on its own side, and
+        // it owns which of its peers the copy reaches. The local-flag bookkeeping the caller's
+        // behaviour describes happens in the local-store leg of a composite copy.
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         let session = self.session(destination_partition).await?;
         session

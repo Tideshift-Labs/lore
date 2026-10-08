@@ -16,6 +16,7 @@ use lore_storage::concurrency::fragment_permit_count;
 use lore_storage::defragment::*;
 use lore_storage::error::StorageError;
 use lore_storage::fragment_flags::FragmentFlags;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::ImmutableStore;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::Sender;
@@ -976,7 +977,7 @@ mod defragment_integration {
             source_address: Address,
             destination_partition: Partition,
             destination_context: Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), StoreError> {
             self.inner
                 .clone()
@@ -985,7 +986,7 @@ mod defragment_integration {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }

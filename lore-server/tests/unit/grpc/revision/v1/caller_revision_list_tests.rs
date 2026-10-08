@@ -19,7 +19,12 @@ async fn caller_required_revision_lists_preserve_history_without_mutable_backfil
                     mutable.clone(),
                     repository,
                 ));
-                let (branch_id, signatures) = create_branch_with_history(&context, 3).await;
+                // v1 needs latest two bands above the page. Upstream 7b1eeab8 answers a page
+                // whose successor shares latest's band from that band alone, with no descent
+                // and so no backfill. At #5, the #2 page's successor lies below boundary 4,
+                // so the descent from latest seals it and the positive control has a write.
+                let history = if v1 { 5 } else { 3 };
+                let (branch_id, signatures) = create_branch_with_history(&context, history).await;
                 let writes = Arc::new(AtomicUsize::new(0));
                 let spy: Arc<dyn lore_storage::MutableStore> = Arc::new(CountWritesMutableStore {
                     inner: mutable,
@@ -48,9 +53,10 @@ async fn caller_required_revision_lists_preserve_history_without_mutable_backfil
                     .unwrap()
                     .into_inner();
                     assert_eq!(response.items.len(), 2);
+                    // signatures is newest first, so #2 sits two from its end.
                     assert_eq!(
                         Hash::from(response.items[0].signature.as_ref()),
-                        signatures[1]
+                        signatures[signatures.len() - 2]
                     );
                 } else {
                     // v0 starts at #3, not #2. Upstream 4ed62928 seals boundary B only when

@@ -325,7 +325,7 @@ mod rebac_stub_policy_tests {
         out
     }
 
-    /// The baseline binding underlying both known-answer vectors (branch_id =
+    /// The baseline binding underlying both known-answer vectors (`branch_id` =
     /// vector A's 16 non-empty bytes) and every "every field is bound" case.
     fn baseline_binding() -> DirectAuthorizationBinding<'static> {
         DirectAuthorizationBinding {

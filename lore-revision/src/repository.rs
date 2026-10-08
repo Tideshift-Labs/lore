@@ -1440,6 +1440,16 @@ pub const SERVICE: &str = "service";
 pub const DOT_URCIGNORE: &str = ".urcignore";
 pub const DOT_LOREIGNORE: &str = ".loreignore";
 
+/// Whether `name` is the repository's own directory, in any ASCII case.
+///
+/// No node carries such a name: a writer refuses it, a per-node read refuses it, and a walk
+/// skips the node, so content in a revision never stands in for the control directory, on a
+/// filesystem that folds case as much as on one that does not.
+#[inline]
+pub fn is_reserved_node_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(DOT_URC) || name.eq_ignore_ascii_case(DOT_LORE)
+}
+
 pub const SALT_URC: &[u8] = b"urc";
 // We cannot easily change this as it is also used on server to create
 // the mutable keys - it would lose track of existing repos in production

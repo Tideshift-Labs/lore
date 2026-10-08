@@ -1800,7 +1800,7 @@ async fn d3_a_copy_racing_the_last_association_obliterate_never_dangles_across_t
                 source_address,
                 destination_partition,
                 destination_context,
-                false,
+                lore_storage::immutable_store::CopyBehavior::default(),
             ),
             store_b.clone().obliterate(
                 source_partition,

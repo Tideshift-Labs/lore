@@ -20,20 +20,25 @@ mod request {
         let (_, source_address, _) = fragment::generate_random();
         let destination_context = random::<Context>();
 
+        // Each flag round trips on its own as well as alongside the other, so one sharing the
+        // other's byte cannot stand in for it.
         for durable in [false, true] {
-            let input = ImmutableCopy {
-                header: ReplicationHeader {
-                    correlation_id: Uuid::new_v4(),
-                    repository: destination_repository,
-                },
-                source_partition,
-                source_address,
-                destination_context,
-                durable,
-            };
-            let bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
-            let output = parse(bytes).expect("parse should succeed");
-            assert_eq!(input, output);
+            for do_not_replicate in [false, true] {
+                let input = ImmutableCopy {
+                    header: ReplicationHeader {
+                        correlation_id: Uuid::new_v4(),
+                        repository: destination_repository,
+                    },
+                    source_partition,
+                    source_address,
+                    destination_context,
+                    durable,
+                    do_not_replicate,
+                };
+                let bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
+                let output = parse(bytes).expect("parse should succeed");
+                assert_eq!(input, output);
+            }
         }
     }
 
@@ -48,6 +53,7 @@ mod request {
             source_address: fragment::generate_random().1,
             destination_context: random::<Context>(),
             durable: false,
+            do_not_replicate: false,
         };
         let bytes = collapse_bytes_without_header(&input.to_quic_chunks());
         let output = parse(bytes.slice(0..bytes.len() - 1)).expect_err("parse should fail");

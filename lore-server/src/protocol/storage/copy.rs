@@ -11,6 +11,7 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
+use lore_storage::immutable_store::CopyBehavior;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
@@ -105,7 +106,10 @@ pub async fn handle_copy(
                     source_address,
                     destination_repository,
                     destination_context,
-                    true,
+                    CopyBehavior {
+                        durable: true,
+                        do_not_replicate: false,
+                    },
                 )
                 .await
             {

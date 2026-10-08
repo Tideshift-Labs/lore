@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+pub mod chunking;
 pub mod client;
 pub mod command_header;
 pub mod net_runtime;

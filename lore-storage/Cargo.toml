@@ -62,3 +62,6 @@ windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }
+
+[lints]
+workspace = true

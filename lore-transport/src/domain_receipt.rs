@@ -39,7 +39,7 @@ pub struct DomainReceiptQuery {
     /// The authenticated principal's receipt namespace. Selects which namespace is searched; it
     /// is deliberately not part of the canonical fingerprint.
     pub initiating_principal_namespace: Bytes,
-    /// The attempt's own UUIDv7. Reused for this lookup and never for a mutation replay.
+    /// The attempt's own `UUIDv7`. Reused for this lookup and never for a mutation replay.
     pub operation_id: Uuid,
     /// The canonical method name the attempt was dispatched under.
     pub method: String,

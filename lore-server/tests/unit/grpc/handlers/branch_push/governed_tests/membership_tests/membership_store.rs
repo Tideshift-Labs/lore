@@ -238,7 +238,7 @@ impl ImmutableStore for MembershipStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: lore_storage::immutable_store::CopyBehavior,
     ) -> Result<(), StoreError> {
         self.inner
             .clone()
@@ -247,7 +247,7 @@ impl ImmutableStore for MembershipStore {
                 source_address,
                 destination_partition,
                 destination_context,
-                durable,
+                behavior,
             )
             .await
     }

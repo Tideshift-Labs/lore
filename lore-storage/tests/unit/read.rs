@@ -22,6 +22,7 @@ use lore_storage::errors::NoRemote;
 use lore_storage::fragment_flags::FragmentFlags;
 use lore_storage::gc_event::GcEventSinkRef;
 use lore_storage::hash;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::local::immutable_store::ImmutableStoreSettings;
@@ -163,7 +164,7 @@ impl ImmutableStore for GetFailingStore {
     }
 
     async fn stop_gc(self: Arc<Self>, terminate: bool) {
-        self.inner.clone().stop_gc(terminate).await
+        self.inner.clone().stop_gc(terminate).await;
     }
 
     fn max_query_batch(&self) -> Option<usize> {
@@ -184,7 +185,7 @@ impl ImmutableStore for GetFailingStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         self.inner
             .clone()
@@ -193,7 +194,7 @@ impl ImmutableStore for GetFailingStore {
                 source_address,
                 destination_partition,
                 destination_context,
-                durable,
+                behavior,
             )
             .await
     }
@@ -536,7 +537,7 @@ impl ImmutableStore for CountingReadStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         self.inner
             .clone()
@@ -545,7 +546,7 @@ impl ImmutableStore for CountingReadStore {
                 source_address,
                 destination_partition,
                 destination_context,
-                durable,
+                behavior,
             )
             .await
     }

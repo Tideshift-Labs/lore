@@ -29,6 +29,7 @@ use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::change::NodeChangeState;
+use crate::errors::NodeNotFound;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
@@ -43,11 +44,10 @@ use crate::lore_drain_tasks;
 use crate::lore_trace;
 use crate::node::*;
 use crate::repository::BASE_SUFFIX;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::TEMP_FILE_EXTENSION;
 use crate::repository::THEIRS_SUFFIX;
+use crate::repository::is_reserved_node_name;
 use crate::state::ChangeSender;
 use crate::state::diff::NodeMatch;
 use crate::state::diff::get_filtered_node_and_path;
@@ -68,6 +68,9 @@ async fn ensure_scan_dir_chain(
 ) -> Result<NodeID, StateError> {
     let mut current_node = ROOT_NODE;
     for segment in path.split('/').filter(|s| !s.is_empty()) {
+        if is_reserved_node_name(segment) {
+            return Err(NodeNotFound.into());
+        }
         let name_hash = crate::hash::hash_string(segment);
         if let Ok(child_id) = state
             .find_subnode(repository.clone(), current_node, name_hash)
@@ -117,7 +120,8 @@ async fn diff_filesystem_subtree_impl(
                 .await?;
                 ctx.from.node = entry_node;
             }
-            diff_filesystem_directory(ctx, *listing, changes).await
+            // boxed: the directory future is over the large-future limit on Windows
+            Box::pin(diff_filesystem_directory(ctx, *listing, changes)).await
         }
         crate::fs::os::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
@@ -141,6 +145,7 @@ async fn diff_filesystem_subtree_impl(
                 ctx.filter_mode,
                 ctx.intent,
                 changes,
+                &ctx.link_mounts,
             )
             .await
         }
@@ -908,6 +913,16 @@ async fn emit_single_delete(
     .await
 }
 
+/// A mount stays absent while the linked repository cannot be read, so the working tree not
+/// holding one says nothing about the link. `link remove` takes a link out of the tree.
+fn keeps_absent_link(node: &Node, path: &RelativePath) -> bool {
+    if !node.is_link() {
+        return false;
+    }
+    lore_trace!("Link mount {path} is absent from the filesystem, keeping the link");
+    true
+}
+
 /// Emit the buffered ancestor-directory deletes, outermost first, and clear the
 /// buffer so sibling subtrees don't re-emit them. When the intent marks dirty each
 /// directory is marked `DirtyDelete` first so a later bare `stage` (which walks
@@ -956,6 +971,8 @@ async fn flush_pending_dir_deletes(
 /// leaves out too: an excluded child is descended rather than skipped, and reported along
 /// with the rest of the descent. Narrowing those reports to the in-view set is the
 /// view-filtered delete work, which needs a walk that marks without reporting.
+///
+/// A directory holding a link is never buffered: the link stays, so the directory does too.
 #[allow(clippy::too_many_arguments)]
 async fn emit_filesystem_subtree_deletes(
     state: Arc<State>,
@@ -968,9 +985,14 @@ async fn emit_filesystem_subtree_deletes(
     intent: FilesystemDiffIntent,
     changes: &ChangeSender,
     pending: &mut Vec<(NodeID, RelativePath)>,
+    link_mounts: &[LinkMountInfo],
 ) -> Result<bool, StateError> {
     // Caller guarantees `node` is not filter-excluded.
-    if node.is_file() || node.is_link() {
+    if keeps_absent_link(node, path) {
+        return Ok(false);
+    }
+
+    if node.is_file() {
         flush_pending_dir_deletes(&state, &repository, changes, pending, intent).await?;
         if intent.marks_dirty() {
             mark_settled(&state, &repository, node_id, SettledAction::Delete, intent).await?;
@@ -979,7 +1001,10 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    pending.push((node_id, path.clone()));
+    let holds_link = LinkMountInfo::any_under(link_mounts, path);
+    if !holds_link {
+        pending.push((node_id, path.clone()));
+    }
     let depth = pending.len();
 
     let mut children =
@@ -1011,6 +1036,7 @@ async fn emit_filesystem_subtree_deletes(
             intent,
             changes,
             pending,
+            link_mounts,
         ))
         .await?
         {
@@ -1032,7 +1058,9 @@ async fn emit_filesystem_subtree_deletes(
     }
 
     // Nothing under this directory materialized: drop its buffered entry.
-    pending.truncate(depth - 1);
+    if !holds_link {
+        pending.truncate(depth - 1);
+    }
     Ok(false)
 }
 
@@ -1191,7 +1219,7 @@ async fn diff_filesystem_directory_walk(
         else {
             continue;
         };
-        if item.name == DOT_URC || item.name == DOT_LORE {
+        if is_reserved_node_name(item.name.as_str()) {
             continue;
         }
         if staging && staging_ignores_name(item.name.as_str()) {
@@ -1518,6 +1546,13 @@ async fn diff_filesystem_linked_directory(
         .filter
         .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
         .0;
+    // Both sides of the crossing, where the link is pinned to a different revision on each:
+    // the mounts are spelled from the from-side path the walk below compares against.
+    let mut linked_trees = vec![(&state_from, &link_from, subnode_from)];
+    if subnode_current != subnode_from || !Arc::ptr_eq(&state_current, &state_from) {
+        linked_trees.push((&state_current, &link_current, subnode_current));
+    }
+    let linked_mounts = collect_link_mounts(&linked_trees, &from_path).await?;
     diff_filesystem_subtree_dispatch(
         FilesystemDiffContext {
             operation: ctx.operation.clone(),
@@ -1539,9 +1574,7 @@ async fn diff_filesystem_linked_directory(
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
             layer_mounts: ctx.layer_mounts.clone(),
-            // Crossing into the linked state; parent's link mounts
-            // are paths in the parent tree and do not apply here.
-            link_mounts: Arc::new(vec![]),
+            link_mounts: Arc::new(linked_mounts),
         },
         tasks,
         changes,
@@ -1874,6 +1907,10 @@ async fn diff_filesystem_missing_nodes(
             }
         }
 
+        if keeps_absent_link(&from_node.node, &from_node.path) {
+            continue;
+        }
+
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
         // wrote to disk (see emit_filesystem_subtree_deletes).
@@ -1890,6 +1927,7 @@ async fn diff_filesystem_missing_nodes(
                 ctx.intent,
                 changes,
                 &mut pending,
+                &ctx.link_mounts,
             )
             .await?;
             continue;
@@ -2021,7 +2059,7 @@ async fn diff_filesystem_new_entries(
             if ctx
                 .link_mounts
                 .iter()
-                .any(|m| m.target_path == child_file_path.as_str())
+                .any(|m| m.target_path.as_str() == child_file_path.as_str())
             {
                 lore_trace!(
                     "Filesystem path {child_file_path} matches a link in the current state, skipping link-internal content"
@@ -2036,7 +2074,7 @@ async fn diff_filesystem_new_entries(
             if let Some(mount) = ctx
                 .layer_mounts
                 .iter()
-                .find(|m| m.target_path == child_file_path.as_str())
+                .find(|m| m.target_path.as_str() == child_file_path.as_str())
             {
                 // A staging walk leaves the mount alone: the layer's own tree is staged by
                 // its own walk against its own state, and staging it from here as well
@@ -2410,7 +2448,7 @@ async fn diff_filesystem_single_file(
 }
 
 /// Handle diff when filesystem path doesn't exist.
-/// Everything in state under this path is considered deleted.
+/// Everything in state under this path is considered deleted, bar what a link keeps.
 async fn diff_filesystem_missing(
     from: NodeMapping,
     filesystem_path: RelativePath,
@@ -2418,12 +2456,35 @@ async fn diff_filesystem_missing(
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
     changes: &ChangeSender,
+    link_mounts: &[LinkMountInfo],
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
 
     // Add delete changes for all nodes under the from node
     if from.node.is_valid_node_id() {
         let from_node = from.state.node(from.repository.clone(), from.node).await?;
+
+        if keeps_absent_link(&from_node, &filesystem_path) {
+            return Ok(stats);
+        }
+
+        if LinkMountInfo::any_under(link_mounts, &from.path) {
+            emit_filesystem_subtree_deletes(
+                from.state.clone(),
+                from.repository.clone(),
+                from.node,
+                &from_node,
+                &from.path,
+                states,
+                filter_mode,
+                intent,
+                changes,
+                &mut Vec::new(),
+                link_mounts,
+            )
+            .await?;
+            return Ok(stats);
+        }
 
         lore_trace!(
             "Filesystem path {} does not exist, marking state node {} as deleted",

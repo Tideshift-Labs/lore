@@ -758,6 +758,9 @@ pub struct CompositeStoreSettings {
     pub replica_factory: Option<ReplicaFactorySettings>,
     pub cache_metadata: Option<bool>,
     pub cache_metadata_semaphore_size: Option<usize>,
+    /// Whether a copy is recorded in the local store and at the write replicas as well as in the
+    /// durable store. Absent enables it.
+    pub record_copy_out_of_band: Option<bool>,
     pub durable_store_delay_ms: Option<u64>,
 }
 

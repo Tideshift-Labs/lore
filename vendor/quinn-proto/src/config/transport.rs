@@ -176,6 +176,9 @@ impl TransportConfig {
 
     /// Upper bound on the RTT estimate
     ///
+    /// LORE: not upstream. Re-apply this, the `max_rtt` field, its default and its `Debug` entry
+    /// when re-vendoring.
+    ///
     /// Clamps individual RTT samples before they enter the smoothed RTT estimator, preventing a
     /// single delayed ACK (e.g. from runtime starvation or socket buffer delays) from poisoning
     /// the estimate. A poisoned RTT inflates PTO, loss detection thresholds, and idle timeout,

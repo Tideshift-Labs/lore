@@ -22,6 +22,7 @@ use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::StoreRepositoryStats;
 use lore_storage::errors::NotSupported;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::observe::Observe;
 use lore_transport::ProtocolError;
@@ -525,7 +526,7 @@ where
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         let meta = ServiceRequestMeta {
             client_epoch: self.client_container.epoch(),
@@ -546,7 +547,12 @@ where
                 source_partition,
                 source_address,
                 destination_context,
-                durable,
+                durable: behavior.durable,
+                // The remote server may be running composite store with write replication enabled.
+                // We want to avoid scenarios where the recipient server replicates to its peers
+                // which may include this region that drove the request. Our store should control
+                // the replication behaviour as we were the first recipient of the payload
+                do_not_replicate: true,
             };
             let client = store.client_container.client().read().await;
             client.copy(request).await

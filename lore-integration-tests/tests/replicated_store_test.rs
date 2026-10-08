@@ -443,7 +443,7 @@ mod replicated_store_tests {
         }
     }
 
-    /// StorageServiceV4 must preserve a backing store's typed ambiguity for both mutable wire
+    /// `StorageServiceV4` must preserve a backing store's typed ambiguity for both mutable wire
     /// operations. An answered `OutcomeUnknown` is a final typed result, never retry authority.
     #[tokio::test]
     async fn mutable_backing_outcome_unknown_crosses_the_real_wire_once_per_operation() {

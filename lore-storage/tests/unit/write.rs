@@ -12,6 +12,7 @@ use lore_storage::Hash;
 use lore_storage::content::ContentSource;
 use lore_storage::error::StorageError;
 use lore_storage::fragment_flags::FragmentFlags;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::ImmutableStore;
 use lore_storage::immutable_store::StoreError;
 use lore_storage::immutable_store::query_one;
@@ -536,7 +537,7 @@ impl ImmutableStore for FailingPutStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         self.inner
             .clone()
@@ -545,7 +546,7 @@ impl ImmutableStore for FailingPutStore {
                 source_address,
                 destination_partition,
                 destination_context,
-                durable,
+                behavior,
             )
             .await
     }
@@ -838,7 +839,7 @@ impl ImmutableStore for DelayingPutStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         self.inner
             .clone()
@@ -847,7 +848,7 @@ impl ImmutableStore for DelayingPutStore {
                 source_address,
                 destination_partition,
                 destination_context,
-                durable,
+                behavior,
             )
             .await
     }
@@ -1113,7 +1114,7 @@ impl ImmutableStore for CountingPutStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         self.inner
             .clone()
@@ -1122,7 +1123,7 @@ impl ImmutableStore for CountingPutStore {
                 source_address,
                 destination_partition,
                 destination_context,
-                durable,
+                behavior,
             )
             .await
     }

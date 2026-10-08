@@ -99,10 +99,11 @@ pub enum Command {
     ImmutableLocalGetMetadata = 16,
     ImmutableQuery = 17,
     ImmutableLocalQuery = 18,
-    ImmutableCopy = 19,
+    // 19 - old ImmutableCopy with only 1 flag that isn't backward compatible
     /// Announces the client's user agent; see
     /// [`send_client_identify`](lore_transport::quic::client::send_client_identify).
     ClientIdentify = 20,
+    ImmutableCopy = 21,
 }
 
 impl From<Command> for QuicOpCode {

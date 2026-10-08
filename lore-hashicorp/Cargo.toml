@@ -25,3 +25,6 @@ mockall = { workspace = true }
 rand = { workspace = true }
 temp-env = { workspace = true }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

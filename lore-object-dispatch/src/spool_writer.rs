@@ -1034,6 +1034,8 @@ mod platform {
         ) -> Result<SpoolWriteReceipt, SpoolWriteError> {
             Err(SpoolWriteError::UnsupportedPlatform)
         }
+        // Keeps the Linux writer's signature, which uses self.
+        #[allow(clippy::unused_self)]
         pub(crate) fn purge_put_body(
             &self,
             _layout: &SpoolLayout,

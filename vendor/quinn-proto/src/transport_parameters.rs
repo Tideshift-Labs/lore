@@ -475,9 +475,7 @@ impl TransportParameters {
                     0 => params.grease_quic_bit = true,
                     _ => return Err(Error::Malformed),
                 },
-                TransportParameterId::MinAckDelayDraft07 => {
-                    params.min_ack_delay = Some(r.get()?)
-                }
+                TransportParameterId::MinAckDelayDraft07 => params.min_ack_delay = Some(r.get()?),
                 _ => {
                     macro_rules! parse {
                         {$($(#[$doc:meta])* $name:ident ($id:ident) = $default:expr,)*} => {

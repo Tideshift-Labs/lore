@@ -18,11 +18,13 @@ mod tests {
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
     use lore_revision::node::Node;
+    use lore_revision::node::NodeBlock;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::ROOT_NODE;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
     use lore_revision::state::State;
+    use lore_storage::hash::hash_string;
     use zerocopy::FromBytes;
 
     include!("helper.rs");
@@ -985,6 +987,114 @@ mod tests {
                         "temp.txt should not exist after reverted add"
                     );
                 }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A tree written before the names were reserved can hold a node named for the repository's
+    /// own directory. A dirty path naming it, in any case, is dropped at the door, so files on
+    /// disk beneath it are never marked under that node: the walk would otherwise reach the node
+    /// by name hash, which folds case.
+    #[tokio::test]
+    async fn dirty_ignores_a_path_through_a_planted_reserved_name() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let path = fixture.path.clone();
+
+                test_file_write(&path.join("base.txt"), b"base");
+                let state = test_commit_tree(&fixture, "Initial").await;
+
+                // Plant the node in a staged tree over the revision, as an older writer could.
+                let planted = state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("xurc"),
+                            ..Default::default()
+                        },
+                        "xurc",
+                    )
+                    .await
+                    .expect("adding the placeholder must succeed");
+                let block_index = NodeBlock::index(planted);
+                let block = state
+                    .block_with_nametable(repository.clone(), block_index)
+                    .await
+                    .expect("the block must read back");
+                {
+                    let mut writer = block.write();
+                    let node = writer.node(Node::index(planted));
+                    let (offset, length) = (node.name_offset, node.name_length);
+                    node.name_hash = hash_string(".URC");
+                    let (offset, length) = writer
+                        .node_name_store_unchecked(".URC", offset, length)
+                        .expect("the unchecked store must accept the name");
+                    let node = writer.node(Node::index(planted));
+                    node.name_offset = offset;
+                    node.name_length = length;
+                    writer.mark_dirty();
+                }
+                state.block_modified(block, block_index);
+                state.set_parent_self(state.revision());
+                state.set_revision_number(0);
+                let token = repository
+                    .try_write_token()
+                    .expect("the fixture holds the write token");
+                let staged = state
+                    .serialize(repository.clone(), token)
+                    .await
+                    .expect("serializing the planted tree must succeed");
+                lore_revision::instance::store_staged_anchor(&repository, staged)
+                    .await
+                    .expect("storing the staged anchor must succeed");
+
+                std::fs::create_dir(path.join(".URC")).expect("Create directory failed");
+                test_file_write(&path.join(".URC").join("planted.txt"), b"planted");
+
+                let signature = file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![LoreString::from(
+                        path.join(".URC").to_string_lossy().as_ref(),
+                    )]),
+                )
+                .await
+                .expect("a dirty path through the planted node must be ignored, not fail");
+                assert_eq!(
+                    signature, staged,
+                    "ignoring the path must leave the staged tree as it was"
+                );
+
+                let (_, state_staged, _) =
+                    State::deserialize_current_and_staged(repository.clone())
+                        .await
+                        .expect("Deserialize failed");
+                let state_staged = state_staged.expect("the planted staged tree must remain");
+                let planted_hash = hash_string(".URC");
+                let (planted, _) = state_staged
+                    .node_children_with_name_hash(repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("the root's children must read")
+                    .into_iter()
+                    .find(|(_, name_hash)| *name_hash == planted_hash)
+                    .expect("the planted node must still be in the tree");
+                let beneath = state_staged
+                    .node_children(repository.clone(), planted)
+                    .await
+                    .expect("the planted node's children must read");
+                assert!(
+                    beneath.is_empty(),
+                    "nothing may be marked beneath the planted node, got {beneath:?}"
+                );
             }))
             .await
             .expect("Test task failed");

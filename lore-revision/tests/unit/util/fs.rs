@@ -3,6 +3,7 @@
 // Fixtures build filesystem state directly; what these test is how the helpers read it.
 #![allow(clippy::disallowed_methods)]
 
+#[cfg(target_os = "linux")]
 use std::fs::Metadata;
 use std::path::Path;
 use std::sync::Arc;

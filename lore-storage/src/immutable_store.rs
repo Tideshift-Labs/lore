@@ -630,18 +630,15 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Every store supporting `copy` supports both. The exact form is the one that can be answered
     /// with a keyed read, so a caller holding a context passes it.
     ///
-    /// `durable` controls the destination's `PayloadStoredDurable` flag: pass `true` only when
-    /// the caller has independent confirmation that the destination tuple is durably stored
-    /// (typically a successful remote round-trip). The source's own durable flag never
-    /// propagates — durability is a per-(partition, address) property and a local copy of an
-    /// already-durable source does not make the new destination tuple durable.
+    /// `behavior` carries what the caller knows that the store cannot see for itself; see
+    /// [`CopyBehavior`].
     async fn copy(
         self: Arc<Self>,
         source_partition: Partition,
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError>;
 
     fn as_any(self: Arc<Self>) -> Arc<dyn Any + Send + Sync>
@@ -656,4 +653,21 @@ impl Debug for dyn ImmutableStore {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "ImmutableStore")
     }
+}
+
+/// What a caller of [`ImmutableStore::copy`] knows about the copy that the store it asks cannot
+/// establish for itself.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct CopyBehavior {
+    /// Controls the destination's `PayloadStoredDurable` flag: pass `true` only with independent
+    /// confirmation that the destination tuple is durably stored, typically a successful remote
+    /// round trip. The source's own durable flag never propagates — durability is a
+    /// per-(partition, address) property, so copying an already-durable source does not make the
+    /// destination tuple durable.
+    pub durable: bool,
+    /// Whether the store must keep the copy to itself rather than passing it on to its own write
+    /// replicas. Set by a caller that has already taken responsibility for replicating it, since a
+    /// store fanning out on its own behalf can otherwise send the copy back to the region it came
+    /// from.
+    pub do_not_replicate: bool,
 }

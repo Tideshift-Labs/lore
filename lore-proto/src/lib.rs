@@ -192,7 +192,7 @@ fn domain_validate_fields(
     while offset < raw.len() {
         let key = domain_read_varint(raw, &mut offset)?;
         let tag = u32::try_from(key >> 3)
-            .map_err(|_| tonic::Status::invalid_argument("protobuf field tag overflows u32"))?;
+            .map_err(|_err| tonic::Status::invalid_argument("protobuf field tag overflows u32"))?;
         if tag == 0 || tag > 63 {
             return Err(tonic::Status::invalid_argument(
                 "invalid protobuf field tag",
@@ -224,7 +224,7 @@ fn domain_validate_fields(
                     )));
                 }
                 let length =
-                    usize::try_from(domain_read_varint(raw, &mut offset)?).map_err(|_| {
+                    usize::try_from(domain_read_varint(raw, &mut offset)?).map_err(|_err| {
                         tonic::Status::invalid_argument("protobuf length overflows usize")
                     })?;
                 if length > maximum {
@@ -271,7 +271,7 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 "clock-get request must use the canonical empty frame",
             ));
         }
-        "DomainOperationClockGetRequest" => {}
+        // An empty clock-get frame has no fields to check; the wildcard arm accepts it.
         "DomainOperationPrepareRequest" | "DomainOperationReceiptGetRequest" => {
             let fields = [
                 domain_ld(1, U),
@@ -403,7 +403,7 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 ));
             }
             let request = <lore::domain::v1::DomainOperationProofNamespaceStateGetRequestV1 as prost::Message>::decode(raw)
-                .map_err(|_| tonic::Status::invalid_argument("invalid namespace state request"))?;
+                .map_err(|_err| tonic::Status::invalid_argument("invalid namespace state request"))?;
             if request.protocol_revision != 2
                 || request.org_uuid.len() != U
                 || request.initiating_principal_namespace.is_empty()
@@ -442,7 +442,7 @@ pub fn validate_domain_operation_v2_raw(name: &str, raw: &[u8]) -> Result<(), to
                 ));
             }
             let response = <lore::domain::v1::DomainOperationProofNamespaceStateGetResponseV1 as prost::Message>::decode(raw)
-                .map_err(|_| tonic::Status::invalid_argument("invalid namespace state response"))?;
+                .map_err(|_err| tonic::Status::invalid_argument("invalid namespace state response"))?;
             if response
                 .final_range_set_digest
                 .as_ref()

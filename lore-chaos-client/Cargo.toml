@@ -33,3 +33,6 @@ test-util = []
 
 [dev-dependencies]
 lore-chaos-client = { path = ".", features = ["test-util"] }
+
+[lints]
+workspace = true

@@ -57,3 +57,6 @@ lore-transport = { workspace = true, features = ["test_seams"] }
 # needs a remote that answers. Unifies with the plain `lore-revision` dependency above for
 # `cargo test`, exactly as the `lore-transport` line does.
 lore-revision = { workspace = true, features = ["test_seams"] }
+
+[lints]
+workspace = true

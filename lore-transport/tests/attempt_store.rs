@@ -38,7 +38,7 @@ fn digest(fill: u8) -> Bytes {
 }
 
 /// A distinct, well-formed ownership token. The width is checked on construction now, so a token
-/// has to be exactly OwnershipToken::LEN bytes rather than a readable label.
+/// has to be exactly `OwnershipToken::LEN` bytes rather than a readable label.
 fn token(fill: u8) -> OwnershipToken {
     OwnershipToken::from_wire(&[fill; OwnershipToken::LEN])
         .expect("a token of the declared width is well formed")
@@ -311,7 +311,7 @@ async fn resolve_leaves_lock_ownership_alone_including_the_resolving_attempts_ow
 /// Priority 5: ties on `recorded_at_unix_millis` break on the attempt id, so two reads of an
 /// unchanged store return the same order even when a client clock repeats a millisecond. Two
 /// records are given the identical timestamp; the expected order is derived from the ids'
-/// natural (UUIDv7) ordering, not from insertion order, and re-read to prove it is stable.
+/// natural (`UUIDv7`) ordering, not from insertion order, and re-read to prove it is stable.
 #[tokio::test]
 async fn unresolved_breaks_a_recorded_at_tie_on_attempt_id_and_is_stable_across_reads() {
     let store = VolatileAttemptStore::new();

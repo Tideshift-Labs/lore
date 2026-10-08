@@ -42,6 +42,7 @@ use lore_storage::MutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 use opentelemetry_sdk::resource::ResourceDetector;
 use tokio::runtime::Handle;
 use tokio::sync::broadcast::Receiver;
@@ -146,7 +147,7 @@ impl ImmutableStore for MockImmutableStore {
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(StoreError::internal("Copy not supported by this store"))
     }

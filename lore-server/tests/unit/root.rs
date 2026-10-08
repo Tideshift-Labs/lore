@@ -15,6 +15,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreObliterateStats;
+use lore_storage::immutable_store::CopyBehavior;
 
 /// An `ImmutableStore` that returns `SlowDown` on every operation.
 struct SlowDownImmutableStore;
@@ -107,7 +108,7 @@ impl ImmutableStore for SlowDownImmutableStore {
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(StoreError::from(SlowDown))
     }

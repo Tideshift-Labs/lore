@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub mod exchange;
+pub mod oidc;
 pub mod token_only;
 pub mod ucs_auth;
 
@@ -24,6 +25,21 @@ fn register_builtin() {
             let _ = user_service::add(scheme, ucs_auth.clone());
         }
     });
+}
+
+/// Whether `url` is a plain-http URL naming a loopback host, where the traffic never leaves
+/// the machine. A URL carrying a username or password is refused, so
+/// `http://localhost:pass@evil.com` cannot pass.
+pub(crate) fn is_loopback_http_url(url: &url::Url) -> bool {
+    if url.scheme() != "http" || !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// Extracts the scheme from an auth URL (the part before `://`).

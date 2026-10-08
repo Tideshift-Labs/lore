@@ -10,6 +10,7 @@ use lore_base::types::Context;
 use lore_base::types::Partition;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::CORRELATION_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
@@ -29,7 +30,13 @@ pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>()
     + size_of::<Partition>()
     + size_of::<Address>()
     + size_of::<Context>()
-    + 1; // durable flag
+    + 1; // behavior flags
+
+/// Positions of the behavior flags in the request's final byte. A peer that sets a bit this
+/// build does not know is answered as though it were clear, since the opcode is what a peer
+/// asking for behavior we cannot honour has to change.
+const FLAG_DURABLE: u8 = 0b1;
+const FLAG_DO_NOT_REPLICATE: u8 = 0b10;
 
 /// `header.repository` carries the destination partition.
 #[derive(Clone, Debug, PartialEq)]
@@ -39,17 +46,25 @@ pub struct ImmutableCopy {
     pub source_address: Address,
     pub destination_context: Context,
     pub durable: bool,
+    pub do_not_replicate: bool,
 }
 
 impl ImmutableCopy {
     pub fn to_quic_chunks(self) -> [Bytes; 6] {
+        let mut flags = 0;
+        if self.durable {
+            flags |= FLAG_DURABLE;
+        }
+        if self.do_not_replicate {
+            flags |= FLAG_DO_NOT_REPLICATE;
+        }
         [
             Bytes::default(), // command header placeholder
             Bytes::from_owner(self.header),
             Bytes::copy_from_slice(self.source_partition.as_bytes()),
             Bytes::from_owner(self.source_address),
             Bytes::copy_from_slice(self.destination_context.as_bytes()),
-            Bytes::copy_from_slice(&[if self.durable { 1u8 } else { 0u8 }]),
+            Bytes::copy_from_slice(&[flags]),
         ]
     }
 }
@@ -63,11 +78,13 @@ pub fn parse(mut bytes: Bytes) -> Result<ImmutableCopy, MessageParseError> {
     let source_partition: Partition = Context::from(bytes.split_to(size_of::<Context>())).into();
     let source_address: Address = bytes.split_to(size_of::<Address>()).into();
     let destination_context: Context = bytes.split_to(size_of::<Context>()).into();
-    let durable = {
-        let flag = bytes[0];
+    let flags = {
+        let flags = bytes[0];
         bytes.advance(1);
-        flag != 0
+        flags
     };
+    let durable = flags & FLAG_DURABLE != 0;
+    let do_not_replicate = flags & FLAG_DO_NOT_REPLICATE != 0;
 
     Ok(ImmutableCopy {
         header,
@@ -75,6 +92,7 @@ pub fn parse(mut bytes: Bytes) -> Result<ImmutableCopy, MessageParseError> {
         source_address,
         destination_context,
         durable,
+        do_not_replicate,
     })
 }
 
@@ -121,7 +139,10 @@ impl RequestHandler for ImmutableCopyHandler {
                         self.request.source_address,
                         self.request.header.repository.into(),
                         self.request.destination_context,
-                        self.request.durable,
+                        CopyBehavior {
+                            durable: self.request.durable,
+                            do_not_replicate: self.request.do_not_replicate,
+                        },
                     )
                     .await
             })

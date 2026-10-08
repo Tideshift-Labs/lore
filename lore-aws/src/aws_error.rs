@@ -43,7 +43,7 @@ const RETRYABLE_STATUS_CODES: &[u16] = &[429, 500, 502, 503, 504];
 /// Service error codes that mean "shedding load, back off and retry" rather
 /// than "this request is wrong".
 ///
-/// Covers DynamoDB's throttle codes and the S3-style `SlowDown`, so one
+/// Covers `DynamoDB`'s throttle codes and the S3-style `SlowDown`, so one
 /// classifier serves both stores as well as the S3-compatible endpoints a
 /// deployment may point at.
 const THROTTLE_ERROR_CODES: &[&str] = &[
@@ -88,6 +88,8 @@ fn is_throttle_code(code: &str) -> bool {
 /// than treating this predicate as permission to retry.
 ///
 /// [`SlowDown`]: lore_base::error::SlowDown
+// Arms that share an answer stay apart so each carries its own reason.
+#[allow(clippy::match_same_arms)]
 pub fn is_retryable_sdk_error<E>(error: &SdkError<E, HttpResponse>) -> bool
 where
     E: ProvideErrorMetadata,
@@ -150,7 +152,7 @@ mod tests {
         )
     }
 
-    /// Builds a `GetItemError` whose `code()` matches the DynamoDB exception
+    /// Builds a `GetItemError` whose `code()` matches the `DynamoDB` exception
     /// name, the way a real deserialized service error would.
     fn coded(error_ctor: impl FnOnce(ErrorMetadata) -> GetItemError, code: &str) -> GetItemError {
         error_ctor(ErrorMetadata::builder().code(code).build())

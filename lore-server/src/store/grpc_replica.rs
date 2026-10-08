@@ -29,6 +29,7 @@ use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
 use lore_storage::StoreRepositoryStats;
 use lore_storage::errors::NotSupported;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
@@ -668,7 +669,7 @@ impl ImmutableStore for GrpcReplica {
         _source_address: Address,
         _destination_partition: Partition,
         _destination_context: Context,
-        _durable: bool,
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         Err(StoreError::internal("copy not supported on grpc replica"))
     }

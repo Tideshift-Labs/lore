@@ -1,7 +1,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Proves the `lore-attempt-id` header actually reaches a real server over the wire (WP-120's
-//! AttemptStore seam), rather than trusting that a `tonic` interceptor runs inside a
+//! `AttemptStore` seam), rather than trusting that a `tonic` interceptor runs inside a
 //! `tokio::task_local!` scope just because it compiles. Every claim here is checked against a
 //! real in-process `tonic` server, following `storage_client.rs`'s test convention -- no mock.
 //!

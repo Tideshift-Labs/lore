@@ -51,7 +51,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.10.1-nightly"
+#define LORE_INTERFACE_VERSION "0.10.2-nightly"
 
 // The status an operation reports when a mutation was dispatched and its outcome is not known
 // (WP-120).

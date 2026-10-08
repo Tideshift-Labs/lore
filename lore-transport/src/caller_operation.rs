@@ -47,7 +47,7 @@ pub fn recovery_dial_url(endpoint: &str) -> Result<String, ProtocolError> {
     if authority.is_empty() || !path.is_empty() {
         return Err(invalid());
     }
-    let url = url::Url::parse(endpoint).map_err(|_| invalid())?;
+    let url = url::Url::parse(endpoint).map_err(|_err| invalid())?;
     let scheme = match url.scheme() {
         "http" | "grpc" => "grpc",
         "https" | "grpcs" => "grpcs",
@@ -115,7 +115,7 @@ pub async fn selected_caller_namespace(
         .await;
     let authorization = crate::grpc::authorization_snapshot(&auth);
     let claims = lore_credential::insecure_decode_token(&authorization)
-        .map_err(|_| ProtocolError::internal("selected credential namespace is unavailable"))?
+        .map_err(|_err| ProtocolError::internal("selected credential namespace is unavailable"))?
         .claims;
     if claims.issuer.is_empty() || claims.user_id.is_empty() {
         return Err(ProtocolError::internal(
@@ -145,7 +145,7 @@ pub(crate) fn current_caller_recovery() -> Option<CallerRecoveryContext> {
 #[lore_macro::test_pub]
 pub(crate) fn canonical_endpoint(endpoint: &str) -> Result<String, ProtocolError> {
     let mut url = url::Url::parse(endpoint)
-        .map_err(|_| ProtocolError::internal("invalid managed endpoint"))?;
+        .map_err(|_err| ProtocolError::internal("invalid managed endpoint"))?;
     let _ = url.set_username("");
     let _ = url.set_password(None);
     url.set_query(None);
@@ -287,7 +287,9 @@ pub(crate) async fn record(
     authorization: &str,
 ) -> Result<(), ProtocolError> {
     let claims = lore_credential::insecure_decode_token(authorization)
-        .map_err(|_| ProtocolError::internal("managed dispatch cannot bind credential namespace"))?
+        .map_err(|_err| {
+            ProtocolError::internal("managed dispatch cannot bind credential namespace")
+        })?
         .claims;
     if endpoint.is_empty() || claims.issuer.is_empty() || claims.user_id.is_empty() {
         return Err(ProtocolError::internal(
@@ -361,7 +363,7 @@ pub(crate) async fn settle<T>(
         .attempts
         .resolve(&attempt, resolution)
         .await
-        .map_err(|_| crate::outcome::outcome_unknown("journal settlement", &attempt))
+        .map_err(|_err| crate::outcome::outcome_unknown("journal settlement", &attempt))
 }
 
 /// The request producer supplies canonical nonsecret intent; no interceptor manufactures it.

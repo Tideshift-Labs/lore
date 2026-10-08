@@ -50,3 +50,6 @@ lore-base = { workspace = true }
 # used by the deadline-shift admission tests. Only sound for a path with no
 # real cross-runtime wait — see the fast-path test's own comment.
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

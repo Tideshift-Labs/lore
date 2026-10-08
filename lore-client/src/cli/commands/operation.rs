@@ -172,7 +172,7 @@ where
             .filter(|parent| !parent.complete)
         {
             let id = Uuid::parse_str(&parent.id)
-                .map_err(|_| lore_transport::ProtocolError::internal("invalid parent UUID"))?;
+                .map_err(|_err| lore_transport::ProtocolError::internal("invalid parent UUID"))?;
             if let Err(error) = store.reconcile_parent(id).await {
                 blockers.push(format!("{source}: {} remains blocked: {error}", parent.id));
             }

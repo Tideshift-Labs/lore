@@ -241,7 +241,7 @@ mod tests {
             source_address: lore_storage::Address,
             destination_partition: lore_storage::Partition,
             destination_context: lore_storage::Context,
-            durable: bool,
+            behavior: lore_storage::immutable_store::CopyBehavior,
         ) -> Result<(), lore_storage::StoreError> {
             self.inner
                 .clone()
@@ -250,7 +250,7 @@ mod tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }

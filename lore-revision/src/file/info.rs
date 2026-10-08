@@ -38,9 +38,8 @@ use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeID;
 use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
-use crate::repository::DOT_LORE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::revision;
 use crate::state;
 use crate::state::NodeComparison;
@@ -572,7 +571,7 @@ async fn calculate_local_filtered_size_hash(
 
 /// Whether `path` names the repository's own directory, which no walk measures or descends into.
 fn is_dot_directory(path: &RelativePath) -> bool {
-    path.as_str() == DOT_URC || path.as_str() == DOT_LORE
+    is_reserved_node_name(path.as_str())
 }
 
 /// What the file at `path` adds to the local size, which is nothing where the repository's own
@@ -775,12 +774,15 @@ fn calculate_filtered_size_recurse(
             }
             let sibling = child_node.sibling();
             lore_spawn!(filtered_size_tasks, async move {
-                let name = state
-                    .node_name_ref(repository.clone(), child)
+                let Some(name) = state
+                    .node_name_ref_or_skip(repository.clone(), child)
                     .await
                     .forward::<InfoError>(
                         "Failed to calculate filtered size, encountered an invalid node",
-                    )?;
+                    )?
+                else {
+                    return Ok(0);
+                };
                 let relative_path = relative_path.push_into_buf(name).freeze();
                 calculate_filtered_size_recurse(
                     repository,

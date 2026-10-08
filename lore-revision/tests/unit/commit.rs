@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 mod operation_tests;
 mod statistics_level_tests;
+mod walk_tests;
 
 use std::collections::HashMap;
 use std::sync::Arc;

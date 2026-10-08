@@ -124,3 +124,6 @@ tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 lore-object-dispatch = { path = "../lore-object-dispatch" }
 toml = { workspace = true }
+
+[lints]
+workspace = true

@@ -31,6 +31,7 @@ use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -148,8 +149,21 @@ pub(crate) async fn dirty_relative_paths(
 pub(crate) async fn dirty_relative_paths_in_operation(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
-    paths: Vec<RelativePath>,
+    mut paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
+    // The walk reaches a node by name hash, which folds case, so a path through the repository's
+    // own directory is dropped here rather than resolved to a node a revision holds by that name.
+    let mut index = 0;
+    while index < paths.len() {
+        if paths[index].as_str().split('/').any(is_reserved_node_name) {
+            let path = paths.remove(index);
+            emit_path_ignore(path.as_str()).await;
+            lore_debug!("Ignore dot directory {}", path.as_str());
+        } else {
+            index += 1;
+        }
+    }
+
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -807,11 +821,18 @@ async fn dirty_delete(
                 .node(repository.clone(), child_node_id)
                 .await
                 .forward::<DirtyError>("Failed deserializing state node block")?;
+            child_node
+                .walk_step(child_node_id, node_id, &mut cycle)
+                .forward::<DirtyError>("Invalid node hierarchy in dirty delete walk")?;
+            child_node_iter = child_node.sibling();
 
-            let child_name = state
-                .node_name_clone(repository.clone(), child_node_id)
+            let Some(child_name) = state
+                .node_name_clone_or_skip(repository.clone(), child_node_id)
                 .await
-                .forward::<DirtyError>("Failed to get child name")?;
+                .forward::<DirtyError>("Failed to get child name")?
+            else {
+                continue;
+            };
             let child_path = path.push_into_buf(&child_name).freeze();
 
             let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
@@ -837,11 +858,6 @@ async fn dirty_delete(
                     child_path.as_str()
                 );
             }
-
-            child_node
-                .walk_step(child_node_id, node_id, &mut cycle)
-                .forward::<DirtyError>("Invalid node hierarchy in dirty delete walk")?;
-            child_node_iter = child_node.sibling();
         }
     }
 
@@ -1042,6 +1058,9 @@ fn dirty_directory<'a>(
         let force = execution_context().globals().force();
         while let Some(entry) = entries.next().await {
             let entry = entry.forward::<DirtyError>("Failed to read directory entry")?;
+            if is_reserved_node_name(&entry.name) {
+                continue;
+            }
             if deletes_to_find {
                 present.push(entry.name_hash);
             }
@@ -1079,11 +1098,14 @@ fn dirty_directory<'a>(
                 .forward::<DirtyError>("Failed to get directory children")?;
 
             for &child_id in &children {
-                let child_name = walk
+                let Some(child_name) = walk
                     .state_current
-                    .node_name_clone(walk.repository.clone(), child_id)
+                    .node_name_clone_or_skip(walk.repository.clone(), child_id)
                     .await
-                    .forward::<DirtyError>("Failed to get child name")?;
+                    .forward::<DirtyError>("Failed to get child name")?
+                else {
+                    continue;
+                };
 
                 let name_hash = crate::hash::hash_string(&child_name);
                 if present.binary_search(&name_hash).is_err() {

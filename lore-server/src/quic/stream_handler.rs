@@ -12,7 +12,8 @@ use lore_base::lore_spawn_core;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::runtime::execution_context;
 use lore_transport::quic::QuicServiceError;
-use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
+use lore_transport::quic::chunking::ChunkingMetric;
+use lore_transport::quic::chunking::ParallelChunking;
 use lore_transport::quic::command_header::CommandHeader;
 use quinn::ClosedStream;
 use quinn::ReadError;
@@ -30,7 +31,6 @@ use tracing::info;
 use tracing::info_span;
 use tracing::trace;
 use tracing::warn;
-use zerocopy::IntoBytes;
 
 use crate::protocol::attribute_map::AttributeMap;
 use crate::quic::ProtocolErrorInfo;
@@ -507,171 +507,61 @@ where
         debug!("Handling stream");
 
         let mut stream_metrics = StreamMetricSender::new(self.stream_metrics.clone());
+        let (metrics_sender, metrics_receiver) = std::sync::mpsc::channel();
 
-        let mut request = CommandHeader::default();
-        let mut payload: Option<bytes::BytesMut> = None;
-
-        let header_size = self.service.header_size();
-        let mut request_bytes = [0u8; COMMAND_HEADER_SIZE_V4];
-        let mut request_bytes_read = 0;
-
-        let mut current_offset = 0u64;
-        let mut next_chunk: Option<quinn::Chunk> = None;
-        let mut pending_chunks = vec![];
-        let mut stall_start = Instant::now();
+        let mut chunk_resolver = ParallelChunking::new(
+            self.service.header_size(),
+            self.service.max_chunk_size(),
+            Some(metrics_sender),
+        );
 
         let send = Arc::new(Mutex::new(send));
-
         let limiter = Arc::new(Semaphore::new(self.process_limit));
+        // Kept across the loop so a chunk carrying several requests costs no allocation.
+        let mut messages = Vec::new();
 
         loop {
-            if next_chunk.is_none() {
-                next_chunk = match recv.read_chunk(self.service.max_chunk_size(), false).await {
-                    Ok(chunk) => chunk,
-                    Err(err) => {
-                        if is_graceful_close(&err) {
-                            return Ok(());
-                        }
-                        return Err(StreamHandlerError::StreamReadError(err));
+            let mut next_chunk = match recv.read_chunk(self.service.max_chunk_size(), false).await {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    if is_graceful_close(&err) {
+                        return Ok(());
                     }
-                };
-            }
+                    return Err(StreamHandlerError::StreamReadError(err));
+                }
+            };
 
-            let Some(mut chunk) = next_chunk.take() else {
+            let Some(chunk) = next_chunk.take() else {
                 debug!("Terminating request reader in stream handler");
                 break;
             };
 
-            if chunk.offset == current_offset {
-                while !chunk.bytes.is_empty() {
-                    if request_bytes_read < header_size {
-                        // Read the request header
-                        if chunk.bytes.len() + request_bytes_read < header_size {
-                            let got_count = chunk.bytes.len();
-                            request_bytes[request_bytes_read..(request_bytes_read + got_count)]
-                                .copy_from_slice(chunk.bytes.as_ref());
+            chunk_resolver
+                .resolve_into(chunk, &mut messages)
+                .map_err(|command_header| {
+                    warn!(?command_header, "Bad header");
+                    StreamHandlerError::BadHeader(command_header)
+                })?;
 
-                            request_bytes_read += got_count;
-                            current_offset += got_count as u64;
-                            chunk.bytes.clear();
-                        } else {
-                            let remain_count = header_size - request_bytes_read;
-                            let remain_bytes = chunk.bytes.split_to(remain_count);
-
-                            request_bytes[request_bytes_read..header_size]
-                                .copy_from_slice(remain_bytes.as_ref());
-
-                            request = if header_size == COMMAND_HEADER_SIZE_V4 {
-                                CommandHeader::from_bytes_v4(request_bytes.as_bytes())
-                            } else {
-                                CommandHeader::from_bytes(request_bytes.as_bytes())
-                            };
-                            if request.size_or_status > self.service.max_chunk_size() as u32 {
-                                warn!(command_header = ?request, "Bad header");
-                                return Err(StreamHandlerError::BadHeader(request));
-                            }
-
-                            request_bytes_read = header_size;
-                            current_offset += remain_count as u64;
-                            chunk.offset += remain_count as u64;
-
-                            trace!("QUIC stream read request header {request:?}");
-
-                            if request.size_or_status > 0 {
-                                if chunk.bytes.len() >= request.size_or_status as usize {
-                                    // Happy path, we can directly use buffer as it contains the full request
-                                    let size = request.size_or_status as usize;
-                                    let current_payload = chunk.bytes.split_to(size);
-
-                                    current_offset += size as u64;
-                                    chunk.offset += size as u64;
-
-                                    trace!(
-                                        "QUIC stream read {} bytes complete payload from single chunk",
-                                        size
-                                    );
-
-                                    request_bytes_read = 0;
-
-                                    self.process_message(
-                                        request,
-                                        Some(current_payload),
-                                        send.clone(),
-                                        &limiter,
-                                    )
-                                    .await?;
-                                } else {
-                                    // Allocate buffer for request payload
-                                    payload = Some(bytes::BytesMut::with_capacity(
-                                        request.size_or_status as usize,
-                                    ));
-                                }
-                            } else {
-                                request_bytes_read = 0;
-
-                                self.process_message(request, None, send.clone(), &limiter)
-                                    .await?;
-                            }
-                        }
-                    }
-                    if let Some(mut current_payload) = payload.take() {
-                        let size = std::cmp::min(
-                            current_payload.capacity() - current_payload.len(),
-                            chunk.bytes.len(),
-                        );
-
-                        let this_chunk = chunk.bytes.split_to(size);
-                        current_payload.extend_from_slice(this_chunk.as_bytes());
-
-                        current_offset += size as u64;
-                        chunk.offset += size as u64;
-
-                        trace!(
-                            "QUIC stream read {} bytes for a total of {} / {} bytes of payload",
-                            size,
-                            current_payload.len(),
-                            current_payload.capacity()
-                        );
-
-                        if current_payload.capacity() == current_payload.len() {
-                            request_bytes_read = 0;
-
-                            self.process_message(
-                                request,
-                                Some(current_payload.freeze()),
-                                send.clone(),
-                                &limiter,
-                            )
-                            .await?;
-                        } else {
-                            payload = Some(current_payload);
-                        }
-                    }
+            for message in messages.drain(..) {
+                // A request cannot report an error.
+                if message.header.error {
+                    debug!(command_header = ?message.header, "Request header carries the error bit");
+                    return Err(StreamHandlerError::BadHeader(message.header));
                 }
-            } else {
-                // Queue for later processing
-                trace!(
-                    "Got out of order chunk @ offset {}, current offset is {}",
-                    chunk.offset, current_offset
-                );
-                if pending_chunks.is_empty() {
-                    stall_start = Instant::now();
-                }
-                pending_chunks.push(chunk);
-                stream_metrics.pending_chunks(pending_chunks.len());
+
+                self.process_message(message.header, message.payload, send.clone(), &limiter)
+                    .await?;
             }
 
-            for (ichunk, chunk) in pending_chunks.iter().enumerate() {
-                if chunk.offset == current_offset {
-                    trace!(
-                        "Grab out of order chunk @ current offset {current_offset} - {} ooo chunks remaining",
-                        pending_chunks.len() - 1
-                    );
-                    next_chunk = Some(pending_chunks.swap_remove(ichunk));
-                    if pending_chunks.is_empty() {
-                        stream_metrics.chunk_stall(stall_start.elapsed());
+            while let Ok(metric) = metrics_receiver.try_recv() {
+                match metric {
+                    ChunkingMetric::Stall(duration) => {
+                        stream_metrics.chunk_stall(duration);
                     }
-                    break;
+                    ChunkingMetric::PendingChunks(num) => {
+                        stream_metrics.pending_chunks(num);
+                    }
                 }
             }
         }

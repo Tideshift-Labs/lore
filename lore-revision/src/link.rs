@@ -37,6 +37,7 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::is_reserved_node_name;
 use crate::revision;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
@@ -777,6 +778,12 @@ pub async fn resolve_link_chain(
 
     while !remainder_path.is_empty() {
         let name = remainder_path.pop_root();
+        if is_reserved_node_name(name) {
+            return Err(InvalidPath {
+                path: name.to_string(),
+            }
+            .into());
+        }
         let name_hash = crate::hash::hash_string(name);
         below_mount.push(name);
 

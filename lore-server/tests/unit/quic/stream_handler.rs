@@ -939,6 +939,42 @@ async fn connection_inflight_ceiling_sheds_without_waiting() {
     .expect("Test task failed");
 }
 
+/// A request cannot report an error, so a header carrying the error bit tears the stream down
+/// rather than being served.
+#[tokio::test]
+async fn a_request_header_carrying_the_error_bit_closes_the_stream() {
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let mut harness = serve_and_connect(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+        )
+        .await;
+
+        let header = CommandHeader::new(MockBehaviour::Echo as QuicOpCode, 1, 0)
+            .response_error(QuicServiceError::Failed as u32);
+        harness
+            .send
+            .write(&header.to_bytes())
+            .await
+            .expect("Failed to write header");
+        harness.send.flush().await.expect("Failed flush");
+
+        let outcome = harness.recv.read_chunk(usize::MAX, false).await;
+        assert!(
+            outcome.is_err() || matches!(outcome, Ok(None)),
+            "expected the stream to be closed, got: {outcome:?}"
+        );
+    }))
+    .await
+    .expect("Test task failed");
+}
+
 /// A request the service cannot parse is answered `InvalidCommand` and recorded, rather than
 /// answered without reaching the operation latency metric at all.
 #[tokio::test]

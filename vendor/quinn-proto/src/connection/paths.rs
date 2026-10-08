@@ -292,6 +292,9 @@ pub struct RttEstimator {
     /// The minimum RTT seen in the connection, ignoring ack delay.
     min: Duration,
     /// Upper bound on RTT samples, preventing poisoning from processing delays
+    ///
+    /// LORE: not upstream. Re-apply this field, the `new` parameter that fills it and the clamp
+    /// in `update` when re-vendoring.
     max: Duration,
 }
 
@@ -343,11 +346,7 @@ impl RttEstimator {
             } else {
                 self.latest
             };
-            let var_sample = if smoothed > adjusted_rtt {
-                smoothed - adjusted_rtt
-            } else {
-                adjusted_rtt - smoothed
-            };
+            let var_sample = smoothed.abs_diff(adjusted_rtt);
             self.var = (3 * self.var + var_sample) / 4;
             self.smoothed = Some((7 * smoothed + adjusted_rtt) / 8);
         } else {

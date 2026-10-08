@@ -264,7 +264,8 @@ async fn verify_no_sibling_claims_a_staged_name(
     Ok(())
 }
 
-/// Reject a node whose stored name does not hash to the `name_hash` beside it.
+/// Reject a node whose stored name the read path refuses, which no commit may publish, or whose
+/// stored name does not hash to the `name_hash` beside it.
 async fn verify_node_name_hash(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -275,9 +276,14 @@ async fn verify_node_name_hash(
         .block_with_nametable(repository, NodeBlock::index(node_id))
         .await
         .forward::<RepositoryError>("Failed to deserialize repository state")?;
-    let node_name = block
-        .node_name_ref(Node::index(node_id))
-        .forward::<RepositoryError>("Failed to get node name")?;
+    let node_name = match block.node_name_ref(Node::index(node_id)) {
+        Ok(node_name) => node_name,
+        Err(err) => {
+            return Err(RepositoryError::internal(format!(
+                "Repository verification failed: Node {node_id} carries a name no node may: {err}"
+            )));
+        }
+    };
     let expected = hash::hash_string(&node_name);
     if name_hash != expected {
         return Err(RepositoryError::internal(format!(

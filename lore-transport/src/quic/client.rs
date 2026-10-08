@@ -537,7 +537,7 @@ impl QuicConnection {
         self.pause_next_session_send
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
-            .map_err(|_| ProtocolError::internal("session send pause is already armed"))
+            .map_err(|_err| ProtocolError::internal("session send pause is already armed"))
     }
 
     /// Wait until the armed session-bearing send reaches its pause. Tests only.
@@ -546,7 +546,7 @@ impl QuicConnection {
         self.session_send_paused
             .acquire()
             .await
-            .map_err(|_| ProtocolError::internal("session send pause closed"))?
+            .map_err(|_err| ProtocolError::internal("session send pause closed"))?
             .forget();
         Ok(())
     }
@@ -598,7 +598,6 @@ impl QuicConnection {
                 .map_err(|_err| QuicClientError::StreamOpen)?;
             connection.writer.push(Arc::new(Mutex::new(send)));
             connection.reader.push(ResponseReader::new(
-                0,
                 recv,
                 self.max_chunk_size,
                 last_recv,
@@ -1800,7 +1799,6 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
             .map_err(|_err| QuicClientError::StreamOpen)?;
         connection_lock.writer.push(Arc::new(Mutex::new(send)));
         connection_lock.reader.push(ResponseReader::new(
-            stream_index,
             recv,
             connection.max_chunk_size,
             last_recv.clone(),

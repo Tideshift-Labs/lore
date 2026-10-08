@@ -37,6 +37,7 @@ mod storage_remote_tests {
     use lore_server::quic::tests::TestHandlerFactory;
     use lore_server::quic::tests::server_certs;
     use lore_server::settings::BaselineAccess;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
 
@@ -276,7 +277,7 @@ mod storage_remote_tests {
             source_address: lore_base::types::Address,
             destination_partition: lore_base::types::Partition,
             destination_context: lore_base::types::Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), lore_storage::StoreError> {
             self.inner
                 .clone()
@@ -285,7 +286,7 @@ mod storage_remote_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }
@@ -1629,6 +1630,112 @@ mod storage_remote_tests {
                     );
 
                     close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// `State::cache_fragments` retains the state and tree records even when their fragments
+    /// lack `PayloadLocalCachePriority`, so both can be read without a remote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_fragment_cache_makes_historical_state_available_offline() -> TestResult {
+        use lore_base::error::NoRemote;
+        use lore_base::types::Address;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::filter::Filter;
+        use lore_revision::instance::InstanceId;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::repository::RepositoryContext;
+        use lore_revision::repository::RepositoryContextCreationArgs;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let execution = setup_execution("storage-remote-historical-state-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let repository_id = RepositoryId::from([0xd2u8; 16]);
+                    let context = |immutable_store, mutable_store, remote| {
+                        Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+                            paths: None,
+                            immutable_store,
+                            mutable_store,
+                            id: repository_id,
+                            instance_id: InstanceId::default(),
+                            remote,
+                            filter: Arc::new(Filter::default()),
+                            filesystem_provider: None,
+                        }))
+                    };
+
+                    let server_repository = context(
+                        server.backend_immutable.clone(),
+                        server.backend_mutable.clone(),
+                        Err(lore_transport::ProtocolError::from(NoRemote)),
+                    );
+                    let write_token = RepositoryWriteToken::acquire(std::path::Path::new(
+                        "historical-state-cache-test",
+                    ))
+                    .await;
+                    let state = State::new();
+                    let node = Node {
+                        name_hash: hash_string("held"),
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(server_repository.clone(), ROOT_NODE, node, "held")
+                        .await?;
+                    let revision = state.serialize(server_repository, &write_token).await?;
+
+                    for hash in [revision, state.tree_hash()] {
+                        let address = Address::zero_context_hash(hash);
+                        let (mut fragment, payload) = server
+                            .backend_immutable
+                            .clone()
+                            .get(repository_id, address)
+                            .await?
+                            .into_payload()?;
+                        fragment.flags &= !FragmentFlags::PayloadLocalCachePriority;
+                        server
+                            .backend_immutable
+                            .clone()
+                            .put(repository_id, address, fragment, Some(payload), true)
+                            .await?;
+                    }
+
+                    let (client_immutable, client_mutable) =
+                        lore_revision::repository::create_client_memory_stores().await?;
+                    let remote = lore_transport::connection::connect(
+                        server.url.as_str(),
+                        "historical-state-cache-test",
+                        repository_id,
+                        1,
+                        "",
+                        "",
+                    )
+                    .await?;
+                    let client_repository =
+                        context(client_immutable.clone(), client_mutable.clone(), Ok(remote));
+                    client_repository.set_disable_cache(true);
+                    State::deserialize(client_repository.clone(), revision)
+                        .await?
+                        .cache_fragments(client_repository)
+                        .await?;
+
+                    let offline_repository = context(
+                        client_immutable,
+                        client_mutable,
+                        Err(lore_transport::ProtocolError::from(NoRemote)),
+                    );
+                    State::deserialize(offline_repository.clone(), revision)
+                        .await?
+                        .tree(offline_repository)
+                        .await?;
                 }
                 Ok(())
             })
@@ -6917,7 +7024,7 @@ mod storage_remote_tests {
             source_address: lore_base::types::Address,
             destination_partition: lore_base::types::Partition,
             destination_context: lore_base::types::Context,
-            durable: bool,
+            behavior: CopyBehavior,
         ) -> Result<(), lore_storage::StoreError> {
             self.inner
                 .clone()
@@ -6926,7 +7033,7 @@ mod storage_remote_tests {
                     source_address,
                     destination_partition,
                     destination_context,
-                    durable,
+                    behavior,
                 )
                 .await
         }

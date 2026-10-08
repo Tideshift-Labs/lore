@@ -680,7 +680,7 @@ impl Interceptor for AuthzInterceptor {
         let authorization = crate::caller_operation::current_dispatch_authorization()
             .unwrap_or_else(|| self.auth.read().authorization_token.clone());
         if let Some(recovery) = crate::caller_operation::current_caller_recovery() {
-            let token = lore_credential::insecure_decode_token(&authorization).map_err(|_| {
+            let token = lore_credential::insecure_decode_token(&authorization).map_err(|_err| {
                 tonic::Status::failed_precondition("recovery credential namespace is unavailable")
             })?;
             if recovery.repository != self.repository
@@ -2087,9 +2087,12 @@ impl Storage for GRPCStorage {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect_classified_unary(GrpcRpc::StorageVerify, || {
-            self.client.verify(&ctx, address, heal)
-        })
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(
+            self.with_reconnect_classified_unary(GrpcRpc::StorageVerify, || {
+                self.client.verify(&ctx, address, heal)
+            }),
+        )
         .await
     }
 
@@ -2134,9 +2137,12 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect_classified_unary(GrpcRpc::StorageMutableStore, || {
-            self.client.mutable_store(&ctx, key, value, key_type)
-        })
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(
+            self.with_reconnect_classified_unary(GrpcRpc::StorageMutableStore, || {
+                self.client.mutable_store(&ctx, key, value, key_type)
+            }),
+        )
         .await
     }
 
@@ -2149,10 +2155,14 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect_classified_unary(GrpcRpc::StorageMutableCompareAndSwap, || {
-            self.client
-                .mutable_compare_and_swap(&ctx, key, expected, value, key_type)
-        })
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(self.with_reconnect_classified_unary(
+            GrpcRpc::StorageMutableCompareAndSwap,
+            || {
+                self.client
+                    .mutable_compare_and_swap(&ctx, key, expected, value, key_type)
+            },
+        ))
         .await
     }
 
@@ -2223,7 +2233,8 @@ impl Revision for GRPCRevision {
         creator: &str,
         stack: &[BranchPoint],
     ) -> Result<Hash, ProtocolError> {
-        with_reconnect_classified(
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(with_reconnect_classified(
             &self.connection,
             GrpcRpc::RevisionBranchCreate,
             || async {
@@ -2234,7 +2245,7 @@ impl Revision for GRPCRevision {
                     .await
             },
             |reconnect_id| self.reconnect(reconnect_id),
-        )
+        ))
         .await
     }
 
@@ -2269,7 +2280,8 @@ impl Revision for GRPCRevision {
         force: bool,
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
-        with_reconnect_classified(
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(with_reconnect_classified(
             &self.connection,
             GrpcRpc::RevisionBranchPush,
             || async {
@@ -2280,7 +2292,7 @@ impl Revision for GRPCRevision {
                     .await
             },
             |reconnect_id| self.reconnect(reconnect_id),
-        )
+        ))
         .await
     }
 
@@ -2516,12 +2528,13 @@ impl Lock for GRPCLock {
         resources: &[FencedLockResource],
         owner: Option<&str>,
     ) -> Result<Vec<AcquiredLock>, ProtocolError> {
-        with_reconnect_classified(
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(with_reconnect_classified(
             &self.connection,
             GrpcRpc::LockLock,
             || async { self.client.read().await.lock(resources, owner).await },
             |reconnect_id| self.reconnect(reconnect_id),
-        )
+        ))
         .await
     }
 
@@ -2574,7 +2587,8 @@ impl Lock for GRPCLock {
         resources: &[LockResource],
         owner: &str,
     ) -> Result<Vec<LockResource>, ProtocolError> {
-        with_reconnect_classified(
+        // boxed: the classified future is over 16 KB on Windows
+        Box::pin(with_reconnect_classified(
             &self.connection,
             GrpcRpc::LockForceUnlock,
             || async {
@@ -2585,7 +2599,7 @@ impl Lock for GRPCLock {
                     .await
             },
             |reconnect_id| self.reconnect(reconnect_id),
-        )
+        ))
         .await
     }
 }

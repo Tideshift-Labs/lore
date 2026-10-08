@@ -399,8 +399,10 @@ impl Cell {
         self.render_pairs
             .iter()
             .find(|(candidate, _)| *candidate == token)
-            .map(|(_, value)| value.clone())
-            .unwrap_or_else(|| panic!("every rendered process substitutes {token}"))
+            .map_or_else(
+                || panic!("every rendered process substitutes {token}"),
+                |(_, value)| value.clone(),
+            )
     }
 
     fn spawn(&mut self, options: BootOptions<'_>) {
@@ -448,15 +450,12 @@ impl Cell {
         // same reason `LORE_FRAGMENT_FAILPOINTS` is: a restart that means to
         // drop an injected fault must actually drop it, and this process
         // inherits the harness's own environment.
-        match options.receiver_faults {
-            Some(spec) => {
-                command.env("LORE_RECEIVER_FAULTS", spec);
-                command.env("LORE_RECEIVER_FAULT_DIR", &self.fault_dir);
-            }
-            None => {
-                command.env_remove("LORE_RECEIVER_FAULTS");
-                command.env_remove("LORE_RECEIVER_FAULT_DIR");
-            }
+        if let Some(spec) = options.receiver_faults {
+            command.env("LORE_RECEIVER_FAULTS", spec);
+            command.env("LORE_RECEIVER_FAULT_DIR", &self.fault_dir);
+        } else {
+            command.env_remove("LORE_RECEIVER_FAULTS");
+            command.env_remove("LORE_RECEIVER_FAULT_DIR");
         }
         if options.trace_target {
             command.env("LORE_RECEIVER_FAULT_TRACE", "1");

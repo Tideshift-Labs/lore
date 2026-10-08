@@ -59,8 +59,7 @@ impl HttpConnector for CountingHttpClient {
             200.try_into().expect("valid HTTP status"),
             self.response_body
                 .clone()
-                .map(SdkBody::from)
-                .unwrap_or_else(SdkBody::empty),
+                .map_or_else(SdkBody::empty, SdkBody::from),
         )))
     }
 }
@@ -167,8 +166,10 @@ fn source_counts_only_at_the_final_connector_call_not_during_request_mutation() 
     .expect("net HTTP client source");
     assert_final_connector_accounting(&source);
 
-    let moved_to_request_preparation =
-        source.replacen(CONNECTOR_INCREMENT, "", 1) + "\n// request_binder record_issue\n";
+    let moved_to_request_preparation = format!(
+        "{}\n// request_binder record_issue\n",
+        source.replacen(CONNECTOR_INCREMENT, "", 1)
+    );
     assert!(
         std::panic::catch_unwind(|| assert_final_connector_accounting(
             &moved_to_request_preparation

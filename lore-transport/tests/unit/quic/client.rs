@@ -345,7 +345,7 @@ async fn loopback_quic_connection() -> (quinn::Connection, tokio::task::JoinHand
     let accept_task = lore_base::lore_spawn!(async move {
         let incoming = server_endpoint.accept().await.expect("incoming connection");
         let _connection = incoming.await.expect("server-side handshake");
-        std::future::pending::<()>().await
+        std::future::pending::<()>().await;
     });
 
     let client_crypto = client_crypto_config(

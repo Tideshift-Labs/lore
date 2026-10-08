@@ -31,6 +31,7 @@ mod remote_store_tests {
     use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
     use lore_storage::StoreMatchResult;
+    use lore_storage::immutable_store::CopyBehavior;
     use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
@@ -543,7 +544,16 @@ mod remote_store_tests {
                 server
                     .immutable_store
                     .clone()
-                    .copy(repo_a, address, repo_b, address.context, false)
+                    .copy(
+                        repo_a,
+                        address,
+                        repo_b,
+                        address.context,
+                        CopyBehavior {
+                            durable: false,
+                            do_not_replicate: false,
+                        },
+                    )
                     .await?;
 
                 let (got_fragment, got_payload) = server

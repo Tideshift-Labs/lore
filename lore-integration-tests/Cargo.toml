@@ -86,3 +86,6 @@ tonic-prost = { workspace = true }
 [features]
 integration_tests = ["lore-server/integration_tests"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]
+
+[lints]
+workspace = true

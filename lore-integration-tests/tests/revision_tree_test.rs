@@ -893,7 +893,8 @@ mod add_tests {
     /// reference to an entry that is a link, and two entries claiming one name
     /// under a parent the same batch creates.
     ///
-    /// The last four are names the node name table refuses. They are checked
+    /// The rest are names the node name table refuses, among them the
+    /// repository's own directory in any ASCII case. They are checked
     /// here rather than at write time, so they fail as a rejection with nothing
     /// created — including when the offending entry sits between valid ones,
     /// which is the case that would otherwise apply part of the batch.
@@ -954,6 +955,18 @@ mod add_tests {
             (
                 18,
                 vec![entry(18, ROOT_NODE, &oversize, LoreNodeType::File)],
+            ),
+            (
+                22,
+                vec![entry(22, ROOT_NODE, ".urc", LoreNodeType::Directory)],
+            ),
+            (23, vec![entry(23, ROOT_NODE, ".LORE", LoreNodeType::File)]),
+            (
+                25,
+                vec![
+                    entry(24, ROOT_NODE, "dir", LoreNodeType::Directory),
+                    nested_entry(25, 0, ".Urc", LoreNodeType::Directory),
+                ],
             ),
             (
                 20,

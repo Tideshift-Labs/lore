@@ -74,6 +74,7 @@ use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
 use crate::fs_util;
 use crate::hash;
+use crate::immutable_store::CopyBehavior;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
 use crate::local::fan_out::GroupLevel;
@@ -4215,7 +4216,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        durable: bool,
+        behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         // Hash is preserved across the copy; the destination address only differs in context.
         // Same hash → same bucket, so source and destination always live in one bucket — including
@@ -4274,7 +4275,9 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             let index = bucket.sorted_index[dest_slot] as usize;
             let entry = &mut bucket.entry[index];
             let before = entry.data;
-            entry.data.merge_from_copy_source(source_data, durable);
+            entry
+                .data
+                .merge_from_copy_source(source_data, behavior.durable);
             if entry.data != before {
                 entry.data.last_access = Self::last_access();
                 group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
@@ -4283,7 +4286,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
 
         let mut data = ImmutableData::default();
-        data.merge_from_copy_source(source_data, durable);
+        data.merge_from_copy_source(source_data, behavior.durable);
         data.last_access = Self::last_access();
 
         let count = bucket.entry.len();

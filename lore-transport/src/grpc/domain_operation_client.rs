@@ -218,7 +218,7 @@ fn decode_state(
     prepared_at_unix_millis: Option<i64>,
     hard_expires_at_unix_millis: Option<i64>,
 ) -> Result<DomainReceiptState, ProtocolError> {
-    let status = DomainOperationReceiptStatus::try_from(status).map_err(|_| {
+    let status = DomainOperationReceiptStatus::try_from(status).map_err(|_err| {
         ProtocolError::internal(format!(
             "receipt lookup returned unrecognised status {status}"
         ))
@@ -268,7 +268,7 @@ fn decode_outcome(
     reason_version: Option<u32>,
     reason: &str,
 ) -> Result<DomainReceiptOutcome, ProtocolError> {
-    let outcome = DomainOperationOutcome::try_from(outcome).map_err(|_| {
+    let outcome = DomainOperationOutcome::try_from(outcome).map_err(|_err| {
         ProtocolError::internal(format!(
             "committed receipt carried unrecognised outcome {outcome}"
         ))

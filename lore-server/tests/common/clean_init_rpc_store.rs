@@ -228,7 +228,7 @@ impl ImmutableStore for RpcStore {
         _: Address,
         _: Partition,
         _: Context,
-        _: bool,
+        _: lore_storage::immutable_store::CopyBehavior,
     ) -> Result<(), StoreError> {
         panic!("outside RPC fixture scope")
     }

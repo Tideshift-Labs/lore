@@ -382,11 +382,18 @@ impl MountResources {
                 .node(self.repository.clone(), child_id)
                 .await
                 .forward::<SwfsWorkError>("Finding child node in state")?;
+            child
+                .walk_step(child_id, directory_node_id, &mut cycle)
+                .forward::<SwfsWorkError>("Invalid node hierarchy in SWFS enumerate directory")?;
+            child_iter = child.sibling();
             let (child_node_name, child_node_path) = {
-                let child_node_name = state
-                    .node_name_ref(self.repository.clone(), child_id)
+                let Some(child_node_name) = state
+                    .node_name_ref_or_skip(self.repository.clone(), child_id)
                     .await
-                    .forward::<SwfsWorkError>("Finding child node name")?;
+                    .forward::<SwfsWorkError>("Finding child node name")?
+                else {
+                    continue;
+                };
                 let child_node_name: &str = child_node_name.as_ref();
                 (
                     CString::new(child_node_name).internal("Making CString from file name")?,
@@ -404,11 +411,6 @@ impl MountResources {
                 SwfsFile::new(child_node_name, &file_info, None)
                     .forward::<SwfsWorkError>("Constructing file info")?,
             );
-
-            child
-                .walk_step(child_id, directory_node_id, &mut cycle)
-                .forward::<SwfsWorkError>("Invalid node hierarchy in SWFS enumerate directory")?;
-            child_iter = child.sibling();
         }
 
         Ok(SwfsFileArray::new(files))

@@ -2054,10 +2054,12 @@ async fn configure_composite_store(
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!("Wiring up Composite store");
 
-    let mut composite_store_builder = CompositeStoreBuilder::default().with_cache_metadata(
-        settings.cache_metadata.unwrap_or_default(),
-        settings.cache_metadata_semaphore_size,
-    );
+    let mut composite_store_builder = CompositeStoreBuilder::default()
+        .with_cache_metadata(
+            settings.cache_metadata.unwrap_or_default(),
+            settings.cache_metadata_semaphore_size,
+        )
+        .with_record_copy_out_of_band(settings.record_copy_out_of_band);
 
     let store = Box::pin(configure_composite_substore(
         registry,

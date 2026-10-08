@@ -46,6 +46,8 @@ use lore_transport::storage_replay_class;
 
 /// B12: every `Command` variant classified by name, exhaustively. Adding a 14th `Command` variant
 /// without extending this match is a compile error, not a silently-defaulted class.
+// One arm per variant, with no wildcard, so a new variant fails to compile here.
+#[allow(clippy::match_same_arms)]
 fn classify(command: Command) -> ReplayClass {
     match command {
         Command::Get => ReplayClass::ReadRetryable,
@@ -167,6 +169,8 @@ fn attempt_budget_is_exactly_two() {
 /// after the original brief was written -- see the exhaustive match below, which had to grow
 /// with it). Exactly one is ambiguous. This fixture is the no-default guard for that: a fourth
 /// `DispatchState` variant fails to compile here until this match says whether it is ambiguous.
+// One arm per variant, with no wildcard, so a new variant fails to compile here.
+#[allow(clippy::match_same_arms)]
 fn is_ambiguous(state: DispatchState) -> bool {
     match state {
         DispatchState::NotDispatched => false,
@@ -219,7 +223,7 @@ fn a_dispatched_response_lost_outcome_is_frozen_as_typed_unknown_with_no_redispa
 }
 
 /// `OutcomeUnknown` must be usable as a real `std::error::Error` (per the contract: Clone, Debug,
-/// PartialEq, `std::error::Error`), since callers propagate it through `?` alongside other
+/// `PartialEq`, `std::error::Error`), since callers propagate it through `?` alongside other
 /// transport errors.
 #[test]
 fn outcome_unknown_is_a_real_error_type() {

@@ -567,90 +567,93 @@ async fn process_block_item(
         node.walk_step(current_node_id, expected_parent, &mut cycle)
             .forward::<CloneError>("invalid node hierarchy in revision state")?;
 
-        let node_name = block
-            .node_name_ref(node_index)
+        if let Some(node_name) = block
+            .node_name_ref_or_skip(node_index, current_node_id)
             .forward::<CloneError>("Failed to deserialize node name")?
-            .freeze();
+        {
+            let node_name = node_name.freeze();
+            if node_name.is_empty() {
+                return Err(CloneError::internal("Failed to deserialize node name"));
+            }
 
-        if node_name.is_empty() {
-            return Err(CloneError::internal("Failed to deserialize node name"));
-        }
+            let node_path = item.repository_path.join(&node_name);
 
-        let node_path = item.repository_path.join(&node_name);
+            let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
+                item.states,
+                &node_path,
+                node.is_directory(),
+                FilterMode::View,
+            );
+            if !excluded {
+                visited_child = true;
+                if node.is_file() {
+                    dispatcher
+                        .stats
+                        .discovery
+                        .total_files
+                        .fetch_add(1, Ordering::Relaxed);
+                    dispatcher
+                        .stats
+                        .discovery
+                        .total_bytes
+                        .fetch_add(node.size, Ordering::Relaxed);
 
-        let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
-            item.states,
-            &node_path,
-            node.is_directory(),
-            FilterMode::View,
-        );
-        if !excluded {
-            visited_child = true;
-            if node.is_file() {
-                dispatcher
-                    .stats
-                    .discovery
-                    .total_files
-                    .fetch_add(1, Ordering::Relaxed);
-                dispatcher
-                    .stats
-                    .discovery
-                    .total_bytes
-                    .fetch_add(node.size, Ordering::Relaxed);
-
-                let Ok(permit) = dispatcher.file_tx.reserve().await else {
-                    // Receiver dropped, consumer encountered an error
-                    return Err(CloneError::internal("Recursion task failed"));
-                };
-                permit.send(CloneWorkItem {
-                    repository: dispatcher.repository.clone(),
-                    node,
-                    repository_path: node_path,
-                });
-            } else if node.is_link() {
-                if dispatcher.is_shutdown() {
-                    dispatcher.item_complete();
-                    return Ok(());
-                }
-                dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
-
-                let d = Arc::clone(dispatcher);
-                let link_node = node;
-                let link_ctx = CloneContext {
-                    repository: dispatcher.repository.clone(),
-                    state: dispatcher.state.clone(),
-                    operation: dispatcher.operation.clone(),
-                    options: dispatcher.options.clone(),
-                    stats: dispatcher.stats.clone(),
-                    modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-                };
-                let link_tx = dispatcher.file_tx.clone();
-                lore_spawn!(async move {
-                    let result = clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
-                    if let Err(err) = result {
-                        d.set_error(err);
-                    }
-                    d.item_complete();
-                });
-            } else if node.is_directory() {
-                if execution_context().globals().dry_run() {
-                    lore_info!("{}", node_path);
-                }
-
-                if let Some(first_child) = node.child() {
-                    dispatcher.dispatch(BlockDiscoverItem {
-                        node_id: first_child,
-                        expected_parent: current_node_id,
+                    let Ok(permit) = dispatcher.file_tx.reserve().await else {
+                        // Receiver dropped, consumer encountered an error
+                        return Err(CloneError::internal("Recursion task failed"));
+                    };
+                    permit.send(CloneWorkItem {
+                        repository: dispatcher.repository.clone(),
+                        node,
                         repository_path: node_path,
-                        states: node_states,
-                        dep_context: None,
-                        follow_deps: false,
-                        depth: 0,
-                        cycle: SiblingCycleGuard::new(current_node_id),
-                        visited_child: false,
                     });
-                } else if !execution_context().globals().dry_run() {
-                    create_empty_directory::<CloneError>(&dispatcher.operation, &node_path).await?;
+                } else if node.is_link() {
+                    if dispatcher.is_shutdown() {
+                        dispatcher.item_complete();
+                        return Ok(());
+                    }
+                    dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
+
+                    let d = Arc::clone(dispatcher);
+                    let link_node = node;
+                    let link_ctx = CloneContext {
+                        repository: dispatcher.repository.clone(),
+                        state: dispatcher.state.clone(),
+                        operation: dispatcher.operation.clone(),
+                        options: dispatcher.options.clone(),
+                        stats: dispatcher.stats.clone(),
+                        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+                    };
+                    let link_tx = dispatcher.file_tx.clone();
+                    lore_spawn!(async move {
+                        let result =
+                            clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
+                        if let Err(err) = result {
+                            d.set_error(err);
+                        }
+                        d.item_complete();
+                    });
+                } else if node.is_directory() {
+                    if execution_context().globals().dry_run() {
+                        lore_info!("{}", node_path);
+                    }
+
+                    if let Some(first_child) = node.child() {
+                        dispatcher.dispatch(BlockDiscoverItem {
+                            node_id: first_child,
+                            expected_parent: current_node_id,
+                            repository_path: node_path,
+                            states: node_states,
+                            dep_context: None,
+                            follow_deps: false,
+                            depth: 0,
+                            cycle: SiblingCycleGuard::new(current_node_id),
+                            visited_child: false,
+                        });
+                    } else if !execution_context().globals().dry_run() {
+                        create_empty_directory::<CloneError>(&dispatcher.operation, &node_path)
+                            .await?;
+                    }
                 }
             }
         }

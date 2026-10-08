@@ -36,8 +36,10 @@ use crate::lore::RepositoryId;
 use crate::lore::ZeroHeapAlloc;
 use crate::lore_debug;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node;
 use crate::repository::RepositoryContext;
+use crate::repository::is_reserved_node_name;
 use crate::state::State;
 use crate::state::StateError;
 
@@ -1068,10 +1070,18 @@ pub enum NodeNameError {
     Oversized,
 }
 
+/// The content rules a name is held to on both the read and the write path: no traversal, no
+/// separator, no leading NUL, and not the repository's own directory in any ASCII case.
 fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
     if name == ".." || name.starts_with('\0') || name.bytes().any(|b| b == b'/' || b == b'\\') {
         return Err(InvalidArguments {
             reason: format!("invalid node name: {name}"),
+        }
+        .into());
+    }
+    if is_reserved_node_name(name) {
+        return Err(InvalidArguments {
+            reason: format!("reserved node name: {name}"),
         }
         .into());
     }
@@ -1273,6 +1283,32 @@ impl NodeBlock {
             name,
             _guard: guard,
         })
+    }
+
+    /// [`Self::node_name_ref`], answering `None` for a node whose name the read path refuses,
+    /// logged as the node being skipped under `node_id`.
+    ///
+    /// A walk that lists or materializes content stands on this, so a name no node may carry
+    /// reaches neither disk nor a listing, and the walk carries on past the node. A name that
+    /// cannot be read at all is still an error.
+    ///
+    /// As with [`Self::node_name_ref`], the returned `NodeNameLock` holds a read lock on the
+    /// block data for its lifetime. Callers must drop it before calling `write()` on the same
+    /// block, or the write lock acquisition will deadlock. Nothing is held when the answer is
+    /// `None`.
+    pub fn node_name_ref_or_skip(
+        &self,
+        node_index: usize,
+        node_id: NodeID,
+    ) -> Result<Option<NodeNameLock>, NodeNameError> {
+        match self.node_name_ref(node_index) {
+            Ok(name) => Ok(Some(name)),
+            Err(err) if err.is_invalid_arguments() => {
+                lore_warn!("Skipping node {node_id} with invalid name: {err}");
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub async fn deserialize_nametable(
@@ -1676,6 +1712,19 @@ impl NodeBlockWriter<'_> {
         prev_length: u32,
     ) -> Result<(u32, u32), NodeNameError> {
         validate_node_name_for_store(name)?;
+        self.node_name_store_unchecked(name, prev_offset, prev_length)
+    }
+
+    /// [`Self::node_name_store`] without the name rules. Only a test has a use for it: a
+    /// name table written before a rule existed can hold a name the rule refuses, and the
+    /// read path has to be shown refusing or skipping such a node.
+    #[lore_macro::test_pub]
+    fn node_name_store_unchecked(
+        &mut self,
+        name: &str,
+        prev_offset: u32,
+        prev_length: u32,
+    ) -> Result<(u32, u32), NodeNameError> {
         let prev_offset = prev_offset as usize;
         let prev_length = prev_length as usize;
         if name.len() <= prev_length && (prev_offset + prev_length) < self.lock.name.len() {

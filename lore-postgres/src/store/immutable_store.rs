@@ -68,6 +68,7 @@ use lore_storage::StoreObliterateStats;
 use lore_storage::StoreRepositoryStats;
 use lore_storage::errors::AddressNotFound;
 use lore_storage::errors::SlowDown;
+use lore_storage::immutable_store::CopyBehavior;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use tokio_postgres::Transaction;
 
@@ -3163,7 +3164,11 @@ impl ImmutableStore for PostgresImmutableStore {
         source_address: Address,
         destination_partition: Partition,
         destination_context: Context,
-        _durable: bool,
+        // Neither flag changes what this store records. durable sets a per-tuple flag that this
+        // store never keeps: every association it holds is durable, and reads report it so
+        // (stored_durable). do_not_replicate asks a store not to forward the copy to its own
+        // write replicas, and this store has none.
+        _behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         let _t = self.instruments.start("copy", self.pool.status());
         let source_repository: Context = source_partition.into();

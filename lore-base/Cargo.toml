@@ -75,3 +75,6 @@ serde_json = { workspace = true, features = ["std"] }
 
 [build-dependencies]
 cc = "1.2.32"
+
+[lints]
+workspace = true

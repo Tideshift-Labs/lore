@@ -402,7 +402,7 @@ mod quic_session_rebind_tests {
                     );
                     let service = RecordingStorageServiceV4 {
                         inner,
-                        connection_id: context.get::<ConnectionId>().map(|id| id.0).unwrap_or(0),
+                        connection_id: context.get::<ConnectionId>().map_or(0, |id| id.0),
                         recorded_connection: NEXT_RECORDED_CONNECTION
                             .fetch_add(1, Ordering::Relaxed),
                         log: log.clone(),
@@ -875,7 +875,7 @@ mod quic_session_rebind_tests {
         (server, notify_answered, release_answer)
     }
 
-    /// Rebind a UDP socket on the exact port a just-closed QUIC server used. UDP has no TIME_WAIT,
+    /// Rebind a UDP socket on the exact port a just-closed QUIC server used. UDP has no `TIME_WAIT`,
     /// so this should succeed immediately once the old `QuinnServer` is fully dropped; poll briefly
     /// to absorb the OS's own teardown latency.
     async fn rebind_udp(port: u16) -> std::net::UdpSocket {
@@ -1749,7 +1749,7 @@ mod quic_session_rebind_tests {
     /// that is still valid: the operation succeeds.
     ///
     /// This is what makes arms 1 and 2 evidence. Without it, a harness that refused every
-    /// replacement session_start for an unrelated reason would produce exactly their result.
+    /// replacement `session_start` for an unrelated reason would produce exactly their result.
     #[tokio::test]
     async fn b4_replacement_authorization_succeeds_while_the_credential_is_still_valid()
     -> TestResult {
@@ -2400,7 +2400,7 @@ mod quic_session_rebind_tests {
     /// B10: the barrier before any epoch-N+1 reconnect/rebind. Every dispatched `MutableNoReplay`
     /// opcode that loses its response branches to `OutcomeUnknown` with ZERO epoch-N+1 bytes,
     /// including no replacement `session_start`. B7 and B8 above each independently prove this
-    /// for CAS and PutResolved via [`assert_no_bytes_after_severed_command`]; this case makes the
+    /// for CAS and `PutResolved` via [`assert_no_bytes_after_severed_command`]; this case makes the
     /// same proof the explicit subject for the plain `Put` and `MutableStore` opcodes B7/B8 don't
     /// cover, so the barrier is pinned for a representative read-modify path (`MutableStore`) and
     /// the representative immutable-publication path (`Put`) too, not just the two compound ones.
@@ -2687,7 +2687,7 @@ mod quic_session_rebind_tests {
     /// The companion positive control for the retry gate. Pause after the old session id has
     /// resolved but before the QUIC write lock, move the generation, and resume. The first send
     /// must be refused as `NotDispatched`; the session layer then rebinds and performs the one
-    /// server-observed MutableStore dispatch.
+    /// server-observed `MutableStore` dispatch.
     #[tokio::test]
     async fn not_dispatched_generation_mover_rebinds_and_retries_once() -> TestResult {
         let execution = setup_execution("test".to_string());
@@ -2988,9 +2988,9 @@ mod quic_session_rebind_tests {
         quic
     }
 
-    /// Send a real `Command::Authorize` (session_start) on `quic`, framed exactly as
+    /// Send a real `Command::Authorize` (`session_start`) on `quic`, framed exactly as
     /// `StorageClient::session_start` does (`quic/storage_service/client.rs:473-526`): the byte
-    /// layout is action(1=0), partition(16), corr_len(1), corr(N), token_len(2, u16 LE),
+    /// layout is action(1=0), partition(16), `corr_len`(1), corr(N), `token_len`(2, u16 LE),
     /// token(M). The token is empty because this harness's `auth_url` is always empty (auth is
     /// off), matching production's own
     /// `if !self.auth_url.is_empty() { .. } else { String::new() }` branch. Also mirrors
@@ -3169,7 +3169,7 @@ mod quic_session_rebind_tests {
             .await
     }
 
-    /// R2: a session_stop framed with connection 1's session id, sent on connection 2's wire,
+    /// R2: a `session_stop` framed with connection 1's session id, sent on connection 2's wire,
     /// must not remove connection 2's own live session -- INV-EO P0-2's deterministic SERVER-side
     /// half, isolated from the client-side gate the same way R1 does (see its doc comment for
     /// why forcing `register_session_for_test` here is deliberate, not a bypass of what this

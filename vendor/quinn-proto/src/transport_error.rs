@@ -55,6 +55,9 @@ impl Code {
     }
 
     /// is this error code classed as a crypto error code?
+    ///
+    /// LORE: not upstream. Re-apply this and the two `Display`/`Debug` arms that call it when
+    /// re-vendoring.
     pub fn is_crypto(&self) -> bool {
         (0x100..0x200).contains(&self.0)
     }

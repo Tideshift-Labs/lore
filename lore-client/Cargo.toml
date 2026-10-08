@@ -60,3 +60,6 @@ OriginalFilename = "lore.exe"
 ProductName = "Lore"
 FileDescription = "Lore CLI"
 LegalCopyright = "Copyright Epic Games, Inc."
+
+[lints]
+workspace = true

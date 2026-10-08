@@ -4,6 +4,7 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::path::Path;
+#[cfg(target_os = "linux")]
 use std::path::PathBuf;
 use std::sync::Arc;
 

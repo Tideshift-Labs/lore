@@ -5,6 +5,7 @@ use lore_revision::interface::LoreNodeType;
 use zerocopy::IntoBytes;
 
 mod cycle_tests;
+mod reserved_name_tests;
 
 use lore_revision::node::*;
 

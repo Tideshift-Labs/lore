@@ -1,7 +1,7 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! Support for WP-109 Phase 3: two real loreserver **processes** over one cell
-//! Postgres database and one MinIO bucket.
+//! Postgres database and one `MinIO` bucket.
 //!
 //! # What makes this different from the Phase 2 harness
 //!
@@ -98,7 +98,7 @@ pub struct Env {
     pub pg_url: String,
     /// Release `loreserver` binary both processes are started from.
     pub server_bin: PathBuf,
-    /// Per-case MinIO bucket. Pre-created by the runner: loreserver HEADs its
+    /// Per-case `MinIO` bucket. Pre-created by the runner: loreserver HEADs its
     /// bucket at boot and never creates one.
     pub s3_bucket: String,
     pub s3_endpoint: String,
@@ -126,7 +126,7 @@ pub struct Env {
     /// refuses a `Consume` whose identity, epoch, or revision disagrees with
     /// what it is serving.
     pub stream_identity: String,
-    /// That stream's epoch. The gateway derives it from the JetStream stream's
+    /// That stream's epoch. The gateway derives it from the `JetStream` stream's
     /// creation timestamp in whole seconds, so it is discovered by the runner
     /// at provisioning time rather than chosen here — a guessed value is
     /// refused as `RECEIVER_EPOCH_MISMATCH_V1` and the receiver never becomes

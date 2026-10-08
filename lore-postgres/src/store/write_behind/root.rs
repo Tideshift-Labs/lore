@@ -901,6 +901,8 @@ mod platform {
     // old `tokio::fs::read`, which reintroduces exactly the fail-open that
     // demotes a healthy fragment to `Missing`. A platform that cannot stage must
     // still be unable to answer "absent" wrongly.
+    // The stubs keep the unix signatures, so they take `self` and stay `async` unused.
+    #[allow(clippy::unused_self, clippy::unused_async)]
     impl ConfinedRoot {
         pub(crate) fn open(_configured: &Path) -> Result<Self, WriteBehindError> {
             Err(WriteBehindError::UnsupportedPlatform)

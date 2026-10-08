@@ -318,7 +318,7 @@ mod tests {
             std::fs::write(self.layer_config_path(), encoded).expect("write layer fixture");
         }
 
-        /// Upstream v0.10.0 moved layer_config_path onto a RepositoryContext; this fixture
+        /// Upstream v0.10.0 moved `layer_config_path` onto a `RepositoryContext`; this fixture
         /// only has the root, so it resolves the dot dir the same way.
         fn layer_config_path(&self) -> std::path::PathBuf {
             lore_revision::repository::get_dot_lore_path(&self.root)

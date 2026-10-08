@@ -747,7 +747,6 @@ impl SharedBackend {
             match report_checkpoint(&mut client, &self.cell_id, &report).await {
                 Ok(CheckpointOutcome::MembershipVersionConflict { .. }) => {
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
                 }
                 other => return other,
             }

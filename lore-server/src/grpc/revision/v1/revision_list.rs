@@ -55,6 +55,11 @@ use crate::util::setup_execution;
 const MAX_REVISION_LIST_RESPONSE_ITEMS: usize = 100;
 const METRICS_START_KEY: &str = "start_type";
 const METRICS_LIST_STRATEGY_KEY: &str = "list_strategy";
+/// Revisions walked between progress reports from the forward-cursor gap
+/// descent. The descent reports its totals when it finishes, and the
+/// handler timeout can end it before it ever gets there, so a descent long
+/// enough to be worth diagnosing reports as it goes.
+const GAP_DESCENT_PROGRESS_HOPS: u64 = 10_000;
 
 enum RevisionListStrategy {
     Direct,
@@ -642,9 +647,10 @@ async fn walk_revisions(
 /// callers use to safely widen the search. A missing key proves nothing
 /// either way (`Unknown`): the seal write is best-effort and silently
 /// dropped on failure, and the key type was renamed once already,
-/// orphaning older entries under the previous name. Conflating `Unknown`
-/// with `Empty` would let the search skip past a boundary that is
-/// genuinely non-empty but whose pointer was simply lost.
+/// orphaning older entries under the previous name. Only `Empty` may
+/// narrow a search towards a single-band answer: treating `Unknown` as
+/// `Empty` would let that answer span a boundary that is genuinely
+/// non-empty but whose pointer was simply lost.
 enum BoundaryProbe {
     Found(Hash),
     Empty,
@@ -690,12 +696,16 @@ enum ForwardAnchor {
     /// lives in the branch's latest revision's own (always-open) band,
     /// likewise bounded to `history_step_size` revisions.
     LatestBand { anchor: Hash },
-    /// A skip pointer was missing somewhere below `anchor`, so the gap
-    /// between `first_number` and `anchor` cannot be trusted to be a
-    /// single band. `anchor` is still guaranteed to be numbered above
-    /// `first_number` (either a proven `Found` boundary, or the latest
-    /// revision), but the descent must walk further and repair the
-    /// missing pointer(s) it discovers instead of assuming one band.
+    /// A boundary somewhere in the search could not be read, so `Empty`'s
+    /// monotonicity no longer covers the boundaries below it and the gap
+    /// between `first_number` and `anchor` cannot be trusted to hold a
+    /// single band. `anchor` is the revision held by the lowest boundary
+    /// the search went on to prove `Found`, which is not necessarily the
+    /// lowest sealed boundary there is: narrowing past an unreadable
+    /// boundary skips whatever lies beneath it. Where the search proved
+    /// none, `anchor` is the branch's latest revision. Either way it is
+    /// numbered above `first_number`, and the descent walks every
+    /// revision between the two, so how low it sits sets the cost.
     UnverifiedGap { anchor: Hash },
 }
 
@@ -717,11 +727,12 @@ enum ForwardAnchor {
 /// budget allows" (which would wrongly fall back to a walk anchored on
 /// latest, spanning however much ordinary history has since accumulated).
 ///
-/// Hitting `Unknown` at any point — the boundary's true state cannot be
-/// determined — aborts the binary search and reports [`ForwardAnchor::UnverifiedGap`]
-/// anchored on the best boundary already proven `Found` (or `latest`, if
-/// none has been found yet), rather than risking `Empty`'s optimism on
-/// a boundary that might not actually be empty.
+/// Hitting `Unknown` — the boundary's true state cannot be determined —
+/// rules out both single-band answers for the rest of the search, since
+/// `Empty`'s monotonicity no longer covers the boundaries below it. The
+/// search continues upward regardless and reports
+/// [`ForwardAnchor::UnverifiedGap`] anchored on the lowest boundary it
+/// goes on to prove `Found`, or on `latest` when it proves none.
 ///
 /// The immediately-following boundary is tried first as a fast path: for
 /// ordinary, non-gapped pagination this resolves in one probe and never
@@ -740,6 +751,8 @@ async fn forward_anchor(
         .div_ceil(history_step_size)
         .saturating_mul(history_step_size);
 
+    let mut saw_unreadable_boundary = false;
+
     match probe_step_boundary(
         repository,
         branch,
@@ -756,7 +769,9 @@ async fn forward_anchor(
             });
         }
         BoundaryProbe::Empty => {}
-        BoundaryProbe::Unknown => return Ok(ForwardAnchor::UnverifiedGap { anchor: latest }),
+        // Records the gap without ending the search: a `Found` boundary
+        // above this one is still a far lower descent anchor than `latest`.
+        BoundaryProbe::Unknown => saw_unreadable_boundary = true,
     }
 
     let latest_state = state::State::deserialize(repository.clone(), latest)
@@ -767,13 +782,14 @@ async fn forward_anchor(
         latest_state.revision_number().div_ceil(history_step_size) * history_step_size;
 
     if latest_boundary <= first_boundary {
-        // Nothing above `first_boundary` is sealed at all — the target
-        // lives in latest's own (always-open) band.
+        // `latest` is numbered above `first_number` and at or below
+        // `first_boundary`, itself at most one step above `first_number`:
+        // both sit in the same band whatever the probe above reported.
         return Ok(ForwardAnchor::LatestBand { anchor: latest });
     }
 
-    // Invariant: `low` is a boundary proven `Empty` (established above for
-    // `first_boundary`, or by the loop body below); `high` is either
+    // Invariant: `low` is a boundary proven `Empty`, or one that could
+    // not be read; `high` is either
     // `latest_boundary` (an unsealed sentinel) or a boundary proven
     // `Found`, whose hash is cached in `high_anchor`. Both start, and
     // every `mid` stays, a multiple of `history_step_size`, so
@@ -794,20 +810,30 @@ async fn forward_anchor(
                 high_anchor = Some(revision);
             }
             BoundaryProbe::Empty => low = mid,
+            // An unreadable boundary leaves the half below `mid`
+            // unexcluded, so narrowing upward can only overshoot the
+            // lowest `Found` boundary, never settle on a bad anchor:
+            // every `Found` is proven above `first_number` on its own,
+            // however the search reached it.
             BoundaryProbe::Unknown => {
-                return Ok(ForwardAnchor::UnverifiedGap {
-                    anchor: high_anchor.unwrap_or(latest),
-                });
+                saw_unreadable_boundary = true;
+                low = mid;
             }
         }
     }
 
-    match high_anchor {
-        Some(revision) if high < latest_boundary => Ok(ForwardAnchor::Sealed {
+    match (saw_unreadable_boundary, high_anchor) {
+        // Both single-band answers rest on `Empty` holding for every
+        // boundary at or below `low`, which one unreadable boundary
+        // anywhere in the search breaks.
+        (true, high_anchor) => Ok(ForwardAnchor::UnverifiedGap {
+            anchor: high_anchor.unwrap_or(latest),
+        }),
+        (false, Some(revision)) if high < latest_boundary => Ok(ForwardAnchor::Sealed {
             anchor: revision,
             boundary: high,
         }),
-        _ => Ok(ForwardAnchor::LatestBand { anchor: latest }),
+        (false, _) => Ok(ForwardAnchor::LatestBand { anchor: latest }),
     }
 }
 
@@ -868,10 +894,9 @@ async fn forward_target(
 
 /// Walks `parent_self` from `anchor` down to the lowest revision numbered
 /// strictly above `first_number`, without assuming the gap fits in one
-/// band. When `step_keys` acceleration is enabled, backfills any
-/// step-boundary skip pointer discovered missing along the way — mirroring
-/// the backfill `walk_revisions` performs for the `FullIteration` strategy
-/// — so a request that pays this walk's cost once repairs the fast path
+/// band. When `step_keys` acceleration is enabled, writes the
+/// step-boundary skip pointer for every boundary the walk crosses, so a
+/// request that pays this walk's cost once leaves the fast path in place
 /// for later requests instead of leaving every subsequent lookup to
 /// rediscover the same gap.
 ///
@@ -903,6 +928,8 @@ async fn descend_unverified_gap(
     // per the caller's guarantee that every `ForwardAnchor` variant is
     // numbered above `first_number`.
     let mut last_above = anchor;
+    let mut hops: u64 = 0;
+    let mut sealed: u64 = 0;
 
     loop {
         let current_state = state::State::deserialize(repository.clone(), hash)
@@ -910,6 +937,14 @@ async fn descend_unverified_gap(
             .filter_slow_down()?
             .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
         let number = current_state.revision_number();
+
+        hops += 1;
+        if hops.is_multiple_of(GAP_DESCENT_PROGRESS_HOPS) {
+            debug!(
+                {BRANCH} = %branch, hops, number, first_number, sealed,
+                "Forward-cursor gap descent still walking",
+            );
+        }
 
         if step_keys_enabled
             && let Some(previous_state) = &prev_state
@@ -920,7 +955,11 @@ async fn descend_unverified_gap(
             )
         {
             for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
-                let _ = cache::revision::seal_boundary_revision_number(
+                // Counts what reached the store, not what was attempted:
+                // a descent reporting repairs it did not make reads as a
+                // fast path restored, when the next request will walk the
+                // same distance again.
+                if cache::revision::seal_boundary_revision_number(
                     repository.clone(),
                     branch,
                     history_step_size,
@@ -928,12 +967,19 @@ async fn descend_unverified_gap(
                     &current_state,
                     previous_state,
                 )
-                .await;
-                debug!(boundary, "Backfilled history step key during gap descent");
+                .await
+                .is_ok()
+                {
+                    sealed += 1;
+                }
             }
         }
 
         if number <= first_number {
+            debug!(
+                {BRANCH} = %branch, %anchor, first_number, hops, sealed,
+                "Forward-cursor gap descent complete",
+            );
             return Ok(last_above);
         }
         last_above = hash;
@@ -1037,7 +1083,10 @@ async fn forward_cursor(
             .await?
         }
         ForwardAnchor::UnverifiedGap { anchor } => {
-            debug!({BRANCH} = %branch, "forward_cursor - calculating from unverified gap");
+            debug!(
+                {BRANCH} = %branch, first_number, %anchor,
+                "forward_cursor - calculating from unverified gap",
+            );
             descend_unverified_gap(
                 repository,
                 branch,
