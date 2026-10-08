@@ -290,9 +290,12 @@ pub enum CellSchemaRevision {
     R28,
     /// `R28` plus forward step 0029: superseded spool markers and the cleanup due time.
     R29,
-    /// `R29` plus forward step 0030: running spool charge counters (WP-115 row 78). The current
-    /// state.
+    /// `R29` plus forward step 0030: running spool charge counters (WP-115 row 78).
     R30,
+    /// `R30` plus forward step 0031: BLAKE3 leaves `PostgreSQL` (WP-115 readiness blocker 6).
+    /// Database-built records are preimages only, and no procedure hashes with BLAKE3. The
+    /// current state.
+    R31,
 }
 
 impl CellSchemaRevision {
@@ -306,6 +309,7 @@ impl CellSchemaRevision {
             Self::R28 => "R28",
             Self::R29 => "R29",
             Self::R30 => "R30",
+            Self::R31 => "R31",
         }
     }
 
@@ -319,12 +323,13 @@ impl CellSchemaRevision {
             Self::R28 => 28,
             Self::R29 => 29,
             Self::R30 => 30,
+            Self::R31 => 31,
         }
     }
 }
 
 /// The state a fully installed or fully upgraded cell must attest as.
-pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R30;
+pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R31;
 
 /// One forward step between two adjacent known states.
 ///
@@ -382,10 +387,29 @@ BEGIN
  END IF;
 END $prelude$;";
 
+/// Message the R30 -> R31 prelude raises for a cell with enrolled dispatcher participants.
+const R30_ENROLLED_PARTICIPANTS_REFUSAL: &str = "CR038_UPGRADE_R30_ENROLLED_PARTICIPANTS";
+
+/// 0031 moves the participant commitment from BLAKE3 to the built-in SHA-256, and rebuilds every
+/// spool and dispatcher record without its digest. A BLAKE3 commitment cannot be converted without
+/// the participant key, so a cell holding any enrolled participant is refused (no real cell has
+/// one). The step locks the four drain tables and the two dispatcher tables it rewrites.
+const R30_TO_R31_PRELUDE_SQL: &str = "SET LOCAL ROLE object_dispatch_retention_owner;
+LOCK TABLE object_store_retention.object_dispatch_spool_objects,
+ object_store_retention.drain_spool_custody,object_store_retention.object_dispatch_quota_usage,
+ object_store_retention.drain_policies,object_store_retention.object_dispatch_dispatchers,
+ object_store_retention.object_dispatch_dispatcher_participants IN ACCESS EXCLUSIVE MODE NOWAIT;
+DO $prelude$
+BEGIN
+ IF EXISTS (SELECT 1 FROM object_store_retention.object_dispatch_dispatcher_participants) THEN
+  RAISE EXCEPTION 'CR038_UPGRADE_R30_ENROLLED_PARTICIPANTS' USING ERRCODE='55000';
+ END IF;
+END $prelude$;";
+
 /// The forward steps, in order, each from one known state to the next (CR-038 D2 as amended by
 /// the 2026-09-23 addendum). `upgrade` chains them until the cell reaches [`CELL_SCHEMA_CURRENT`].
 /// A cell at a state outside [`CELL_SCHEMA_STATES`] is still refused, never walked forward.
-pub const CELL_FORWARD_STEPS: [CellForwardStep; 5] = [
+pub const CELL_FORWARD_STEPS: [CellForwardStep; 6] = [
     CellForwardStep {
         from: CellSchemaRevision::R25,
         to: CellSchemaRevision::R26,
@@ -432,6 +456,17 @@ pub const CELL_FORWARD_STEPS: [CellForwardStep; 5] = [
         ),
         unwrap_frozen_transaction: false,
         prelude_sql: DRAIN_TABLES_LOCK_SQL,
+    },
+    CellForwardStep {
+        from: CellSchemaRevision::R30,
+        to: CellSchemaRevision::R31,
+        migration: cell_migration!(
+            31,
+            "0031_object_store_dispatch_hash_to_rust.sql",
+            "4ff9da3310218ee1430aa9b6209dbd93d0484f111ed57cda1ae68c7c346a308c"
+        ),
+        unwrap_frozen_transaction: false,
+        prelude_sql: R30_TO_R31_PRELUDE_SQL,
     },
 ];
 
@@ -1332,6 +1367,33 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R30: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R30: [u8; 32] =
     hex32("556373cbc34fc3054a2f9049d0ac9e6264609ab4afae4d6ddbc68caf6cd56b75");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R31`], `PostgreSQL` 16.
+///
+/// Forward step 0031 replaces fourteen function bodies, creates `drain_check_ready_v2` and drops
+/// four functions, drops `NOT NULL` from two digest columns, and swaps their tail `CHECK`s for
+/// NULL checks. So `columns`, `constraints`, `functions` and `function_acls` move against the R30
+/// pin and the other eight do not. Measured 2026-10-08 on `postgres:16` (160014, a plain image
+/// with no `plpython3u` and no `public.blake3`) both from a fresh install and from an R30 cell
+/// carrying a reserved and a ready spool row; the two manifests were identical.
+pub const CELL_CATALOG_SECTION_BLAKE3_R31: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R30[0],
+    CELL_CATALOG_SECTION_BLAKE3_R30[1],
+    hex32("69b7435b3a25f6ab2eb2b5e39b660b9daf3342ddce04cf8a37cc5d1eb7b5d91e"),
+    hex32("6e553dc3fcff248d9d3b932f3bb5b532eca2970eece1ad2b97284ca2d5c894b2"),
+    CELL_CATALOG_SECTION_BLAKE3_R30[4],
+    CELL_CATALOG_SECTION_BLAKE3_R30[5],
+    hex32("3a86c9b4b7fc76b91c7e078aed7060cae1161037cdfd35cca46b418e42ec1112"),
+    hex32("5a244561cc62abb5b205e08f1ddb9262dc0f52b130084efea562174e22213b68"),
+    CELL_CATALOG_SECTION_BLAKE3_R30[8],
+    CELL_CATALOG_SECTION_BLAKE3_R30[9],
+    CELL_CATALOG_SECTION_BLAKE3_R30[10],
+    CELL_CATALOG_SECTION_BLAKE3_R30[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R31`] cell, `PostgreSQL` 16.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R31: [u8; 32] =
+    hex32("f27b8611d1c89cd0741202615f0e3719411554e8fcc84ba43962d5f4615d7a0d");
+
 /// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 16 (CR-038 addendum).
 ///
 /// Measured 2026-09-23 on `postgres:16` from a fresh 0002-0025 install. The same twelve digests
@@ -1383,7 +1445,7 @@ pub const CELL_CATALOG_MANIFEST_BLAKE3_R26: [u8; 32] =
     hex32("b944ad69c2cd0efc047f54096f4ac17f815a2944efdfe3818b10bcfe7d6bcbdc");
 
 /// Every known state with its pins, oldest first. Attestation classifies against this closed list.
-pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 6] = [
+pub const CELL_SCHEMA_STATES: CellSchemaStatePins = [
     (
         CellSchemaRevision::R25,
         CELL_CATALOG_SECTION_BLAKE3_R25,
@@ -1413,6 +1475,11 @@ pub const CELL_SCHEMA_STATES: [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 6
         CellSchemaRevision::R30,
         CELL_CATALOG_SECTION_BLAKE3_R30,
         CELL_CATALOG_MANIFEST_BLAKE3_R30,
+    ),
+    (
+        CellSchemaRevision::R31,
+        CELL_CATALOG_SECTION_BLAKE3_R31,
+        CELL_CATALOG_MANIFEST_BLAKE3_R31,
     ),
 ];
 
@@ -1554,8 +1621,33 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R30_PG18: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R30_PG18: [u8; 32] =
     hex32("170c5da720df7a8d6f5c6f0f0c1a77980449b46051016f76911a16ebb692eebc");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R31`], `PostgreSQL` 18.
+///
+/// Measured 2026-10-08 on `postgres:18` (180006, a plain image with no `plpython3u` and no
+/// `public.blake3`) from a fresh install and from a seeded R30 cell; identical. Against the R31
+/// `PostgreSQL` 16 pin, the same three sections differ as in every state: `constraints`,
+/// `functions`, `relation_acls`.
+pub const CELL_CATALOG_SECTION_BLAKE3_R31_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R31[0],
+    CELL_CATALOG_SECTION_BLAKE3_R31[1],
+    CELL_CATALOG_SECTION_BLAKE3_R31[2],
+    hex32("22ff758c26184101911c6325be1a36d305a1d25f76439a472ec4698a66417efc"),
+    CELL_CATALOG_SECTION_BLAKE3_R31[4],
+    CELL_CATALOG_SECTION_BLAKE3_R31[5],
+    hex32("6450aa635c548d57f42939944e90b7ddbc98d1dd53f07b09f054092f763ee42c"),
+    CELL_CATALOG_SECTION_BLAKE3_R31[7],
+    CELL_CATALOG_SECTION_BLAKE3_R30_PG18[8],
+    CELL_CATALOG_SECTION_BLAKE3_R31[9],
+    CELL_CATALOG_SECTION_BLAKE3_R31[10],
+    CELL_CATALOG_SECTION_BLAKE3_R31[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R31`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R31_PG18: [u8; 32] =
+    hex32("e5b283d671f3fcc9a8f16a743088068e01feaeafb01ad9ac5563b8395e6a6097");
+
 /// One major's closed list of known states: each state with its section pins and manifest pin.
-pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 6];
+pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 7];
 
 /// Every known `PostgreSQL` 18 state with its pins, oldest first.
 pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
@@ -1588,6 +1680,11 @@ pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
         CellSchemaRevision::R30,
         CELL_CATALOG_SECTION_BLAKE3_R30_PG18,
         CELL_CATALOG_MANIFEST_BLAKE3_R30_PG18,
+    ),
+    (
+        CellSchemaRevision::R31,
+        CELL_CATALOG_SECTION_BLAKE3_R31_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R31_PG18,
     ),
 ];
 
@@ -2212,7 +2309,7 @@ pub async fn release_cell_schema_lock(client: &Client) -> Result<(), CellSchemaE
 }
 
 /// Move a cell at any known older state to [`CELL_SCHEMA_CURRENT`] (CR-038 and its 2026-09-23
-/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28 -> R29 -> R30.
+/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28 -> R29 -> R30 -> R31.
 ///
 /// Offline only: every replica must be stopped. The session guard checks ONCE before each step's
 /// `BEGIN`: it refuses if any other session is connected to the cell database. A session that
@@ -2365,6 +2462,15 @@ fn forward_step_error(error: tokio_postgres::Error) -> CellSchemaError {
         CellSchemaError::Precondition(
             "R25 upgrade refused: the cell has charged spool quota that cannot be carried forward \
              (no R25 procedure ever returns it); reinstall the cell (install on a fresh database) \
+             or get an owner decision",
+        )
+    } else if database_error.message() == R30_ENROLLED_PARTICIPANTS_REFUSAL {
+        // Why: R31 checks the participant commitment with SHA-256, and a stored BLAKE3 commitment
+        // cannot be converted without the key it commits to. What clears it: nothing automatic.
+        // Re-enroll each participant after the upgrade, on a cell whose participants were removed.
+        CellSchemaError::Precondition(
+            "R30 upgrade refused: the cell has enrolled dispatcher participants whose BLAKE3 key \
+             commitments R31 cannot check (R31 uses SHA-256); remove them, upgrade, and re-enroll, \
              or get an owner decision",
         )
     } else {

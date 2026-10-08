@@ -31,12 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get(0);
     admin.batch_execute(&format!("GRANT CREATE ON DATABASE \"{}\" TO object_dispatch_retention_owner; SET SESSION AUTHORIZATION object_dispatch_retention_migrator;", database.replace('"', "\"\""))).await?;
     lore_object_dispatch::cell_schema_install::install_cell_schema(&admin).await?;
-    admin.batch_execute("RESET SESSION AUTHORIZATION;
-      CREATE EXTENSION IF NOT EXISTS plpython3u;
-      CREATE OR REPLACE FUNCTION public.blake3(payload bytea) RETURNS bytea LANGUAGE plpython3u IMMUTABLE STRICT AS $$
-import blake3
-return blake3.blake3(bytes(payload)).digest()
-$$;").await?;
+    // R31: the database computes no BLAKE3, so the install above needs no `plpython3u` and no
+    // `public.blake3`, and this fixture installs neither. It runs on a plain postgres image.
+    admin.batch_execute("RESET SESSION AUTHORIZATION;").await?;
     let row = admin.query_one("SELECT s.system_identifier::text,d.oid::bigint,floor(extract(epoch FROM clock_timestamp())*1000)::bigint FROM pg_control_system() s,pg_database d WHERE d.datname=current_database()", &[]).await?;
     let system: String = row.get(0);
     let oid = u32::try_from(row.get::<_, i64>(1))?;

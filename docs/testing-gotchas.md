@@ -129,11 +129,11 @@ it's derived from another column rather than a fixed literal.
   `(logical_request_id, attempt_id, terminal_result_id)` — the three values must match a seeded
   request row *exactly*, including `terminal_result_id`, which is easy to drift into a
   differently-spelled placeholder string across two independently-written INSERTs.
-- **`drain_cleanup_release_v1` needs a real BLAKE3 provider even when the test's point is the
-  metadata true-up, not the release receipt.** It calls `local_blake3_v1` unconditionally to sign
-  the release receipt; without `public.blake3(bytea)` installed, every path through this function —
-  including the underflow case — fails with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE` before reaching the
-  logic under test.
+- **Through R30, `drain_cleanup_release_v1` needs a real BLAKE3 provider even when the test's point
+  is the metadata true-up, not the release receipt.** It called `local_blake3_v1` to sign the
+  receipt; without `public.blake3(bytea)` every path through it failed with
+  `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`. From R31 (migration 0031) it signs nothing and needs no
+  provider; only R25-R30 fixture cells (`install_cell_schema_at`) still do.
 - **`drain_cleanup_claim_v2` (0029; `_v1` before it) refuses `DRAIN_CLEANUP_TOO_EARLY` until the
   reservation's own expiry passes.** A fixture driving reserve→claim→release back-to-back (to
   simulate load quickly, not a realistic multi-minute TTL) must give the policy/descriptor a short
@@ -194,16 +194,13 @@ it's derived from another column rather than a fixed literal.
   yet. A call already at the current state needs none of this (D4 only gates the one transition).
 
 - **`ReservePutRequest`'s `*_blake3` fields are opaque 32-byte tokens, not hashes the client must
-  derive.** 0013's `reserve_put` stores whatever bytes are supplied for `boundary_blake3`,
-  `observation_binding_blake3`, `expected_blake3` and `put_reservation_fingerprint`; there is no
-  server-side check that they are a real digest of anything. But the shared canonical-record codec
-  (0009) it calls into DOES need a real `public.blake3(bytea)` provider to verify its own generated
-  ACK digest — a fresh disposable database with no BLAKE3 provider installed fails every
-  `reserve_put` call with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`, even though nothing in the request
-  itself "needed" hashing. Install the provider (the genuine `plpython3u` one from
-  `run-cell-schema-forward-upgrade-live.ps1`'s image, not a golden-vector stand-in) before any real
-  `reserve_put`/`put_upload_progress`/`put_spool_ready` call, not just before a release/compaction
-  call.
+  derive.** `reserve_put` stores whatever bytes are supplied for `boundary_blake3`,
+  `observation_binding_blake3`, `expected_blake3` and `put_reservation_fingerprint`; nothing checks
+  that they digest anything. Through R30 the shared codec (0009) still needed a real
+  `public.blake3(bytea)` for its own ACK digest, so an R25-R30 fixture with no provider failed every
+  `reserve_put`/`put_upload_progress`/`put_spool_ready` with `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`;
+  install the genuine `plpython3u` provider (`run-cell-schema-forward-upgrade-live.ps1`'s image, not
+  a golden-vector stand-in) for those. From R31 the codec builds a digest-free preimage; none needed.
 - **A `CREATE TABLE`/`DROP TABLE` drift probe can flake a following D4 exclusivity check.** Planting
   catalog drift with a table (then dropping it to undo the plant) can attract a stray autovacuum
   backend shortly afterward; `upgrade_cell_schema`'s "no other session connected" poll
@@ -236,6 +233,40 @@ See `lore-object-dispatch/tests/cell_schema_forward_upgrade_live.rs` for the res
 `admit_one_reserved_spool_object`) and `run-cell-schema-forward-upgrade-live.ps1` for the dedicated
 BLAKE3-capable container.
 
+## R31 (migration 0031, BLAKE3 leaves PostgreSQL) fixture gotchas
+
+- **`new row ... violates check constraint "..._record_blake3_null_ck"` on a seeded row.** From R31
+  `object_dispatch_spool_objects.record_blake3`, `.reserve_put_ack_blake3` and
+  `object_dispatch_dispatchers.record_blake3` are NULL by CHECK, and 0007's "bytes end with the
+  digest" CHECKs are gone. A direct INSERT must write NULL there (`tests/common/cell_retention_rows.sql`,
+  `seed_metadata_true_up_fixture`). `release_receipt_blake3` on a lifecycle-3 spool row is separate:
+  it keeps its presence and tail-equals-digest CHECKs, so `cell_retention_live.rs` writes a literal
+  32-byte value and bytes that end with it.
+- **A full-chain tier cannot reach reserve or ready through the runtime role as 0026 left it.**
+  0026 revoked runtime EXECUTE on the raw `reserve_put`/`put_upload_progress`, and
+  `put_spool_ready_v1` refuses `DRAIN_READY_EXPIRED_OR_FENCED` without live drain custody under an
+  unexpired policy. `dispatch_client_live.rs` re-grants the two raw procedures as the superuser and
+  seeds the policy and custody pair (the custody insert trigger needs a descriptor naming the
+  policy's revision and hex digest); the ready procedure still runs for real.
+- **Expected v2 bytes come from the row's input columns, built by hand.** `dispatch_client_live.rs`
+  assembles each fixture-constant preimage; `cell_schema_forward_upgrade_live.rs` (`SpoolInputs`,
+  `ack_v2`, `row_v2`) rebuilds a backfilled row from the columns the database did not compute.
+  Never call a SQL codec to build the expectation. Children are framed `u32 length || preimage`; the
+  reservation and ready rows no longer carry the raw ack digest.
+- **The R31 participant commitment is SHA-256, computed by `tests/common/sha256.rs`** (NIST-vector
+  `self_check`, no new dev-dependency). The database's own `sha256()` would make the expectation
+  circular. A participant enrolled under the old BLAKE3 commitment must fail to authenticate.
+- **Pin the cut by measuring it.** Tampering the stored ack in place is still refused (every replay
+  recomputes ack and record from the columns and compares bytes); tampering the stored release
+  receipt is not noticed, because nothing reads it back. A policy digest that is not the policy's
+  BLAKE3 publishes and reads back at the database, and only `DrainClient::read` refuses it
+  (`DrainError::Invalid`, not `Refused`, which tells Rust's refusal from the database's).
+- **The release underflow discrimination proof reads the function from 0031's text**
+  (`real_release_function_body`) and mutates the guard with a replace that asserts it matched, so
+  there is no second hand-copied literal to drift.
+- **`lore-postgres/tests/run-write-behind-linux.ps1` defaults to plain `postgres:18-bookworm`.** Its
+  Linux target volume is ~64 GB; a second `-RunNamespace` doubles that and does not fit beside it on
+  C:. Run it on the default volumes, and only when no other lane's `wb-linux-*` container is up.
 ## CR-039 fragment-schema-upgrade fixture gotchas
 
 Building a revision-4 clean-cell fixture by clean-initializing (reaching the compiled revision) then

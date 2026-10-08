@@ -14,6 +14,9 @@ There is no separate dispatcher process, no in-cell mTLS service, and no survivi
 ### Out-of-Band Cell Schema Install (WP-114 CD-1)
 Migrations are never auto-installed by runtime. They are installed out of band through the concrete `cell-schema-install` binary.
 - **TLS:** The installer's transport follows the same rule as the dispatch pool (`dispatch_pool::cell_tls_connector`). When `LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM` (PEM text) is set, the URL must say `sslmode=require`. The server is verified against exactly that bundle (chain and host name, libpq `verify-full` semantics). When it is unset, the URL must say `sslmode=disable`. `prefer` or a missing `sslmode` exits 2.
+- **Install set:** migrations `0002`, `0003`, then `0007` through `0031` (`0004`-`0006` stay deferred); the embedded identity is cell schema R31 (R30 plus forward step `0031`). Existing R30 cells reach R31 through `cell-schema-install upgrade`.
+- **No database BLAKE3:** the cell Postgres provides no `public.blake3` and needs no plpython3u. Rust callers compute and check BLAKE3 digests and hash columns; the database does not verify them. The participant key check uses the built-in `sha256()`.
+
 For a detailed catalogue of embedded migrations (including BLAKE3 hashes and detailed bytes sizes), see [README-migrations.md](./README-migrations.md).
 
 ### Shared Spool Verifier

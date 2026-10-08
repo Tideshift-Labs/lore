@@ -63,9 +63,7 @@ fn ready() -> PutSpoolReadyOutcome {
         committed_blake3: DIGEST,
         ready_at_unix_ms: 1_700_000_000_000,
         reserve_put_ack_canonical_bytes: vec![1, 2, 3],
-        reserve_put_ack_blake3: [0xb6; 32],
         spool_revision: 7,
-        record_blake3: [0xc7; 32],
     }
 }
 

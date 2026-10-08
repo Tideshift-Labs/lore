@@ -104,7 +104,7 @@ param(
     [switch]$SkipLive,
     [switch]$IncludeCompileFail,
     [switch]$Clippy,
-    [string]$PostgresImage = 'commit0-postgres-blake3:pg18-local-tests'
+    [string]$PostgresImage = 'postgres:18-bookworm'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -796,21 +796,6 @@ try {
         }
     }
     else {
-        if (-not $PSBoundParameters.ContainsKey('PostgresImage')) {
-            & docker image inspect $PostgresImage *> $null
-            if ($LASTEXITCODE -ne 0) {
-                $postgresContext = [IO.Path]::GetFullPath((Join-Path $loreRoot '../lorehub/docker/dev-cell'))
-                $postgresDockerfile = Join-Path $postgresContext 'Dockerfile.postgres-blake3'
-                if (-not (Test-Path -LiteralPath $postgresDockerfile)) {
-                    throw "local PostgreSQL fixture Dockerfile missing: $postgresDockerfile; supply -PostgresImage explicitly"
-                }
-                # $expectedPgMajor is parsed from this same $PostgresImage tag above; pass it through
-                # so the built image's actual major matches what its own tag claims, rather than
-                # silently taking the Dockerfile's ARG PG_MAJOR default of 16 regardless of tag.
-                Invoke-Checked docker @('build', '--file', $postgresDockerfile, '--tag', $PostgresImage, '--build-arg', "PG_MAJOR=$expectedPgMajor", $postgresContext)
-            }
-            $global:LASTEXITCODE = 0
-        }
         $fixtureBuild = Invoke-InContainer -Command @('cargo', 'build', '-p', 'lore-object-dispatch', '--example', 'write-behind-test-fixture')
         if ($fixtureBuild.ExitCode -ne 0) { throw "adapter fixture build failed: $($fixtureBuild.Output)" }
         Invoke-Checked docker @(

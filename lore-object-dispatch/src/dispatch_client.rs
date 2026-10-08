@@ -76,8 +76,7 @@ const RESERVE_PUT_SQL: &str = "SELECT
   ((r).upload_fence)::text,
   (r).admission_clock_unix_ms,
   (r).expires_at_unix_ms,
-  (r).reserve_put_ack_canonical_bytes,
-  (r).reserve_put_ack_blake3
+  (r).reserve_put_ack_canonical_bytes
 FROM (SELECT object_store_retention.object_store_dispatch_reserve_put_v1(
   $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
   $11::text::object_store_retention.uint64, $12, $13, $14,
@@ -115,8 +114,7 @@ const PUT_UPLOAD_PROGRESS_SQL: &str = "SELECT
   ((r).upload_fence)::text,
   ((r).committed_prefix_bytes)::text,
   ((r).committed_prefix_chunks)::text,
-  ((r).spool_revision)::text,
-  (r).record_blake3
+  ((r).spool_revision)::text
 FROM (SELECT object_store_retention.object_store_dispatch_put_upload_progress_v1(
   $1, $2, $3, $4, $5, $6, $7, $8,
   $9::text::object_store_retention.uint64,
@@ -137,9 +135,7 @@ const PUT_SPOOL_READY_SQL: &str = "SELECT
   (r).committed_blake3,
   (r).ready_at_unix_ms,
   (r).reserve_put_ack_canonical_bytes,
-  (r).reserve_put_ack_blake3,
-  ((r).spool_revision)::text,
-  (r).record_blake3
+  ((r).spool_revision)::text
 FROM (SELECT object_store_retention.object_store_dispatch_put_spool_ready_v1(
   $1, $2, $3, $4, $5, $6, $7, $8,
   $9::text::object_store_retention.uint64,
@@ -163,8 +159,7 @@ const REGISTER_DISPATCHER_SQL: &str = "SELECT
   (r).provider_boundary_id,
   (r).service_instance_id,
   ((r).dispatcher_fence)::text,
-  (r).state,
-  (r).record_blake3
+  (r).state
 FROM (SELECT object_store_retention.object_store_dispatch_register_dispatcher_v1(
   $1, $2,
   $3::text::object_store_retention.uint64,
@@ -222,10 +217,6 @@ pub enum DispatchAuthorityError {
     InvalidArgument,
     #[error("cell authority could not form a valid canonical record from this call's inputs")]
     CanonicalRecordInvalid,
-    /// The cell database's `public.blake3` provider is absent or returned an unusable digest. A
-    /// deployment prerequisite, not schema drift and not a caller error.
-    #[error("cell authority's BLAKE3 digest provider is unavailable or unusable")]
-    DigestProviderUnavailable,
     /// A supplied `UUIDv7`'s embedded timestamp is outside the window the authority admits against
     /// its own clock. Distinct from a malformed identifier: the identifier is well formed.
     #[error("supplied identifier's timestamp is outside the cell authority's admission window")]
@@ -260,7 +251,7 @@ pub enum DispatchAuthorityError {
     ParticipantAuthenticationRequired,
     #[error("dispatcher participant enrollment state is not usable")]
     ParticipantStateInvalid,
-    #[error("dispatcher participant key digest is not a 32-byte BLAKE3 digest")]
+    #[error("dispatcher participant key digest is not a 32-byte SHA-256 digest")]
     ParticipantKeyDigestInvalid,
     #[error("cell authority requires a serializable read-write transaction")]
     SerializableTransactionRequired,
@@ -494,6 +485,9 @@ impl fmt::Debug for ReservePutRequest {
 }
 
 /// 0013's projected reservation.
+///
+/// From cell schema R31 the ack is the database-built preimage only
+/// (`object-store-local-reserve-put-ack-v2`); the database computes no digest over it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ReservePutOutcome {
     pub spool_object_id: Uuid,
@@ -504,7 +498,6 @@ pub struct ReservePutOutcome {
     pub admission_clock_unix_ms: i64,
     pub expires_at_unix_ms: i64,
     pub reserve_put_ack_canonical_bytes: Vec<u8>,
-    pub reserve_put_ack_blake3: [u8; 32],
 }
 
 impl fmt::Debug for ReservePutOutcome {
@@ -519,7 +512,6 @@ impl fmt::Debug for ReservePutOutcome {
             .field("admission_clock_unix_ms", &self.admission_clock_unix_ms)
             .field("expires_at_unix_ms", &self.expires_at_unix_ms)
             .field("reserve_put_ack_canonical_bytes", &"[REDACTED]")
-            .field("reserve_put_ack_blake3", &"[REDACTED]")
             .finish()
     }
 }
@@ -558,7 +550,6 @@ pub struct PutUploadProgressOutcome {
     pub committed_prefix_bytes: u64,
     pub committed_prefix_chunks: u64,
     pub spool_revision: u64,
-    pub record_blake3: [u8; 32],
 }
 
 impl fmt::Debug for PutUploadProgressOutcome {
@@ -573,7 +564,6 @@ impl fmt::Debug for PutUploadProgressOutcome {
             .field("committed_prefix_bytes", &"[REDACTED]")
             .field("committed_prefix_chunks", &"[REDACTED]")
             .field("spool_revision", &"[REDACTED]")
-            .field("record_blake3", &"[REDACTED]")
             .finish()
     }
 }
@@ -611,6 +601,9 @@ impl fmt::Debug for PutSpoolReadyRequest {
 }
 
 /// 0017's projected ready row.
+///
+/// `(spool_revision, ready_at_unix_ms)` is the row's ready token: `drain_check_ready_v2` CASes on
+/// it (cell schema R31), since the database no longer builds a record digest.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PutSpoolReadyOutcome {
     pub spool_object_id: Uuid,
@@ -623,9 +616,7 @@ pub struct PutSpoolReadyOutcome {
     pub committed_blake3: [u8; 32],
     pub ready_at_unix_ms: i64,
     pub reserve_put_ack_canonical_bytes: Vec<u8>,
-    pub reserve_put_ack_blake3: [u8; 32],
     pub spool_revision: u64,
-    pub record_blake3: [u8; 32],
 }
 
 impl fmt::Debug for PutSpoolReadyOutcome {
@@ -642,9 +633,7 @@ impl fmt::Debug for PutSpoolReadyOutcome {
             .field("committed_blake3", &"[REDACTED]")
             .field("ready_at_unix_ms", &self.ready_at_unix_ms)
             .field("reserve_put_ack_canonical_bytes", &"[REDACTED]")
-            .field("reserve_put_ack_blake3", &"[REDACTED]")
             .field("spool_revision", &"[REDACTED]")
-            .field("record_blake3", &"[REDACTED]")
             .finish()
     }
 }
@@ -654,7 +643,10 @@ impl fmt::Debug for PutSpoolReadyOutcome {
 pub struct EnrollParticipantRequest {
     pub provider_boundary_id: String,
     pub dispatcher_id: String,
-    pub participant_key_blake3: [u8; 32],
+    /// SHA-256 of the participant key (cell schema R31). The database stores it in the column
+    /// still named `participant_key_blake3` and registration checks `sha256(participant_key)`
+    /// against it.
+    pub participant_key_sha256: [u8; 32],
 }
 
 impl fmt::Debug for EnrollParticipantRequest {
@@ -663,7 +655,7 @@ impl fmt::Debug for EnrollParticipantRequest {
             .debug_struct("EnrollParticipantRequest")
             .field("provider_boundary_id", &"[REDACTED]")
             .field("dispatcher_id", &"[REDACTED]")
-            .field("participant_key_blake3", &"[REDACTED]")
+            .field("participant_key_sha256", &"[REDACTED]")
             .finish()
     }
 }
@@ -732,7 +724,6 @@ pub struct RegisterDispatcherOutcome {
     pub service_instance_id: String,
     pub dispatcher_fence: u64,
     pub state: i16,
-    pub record_blake3: [u8; 32],
 }
 
 impl fmt::Debug for RegisterDispatcherOutcome {
@@ -745,7 +736,6 @@ impl fmt::Debug for RegisterDispatcherOutcome {
             .field("service_instance_id", &"[REDACTED]")
             .field("dispatcher_fence", &"[REDACTED]")
             .field("state", &self.state)
-            .field("record_blake3", &"[REDACTED]")
             .finish()
     }
 }
@@ -1251,9 +1241,6 @@ fn refusal_for_condition(message: &str) -> Option<DispatchAuthorityError> {
         | "LOCAL_CANONICAL_U8_INVALID"
         | "LOCAL_CANONICAL_U32_INVALID"
         | "LOCAL_CANONICAL_RECORD_TOO_LARGE" => DispatchAuthorityError::CanonicalRecordInvalid,
-        "LOCAL_BLAKE3_PROVIDER_UNAVAILABLE" | "LOCAL_BLAKE3_PROVIDER_INVALID_RESULT" => {
-            DispatchAuthorityError::DigestProviderUnavailable
-        }
         "UUIDV7_TIMESTAMP_TOO_FAR_IN_FUTURE" => {
             DispatchAuthorityError::IdentifierTimestampOutOfRange
         }
@@ -1557,7 +1544,6 @@ impl PreparedMutation for PreparedReservePut<'_> {
             admission_clock_unix_ms: int8(row, 6)?,
             expires_at_unix_ms: int8(row, 7)?,
             reserve_put_ack_canonical_bytes: bytes(row, 8)?,
-            reserve_put_ack_blake3: digest(row, 9)?,
         };
         // Bind the projection to the descriptor this call submitted. A replay that names another
         // reservation is a different writer's record, not this call's result.
@@ -1634,7 +1620,6 @@ impl PreparedMutation for PreparedPutUploadProgress<'_> {
             committed_prefix_bytes: uint64(row, 6)?,
             committed_prefix_chunks: uint64(row, 7)?,
             spool_revision: uint64(row, 8)?,
-            record_blake3: digest(row, 9)?,
         };
         require(
             value.logical_request_id == self.request.identity.logical_request_id
@@ -1717,9 +1702,7 @@ impl PreparedMutation for PreparedPutSpoolReady<'_> {
             committed_blake3: digest(row, 8)?,
             ready_at_unix_ms: int8(row, 9)?,
             reserve_put_ack_canonical_bytes: bytes(row, 10)?,
-            reserve_put_ack_blake3: digest(row, 11)?,
-            spool_revision: uint64(row, 12)?,
-            record_blake3: digest(row, 13)?,
+            spool_revision: uint64(row, 11)?,
         };
         require(
             value.logical_request_id == self.request.identity.logical_request_id
@@ -1747,7 +1730,7 @@ impl PreparedMutation for PreparedPutSpoolReady<'_> {
 struct PreparedEnrollParticipant<'a> {
     request: &'a EnrollParticipantRequest,
     api: &'static str,
-    participant_key_blake3: Vec<u8>,
+    participant_key_sha256: Vec<u8>,
 }
 
 impl<'a> PreparedEnrollParticipant<'a> {
@@ -1755,7 +1738,7 @@ impl<'a> PreparedEnrollParticipant<'a> {
         Self {
             request,
             api: DISPATCHER_REGISTRATION_API_REVISION_V1,
-            participant_key_blake3: request.participant_key_blake3.to_vec(),
+            participant_key_sha256: request.participant_key_sha256.to_vec(),
         }
     }
 }
@@ -1772,7 +1755,7 @@ impl PreparedMutation for PreparedEnrollParticipant<'_> {
             &self.api,
             &self.request.provider_boundary_id,
             &self.request.dispatcher_id,
-            &self.participant_key_blake3,
+            &self.participant_key_sha256,
         ]
     }
 
@@ -1849,7 +1832,6 @@ impl PreparedMutation for PreparedRegisterDispatcher<'_> {
             service_instance_id: text(row, 4)?,
             dispatcher_fence: uint64(row, 5)?,
             state: int2(row, 6)?,
-            record_blake3: digest(row, 7)?,
         };
         // `dispatcher_id` and `provider_boundary_id` are database-minted from the enrolled
         // participant row, so they are not compared against a submitted value. Everything the call

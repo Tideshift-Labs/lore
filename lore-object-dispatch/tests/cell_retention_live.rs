@@ -252,7 +252,7 @@ async fn live_cell_retention_blockers_fail_readiness_and_recover_after_drain() {
         (
             1,
             "UPDATE object_store_retention.object_dispatch_spool_objects SET lifecycle_state=2,purged_at_unix_ms=NULL,release_reason=NULL,release_receipt_bytes=NULL,release_receipt_blake3=NULL",
-            "UPDATE object_store_retention.object_dispatch_spool_objects SET lifecycle_state=3,purged_at_unix_ms=1600,release_reason=1,release_receipt_bytes=canonical_record_bytes,release_receipt_blake3=record_blake3",
+            "UPDATE object_store_retention.object_dispatch_spool_objects SET lifecycle_state=3,purged_at_unix_ms=1600,release_reason=1,release_receipt_bytes=canonical_record_bytes||pg_catalog.decode(repeat('c7',32),'hex'),release_receipt_blake3=pg_catalog.decode(repeat('c7',32),'hex')",
         ),
         (
             2,

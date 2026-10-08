@@ -128,7 +128,13 @@ $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R29_PG_URL'; Name = 'live_r29_cell_is_refused_then_upgrades_and_counts_every_charge'; Database = 'r29_upgrade' },
     # Row 78 follow-up: the usesysid filter excludes a REAL autovacuum worker, not just a
     # manufactured NULL-backend_type row.
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_AUTOVACUUM_PG_URL'; Name = 'live_the_active_service_session_guard_ignores_a_real_autovacuum_worker'; Database = 'autovacuum_excluded' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_AUTOVACUUM_PG_URL'; Name = 'live_the_active_service_session_guard_ignores_a_real_autovacuum_worker'; Database = 'autovacuum_excluded' },
+    # Migration 0031 (WP-115 readiness blocker 6): BLAKE3 leaves PostgreSQL.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_BACKFILL_PG_URL'; Name = 'live_r30_cell_with_live_rows_upgrades_to_r31_and_backfills_them'; Database = 'r31_backfill' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_PARTICIPANT_PG_URL'; Name = 'live_r30_cell_with_an_enrolled_participant_is_refused_and_stays_r30'; Database = 'r31_participant' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_RECEIPT_PG_URL'; Name = 'live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by_rust'; Database = 'r31_receipt' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_REPLAY_PG_URL'; Name = 'live_r31_drain_reserve_replay_is_pinned_to_the_descriptor_digest'; Database = 'r31_replay' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_CUT_PG_URL'; Name = 'live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row'; Database = 'r31_cut' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

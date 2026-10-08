@@ -100,6 +100,17 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   needs `lore-object-dispatch = { workspace = true, features = ["test_seams"] }` in
   `[dev-dependencies]` — it's `#[cfg(feature = "test_seams")]`-gated upstream in that crate, the
   same shape `lore-transport`/`lore-revision` use their own `test_seams` for.
+- **WP-115 blocker 6: BLAKE3 leaves PostgreSQL, cell schema R31 / migration 0031 [SERVER]**: database
+  records are digest-free `*-v2` preimages; participant commitment is SHA-256; `drain_check_ready_v2`
+  takes `(spool_revision, ready_at_unix_ms)`. Offline: `cargo test -p lore-object-dispatch --test
+  cell_schema_install --test dispatch_client` (R31 pins, `the_r31_step_calls_no_database_blake3_and_emits_only_v2_record_tags`)
+  and `cargo test -p lore-fragment-provider`. Live, all on plain images with no `plpython3u`:
+  `run-cell-schema-install-live.ps1` (PG16 and PG18, `-PostgresImage postgres:16`),
+  `run-local-authority-live.ps1` (`dispatch_client_live` installs the full chain and pins hand-built
+  v2 records), and `run-cell-schema-forward-upgrade-live.ps1`, whose R25-R30 cases keep the
+  `Dockerfile.postgres-blake3` image and which adds the R30 to R31 backfill, enrolled-participant
+  refusal, and v2 release-receipt cases. Fixture traps:
+  [testing-gotchas.md](testing-gotchas.md#r31-migration-0031-blake3-leaves-postgresql-fixture-gotchas).
 - **CR-039 clean-cell fragment schema forward upgrade [SERVER, `lore-postgres/src/domain/fragments/upgrade.rs`]**:
   `PostgresFragmentCoordinator::upgrade_clean_schema` moves an exact revision-4 clean cell to
   revision 7 (WP-122's stage custody schema plus WP-115 row 78's stage charge counters), or an

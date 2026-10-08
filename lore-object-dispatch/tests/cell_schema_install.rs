@@ -1101,7 +1101,7 @@ fn strip_sql_line_comments(source: &str) -> String {
 fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
     assert_eq!(
         CELL_FORWARD_STEPS.len(),
-        5,
+        6,
         "a new forward step must extend this sweep, not bypass it"
     );
     for step in CELL_FORWARD_STEPS {
@@ -1232,12 +1232,99 @@ fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
             (CellSchemaRevision::R27, CellSchemaRevision::R28),
             (CellSchemaRevision::R28, CellSchemaRevision::R29),
             (CellSchemaRevision::R29, CellSchemaRevision::R30),
+            (CellSchemaRevision::R30, CellSchemaRevision::R31),
         ]
     );
     assert_eq!(
-        CELL_FORWARD_STEPS[4].to,
+        CELL_FORWARD_STEPS[5].to,
         lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT
     );
+}
+
+#[test]
+fn the_r31_step_calls_no_database_blake3_and_emits_only_v2_record_tags() {
+    // WP-115 readiness blocker 6: BLAKE3 leaves PostgreSQL. This is the offline half of the proof;
+    // `live_postgres_cell_schema_installs_clean_and_attests` scans the installed function bodies.
+    let step = CELL_FORWARD_STEPS
+        .iter()
+        .find(|step| step.to == CellSchemaRevision::R31)
+        .expect("a step into R31");
+    assert_eq!(step.from, CellSchemaRevision::R30);
+    let code = strip_sql_line_comments(step.migration.sql);
+    // The only mentions of the four dropped functions are their DROP statements.
+    let without_drops: String = code
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("DROP FUNCTION"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in [
+        "local_blake3_v1",
+        "local_assert_blake3_v1",
+        "local_complete_record_v1",
+        "drain_check_ready_v1",
+        "public.blake3",
+        "plpython",
+    ] {
+        assert!(
+            !without_drops.contains(forbidden),
+            "0031 must not call {forbidden}: BLAKE3 left the database"
+        );
+    }
+    assert_eq!(
+        code.lines()
+            .filter(|line| line.trim_start().starts_with("DROP FUNCTION"))
+            .count(),
+        4,
+        "exactly the four database hashing functions are dropped"
+    );
+    // The participant commitment is the built-in SHA-256, the one check that stays in the database.
+    let flattened = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flattened.contains(
+            "enrolled.participant_key_blake3 = pg_catalog.sha256( \
+             object_store_dispatch_register_dispatcher_v1.participant_key )"
+        ),
+        "registration must compare the enrolled commitment with the built-in SHA-256 of the key"
+    );
+    // Every record the database builds takes a new v2 tag, once, and emits no v1 tag. The v1 tags
+    // belong to the Rust and TypeScript wire encoders (or to frozen layers), which still hash.
+    for (v2, v1) in [
+        (
+            "object-store-local-quota-units-v2",
+            "object-store-local-quota-units-v1",
+        ),
+        (
+            "object-store-local-put-spool-ready-v2",
+            "object-store-local-put-spool-ready-v1",
+        ),
+        (
+            "object-store-local-reserve-put-ack-v2",
+            "object-store-local-reserve-put-ack-v1",
+        ),
+        (
+            "object-store-dispatch-put-reservation-row-v2",
+            "object-store-dispatch-put-reservation-row-v1",
+        ),
+        (
+            "object-store-dispatch-put-spool-ready-row-v2",
+            "object-store-dispatch-put-spool-ready-row-v1",
+        ),
+        (
+            "object-store-dispatch-dispatcher-registration-row-v2",
+            "object-store-dispatch-dispatcher-registration-row-v1",
+        ),
+        ("fragment-drain-release-v2", "fragment-drain-release-v1"),
+    ] {
+        assert_eq!(
+            code.matches(&format!("'{v2}'")).count(),
+            1,
+            "0031 must emit {v2} exactly once"
+        );
+        assert!(
+            !code.contains(v1),
+            "0031 must not emit the v1 tag {v1}: its layout changed, so its tag must"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

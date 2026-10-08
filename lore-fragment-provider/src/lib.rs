@@ -728,7 +728,6 @@ impl FragmentProviderError {
                 | DispatchAuthorityError::Unauthorized
                 | DispatchAuthorityError::UnsupportedApiRevision
                 | DispatchAuthorityError::SchemaUnavailable
-                | DispatchAuthorityError::DigestProviderUnavailable
                 | DispatchAuthorityError::SerializableTransactionRequired => {
                     FragmentProviderDisposition::NotReady
                 }
@@ -2307,7 +2306,8 @@ impl FragmentDrainCapability {
                 .check_ready(
                     ready.0.spool_object_id,
                     ready.0.attempt_id,
-                    &ready.0.record_blake3,
+                    ready.0.spool_revision,
+                    ready.0.ready_at_unix_ms,
                     &ready_key,
                     ready_deadline,
                 )
@@ -2364,7 +2364,8 @@ impl ProviderPreTransportGuard for DrainPreTransportGuard<'_> {
                 .check_ready(
                     self.ready.spool_object_id,
                     self.ready.attempt_id,
-                    &self.ready.record_blake3,
+                    self.ready.spool_revision,
+                    self.ready.ready_at_unix_ms,
                     self.object_key,
                     self.deadline_unix_ms,
                 )

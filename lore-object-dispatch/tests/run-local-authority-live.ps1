@@ -484,6 +484,12 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded',
         'live_r29_cell_is_refused_then_upgrades_and_counts_every_charge',
         'live_the_active_service_session_guard_ignores_a_real_autovacuum_worker',
+        # Same file, migration 0031 (WP-115 readiness blocker 6), also run by that runner.
+        'live_r30_cell_with_live_rows_upgrades_to_r31_and_backfills_them',
+        'live_r30_cell_with_an_enrolled_participant_is_refused_and_stays_r30',
+        'live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by_rust',
+        'live_r31_drain_reserve_replay_is_pinned_to_the_descriptor_digest',
+        'live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row',
         # CR-034 budget pin refresh -- run-budget-pin-refresh-live.ps1
         'live_postgres_head_read_function_is_the_only_door_and_is_least_privilege',
         'live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the_new_fence',

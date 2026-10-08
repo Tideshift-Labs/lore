@@ -442,6 +442,10 @@ fn every_bound_value_sits_at_the_position_the_migration_declares_for_its_name() 
             } else if name == "api" {
                 // The one alias: the client's field is `api`, the parameter is `api_revision`.
                 bound.push("api_revision".to_string());
+            } else if name == "participant_key_sha256" {
+                // R31 holds a SHA-256 commitment in the parameter and column still named
+                // `participant_key_blake3` (naming debt recorded in migration 0031).
+                bound.push("participant_key_blake3".to_string());
             } else {
                 bound.push(name);
             }
@@ -453,10 +457,26 @@ fn every_bound_value_sits_at_the_position_the_migration_declares_for_its_name() 
     }
 }
 
+/// The composite attributes that hold a database-computed digest in the frozen layers and NULL from
+/// cell schema R31 on.
+const R31_NULL_DIGEST_COLUMNS: [&str; 2] = ["reserve_put_ack_blake3", "record_blake3"];
+
 #[test]
 fn every_projection_selects_the_result_columns_in_the_frozen_composite_order() {
     for procedure in procedures() {
-        let declared = migration_result_columns(procedure.migration, procedure.result_type);
+        let mut declared = migration_result_columns(procedure.migration, procedure.result_type);
+        // R31 (migration 0031) keeps these composite attributes so no result type changes, but
+        // stores NULL in them: the database computes no digest. The client therefore must not select
+        // them. The carve-out is explicit and bounded to digest-typed columns, so any other column
+        // the client stops selecting still fails this test.
+        let declared_before = declared.len();
+        declared.retain(|(name, _)| !R31_NULL_DIGEST_COLUMNS.contains(&name.as_str()));
+        let carved_out = declared_before - declared.len();
+        assert!(
+            carved_out <= 2,
+            "{}: only reserve_put_ack_blake3/record_blake3 may be skipped",
+            procedure.name
+        );
         let selected = client_selected_columns(&client_statement(procedure.statement_const));
         assert_eq!(
             selected.len(),
@@ -704,6 +724,16 @@ fn function_bodies() -> Vec<(String, String)> {
                 bodies.push((name, body));
             }
         }
+        // A function a later step drops no longer exists, so its body must not be walked.
+        for line in migration.lines() {
+            if let Some(dropped) = line.strip_prefix("DROP FUNCTION object_store_retention.") {
+                let name: String = dropped
+                    .chars()
+                    .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+                    .collect();
+                bodies.retain(|(existing, _)| existing != &name);
+            }
+        }
     }
     bodies
 }
@@ -726,6 +756,9 @@ fn install_set_migrations() -> Vec<&'static str> {
         include_str!("../migrations/0018_object_store_dispatch_dispatcher_identity_schema.sql"),
         IDENTITY_MIGRATION,
         REGISTRATION_MIGRATION,
+        // R31 replaces the codecs and registration without BLAKE3 and drops the database BLAKE3
+        // functions, so the reachable condition set must be read at its end state.
+        include_str!("../migrations/0031_object_store_dispatch_hash_to_rust.sql"),
     ]
 }
 
@@ -996,7 +1029,6 @@ const BINDING_CONTRACTS: [BindingContract; 5] = [
             "admission_clock_unix_ms",
             "expires_at_unix_ms",
             "reserve_put_ack_canonical_bytes",
-            "reserve_put_ack_blake3",
         ],
     },
     BindingContract {
@@ -1009,7 +1041,6 @@ const BINDING_CONTRACTS: [BindingContract; 5] = [
             "spool_object_id",
             "committed_prefix_chunks",
             "spool_revision",
-            "record_blake3",
         ],
     },
     BindingContract {
@@ -1023,9 +1054,7 @@ const BINDING_CONTRACTS: [BindingContract; 5] = [
             "spool_object_id",
             "ready_at_unix_ms",
             "reserve_put_ack_canonical_bytes",
-            "reserve_put_ack_blake3",
             "spool_revision",
-            "record_blake3",
         ],
     },
     BindingContract {
@@ -1039,12 +1068,7 @@ const BINDING_CONTRACTS: [BindingContract; 5] = [
         outcome_type: "RegisterDispatcherOutcome",
         renamed: &[("lease_generation", "next_generation", "==")],
         // 0020 mints both identity columns from the enrolled participant row.
-        minted: &[
-            "dispatcher_id",
-            "provider_boundary_id",
-            "state",
-            "record_blake3",
-        ],
+        minted: &["dispatcher_id", "provider_boundary_id", "state"],
     },
 ];
 
@@ -1502,7 +1526,7 @@ fn no_request_type_discloses_an_identifier_or_a_boundary_id_through_debug() {
     let enroll = EnrollParticipantRequest {
         provider_boundary_id: "boundary-secret".into(),
         dispatcher_id: "instance-secret".into(),
-        participant_key_blake3: [6; 32],
+        participant_key_sha256: [6; 32],
     };
     assert_redacted("EnrollParticipantRequest", &format!("{enroll:#?}"));
 
@@ -1543,7 +1567,6 @@ fn no_outcome_type_discloses_an_identifier_through_debug() {
                 admission_clock_unix_ms: 2000,
                 expires_at_unix_ms: 3000,
                 reserve_put_ack_canonical_bytes: b"boundary-secret".to_vec(),
-                reserve_put_ack_blake3: [7; 32],
             }
         ),
     );
@@ -1560,7 +1583,6 @@ fn no_outcome_type_discloses_an_identifier_through_debug() {
                 committed_prefix_bytes: 987_654_321,
                 committed_prefix_chunks: 987_654_321,
                 spool_revision: 987_654_321,
-                record_blake3: [7; 32],
             }
         ),
     );
@@ -1579,9 +1601,7 @@ fn no_outcome_type_discloses_an_identifier_through_debug() {
                 committed_blake3: [7; 32],
                 ready_at_unix_ms: 2000,
                 reserve_put_ack_canonical_bytes: b"boundary-secret".to_vec(),
-                reserve_put_ack_blake3: [7; 32],
                 spool_revision: 987_654_321,
-                record_blake3: [7; 32],
             }
         ),
     );
@@ -1606,7 +1626,6 @@ fn no_outcome_type_discloses_an_identifier_through_debug() {
                 service_instance_id: "instance-secret".into(),
                 dispatcher_fence: 987_654_321,
                 state: 1,
-                record_blake3: [7; 32],
             }
         ),
     );

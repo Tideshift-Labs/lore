@@ -82,9 +82,9 @@ impl std::fmt::Debug for DrainDescriptor {
     }
 }
 
-/// The cell schema revision this build ships (CR-038). Migration 0030's
+/// The cell schema revision this build ships (CR-038). Migration 0031's
 /// `cell_schema_revision_v1()` returns it; write-behind refuses to start on any other value.
-pub const CELL_SCHEMA_REVISION: i32 = 30;
+pub const CELL_SCHEMA_REVISION: i32 = 31;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DrainError {
@@ -259,7 +259,7 @@ pub fn drain_procedure_label(sql: &str) -> &'static str {
     const PROCEDURES: [(&str, &str); 14] = [
         ("drain_reserve_v1", "reserve"),
         ("drain_policy_read_v1", "policy_read"),
-        ("drain_check_ready_v1", "check_ready"),
+        ("drain_check_ready_v2", "check_ready"),
         ("drain_observe_v1", "observe"),
         ("drain_cleanup_candidates_v1", "cleanup_candidates"),
         ("drain_cleanup_claim_v2", "cleanup_claim"),
@@ -793,18 +793,33 @@ impl DrainClient {
         Ok(())
     }
 
+    /// CAS-check a ready spool row before its provider send (cell schema R31).
+    ///
+    /// The token is the row's `(spool_revision, ready_at_unix_ms)` from its spool-ready outcome:
+    /// within one row `spool_revision` only grows and a ready row is frozen, and `ready_at` is the
+    /// database clock, so the pair names exactly one ready incarnation. It replaced the
+    /// database-built record digest when BLAKE3 left `PostgreSQL`.
     pub async fn check_ready(
         &self,
         spool: Uuid,
         attempt: Uuid,
-        record: &[u8; 32],
+        spool_revision: u64,
+        ready_at_unix_ms: i64,
         key: &str,
         deadline: i64,
     ) -> Result<(i64, u64), DrainError> {
+        let spool_revision = spool_revision.to_string();
         let rows = self
             .query(
-                "SELECT * FROM object_store_retention.drain_check_ready_v1($1,$2,$3,$4,$5)",
-                &[&spool, &attempt, &&record[..], &key, &deadline],
+                "SELECT * FROM object_store_retention.drain_check_ready_v2($1,$2,$3::text::object_store_retention.uint64,$4,$5,$6)",
+                &[
+                    &spool,
+                    &attempt,
+                    &spool_revision,
+                    &ready_at_unix_ms,
+                    &key,
+                    &deadline,
+                ],
             )
             .await?;
         let row = rows.first().ok_or(DrainError::Refused)?;
@@ -1083,7 +1098,7 @@ mod tests {
                 "policy_read",
             ),
             (
-                "SELECT * FROM object_store_retention.drain_check_ready_v1($1,$2,$3,$4,$5)",
+                "SELECT * FROM object_store_retention.drain_check_ready_v2($1,$2,$3::text::object_store_retention.uint64,$4,$5,$6)",
                 "check_ready",
             ),
             (

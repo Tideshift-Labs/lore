@@ -179,6 +179,51 @@ async fn live_postgres_cell_schema_installs_clean_and_attests() {
     // comparing the constant to itself.
     assert_eq!(CELL_INSTALL_SET.len(), 23);
 
+    // R31 (WP-115 readiness blocker 6): BLAKE3 left the database. This install ran on a plain image,
+    // so the four database hashing functions must be gone and no surviving function body may call
+    // one. plpgsql bodies record no dependency edges, so the body scan is the proof, not a catalog
+    // dependency check.
+    let hashing_functions: i64 = cell
+        .client
+        .query_one(
+            "SELECT count(*)::bigint FROM pg_catalog.pg_proc AS procedure
+             WHERE procedure.pronamespace = 'object_store_retention'::regnamespace
+               AND procedure.proname IN ('local_blake3_v1', 'local_assert_blake3_v1',
+                                         'local_complete_record_v1', 'drain_check_ready_v1')",
+            &[],
+        )
+        .await
+        .expect("count the dropped hashing functions")
+        .get(0);
+    assert_eq!(hashing_functions, 0, "the R31 drops must have been applied");
+    let callers: i64 = cell
+        .client
+        .query_one(
+            "SELECT count(*)::bigint FROM pg_catalog.pg_proc AS procedure
+             WHERE procedure.pronamespace = 'object_store_retention'::regnamespace
+               AND procedure.prosrc ~ '(\\mblake3\\s*\\(|local_blake3_v1|local_assert_blake3_v1|local_complete_record_v1|drain_check_ready_v1|public\\.blake3)'",
+            &[],
+        )
+        .await
+        .expect("scan function bodies for database hashing")
+        .get(0);
+    assert_eq!(
+        callers, 0,
+        "no authority function may call a database BLAKE3"
+    );
+    let ready_v2: i64 = cell
+        .client
+        .query_one(
+            "SELECT count(*)::bigint FROM pg_catalog.pg_proc
+             WHERE pronamespace = 'object_store_retention'::regnamespace
+               AND proname = 'drain_check_ready_v2'",
+            &[],
+        )
+        .await
+        .expect("count drain_check_ready_v2")
+        .get(0);
+    assert_eq!(ready_v2, 1, "drain_check_ready_v2 replaces v1");
+
     // An installed cell holds ZERO `pg_default_acl` rows, cluster-wide. Measured, not assumed, and
     // it is not what reading 0002 suggests: 0002:12-17 issues three `ALTER DEFAULT PRIVILEGES ...
     // REVOKE ... FROM PUBLIC` statements, and none of them leaves a catalog row. PostgreSQL stores
@@ -301,26 +346,23 @@ async fn live_drain_policy_publication_is_maintenance_only_and_replays_exactly()
     let json = serde_json::to_string(&policy).unwrap();
     let canonical = policy.canonical_bytes().unwrap();
     let digest = policy.digest().unwrap();
-    // PostgreSQL 16 has no built-in BLAKE3. This exact lookup supplies only
-    // independently computed fixture preimages; unknown input fails closed.
+    // R31 (WP-115 readiness blocker 6): the database computes no BLAKE3 and this fixture installs
+    // no provider. Publication, replay and verification below run on a plain image, so any
+    // procedure that still reached for `public.blake3` would fail here.
+    let provider_residue: i64 = admin
+        .client
+        .query_one(
+            "SELECT (SELECT count(*) FROM pg_proc WHERE proname = 'blake3'
+                       AND pronamespace = 'public'::regnamespace)
+                  + (SELECT count(*) FROM pg_extension WHERE extname = 'plpython3u')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(provider_residue, 0, "no database BLAKE3 provider may exist");
     let mut changed = policy.clone();
     changed.quotas[0][0] += 1;
-    let cases = [&policy, &changed]
-        .into_iter()
-        .map(|value| {
-            let bytes = value.canonical_bytes().unwrap();
-            let encoded = bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            format!(
-                "WHEN '{encoded}' THEN decode('{}','hex')",
-                hex(&value.digest().unwrap())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    admin.client.batch_execute(&format!("CREATE FUNCTION public.blake3(payload bytea) RETURNS bytea LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT CASE encode(payload,'hex') {cases} ELSE NULL::bytea END $$")).await.unwrap();
     let publish = "SELECT object_store_retention.drain_policy_publish_v1($1::text::jsonb,$2,$3)";
     admin
         .client
@@ -366,6 +408,66 @@ async fn live_drain_policy_publication_is_maintenance_only_and_replays_exactly()
     assert!(
         different.is_err(),
         "a revision cannot publish different limits"
+    );
+    admin.client.batch_execute("ROLLBACK").await.unwrap();
+    // The accepted cut, pinned honestly: the database stores the 32-byte digest a caller supplies and
+    // compares it byte for byte, but it no longer hashes the policy to check it. A digest that is
+    // NOT the BLAKE3 of the canonical policy therefore publishes and verifies. What refuses it is
+    // Rust: `DrainClient::read` re-hashes the stored policy against the pin (drain_policy.rs), which
+    // `tests/cell_schema_forward_upgrade_live.rs` drives live.
+    let mut unhashed = policy.clone();
+    unhashed.boundary = "unhashed-boundary".into();
+    unhashed.cell = "unhashed-cell".into();
+    let wrong_digest = [0x77_u8; 32];
+    assert_ne!(
+        unhashed.digest().unwrap(),
+        wrong_digest,
+        "the probe digest must not be the real one"
+    );
+    admin
+        .client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    admin
+        .client
+        .execute(
+            publish,
+            &[
+                &serde_json::to_string(&unhashed).unwrap(),
+                &unhashed.canonical_bytes().unwrap(),
+                &&wrong_digest[..],
+            ],
+        )
+        .await
+        .expect("R31: the database stores a caller digest without hashing the policy");
+    admin
+        .client
+        .execute(
+            "SELECT object_store_retention.drain_policy_verify_v1($1::text::jsonb,$2,$3)",
+            &[
+                &serde_json::to_string(&unhashed).unwrap(),
+                &unhashed.canonical_bytes().unwrap(),
+                &&wrong_digest[..],
+            ],
+        )
+        .await
+        .expect("verify compares the stored digest byte for byte");
+    let true_digest = unhashed.digest().unwrap();
+    let mismatched = admin
+        .client
+        .execute(
+            "SELECT object_store_retention.drain_policy_verify_v1($1::text::jsonb,$2,$3)",
+            &[
+                &serde_json::to_string(&unhashed).unwrap(),
+                &unhashed.canonical_bytes().unwrap(),
+                &&true_digest[..],
+            ],
+        )
+        .await;
+    assert!(
+        mismatched.is_err(),
+        "verify still refuses a digest that differs from the stored one"
     );
     admin.client.batch_execute("ROLLBACK").await.unwrap();
     admin.client.batch_execute("RESET SESSION AUTHORIZATION; SET SESSION AUTHORIZATION object_dispatch_retention_runtime").await.unwrap();
@@ -1032,7 +1134,8 @@ async fn live_postgres_cell_schema_measure_catalog_manifest() {
     let cell = connect("LORE_TEST_CELL_SCHEMA_MEASURE_PG_URL").await;
     // Optional: measure an older known state, e.g. on a newly supported server major.
     let target = match std::env::var("LORE_TEST_CELL_SCHEMA_MEASURE_TARGET").as_deref() {
-        Err(_) | Ok("R30") => CellSchemaRevision::R30,
+        Err(_) | Ok("R31") => CellSchemaRevision::R31,
+        Ok("R30") => CellSchemaRevision::R30,
         Ok("R29") => CellSchemaRevision::R29,
         Ok("R28") => CellSchemaRevision::R28,
         Ok("R25") => CellSchemaRevision::R25,

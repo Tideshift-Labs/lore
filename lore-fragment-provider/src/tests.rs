@@ -2100,9 +2100,7 @@ fn drain_ready_outcome(
         committed_blake3,
         ready_at_unix_ms: ATTEMPT_TIMESTAMP_MS,
         reserve_put_ack_canonical_bytes: Vec::new(),
-        reserve_put_ack_blake3: [0u8; 32],
         spool_revision: 1,
-        record_blake3: [0u8; 32],
     }
 }
 
@@ -2538,34 +2536,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
     use tokio_postgres::Client;
     use tokio_util::task::AbortOnDropHandle;
 
-    // PostgreSQL 16 has no built-in BLAKE3. As in dispatch_client_live, the
-    // test supplies exact genuine digests, never a permissive fallback.
-    // A bounded rollback-only primer discovers each canonical preimage;
-    // real reserve/ready calls then execute against that immutable lookup.
-    async fn prime(admin: &Client, role: &str, sql: &str) {
-        for _ in 0..24 {
-            let call = format!(
-                "SET SESSION AUTHORIZATION {role}; BEGIN ISOLATION LEVEL SERIALIZABLE; {sql}; ROLLBACK; RESET SESSION AUTHORIZATION;"
-            );
-            match admin.batch_execute(&call).await {
-                Ok(()) => return,
-                Err(error) => {
-                    admin
-                        .batch_execute("ROLLBACK; RESET SESSION AUTHORIZATION;")
-                        .await
-                        .unwrap();
-                    let message = error.as_db_error().expect("prime SQL error").message();
-                    let payload = message.strip_prefix("FIXTURE_BLAKE3:").unwrap_or_else(|| {
-                        panic!("unexpected authority refusal while priming: {error:?}")
-                    });
-                    let bytes = hex::decode(payload).unwrap();
-                    let digest = blake3::hash(&bytes);
-                    admin.execute("INSERT INTO public.test_drain_hashes(payload,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&bytes,&&digest.as_bytes()[..]]).await.unwrap();
-                }
-            }
-        }
-        panic!("canonical hash primer exceeded its finite bound");
-    }
     fn quoted(text: &str) -> String {
         format!("'{}'", text.replace('\'', "''"))
     }
@@ -2600,11 +2570,10 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
     lore_object_dispatch::cell_schema_install::install_cell_schema(&admin)
         .await
         .expect("supported full-chain install and attestation");
-    admin.batch_execute("RESET SESSION AUTHORIZATION;
-          CREATE TABLE public.test_drain_hashes(payload bytea PRIMARY KEY,digest bytea NOT NULL);
-          CREATE FUNCTION public.blake3(payload bytea) RETURNS bytea LANGUAGE plpgsql STABLE STRICT SECURITY DEFINER SET search_path=pg_catalog AS $$
-          DECLARE value bytea; BEGIN SELECT h.digest INTO value FROM public.test_drain_hashes h WHERE h.payload=blake3.payload;
-          IF value IS NULL THEN RAISE EXCEPTION 'FIXTURE_BLAKE3:%',encode(payload,'hex'); END IF; RETURN value; END $$;").await.unwrap();
+    admin
+        .batch_execute("RESET SESSION AUTHORIZATION;")
+        .await
+        .unwrap();
     let row=admin.query_one("SELECT s.system_identifier::text,d.oid::bigint,floor(extract(epoch FROM clock_timestamp())*1000)::bigint FROM pg_control_system() s,pg_database d WHERE d.datname=current_database()",&[]).await.unwrap();
     let system: String = row.get(0);
     let oid = row.get::<_, i64>(1) as u32;
@@ -2667,7 +2636,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         hex::encode(&policy_bytes),
         hex::encode(policy_digest)
     );
-    prime(&admin, "object_dispatch_retention_maintenance", &publish).await;
     admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance;BEGIN ISOLATION LEVEL SERIALIZABLE;{publish};COMMIT;RESET SESSION AUTHORIZATION;")).await.unwrap();
     let pool = Arc::new(
         DispatchRuntimePool::new(DispatchPoolConfig {
@@ -2861,7 +2829,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         hex::encode(&canonical),
         blake3::hash(&canonical).to_hex()
     );
-    prime(&admin, "object_dispatch_retention_runtime", &reserve).await;
     let mut plan = FragmentDrainReservationPlan::new(input.clone());
     let reservation = capability
         .reserve_spool(&mut plan)
@@ -2889,9 +2856,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         changed_policy,
         changed_fingerprint,
     ] {
-        let canonical = changed.canonical_bytes().unwrap();
-        let digest = blake3::hash(&canonical);
-        admin.execute("INSERT INTO public.test_drain_hashes(payload,digest) VALUES($1,$2) ON CONFLICT DO NOTHING", &[&canonical, &&digest.as_bytes()[..]]).await.unwrap();
         assert!(
             identity_client.reserve(&changed).await.is_err(),
             "changed reservation identity cannot reuse an admitted spool identity"
@@ -2922,7 +2886,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         hex::encode(body_blake3),
         quoted(receipt.0.opaque_handle())
     );
-    prime(&admin, "object_dispatch_retention_runtime", &ready_sql).await;
     let wrong_protocol = ready_sql.replacen("'object-dispatch-v1'", "'object-dispatch-invalid'", 1);
     let protocol_error = admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_runtime;BEGIN ISOLATION LEVEL SERIALIZABLE;{wrong_protocol};ROLLBACK;RESET SESSION AUTHORIZATION;")).await.unwrap_err();
     admin
@@ -3046,11 +3009,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
     let client = DrainClient::new(pool);
     let intent = client.claim_cleanup(input.spool_object_id).await.unwrap();
     intent.unlink(&layout).unwrap();
-    let release = format!(
-        "SELECT object_store_retention.drain_cleanup_release_v1('{}'::uuid,1)",
-        input.spool_object_id
-    );
-    prime(&admin, "object_dispatch_retention_runtime", &release).await;
     client.release_cleanup(&intent).await.unwrap();
     client.release_cleanup(&intent).await.unwrap();
     let full_rows: i64 = admin.query_one("SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects WHERE spool_object_id=$1", &[&input.spool_object_id]).await.unwrap().get(0);
@@ -3121,7 +3079,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         quoted(&policy.revision),
         hex::encode(policy_digest)
     );
-    prime(&admin, "object_dispatch_retention_maintenance", &rotate).await;
     admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance;BEGIN ISOLATION LEVEL SERIALIZABLE;{rotate};COMMIT;RESET SESSION AUTHORIZATION;")).await.unwrap();
     async fn marker(admin: &Client, spool: Uuid) -> Option<(bool, i64)> {
         admin
@@ -3521,7 +3478,7 @@ fn the_new_drain_error_variants_support_partial_eq() {
 /// classification silently changes.
 #[test]
 fn every_drain_spool_ready_refusal_carries_a_named_disposition() {
-    let expected: [(DispatchAuthorityError, FragmentProviderDisposition); 33] = [
+    let expected: [(DispatchAuthorityError, FragmentProviderDisposition); 32] = [
         (
             DispatchAuthorityError::Pool(DispatchPoolError::PoolExhausted),
             FragmentProviderDisposition::Transient,
@@ -3568,10 +3525,6 @@ fn every_drain_spool_ready_refusal_carries_a_named_disposition() {
         ),
         (
             DispatchAuthorityError::SchemaUnavailable,
-            FragmentProviderDisposition::NotReady,
-        ),
-        (
-            DispatchAuthorityError::DigestProviderUnavailable,
             FragmentProviderDisposition::NotReady,
         ),
         (

@@ -3,6 +3,7 @@
 -- Schema-only fixture. These records deliberately do not claim canonical lifecycle validity.
 -- No Submit/ACK writer exists in the installed cell procedure set. Retention reads relational
 -- state only; all CHECK/FK constraints remain enabled. $ID is a test-owned integer.
+-- R31: spool and dispatcher rows carry no record digest (record_blake3 IS NULL by CHECK).
 INSERT INTO object_store_retention.object_dispatch_requests (
  schema_revision, protocol_revision, policy_revision, provider_boundary_id,
  authenticated_cell_id, authenticated_tenant_id, logical_request_id, attempt_id,
@@ -32,7 +33,7 @@ INSERT INTO object_store_retention.object_dispatch_dispatchers (
  provider_credential_revision,state,acquired_at_unix_ms,renewed_at_unix_ms,
  expires_at_unix_ms,state_changed_at_unix_ms,canonical_record_bytes,record_blake3
 ) VALUES ('object-store-dispatch-authority-schema-v1','dispatcher-$ID',1,'boundary-1',
- 'instance-$ID',1,1,'allocation-1',1,'cred-1',1,1000,1000,2000,1000,$RECORD,$DIGEST);
+ 'instance-$ID',1,1,'allocation-1',1,'cred-1',1,1000,1000,2000,1000,$RECORD,NULL);
 INSERT INTO object_store_retention.object_dispatch_attempts (
  schema_revision,logical_request_id,attempt_id,provider_boundary_id,provider_grant_id,
  provider_grant_fence,grant_canonical_bytes,grant_blake3,dispatcher_id,
@@ -51,7 +52,7 @@ INSERT INTO object_store_retention.object_dispatch_spool_objects (
  release_reason,release_receipt_bytes,release_receipt_blake3
 ) VALUES ('object-store-dispatch-authority-schema-v1','$SPOOL','$LOGICAL','$ATTEMPT',
  'boundary-1','cell-1','tenant-1','$LOGICAL','$ATTEMPT',2,2,3,'result-$ID',
- $DIGEST,'boundary-token',$DIGEST,33,$DIGEST,33,1,1,1,3,$RECORD,$DIGEST,1,1500,
+ $DIGEST,'boundary-token',$DIGEST,33,$DIGEST,33,1,1,1,3,$RECORD,NULL,1,1500,
  33,$DIGEST,'result/body-$ID',1500,1600,1,$RECORD,$DIGEST);
 INSERT INTO object_store_retention.object_dispatch_payload_purges (
  schema_revision,purge_id,spool_object_id,provider_boundary_id,authenticated_cell_id,

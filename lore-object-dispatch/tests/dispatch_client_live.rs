@@ -7,7 +7,14 @@
 //! against an earlier slice caught signature order, rows/bytes/retention semantics, a typed
 //! `NOT_FOUND`, and a text-to-domain cast that every static check had found plausible. So every
 //! procedure the typed client calls is driven here, through the public client API, against a real
-//! `PostgreSQL` 16 with the full chain installed.
+//! `PostgreSQL` with the full chain installed (cell schema R31, through the installer, on a plain
+//! image: no `plpython3u`, no `public.blake3`).
+//!
+//! R31 moved BLAKE3 out of the database (WP-115 readiness blocker 6). The database now builds
+//! preimage-only `*-v2` records and no longer verifies any BLAKE3 digest, so the expected record
+//! bytes below are assembled by hand from the v2 layout, independently of the SQL codecs, and pinned
+//! against what the database stored. The v1 tags belong to the Rust and TypeScript wire encoders;
+//! one assertion pins that the database never emits bytes under them.
 //!
 //! Unlike the sibling live tiers, this one connects **as the authority roles themselves** rather
 //! than using `SET SESSION AUTHORIZATION`, because the pool's whole point is that it carries its
@@ -51,6 +58,8 @@ use lore_object_dispatch::RegisterDispatcherRequest;
 use lore_object_dispatch::ReservePutAckLimits;
 use lore_object_dispatch::ReservePutQuotaScope;
 use lore_object_dispatch::ReservePutRequest;
+use lore_object_dispatch::cell_schema_install::CellInstallDisposition;
+use lore_object_dispatch::cell_schema_install::install_cell_schema;
 use lore_object_dispatch::validate_and_encode_object_store_reserve_put_ack;
 use lore_proto::lore::object_dispatch::v1::ObjectStoreQuotaUnitsV1;
 use lore_proto::lore::object_dispatch::v1::PutReservationStateV1;
@@ -62,16 +71,10 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
-#[path = "common/cell_migration_sql.rs"]
-mod cell_migration_sql;
-use cell_migration_sql::cell_install_sql;
+#[path = "common/sha256.rs"]
+mod sha256;
+use sha256::sha256;
 
-const RETENTION_SCHEMA_BLAKE3: &str =
-    "f86d1a574cab9346ef39843fed6ffb849cafe5967881a45d0c6d89028780f6dd";
-const AUTHORITY_SCHEMA_BLAKE3: &str =
-    "d762b841bd31a37908a6ff95c2292d5abfca234fa9b7d3c0c639ec63dcf3a7ff";
-const PUT_RESERVATION_SCHEMA_BLAKE3: &str =
-    "56b6b891f6fa44875494a9d644b1a8ad66f1f87be5f886efeb324da05cb2ae67";
 const DISPATCHER_IDENTITY_SCHEMA_BLAKE3: &str =
     "a7d54d94d0fa5035872eb9b3426cbbe6471bcf9ae34ed41877542f050e1aaad9";
 
@@ -96,6 +99,10 @@ const RETRY_INSTANCE: &str = "instance-b-1";
 const EXHAUST_KEY: [u8; 32] = [0xcc; 32];
 const EXHAUST_DISPATCHER_ID: &str = "dispatcher-c";
 const EXHAUST_INSTANCE: &str = "instance-c-1";
+/// Enrolled under the retired BLAKE3 commitment scheme to prove it no longer authenticates.
+const LEGACY_KEY: [u8; 32] = [0xdd; 32];
+const LEGACY_DISPATCHER_ID: &str = "dispatcher-d";
+const LEGACY_INSTANCE: &str = "instance-d-1";
 const AMBIGUOUS_KEY: [u8; 32] = [0xee; 32];
 const AMBIGUOUS_DISPATCHER_ID: &str = "dispatcher-e";
 const AMBIGUOUS_INSTANCE: &str = "instance-e-1";
@@ -136,14 +143,9 @@ fn push_bytes(buffer: &mut Vec<u8>, value: &[u8]) {
     buffer.extend_from_slice(value);
 }
 
-fn complete(preimage: &[u8]) -> Vec<u8> {
-    let mut value = preimage.to_vec();
-    value.extend_from_slice(blake3::hash(preimage).as_bytes());
-    value
-}
-
+/// The v2 quota child: tag, then three `u64`s. No trailing digest.
 fn quota_preimage(size: u64) -> Vec<u8> {
-    let mut value = b"object-store-quota-units-v1\0".to_vec();
+    let mut value = b"object-store-local-quota-units-v2\0".to_vec();
     for field in [size, 1, 1] {
         value.extend_from_slice(&field.to_be_bytes());
     }
@@ -197,8 +199,9 @@ fn ack_fixture(size: u64, ready: bool) -> ReservePutAckV1 {
     value
 }
 
+/// The v2 spool-ready child. No trailing digest.
 fn spool_child_preimage(size: u64) -> Vec<u8> {
-    let mut value = b"object-store-put-spool-ready-v1\0".to_vec();
+    let mut value = b"object-store-local-put-spool-ready-v2\0".to_vec();
     for field in [
         "protocol-1",
         "boundary-1",
@@ -218,18 +221,57 @@ fn spool_child_preimage(size: u64) -> Vec<u8> {
     value
 }
 
+/// The v2 reserve-put ack, assembled field by field. Children are framed as
+/// `u32 length || child preimage`; the ack carries no digest of its own.
+fn ack_v2_preimage(size: u64, ready: bool) -> Vec<u8> {
+    let mut value = b"object-store-local-reserve-put-ack-v2\0".to_vec();
+    for field in [
+        "protocol-1",
+        "policy-1",
+        "boundary-1",
+        "cell-1",
+        "tenant-1",
+        &logical_request_id(),
+        &attempt_id(),
+        &upload_id(),
+    ] {
+        push_text(&mut value, field);
+    }
+    value.extend_from_slice(&7_u64.to_be_bytes());
+    let state = if ready {
+        PutReservationStateV1::PutReservationStateSpoolReady
+    } else {
+        PutReservationStateV1::PutReservationStateReserved
+    };
+    value.extend_from_slice(&(state as u32).to_be_bytes());
+    push_bytes(&mut value, &quota_preimage(size));
+    value.extend_from_slice(&3000_u64.to_be_bytes());
+    value.extend_from_slice(&6_u64.to_be_bytes());
+    value.push(u8::from(ready));
+    if ready {
+        push_bytes(&mut value, &spool_child_preimage(size));
+    }
+    value.push(0);
+    value.extend_from_slice(&2000_u64.to_be_bytes());
+    value.extend_from_slice(&4000_u64.to_be_bytes());
+    value.push(0);
+    value.push(0);
+    value
+}
+
+/// The v2 spool row record. The ack is framed in full, and the raw ack digest that v1 appended after
+/// it is gone.
 fn row_preimage(
     ack_canonical: &[u8],
-    ack_digest: &[u8],
     size: u64,
     progress: (u64, u64, u64),
     revision: u64,
     ready: bool,
 ) -> Vec<u8> {
     let mut value = if ready {
-        b"object-store-dispatch-put-spool-ready-row-v1\0".to_vec()
+        b"object-store-dispatch-put-spool-ready-row-v2\0".to_vec()
     } else {
-        b"object-store-dispatch-put-reservation-row-v1\0".to_vec()
+        b"object-store-dispatch-put-reservation-row-v2\0".to_vec()
     };
     for field in [
         "object-store-dispatch-authority-schema-v1",
@@ -260,7 +302,7 @@ fn row_preimage(
     for field in [progress.0, progress.1, progress.2] {
         value.extend_from_slice(&field.to_be_bytes());
     }
-    push_bytes(&mut value, &complete(&quota_preimage(size)));
+    push_bytes(&mut value, &quota_preimage(size));
     value.extend_from_slice(&1_u64.to_be_bytes());
     value.extend_from_slice(&3000_u64.to_be_bytes());
     value.extend_from_slice(&FINGERPRINT);
@@ -269,7 +311,6 @@ fn row_preimage(
         value.extend_from_slice(&field.to_be_bytes());
     }
     push_bytes(&mut value, ack_canonical);
-    value.extend_from_slice(ack_digest);
     value.extend_from_slice(&revision.to_be_bytes());
     value.extend_from_slice(&2000_u64.to_be_bytes());
     if ready {
@@ -283,7 +324,7 @@ fn registration_record_preimage(
     generation: u64,
     service_instance_id: &str,
 ) -> Vec<u8> {
-    let mut preimage = b"object-store-dispatch-dispatcher-registration-row-v1".to_vec();
+    let mut preimage = b"object-store-dispatch-dispatcher-registration-row-v2".to_vec();
     preimage.push(0);
     push_text(&mut preimage, "object-store-dispatch-authority-schema-v1");
     push_text(&mut preimage, dispatcher_id);
@@ -300,31 +341,6 @@ fn registration_record_preimage(
         preimage.extend_from_slice(&field.to_be_bytes());
     }
     preimage
-}
-
-/// `PostgreSQL` 16 has no BLAKE3, so the schema calls out to `public.blake3`. This installs an exact
-/// lookup over the preimages this run's sequence hashes: a genuine digest for each, and NULL for
-/// anything else, so an unplanned preimage fails closed rather than silently returning garbage.
-fn blake3_provider_sql(vectors: &[(Vec<u8>, [u8; 32])]) -> String {
-    let cases = vectors
-        .iter()
-        .map(|(payload, digest)| {
-            format!(
-                "WHEN '{}' THEN pg_catalog.decode('{}', 'hex')",
-                hex(payload),
-                hex(digest)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "CREATE OR REPLACE FUNCTION public.blake3(payload bytea) RETURNS bytea
-         LANGUAGE sql IMMUTABLE STRICT
-         AS $$ SELECT CASE pg_catalog.encode(payload, 'hex')
-           {cases}
-           ELSE NULL::bytea
-         END $$;"
-    )
 }
 
 fn identity() -> PutStreamIdentity {
@@ -472,27 +488,6 @@ fn pool_config(
     }
 }
 
-async fn install_as_migrator(client: &tokio_postgres::Client, sql: &str) -> String {
-    client
-        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_migrator;")
-        .await
-        .expect("assume migrator");
-    client
-        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;")
-        .await
-        .expect("begin serializable");
-    let row = client.query_one(sql, &[]).await;
-    client
-        .batch_execute(if row.is_ok() { "COMMIT;" } else { "ROLLBACK;" })
-        .await
-        .expect("close install transaction");
-    client
-        .batch_execute("RESET SESSION AUTHORIZATION;")
-        .await
-        .expect("reset authorization");
-    row.expect("install call").get(0)
-}
-
 #[tokio::test]
 #[ignore = "requires a fresh disposable PostgreSQL 16 database"]
 async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
@@ -529,97 +524,74 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         .await
         .expect("bootstrap disposable roles with login");
 
-    for migration in [
-        include_str!("../migrations/0002_object_store_retention_authority.sql"),
-        include_str!("../migrations/0003_object_store_retention_provisioning.sql"),
-        include_str!("../migrations/0007_object_store_dispatch_authority_core.sql"),
-        include_str!("../migrations/0008_object_store_dispatch_authority_provisioning.sql"),
-    ] {
-        admin
-            .batch_execute(&cell_install_sql(&admin, migration).await)
+    sha256::self_check();
+
+    // Install the whole chain the way an operator does: through the installer, as the migrator, on
+    // a plain image. R31 needs no `plpython3u` and no `public.blake3`; nothing here provides either,
+    // so any statement that still reached for a database BLAKE3 would fail this test.
+    admin
+        .batch_execute(
+            "ALTER ROLE object_dispatch_retention_migrator LOGIN;
+             GRANT object_dispatch_retention_owner TO object_dispatch_retention_migrator
+               WITH INHERIT FALSE, SET TRUE;",
+        )
+        .await
+        .expect("give the migrator a login");
+    let migrator_url = format!(
+        "postgresql://object_dispatch_retention_migrator@{}",
+        url.split_once('@')
+            .map(|(_, rest)| rest)
+            .expect("runner URL carries a role")
+    );
+    let (migrator, migrator_connection) =
+        tokio_postgres::connect(&migrator_url, tokio_postgres::NoTls)
             .await
-            .expect("apply base migration");
-    }
-    assert_eq!(
-        install_as_migrator(
-            &admin,
-            &format!(
-                "SELECT (object_store_retention.object_store_retention_install_v1(
-                   'object-store-retention-provisioning-v1',
-                   'object-store-retention-authority-schema-v1',
-                   pg_catalog.decode('{RETENTION_SCHEMA_BLAKE3}', 'hex'), 1)).result_code"
-            )
+            .expect("connect as the migrator");
+    let _migrator_task = AbortOnDropHandle::new(lore_base::lore_spawn!(
+        "dispatch-client-live-migrator",
+        async move {
+            let _ = migrator_connection.await;
+        }
+    ));
+    let report = install_cell_schema(&migrator)
+        .await
+        .expect("install the full chain on a plain image");
+    assert_eq!(report.disposition, CellInstallDisposition::Created);
+    let provider_residue: i64 = admin
+        .query_one(
+            "SELECT (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc
+                      WHERE proname = 'blake3' AND pronamespace = 'public'::regnamespace)
+                  + (SELECT pg_catalog.count(*) FROM pg_catalog.pg_extension
+                      WHERE extname = 'plpython3u')",
+            &[],
         )
-        .await,
-        "CREATED"
-    );
+        .await
+        .expect("look for a database BLAKE3 provider")
+        .get(0);
     assert_eq!(
-        install_as_migrator(
-            &admin,
-            &format!(
-                "SELECT (object_store_retention.object_store_dispatch_authority_install_v1(
-                   'object-store-dispatch-authority-provisioning-v1',
-                   'object-store-dispatch-authority-schema-v1',
-                   pg_catalog.decode('{AUTHORITY_SCHEMA_BLAKE3}', 'hex'), 1)).result_code"
-            )
-        )
-        .await,
-        "CREATED"
+        provider_residue, 0,
+        "this tier must run without a BLAKE3 provider"
     );
-    for migration in [
-        include_str!("../migrations/0009_object_store_dispatch_authority_canonical_codec.sql"),
-        include_str!("../migrations/0010_object_store_dispatch_put_reservation_schema.sql"),
-        include_str!("../migrations/0011_object_store_dispatch_put_reservation_provisioning.sql"),
-    ] {
-        admin
-            .batch_execute(&cell_install_sql(&admin, migration).await)
-            .await
-            .expect("apply put-reservation migration");
-    }
-    assert_eq!(
-        install_as_migrator(
-            &admin,
-            &format!(
-                "SELECT (object_store_retention.object_store_dispatch_put_reservation_install_v1(
-                   'object-store-dispatch-put-reservation-provisioning-v1',
-                   'object-store-dispatch-put-reservation-schema-v1',
-                   pg_catalog.decode('{PUT_RESERVATION_SCHEMA_BLAKE3}', 'hex'), 1)).result_code"
-            )
+
+    // 0026 revoked runtime EXECUTE on the raw reservation and progress procedures: production
+    // reaches reservation only through `drain_reserve_v1`. This tier exists to prove the typed client
+    // agrees with those procedures, so it re-grants exactly those two to the runtime role, as the
+    // superuser and after the install. The attester is not run again.
+    admin
+        .batch_execute(
+            "DO $$ DECLARE f record; BEGIN
+               FOR f IN SELECT p.oid::regprocedure AS signature FROM pg_catalog.pg_proc p
+                 WHERE p.pronamespace = 'object_store_retention'::regnamespace
+                   AND p.proname IN ('object_store_dispatch_reserve_put_v1',
+                                     'object_store_dispatch_put_upload_progress_v1')
+               LOOP
+                 EXECUTE pg_catalog.format(
+                   'GRANT EXECUTE ON FUNCTION %s TO object_dispatch_retention_runtime', f.signature);
+               END LOOP;
+             END $$;",
         )
-        .await,
-        "CREATED"
-    );
-    for migration in [
-        include_str!("../migrations/0012_object_store_dispatch_put_reservation_record_codec.sql"),
-        include_str!("../migrations/0013_object_store_dispatch_reserve_put_mutation.sql"),
-        include_str!("../migrations/0014_object_store_dispatch_put_upload_progress_codec.sql"),
-        include_str!("../migrations/0015_object_store_dispatch_put_upload_progress_mutation.sql"),
-        include_str!("../migrations/0016_object_store_dispatch_put_spool_ready_codec.sql"),
-        include_str!("../migrations/0017_object_store_dispatch_put_spool_ready_mutation.sql"),
-        include_str!("../migrations/0018_object_store_dispatch_dispatcher_identity_schema.sql"),
-        include_str!(
-            "../migrations/0019_object_store_dispatch_dispatcher_identity_provisioning.sql"
-        ),
-        include_str!("../migrations/0020_object_store_dispatch_dispatcher_registration.sql"),
-    ] {
-        admin
-            .batch_execute(migration)
-            .await
-            .expect("apply mutation chain and dispatcher identity");
-    }
-    assert_eq!(
-        install_as_migrator(
-            &admin,
-            &format!(
-                "SELECT (object_store_retention.object_store_dispatch_dispatcher_identity_install_v1(
-                   'object-store-dispatch-dispatcher-identity-provisioning-v1',
-                   'object-store-dispatch-dispatcher-identity-schema-v1',
-                   pg_catalog.decode('{DISPATCHER_IDENTITY_SCHEMA_BLAKE3}', 'hex'), 1)).result_code"
-            )
-        )
-        .await,
-        "CREATED"
-    );
+        .await
+        .expect("re-grant the raw procedures to the runtime role for this tier");
     admin
         .batch_execute(
             "CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint
@@ -629,83 +601,46 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         .await
         .expect("freeze the database clock");
 
-    // Every preimage this run's sequence hashes, with its genuine digest.
+    // The v2 records, assembled by hand from the layout, never by the SQL codecs. The wire encoder's
+    // v1 ack is built too, only to pin that the database does NOT emit it any more.
     let ack_limits = ReservePutAckLimits {
         max_identity_bytes: 256,
         max_durable_handle_bytes: 4096,
         max_canonical_row_bytes: 16_777_216,
     };
-    let reserved =
+    let wire_reserved =
         validate_and_encode_object_store_reserve_put_ack(&ack_fixture(SIZE, false), &ack_limits)
-            .expect("independent reserved ACK");
-    let ready =
+            .expect("independent reserved wire ACK");
+    let wire_ready =
         validate_and_encode_object_store_reserve_put_ack(&ack_fixture(SIZE, true), &ack_limits)
-            .expect("independent ready ACK");
-    let initial_row = row_preimage(
-        reserved.canonical_bytes(),
-        reserved.ack_blake3(),
-        SIZE,
-        (0, 0, 0),
-        1,
-        false,
-    );
-    let progress_three = row_preimage(
-        reserved.canonical_bytes(),
-        reserved.ack_blake3(),
-        SIZE,
-        (3, 1, 1),
-        2,
-        false,
-    );
-    let progress_six = row_preimage(
-        reserved.canonical_bytes(),
-        reserved.ack_blake3(),
-        SIZE,
-        (6, 2, 1),
-        3,
-        false,
-    );
-    let final_row = row_preimage(
-        ready.canonical_bytes(),
-        ready.ack_blake3(),
-        SIZE,
-        (0, 0, 0),
-        4,
-        true,
-    );
-    let mut vectors: Vec<(Vec<u8>, [u8; 32])> = Vec::new();
-    for preimage in [
-        quota_preimage(SIZE),
-        reserved.canonical_preimage().to_vec(),
-        ready.canonical_preimage().to_vec(),
-        spool_child_preimage(SIZE),
-        initial_row,
-        progress_three,
-        progress_six,
-        final_row,
-        PARTICIPANT_KEY.to_vec(),
-        // An unenrolled key still gets hashed for the lookup, so its digest must resolve or the
-        // probe would fail closed on the provider instead of on the enrollment check.
-        UNENROLLED_KEY.to_vec(),
-        registration_record_preimage(DISPATCHER_ID, 1, SERVICE_INSTANCE),
-        // The injected-conflict coverage below. The exhaustion probe never commits, but its record
-        // is computed before the insert the trigger rejects, so its preimage must resolve or the
-        // probe would fail closed on the digest provider instead of on the retry budget.
-        RETRY_KEY.to_vec(),
-        EXHAUST_KEY.to_vec(),
-        registration_record_preimage(RETRY_DISPATCHER_ID, 1, RETRY_INSTANCE),
-        registration_record_preimage(EXHAUST_DISPATCHER_ID, 1, EXHAUST_INSTANCE),
-        // The lost-COMMIT coverage below.
-        AMBIGUOUS_KEY.to_vec(),
-        registration_record_preimage(AMBIGUOUS_DISPATCHER_ID, 1, AMBIGUOUS_INSTANCE),
-    ] {
-        let digest = *blake3::hash(&preimage).as_bytes();
-        vectors.push((preimage, digest));
-    }
-    admin
-        .batch_execute(&blake3_provider_sql(&vectors))
-        .await
-        .expect("install the exact-preimage BLAKE3 provider");
+            .expect("independent ready wire ACK");
+    let reserved_ack = ack_v2_preimage(SIZE, false);
+    let ready_ack = ack_v2_preimage(SIZE, true);
+    let initial_row = row_preimage(&reserved_ack, SIZE, (0, 0, 0), 1, false);
+    let progress_three_row = row_preimage(&reserved_ack, SIZE, (3, 1, 1), 2, false);
+    let progress_six_row = row_preimage(&reserved_ack, SIZE, (6, 2, 1), 3, false);
+    let final_row = row_preimage(&ready_ack, SIZE, (0, 0, 0), 4, true);
+    let stored_row = |spool: Uuid| {
+        let admin = &admin;
+        async move {
+            let row = admin
+                .query_one(
+                    "SELECT canonical_record_bytes, record_blake3, reserve_put_ack_blake3,
+                            reserve_put_ack_canonical_bytes
+                     FROM object_store_retention.object_dispatch_spool_objects
+                     WHERE spool_object_id = $1",
+                    &[&spool],
+                )
+                .await
+                .expect("read the stored spool row");
+            (
+                row.get::<_, Vec<u8>>(0),
+                row.get::<_, Option<Vec<u8>>>(1),
+                row.get::<_, Option<Vec<u8>>>(2),
+                row.get::<_, Vec<u8>>(3),
+            )
+        }
+    };
 
     // ---------------------------------------------------------------------------------------
     // The typed client takes over from here. Nothing below uses SET SESSION AUTHORIZATION.
@@ -829,7 +764,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
             "SELECT (object_store_retention.object_store_dispatch_enroll_dispatcher_participant_v1(
                'object-store-dispatch-dispatcher-registration-v1', 'boundary-a', 'dispatcher-a',
                pg_catalog.decode($1, 'hex'))).result_code",
-            &[&hex(blake3::hash(&PARTICIPANT_KEY).as_bytes())],
+            &[&hex(&sha256(&PARTICIPANT_KEY))],
         )
         .await
         .expect_err("runtime must not reach maintenance-only enrollment");
@@ -843,7 +778,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     let enroll = EnrollParticipantRequest {
         provider_boundary_id: REGISTRATION_BOUNDARY.into(),
         dispatcher_id: DISPATCHER_ID.into(),
-        participant_key_blake3: *blake3::hash(&PARTICIPANT_KEY).as_bytes(),
+        participant_key_sha256: sha256(&PARTICIPANT_KEY),
     };
     let created = maintenance
         .enroll_dispatcher_participant(&enroll)
@@ -872,14 +807,25 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     assert_eq!(registered.value.dispatcher_fence, 1);
     assert_eq!(registered.value.service_instance_id, SERVICE_INSTANCE);
     assert_eq!(registered.value.state, 1);
+    // The stored registration record is the hand-built v2 preimage, with no digest at all.
+    let stored_registration = admin
+        .query_one(
+            "SELECT canonical_record_bytes, record_blake3
+             FROM object_store_retention.object_dispatch_dispatchers
+             WHERE dispatcher_id = $1 AND lease_generation = 1",
+            &[&DISPATCHER_ID],
+        )
+        .await
+        .expect("read the stored registration record");
     assert_eq!(
-        registered.value.record_blake3,
-        *blake3::hash(&registration_record_preimage(
-            DISPATCHER_ID,
-            1,
-            SERVICE_INSTANCE
-        ))
-        .as_bytes()
+        stored_registration.get::<_, Vec<u8>>(0),
+        registration_record_preimage(DISPATCHER_ID, 1, SERVICE_INSTANCE),
+        "the stored registration record differs from the hand-built v2 preimage"
+    );
+    assert_eq!(
+        stored_registration.get::<_, Option<Vec<u8>>>(1),
+        None,
+        "R31 stores no registration record digest"
     );
     let registered_again = runtime
         .register_dispatcher(&registration_request(1))
@@ -901,8 +847,8 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     );
 
     // An unenrolled participant key is an authentication refusal, not an invalid argument, and it
-    // is raised before the record codec runs - no preimage for generation 2 is in the provider, so
-    // a refusal raised any later would surface as SchemaUnavailable instead.
+    // is raised at the commitment check (SHA-256 of the key against the enrolled slot), before the
+    // registration record is built, so it must not surface as a record or schema error instead.
     let mut unenrolled = registration_request(2);
     unenrolled.participant_key = UNENROLLED_KEY;
     assert_eq!(
@@ -910,6 +856,35 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
             .register_dispatcher(&unenrolled)
             .await
             .expect_err("unenrolled participant key"),
+        DispatchAuthorityError::ParticipantAuthenticationRequired
+    );
+
+    // R31 checks `sha256(participant_key)` against the enrolled commitment. Two discriminating
+    // probes: the enrolled key with one byte changed (a wrong key), and a participant enrolled
+    // under the OLD scheme, the BLAKE3 of its own key, which must no longer authenticate even though
+    // it presents the right key.
+    let mut flipped = registration_request(2);
+    flipped.participant_key[0] ^= 0x01;
+    assert_eq!(
+        runtime
+            .register_dispatcher(&flipped)
+            .await
+            .expect_err("wrong participant key"),
+        DispatchAuthorityError::ParticipantAuthenticationRequired
+    );
+    maintenance
+        .enroll_dispatcher_participant(&EnrollParticipantRequest {
+            provider_boundary_id: REGISTRATION_BOUNDARY.into(),
+            dispatcher_id: LEGACY_DISPATCHER_ID.into(),
+            participant_key_sha256: *blake3::hash(&LEGACY_KEY).as_bytes(),
+        })
+        .await
+        .expect("enroll a participant under the legacy BLAKE3 commitment");
+    assert_eq!(
+        runtime
+            .register_dispatcher(&registration_request_for(LEGACY_KEY, 1, LEGACY_INSTANCE))
+            .await
+            .expect_err("a BLAKE3 commitment is not a SHA-256 commitment"),
         DispatchAuthorityError::ParticipantAuthenticationRequired
     );
 
@@ -975,7 +950,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
             .enroll_dispatcher_participant(&EnrollParticipantRequest {
                 provider_boundary_id: REGISTRATION_BOUNDARY.into(),
                 dispatcher_id: dispatcher_id.into(),
-                participant_key_blake3: *blake3::hash(&key).as_bytes(),
+                participant_key_sha256: sha256(&key),
             })
             .await
             .unwrap_or_else(|error| panic!("enrol {dispatcher_id}: {error}"));
@@ -1092,7 +1067,7 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
         .enroll_dispatcher_participant(&EnrollParticipantRequest {
             provider_boundary_id: REGISTRATION_BOUNDARY.into(),
             dispatcher_id: AMBIGUOUS_DISPATCHER_ID.into(),
-            participant_key_blake3: *blake3::hash(&AMBIGUOUS_KEY).as_bytes(),
+            participant_key_sha256: sha256(&AMBIGUOUS_KEY),
         })
         .await
         .expect("enrol the ambiguity participant");
@@ -1143,14 +1118,32 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     assert_eq!(reserved_outcome.value.admission_clock_unix_ms, 2000);
     assert_eq!(reserved_outcome.value.expires_at_unix_ms, 3000);
     assert_eq!(
+        reserved_outcome.value.reserve_put_ack_canonical_bytes, reserved_ack,
+        "the database's ACK bytes differ from the hand-built v2 preimage"
+    );
+    // The database never emits the wire encoder's v1 bytes: its ack is a different, digest-free
+    // layout under its own tag.
+    assert_ne!(
         reserved_outcome.value.reserve_put_ack_canonical_bytes,
-        reserved.canonical_bytes(),
-        "the database's ACK bytes differ from the independent Rust encoding"
+        wire_reserved.canonical_bytes()
     );
+    assert!(
+        !reserved_outcome
+            .value
+            .reserve_put_ack_canonical_bytes
+            .starts_with(b"object-store-reserve-put-ack-v1"),
+        "the database emitted bytes under the wire encoder's v1 tag"
+    );
+    let (stored_record, stored_record_digest, stored_ack_digest, stored_ack) =
+        stored_row(reserve.spool_object_id).await;
     assert_eq!(
-        reserved_outcome.value.reserve_put_ack_blake3,
-        *reserved.ack_blake3()
+        stored_record, initial_row,
+        "reserved row record differs from the hand-built v2 preimage"
     );
+    assert_eq!(stored_ack, reserved_ack);
+    assert_eq!(stored_record_digest, None, "R31 stores no record digest");
+    assert_eq!(stored_ack_digest, None, "R31 stores no ack digest");
+
     // Re-issuing the identical call is exactly the authoritative read the ambiguity resolution
     // performs. It returns REPLAY bound to the same descriptor.
     let reserved_replay = runtime.reserve_put(&reserve).await.expect("replay reserve");
@@ -1166,6 +1159,11 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     assert_eq!(first.value.committed_prefix_bytes, 3);
     assert_eq!(first.value.committed_prefix_chunks, 1);
     assert_eq!(first.value.spool_revision, 2);
+    assert_eq!(
+        stored_row(reserve.spool_object_id).await.0,
+        progress_three_row,
+        "row record after the first chunk differs from the hand-built v2 preimage"
+    );
     let first_replay = runtime
         .put_upload_progress(&progress_request(0, 3))
         .await
@@ -1188,6 +1186,42 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     assert_eq!(second.value.committed_prefix_bytes, 6);
     assert_eq!(second.value.committed_prefix_chunks, 2);
     assert_eq!(second.value.spool_revision, 3);
+    assert_eq!(
+        stored_row(reserve.spool_object_id).await.0,
+        progress_six_row,
+        "row record after the second chunk differs from the hand-built v2 preimage"
+    );
+
+    // Since WP-122 (0026), ready is admitted only for a reservation that holds live drain custody
+    // under an unexpired policy, and production creates that custody only through `drain_reserve_v1`.
+    // This tier reserved through the raw procedure, so it seeds the custody pair the ready guard
+    // reads, as the superuser. The ready procedure itself still runs for real below.
+    admin
+        .execute(
+            "INSERT INTO object_store_retention.drain_policies(boundary,cell,revision,digest,policy,canonical)
+             VALUES ('boundary-1','cell-1','policy-1',pg_catalog.decode(pg_catalog.repeat('ab',32),'hex'),
+                     '{\"expires_at_ms\": 4102444800000}'::jsonb, '\\x00'::bytea)",
+            &[],
+        )
+        .await
+        .expect("seed the drain policy the ready guard reads");
+    admin
+        .execute(
+            "INSERT INTO object_store_retention.drain_spool_custody(
+                spool_id,boundary,cell,service,logical_id,attempt_id,descriptor,digest,
+                cleanup_not_before,metadata_bytes)
+             VALUES ($1,'boundary-1','cell-1','service-1',$2,$3,
+                     pg_catalog.jsonb_build_object('policy_revision','policy-1',
+                       'policy_digest',pg_catalog.repeat('ab',32)),
+                     pg_catalog.decode(pg_catalog.repeat('cd',32),'hex'),3000,1024)",
+            &[
+                &reserve.spool_object_id,
+                &reserve.identity.logical_request_id,
+                &reserve.identity.attempt_id,
+            ],
+        )
+        .await
+        .expect("seed the drain custody the ready guard reads");
 
     // 0017: the already-durable body assertion, then its replay.
     let ready_outcome = runtime
@@ -1201,16 +1235,150 @@ async fn live_postgres_typed_client_agrees_with_every_called_cell_procedure() {
     assert_eq!(ready_outcome.value.ready_at_unix_ms, 2000);
     assert_eq!(ready_outcome.value.spool_revision, 4);
     assert_eq!(
-        ready_outcome.value.reserve_put_ack_canonical_bytes,
-        ready.canonical_bytes(),
-        "the database's ready ACK bytes differ from the independent Rust encoding"
+        ready_outcome.value.reserve_put_ack_canonical_bytes, ready_ack,
+        "the database's ready ACK bytes differ from the hand-built v2 preimage"
     );
+    assert_ne!(
+        ready_outcome.value.reserve_put_ack_canonical_bytes,
+        wire_ready.canonical_bytes()
+    );
+    let (ready_record, ready_record_digest, ready_ack_digest, stored_ready_ack) =
+        stored_row(reserve.spool_object_id).await;
+    assert_eq!(
+        ready_record, final_row,
+        "ready row record differs from the hand-built v2 preimage"
+    );
+    assert_eq!(stored_ready_ack, ready_ack);
+    assert_eq!((ready_record_digest, ready_ack_digest), (None, None));
     let ready_replay = runtime
         .put_spool_ready(&ready_request(2))
         .await
         .expect("replay spool ready");
     assert_eq!(ready_replay.disposition, DispatchDisposition::Replayed);
     assert_eq!(ready_replay.value, ready_outcome.value);
+
+    // The cut, measured rather than assumed. R31 removed the digest the database used to verify
+    // over the stored ack, but every replay still rebuilds the whole ack and row record from the
+    // row's columns and compares them byte for byte. So an ack preimage tampered in place is STILL
+    // refused; what R31 gives up is only a digest an attacker with table write access could not
+    // forge, not the byte comparison. Restore the bytes afterwards: the rest of the run needs them.
+    let mut tampered_ack = ready_ack.clone();
+    if let Some(last) = tampered_ack.last_mut() {
+        *last ^= 0x01;
+    }
+    admin
+        .execute(
+            "UPDATE object_store_retention.object_dispatch_spool_objects
+             SET reserve_put_ack_canonical_bytes = $1 WHERE spool_object_id = $2",
+            &[&tampered_ack, &reserve.spool_object_id],
+        )
+        .await
+        .expect("tamper the stored ready ack in place");
+    assert!(
+        runtime.put_spool_ready(&ready_request(2)).await.is_err(),
+        "a tampered stored ack must not replay: the byte comparison against the columns remains"
+    );
+    admin
+        .execute(
+            "UPDATE object_store_retention.object_dispatch_spool_objects
+             SET reserve_put_ack_canonical_bytes = $1 WHERE spool_object_id = $2",
+            &[&ready_ack, &reserve.spool_object_id],
+        )
+        .await
+        .expect("restore the stored ready ack");
+    assert_eq!(
+        runtime
+            .put_spool_ready(&ready_request(2))
+            .await
+            .expect("replay after restore")
+            .value,
+        ready_outcome.value
+    );
+
+    // Which layer detects a tampered stored body digest. Rewrite the ready row's committed digest
+    // (and the expected digest a CHECK ties it to) in place, then replay `put_spool_ready` with the
+    // ORIGINAL fsynced digest.
+    let mut forged = BODY;
+    forged[0] ^= 0x01;
+    let forge = "UPDATE object_store_retention.object_dispatch_spool_objects
+                 SET committed_blake3 = $1::bytea::object_store_retention.blake3_256,
+                     expected_blake3 = $1::bytea::object_store_retention.blake3_256
+                 WHERE spool_object_id = $2";
+    admin
+        .execute(forge, &[&forged.to_vec(), &reserve.spool_object_id])
+        .await
+        .expect("tamper the stored committed digest");
+    let refused = runtime.put_spool_ready(&ready_request(2)).await;
+    admin
+        .execute(forge, &[&BODY.to_vec(), &reserve.spool_object_id])
+        .await
+        .expect("restore the stored committed digest");
+    // Detected by the DATABASE: `put_spool_ready_v1` rebuilds the row record from the columns and
+    // compares bytes before it returns anything (the `DISPATCH_RESERVED_PUT_STORED_RECORD_MISMATCH`
+    // family, which the client maps to `StoredRecordMismatch`). The Rust echo check on the
+    // projection is never reached here, so this case does not exercise it; the next one does.
+    assert_eq!(
+        refused.err(),
+        Some(DispatchAuthorityError::StoredRecordMismatch),
+        "the database's byte comparison must refuse a replay over a tampered committed digest"
+    );
+    assert_eq!(
+        runtime
+            .put_spool_ready(&ready_request(2))
+            .await
+            .expect("replay after the digest is restored")
+            .value,
+        ready_outcome.value
+    );
+
+    // The Rust echo check as the ONLY detector. No live tamper reaches it: the database rebuilds
+    // and byte-checks every record it returns, and returns no value it did not check. So this is
+    // fault injection, labelled as such: the ready procedure's projection step is wrapped so that
+    // it hands back the genuine row with the committed digest swapped, as a misbehaving or
+    // substituted procedure would. The client must refuse the projection because it does not carry
+    // the body this call asserted (`InvalidAuthorityResponse` from `decode`), not adopt it.
+    const PROJECT_ARGS: &str = "object_store_retention.object_dispatch_spool_objects, text";
+    admin
+        .batch_execute(&format!(
+            "ALTER FUNCTION object_store_retention.project_dispatch_put_spool_ready_v1({PROJECT_ARGS})
+               RENAME TO real_project_put_spool_ready_v1;
+             CREATE FUNCTION object_store_retention.project_dispatch_put_spool_ready_v1(
+               stored object_store_retention.object_dispatch_spool_objects, result_code text)
+             RETURNS object_store_retention.dispatch_put_spool_ready_result_v1
+             LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+             DECLARE r object_store_retention.dispatch_put_spool_ready_result_v1;
+             BEGIN
+               r := object_store_retention.real_project_put_spool_ready_v1(stored, result_code);
+               r.committed_blake3 := pg_catalog.decode(pg_catalog.repeat('ee', 32), 'hex');
+               RETURN r;
+             END $$;"
+        ))
+        .await
+        .expect("install the digest-swapping projection");
+    let swapped = runtime.put_spool_ready(&ready_request(2)).await;
+    admin
+        .batch_execute(&format!(
+            "DROP FUNCTION object_store_retention.project_dispatch_put_spool_ready_v1({PROJECT_ARGS});
+             ALTER FUNCTION object_store_retention.real_project_put_spool_ready_v1({PROJECT_ARGS})
+               RENAME TO project_dispatch_put_spool_ready_v1;"
+        ))
+        .await
+        .expect("remove the wrapper and restore the real projection");
+    assert_eq!(
+        swapped.err(),
+        Some(DispatchAuthorityError::InvalidAuthorityResponse(
+            "ready projection does not carry the asserted durable body"
+        )),
+        "the Rust echo check must refuse a projection whose committed digest differs from the request"
+    );
+    assert_eq!(
+        runtime
+            .put_spool_ready(&ready_request(2))
+            .await
+            .expect("the real procedure is back")
+            .value,
+        ready_outcome.value
+    );
 
     // The bounded-execution envelope is in force, not merely emitted: a pool whose
     // `statement_timeout` is one millisecond cannot complete a reservation, and the abort arrives

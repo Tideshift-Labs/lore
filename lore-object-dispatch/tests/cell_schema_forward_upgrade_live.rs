@@ -1612,7 +1612,7 @@ async fn read_retained_and_expected(admin: &tokio_postgres::Client, spool: Uuid)
     let row = admin
         .query_one(
             "SELECT metadata_bytes, octet_length(descriptor::text), octet_length(canonical), \
-             octet_length(release_receipt), octet_length(release_digest) \
+             octet_length(release_receipt), coalesce(octet_length(release_digest), 0) \
              FROM object_store_retention.drain_spool_custody WHERE spool_id = $1",
             &[&spool],
         )
@@ -2395,7 +2395,7 @@ async fn seed_metadata_true_up_fixture(
                '{boundary}', '{cell}', 'seed-tenant', '{logical}', '{attempt}', 2, 2, 2, 'result-{spool}',
                decode(repeat('11',32),'hex'), 'boundary-token', decode(repeat('11',32),'hex'),
                33, decode(repeat('11',32),'hex'), 1, 1, 1, 1, 3, decode('aa'||repeat('11',32),'hex'),
-               decode(repeat('11',32),'hex'), 1, 1500, 33, decode(repeat('11',32),'hex'),
+               NULL, 1, 1500, 33, decode(repeat('11',32),'hex'),
                'result/body-{spool}', 1500);
              -- Shared across every case's spool row (same boundary/cell/service): top up rather
              -- than insert-once, so each case's own release has enough counted usage to give back.
@@ -2425,99 +2425,36 @@ async fn seed_metadata_true_up_fixture(
         .expect("seed spool_objects, quota_usage and drain_spool_custody rows");
 }
 
-/// The real release function's body (0029's, which keeps 0028's true-up), reproduced verbatim as a
-/// literal for the discrimination proof below. `local_blake3_v1` inside it requires a real BLAKE3
-/// provider, so this test needs the same `plpython3u` image as the flagship wedge test.
-const REAL_RELEASE_FUNCTION_BODY: &str = "(spool uuid,fence bigint)
-RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$
-DECLARE s object_store_retention.object_dispatch_spool_objects%ROWTYPE; c object_store_retention.drain_spool_custody%ROWTYPE;
-DECLARE q object_store_retention.object_dispatch_quota_usage%ROWTYPE; n integer:=0; receipt bytea; computed_release_digest bytea;
-DECLARE retained bigint;
-BEGIN
- PERFORM object_store_retention.assert_dispatch_runtime_v1(); PERFORM object_store_retention.assert_serializable_write_v1();
- SELECT * INTO s FROM object_store_retention.object_dispatch_spool_objects x WHERE x.spool_object_id=spool FOR UPDATE;
- SELECT * INTO c FROM object_store_retention.drain_spool_custody x WHERE x.spool_id=spool FOR UPDATE;
- IF NOT FOUND THEN RETURN; END IF;
- IF c.cleanup_fence IS DISTINCT FROM fence OR c.state=1 THEN RAISE EXCEPTION 'DRAIN_CLEANUP_FENCED'; END IF;
- IF c.state IN(3,4) THEN RETURN; END IF;
- IF s.spool_object_id IS NULL THEN RAISE EXCEPTION 'DRAIN_CLEANUP_MISSING_ACCOUNTING'; END IF;
- FOR q IN SELECT * FROM object_store_retention.object_dispatch_quota_usage x
- WHERE x.provider_boundary_id=c.boundary AND x.quota_class=1 AND
- ((x.scope_kind=1 AND x.scope_id=c.boundary) OR (x.scope_kind=2 AND x.scope_id=c.cell) OR (x.scope_kind=3 AND x.scope_id=c.service))
- ORDER BY x.scope_kind FOR UPDATE LOOP
-  IF q.used_bytes<s.quota_bytes OR q.used_rows<s.quota_rows OR q.used_concurrency<s.quota_concurrency THEN RAISE EXCEPTION 'DRAIN_COUNTER_UNDERFLOW'; END IF;
-  n:=n+1;
- END LOOP;
- IF n<>3 THEN RAISE EXCEPTION 'DRAIN_COUNTER_MISSING'; END IF;
- UPDATE object_store_retention.object_dispatch_quota_usage x SET used_bytes=x.used_bytes-s.quota_bytes,
- used_rows=x.used_rows-s.quota_rows,used_concurrency=x.used_concurrency-s.quota_concurrency,counter_revision=x.counter_revision+1,
- updated_at_unix_ms=object_store_retention.clock_unix_ms_v1()
- WHERE x.provider_boundary_id=c.boundary AND x.quota_class=1 AND
- ((x.scope_kind=1 AND x.scope_id=c.boundary) OR (x.scope_kind=2 AND x.scope_id=c.cell) OR (x.scope_kind=3 AND x.scope_id=c.service));
- receipt:=convert_to('fragment-drain-release-v1','UTF8')||uuid_send(spool)||c.digest
- ||object_store_retention.local_canonical_u64_v1(fence::object_store_retention.uint64)
- ||object_store_retention.local_canonical_u64_v1(s.quota_bytes)
- ||object_store_retention.local_canonical_u64_v1(s.quota_rows)
- ||object_store_retention.local_canonical_u64_v1(s.quota_concurrency);
- computed_release_digest:=object_store_retention.local_blake3_v1(receipt);
- UPDATE object_store_retention.drain_spool_custody x SET state=3,release_receipt=receipt||computed_release_digest,release_digest=computed_release_digest
- WHERE x.spool_id=spool RETURNING * INTO c;
- retained:=object_store_retention.drain_retained_metadata_bytes_v1(c);
- IF retained<c.metadata_bytes THEN
-  UPDATE object_store_retention.drain_spool_custody x SET metadata_bytes=retained WHERE x.spool_id=spool;
-  UPDATE object_store_retention.drain_policies x
-  SET metadata_bytes=(x.metadata_bytes::numeric-(c.metadata_bytes-retained))::object_store_retention.uint64
-  WHERE x.boundary=c.boundary AND x.cell=c.cell AND x.metadata_bytes::numeric>=(c.metadata_bytes-retained);
-  IF NOT FOUND THEN RAISE EXCEPTION 'DRAIN_METADATA_UNDERFLOW'; END IF;
- END IF;
-END $$;";
+/// The current release function's body, `(spool uuid,fence bigint) ... END $$;`, read from the
+/// migration that defines it (0031, which keeps 0028's true-up and 0029's lease handling and drops
+/// the database BLAKE3). Taken from the file rather than copied so the discrimination proof below
+/// mutates the function the cell really runs.
+fn real_release_function_body() -> String {
+    let migration = include_str!("../migrations/0031_object_store_dispatch_hash_to_rust.sql");
+    let header = "CREATE OR REPLACE FUNCTION object_store_retention.drain_cleanup_release_v1";
+    let start = migration
+        .find(header)
+        .expect("0031 defines the release function")
+        + header.len();
+    let tail = &migration[start..];
+    let end = tail.find("END $$;").expect("the release body ends") + "END $$;".len();
+    tail[..end].to_string()
+}
 
 /// The same body with 0026's original silent clamp in place of the underflow guard -- the exact
 /// shape the CR's test plan asks the discrimination proof to revert.
-const CLAMPING_RELEASE_FUNCTION_BODY: &str = "(spool uuid,fence bigint)
-RETURNS void LANGUAGE plpgsql VOLATILE SECURITY DEFINER SET search_path=pg_catalog AS $$
-DECLARE s object_store_retention.object_dispatch_spool_objects%ROWTYPE; c object_store_retention.drain_spool_custody%ROWTYPE;
-DECLARE q object_store_retention.object_dispatch_quota_usage%ROWTYPE; n integer:=0; receipt bytea; computed_release_digest bytea;
-DECLARE retained bigint;
-BEGIN
- PERFORM object_store_retention.assert_dispatch_runtime_v1(); PERFORM object_store_retention.assert_serializable_write_v1();
- SELECT * INTO s FROM object_store_retention.object_dispatch_spool_objects x WHERE x.spool_object_id=spool FOR UPDATE;
- SELECT * INTO STRICT c FROM object_store_retention.drain_spool_custody x WHERE x.spool_id=spool FOR UPDATE;
- IF c.cleanup_fence IS DISTINCT FROM fence OR c.state=1 THEN RAISE EXCEPTION 'DRAIN_CLEANUP_FENCED'; END IF;
- IF c.state IN(3,4) THEN RETURN; END IF;
- IF s.spool_object_id IS NULL THEN RAISE EXCEPTION 'DRAIN_CLEANUP_MISSING_ACCOUNTING'; END IF;
- FOR q IN SELECT * FROM object_store_retention.object_dispatch_quota_usage x
- WHERE x.provider_boundary_id=c.boundary AND x.quota_class=1 AND
- ((x.scope_kind=1 AND x.scope_id=c.boundary) OR (x.scope_kind=2 AND x.scope_id=c.cell) OR (x.scope_kind=3 AND x.scope_id=c.service))
- ORDER BY x.scope_kind FOR UPDATE LOOP
-  IF q.used_bytes<s.quota_bytes OR q.used_rows<s.quota_rows OR q.used_concurrency<s.quota_concurrency THEN RAISE EXCEPTION 'DRAIN_COUNTER_UNDERFLOW'; END IF;
-  n:=n+1;
- END LOOP;
- IF n<>3 THEN RAISE EXCEPTION 'DRAIN_COUNTER_MISSING'; END IF;
- UPDATE object_store_retention.object_dispatch_quota_usage x SET used_bytes=x.used_bytes-s.quota_bytes,
- used_rows=x.used_rows-s.quota_rows,used_concurrency=x.used_concurrency-s.quota_concurrency,counter_revision=x.counter_revision+1,
- updated_at_unix_ms=object_store_retention.clock_unix_ms_v1()
- WHERE x.provider_boundary_id=c.boundary AND x.quota_class=1 AND
- ((x.scope_kind=1 AND x.scope_id=c.boundary) OR (x.scope_kind=2 AND x.scope_id=c.cell) OR (x.scope_kind=3 AND x.scope_id=c.service));
- receipt:=convert_to('fragment-drain-release-v1','UTF8')||uuid_send(spool)||c.digest
- ||object_store_retention.local_canonical_u64_v1(fence::object_store_retention.uint64)
- ||object_store_retention.local_canonical_u64_v1(s.quota_bytes)
- ||object_store_retention.local_canonical_u64_v1(s.quota_rows)
- ||object_store_retention.local_canonical_u64_v1(s.quota_concurrency);
- computed_release_digest:=object_store_retention.local_blake3_v1(receipt);
- UPDATE object_store_retention.drain_spool_custody x SET state=3,release_receipt=receipt||computed_release_digest,release_digest=computed_release_digest
- WHERE x.spool_id=spool RETURNING * INTO c;
- retained:=object_store_retention.drain_retained_metadata_bytes_v1(c);
- IF retained<c.metadata_bytes THEN
-  UPDATE object_store_retention.drain_spool_custody x SET metadata_bytes=retained WHERE x.spool_id=spool;
-  UPDATE object_store_retention.drain_policies x
-  SET metadata_bytes=greatest((x.metadata_bytes::numeric-(c.metadata_bytes-retained)),0)::object_store_retention.uint64
-  WHERE x.boundary=c.boundary AND x.cell=c.cell;
- END IF;
-END $$;";
-
+fn clamping_release_function_body() -> String {
+    let real = real_release_function_body();
+    let guarded_update = "  SET metadata_bytes=(x.metadata_bytes::numeric-(c.metadata_bytes-retained))::object_store_retention.uint64\n  WHERE x.boundary=c.boundary AND x.cell=c.cell AND x.metadata_bytes::numeric>=(c.metadata_bytes-retained);\n  IF NOT FOUND THEN RAISE EXCEPTION 'DRAIN_METADATA_UNDERFLOW'; END IF;\n";
+    let clamped_update = "  SET metadata_bytes=greatest((x.metadata_bytes::numeric-(c.metadata_bytes-retained)),0)::object_store_retention.uint64\n  WHERE x.boundary=c.boundary AND x.cell=c.cell;\n";
+    assert!(
+        real.contains(guarded_update),
+        "the real release function no longer has the underflow guard this proof mutates"
+    );
+    real.replace(guarded_update, clamped_update)
+}
 #[tokio::test]
-#[ignore = "requires a fresh disposable PostgreSQL 16 database with a real BLAKE3 provider"]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
 async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
     let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_TRUE_UP_PG_URL").await;
     let base_url = fixture.base_url.clone();
@@ -2532,7 +2469,6 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
         .await
         .expect("upgrade to current (real 0028)");
     let fixture = admin_at(base_url).await;
-    install_blake3_provider(&fixture.client).await;
 
     let boundary = "true-up-boundary";
     let cell = "true-up-cell";
@@ -2542,7 +2478,7 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
     // or tiny at this point (release has not run yet), so `drain_retained_metadata_bytes_v1`
     // computes the 1024 floor before release fills in the release receipt/digest; after release it
     // must equal 1024 + len(descriptor::text) + len(canonical) + len(release_receipt) +
-    // len(release_digest), clamped to the charge and never below 1024. Assert against that formula
+    // len(release_digest, zero from R31 on, when the receipt carries no digest), clamped to the charge and never below 1024. Assert against that formula
     // computed independently in Rust from what the row holds after release, not merely "less than
     // 16384", so a regression that changes the formula's shape (not just its magnitude) is caught.
     let spool = Uuid::now_v7();
@@ -2576,7 +2512,7 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
         .client
         .query_one(
             "SELECT metadata_bytes, octet_length(descriptor::text), octet_length(canonical), \
-             octet_length(release_receipt), octet_length(release_digest) \
+             octet_length(release_receipt), coalesce(octet_length(release_digest), 0) \
              FROM object_store_retention.drain_spool_custody WHERE spool_id = $1",
             &[&spool],
         )
@@ -2671,15 +2607,17 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
     // This never touches migrations/0028_*.sql on disk -- both bodies above are Rust string
     // literals compared against each other, not derived from the tracked file -- so no worktree is
     // needed and `git status` on implementation files is unaffected by construction.
+    let real = real_release_function_body();
+    let clamping = clamping_release_function_body();
     assert_ne!(
-        CLAMPING_RELEASE_FUNCTION_BODY, REAL_RELEASE_FUNCTION_BODY,
+        clamping, real,
         "the mutation must actually change the function body, or this proves nothing"
     );
     fixture
         .client
         .batch_execute(&format!(
             "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
-             CREATE OR REPLACE FUNCTION object_store_retention.drain_cleanup_release_v1{CLAMPING_RELEASE_FUNCTION_BODY}
+             CREATE OR REPLACE FUNCTION object_store_retention.drain_cleanup_release_v1{clamping}
              COMMIT;"
         ))
         .await
@@ -2745,16 +2683,11 @@ async fn live_release_true_up_matches_actual_size_and_underflow_raises() {
         .client
         .batch_execute(&format!(
             "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
-             CREATE OR REPLACE FUNCTION object_store_retention.drain_cleanup_release_v1{REAL_RELEASE_FUNCTION_BODY}
+             CREATE OR REPLACE FUNCTION object_store_retention.drain_cleanup_release_v1{real}
              COMMIT;"
         ))
         .await
         .expect("restore the real release function");
-    assert!(
-        include_str!("../migrations/0029_object_store_dispatch_drain_superseded_markers.sql")
-            .contains(REAL_RELEASE_FUNCTION_BODY),
-        "the restored body must be the current migration's, byte for byte"
-    );
     attest_cell_schema(&migrator)
         .await
         .expect("attestation holds again once the real function is restored");
@@ -3437,13 +3370,24 @@ struct DrainCell {
 }
 
 async fn drain_cell(variable: &str, label: &str, metadata_max_rows: u64) -> DrainCell {
+    drain_cell_with_ttl(variable, label, metadata_max_rows, None).await
+}
+
+/// [`drain_cell`] with the policy's reservation window overridden (the default is a short window
+/// so cleanup is reachable quickly; a case that must stay inside it passes a long one).
+async fn drain_cell_with_ttl(
+    variable: &str,
+    label: &str,
+    metadata_max_rows: u64,
+    ttl_ms: Option<u64>,
+) -> DrainCell {
     let fixture = admin(variable).await;
     let migrator = connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
     install_cell_schema(&migrator.0)
         .await
         .expect("install a current cell");
+    // R31: the current cell hashes nothing in the database, so no BLAKE3 provider is installed.
     let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
-    install_blake3_provider(&fixture.client).await;
     fixture
         .client
         .batch_execute(
@@ -3474,6 +3418,11 @@ async fn drain_cell(variable: &str, label: &str, metadata_max_rows: u64) -> Drai
         16_384 * metadata_max_rows,
         metadata_max_rows,
     );
+    let mut policy = policy;
+    if let Some(ttl) = ttl_ms {
+        policy.maximum_ttl_ms = ttl;
+        policy.stage.prepare_ttl_ms = ttl;
+    }
     publish_drain_policy(&fixture.client, &policy).await;
     let policy_digest = policy.digest().unwrap();
     let client = drain_client(&fixture.base_url, identity).await;
@@ -4283,7 +4232,8 @@ async fn live_r29_cell_is_refused_then_upgrades_and_counts_every_charge() {
         report.disposition,
         CellUpgradeDisposition::Upgraded(CellSchemaRevision::R29)
     );
-    assert_eq!(report.attestation.schema_revision, CellSchemaRevision::R30);
+    // The upgrade walks every step to the current state: R29 -> R30 -> R31.
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
 
     let fixture = admin_at(base_url.clone()).await;
     let client = drain_client(&base_url, identity).await;
@@ -4476,4 +4426,911 @@ async fn live_the_active_service_session_guard_ignores_a_real_autovacuum_worker(
         .batch_execute("DROP TABLE autovacuum_probe;")
         .await
         .expect("clean up the probe table");
+}
+
+// -------------------------------------------------------------------------------------------
+// Migration 0031 (WP-115 readiness blocker 6): BLAKE3 leaves PostgreSQL.
+//
+// R30 -> R31 rebuilds every live spool row as a digest-free `*-v2` preimage, replaces the
+// participant commitment with SHA-256, and swaps `drain_check_ready_v1`'s database-built record
+// digest for a `(spool_revision, ready_at_unix_ms)` token. Each expected byte string below is
+// assembled here, by hand, from the stored row's own input columns; nothing calls the SQL codecs
+// to build an expectation.
+// -------------------------------------------------------------------------------------------
+
+/// The input columns of one spool row: everything a record is built from, and nothing the
+/// database computed.
+struct SpoolInputs {
+    protocol_revision: String,
+    policy_revision: String,
+    provider_boundary_id: String,
+    authenticated_cell_id: String,
+    authenticated_tenant_id: String,
+    spool_object_id: Uuid,
+    logical_request_id: Uuid,
+    attempt_id: Uuid,
+    upload_id: Uuid,
+    upload_fence: u64,
+    boundary_blake3: Vec<u8>,
+    boundary_token: String,
+    observation_binding_blake3: Vec<u8>,
+    expected_size: u64,
+    expected_blake3: Vec<u8>,
+    committed_size: Option<u64>,
+    committed_blake3: Option<Vec<u8>>,
+    durable_handle: Option<String>,
+    partial_temp_bytes: u64,
+    partial_temp_chunks: u64,
+    partial_temp_files: u64,
+    quota_bytes: u64,
+    quota_rows: u64,
+    quota_concurrency: u64,
+    quota_revision: u64,
+    expires_at: i64,
+    fingerprint: Vec<u8>,
+    allocation_revision: String,
+    allocation_fence: u64,
+    reservation_deadline: i64,
+    allocation_hard_expiry: i64,
+    admission_clock: i64,
+    prepared_ttl: i64,
+    max_chunk_bytes: u64,
+    spool_revision: u64,
+    ready_at: Option<i64>,
+    lifecycle: i16,
+}
+
+async fn read_spool_inputs(admin: &tokio_postgres::Client, spool: Uuid) -> SpoolInputs {
+    fn number(row: &tokio_postgres::Row, index: usize) -> u64 {
+        row.get::<_, String>(index).parse().expect("uint64 column")
+    }
+    let row = admin
+        .query_one(
+            "SELECT protocol_revision, policy_revision, provider_boundary_id, authenticated_cell_id,
+                    authenticated_tenant_id, spool_object_id, logical_request_id, attempt_id,
+                    upload_id, upload_fence::text, boundary_blake3::bytea, boundary_token,
+                    observation_binding_blake3::bytea, expected_size::text, expected_blake3::bytea,
+                    committed_size::text, committed_blake3::bytea, durable_handle,
+                    partial_temp_bytes::text, partial_temp_chunks::text, partial_temp_files::text,
+                    quota_bytes::text, quota_rows::text, quota_concurrency::text,
+                    quota_revision::text, expires_at_unix_ms, put_reservation_fingerprint::bytea,
+                    allocation_revision, allocation_fence::text, reservation_deadline_unix_ms,
+                    allocation_hard_expiry_unix_ms, admission_clock_unix_ms, prepared_ttl_ms,
+                    max_chunk_bytes::text, spool_revision::text, ready_at_unix_ms, lifecycle_state
+             FROM object_store_retention.object_dispatch_spool_objects
+             WHERE spool_object_id = $1",
+            &[&spool],
+        )
+        .await
+        .expect("read the spool row's input columns");
+    SpoolInputs {
+        protocol_revision: row.get(0),
+        policy_revision: row.get(1),
+        provider_boundary_id: row.get(2),
+        authenticated_cell_id: row.get(3),
+        authenticated_tenant_id: row.get(4),
+        spool_object_id: row.get(5),
+        logical_request_id: row.get(6),
+        attempt_id: row.get(7),
+        upload_id: row.get(8),
+        upload_fence: number(&row, 9),
+        boundary_blake3: row.get(10),
+        boundary_token: row.get(11),
+        observation_binding_blake3: row.get(12),
+        expected_size: number(&row, 13),
+        expected_blake3: row.get(14),
+        committed_size: row
+            .get::<_, Option<String>>(15)
+            .map(|value| value.parse().expect("uint64 column")),
+        committed_blake3: row.get(16),
+        durable_handle: row.get(17),
+        partial_temp_bytes: number(&row, 18),
+        partial_temp_chunks: number(&row, 19),
+        partial_temp_files: number(&row, 20),
+        quota_bytes: number(&row, 21),
+        quota_rows: number(&row, 22),
+        quota_concurrency: number(&row, 23),
+        quota_revision: number(&row, 24),
+        expires_at: row.get(25),
+        fingerprint: row.get(26),
+        allocation_revision: row.get(27),
+        allocation_fence: number(&row, 28),
+        reservation_deadline: row.get(29),
+        allocation_hard_expiry: row.get(30),
+        admission_clock: row.get(31),
+        prepared_ttl: row.get(32),
+        max_chunk_bytes: number(&row, 33),
+        spool_revision: number(&row, 34),
+        ready_at: row.get(35),
+        lifecycle: row.get(36),
+    }
+}
+
+fn put_text(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: impl TryInto<u64>) {
+    out.extend_from_slice(&value.try_into().ok().unwrap().to_be_bytes());
+}
+
+/// A child record framed as `u32 length || child preimage`.
+fn put_framed(out: &mut Vec<u8>, child: &[u8]) {
+    out.extend_from_slice(&u32::try_from(child.len()).unwrap().to_be_bytes());
+    out.extend_from_slice(child);
+}
+
+fn quota_child_v2(inputs: &SpoolInputs) -> Vec<u8> {
+    let mut out = b"object-store-local-quota-units-v2\0".to_vec();
+    put_u64(&mut out, inputs.quota_bytes);
+    put_u64(&mut out, inputs.quota_rows);
+    put_u64(&mut out, inputs.quota_concurrency);
+    out
+}
+
+fn spool_child_v2(inputs: &SpoolInputs) -> Vec<u8> {
+    let mut out = b"object-store-local-put-spool-ready-v2\0".to_vec();
+    for text in [
+        &inputs.protocol_revision,
+        &inputs.provider_boundary_id,
+        &inputs.authenticated_cell_id,
+        &inputs.authenticated_tenant_id,
+        &inputs.logical_request_id.to_string(),
+        &inputs.attempt_id.to_string(),
+        &inputs.upload_id.to_string(),
+    ] {
+        put_text(&mut out, text);
+    }
+    put_u64(&mut out, inputs.upload_fence);
+    put_text(&mut out, inputs.durable_handle.as_deref().unwrap());
+    put_u64(&mut out, inputs.committed_size.unwrap());
+    out.extend_from_slice(inputs.committed_blake3.as_deref().unwrap());
+    put_u64(&mut out, inputs.ready_at.unwrap());
+    out
+}
+
+fn ack_v2(inputs: &SpoolInputs, ready: bool) -> Vec<u8> {
+    let mut out = b"object-store-local-reserve-put-ack-v2\0".to_vec();
+    for text in [
+        &inputs.protocol_revision,
+        &inputs.policy_revision,
+        &inputs.provider_boundary_id,
+        &inputs.authenticated_cell_id,
+        &inputs.authenticated_tenant_id,
+        &inputs.logical_request_id.to_string(),
+        &inputs.attempt_id.to_string(),
+        &inputs.upload_id.to_string(),
+    ] {
+        put_text(&mut out, text);
+    }
+    put_u64(&mut out, inputs.upload_fence);
+    out.extend_from_slice(&(if ready { 2_u32 } else { 1_u32 }).to_be_bytes());
+    put_framed(&mut out, &quota_child_v2(inputs));
+    put_u64(&mut out, inputs.expires_at);
+    put_u64(&mut out, inputs.max_chunk_bytes);
+    out.push(u8::from(ready));
+    if ready {
+        put_framed(&mut out, &spool_child_v2(inputs));
+    }
+    out.push(0);
+    put_u64(&mut out, inputs.admission_clock);
+    put_u64(&mut out, inputs.allocation_hard_expiry);
+    out.push(0);
+    out.push(0);
+    out
+}
+
+fn row_v2(inputs: &SpoolInputs, ack: &[u8], ready: bool) -> Vec<u8> {
+    let mut out = if ready {
+        b"object-store-dispatch-put-spool-ready-row-v2\0".to_vec()
+    } else {
+        b"object-store-dispatch-put-reservation-row-v2\0".to_vec()
+    };
+    for text in [
+        "object-store-dispatch-authority-schema-v1",
+        &inputs.protocol_revision,
+        &inputs.policy_revision,
+        &inputs.provider_boundary_id,
+        &inputs.authenticated_cell_id,
+        &inputs.authenticated_tenant_id,
+        &inputs.spool_object_id.to_string(),
+        &inputs.logical_request_id.to_string(),
+        &inputs.attempt_id.to_string(),
+        &inputs.upload_id.to_string(),
+    ] {
+        put_text(&mut out, text);
+    }
+    put_u64(&mut out, inputs.upload_fence);
+    out.extend_from_slice(if ready { &[1, 1, 2, 1] } else { &[1, 1, 1, 1] });
+    out.extend_from_slice(&inputs.boundary_blake3);
+    put_text(&mut out, &inputs.boundary_token);
+    out.extend_from_slice(&inputs.observation_binding_blake3);
+    put_u64(&mut out, inputs.expected_size);
+    out.extend_from_slice(&inputs.expected_blake3);
+    if ready {
+        put_u64(&mut out, inputs.committed_size.unwrap());
+        out.extend_from_slice(inputs.committed_blake3.as_deref().unwrap());
+        put_text(&mut out, inputs.durable_handle.as_deref().unwrap());
+    }
+    put_u64(&mut out, inputs.partial_temp_bytes);
+    put_u64(&mut out, inputs.partial_temp_chunks);
+    put_u64(&mut out, inputs.partial_temp_files);
+    put_framed(&mut out, &quota_child_v2(inputs));
+    put_u64(&mut out, inputs.quota_revision);
+    put_u64(&mut out, inputs.expires_at);
+    out.extend_from_slice(&inputs.fingerprint);
+    put_text(&mut out, &inputs.allocation_revision);
+    put_u64(&mut out, inputs.allocation_fence);
+    put_u64(&mut out, inputs.reservation_deadline);
+    put_u64(&mut out, inputs.allocation_hard_expiry);
+    put_u64(&mut out, inputs.admission_clock);
+    put_u64(&mut out, inputs.prepared_ttl);
+    put_u64(&mut out, inputs.max_chunk_bytes);
+    put_framed(&mut out, ack);
+    put_u64(&mut out, inputs.spool_revision);
+    put_u64(&mut out, inputs.admission_clock);
+    if ready {
+        put_u64(&mut out, inputs.ready_at.unwrap());
+    }
+    out
+}
+
+/// What a spool row stores, before or after a record rewrite.
+struct StoredRecords {
+    record: Vec<u8>,
+    ack: Vec<u8>,
+    record_digest_present: bool,
+    ack_digest_present: bool,
+}
+
+async fn read_stored_records(admin: &tokio_postgres::Client, spool: Uuid) -> StoredRecords {
+    let row = admin
+        .query_one(
+            "SELECT canonical_record_bytes, reserve_put_ack_canonical_bytes,
+                    record_blake3 IS NOT NULL, reserve_put_ack_blake3 IS NOT NULL
+             FROM object_store_retention.object_dispatch_spool_objects WHERE spool_object_id = $1",
+            &[&spool],
+        )
+        .await
+        .expect("read the stored records");
+    StoredRecords {
+        record: row.get(0),
+        ack: row.get(1),
+        record_digest_present: row.get(2),
+        ack_digest_present: row.get(3),
+    }
+}
+
+/// Mark a reservation spool-ready through the runtime role, exactly as the drain does (0026's
+/// `object_store_dispatch_put_spool_ready_v1`). Returns `(result_code, spool_revision, ready_at)`.
+async fn mark_ready_through_runtime(
+    runtime: &tokio_postgres::Client,
+    descriptor: &DrainDescriptor,
+) -> (String, u64, i64) {
+    let digest = lore_object_dispatch::drain_policy::decode_digest(&descriptor.body_digest)
+        .expect("descriptor body digest");
+    runtime
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    let row = runtime
+        .query_one(
+            "SELECT (r).result_code, ((r).spool_revision)::text, (r).ready_at_unix_ms
+             FROM (SELECT object_store_retention.object_store_dispatch_put_spool_ready_v1(
+               $1, $2, $3, $4, $5, $6, $7, $8,
+               $9::text::object_store_retention.uint64,
+               $10::text::object_store_retention.uint64,
+               $11::text::object_store_retention.uint64,
+               $12, $13, $14, $15, $16, $17) AS r) q",
+            &[
+                &"object-store-dispatch-put-spool-ready-v1",
+                &"object-dispatch-v1",
+                &descriptor.boundary,
+                &descriptor.cell,
+                &descriptor.service,
+                &descriptor.logical_request_id,
+                &descriptor.attempt_id,
+                &descriptor.upload_id,
+                &descriptor.upload_fence.to_string(),
+                &"0",
+                &descriptor.body_size.to_string(),
+                &&digest[..],
+                &"durable/r31-fixture-handle",
+                &256_i32,
+                &256_i32,
+                &4096_i32,
+                &16384_i32,
+            ],
+        )
+        .await
+        .expect("mark the reservation spool-ready");
+    runtime.batch_execute("COMMIT").await.unwrap();
+    (
+        row.get(0),
+        row.get::<_, String>(1).parse().expect("spool revision"),
+        row.get(2),
+    )
+}
+
+/// The four database hashing functions R31 drops, plus the v1 ready check.
+async fn hashing_functions_present(admin: &tokio_postgres::Client) -> Vec<String> {
+    admin
+        .query(
+            "SELECT proname::text FROM pg_catalog.pg_proc
+             WHERE pronamespace = 'object_store_retention'::regnamespace
+               AND proname IN ('local_blake3_v1', 'local_assert_blake3_v1',
+                               'local_complete_record_v1', 'drain_check_ready_v1')
+             ORDER BY 1",
+            &[],
+        )
+        .await
+        .expect("look for the dropped hashing functions")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
+}
+
+// R30 -> R31: an R30 cell holding a reserved row and a ready row upgrades with both rebuilt as v2
+// preimages, digest columns cleared, and every byte equal to a hand-built expectation. The ready row
+// then replays `put_spool_ready`, and `drain_check_ready_v2` accepts its exact token and refuses a
+// stale revision, a different `ready_at`, a different key, and a row that is not ready.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database with a real BLAKE3 provider"]
+async fn live_r30_cell_with_live_rows_upgrades_to_r31_and_backfills_them() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R31_BACKFILL_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R30)
+        .await
+        .expect("install a real R30 cell");
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R30))
+    );
+    let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
+    // R30 still hashes in the database; this is the last cell state that needs the provider.
+    install_blake3_provider(&fixture.client).await;
+    let now = now_ms(&fixture.client).await;
+    let allocation = publish_budget(
+        &fixture.client,
+        "r31-boundary",
+        "r31-cell",
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    // Long-lived reservations: the rows must still be live after the upgrade, not expired.
+    let mut policy = drain_policy(
+        "r31-boundary",
+        "r31-cell",
+        "r31-service",
+        "r31-policy-v1",
+        u64::try_from(now + 7_200_000).unwrap(),
+        16_384 * 8,
+        8,
+    );
+    policy.maximum_ttl_ms = 600_000;
+    policy.stage.prepare_ttl_ms = 600_000;
+    publish_drain_policy(&fixture.client, &policy).await;
+    let digest = policy.digest().unwrap();
+    let client = DrainClient::new(Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    ));
+    let reserved = synthetic_descriptor(
+        0,
+        &policy,
+        &digest,
+        &allocation,
+        now_ms(&fixture.client).await,
+    );
+    let ready = synthetic_descriptor(
+        1,
+        &policy,
+        &digest,
+        &allocation,
+        now_ms(&fixture.client).await,
+    );
+    client.reserve(&reserved).await.expect("R30 reservation");
+    client.reserve(&ready).await.expect("R30 reservation");
+    let (runtime, runtime_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_runtime").await;
+    let (code, ready_revision, ready_at) = mark_ready_through_runtime(&runtime, &ready).await;
+    assert_eq!(code, "APPLIED");
+
+    // The R30 shape the upgrade must rewrite: v1 records that carry database-built digests.
+    for (descriptor, tag) in [
+        (
+            &reserved,
+            &b"object-store-dispatch-put-reservation-row-v1\0"[..],
+        ),
+        (
+            &ready,
+            &b"object-store-dispatch-put-spool-ready-row-v1\0"[..],
+        ),
+    ] {
+        let stored = read_stored_records(&fixture.client, descriptor.spool_object_id).await;
+        assert!(
+            stored.record.starts_with(tag),
+            "R30 rows carry v1 records before the upgrade"
+        );
+        assert!(stored.record_digest_present && stored.ack_digest_present);
+    }
+    drop(runtime);
+    drop(runtime_task);
+    drop(client);
+
+    let base_url = fixture.base_url.clone();
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    let report = upgrade_cell_schema(&migrator)
+        .await
+        .expect("upgrade R30 to R31");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R30)
+    );
+    assert_eq!(report.attestation.schema_revision, CellSchemaRevision::R31);
+
+    let fixture = admin_at(base_url.clone()).await;
+    // The four database hashing functions are gone, and the v2 ready check replaces v1.
+    assert_eq!(
+        hashing_functions_present(&fixture.client).await,
+        Vec::<String>::new()
+    );
+    // Backfilled rows: digest columns cleared, bytes equal to the independent expectation.
+    for (descriptor, is_ready) in [(&reserved, false), (&ready, true)] {
+        let inputs = read_spool_inputs(&fixture.client, descriptor.spool_object_id).await;
+        assert_eq!(inputs.lifecycle, if is_ready { 2 } else { 1 });
+        let ack = ack_v2(&inputs, is_ready);
+        let record = row_v2(&inputs, &ack, is_ready);
+        let stored = read_stored_records(&fixture.client, descriptor.spool_object_id).await;
+        assert_eq!(
+            stored.ack, ack,
+            "backfilled ack differs from the hand-built v2 preimage (ready={is_ready})"
+        );
+        assert_eq!(
+            stored.record, record,
+            "backfilled row record differs from the hand-built v2 preimage (ready={is_ready})"
+        );
+        assert!(
+            !stored.record_digest_present && !stored.ack_digest_present,
+            "the backfill must clear both digest columns (ready={is_ready})"
+        );
+    }
+
+    // The ready row survives the upgrade as a live ready row: replaying `put_spool_ready` is a
+    // REPLAY with the same token, and `drain_check_ready_v2` accepts exactly that token.
+    let (runtime, _runtime_task) = connect_as(&base_url, "object_dispatch_retention_runtime").await;
+    let (code, replay_revision, replay_ready_at) =
+        mark_ready_through_runtime(&runtime, &ready).await;
+    assert_eq!(code, "REPLAY", "a backfilled ready row must replay");
+    assert_eq!(
+        (replay_revision, replay_ready_at),
+        (ready_revision, ready_at)
+    );
+    let client = drain_client(&base_url, identity).await;
+    let deadline = i64::try_from(ready.send_not_after_ms).unwrap() - 1;
+    let (effective, remaining) = client
+        .check_ready(
+            ready.spool_object_id,
+            ready.attempt_id,
+            ready_revision,
+            ready_at,
+            &ready.object_key,
+            deadline,
+        )
+        .await
+        .expect("the exact ready token passes drain_check_ready_v2");
+    assert!(effective > 0 && remaining > 0);
+    for (label, spool_revision, at, key) in [
+        (
+            "a stale spool_revision",
+            ready_revision - 1,
+            ready_at,
+            ready.object_key.as_str(),
+        ),
+        (
+            "a different ready_at",
+            ready_revision,
+            ready_at + 1,
+            ready.object_key.as_str(),
+        ),
+        (
+            "a different object key",
+            ready_revision,
+            ready_at,
+            "another-object-key",
+        ),
+    ] {
+        assert_eq!(
+            client
+                .check_ready(
+                    ready.spool_object_id,
+                    ready.attempt_id,
+                    spool_revision,
+                    at,
+                    key,
+                    deadline,
+                )
+                .await,
+            Err(DrainError::Refused),
+            "{label} must be refused"
+        );
+    }
+    assert_eq!(
+        client
+            .check_ready(
+                reserved.spool_object_id,
+                reserved.attempt_id,
+                1,
+                ready_at,
+                &reserved.object_key,
+                i64::try_from(reserved.send_not_after_ms).unwrap() - 1,
+            )
+            .await,
+        Err(DrainError::Refused),
+        "a reservation that is not ready has no ready token"
+    );
+}
+
+// R30 -> R31: a cell with an enrolled dispatcher participant is refused with its own reason and
+// stays at R30. Its commitment is a BLAKE3 digest the SHA-256 check could never match, and a
+// commitment cannot be converted without the key.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r30_cell_with_an_enrolled_participant_is_refused_and_stays_r30() {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R31_PARTICIPANT_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R30)
+        .await
+        .expect("install a real R30 cell");
+    let (maintenance, maintenance_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_maintenance").await;
+    maintenance
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    maintenance
+        .query_one(
+            "SELECT (object_store_retention.object_store_dispatch_enroll_dispatcher_participant_v1(
+               'object-store-dispatch-dispatcher-registration-v1', 'boundary-a', 'dispatcher-a',
+               pg_catalog.decode(pg_catalog.repeat('11', 32), 'hex'))).result_code",
+            &[],
+        )
+        .await
+        .expect("enroll a participant on the R30 cell");
+    maintenance.batch_execute("COMMIT").await.unwrap();
+    drop(maintenance);
+    drop(maintenance_task);
+
+    let base_url = fixture.base_url.clone();
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    match upgrade_cell_schema(&migrator).await {
+        Err(CellSchemaError::Precondition(reason)) => assert!(
+            reason.contains("enrolled dispatcher participants"),
+            "the refusal must name the participants: {reason}"
+        ),
+        other => panic!("expected the enrolled-participant refusal, got {other:?}"),
+    }
+
+    // Nothing moved: the cell is still R30, and the participant is still enrolled.
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R30))
+    );
+    let fixture = admin_at(base_url).await;
+    let marker: i32 = fixture
+        .client
+        .query_one(
+            "SELECT object_store_retention.cell_schema_revision_v1()",
+            &[],
+        )
+        .await
+        .expect("read the schema marker")
+        .get(0);
+    assert_eq!(
+        marker, 30,
+        "the refused upgrade must leave the marker at R30"
+    );
+    let participants: i64 = fixture
+        .client
+        .query_one(
+            "SELECT pg_catalog.count(*) FROM
+             object_store_retention.object_dispatch_dispatcher_participants",
+            &[],
+        )
+        .await
+        .expect("count participants")
+        .get(0);
+    assert_eq!(participants, 1);
+    assert_eq!(
+        hashing_functions_present(&fixture.client).await.len(),
+        4,
+        "a refused upgrade must not drop the R30 hashing functions"
+    );
+}
+
+// R31 (fresh, no BLAKE3 provider): a released row carries a 105-byte preimage-only v2 receipt with
+// no digest; the receipt equals a hand-built expectation. The cut is pinned honestly: nothing
+// reads a stored receipt back, so tampering with one is not caught by the database, and a release
+// replay still succeeds. And the policy digest the database no longer hashes is refused by Rust.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by_rust() {
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R31_RECEIPT_PG_URL",
+        "r31rcpt",
+        16,
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let provider_residue: i64 = admin
+        .query_one(
+            "SELECT (SELECT count(*) FROM pg_catalog.pg_proc
+                      WHERE proname = 'blake3' AND pronamespace = 'public'::regnamespace)
+                  + (SELECT count(*) FROM pg_catalog.pg_extension WHERE extname = 'plpython3u')",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        provider_residue, 0,
+        "this case must run without a BLAKE3 provider"
+    );
+
+    // Reserve, wait past the short window, claim, release.
+    let descriptor = cell.descriptor(0, &cell.policy).await;
+    cell.client.reserve(&descriptor).await.expect("reservation");
+    tokio::time::sleep(Duration::from_millis(cell.policy.maximum_ttl_ms + 500)).await;
+    let intent = cell
+        .client
+        .claim_cleanup(descriptor.spool_object_id)
+        .await
+        .expect("claim an expired reservation");
+    cell.client
+        .release_cleanup(&intent)
+        .await
+        .expect("release it");
+
+    let row = admin
+        .query_one(
+            "SELECT release_receipt, release_digest, digest, cleanup_fence, state
+             FROM object_store_retention.drain_spool_custody WHERE spool_id = $1",
+            &[&descriptor.spool_object_id],
+        )
+        .await
+        .expect("read the released custody row");
+    let receipt: Vec<u8> = row.get(0);
+    let release_digest: Option<Vec<u8>> = row.get(1);
+    let custody_digest: Vec<u8> = row.get(2);
+    let fence: i64 = row.get(3);
+    assert_eq!(row.get::<_, i16>(4), 3);
+    // The custody digest is the descriptor digest Rust supplied, never a database computation.
+    assert_eq!(
+        custody_digest,
+        blake3::hash(&descriptor.canonical_bytes().unwrap())
+            .as_bytes()
+            .to_vec()
+    );
+    let mut expected = b"fragment-drain-release-v2".to_vec();
+    expected.extend_from_slice(descriptor.spool_object_id.as_bytes());
+    expected.extend_from_slice(&custody_digest);
+    for field in [u64::try_from(fence).unwrap(), descriptor.body_size, 1, 1] {
+        expected.extend_from_slice(&field.to_be_bytes());
+    }
+    assert_eq!(receipt.len(), 105, "the v2 receipt is 105 bytes");
+    assert_eq!(
+        receipt, expected,
+        "the receipt differs from the hand-built v2 preimage"
+    );
+    assert_eq!(release_digest, None, "R31 stores no release digest");
+
+    // The cut: the database never reads a stored receipt back, so a tampered one is not noticed.
+    // A replayed release is a no-op on a released row, and succeeds over the tampered bytes.
+    let mut tampered = receipt.clone();
+    if let Some(last) = tampered.last_mut() {
+        *last ^= 0x01;
+    }
+    admin
+        .execute(
+            "UPDATE object_store_retention.drain_spool_custody SET release_receipt = $1
+             WHERE spool_id = $2",
+            &[&tampered, &descriptor.spool_object_id],
+        )
+        .await
+        .expect("tamper the stored release receipt");
+    cell.client
+        .release_cleanup(&intent)
+        .await
+        .expect("R31 does not detect a tampered release receipt");
+    admin
+        .execute(
+            "UPDATE object_store_retention.drain_spool_custody SET release_receipt = $1
+             WHERE spool_id = $2",
+            &[&receipt, &descriptor.spool_object_id],
+        )
+        .await
+        .expect("restore the stored release receipt");
+
+    // The policy pin. The database stores whatever 32-byte digest a caller publishes and compares
+    // pins byte for byte; it does not hash the policy. A digest that is not the BLAKE3 of the policy
+    // therefore publishes, and reads back to the same pin; Rust is what refuses it.
+    let (_, system_identifier, database_oid) = database_identity(admin).await;
+    let now = now_ms(admin).await;
+    publish_budget(
+        admin,
+        "wrongpin-boundary",
+        "wrongpin-cell",
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    let wrong = drain_policy(
+        "wrongpin-boundary",
+        "wrongpin-cell",
+        "wrongpin-service",
+        "wrongpin-policy-v1",
+        u64::try_from(now + 3_600_000).unwrap(),
+        16_384 * 8,
+        8,
+    );
+    let wrong_pin = [0x77_u8; 32];
+    assert_ne!(wrong.digest().unwrap(), wrong_pin);
+    admin
+        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance; BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    admin
+        .query_one(
+            "SELECT object_store_retention.drain_policy_publish_v1($1::text::jsonb,$2,$3)",
+            &[
+                &serde_json::to_string(&wrong).unwrap(),
+                &wrong.canonical_bytes().unwrap(),
+                &&wrong_pin[..],
+            ],
+        )
+        .await
+        .expect("R31: the database publishes a digest it did not compute");
+    admin
+        .batch_execute("COMMIT; RESET SESSION AUTHORIZATION")
+        .await
+        .unwrap();
+    // Control: the real policy reads back through the same client.
+    cell.client
+        .read(
+            &cell.policy.boundary,
+            &cell.policy.cell,
+            &cell.policy.revision,
+            &cell.policy_digest,
+        )
+        .await
+        .expect("a policy whose pin is its real digest reads");
+    // The database answers the wrong pin (it matches what was stored), and Rust refuses it.
+    assert_eq!(
+        cell.client
+            .read(&wrong.boundary, &wrong.cell, &wrong.revision, &wrong_pin)
+            .await
+            .map(|_| ()),
+        Err(DrainError::Invalid),
+        "Rust must refuse a stored policy that does not hash to its pin"
+    );
+}
+
+// R31 deviation in `drain_reserve_v1` (0031): the descriptor digest is Rust-supplied and no longer
+// hashed by the database, so the replay path pins it byte for byte. A replay of an admitted
+// reservation with a different 32-byte digest (everything else identical) is refused, and a digest
+// that is not 32 bytes is refused as invalid before any lookup.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r31_drain_reserve_replay_is_pinned_to_the_descriptor_digest() {
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R31_REPLAY_PG_URL",
+        "r31replay",
+        16,
+    )
+    .await;
+    let descriptor = cell.descriptor(0, &cell.policy).await;
+    cell.client.reserve(&descriptor).await.expect("reservation");
+    let json = serde_json::to_string(&descriptor).unwrap();
+    let canonical = descriptor.canonical_bytes().unwrap();
+    let real = *blake3::hash(&canonical).as_bytes();
+    let sql = "SELECT object_store_retention.drain_reserve_v1($1::text::jsonb,$2,$3)";
+    // Control: the identical call replays.
+    assert_eq!(
+        cell.runtime_message(sql, &[&json, &canonical, &&real[..]])
+            .await,
+        None,
+        "the exact replay must be accepted"
+    );
+    let other = [0x99_u8; 32];
+    assert_ne!(other, real);
+    assert_eq!(
+        cell.runtime_message(sql, &[&json, &canonical, &&other[..]])
+            .await,
+        Some("DRAIN_REPLAY_REFUSED".to_string()),
+        "a replay carrying a different 32-byte descriptor digest must be refused"
+    );
+    let short = &real[..31];
+    assert_eq!(
+        cell.runtime_message(sql, &[&json, &canonical, &short])
+            .await,
+        Some("DRAIN_DESCRIPTOR_DIGEST_INVALID".to_string()),
+        "a 31-byte digest must be refused as invalid"
+    );
+}
+
+// DOCUMENTED CUT, not a desired property. `drain_check_ready_v2` binds only
+// `(spool_revision, ready_at_unix_ms)` (plus lifecycle, custody state and the object key); since
+// BLAKE3 left the database it no longer re-verifies the stored record. A ready row whose stored
+// record bytes and `committed_blake3` were altered in place is still ACCEPTED. The tamper is
+// restored afterwards.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row() {
+    let cell = drain_cell_with_ttl(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R31_CUT_PG_URL",
+        "r31cut",
+        16,
+        Some(600_000),
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let descriptor = cell.descriptor(0, &cell.policy).await;
+    cell.client.reserve(&descriptor).await.expect("reservation");
+    let (runtime, _runtime_task) =
+        connect_as(&cell.fixture.base_url, "object_dispatch_retention_runtime").await;
+    let (code, revision, ready_at) = mark_ready_through_runtime(&runtime, &descriptor).await;
+    assert_eq!(code, "APPLIED");
+    let deadline = i64::try_from(descriptor.send_not_after_ms).unwrap() - 1;
+    let check = || {
+        cell.client.check_ready(
+            descriptor.spool_object_id,
+            descriptor.attempt_id,
+            revision,
+            ready_at,
+            &descriptor.object_key,
+            deadline,
+        )
+    };
+    check()
+        .await
+        .expect("control: the untampered ready row passes");
+    let original = admin
+        .query_one(
+            "SELECT canonical_record_bytes, committed_blake3::bytea
+             FROM object_store_retention.object_dispatch_spool_objects WHERE spool_object_id = $1",
+            &[&descriptor.spool_object_id],
+        )
+        .await
+        .expect("read the ready row");
+    let record: Vec<u8> = original.get(0);
+    let committed: Vec<u8> = original.get(1);
+    let (mut bad_record, mut bad_committed) = (record.clone(), committed.clone());
+    bad_record[40] ^= 0x01;
+    bad_committed[0] ^= 0x01;
+    let set = "UPDATE object_store_retention.object_dispatch_spool_objects
+               SET canonical_record_bytes = $1,
+                   committed_blake3 = $2::bytea::object_store_retention.blake3_256,
+                   expected_blake3 = $2::bytea::object_store_retention.blake3_256
+               WHERE spool_object_id = $3";
+    admin
+        .execute(
+            set,
+            &[&bad_record, &bad_committed, &descriptor.spool_object_id],
+        )
+        .await
+        .expect("tamper the ready row in place");
+    let accepted = check().await;
+    admin
+        .execute(set, &[&record, &committed, &descriptor.spool_object_id])
+        .await
+        .expect("restore the ready row");
+    accepted.expect("accepted cut: check_ready_v2 binds only (spool_revision, ready_at)");
 }
