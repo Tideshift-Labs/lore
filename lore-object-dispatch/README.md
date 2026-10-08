@@ -29,6 +29,7 @@ For a detailed catalogue of embedded migrations (including BLAKE3 hashes and det
 `provider_client.rs` manages provider attempts and the charge-before-send kernel.
 - **Provider Ledger:** A ledger is bound exclusively to one boundary and one request (`ProviderAttemptLedger::new`).
 - **Authorization:** Replaces global execution flows with bounded ledger auditing. Charging outside a ledger is unreachable.
+- **Budget Provenance:** `budget_provenance.rs` and the `cell-budget-configure --cell-config` binary accept two provenance types. The local type is for a local http endpoint and has a window of at most 24 h. `owner-decision-documented-provider-limit-v1` is for `https://sfo3.digitaloceanspaces.com` only, with a window of at most 7 days and at most 800 charged ops/s. The `lore-server` boot check enforces the pairing. Limits and operator steps are in `lorehub/docs/contracts/object-store-budget-v1.md` (amendment).
 - **No-Dispatch Proof Binding:** The `object-store-no-dispatch-proof-v1` canonical preimage carries the logical request's identity. `record_no_dispatch` refuses a correctly digested proof minted for a different request (`LedgerRequestMismatch`), so a no-dispatch proof cannot finalize the wrong ledger.
 
 ### Typed Cell-Authority Client (WP-114 CD-3)
