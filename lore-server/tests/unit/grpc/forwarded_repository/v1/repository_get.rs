@@ -82,6 +82,7 @@ async fn missing_user_id_returns_internal_error() {
             Arc::new(AllowAllRepositoryAuthorizer),
             immutable_store,
             mutable_store,
+            None, // no domain context
         )
         .await
         .expect_err("missing user id should fail");
@@ -118,6 +119,7 @@ mod base_repository_get_handler {
                 Arc::new(AllowAllRepositoryAuthorizer),
                 immutable_store,
                 mutable_store,
+                None, // no domain context
             )
             .await
             .expect("Request failed");
@@ -146,6 +148,7 @@ mod base_repository_get_handler {
                 Arc::new(AllowAllRepositoryAuthorizer),
                 immutable_store,
                 mutable_store,
+                None, // no domain context
             )
             .await
             .expect_err("unknown id should fail");
@@ -194,6 +197,7 @@ mod base_repository_get_handler {
                 Arc::new(DenyAllRepositoryAuthorizer),
                 immutable_store,
                 mutable_store,
+                None, // no domain context
             )
             .await
             .expect_err("denied get must fail");
@@ -336,6 +340,7 @@ mod token_verification {
                 authorizer.clone(),
                 immutable_store,
                 mutable_store,
+                None, // no domain context
             )
             .await
             .expect("Request failed");
@@ -377,6 +382,7 @@ mod token_verification {
                 authorizer.clone(),
                 immutable_store,
                 mutable_store,
+                None, // no domain context
             )
             .await
             .expect("the permitting authorizer decides, not the handler");
@@ -387,6 +393,84 @@ mod token_verification {
                 [None],
                 "an unverifiable token must not reach the authorizer as verified"
             );
+        }))
+        .await;
+    }
+}
+
+/// WP-120: the forwarded repository service passes the domain context through
+/// to the shared implementation.
+mod refresh_generation {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::grpc::generation_store::GenerationStore;
+
+    #[tokio::test]
+    async fn forwarded_get_without_a_domain_context_has_no_generation() {
+        let id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            store_repository(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                id,
+                "my-repo",
+            )
+            .await;
+
+            let response = handler(
+                make_forwarded_request(Query::Name("my-repo".into()), None),
+                None, /* no verifier */
+                Arc::new(AllowAllRepositoryAuthorizer),
+                immutable_store,
+                mutable_store,
+                None,
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert!(response.repository.is_some());
+            assert_eq!(response.repository_generation, None);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn forwarded_get_passes_the_generation_through() {
+        let id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let store = GenerationStore::new(Some(11), None);
+        let domain = store.context(true);
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            store_repository(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                id,
+                "my-repo",
+            )
+            .await;
+
+            for query in [Query::Name("my-repo".into()), Query::Id(id.into())] {
+                let response = handler(
+                    make_forwarded_request(query, None),
+                    None, /* no verifier */
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    Some(&domain),
+                )
+                .await
+                .expect("Request failed")
+                .into_inner();
+                assert_eq!(response.repository_generation, Some(11));
+                assert_eq!(response.repository.expect("record").name, "my-repo");
+            }
+            assert_eq!(store.repository_reads.load(Ordering::SeqCst), 2);
         }))
         .await;
     }

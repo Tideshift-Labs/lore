@@ -66,6 +66,7 @@ async fn both_repository_handlers_refuse_stale_names_without_deleting_in_require
                     immutable,
                     store,
                     &None,
+                    None, // no domain context
                 )
                 .await
                 .unwrap_err()
@@ -141,6 +142,7 @@ async fn both_repository_handlers_return_missing_mapping_reads_without_repair_in
                         immutable,
                         store,
                         &None,
+                        None, // no domain context
                     )
                     .await
                     .unwrap()

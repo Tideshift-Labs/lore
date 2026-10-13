@@ -27,6 +27,9 @@ pub async fn handler(
         caller_context,
         immutable_store,
         mutable_store,
+        // The forwarded revision service carries no domain context, so the
+        // generation is absent here (INV-BD keeps this route off).
+        None,
     )
     .await
 }

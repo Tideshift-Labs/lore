@@ -12,6 +12,7 @@ use tracing::debug;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::domain::DomainContext;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::repository::v1::repository_get::repository_get_implementation;
 
@@ -32,6 +33,7 @@ pub async fn handler(
     authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
     let (_, mut extensions, req) = request.into_parts();
@@ -60,6 +62,7 @@ pub async fn handler(
         extensions,
         immutable_store,
         mutable_store,
+        domain_context,
     )
     .await
 }

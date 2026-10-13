@@ -660,6 +660,7 @@ impl LockService for StubLockService {
                     ownership_token: Vec::new().into(),
                 })
                 .collect(),
+            namespace_generation: None,
         }))
     }
 
@@ -825,6 +826,7 @@ impl RevisionService for StubRevisionService {
                     deleted,
                     ..model_v1::Branch::default()
                 }),
+                branch_generation: None,
             })),
         }
     }

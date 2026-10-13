@@ -63,7 +63,10 @@ fn v1_revision_field_shapes() {
     let BranchGetRequest { query: _ } = BranchGetRequest::default();
     let _ = BranchGetQuery::Id(Default::default());
     let _ = BranchGetQuery::Name(Default::default());
-    let BranchGetResponse { branch: _ } = BranchGetResponse::default();
+    let BranchGetResponse {
+        branch: _,
+        branch_generation: _,
+    } = BranchGetResponse::default();
 
     let BranchListRequest {
         creator: _,

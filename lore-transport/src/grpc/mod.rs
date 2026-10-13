@@ -2559,6 +2559,27 @@ impl Lock for GRPCLock {
         .await
     }
 
+    async fn query_with_generation(
+        &self,
+        branch: Option<BranchId>,
+        owner: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<LockQueryResult, ProtocolError> {
+        with_reconnect_classified(
+            &self.connection,
+            GrpcRpc::LockQuery,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .query_with_generation(branch, owner, description)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError> {
         with_reconnect_classified(
             &self.connection,

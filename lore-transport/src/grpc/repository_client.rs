@@ -84,6 +84,7 @@ impl RepositoryService {
             id: repository.id.into(),
             name: repository.name,
             metadata: repository.metadata.into(),
+            generation: None,
         })
     }
 
@@ -149,6 +150,7 @@ impl RepositoryService {
                 id: repository.id.into(),
                 name: repository.name,
                 metadata: repository.metadata.into(),
+                generation: response.repository_generation,
             })
         } else {
             Err(ProtocolError::from(NotFound))
@@ -175,6 +177,7 @@ impl RepositoryService {
                                         id: repository.id.into(),
                                         name: repository.name,
                                         metadata: repository.metadata.into(),
+                                        generation: None,
                                     });
                                 }
                             }

@@ -8,6 +8,7 @@ mod fork_tests;
 mod forwarded_repository;
 mod forwarded_requests;
 mod forwarded_revision;
+mod generation_store;
 mod handlers;
 mod lock_service;
 mod notification_service;

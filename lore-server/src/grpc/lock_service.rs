@@ -884,6 +884,19 @@ impl LoreLockService {
                     verified_issuer: authorization.issuer.clone(),
                     authenticated_subject: subject.clone(),
                 });
+            // Read the generation before the lock rows (WP-120): a race then
+            // costs the client one extra refresh, never a missed change. Only a
+            // query scoped to exactly one branch names one namespace.
+            let namespace_generation = match query_request.branch.as_deref() {
+                Some(branch) => crate::domain::read_generation::lock_namespace_generation(
+                    coordinator,
+                    repository.as_ref(),
+                    branch,
+                )
+                .await
+                .map(Into::into),
+                None => None,
+            };
             let locks = coordinator
                 .query_filtered(
                     repository.as_ref(),
@@ -896,7 +909,10 @@ impl LoreLockService {
                 .into_iter()
                 .map(fenced_lock_to_wire)
                 .collect::<Result<Vec<_>, _>>()?;
-            return Ok(Response::new(QueryResponse { result: locks }));
+            return Ok(Response::new(QueryResponse {
+                result: locks,
+                namespace_generation,
+            }));
         }
 
         let execution = setup_execution(module_path!(), correlation_id, user_id.clone());
@@ -909,6 +925,8 @@ impl LoreLockService {
                     .map(|result| {
                         Response::new(QueryResponse {
                             result: result.into_iter().map(Into::into).collect(),
+                            // The legacy store has no namespace generation.
+                            namespace_generation: None,
                         })
                     })
                     .map_err(handle_lock_error)

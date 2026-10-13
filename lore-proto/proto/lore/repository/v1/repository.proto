@@ -112,6 +112,15 @@ message RepositoryGetRequest {
 message RepositoryGetResponse {
   // Repository record matching the lookup.
   lore.model.v1.Repository repository = 1;
+
+  // FORK-LOCAL (Tideshift, WP-120). The repository's authoritative domain
+  // generation, read before the repository record. A client compares it with
+  // the last value it saw to decide whether to refresh. Absent when the cell
+  // has no armed domain coordinator; never a placeholder zero.
+  //
+  // Fork-local fields on upstream messages use 1000-1999 so an upstream merge
+  // cannot collide.
+  optional uint64 repository_generation = 1001;
 }
 
 // Request to stream repositories the caller is authorised to see, with

@@ -176,6 +176,7 @@ pub async fn handler(
                         id,
                         name: metadata.name,
                         metadata: metadata_hash,
+                        generation: None,
                     }
                 }
                 None => repository_create(
@@ -424,6 +425,7 @@ async fn repository_create(
         id: repository.id,
         name: name.to_string(),
         metadata,
+        generation: None,
     })
 }
 

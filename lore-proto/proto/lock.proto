@@ -99,7 +99,32 @@ message QueryRequest {
   optional string description = 3;
 }
 
-message QueryResponse { repeated Lock result = 1; }
+message QueryResponse {
+  repeated Lock result = 1;
+
+  // FORK-LOCAL (Tideshift, WP-120). The lock namespace generation of the one
+  // branch this query was scoped to, read before the lock rows. Set only when
+  // the query names exactly one branch and the cell routes locks through the
+  // fenced lock authority; absent otherwise, never a placeholder zero.
+  //
+  // Fork-local fields on upstream messages use 1000-1999 so an upstream merge
+  // cannot collide.
+  optional LockNamespaceGeneration namespace_generation = 1001;
+}
+
+// FORK-LOCAL (Tideshift, WP-120). The generation counters of one
+// (repository, branch) lock namespace. A client compares them with the last
+// values it saw to decide whether to refresh its lock view.
+message LockNamespaceGeneration {
+  // Bumped when the repository's lock identity is invalidated (tombstone or
+  // obliteration begin).
+  uint64 repository_lock_generation = 1;
+  // Bumped when this branch is tombstoned.
+  uint64 branch_lock_generation = 2;
+  // Fence of the latest lock mutation applied on this branch. Lease expiry
+  // moves no counter.
+  uint64 last_applied_fence = 3;
+}
 
 message StatusRequest { repeated Resource resources = 1; }
 

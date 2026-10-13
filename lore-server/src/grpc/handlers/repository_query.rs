@@ -171,6 +171,7 @@ async fn repository_query_id_with_repairs(
         id,
         name: metadata.name,
         metadata: metadata_hash,
+        generation: None,
     })
 }
 
@@ -243,6 +244,7 @@ async fn repository_query_name_with_repairs(
         id,
         name: metadata.name,
         metadata: metadata_hash,
+        generation: None,
     })
 }
 

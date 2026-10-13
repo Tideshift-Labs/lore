@@ -230,6 +230,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.forwarded_requests,
+                self.domain_context.as_ref(),
             ),
         )
         .await

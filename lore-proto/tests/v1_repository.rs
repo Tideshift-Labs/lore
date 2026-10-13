@@ -59,7 +59,10 @@ fn v1_repository_field_shapes() {
     let RepositoryGetRequest { query: _ } = RepositoryGetRequest::default();
     let _ = RepositoryGetQuery::Id(Default::default());
     let _ = RepositoryGetQuery::Name(Default::default());
-    let RepositoryGetResponse { repository: _ } = RepositoryGetResponse::default();
+    let RepositoryGetResponse {
+        repository: _,
+        repository_generation: _,
+    } = RepositoryGetResponse::default();
 
     let RepositoryListRequest { creator: _ } = RepositoryListRequest::default();
     let RepositoryListResponse { repository: _ } = RepositoryListResponse::default();

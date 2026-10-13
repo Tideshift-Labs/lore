@@ -27,6 +27,8 @@ use tracing::warn;
 use super::record::build_repository;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::domain::DomainContext;
+use crate::domain::read_generation;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -54,6 +56,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // the queried repository is named by the request
@@ -75,6 +78,7 @@ pub async fn handler(
             extensions,
             immutable_store,
             mutable_store,
+            domain_context,
         )
         .await
     }
@@ -108,6 +112,7 @@ pub async fn repository_get_implementation(
     extensions: tonic::Extensions,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
     let allow_repairs = crate::grpc::caller_capabilities::read_repairs_allowed(&extensions);
     let Some(query) = req.query else {
@@ -131,6 +136,21 @@ pub async fn repository_get_implementation(
     LORE_CONTEXT
         .scope(execution, async move {
             let token = get_verified_token(&extensions);
+            // Authorize, then read the generation, then the record (WP-120). A
+            // denied caller gets the same NotFound as before and causes no
+            // generation read. Reading the generation before the record means
+            // a race costs the client one extra refresh, never a missed change.
+            let authorized = generation_before_record(
+                repository.clone(),
+                &query,
+                authorizer.as_ref(),
+                token.as_ref(),
+                domain_context,
+            )
+            .await?;
+            let pre_authorized = authorized.map(|(id, _)| id);
+            let generation = authorized
+                .and_then(|(id, generation)| generation.map(|generation| (id, generation)));
             let (id, metadata, metadata_hash) = match query {
                 Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
@@ -141,6 +161,7 @@ pub async fn repository_get_implementation(
                         Some(authorizer.as_ref()),
                         token.as_ref(),
                         allow_repairs,
+                        pre_authorized,
                     )
                     .await
                     .filter_slow_down()?
@@ -155,6 +176,7 @@ pub async fn repository_get_implementation(
                         Some(authorizer.as_ref()),
                         token.as_ref(),
                         allow_repairs,
+                        pre_authorized,
                     )
                     .await
                     .filter_slow_down()?
@@ -163,11 +185,67 @@ pub async fn repository_get_implementation(
                 }
             };
             debug!(%id, "Repository get response");
+            // A name lookup resolves its id twice; if the mapping moved in
+            // between, the generation belongs to another repository.
+            let repository_generation = generation
+                .filter(|(generation_id, _)| *generation_id == id)
+                .map(|(_, generation)| generation);
             Ok(Response::new(RepositoryGetResponse {
                 repository: Some(build_repository(id, &metadata, metadata_hash)),
+                repository_generation,
             }))
         })
         .await
+}
+
+/// Resolve the queried repository's id, authorize the caller for it, and only
+/// then read its domain generation, ahead of the record read. Answers the
+/// authorized id and its generation (if any).
+///
+/// `None` when the cell has no authoritative generation or the name does not
+/// resolve; the record read then authorizes and reports the miss itself. A
+/// denied caller gets exactly the status the record read would give it, and
+/// no generation read happens.
+async fn generation_before_record(
+    repository: Arc<RepositoryContext>,
+    query: &Query,
+    authorizer: &dyn RepositoryAuthorizer,
+    token: Option<&VerifiedToken<'_>>,
+    domain_context: Option<&Arc<DomainContext>>,
+) -> Result<Option<(RepositoryId, Option<u64>)>, Status> {
+    if !read_generation::is_authoritative(domain_context) {
+        return Ok(None);
+    }
+    let (id, denied) = match query {
+        Query::Id(id) => {
+            let id = RepositoryId::from(Context::from(id.clone()));
+            (id, format!("Repository {id} not found"))
+        }
+        Query::Name(name) => {
+            let denied = format!("Repository {name} not found");
+            if let Ok(id) = RepositoryId::from_str(name) {
+                (id, denied)
+            } else {
+                let name_repository =
+                    Arc::new(repository.to_server_context(RepositoryId::default()));
+                match repository::id_from_name(name_repository, name)
+                    .await
+                    .filter_slow_down()?
+                {
+                    Ok(id) => (id, denied),
+                    Err(_) => return Ok(None),
+                }
+            }
+        }
+    };
+    check_repository_query_authorization(authorizer, token, id)
+        .await
+        .map_err(|status| {
+            debug!(%id, "User authorization failed: {status}");
+            Status::not_found(denied)
+        })?;
+    let generation = read_generation::repository_generation(domain_context, id.data()).await;
+    Ok(Some((id, generation)))
 }
 
 /// Resolve a repository by id, returning its metadata blob plus the
@@ -182,9 +260,12 @@ pub(super) async fn repository_load_id(
     authorizer: Option<&dyn RepositoryAuthorizer>,
     token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
-    repository_load_id_with_repairs(repository, id, authorizer, token, true).await
+    repository_load_id_with_repairs(repository, id, authorizer, token, true, None).await
 }
 
+/// `pre_authorized` names an id the caller already passed the access check
+/// for in this request; that one check is not repeated. Any other id is still
+/// checked here.
 #[allow(clippy::map_err_ignore)]
 async fn repository_load_id_with_repairs(
     repository: Arc<RepositoryContext>,
@@ -192,8 +273,9 @@ async fn repository_load_id_with_repairs(
     authorizer: Option<&dyn RepositoryAuthorizer>,
     token: Option<&VerifiedToken<'_>>,
     allow_repairs: bool,
+    pre_authorized: Option<RepositoryId>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
-    if let Some(authorizer) = authorizer {
+    if let Some(authorizer) = authorizer.filter(|_| pre_authorized != Some(id)) {
         check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {
@@ -253,9 +335,11 @@ pub(super) async fn repository_load_name(
     authorizer: Option<&dyn RepositoryAuthorizer>,
     token: Option<&VerifiedToken<'_>>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
-    repository_load_name_with_repairs(repository, name, authorizer, token, true).await
+    repository_load_name_with_repairs(repository, name, authorizer, token, true, None).await
 }
 
+/// `pre_authorized`: as for [`repository_load_id_with_repairs`]. If the name
+/// now resolves to a different id, that id is checked here.
 #[allow(clippy::map_err_ignore)]
 async fn repository_load_name_with_repairs(
     repository: Arc<RepositoryContext>,
@@ -263,18 +347,25 @@ async fn repository_load_name_with_repairs(
     authorizer: Option<&dyn RepositoryAuthorizer>,
     token: Option<&VerifiedToken<'_>>,
     allow_repairs: bool,
+    pre_authorized: Option<RepositoryId>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
     if let Ok(id) = RepositoryId::from_str(name) {
-        let (metadata, metadata_hash) =
-            repository_load_id_with_repairs(repository, id, authorizer, token, allow_repairs)
-                .await?;
+        let (metadata, metadata_hash) = repository_load_id_with_repairs(
+            repository,
+            id,
+            authorizer,
+            token,
+            allow_repairs,
+            pre_authorized,
+        )
+        .await?;
         return Ok((id, metadata, metadata_hash));
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(authorizer) = authorizer {
+    if let Some(authorizer) = authorizer.filter(|_| pre_authorized != Some(id)) {
         check_repository_query_authorization(authorizer, token, id)
             .await
             .map_err(|status| {

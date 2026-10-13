@@ -2976,6 +2976,8 @@ pub mod event_operator;
 pub mod fragment_operator;
 /// WP-120's `loreserver domain <status|cutover>` operator surface.
 pub mod operator;
+/// WP-120's authoritative generations for refresh reads.
+pub mod read_generation;
 /// `loreserver schema validate-constraints`, the out-of-band `VALIDATE
 /// CONSTRAINT` step for the boot path's `NOT VALID` constraints.
 pub mod schema_operator;

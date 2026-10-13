@@ -129,6 +129,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect("Request failed");
@@ -169,6 +170,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect("Request failed");
@@ -207,6 +209,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect("Request failed");
@@ -241,6 +244,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect_err("name lookup of deleted branch should fail");
@@ -262,6 +266,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect_err("unknown id should fail");
@@ -282,6 +287,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect_err("unknown name should fail");
@@ -308,6 +314,7 @@ mod direct_handling {
                 immutable_store.clone(),
                 mutable_store.clone(),
                 &None, /* no forwarded requests */
+                None,  // no domain context
             )
             .await
             .expect_err("unset query should fail");
@@ -443,6 +450,7 @@ mod forwarded_request {
         };
         let branch_response = Ok(Ok(Response::new(BranchGetResponse {
             branch: Some(branch),
+            branch_generation: Some(42),
         })));
         let forwarded_requests = StubForwardedRequests::forwarding_enabled(branch_response);
 
@@ -454,14 +462,15 @@ mod forwarded_request {
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                None, // no domain context
             )
             .await
-            .expect("should succeed");
+            .expect("should succeed")
+            .into_inner();
 
-            let branch = response
-                .into_inner()
-                .branch
-                .expect("response should include Branch");
+            // A forwarded response carries the remote server's generation through untouched.
+            assert_eq!(response.branch_generation, Some(42));
+            let branch = response.branch.expect("response should include Branch");
             assert_eq!(branch.name, "test-name");
         }))
         .await;
@@ -486,6 +495,7 @@ mod forwarded_request {
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                None, // no domain context
             )
             .await
             .expect_err("forwarded error should propagate");
@@ -514,6 +524,7 @@ mod forwarded_request {
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                None, // no domain context
             )
             .await
             .expect_err("transport error should become internal status");
@@ -550,6 +561,7 @@ mod forwarded_request {
                 immutable_store,
                 mutable_store,
                 &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                None, // no domain context
             )
             .await
             .expect("local execution should succeed");
@@ -585,6 +597,7 @@ async fn get_by_id_fresh_branch_reports_protected_false() {
             immutable_store.clone(),
             mutable_store.clone(),
             &None,
+            None, // no domain context
         )
         .await
         .expect("Request failed");
@@ -621,6 +634,7 @@ async fn get_by_id_protected_branch_reports_protected_true() {
             immutable_store.clone(),
             mutable_store.clone(),
             &None,
+            None, // no domain context
         )
         .await
         .expect("Request failed");
@@ -660,6 +674,7 @@ async fn get_by_id_branch_after_protect_then_unprotect_reports_protected_false()
             immutable_store.clone(),
             mutable_store.clone(),
             &None,
+            None, // no domain context
         )
         .await
         .expect("Request failed");
@@ -671,4 +686,364 @@ async fn get_by_id_branch_after_protect_then_unprotect_reports_protected_false()
         );
     }))
     .await;
+}
+
+/// WP-120: `branch_generation` on `BranchGetResponse`.
+mod refresh_generation {
+    use std::sync::atomic::Ordering;
+
+    use lore_server::domain::DomainContext;
+
+    use super::*;
+    use crate::grpc::generation_store::GenerationStore;
+    use crate::grpc::generation_store::ReadHook;
+    use crate::grpc::generation_store::RecordingMutableStore;
+    use crate::grpc::generation_store::SequenceLog;
+
+    async fn get(
+        request: Request<BranchGetRequest>,
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+        domain: Option<&Arc<DomainContext>>,
+    ) -> Result<BranchGetResponse, tonic::Status> {
+        handler(request, immutable, mutable, &None, domain)
+            .await
+            .map(tonic::Response::into_inner)
+    }
+
+    #[tokio::test]
+    async fn generation_is_absent_without_a_domain_context() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            for request in [
+                make_request_id(repository, branch_id),
+                make_request_name(repository, "test-name"),
+            ] {
+                let response = get(request, immutable.clone(), mutable.clone(), None)
+                    .await
+                    .expect("get succeeds without a domain context");
+                assert!(response.branch.is_some());
+                assert_eq!(response.branch_generation, None);
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn generation_is_passed_through_by_id_and_by_name() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::new(None, Some(9));
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            for request in [
+                make_request_id(repository, branch_id),
+                make_request_name(repository, "test-name"),
+            ] {
+                let response = get(request, immutable.clone(), mutable.clone(), Some(&domain))
+                    .await
+                    .expect("get succeeds");
+                assert_eq!(response.branch_generation, Some(9));
+                assert_eq!(response.branch.expect("record").name, "test-name");
+            }
+            assert_eq!(store.branch_reads.load(Ordering::SeqCst), 2);
+        }))
+        .await;
+    }
+
+    /// Zero is a real generation, not an unset field.
+    #[tokio::test]
+    async fn generation_zero_is_present_not_dropped() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::new(None, Some(0));
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            let response = get(
+                make_request_id(repository, branch_id),
+                immutable,
+                mutable,
+                Some(&domain),
+            )
+            .await
+            .expect("get succeeds");
+            assert_eq!(response.branch_generation, Some(0));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn generation_is_absent_when_enforcement_is_off() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::new(None, Some(9));
+        let domain = store.context(false);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            for request in [
+                make_request_id(repository, branch_id),
+                make_request_name(repository, "test-name"),
+            ] {
+                let response = get(request, immutable.clone(), mutable.clone(), Some(&domain))
+                    .await
+                    .expect("get succeeds");
+                assert_eq!(response.branch_generation, None);
+            }
+            assert_eq!(store.branch_reads.load(Ordering::SeqCst), 0);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn generation_is_absent_when_the_domain_row_is_missing() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::new(None, None);
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            let response = get(
+                make_request_id(repository, branch_id),
+                immutable,
+                mutable,
+                Some(&domain),
+            )
+            .await
+            .expect("get succeeds");
+            assert!(response.branch.is_some());
+            assert_eq!(response.branch_generation, None);
+            assert_eq!(store.branch_reads.load(Ordering::SeqCst), 1);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_negative_stored_generation_reads_as_absent() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::new(None, Some(-3));
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            let response = get(
+                make_request_id(repository, branch_id),
+                immutable,
+                mutable,
+                Some(&domain),
+            )
+            .await
+            .expect("get succeeds");
+            assert_eq!(response.branch_generation, None);
+        }))
+        .await;
+    }
+
+    /// An unknown branch by name answers `NotFound` and never a generation.
+    #[tokio::test]
+    async fn an_unknown_branch_name_is_not_found_with_a_generation_available() {
+        let repository = random::<RepositoryId>();
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::new(None, Some(9));
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let error = get(
+                make_request_name(repository, "no-such-branch"),
+                immutable,
+                mutable,
+                Some(&domain),
+            )
+            .await
+            .expect_err("unknown branch");
+            assert_eq!(error.code(), tonic::Code::NotFound, "{error:?}");
+        }))
+        .await;
+    }
+
+    /// The generation is read BEFORE the projection (see
+    /// `domain::read_generation`): a shared sequence stamps the generation
+    /// read and every projection (mutable-store) load.
+    #[tokio::test]
+    async fn the_generation_is_read_before_the_projection_by_id_and_by_name() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let log = SequenceLog::new();
+        let store = GenerationStore::recording(None, Some(9), log.clone());
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            let recording = RecordingMutableStore::wrap(mutable.clone(), log.clone());
+            for (label, request, by_id) in [
+                ("id", make_request_id(repository, branch_id), true),
+                ("name", make_request_name(repository, "test-name"), false),
+            ] {
+                log.clear();
+                let response = get(request, immutable.clone(), recording.clone(), Some(&domain))
+                    .await
+                    .expect("get succeeds");
+                assert_eq!(response.branch_generation, Some(9), "by {label}");
+                let generation_reads = log.generation_reads();
+                let loads = log.projection_loads();
+                assert!(!generation_reads.is_empty(), "by {label}: generation read");
+                assert!(!loads.is_empty(), "by {label}: the record read must be observed");
+                let generation = generation_reads[0];
+                let last_load = *loads.last().expect("non-empty");
+                assert!(
+                    generation < last_load,
+                    "by {label}: generation read ({generation}) must precede the record read ({last_load}); loads {loads:?}"
+                );
+                if by_id {
+                    assert_eq!(generation_reads.len(), 1, "by id: one generation read");
+                    assert!(
+                        generation < loads[0],
+                        "by id: no projection load may precede the generation read; loads {loads:?}"
+                    );
+                }
+            }
+        }))
+        .await;
+    }
+
+    /// A failing generation read must not fail the record read.
+    #[tokio::test]
+    async fn a_generation_read_error_leaves_the_generation_absent_and_the_get_succeeds() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let store = GenerationStore::failing();
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let context = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository,
+            ));
+            create_test_branch(context, branch_id).await;
+            for (label, request) in [
+                ("id", make_request_id(repository, branch_id)),
+                ("name", make_request_name(repository, "test-name")),
+            ] {
+                let before = store.branch_reads.load(Ordering::SeqCst);
+                let response = get(request, immutable.clone(), mutable.clone(), Some(&domain))
+                    .await
+                    .unwrap_or_else(|error| panic!("by {label}: get must succeed: {error:?}"));
+                assert!(
+                    store.branch_reads.load(Ordering::SeqCst) > before,
+                    "by {label}: the failing read must actually have been attempted"
+                );
+                assert_eq!(response.branch_generation, None, "by {label}");
+                assert_eq!(response.branch.expect("record").name, "test-name");
+            }
+        }))
+        .await;
+    }
+
+    /// A name resolves twice (once for the generation, once for the record).
+    /// If the mapping moved in between, the generation belongs to the other
+    /// branch and must be dropped, while the record read still answers for the
+    /// branch the name now points at.
+    #[tokio::test]
+    async fn a_name_that_moves_between_resolves_drops_the_generation() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let moved_to = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable, mutable, execution) = test_store_create().await.expect("stores");
+        let context = Arc::new(RepositoryContext::new_server_context(
+            immutable.clone(),
+            mutable.clone(),
+            repository,
+        ));
+        let hook_context = context.clone();
+        let hook: ReadHook = Arc::new(move || {
+            let context = hook_context.clone();
+            Box::pin(async move {
+                branch::store_name_to_id(context, moved_to, "test-name")
+                    .await
+                    .expect("re-point the name between the two resolves");
+            })
+        });
+        let store = GenerationStore::with_read_hook(None, Some(9), hook);
+        let domain = store.context(true);
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            create_test_branch(context.clone(), branch_id).await;
+            lore_revision::branch::create(
+                context.clone(),
+                &get_write_token(),
+                moved_to,
+                "other-name",
+                branch::personal_category(),
+                "BranchCreator",
+                12345,
+                vec![],
+                false,
+                false,
+            )
+            .await
+            .expect("create the branch the name moves to");
+            let response = get(
+                make_request_name(repository, "test-name"),
+                immutable,
+                mutable,
+                Some(&domain),
+            )
+            .await
+            .expect("get succeeds");
+            assert!(store.branch_reads.load(Ordering::SeqCst) >= 1);
+            assert_eq!(
+                response.branch.expect("record").name,
+                "other-name",
+                "sanity: the second resolve saw the moved mapping"
+            );
+            assert_eq!(
+                response.branch_generation, None,
+                "the generation read for the first id must not ride along with the other branch"
+            );
+        }))
+        .await;
+    }
 }

@@ -216,3 +216,43 @@ mod base_branch_get_handler {
         .await;
     }
 }
+
+/// WP-120: the forwarded branch service carries no domain context (INV-BD
+/// keeps this route off), so the response never carries a generation.
+mod refresh_generation {
+    use super::*;
+
+    #[tokio::test]
+    async fn forwarded_get_never_carries_a_branch_generation() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context, branch_id).await;
+
+            for query in [
+                BranchGetQuery::Id(branch_id.into()),
+                BranchGetQuery::Name("test-name".into()),
+            ] {
+                let response = handler(
+                    make_forwarded_request(repository, query),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect("Request failed")
+                .into_inner();
+                assert!(response.branch.is_some());
+                assert_eq!(response.branch_generation, None);
+            }
+        }))
+        .await;
+    }
+}

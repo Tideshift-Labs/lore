@@ -228,7 +228,7 @@ impl RevisionService {
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
-        let branch_record = loop {
+        let (branch_record, generation) = loop {
             let query = if let Some(branch) = branch {
                 revision_v1::branch_get_request::Query::Id(branch.into())
             } else {
@@ -239,9 +239,12 @@ impl RevisionService {
             let mut client = self.client.clone();
 
             match client.branch_get(request).await {
-                Ok(response) => match response.into_inner().branch {
-                    Some(branch) => break branch,
-                    None => {
+                Ok(response) => match response.into_inner() {
+                    revision_v1::BranchGetResponse {
+                        branch: Some(branch),
+                        branch_generation,
+                    } => break (branch, branch_generation),
+                    revision_v1::BranchGetResponse { branch: None, .. } => {
                         return Err(ProtocolError::internal("BranchGet response missing branch"));
                     }
                 },
@@ -273,6 +276,7 @@ impl RevisionService {
             latest,
             metadata,
             deleted,
+            generation,
         })
     }
 

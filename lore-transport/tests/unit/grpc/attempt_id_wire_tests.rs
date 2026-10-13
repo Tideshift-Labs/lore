@@ -98,7 +98,10 @@ impl LockServiceServerTrait for RecordingLockServer {
             .lock()
             .unwrap()
             .push(captured_attempt_id_header(request.metadata()));
-        Ok(Response::new(QueryResponse { result: vec![] }))
+        Ok(Response::new(QueryResponse {
+            result: vec![],
+            namespace_generation: None,
+        }))
     }
 
     async fn status(

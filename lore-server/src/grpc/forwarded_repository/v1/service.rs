@@ -114,6 +114,7 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
                 self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.domain_context.as_ref(),
             ),
         )
         .await

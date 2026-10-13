@@ -31,6 +31,7 @@ use crate::attempt_store::AcquiredLock;
 use crate::attempt_store::FencedLockResource;
 use crate::attempt_store::OwnershipToken;
 use crate::error::ProtocolError;
+use crate::types::LockQueryResult;
 
 /// Project one request resource onto the wire, carrying the token the caller holds for it.
 ///
@@ -191,12 +192,26 @@ impl LockService {
         owner: Option<&str>,
         description: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
+        Ok(self
+            .query_with_generation(branch, owner, description)
+            .await?
+            .locks)
+    }
+
+    /// [`Self::query`], keeping the namespace generation a fenced cell reports
+    /// for a query scoped to one branch (WP-120).
+    pub async fn query_with_generation(
+        &self,
+        branch: Option<Context>,
+        owner: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<LockQueryResult, ProtocolError> {
         lore_debug!("Querying resources");
 
         let _counter = RequestScopedCounter::new(self.request_inflight.clone());
 
         let mut retry = grpc_retry();
-        let locks = loop {
+        let response = loop {
             let request = QueryRequest {
                 branch: branch.map(Context::into),
                 owner: owner.map(str::to_string),
@@ -206,13 +221,16 @@ impl LockService {
             let mut client = self.client.clone();
             match client.query(request).await {
                 Ok(response) => {
-                    break response.into_inner().result;
+                    break response.into_inner();
                 }
                 Err(status) => handle_error(&mut retry, status).await?,
             }
         };
 
-        Ok(locks.into_iter().map(Into::into).collect())
+        Ok(LockQueryResult {
+            locks: response.result.into_iter().map(Into::into).collect(),
+            namespace_generation: response.namespace_generation.map(Into::into),
+        })
     }
 
     pub async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError> {

@@ -133,6 +133,15 @@ pub struct BranchGetResponse {
     /// Branch record matching the lookup.
     #[prost(message, optional, tag = "1")]
     pub branch: ::core::option::Option<crate::lore::model::v1::Branch>,
+    /// FORK-LOCAL (Tideshift, WP-120). The branch's authoritative domain
+    /// generation, read before the branch record. A client compares it with the
+    /// last value it saw to decide whether to refresh. Absent when the cell has no
+    /// armed domain coordinator; never a placeholder zero.
+    ///
+    /// Fork-local fields on upstream messages use 1000-1999 so an upstream merge
+    /// cannot collide.
+    #[prost(uint64, optional, tag = "1001")]
+    pub branch_generation: ::core::option::Option<u64>,
 }
 impl ::prost::Name for BranchGetResponse {
     const NAME: &'static str = "BranchGetResponse";

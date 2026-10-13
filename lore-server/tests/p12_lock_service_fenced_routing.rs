@@ -45,10 +45,12 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_postgres::domain::PostgresDomainStore;
+use lore_postgres::domain::coordinator::BranchCreateInput;
 use lore_postgres::domain::coordinator::DomainTransactionStore;
 use lore_postgres::domain::coordinator::GovernedOperation;
 use lore_postgres::domain::coordinator::RepositoryCreateInput;
 use lore_postgres::domain::locks::BackfillIssuerMap;
+use lore_postgres::domain::receipts::DirectAuthorizationEvidence;
 use lore_postgres::domain::receipts::OperationBinding;
 use lore_postgres::domain::receipts::PrepareResult;
 use lore_postgres::domain::receipts::ReceiptKey;
@@ -1114,5 +1116,386 @@ async fn same_subject_string_under_a_different_issuer_cannot_self_force_release(
         "the permission gate passes (self-named), but the coordinator's own owner match must \
          still refuse a cross-issuer row -- this must never be PermissionDenied (that would mean \
          the gate itself, not the row match, caught it) and never Ok (a silent release)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP-120 refresh reads: `QueryResponse.namespace_generation`.
+// ---------------------------------------------------------------------------
+
+/// The namespace counters straight from the table, as an oracle independent
+/// of the handler under test.
+async fn namespace_row(
+    client: &Client,
+    repository_id: &[u8; 16],
+    branch_id: &[u8; 16],
+) -> (u64, u64, u64) {
+    let repository_id = repository_id.as_slice();
+    let branch_id = branch_id.as_slice();
+    let row = client
+        .query_one(
+            "SELECT repository_lock_generation, branch_lock_generation, last_applied_fence \
+               FROM lore_domain_lock_namespaces \
+              WHERE repository_id = $1 AND branch_id = $2",
+            &[&repository_id, &branch_id],
+        )
+        .await
+        .expect("read the lock namespace row");
+    let as_u64 = |index: usize| u64::try_from(row.get::<_, i64>(index)).expect("non-negative");
+    (as_u64(0), as_u64(1), as_u64(2))
+}
+
+fn query_for_branch(branch_id: &[u8; 16]) -> QueryRequest {
+    QueryRequest {
+        branch: Some(branch_id.to_vec().into()),
+        owner: None,
+        description: None,
+    }
+}
+
+/// A single-branch query on the fenced route carries the branch namespace's
+/// counters, equal to the table's, and the fence advances after an acquire and
+/// again after a release.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_single_branch_query_namespace_fence_advances_on_acquire_and_release() {
+    let url = pg_url().expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let db = client(&url).await;
+    let token = AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: "wp120-namespace-generation".to_owned(),
+        ..Default::default()
+    };
+    let read = || async {
+        let response = service
+            .query(authenticated_request(
+                query_for_branch(&branch_id),
+                &repository_id,
+                &token,
+            ))
+            .await
+            .expect("query must succeed")
+            .into_inner();
+        let generation = response
+            .namespace_generation
+            .expect("a single-branch query on the fenced route must carry the namespace counters");
+        (
+            generation.repository_lock_generation,
+            generation.branch_lock_generation,
+            generation.last_applied_fence,
+        )
+    };
+
+    let before = read().await;
+    assert_eq!(
+        before,
+        namespace_row(&db, &repository_id, &branch_id).await,
+        "the response must carry the table's counters, not a placeholder"
+    );
+
+    let resource = resource_for_branch(&branch_id);
+    let locked = service
+        .lock(authenticated_request(
+            LockRequest {
+                resources: vec![resource.clone()],
+            },
+            &repository_id,
+            &token,
+        ))
+        .await
+        .expect("acquire must succeed")
+        .into_inner();
+    let acquired = locked.locks[0].clone();
+    let after_acquire = read().await;
+    assert!(
+        after_acquire.2 > before.2,
+        "the namespace fence must advance after an acquire: {before:?} -> {after_acquire:?}"
+    );
+    assert_eq!(
+        after_acquire,
+        namespace_row(&db, &repository_id, &branch_id).await
+    );
+
+    service
+        .unlock(authenticated_request(
+            UnlockRequest {
+                resources: vec![Resource {
+                    expected_ownership_token: acquired.ownership_token.clone(),
+                    ..resource
+                }],
+            },
+            &repository_id,
+            &token,
+        ))
+        .await
+        .expect("release with the issued token must succeed");
+    let after_release = read().await;
+    assert!(
+        after_release.2 > after_acquire.2,
+        "the namespace fence must advance after a release: {after_acquire:?} -> {after_release:?}"
+    );
+    assert_eq!(
+        after_release,
+        namespace_row(&db, &repository_id, &branch_id).await
+    );
+}
+
+/// A query that names no branch spans many namespaces, so it names none.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_query_without_a_branch_carries_no_namespace_generation() {
+    let url = pg_url().expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+    let (service, _coordinator, _verifier, repository_id, _branch_id) = armed_service(&url).await;
+    let token = AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: "wp120-namespace-generation-all".to_owned(),
+        ..Default::default()
+    };
+    let response = service
+        .query(authenticated_request(
+            QueryRequest {
+                branch: None,
+                owner: None,
+                description: None,
+            },
+            &repository_id,
+            &token,
+        ))
+        .await
+        .expect("an all-branch query must succeed")
+        .into_inner();
+    assert_eq!(response.namespace_generation, None);
+}
+
+/// A single-branch query whose namespace row is absent carries no counters
+/// rather than a zero.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_query_of_an_unknown_branch_carries_no_namespace_generation() {
+    let url = pg_url().expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+    let (service, _coordinator, _verifier, repository_id, _branch_id) = armed_service(&url).await;
+    let token = AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: "wp120-namespace-generation-unknown".to_owned(),
+        ..Default::default()
+    };
+    let unknown_branch: [u8; 16] = rand::random();
+    let response = service
+        .query(authenticated_request(
+            query_for_branch(&unknown_branch),
+            &repository_id,
+            &token,
+        ))
+        .await
+        .expect("a query of an unknown branch must succeed")
+        .into_inner();
+    assert!(response.result.is_empty());
+    assert_eq!(response.namespace_generation, None);
+}
+
+/// The legacy (unfenced) route has no namespace, so even a single-branch query
+/// carries no counters.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_legacy_route_query_carries_no_namespace_generation() {
+    let url = pg_url().expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+    let lock_store = PostgresLockStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect legacy lock store");
+    let repository_id: [u8; 16] = rand::random();
+    let service = LoreLockService::new(
+        Arc::new(lock_store),
+        Arc::new(NotificationSender::default()),
+        Arc::new(HookDispatcher::empty()),
+        claims_authorizer(),
+        Duration::from_secs(60),
+        false,
+    );
+    let resource = one_resource();
+    service
+        .lock(request_with_repository(
+            LockRequest {
+                resources: vec![resource.clone()],
+            },
+            &repository_id,
+        ))
+        .await
+        .expect("legacy acquire must succeed");
+    let response = service
+        .query(request_with_repository(
+            QueryRequest {
+                branch: Some(resource.branch.clone()),
+                owner: None,
+                description: None,
+            },
+            &repository_id,
+        ))
+        .await
+        .expect("legacy query must succeed")
+        .into_inner();
+    assert_eq!(
+        response.result.len(),
+        1,
+        "sanity: the legacy query reads the lock"
+    );
+    assert_eq!(response.namespace_generation, None);
+}
+
+/// Add a second branch to an existing fixture repository through the domain
+/// coordinator, so two lock namespaces share one repository.
+async fn add_branch_to_repository(
+    store: &PostgresDomainStore,
+    repository_id: &[u8; 16],
+) -> [u8; 16] {
+    let snapshot = store
+        .repository_snapshot(repository_id)
+        .await
+        .expect("read the fixture repository")
+        .expect("the fixture repository exists");
+    let branch_id: [u8; 16] = rand::random();
+    let attempt = Uuid::now_v7();
+    let key = ReceiptKey {
+        verified_issuer: "https://issuer.example/wp120-second-branch".to_owned(),
+        authenticated_subject: "wp120-second-branch".to_owned(),
+        tenant_scope_key: repository_id.to_vec(),
+        operation_id: attempt,
+    };
+    let binding = OperationBinding {
+        method: "branch.create".to_owned(),
+        scope: repository_id.to_vec(),
+        fingerprint_version: 1,
+        fingerprint: vec![4; 32],
+        canonical_intent_digest: vec![5; 32],
+    };
+    let evidence = DirectAuthorizationEvidence {
+        authorization_id: attempt.as_bytes().to_vec(),
+        authorization_revision: 1,
+        verification_nonce: vec![6; 32],
+        bound_fields_digest: vec![7; 32],
+    };
+    let PrepareResult::Prepared { token, .. } = store
+        .domain_operation_prepare_direct(&key, &binding, &evidence, Some(attempt))
+        .await
+        .expect("prepare the second branch create")
+    else {
+        panic!("a fresh branch create must prepare");
+    };
+    store
+        .branch_create(
+            &GovernedOperation {
+                key,
+                binding,
+                prepare_token: token,
+            },
+            &BranchCreateInput {
+                repository_id: repository_id.to_vec(),
+                branch_id: branch_id.to_vec(),
+                expected_repository_generation: snapshot.generation,
+                expected_repository_metadata_hash: snapshot.metadata_hash.clone(),
+                expected_default_branch_id: snapshot.default_branch_id.clone(),
+                parent_metadata: None,
+                name: format!("wp120-second-{:016x}", rand::random::<u64>()),
+                metadata_hash: rand::random::<[u8; 32]>().to_vec(),
+                latest_hash: rand::random::<[u8; 32]>().to_vec(),
+                metadata_witness: None,
+                projection: Vec::new(),
+                events: Vec::new(),
+                public_result: vec![1, 2, 3],
+            },
+        )
+        .await
+        .expect("create the second branch");
+    branch_id
+}
+
+/// A namespace is scoped to one branch: acquiring and releasing on branch A
+/// moves A's fence and leaves every counter of sibling branch B untouched, both
+/// in the table and in what a B query returns.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_lock_activity_on_one_branch_does_not_move_a_sibling_branch_namespace() {
+    let url = pg_url().expect("LORE_TEST_PG_URL must be set; an unconfigured live case is NOT RUN");
+    let (service, _coordinator, _verifier, repository_id, branch_a) = armed_service(&url).await;
+    let db = client(&url).await;
+    let second_store = PostgresDomainStore::connect(&url, 4, &TlsConfig::default())
+        .await
+        .expect("connect second domain store");
+    let branch_b = add_branch_to_repository(&second_store, &repository_id).await;
+    let token = AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: "wp120-cross-branch".to_owned(),
+        ..Default::default()
+    };
+    let read = |branch: [u8; 16]| {
+        let service = &service;
+        let token = &token;
+        async move {
+            let generation = service
+                .query(authenticated_request(
+                    query_for_branch(&branch),
+                    &repository_id,
+                    token,
+                ))
+                .await
+                .expect("query must succeed")
+                .into_inner()
+                .namespace_generation
+                .expect("a single-branch query on the fenced route carries counters");
+            (
+                generation.repository_lock_generation,
+                generation.branch_lock_generation,
+                generation.last_applied_fence,
+            )
+        }
+    };
+
+    let b_before = read(branch_b).await;
+    let a_before = read(branch_a).await;
+    assert_eq!(
+        b_before,
+        namespace_row(&db, &repository_id, &branch_b).await
+    );
+
+    let resource = resource_for_branch(&branch_a);
+    let locked = service
+        .lock(authenticated_request(
+            LockRequest {
+                resources: vec![resource.clone()],
+            },
+            &repository_id,
+            &token,
+        ))
+        .await
+        .expect("acquire on branch A must succeed")
+        .into_inner();
+    service
+        .unlock(authenticated_request(
+            UnlockRequest {
+                resources: vec![Resource {
+                    expected_ownership_token: locked.locks[0].ownership_token.clone(),
+                    ..resource
+                }],
+            },
+            &repository_id,
+            &token,
+        ))
+        .await
+        .expect("release on branch A must succeed");
+
+    let a_after = read(branch_a).await;
+    assert!(
+        a_after.2 > a_before.2,
+        "sanity: branch A's own fence must move: {a_before:?} -> {a_after:?}"
+    );
+    assert_eq!(
+        read(branch_b).await,
+        b_before,
+        "branch B's namespace must not move because of branch A's lock activity"
+    );
+    assert_eq!(
+        namespace_row(&db, &repository_id, &branch_b).await,
+        b_before,
+        "branch B's table row must not move either"
     );
 }

@@ -94,6 +94,21 @@ Durable, recurring testing lessons grouped by topic.
   first. Kill a hung live test by its test-binary name only; `Stop-Process` on every `cargo` also
   kills other lanes' builds in the shared checkout.
 
+- **Refresh-read generations (WP-120)**: handlers read `lore_domain_*.generation` through
+  `DomainContext::store().repository_snapshot/branch_snapshot`. Unit tests script them with
+  `lore-server/tests/unit/grpc/generation_store.rs` (`GenerationStore::new(repo_gen, branch_gen)`; every
+  other trait method panics). Live proof is `lore-postgres/tests/run-sweep-reads-live.ps1`
+  (`lore-server/tests/sweep_reads_live.rs` plus the `wp120_` cases in `p12_lock_service_fenced_routing.rs`):
+  real `repository_get`/`branch_get` handlers over `PostgresMutableStore` + a local immutable store,
+  writes through the governed coordinator, and every response generation compared with a direct SQL
+  read of the table (never the handler as its own oracle). Mutation probe: change one
+  `to_wire(snapshot.generation)` in `lore-server/src/domain/read_generation.rs` to `.min(1)`.
+- **A runner with a prefix-policed non-exact target** (`ExactPrefixes = @('wp120_')`) lets a new live
+  case in a shared integration-test file join the inventory without claiming the whole file.
+- **`Remove-Item Env:X` is blocked by the tool sandbox**: clear a probe variable with `$env:X = $null`.
+- **Formatting without touching a concurrent lane's files**: `rustup run nightly rustfmt --edition 2024 <your files>`
+  instead of `cargo fmt -p`, then `cargo +nightly fmt -p <crate> -- --check` to confirm.
+
 ## Histogram/quantile fixtures
 
 - **Testing a quantile-from-bucket-counts function without re-deriving its formula**: build a fixture

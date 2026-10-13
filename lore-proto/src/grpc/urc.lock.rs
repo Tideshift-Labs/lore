@@ -122,6 +122,15 @@ impl ::prost::Name for QueryRequest {
 pub struct QueryResponse {
     #[prost(message, repeated, tag = "1")]
     pub result: ::prost::alloc::vec::Vec<Lock>,
+    /// FORK-LOCAL (Tideshift, WP-120). The lock namespace generation of the one
+    /// branch this query was scoped to, read before the lock rows. Set only when
+    /// the query names exactly one branch and the cell routes locks through the
+    /// fenced lock authority; absent otherwise, never a placeholder zero.
+    ///
+    /// Fork-local fields on upstream messages use 1000-1999 so an upstream merge
+    /// cannot collide.
+    #[prost(message, optional, tag = "1001")]
+    pub namespace_generation: ::core::option::Option<LockNamespaceGeneration>,
 }
 impl ::prost::Name for QueryResponse {
     const NAME: &'static str = "QueryResponse";
@@ -131,6 +140,33 @@ impl ::prost::Name for QueryResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/urc.lock.QueryResponse".into()
+    }
+}
+/// FORK-LOCAL (Tideshift, WP-120). The generation counters of one
+/// (repository, branch) lock namespace. A client compares them with the last
+/// values it saw to decide whether to refresh its lock view.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LockNamespaceGeneration {
+    /// Bumped when the repository's lock identity is invalidated (tombstone or
+    /// obliteration begin).
+    #[prost(uint64, tag = "1")]
+    pub repository_lock_generation: u64,
+    /// Bumped when this branch is tombstoned.
+    #[prost(uint64, tag = "2")]
+    pub branch_lock_generation: u64,
+    /// Fence of the latest lock mutation applied on this branch. Lease expiry
+    /// moves no counter.
+    #[prost(uint64, tag = "3")]
+    pub last_applied_fence: u64,
+}
+impl ::prost::Name for LockNamespaceGeneration {
+    const NAME: &'static str = "LockNamespaceGeneration";
+    const PACKAGE: &'static str = "urc.lock";
+    fn full_name() -> ::prost::alloc::string::String {
+        "urc.lock.LockNamespaceGeneration".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/urc.lock.LockNamespaceGeneration".into()
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]

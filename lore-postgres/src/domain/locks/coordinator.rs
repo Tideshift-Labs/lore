@@ -1354,6 +1354,31 @@ impl PostgresLockCoordinator {
         Ok(witness_from_row(&row))
     }
 
+    /// Read one branch namespace's generation counters for a refresh read
+    /// (WP-120). The same three scalars as [`Self::capture_push_witness`], but
+    /// an absent namespace row is `None` rather than an error: a reader that
+    /// gets no generation falls back to an unconditional refresh, so absence
+    /// is not a fault here.
+    pub async fn namespace_generation(
+        &self,
+        repository_id: &[u8],
+        branch_id: &[u8],
+    ) -> Result<Option<PushLockWitness>, DomainError> {
+        validate_id("repository_id", repository_id)?;
+        validate_id("branch_id", branch_id)?;
+        let client = self.checkout().await?;
+        let row = client
+            .query_opt(
+                "SELECT repository_lock_generation, branch_lock_generation, last_applied_fence \
+                   FROM lore_domain_lock_namespaces \
+                  WHERE repository_id = $1 AND branch_id = $2",
+                &[&repository_id, &branch_id],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("lock namespace generation", error))?;
+        Ok(row.as_ref().map(witness_from_row))
+    }
+
     /// Revalidate the witness inside the caller's final-push transaction.
     pub async fn revalidate_push_witness(
         tx: &Transaction<'_>,

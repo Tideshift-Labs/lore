@@ -17,6 +17,8 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::domain::DomainContext;
+use crate::domain::read_generation;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
@@ -37,6 +39,7 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchGetResponse>, Status> {
     let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
@@ -45,7 +48,14 @@ pub async fn handler(
     {
         forward_branch_get(req, caller_context, forwarded_requests).await
     } else {
-        branch_get_implementation(req, caller_context, immutable_store, mutable_store).await
+        branch_get_implementation(
+            req,
+            caller_context,
+            immutable_store,
+            mutable_store,
+            domain_context,
+        )
+        .await
     }
 }
 
@@ -75,6 +85,7 @@ pub async fn branch_get_implementation(
     caller_context: CallerContext,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchGetResponse>, Status> {
     let Some(query) = req.query else {
         return Err(Status::invalid_argument(
@@ -99,11 +110,20 @@ pub async fn branch_get_implementation(
                 BranchGetQuery::Id(id) => {
                     let branch_id = BranchId::from(id);
                     debug!({BRANCH_ID} = %branch_id, "Get branch by id");
-                    get_by_id(repository, branch_id).await
+                    // Read the generation before the record (WP-120): a race
+                    // then costs the client one extra refresh, never a missed
+                    // change.
+                    let generation = read_generation::branch_generation(
+                        domain_context,
+                        repository.id.data(),
+                        branch_id.data(),
+                    )
+                    .await;
+                    get_by_id(repository, branch_id, generation).await
                 }
                 BranchGetQuery::Name(name) => {
                     debug!(name, "Get branch by name");
-                    get_by_name(repository, &name).await
+                    get_by_name(repository, &name, domain_context).await
                 }
             }
         })
@@ -113,6 +133,7 @@ pub async fn branch_get_implementation(
 async fn get_by_id(
     repository: Arc<RepositoryContext>,
     branch_id: BranchId,
+    branch_generation: Option<u64>,
 ) -> Result<Response<BranchGetResponse>, Status> {
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
@@ -140,13 +161,36 @@ async fn get_by_id(
     debug!({BRANCH_ID} = %branch_id, {METADATA} = %metadata_hash, deleted, "Branch get by id response");
     Ok(Response::new(BranchGetResponse {
         branch: Some(response_branch),
+        branch_generation,
     }))
 }
 
 async fn get_by_name(
     repository: Arc<RepositoryContext>,
     name: &str,
+    domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<BranchGetResponse>, Status> {
+    // Read the generation before the record (WP-120): a race then costs the
+    // client one extra refresh, never a missed change. The name resolves
+    // twice; if the mapping moved in between, the generation belongs to
+    // another branch and is dropped.
+    let generation = if read_generation::is_authoritative(domain_context) {
+        match branch::load_name_to_id_local(repository.clone(), name)
+            .await
+            .filter_slow_down()?
+        {
+            Ok(id) => {
+                let id = BranchId::from(id);
+                read_generation::branch_generation(domain_context, repository.id.data(), id.data())
+                    .await
+                    .map(|generation| (id, generation))
+            }
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+
     let branch_id_ctx = branch::load_name_to_id_local(repository.clone(), name)
         .await
         .filter_slow_down()?
@@ -168,7 +212,11 @@ async fn get_by_name(
         .unwrap_or_default();
     let response_branch = build_branch(branch_id, &metadata, metadata_hash, false, latest);
     debug!({BRANCH_ID} = %branch_id, {METADATA} = %metadata_hash, "Branch get by name response");
+    let branch_generation = generation
+        .filter(|(generation_id, _)| *generation_id == branch_id)
+        .map(|(_, generation)| generation);
     Ok(Response::new(BranchGetResponse {
         branch: Some(response_branch),
+        branch_generation,
     }))
 }

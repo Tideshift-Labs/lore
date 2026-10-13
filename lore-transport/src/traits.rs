@@ -609,6 +609,21 @@ pub trait Lock: Send + Sync {
         description: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError>;
 
+    /// [`Self::query`] plus the namespace generation a fenced cell reports for a
+    /// query scoped to one branch (WP-120). The default reports no generation,
+    /// which a caller reads as "refresh unconditionally".
+    async fn query_with_generation(
+        &self,
+        branch: Option<Context>,
+        owner: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<LockQueryResult, ProtocolError> {
+        Ok(LockQueryResult {
+            locks: self.query(branch, owner, description).await?,
+            namespace_generation: None,
+        })
+    }
+
     /// Get the locking status of the resource(s)
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError>;
 

@@ -215,6 +215,10 @@ pub struct BranchQueryResponse {
     pub metadata: Hash,
     /// Whether the branch has been deleted (name->id mapping removed)
     pub deleted: bool,
+    /// FORK-LOCAL (WP-120). The branch's authoritative domain generation, set
+    /// only by a cell with an armed domain coordinator. `None` means "no
+    /// authority", never "generation zero".
+    pub generation: Option<u64>,
 }
 
 pub struct BranchListResponse {
@@ -260,11 +264,44 @@ impl From<Hash> for RevisionListStart {
     }
 }
 
+/// FORK-LOCAL (WP-120). The generation counters of one (repository, branch)
+/// lock namespace, as a branch-scoped lock `Query` on a fenced cell reports
+/// them.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LockNamespaceGeneration {
+    pub repository_lock_generation: u64,
+    pub branch_lock_generation: u64,
+    pub last_applied_fence: u64,
+}
+
+impl From<lore_proto::lock::LockNamespaceGeneration> for LockNamespaceGeneration {
+    fn from(value: lore_proto::lock::LockNamespaceGeneration) -> Self {
+        Self {
+            repository_lock_generation: value.repository_lock_generation,
+            branch_lock_generation: value.branch_lock_generation,
+            last_applied_fence: value.last_applied_fence,
+        }
+    }
+}
+
+/// FORK-LOCAL (WP-120). A lock query's rows plus the namespace generation read
+/// before them. `namespace_generation` is `None` unless the query named exactly
+/// one branch and the cell routes locks through the fenced authority.
+#[derive(Default, Debug, Clone)]
+pub struct LockQueryResult {
+    pub locks: Vec<LockData>,
+    pub namespace_generation: Option<LockNamespaceGeneration>,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct RepositoryData {
     pub id: RepositoryId,
     pub name: String,
     pub metadata: Hash,
+    /// FORK-LOCAL (WP-120). The repository's authoritative domain generation,
+    /// set only by a `RepositoryGet` answered by a cell with an armed domain
+    /// coordinator. `None` means "no authority", never "generation zero".
+    pub generation: Option<u64>,
 }
 
 /// Result of a repository metadata compare-and-swap operation
