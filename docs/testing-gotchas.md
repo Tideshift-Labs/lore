@@ -15,6 +15,11 @@ Durable, recurring testing lessons grouped by topic.
   line appears in the output, only `Finished`. Confirm the on-disk source first (`Read` it back), and
   if a rerun after a confirmed-correct restore still fails, bump the file's mtime
   (`(Get-Item $f).LastWriteTime = Get-Date`) to force a real recompile before trusting the result.
+  Same trap without concurrency (WP-120, 2026-10-12, `lore-server`): a byte-identical restore can
+  carry an OLDER mtime than the mutated build, so cargo sees nothing to rebuild and the tests run
+  against the mutated binary. Do not wait for a red rerun. After every mutation probe, touch the
+  restored file to a new mtime or run `cargo clean -p <crate>`, and confirm a `Compiling <crate>`
+  line before trusting results.
 
 ## Deterministic async tests
 
