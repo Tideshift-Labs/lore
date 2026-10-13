@@ -16,6 +16,8 @@ mod domain_operation_client;
 mod environment_client;
 mod fenced_lock_token_wire_tests;
 mod lock_client;
+mod managed_not_prepared_proof_tests;
+mod not_prepared_proof_wire_tests;
 mod revision_client;
 mod storage_client;
 

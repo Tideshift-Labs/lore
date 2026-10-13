@@ -1439,6 +1439,7 @@ async fn prepare_direct_lock_operation_refuses_with_no_verifier_configured() {
         )
         .await
         .expect_err("no verifier configured must refuse, not panic or silently admit");
+    let error = before_prepare(error);
 
     assert_eq!(error.code(), Code::FailedPrecondition);
 }
@@ -1477,6 +1478,7 @@ async fn prepare_direct_lock_operation_excludes_service_accounts() {
         )
         .await
         .expect_err("a service account must be refused a direct fenced lock");
+    let error = before_prepare(error);
 
     assert_eq!(error.code(), Code::PermissionDenied);
 }
@@ -1487,6 +1489,17 @@ async fn prepare_direct_lock_operation_excludes_service_accounts() {
 // --- `prepare_direct_lock_operation`'s own service-account exclusion, so
 // --- neither an unconfigured cell nor a service account is told to
 // --- upgrade a client that is already current.
+
+/// The status of a refusal that must have been raised before the receipt store was reached.
+/// Anything else is a failure: the fenced lock rail marks only these refusals as not prepared.
+fn before_prepare(refusal: DirectPrepareRefusal) -> Status {
+    match refusal {
+        DirectPrepareRefusal::BeforePrepare(status) => status,
+        DirectPrepareRefusal::AtPrepare(status) => {
+            panic!("expected a refusal before the prepare, got one at it: {status:?}")
+        }
+    }
+}
 
 fn lock_binding() -> OperationBinding {
     OperationBinding {
@@ -1519,6 +1532,7 @@ async fn prepare_direct_lock_operation_refuses_an_absent_bearer_for_a_human_prin
         )
         .await
         .expect_err("an absent bearer must be refused for a human principal");
+    let error = before_prepare(error);
 
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert_eq!(
@@ -1554,6 +1568,7 @@ async fn prepare_direct_lock_operation_excludes_a_service_account_even_with_no_b
         )
         .await
         .expect_err("a service account must be refused regardless of the bearer");
+    let error = before_prepare(error);
 
     assert_eq!(error.code(), Code::PermissionDenied);
     assert_ne!(
@@ -1587,6 +1602,7 @@ async fn prepare_direct_lock_operation_with_no_verifier_configured_refuses_befor
         )
         .await
         .expect_err("no verifier configured must refuse before ever inspecting the bearer");
+    let error = before_prepare(error);
 
     assert_eq!(error.code(), Code::FailedPrecondition);
     assert_ne!(
@@ -1597,6 +1613,101 @@ async fn prepare_direct_lock_operation_with_no_verifier_configured_refuses_befor
     );
 }
 
+// --- 6b-ter. The `BeforePrepare` / `AtPrepare` split (Gate 0 campaign c13) ---
+//
+// The fenced lock rail stamps `lore-not-prepared-attempt-v1` on exactly the refusals that arrive
+// before the receipt store is asked to prepare. `UnreachableDomainStore` panics on any store call,
+// so each `BeforePrepare` case below also proves no receipt row could have been written.
+
+// A verifier outage is the c13 trigger itself: it must be BeforePrepare and keep its own status.
+#[tokio::test]
+async fn prepare_direct_lock_operation_marks_a_verifier_outage_before_prepare() {
+    let ctx = context(true).with_operation_verifier(Some(std::sync::Arc::new(
+        DirectVerifierDouble::erroring(Status::unavailable("verifier unreachable")),
+    )));
+
+    let error = ctx
+        .prepare_direct_lock_operation(
+            &human_token(),
+            Some("Bearer x"),
+            &test_repository_id(),
+            &test_repository_id(),
+            lock_binding(),
+            None,
+        )
+        .await
+        .expect_err("a verifier outage must refuse");
+    let status = before_prepare(error);
+
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(status.message(), "verifier unreachable");
+}
+
+// A verifier answer that fails the echo check is also refused before any write.
+#[tokio::test]
+async fn prepare_direct_lock_operation_marks_an_echo_mismatch_before_prepare() {
+    let ctx = context(true).with_operation_verifier(Some(std::sync::Arc::new(
+        DirectVerifierDouble::diverging(EchoDivergence::Fingerprint),
+    )));
+
+    let error = ctx
+        .prepare_direct_lock_operation(
+            &human_token(),
+            Some("Bearer x"),
+            &test_repository_id(),
+            &test_repository_id(),
+            lock_binding(),
+            None,
+        )
+        .await
+        .expect_err("a diverging echo must refuse");
+
+    before_prepare(error);
+}
+
+// Negative control: a refusal FROM the store prepare is AtPrepare, never BeforePrepare. A failed
+// commit there can leave a row the caller never learned about.
+#[tokio::test]
+async fn prepare_direct_lock_operation_marks_a_store_prepare_refusal_at_prepare() {
+    let store = lore_server::domain::test_support::PreparingDomainStore::default();
+    *store.direct_result.lock().unwrap() = Some(PrepareResult::Mismatch);
+    let ctx = DomainContext::new(Arc::new(store), true)
+        .with_operation_verifier(Some(Arc::new(DirectVerifierDouble::echo())));
+
+    let error = ctx
+        .prepare_direct_lock_operation(
+            &human_token(),
+            Some("Bearer x"),
+            &test_repository_id(),
+            &test_repository_id(),
+            lock_binding(),
+            None,
+        )
+        .await
+        .expect_err("a store Mismatch must refuse");
+
+    match error {
+        DirectPrepareRefusal::AtPrepare(status) => {
+            assert_eq!(status.code(), Code::Aborted, "got {status:?}");
+        }
+        DirectPrepareRefusal::BeforePrepare(status) => {
+            panic!("a refusal from the store prepare must be AtPrepare, got {status:?}")
+        }
+    }
+}
+
+// `into_status` collapses either side to the status it carries, unchanged.
+#[test]
+fn direct_prepare_refusal_into_status_returns_the_carried_status() {
+    for refusal in [
+        DirectPrepareRefusal::BeforePrepare(Status::unavailable("a")),
+        DirectPrepareRefusal::AtPrepare(Status::unavailable("a")),
+    ] {
+        let status = refusal.into_status();
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "a");
+    }
+}
 // --- 6c. internal_prepare_fingerprint determinism -----------------------
 //
 // Every vector below is computed independently (Python's `blake3`

@@ -254,6 +254,59 @@ pub(crate) fn answer_lost_code(error: &ProtocolError) -> Option<tonic::Code> {
     None
 }
 
+/// Typed proof that a loreserver refused a mutation before it prepared any receipt for it.
+///
+/// Built only from a status carrying [`crate::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY`] whose
+/// code would otherwise read as a lost answer. It rides inside `ProtocolError::Internal` for the
+/// same reason [`AnswerLostInTransit`] does, and the one layer that acts on it,
+/// `with_reconnect_classified`, settles the attempt only when the proof names that attempt and the
+/// attempt was sent once. Anywhere else it is an ordinary decisive refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{status}")]
+pub(crate) struct RefusedBeforePrepare {
+    attempt: uuid::Uuid,
+    status: String,
+}
+
+/// The codes whose plain mapping reads as a lost answer, and so the only codes the not-prepared
+/// proof changes. Every other code already maps to a decisive refusal and keeps its richer
+/// variant (`NotAuthenticated`, `NotAuthorized`, ...), so the proof is ignored on it.
+fn is_unsettled_code(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::Unavailable
+            | tonic::Code::Unknown
+            | tonic::Code::Cancelled
+            | tonic::Code::DeadlineExceeded
+    )
+}
+
+/// Read the server's not-prepared proof off a status, if it set a well-formed one.
+fn not_prepared_marker(status: &tonic::Status) -> Option<uuid::Uuid> {
+    let mut values = status
+        .metadata()
+        .get_all(crate::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY)
+        .iter();
+    let value = values.next()?;
+    // Two values is not a proof about one attempt.
+    if values.next().is_some() {
+        return None;
+    }
+    uuid::Uuid::parse_str(value.to_str().ok()?).ok()
+}
+
+/// The attempt a not-prepared proof names, when the error carries one.
+pub(crate) fn not_prepared_attempt(error: &ProtocolError) -> Option<uuid::Uuid> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(refused) = source.downcast_ref::<RefusedBeforePrepare>() {
+            return Some(refused.attempt);
+        }
+        current = source.source();
+    }
+    None
+}
+
 use crate::grpc::address_not_found_details;
 use crate::grpc::address_not_found_status;
 
@@ -324,6 +377,19 @@ impl From<tonic::Status> for ProtocolError {
         // than repeated on the arms that happen to need it today.
         if is_tonic_lost_response(&value) {
             return answer_lost(&value);
+        }
+        // Checked last of the four, so either sign of a lost answer above outranks it: the proof
+        // speaks for a refusal the server sent, not for one a relay or this client inferred.
+        if is_unsettled_code(value.code())
+            && let Some(attempt) = not_prepared_marker(&value)
+        {
+            return ProtocolError::internal_with_context(
+                RefusedBeforePrepare {
+                    attempt,
+                    status: value.to_string(),
+                },
+                "the server refused this request before preparing it",
+            );
         }
         match value.code() {
             tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
@@ -508,6 +574,12 @@ impl From<ProtocolError> for tonic::Status {
                 ANSWER_LOST_METADATA_VALUE,
             );
             return status;
+        }
+        // A relaying peer re-emits an upstream not-prepared refusal as a plain `Unavailable`,
+        // without the proof. The proof is the upstream server's word about its own copy; the
+        // relay's own client never sent that copy, so for it the outcome stays unknown.
+        if not_prepared_attempt(&value).is_some() {
+            return tonic::Status::new(tonic::Code::Unavailable, msg);
         }
         match value {
             ProtocolError::NotAuthenticated(_) => {

@@ -86,6 +86,21 @@ pub const OUTCOME_UNKNOWN_ATTEMPT_KEY: &str = "lore-outcome-unknown-attempt";
 /// [`AttemptId`]'s `Display` renders, and a `-bin` key would make tonic expect base64.
 pub const ATTEMPT_ID_METADATA_KEY: &str = "lore-attempt-id";
 
+/// Response header a loreserver sets when it refused a mutation before preparing any receipt
+/// for it. The value is the attempt id the request carried in [`ATTEMPT_ID_METADATA_KEY`].
+///
+/// This is the proof a released client needs to settle an attempt as not applied after a
+/// refusal whose code would otherwise read as a lost answer. Without it, a verifier outage that
+/// the cell reported as `UNAVAILABLE` left the attempt unknown, and since no receipt was ever
+/// filed, no reconciliation could settle it (Gate 0 campaign c13, 2026-10-13).
+///
+/// Bound to the attempt rather than a bare flag, so a header that reached the client on some
+/// other call cannot settle this one. A load balancer, proxy or transport never sets it, so an
+/// unmarked `UNAVAILABLE` stays an unknown outcome. The client still honours it only for an
+/// attempt it sent exactly once (see [`dispatch_send_count`]): the proof speaks for the copy
+/// that was refused, not for a second copy another replica may have prepared.
+pub const NOT_PREPARED_ATTEMPT_METADATA_KEY: &str = "lore-not-prepared-attempt-v1";
+
 /// The identity one attempt at a mutable operation was dispatched under.
 ///
 /// `UUIDv7` so it sorts by mint time, which is what makes a journal of unresolved attempts
@@ -150,6 +165,37 @@ where
 /// files no receipt for.
 pub fn current_dispatch_attempt() -> Option<AttemptId> {
     DISPATCH_ATTEMPT.try_with(|attempt| *attempt).ok()
+}
+
+/// How many requests this process has stamped with each attempt id.
+///
+/// Process-wide rather than scoped to one dispatch, because the same id can be in scope across
+/// several dispatches (a desktop repository call scopes one id around the whole call). The count
+/// is what lets a not-prepared refusal settle an attempt: that proof covers one copy, so it only
+/// settles an attempt this process sent once. An entry is never removed, because a later copy of
+/// the same id must still count as a second send; that costs a few dozen bytes per mutating
+/// dispatch for the life of the process.
+///
+/// The count is read once, when the refusal arrives. A copy of the same id sent after that
+/// attempt has already settled is not caught. Only an id reused across dispatches can do that
+/// (`lore::call`'s caller-supplied id around a whole call), and reusing one already breaks the
+/// receipt lookup, which answers `NotFound` for an id with two receipts.
+static DISPATCH_SENDS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<AttemptId, u32>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Count one request stamped with `attempt`. Called where the header is stamped, so every copy
+/// that could reach a server is counted, including one a retry loop reissues.
+pub(crate) fn note_dispatch_send(attempt: AttemptId) {
+    let mut sends = DISPATCH_SENDS.lock();
+    let count = sends.entry(attempt).or_insert(0);
+    *count = count.saturating_add(1);
+}
+
+/// How many requests this process has stamped with `attempt`.
+#[lore_macro::test_pub]
+pub(crate) fn dispatch_send_count(attempt: &AttemptId) -> u32 {
+    DISPATCH_SENDS.lock().get(attempt).copied().unwrap_or(0)
 }
 
 /// Build the public unknown-outcome error for one named operation and attempt.

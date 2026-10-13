@@ -821,6 +821,7 @@ impl DomainContext {
             internal.client_attempt_id,
         )
         .await
+        .map_err(DirectPrepareRefusal::into_status)
     }
 
     /// Run the internal prepare for a **fenced lock** mutation.
@@ -844,15 +845,15 @@ impl DomainContext {
         branch_id: &[u8],
         binding: OperationBinding,
         client_attempt_id: Option<Uuid>,
-    ) -> Result<GovernedOperation, Status> {
+    ) -> Result<GovernedOperation, DirectPrepareRefusal> {
         if token.user_id == CONTROL_PLANE_SERVICE_SUBJECT || token.is_service_account == Some(true)
         {
             // Same exclusion the entry gate applies. The control plane reaches a
             // governed lock through the mediated rail with its own carriage; a
             // service account minting a direct lock receipt would take fenced
             // ownership under a namespace that was never designed for it.
-            return Err(Status::permission_denied(
-                "Direct fenced lock mutations are for human principals",
+            return Err(DirectPrepareRefusal::BeforePrepare(
+                Status::permission_denied("Direct fenced lock mutations are for human principals"),
             ));
         }
         let key = ReceiptKey {
@@ -865,7 +866,9 @@ impl DomainContext {
             operation_id: Uuid::now_v7(),
         };
         if let Some(admission) = self.admission.get() {
-            admission.refuse_if_closed()?;
+            admission
+                .refuse_if_closed()
+                .map_err(DirectPrepareRefusal::BeforePrepare)?;
         }
         // Every lock family is branch-scoped by nature, so the branch is always
         // known here and always sent. This is the half of the platform's
@@ -882,6 +885,13 @@ impl DomainContext {
     }
 
     /// The shared half of every internal prepare: verify, echo-check, persist.
+    ///
+    /// Every refusal before the receipt store is asked to prepare is
+    /// [`DirectPrepareRefusal::BeforePrepare`]: nothing durable exists for the
+    /// request, and once this returns nothing will prepare it. A refusal from
+    /// the store prepare itself, or after it, is
+    /// [`DirectPrepareRefusal::AtPrepare`], because a failed commit there can
+    /// leave a row the caller never learned about.
     #[allow(clippy::too_many_arguments)]
     async fn prepare_direct(
         &self,
@@ -891,7 +901,26 @@ impl DomainContext {
         branch_id: &[u8],
         bearer: Option<&str>,
         client_attempt_id: Option<Uuid>,
-    ) -> Result<GovernedOperation, Status> {
+    ) -> Result<GovernedOperation, DirectPrepareRefusal> {
+        let evidence = self
+            .authorize_direct(&key, &binding, repository_id, branch_id, bearer)
+            .await
+            .map_err(DirectPrepareRefusal::BeforePrepare)?;
+        self.persist_direct_prepare(key, binding, &evidence, client_attempt_id)
+            .await
+            .map_err(DirectPrepareRefusal::AtPrepare)
+    }
+
+    /// The verifier half of [`Self::prepare_direct`]: verify and echo-check,
+    /// with no durable write. Returns the evidence the prepare persists.
+    async fn authorize_direct(
+        &self,
+        key: &ReceiptKey,
+        binding: &OperationBinding,
+        repository_id: &[u8],
+        branch_id: &[u8],
+        bearer: Option<&str>,
+    ) -> Result<lore_postgres::domain::receipts::DirectAuthorizationEvidence, Status> {
         let verifier = self.operation_verifier.as_ref().ok_or_else(|| {
             Status::failed_precondition(
                 "Internal domain prepare requires a configured repository-operation verifier",
@@ -943,19 +972,32 @@ impl DomainContext {
         let response = verifier
             .authorize_direct_repository_operation(request)
             .await?;
-        verify_direct_echo(&key, &binding, repository_id, branch_id, &response)?;
+        verify_direct_echo(key, binding, repository_id, branch_id, &response)?;
 
         // P-029-3: direct evidence belongs beside the receipt, without a
         // mediated claim or dispatch-possibility fence.
-        let evidence = lore_postgres::domain::receipts::DirectAuthorizationEvidence {
-            authorization_id: response.authorization_id.to_vec(),
-            authorization_revision: response.authorization_revision,
-            verification_nonce: response.verification_nonce.to_vec(),
-            bound_fields_digest: response.bound_fields_digest.to_vec(),
-        };
+        Ok(
+            lore_postgres::domain::receipts::DirectAuthorizationEvidence {
+                authorization_id: response.authorization_id.to_vec(),
+                authorization_revision: response.authorization_revision,
+                verification_nonce: response.verification_nonce.to_vec(),
+                bound_fields_digest: response.bound_fields_digest.to_vec(),
+            },
+        )
+    }
+
+    /// The durable half of [`Self::prepare_direct`]: persist the `PREPARED`
+    /// receipt. Every refusal from here on may follow a durable write.
+    async fn persist_direct_prepare(
+        &self,
+        key: ReceiptKey,
+        binding: OperationBinding,
+        evidence: &lore_postgres::domain::receipts::DirectAuthorizationEvidence,
+        client_attempt_id: Option<Uuid>,
+    ) -> Result<GovernedOperation, Status> {
         let prepared = self
             .store
-            .domain_operation_prepare_direct(&key, &binding, &evidence, client_attempt_id)
+            .domain_operation_prepare_direct(&key, &binding, evidence, client_attempt_id)
             .await
             .map_err(|error| crate::grpc::map_domain_error_to_status(&error))?;
         match prepared {
@@ -986,6 +1028,33 @@ impl DomainContext {
             PrepareResult::CapacityExhausted => Err(Status::resource_exhausted(
                 "Domain operation admission capacity is exhausted",
             )),
+        }
+    }
+}
+
+/// Why a direct prepare produced no operation, split by whether the receipt
+/// store was reached.
+///
+/// The split is what lets the fenced lock rail tell a released client that a
+/// refusal is final (Gate 0 campaign c13, 2026-10-13). A verifier outage was
+/// relayed as `UNAVAILABLE`, the client read it as a lost answer, and since no
+/// receipt was ever filed no reconciliation could settle the attempt.
+#[derive(Debug)]
+pub enum DirectPrepareRefusal {
+    /// Refused before the receipt store was asked to prepare. No receipt row,
+    /// claim or mutation exists for this request, and nothing will prepare it
+    /// once the handler returns.
+    BeforePrepare(Status),
+    /// Refused by or after the store prepare. A failed commit there can leave a
+    /// row the caller never learned about, so this proves nothing about absence.
+    AtPrepare(Status),
+}
+
+impl DirectPrepareRefusal {
+    /// The status to answer with, for a caller that does not act on the split.
+    pub fn into_status(self) -> Status {
+        match self {
+            Self::BeforePrepare(status) | Self::AtPrepare(status) => status,
         }
     }
 }

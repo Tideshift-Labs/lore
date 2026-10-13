@@ -114,6 +114,24 @@ Durable, recurring testing lessons grouped by topic.
 - **Formatting without touching a concurrent lane's files**: `rustup run nightly rustfmt --edition 2024 <your files>`
   instead of `cargo fmt -p`, then `cargo +nightly fmt -p <crate> -- --check` to confirm.
 
+- **Live `p12_lock_service_fenced_routing` cases need one fresh database each.** Symptom: running the whole
+  file with `-- --ignored` on one `LORE_TEST_PG_URL` fails ~9 cases that pass alone. Cause: each case
+  bootstraps/arms the fenced schema itself. Do: `CREATE DATABASE` per case and `--exact`, as
+  `lore-postgres/tests/run-sweep-reads-live.ps1` does; register a new `wp120_` case in that runner's
+  `Cases` or its prefix guard refuses to start. A fake verifier that fails on demand is
+  `DirectEchoVerifier::failing(Status)` in that file; assert receipt absence with
+  `SELECT count(*) FROM lore_domain_operation_receipts WHERE client_attempt_id = $1` and keep a
+  positive control that a served lock files exactly one row.
+- **Proving a `lore-transport` client-classification test red pre-fix**: reverse-apply only
+  `lore-transport/src/error.rs` and `src/grpc/mod.rs` (patch file in scratch, `git apply -R`, run,
+  `git apply`, touch both files, compare `git diff` hashes). Reverting `outcome.rs` too breaks the
+  `lore_revision::live_fixture` build, which names its public key const. The live repro is
+  `lore/tests/live_lock_journal.rs` driving `RpcOutcome::RefuseNotPrepared(NotPreparedProof::..)`.
+- **clippy `large_futures` in a transport test** -> `Box::pin(with_reconnect_classified(..))` inside the
+  one helper that dispatches, not in each caller.
+- **`cargo clippy ... -D warnings` on Windows stops at upstream-identical files** (`lore-revision/src/util/fs.rs`,
+  `lore/src/remote/network/windows.rs`, unused imports in several `tests/unit` files). Rerun without `-D`
+  and read only the files you touched.
 ## Histogram/quantile fixtures
 
 - **Testing a quantile-from-bucket-counts function without re-deriving its formula**: build a fixture

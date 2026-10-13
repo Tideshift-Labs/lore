@@ -138,6 +138,18 @@ where
                     continue;
                 }
             };
+            // State before method: a lookup that found no receipt carries no method at all, and
+            // checking the method first reported that absence as a method mismatch (Gate 0
+            // campaign c13, 2026-10-13).
+            let lore_transport::DomainReceiptState::Committed { outcome, .. } = receipt.state
+            else {
+                blockers.push(format!(
+                    "{source}: {} receipt is nondecisive ({}); remains blocked",
+                    child.attempt_id,
+                    receipt_state_label(&receipt.state)
+                ));
+                continue;
+            };
             if !lore_transport::caller_operation::recovery_receipt_method_matches(
                 &child.operation,
                 &receipt.method,
@@ -148,22 +160,15 @@ where
                 ));
                 continue;
             }
-            if let lore_transport::DomainReceiptState::Committed { outcome, .. } = receipt.state {
-                let resolution = match outcome {
-                    lore_transport::DomainReceiptOutcome::Applied => {
-                        lore_transport::AttemptResolution::Applied
-                    }
-                    lore_transport::DomainReceiptOutcome::NotApplied { .. } => {
-                        lore_transport::AttemptResolution::NotApplied
-                    }
-                };
-                store.resolve(&child.attempt_id, resolution).await?;
-            } else {
-                blockers.push(format!(
-                    "{source}: {} receipt is nondecisive; remains blocked",
-                    child.attempt_id
-                ));
-            }
+            let resolution = match outcome {
+                lore_transport::DomainReceiptOutcome::Applied => {
+                    lore_transport::AttemptResolution::Applied
+                }
+                lore_transport::DomainReceiptOutcome::NotApplied { .. } => {
+                    lore_transport::AttemptResolution::NotApplied
+                }
+            };
+            store.resolve(&child.attempt_id, resolution).await?;
         }
         for parent in store
             .managed_parents()
@@ -182,6 +187,18 @@ where
         Ok(())
     } else {
         Err(ProtocolError::internal(blockers.join("\n")))
+    }
+}
+
+/// The name an operator reads for a receipt state that cannot settle an attempt.
+fn receipt_state_label(state: &lore_transport::DomainReceiptState) -> &'static str {
+    match state {
+        lore_transport::DomainReceiptState::Prepared { .. } => "prepared, not committed",
+        lore_transport::DomainReceiptState::Committed { .. } => "committed",
+        lore_transport::DomainReceiptState::Mismatch => "identity mismatch",
+        lore_transport::DomainReceiptState::Expired => "expired",
+        lore_transport::DomainReceiptState::ExpiredOrUnknown => "expired or unknown",
+        lore_transport::DomainReceiptState::NotFound => "no receipt found",
     }
 }
 

@@ -281,3 +281,84 @@ async fn unsupported_admin_lock_is_not_silently_added_to_recovery_scope() {
     );
     assert_eq!(store.unresolved().await.unwrap(), vec![record]);
 }
+
+/// Gate 0 campaign c13: a lookup that finds no receipt carries an empty method, and the method
+/// check used to run first, so the operator read "receipt method mismatch" for a receipt that was
+/// simply never filed. The state is read first; the child stays unresolved either way.
+#[tokio::test]
+async fn a_receipt_that_is_not_committed_reports_its_state_not_a_method_mismatch() {
+    for (state, label) in [
+        (DomainReceiptState::NotFound, "no receipt found"),
+        (DomainReceiptState::Mismatch, "identity mismatch"),
+        (DomainReceiptState::Expired, "expired"),
+        (DomainReceiptState::ExpiredOrUnknown, "expired or unknown"),
+        (
+            DomainReceiptState::Prepared {
+                prepared_at_unix_millis: 1,
+                hard_expires_at_unix_millis: 2,
+            },
+            "prepared, not committed",
+        ),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let guard = RepositoryMutationGuard::recover(directory.path())
+            .await
+            .unwrap();
+        let store = guard.store();
+        let (_, record) = managed_child(&store, "LockService.Lock").await;
+
+        let error = reconcile_stores(&guard, |_, _| {
+            let state = state.clone();
+            async move {
+                Ok(DomainAttemptReceipt {
+                    method: String::new(),
+                    state,
+                })
+            }
+        })
+        .await
+        .expect_err("a receipt that decides nothing must keep the attempt blocked");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("nondecisive") && message.contains(label),
+            "the operator must read the receipt state ({label}), got: {message}"
+        );
+        assert!(
+            !message.contains("method mismatch"),
+            "an absent method is not a method mismatch ({label}), got: {message}"
+        );
+        assert_eq!(store.unresolved().await.unwrap(), vec![record]);
+        assert!(!store.managed_parents().await.unwrap()[0].complete);
+    }
+}
+
+/// Control for the case above: the method check still runs for a committed receipt, so the state
+/// ordering did not delete the mismatch refusal.
+#[tokio::test]
+async fn a_committed_receipt_with_the_wrong_method_still_reports_a_method_mismatch() {
+    let directory = tempfile::tempdir().unwrap();
+    let guard = RepositoryMutationGuard::recover(directory.path())
+        .await
+        .unwrap();
+    let store = guard.store();
+    let (_, record) = managed_child(&store, "LockService.Lock").await;
+
+    let error = reconcile_stores(&guard, |_, _| async {
+        Ok(DomainAttemptReceipt {
+            method: "lock.release".into(),
+            state: DomainReceiptState::Committed {
+                outcome: DomainReceiptOutcome::Applied,
+                from_future_marker: false,
+            },
+        })
+    })
+    .await
+    .expect_err("a wrong-method committed receipt must keep the attempt blocked");
+
+    assert!(
+        error.to_string().contains("method mismatch"),
+        "got: {error}"
+    );
+    assert_eq!(store.unresolved().await.unwrap(), vec![record]);
+}

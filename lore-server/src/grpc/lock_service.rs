@@ -255,6 +255,48 @@ fn fenced_branch_id(value: &[u8]) -> Result<[u8; 16], Status> {
         .map_err(|_err| Status::invalid_argument("lock resource branch must be exactly 16 bytes"))
 }
 
+/// Mark a fenced lock refusal raised before any receipt prepare, so a released
+/// client can settle its attempt as not applied.
+///
+/// Called only where nothing durable exists for this request and nothing will
+/// prepare it after the handler returns. Any marker already on the status is
+/// removed first: a verifier status arrives carrying whatever the auth service
+/// put in its trailers, and only this server may vouch that it did not prepare.
+/// With no client attempt id there is nothing to bind the proof to, so the
+/// status leaves unmarked.
+fn refused_before_prepare(mut status: Status, attempt: Option<uuid::Uuid>) -> Status {
+    let metadata = status.metadata_mut();
+    metadata.remove(lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY);
+    if let Some(attempt) = attempt
+        && let Ok(value) = attempt.to_string().parse()
+    {
+        metadata.insert(
+            lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY,
+            value,
+        );
+    }
+    status
+}
+
+/// Answer a failed direct lock prepare, marking only the refusals that came
+/// before the receipt store was reached.
+fn lock_prepare_refusal(
+    refusal: crate::domain::DirectPrepareRefusal,
+    attempt: Option<uuid::Uuid>,
+) -> Status {
+    match refusal {
+        crate::domain::DirectPrepareRefusal::BeforePrepare(status) => {
+            refused_before_prepare(status, attempt)
+        }
+        crate::domain::DirectPrepareRefusal::AtPrepare(mut status) => {
+            status
+                .metadata_mut()
+                .remove(lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY);
+            status
+        }
+    }
+}
+
 /// One wire lock batch, normalised for the fenced coordinator.
 struct FencedBatch {
     branch_id: [u8; 16],
@@ -464,7 +506,8 @@ impl LoreLockService {
         for_owner: Option<&str>,
         correlation_id: &str,
     ) -> Result<Vec<lore_proto::lock::Lock>, Status> {
-        let batch = fenced_batch(resources, false)?;
+        let not_prepared = |status: Status| refused_before_prepare(status, call.client_attempt_id);
+        let batch = fenced_batch(resources, false).map_err(not_prepared)?;
         let owner = match for_owner {
             Some(subject) => VerifiedLockOwner {
                 verified_issuer: call.caller.verified_issuer.clone(),
@@ -486,7 +529,7 @@ impl LoreLockService {
             outbox_cell_id: call.domain.outbox_cell_id().map(str::to_owned),
         };
         let binding = acquire_or_renew_binding(&input)
-            .map_err(|error| super::map_domain_error_to_status(&error))?;
+            .map_err(|error| not_prepared(super::map_domain_error_to_status(&error)))?;
         let operation = call
             .domain
             .prepare_direct_lock_operation(
@@ -497,7 +540,8 @@ impl LoreLockService {
                 binding,
                 call.client_attempt_id,
             )
-            .await?;
+            .await
+            .map_err(|refusal| lock_prepare_refusal(refusal, call.client_attempt_id))?;
         let result = call
             .coordinator
             .acquire_or_renew(&operation, &input)
@@ -529,7 +573,8 @@ impl LoreLockService {
         resources: &[lore_proto::lock::Resource],
         correlation_id: &str,
     ) -> Result<Vec<lore_proto::lock::Resource>, Status> {
-        let batch = fenced_batch(resources, true)?;
+        let not_prepared = |status: Status| refused_before_prepare(status, call.client_attempt_id);
+        let batch = fenced_batch(resources, true).map_err(not_prepared)?;
         let input = ReleaseInput {
             repository_id: repository.as_ref().to_vec(),
             branch_id: batch.branch_id.to_vec(),
@@ -537,8 +582,8 @@ impl LoreLockService {
             resources: batch.resources,
             outbox_cell_id: call.domain.outbox_cell_id().map(str::to_owned),
         };
-        let binding =
-            release_binding(&input).map_err(|error| super::map_domain_error_to_status(&error))?;
+        let binding = release_binding(&input)
+            .map_err(|error| not_prepared(super::map_domain_error_to_status(&error)))?;
         let operation = call
             .domain
             .prepare_direct_lock_operation(
@@ -549,7 +594,8 @@ impl LoreLockService {
                 binding,
                 call.client_attempt_id,
             )
-            .await?;
+            .await
+            .map_err(|refusal| lock_prepare_refusal(refusal, call.client_attempt_id))?;
         let result = call
             .coordinator
             .release(&operation, &input)
@@ -582,7 +628,8 @@ impl LoreLockService {
         // only principal that ever needs it — and would leave every
         // cutover-converted legacy row unreleasable by anybody. A token is still
         // honoured if supplied.
-        let batch = fenced_batch(resources, false)?;
+        let not_prepared = |status: Status| refused_before_prepare(status, call.client_attempt_id);
+        let batch = fenced_batch(resources, false).map_err(not_prepared)?;
         let input = ForceReleaseInput {
             repository_id: repository.as_ref().to_vec(),
             branch_id: batch.branch_id.to_vec(),
@@ -597,7 +644,7 @@ impl LoreLockService {
             outbox_cell_id: call.domain.outbox_cell_id().map(str::to_owned),
         };
         let binding = force_release_binding(&input)
-            .map_err(|error| super::map_domain_error_to_status(&error))?;
+            .map_err(|error| not_prepared(super::map_domain_error_to_status(&error)))?;
         let operation = call
             .domain
             .prepare_direct_lock_operation(
@@ -608,7 +655,8 @@ impl LoreLockService {
                 binding,
                 call.client_attempt_id,
             )
-            .await?;
+            .await
+            .map_err(|refusal| lock_prepare_refusal(refusal, call.client_attempt_id))?;
         let result = call
             .coordinator
             .force_release(&operation, &input)

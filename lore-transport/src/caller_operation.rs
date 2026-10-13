@@ -435,7 +435,10 @@ pub(crate) async fn dispatch_recorded_result<T, F: Future<Output = Result<T, Pro
         Err(error)
             if error.is_outcome_unknown()
                 || error.is_disconnected()
-                || crate::error::answer_lost_code(&error).is_some() =>
+                || crate::error::answer_lost_code(&error).is_some()
+                // Same rule `with_reconnect_classified` applies, and it must hold here too: this
+                // journal settles before that outer check runs.
+                || !crate::grpc::not_prepared_proof_holds(&error, &attempt) =>
         {
             Err(crate::outcome::outcome_unknown(rpc.wire_name(), &attempt))
         }

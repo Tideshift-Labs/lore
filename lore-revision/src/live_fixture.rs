@@ -199,6 +199,43 @@ pub enum RpcOutcome {
     /// fixture that only offered `LoseTheAnswer` could not express the bug this variant was added
     /// to catch a regression of.
     LoseTheAnswerCancelled,
+    /// Receive and record the request, then answer `UNAVAILABLE` carrying the loreserver's
+    /// not-prepared proof (`lore-not-prepared-attempt-v1`) -- the shape a fenced cell sends when
+    /// its repository-operation verifier is down and it never filed a receipt (Gate 0 campaign
+    /// c13). The [`NotPreparedProof`] picks which attempt id the proof names.
+    RefuseNotPrepared(NotPreparedProof),
+}
+
+/// Which attempt id a [`RpcOutcome::RefuseNotPrepared`] proof names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotPreparedProof {
+    /// The id the request itself carried in `lore-attempt-id`: a genuine loreserver proof.
+    OwnAttempt,
+    /// A fresh unrelated id: a header that reached the client from some other call.
+    ForeignAttempt,
+}
+
+/// The status a [`RpcOutcome::RefuseNotPrepared`] answer carries, built from the request that
+/// is being refused so an own-attempt proof names exactly the id the client sent.
+fn not_prepared_refusal(
+    request_metadata: &tonic::metadata::MetadataMap,
+    proof: NotPreparedProof,
+) -> Status {
+    let mut status = Status::unavailable("fixture: refused before prepare");
+    let named = match proof {
+        NotPreparedProof::OwnAttempt => request_metadata
+            .get(ATTEMPT_ID_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        NotPreparedProof::ForeignAttempt => Some(uuid::Uuid::now_v7().to_string()),
+    };
+    if let Some(value) = named.and_then(|named| named.parse().ok()) {
+        status.metadata_mut().insert(
+            lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY,
+            value,
+        );
+    }
+    status
 }
 
 /// The status a [`RpcOutcome::LoseTheAnswer`] answer carries.
@@ -635,6 +672,9 @@ impl LockService for StubLockService {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
+            RpcOutcome::RefuseNotPrepared(proof) => {
+                Err(not_prepared_refusal(request.metadata(), proof))
+            }
             RpcOutcome::Grant => Ok(Response::new(LockResponse {
                 locks: self.grant(resources, "fixture-owner"),
             })),
@@ -683,6 +723,9 @@ impl LockService for StubLockService {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
+            RpcOutcome::RefuseNotPrepared(proof) => {
+                Err(not_prepared_refusal(request.metadata(), proof))
+            }
             RpcOutcome::Grant => {
                 let echo = self.state.policy.lock().unlock_echo;
                 let confirmed = match echo {
@@ -708,6 +751,9 @@ impl LockService for StubLockService {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
+            RpcOutcome::RefuseNotPrepared(proof) => {
+                Err(not_prepared_refusal(request.metadata(), proof))
+            }
             RpcOutcome::Grant => Ok(Response::new(AdminLockResponse {
                 locks: self.grant(resources, &owner),
             })),
@@ -725,6 +771,9 @@ impl LockService for StubLockService {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
+            RpcOutcome::RefuseNotPrepared(proof) => {
+                Err(not_prepared_refusal(request.metadata(), proof))
+            }
             RpcOutcome::Grant => Ok(Response::new(ForceUnlockResponse { resources })),
         }
     }
@@ -768,6 +817,9 @@ impl RevisionService for StubRevisionService {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
+            RpcOutcome::RefuseNotPrepared(proof) => {
+                Err(not_prepared_refusal(request.metadata(), proof))
+            }
             RpcOutcome::Grant => {
                 let body = request.into_inner();
                 // The branch point the caller named, echoed back as the created tip. A push that
@@ -848,6 +900,9 @@ impl RevisionService for StubRevisionService {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
+            RpcOutcome::RefuseNotPrepared(proof) => {
+                Err(not_prepared_refusal(request.metadata(), proof))
+            }
             RpcOutcome::Grant => Ok(Response::new(BranchPushResponse {
                 revision_signature: request.into_inner().revision_signature,
                 ..BranchPushResponse::default()

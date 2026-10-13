@@ -811,3 +811,146 @@ fn the_answer_lost_header_alone_marks_an_allowlisted_code_with_no_other_reason_t
          alone must mark it -- the gate must not be over-broad in the other direction either"
     );
 }
+
+// --- Not-prepared proof (`lore-not-prepared-attempt-v1`, Gate 0 campaign c13) ---
+//
+// A fenced cell that refuses before it files a receipt stamps this header with the request's
+// attempt id. At the status-conversion layer the proof turns an otherwise lost-answer code into a
+// decisive `Internal`; what settles an attempt is `with_reconnect_classified`, covered by
+// `grpc/not_prepared_proof_wire_tests.rs`. `NOT_PREPARED_ATTEMPT_METADATA_KEY` is a public const.
+
+fn status_with_markers(code: tonic::Code, values: &[&str]) -> tonic::Status {
+    let mut status = tonic::Status::new(code, "verifier unavailable");
+    for value in values {
+        status.metadata_mut().append(
+            lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY,
+            value.parse().expect("ascii metadata value"),
+        );
+    }
+    status
+}
+
+/// Whether `err` is the decisive, proof-carrying shape: not a lost answer in any form.
+fn is_refused_before_prepare(err: &ProtocolError) -> bool {
+    matches!(err, ProtocolError::Internal(_))
+        && answer_lost_code(err).is_none()
+        && !err.is_outcome_unknown()
+}
+
+#[test]
+fn a_well_formed_marker_turns_every_unsettled_code_into_a_decisive_refusal() {
+    let attempt = uuid::Uuid::now_v7().to_string();
+    for code in [
+        tonic::Code::Unavailable,
+        tonic::Code::Unknown,
+        tonic::Code::Cancelled,
+        tonic::Code::DeadlineExceeded,
+    ] {
+        let err = ProtocolError::from(status_with_markers(code, &[&attempt]));
+        assert!(
+            is_refused_before_prepare(&err),
+            "{code:?} carrying the proof must be a decisive Internal, got {err:?}"
+        );
+        assert!(
+            !matches!(err, ProtocolError::Disconnected(_)),
+            "{code:?} carrying the proof must not read as a lost channel"
+        );
+        assert!(
+            err.to_string().contains("verifier unavailable"),
+            "the status's own message must survive: {err}"
+        );
+    }
+}
+
+// Negative control for the test above: the same codes with no marker keep their old reading.
+#[test]
+fn an_unmarked_unsettled_code_keeps_its_lost_answer_reading() {
+    for code in [tonic::Code::Unavailable, tonic::Code::Unknown] {
+        let err = ProtocolError::from(status_with_markers(code, &[]));
+        assert!(
+            matches!(err, ProtocolError::Disconnected(_)),
+            "an unmarked {code:?} must stay Disconnected, got {err:?}"
+        );
+    }
+    for code in [tonic::Code::Cancelled, tonic::Code::DeadlineExceeded] {
+        let err = ProtocolError::from(status_with_markers(code, &[]));
+        assert_eq!(answer_lost_code(&err), Some(code));
+    }
+}
+
+#[test]
+fn a_marker_on_a_decisive_code_keeps_the_usual_variant() {
+    let attempt = uuid::Uuid::now_v7().to_string();
+    let denied = ProtocolError::from(status_with_markers(
+        tonic::Code::PermissionDenied,
+        &[&attempt],
+    ));
+    assert!(
+        matches!(denied, ProtocolError::NotAuthorized(_)),
+        "PermissionDenied must stay NotAuthorized, got {denied:?}"
+    );
+
+    let mut unauthenticated = tonic::Status::unauthenticated("bearer audience is wrong");
+    unauthenticated.metadata_mut().append(
+        lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY,
+        attempt.parse().expect("ascii metadata value"),
+    );
+    let err = ProtocolError::from(unauthenticated);
+    assert!(
+        matches!(err, ProtocolError::NotAuthenticated(_)),
+        "Unauthenticated must stay NotAuthenticated, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("bearer audience is wrong"),
+        "NotAuthenticated must keep the server's reason: {err}"
+    );
+}
+
+#[test]
+fn two_markers_or_an_unparseable_marker_give_no_proof() {
+    let first = uuid::Uuid::now_v7().to_string();
+    let second = uuid::Uuid::now_v7().to_string();
+    for (label, values) in [
+        ("two different ids", vec![first.as_str(), second.as_str()]),
+        ("the same id twice", vec![first.as_str(), first.as_str()]),
+        ("an unparseable value", vec!["not-a-uuid"]),
+        ("an empty value", vec![""]),
+    ] {
+        let err = ProtocolError::from(status_with_markers(tonic::Code::Unavailable, &values));
+        assert!(
+            matches!(err, ProtocolError::Disconnected(_)),
+            "{label} must give no proof and keep the lost-channel reading, got {err:?}"
+        );
+    }
+}
+
+/// A relay re-emits an upstream refusal as a plain `Unavailable`, with no proof: the proof is
+/// the upstream server's word about its own copy, not the relay's.
+#[test]
+fn a_refused_before_prepare_error_converts_back_to_an_unmarked_unavailable() {
+    let attempt = uuid::Uuid::now_v7().to_string();
+    let err = ProtocolError::from(status_with_markers(tonic::Code::Unavailable, &[&attempt]));
+    assert!(is_refused_before_prepare(&err));
+
+    let status = tonic::Status::from(err);
+    assert_eq!(status.code(), tonic::Code::Unavailable);
+    assert!(
+        status
+            .metadata()
+            .get(lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY)
+            .is_none(),
+        "the relay must not pass the proof on: {:?}",
+        status.metadata()
+    );
+    assert!(
+        status.message().contains("verifier unavailable"),
+        "the message must survive the relay: {}",
+        status.message()
+    );
+
+    // And what the next hop's client sees is an ordinary lost channel.
+    assert!(matches!(
+        ProtocolError::from(status),
+        ProtocolError::Disconnected(_)
+    ));
+}

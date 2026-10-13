@@ -26,6 +26,7 @@ use lore_revision::live_fixture::LockPolicy;
 use lore_revision::live_fixture::LockRpc;
 use lore_revision::live_fixture::LockServer;
 use lore_revision::live_fixture::LockServerProbe;
+use lore_revision::live_fixture::NotPreparedProof;
 use lore_revision::live_fixture::Refusal;
 use lore_revision::live_fixture::RpcOutcome;
 use lore_revision::live_fixture::UnlockEcho;
@@ -1693,6 +1694,140 @@ fn a_decisive_refusal_on_the_acquire_stays_decisive_and_sends_no_rollback() {
         "a decisive refusal must not send any force-release either. Got {:?}",
         server.calls()
     );
+}
+
+/// What one single-batch acquire left behind, for the not-prepared proof cases below.
+struct AcquireOutcome {
+    status: i32,
+    server: LockServer,
+    spy: Arc<JournalSpy>,
+    unresolved: Vec<AttemptRecord>,
+}
+
+/// Run one acquire against a server whose `Lock` answers `outcome`, journalling into a spy.
+fn acquire_answered_with(outcome: RpcOutcome) -> AcquireOutcome {
+    let runtime = lore::runtime();
+    let server = runtime.block_on(LockServer::start_with_policy(LockPolicy {
+        lock: outcome,
+        ..LockPolicy::default()
+    }));
+    let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
+        LiveRepository::create(&server.remote_url()).await
+    }));
+    let spy = Arc::new(JournalSpy::new(server.probe()));
+    let attempts: Arc<dyn AttemptStore> = spy.clone();
+    let status = runtime.block_on(lore::lock::file_acquire_with_attempt_store(
+        fixture.globals(),
+        lore::lock::LoreLockFileAcquireArgs {
+            paths: all_paths(&fixture),
+            branch: LoreString::default(),
+        },
+        no_callback(),
+        attempts,
+    ));
+    let unresolved = runtime
+        .block_on(spy.inner.unresolved())
+        .expect("unresolved() must succeed on a fresh store");
+    AcquireOutcome {
+        status,
+        server,
+        spy,
+        unresolved,
+    }
+}
+
+/// Gate 0 campaign c13: a fenced cell whose verifier is down refuses `Lock` with `UNAVAILABLE`
+/// before it files any receipt, and says so in `lore-not-prepared-attempt-v1`. The client used to
+/// read that as a lost answer, raise `OutcomeUnknown` and leave the attempt unresolved with no
+/// receipt anywhere that reconciliation could ever find, which wedged the lane.
+///
+/// A near-copy of `a_lost_answer_on_the_acquire_is_not_rolled_back_and_surfaces_outcome_unknown`
+/// differing in ONE input: the refusal carries the proof for the request's own attempt.
+#[test]
+fn a_refusal_proven_not_prepared_is_decisive_and_resolves_not_applied() {
+    let run = acquire_answered_with(RpcOutcome::RefuseNotPrepared(NotPreparedProof::OwnAttempt));
+
+    assert_ne!(
+        run.status,
+        LoreError::OutcomeUnknown as i32,
+        "a refusal the server proved was raised before any receipt was prepared must not surface \
+         as OutcomeUnknown"
+    );
+    assert_ne!(run.status, 0, "the refused acquire must fail");
+
+    let locks = run.server.calls_for(LockRpc::Lock);
+    assert_eq!(
+        locks.len(),
+        1,
+        "exactly one Lock dispatch must reach the server, got {:?}",
+        run.server.calls()
+    );
+    let records = run.spy.record_entries();
+    assert_eq!(
+        records.len(),
+        1,
+        "one attempt must be journalled: {records:?}"
+    );
+    assert_eq!(
+        Some(records[0].0.clone()),
+        locks[0].attempt_id,
+        "the journalled id must be the id that reached the server"
+    );
+
+    let resolves = run.spy.resolve_entries();
+    assert_eq!(
+        resolves.len(),
+        1,
+        "the attempt must be resolved: {resolves:?}"
+    );
+    assert_eq!(resolves[0].0, records[0].0);
+    assert_eq!(
+        resolves[0].1,
+        AttemptResolution::NotApplied,
+        "a proven not-prepared refusal settles the attempt as not applied"
+    );
+    assert!(
+        run.unresolved.is_empty(),
+        "nothing may be left unresolved for a reconcile that can never find a receipt, got {:?}",
+        run.unresolved
+    );
+    assert!(
+        run.server.calls_for(LockRpc::Unlock).is_empty()
+            && run.server.calls_for(LockRpc::ForceUnlock).is_empty(),
+        "no rollback may follow, got {:?}",
+        run.server.calls()
+    );
+}
+
+/// Negative control for the case above: the same `UNAVAILABLE` WITHOUT the proof is what a load
+/// balancer or a dropped connection looks like, and stays an unknown outcome.
+#[test]
+fn an_unavailable_without_the_proof_stays_outcome_unknown() {
+    let run = acquire_answered_with(RpcOutcome::LoseTheAnswer);
+
+    assert_eq!(
+        run.status,
+        LoreError::OutcomeUnknown as i32,
+        "an unmarked UNAVAILABLE must stay OutcomeUnknown"
+    );
+    assert!(run.spy.resolve_entries().is_empty());
+    assert_eq!(run.unresolved.len(), 1, "got {:?}", run.unresolved);
+}
+
+/// A proof naming a different attempt is not this attempt's proof, so the outcome stays unknown.
+#[test]
+fn a_proof_naming_another_attempt_stays_outcome_unknown() {
+    let run = acquire_answered_with(RpcOutcome::RefuseNotPrepared(
+        NotPreparedProof::ForeignAttempt,
+    ));
+
+    assert_eq!(
+        run.status,
+        LoreError::OutcomeUnknown as i32,
+        "a not-prepared proof for some other attempt must not settle this one"
+    );
+    assert!(run.spy.resolve_entries().is_empty());
+    assert_eq!(run.unresolved.len(), 1, "got {:?}", run.unresolved);
 }
 
 /// 101 file names -- one more than `LOCK_BATCH_SIZE` (100), so a fixture built from these commits

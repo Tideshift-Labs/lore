@@ -92,7 +92,12 @@ $inventory = @(
             'wp120_query_without_a_branch_carries_no_namespace_generation',
             'wp120_query_of_an_unknown_branch_carries_no_namespace_generation',
             'wp120_legacy_route_query_carries_no_namespace_generation',
-            'wp120_lock_activity_on_one_branch_does_not_move_a_sibling_branch_namespace'
+            'wp120_lock_activity_on_one_branch_does_not_move_a_sibling_branch_namespace',
+            'wp120_not_prepared_a_verifier_outage_marks_the_refusal_with_the_request_attempt',
+            'wp120_not_prepared_a_served_lock_files_a_receipt_for_its_attempt_and_carries_no_marker',
+            'wp120_not_prepared_a_request_without_an_attempt_id_gets_no_marker',
+            'wp120_not_prepared_a_forged_marker_from_the_verifier_is_replaced',
+            'wp120_not_prepared_a_refusal_after_the_prepare_carries_no_marker'
         )
     }
 )

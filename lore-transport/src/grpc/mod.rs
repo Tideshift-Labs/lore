@@ -620,6 +620,9 @@ pub fn inject_attempt_id(request: &mut tonic::Request<()>) -> Result<(), tonic::
     let Some(attempt) = crate::outcome::current_dispatch_attempt() else {
         return Ok(());
     };
+    // Counted before the header is built, so even a copy whose header would not encode counts.
+    // Over-counting only keeps an attempt unknown; under-counting could settle one wrongly.
+    crate::outcome::note_dispatch_send(attempt);
     match MetadataValue::from_str(&attempt.to_string()) {
         Ok(value) => {
             request
@@ -1869,7 +1872,10 @@ where
             )
             .await
             {
-                Err(error) if answer_is_not_settled(&error) => {
+                Err(error)
+                    if answer_is_not_settled(&error)
+                        || !not_prepared_proof_holds(&error, &attempt) =>
+                {
                     Err(outcome_unknown(rpc.wire_name(), &attempt))
                 }
                 result => result,
@@ -1895,6 +1901,23 @@ where
 fn answer_is_not_settled(error: &ProtocolError) -> bool {
     matches!(error, ProtocolError::Disconnected(_))
         || crate::error::answer_lost_code(error).is_some()
+}
+
+/// Whether a server's not-prepared proof, if the error carries one, settles this attempt.
+///
+/// An error without the proof is an ordinary refusal and this answers `true`. With the proof it
+/// answers `true` only when the proof names this attempt and this process sent the attempt
+/// exactly once. The proof is the server's word about the copy it refused; a second copy (a
+/// retry loop, or one id scoped across several dispatches) may have reached another replica and
+/// been prepared there, so the attempt then stays unknown.
+#[lore_macro::test_pub]
+pub(crate) fn not_prepared_proof_holds(error: &ProtocolError, attempt: &AttemptId) -> bool {
+    match crate::error::not_prepared_attempt(error) {
+        None => true,
+        Some(marked) => {
+            marked == attempt.as_uuid() && crate::outcome::dispatch_send_count(attempt) == 1
+        }
+    }
 }
 
 impl GRPCStorage {

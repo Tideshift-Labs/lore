@@ -208,12 +208,22 @@ async fn outbox_event_kind_count(client: &Client, repository_id: &[u8], event_ki
 /// rail those other methods serve.
 struct DirectEchoVerifier {
     calls: AtomicUsize,
+    /// When set, the verifier fails every call with this status instead of echoing.
+    fail_with: Option<Status>,
 }
 
 impl DirectEchoVerifier {
     fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            fail_with: None,
+        }
+    }
+
+    fn failing(status: Status) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            fail_with: Some(status),
         }
     }
 }
@@ -270,6 +280,9 @@ impl RepositoryOperationAuthorizationVerifier for DirectEchoVerifier {
             "the internal prepare must forward the lore-authn-bearer value to the verifier, \
              not the authorization value"
         );
+        if let Some(status) = &self.fail_with {
+            return Err(status.clone());
+        }
         Ok(direct_authorization::direct_echo(request.into_inner()))
     }
 }
@@ -436,6 +449,20 @@ async fn armed_service(
     [u8; 16],
     [u8; 16],
 ) {
+    armed_service_with(url, Arc::new(DirectEchoVerifier::new())).await
+}
+
+/// [`armed_service`] with the direct-authorization verifier the caller supplies.
+async fn armed_service_with(
+    url: &str,
+    verifier: Arc<DirectEchoVerifier>,
+) -> (
+    LoreLockService,
+    Arc<lore_postgres::domain::locks::PostgresLockCoordinator>,
+    Arc<DirectEchoVerifier>,
+    [u8; 16],
+    [u8; 16],
+) {
     let domain_store = PostgresDomainStore::connect(url, 4, &TlsConfig::default())
         .await
         .expect("connect domain store");
@@ -454,7 +481,6 @@ async fn armed_service(
         .expect("arm fenced routing through the production gate");
     let (repository_id, branch_id) = create_repository_and_branch(&domain_store).await;
 
-    let verifier = Arc::new(DirectEchoVerifier::new());
     let domain = Arc::new(
         DomainContext::new_with_lock_coordinator(
             Arc::new(domain_store) as Arc<dyn DomainTransactionStore>,
@@ -1498,4 +1524,300 @@ async fn wp120_lock_activity_on_one_branch_does_not_move_a_sibling_branch_namesp
         b_before,
         "branch B's table row must not move either"
     );
+}
+
+// --- The not-prepared proof on the fenced Lock rail (Gate 0 campaign c13) ---
+//
+// A refusal raised before the receipt store was asked to prepare carries
+// `lore-not-prepared-attempt-v1: <the request's lore-attempt-id>`, so a released client can settle
+// its attempt as not applied. These cases drive the real `LoreLockService::lock` over real
+// Postgres and read the receipt table directly, never the handler as its own oracle.
+
+const NOT_PREPARED_KEY: &str = lore_transport::outcome::NOT_PREPARED_ATTEMPT_METADATA_KEY;
+
+fn released_client(subject: &str) -> AuthorizationToken {
+    AuthorizationToken {
+        issuer: "https://issuer.example".to_owned(),
+        user_id: subject.to_owned(),
+        ..Default::default()
+    }
+}
+
+/// A fenced `Lock` for one real branch, carrying `attempt` as its `lore-attempt-id` when given.
+fn lock_request_with_attempt(
+    branch_id: &[u8; 16],
+    repository_id: &[u8; 16],
+    token: &AuthorizationToken,
+    attempt: Option<Uuid>,
+) -> Request<LockRequest> {
+    let mut request = authenticated_request(
+        LockRequest {
+            resources: vec![resource_for_branch(branch_id)],
+        },
+        repository_id,
+        token,
+    );
+    if let Some(attempt) = attempt {
+        request.metadata_mut().insert(
+            lore_transport::outcome::ATTEMPT_ID_METADATA_KEY,
+            attempt.to_string().parse().expect("ascii header"),
+        );
+    }
+    request
+}
+
+async fn receipt_rows_for_attempt(client: &Client, attempt: Uuid) -> i64 {
+    client
+        .query_one(
+            "SELECT count(*) FROM lore_domain_operation_receipts WHERE client_attempt_id = $1",
+            &[&attempt.as_bytes().as_slice()],
+        )
+        .await
+        .expect("count receipt rows for the attempt")
+        .get(0)
+}
+
+fn marker_values(status: &Status) -> Vec<String> {
+    status
+        .metadata()
+        .get_all(NOT_PREPARED_KEY)
+        .iter()
+        .map(|value| value.to_str().expect("ascii marker").to_owned())
+        .collect()
+}
+
+fn unavailable_with_forged_marker(forged: Uuid) -> Status {
+    let mut status = Status::unavailable("verifier unreachable");
+    status
+        .metadata_mut()
+        .append(NOT_PREPARED_KEY, forged.to_string().parse().expect("ascii"));
+    status
+}
+
+/// The c13 trigger: the verifier is down, so the handler refuses before any receipt row exists and
+/// says so, naming the request's own attempt. The status keeps its code and message.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_not_prepared_a_verifier_outage_marks_the_refusal_with_the_request_attempt() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let verifier = Arc::new(DirectEchoVerifier::failing(Status::unavailable(
+        "verifier unreachable",
+    )));
+    let (service, _coordinator, verifier, repository_id, branch_id) =
+        armed_service_with(&url, verifier).await;
+    let db = client(&url).await;
+    let token = released_client("wp120-not-prepared-outage");
+    let attempt = Uuid::now_v7();
+
+    let refusal = service
+        .lock(lock_request_with_attempt(
+            &branch_id,
+            &repository_id,
+            &token,
+            Some(attempt),
+        ))
+        .await
+        .expect_err("a verifier outage must refuse the lock");
+
+    assert_eq!(refusal.code(), Code::Unavailable);
+    assert_eq!(refusal.message(), "verifier unreachable");
+    assert_eq!(
+        marker_values(&refusal),
+        vec![attempt.to_string()],
+        "the refusal must name exactly the request's attempt"
+    );
+    assert_eq!(
+        verifier.calls.load(Ordering::SeqCst),
+        1,
+        "the verifier must have been asked (the refusal is its outage)"
+    );
+    assert_eq!(
+        receipt_rows_for_attempt(&db, attempt).await,
+        0,
+        "no receipt row may exist for a refusal the server proved was not prepared"
+    );
+}
+
+/// Control for the case above: the query sees a receipt row when the lock is prepared, so the
+/// zero above is a finding and not a misspelt table.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_not_prepared_a_served_lock_files_a_receipt_for_its_attempt_and_carries_no_marker() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let db = client(&url).await;
+    let token = released_client("wp120-not-prepared-control");
+    let attempt = Uuid::now_v7();
+
+    let response = service
+        .lock(lock_request_with_attempt(
+            &branch_id,
+            &repository_id,
+            &token,
+            Some(attempt),
+        ))
+        .await
+        .expect("a served lock must succeed");
+
+    assert!(marker_values_of_response(&response).is_empty());
+    assert_eq!(
+        receipt_rows_for_attempt(&db, attempt).await,
+        1,
+        "a prepared lock must file exactly one receipt row under its attempt"
+    );
+}
+
+fn marker_values_of_response<T>(response: &tonic::Response<T>) -> Vec<String> {
+    response
+        .metadata()
+        .get_all(NOT_PREPARED_KEY)
+        .iter()
+        .map(|value| value.to_str().expect("ascii marker").to_owned())
+        .collect()
+}
+
+/// With no `lore-attempt-id` there is nothing to bind the proof to, so no marker is set. A marker
+/// the verifier's own status carried is stripped too: only this server may vouch.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_not_prepared_a_request_without_an_attempt_id_gets_no_marker() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let token = released_client("wp120-not-prepared-noattempt");
+    for (label, status) in [
+        ("plain", Status::unavailable("verifier unreachable")),
+        ("forged", unavailable_with_forged_marker(Uuid::now_v7())),
+    ] {
+        let verifier = Arc::new(DirectEchoVerifier::failing(status));
+        let (service, _coordinator, _verifier, repository_id, branch_id) =
+            armed_service_with(&url, verifier).await;
+
+        let refusal = service
+            .lock(lock_request_with_attempt(
+                &branch_id,
+                &repository_id,
+                &token,
+                None,
+            ))
+            .await
+            .expect_err("a verifier outage must refuse the lock");
+
+        assert_eq!(refusal.code(), Code::Unavailable, "{label}");
+        assert!(
+            marker_values(&refusal).is_empty(),
+            "{label}: a request with no attempt id must get no marker, got {:?}",
+            marker_values(&refusal)
+        );
+    }
+}
+
+/// A marker already on the verifier's status is replaced by the request's own id, never passed on
+/// and never appended beside it.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_not_prepared_a_forged_marker_from_the_verifier_is_replaced() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let forged = Uuid::now_v7();
+    let verifier = Arc::new(DirectEchoVerifier::failing(unavailable_with_forged_marker(
+        forged,
+    )));
+    let (service, _coordinator, _verifier, repository_id, branch_id) =
+        armed_service_with(&url, verifier).await;
+    let token = released_client("wp120-not-prepared-forged");
+    let attempt = Uuid::now_v7();
+    assert_ne!(forged, attempt);
+
+    let refusal = service
+        .lock(lock_request_with_attempt(
+            &branch_id,
+            &repository_id,
+            &token,
+            Some(attempt),
+        ))
+        .await
+        .expect_err("a verifier outage must refuse the lock");
+
+    assert_eq!(
+        marker_values(&refusal),
+        vec![attempt.to_string()],
+        "exactly one marker, and it names the request's attempt rather than the forged id"
+    );
+}
+
+/// A refusal after the prepare carries no marker: the receipt row exists, so the server must not
+/// claim it never prepared. A second subject contending for a held resource is refused by the
+/// coordinator, after its own receipt was filed.
+#[tokio::test]
+#[ignore = "needs live Postgres env (LORE_TEST_PG_URL); run with -- --ignored"]
+async fn wp120_not_prepared_a_refusal_after_the_prepare_carries_no_marker() {
+    let Some(url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let (service, _coordinator, _verifier, repository_id, branch_id) = armed_service(&url).await;
+    let db = client(&url).await;
+    let holder = released_client("wp120-not-prepared-holder");
+    let contender = released_client("wp120-not-prepared-contender");
+
+    let resource = resource_for_branch(&branch_id);
+    let first = service
+        .lock({
+            let mut request = authenticated_request(
+                LockRequest {
+                    resources: vec![resource.clone()],
+                },
+                &repository_id,
+                &holder,
+            );
+            request.metadata_mut().insert(
+                lore_transport::outcome::ATTEMPT_ID_METADATA_KEY,
+                Uuid::now_v7().to_string().parse().expect("ascii header"),
+            );
+            request
+        })
+        .await
+        .expect("the holder acquires the resource");
+    drop(first);
+
+    let attempt = Uuid::now_v7();
+    let mut request = authenticated_request(
+        LockRequest {
+            resources: vec![resource],
+        },
+        &repository_id,
+        &contender,
+    );
+    request.metadata_mut().insert(
+        lore_transport::outcome::ATTEMPT_ID_METADATA_KEY,
+        attempt.to_string().parse().expect("ascii header"),
+    );
+    let outcome = service.lock(request).await;
+
+    assert_eq!(
+        receipt_rows_for_attempt(&db, attempt).await,
+        1,
+        "the contender's prepare must have filed its receipt before the coordinator refused"
+    );
+    match outcome {
+        Err(refusal) => assert!(
+            marker_values(&refusal).is_empty(),
+            "a refusal after the prepare must carry no marker, got {:?}",
+            marker_values(&refusal)
+        ),
+        Ok(response) => panic!(
+            "the contender must be refused a held resource, got {:?}",
+            response.get_ref()
+        ),
+    }
 }
