@@ -2,6 +2,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -55,20 +56,82 @@ type Identity = String;
 type CacheResourceId = String;
 type RecipientDomain = String;
 type CredentialFingerprint = String;
-type AuthzCache = Mutex<
-    HashMap<
-        (
-            AuthUrl,
-            Identity,
-            CacheResourceId,
-            RecipientDomain,
-            CredentialFingerprint,
-        ),
-        String,
-    >,
->;
+#[lore_macro::test_pub]
+type AuthzKey = (
+    AuthUrl,
+    Identity,
+    CacheResourceId,
+    RecipientDomain,
+    CredentialFingerprint,
+);
+
+/// The in-memory authorization cache.
+///
+/// `tokens` is held only for one map read or write, never across an await.
+/// A miss runs its exchange under that key's own flight lock in `flights`, so
+/// concurrent misses on one key share a single exchange while misses on
+/// different keys run in parallel. `flights` holds a key only while a lookup
+/// for it is in progress, with the number of callers waiting on or holding it.
+///
+/// `epoch` is held shared for the whole of a lookup and exclusively by
+/// [`clear_authz_cache`]. A clear therefore waits out every exchange already
+/// running, as it did when one lock guarded everything, and none of them can
+/// put an entry back after it returns.
+#[lore_macro::test_pub]
+struct AuthzCache {
+    epoch: tokio::sync::RwLock<()>,
+    tokens: parking_lot::Mutex<HashMap<AuthzKey, String>>,
+    flights: parking_lot::Mutex<HashMap<AuthzKey, (Arc<Mutex<()>>, usize)>>,
+}
 
 static AUTHZ_CACHE: std::sync::OnceLock<AuthzCache> = std::sync::OnceLock::new();
+
+/// One caller's share of a key's flight lock.
+///
+/// Dropping it, whether its caller finished, failed, or was cancelled while
+/// waiting or exchanging, releases the share. The last share removes the key
+/// from `flights`, so no outcome leaves a key wedged or the map growing.
+struct FlightTicket {
+    key: AuthzKey,
+    flight: Arc<Mutex<()>>,
+}
+
+impl FlightTicket {
+    fn join(key: &AuthzKey) -> Self {
+        let mut flights = cache().flights.lock();
+        let entry = flights
+            .entry(key.clone())
+            .or_insert_with(|| (Arc::new(Mutex::new(())), 0));
+        entry.1 += 1;
+        Self {
+            key: key.clone(),
+            flight: entry.0.clone(),
+        }
+    }
+}
+
+impl Drop for FlightTicket {
+    fn drop(&mut self) {
+        let mut flights = cache().flights.lock();
+        let last = match flights.get_mut(&self.key) {
+            Some(entry) if Arc::ptr_eq(&entry.0, &self.flight) => {
+                entry.1 = entry.1.saturating_sub(1);
+                entry.1 == 0
+            }
+            _ => false,
+        };
+        if last {
+            flights.remove(&self.key);
+        }
+    }
+}
+
+/// What an exchange authorizes against.
+#[derive(Clone, Copy)]
+enum AuthzResource<'a> {
+    Repository(RepositoryId),
+    Custom(&'a str),
+}
 
 /// Refresh authentication five minutes before expiry so the existing
 /// once-per-minute auth loop has multiple retry opportunities.
@@ -91,7 +154,11 @@ const AUTHENTICATION_REFRESH_TIMEOUTS: AuthenticationRefreshTimeouts =
 
 #[lore_macro::test_pub]
 fn cache() -> &'static AuthzCache {
-    AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    AUTHZ_CACHE.get_or_init(|| AuthzCache {
+        epoch: tokio::sync::RwLock::new(()),
+        tokens: parking_lot::Mutex::new(HashMap::new()),
+        flights: parking_lot::Mutex::new(HashMap::new()),
+    })
 }
 
 /// Evicts every exchanged authorization token from the in-memory cache.
@@ -102,7 +169,8 @@ fn cache() -> &'static AuthzCache {
 /// reset.
 pub async fn clear_authz_cache() {
     if let Some(cache) = AUTHZ_CACHE.get() {
-        cache.lock().await.clear();
+        let _epoch = cache.epoch.write().await;
+        cache.tokens.lock().clear();
     }
 }
 
@@ -393,145 +461,14 @@ pub async fn exchange(
         .into());
     }
 
-    let auth_domain = get_domain_or_empty(auth_url);
-    let auth_url = auth_url.to_string();
-    let repo_id_str = repository.to_string();
-    // A supplied access token returned above, so the identity token is the only
-    // credential that reaches the cache or the store from here.
-    let credential_fingerprint = lore_credential::token_fingerprint(identity_token);
-    let supplied_credentials = !credential_fingerprint.is_empty();
-    let cache_key = (
-        auth_url.clone(),
-        identity.to_string(),
-        repo_id_str.clone(),
-        recipient_domain.clone(),
-        credential_fingerprint,
-    );
-    let mut cache = cache().lock().await;
-
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
-
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
-
-    // Token store key: "{auth_url}/{repository_id}" (no urc- prefix)
-    let token_store_key = format!("{auth_url}/{repo_id_str}");
-
-    if !token.is_empty() {
-        lore_trace!("Found cached authz token for {cache_key:?}");
-    } else if !supplied_credentials {
-        lore_trace!("Check for token store authz token for {token_store_key:?}");
-        token = token_store::load_user_token_from_store(
-            &token_store_key,
-            identity,
-            tokens_only_for_recipient_domain(recipient_domain.clone()),
-        )
-        .await
-        .unwrap_or_default();
-    }
-
-    if !token.is_empty() {
-        lore_trace!("Validating token expiry");
-        if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
-            if !is_expired(user_info.expires) {
-                lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
-                return Ok(token.clone());
-            } else {
-                lore_debug!("Authz token for {cache_key:?} has expired");
-            }
-        } else {
-            lore_warn!("Invalid authz token found for {cache_key:?}");
-        }
-    } else {
-        lore_trace!("No stored authz token found for {cache_key:?}");
-    }
-
-    // Load authn token for the auth service domain
-    lore_trace!("Authorizing using authn identity: {identity}");
-    let Some(auth_service_only_token) = lore_credential::user_info(
-        auth_url.as_str(),
+    cached_authorization(
+        auth_url,
         identity,
-        tokens_only_for_recipient_domain(auth_domain),
+        AuthzResource::Repository(repository),
+        recipient_domain,
         identity_token,
-        access_token,
     )
     .await
-    else {
-        lore_debug!("Not authenticated, unable to perform authz exchange");
-        return Err(NotAuthenticated::new(format!(
-            "no authentication token is stored for identity {identity} at {auth_url}; sign in again"
-        ))
-        .into());
-    };
-    lore_trace!("Authorizing using endpoint: {auth_url}");
-
-    let time_start = Instant::now();
-
-    // Delegate to the Authentication implementation
-    let auth_impl = authentication::find(&auth_url)
-        .forward::<ExchangeError>("Unable to connect to auth exchange endpoint")?;
-    // The correlation_id is no longer available from ExecutionContext in lore-transport.
-    // Pass an empty string -- the gRPC interceptor may inject it from ambient state.
-    let correlation_id = String::new();
-
-    lore_trace!("Send auth exchange request");
-    let authz = auth_impl
-        .exchange_for_repository(
-            &auth_url,
-            &auth_service_only_token.token,
-            repository,
-            &correlation_id,
-        )
-        .await
-        .map_err(|err| {
-            if err.is_not_authorized() {
-                ExchangeError::from(NotAuthorized)
-            } else {
-                ExchangeError::internal_with_context(err, "Failed to exchange token")
-            }
-        })?;
-
-    let token = authz.token;
-    if token.is_empty() {
-        return Err(ExchangeError::internal("Empty token response"));
-    }
-    let decoded_token = insecure_decode_token(&token)
-        .internal("Could not decode token")
-        .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
-        lore_warn!("{err}");
-        ExchangeError::internal_with_context(
-            err,
-            "The token is not suitable for what you intend to do",
-        )
-    })?;
-
-    lore_trace!(
-        "Authorization with user token successful in {} ms",
-        time_start.elapsed().as_millis()
-    );
-
-    lore_trace!("Cached authz token for {cache_key:?}");
-
-    cache.insert(cache_key, token.clone());
-
-    if !supplied_credentials {
-        let _ = token_store::store_user_token(
-            &token_store_key,
-            identity,
-            &token,
-            decoded_token.claims.acceptable_root_domains(),
-        )
-        .await
-        .map_err(|err| {
-            lore_warn!("Failed to store token: {err}");
-        });
-    }
-
-    Ok(token)
 }
 
 /// Exchanges an authentication token for an authorization token scoped to an
@@ -576,31 +513,74 @@ pub async fn exchange_custom_resource(
         ));
     }
 
-    let auth_domain = get_domain_or_empty(auth_url);
-    let auth_url = auth_url.to_string();
-    // A supplied access token returned above, so the identity token is the only
-    // credential that reaches the cache or the store from here.
+    cached_authorization(
+        auth_url,
+        identity,
+        AuthzResource::Custom(resource_id),
+        recipient_domain,
+        identity_token,
+    )
+    .await
+}
+
+/// True when `token` decodes and has not expired.
+fn authorization_is_current(token: &str) -> bool {
+    lore_credential::user_info_from_token(token.to_string())
+        .is_some_and(|user_info| !is_expired(user_info.expires))
+}
+
+/// The cache, token-store and exchange steps shared by [`exchange`] and
+/// [`exchange_custom_resource`], once their argument checks have passed and a
+/// supplied access token has returned.
+///
+/// A current in-memory entry is served without waiting on anything but the
+/// map. Otherwise the caller joins the key's flight and repeats the lookup
+/// under it: a caller that waited behind a successful exchange finds that
+/// exchange's token, and one that waited behind a failed or cancelled one
+/// finds nothing and runs its own.
+async fn cached_authorization(
+    auth_url: &str,
+    identity: &str,
+    resource: AuthzResource<'_>,
+    recipient_domain: String,
+    identity_token: &str,
+) -> Result<String, ExchangeError> {
+    let resource_id = match resource {
+        AuthzResource::Repository(repository) => repository.to_string(),
+        AuthzResource::Custom(resource_id) => resource_id.to_string(),
+    };
+    // A supplied access token returned before this, so the identity token is
+    // the only credential that reaches the cache or the store from here.
     let credential_fingerprint = lore_credential::token_fingerprint(identity_token);
     let supplied_credentials = !credential_fingerprint.is_empty();
-    let cache_key = (
-        auth_url.clone(),
+    // Token store key: "{auth_url}/{resource_id}" (no urc- prefix). A custom
+    // resource ID takes the repository slot.
+    let token_store_key = format!("{auth_url}/{resource_id}");
+    let cache_key: AuthzKey = (
+        auth_url.to_string(),
         identity.to_string(),
-        resource_id.to_string(),
+        resource_id,
         recipient_domain.clone(),
         credential_fingerprint,
     );
-    let mut cache = cache().lock().await;
+    let authz = cache();
+    let _epoch = authz.epoch.read().await;
 
-    lore_trace!(
-        "Check for cached authz token for {cache_key:?} in cache with {} tokens",
-        cache.len()
-    );
+    let cached = authz.tokens.lock().get(&cache_key).cloned();
+    if let Some(token) = cached
+        && authorization_is_current(&token)
+    {
+        lore_trace!("Using cached authz token for {cache_key:?}");
+        return Ok(token);
+    }
 
-    let mut token = cache.get(&cache_key).cloned().unwrap_or_default();
+    // Declared before the guard, so the guard is released before the ticket.
+    let ticket = FlightTicket::join(&cache_key);
+    let _flight = ticket.flight.lock().await;
 
-    // Token store key: "{auth_url}/{resource_id}" -- same shape as the
-    // repository variant, with the resource ID taking the repository slot.
-    let token_store_key = format!("{auth_url}/{resource_id}");
+    let cached = authz.tokens.lock().get(&cache_key).cloned();
+    lore_trace!("Check for cached authz token for {cache_key:?}");
+    let mut token = cached.unwrap_or_default();
 
     if !token.is_empty() {
         lore_trace!("Found cached authz token for {cache_key:?}");
@@ -620,8 +600,8 @@ pub async fn exchange_custom_resource(
         if let Some(user_info) = lore_credential::user_info_from_token(token.clone()) {
             if !is_expired(user_info.expires) {
                 lore_trace!("Using authz token for {cache_key:?}");
-                cache.insert(cache_key, token.clone());
-                return Ok(token.clone());
+                authz.tokens.lock().insert(cache_key, token.clone());
+                return Ok(token);
             } else {
                 lore_debug!("Authz token for {cache_key:?} has expired");
             }
@@ -632,13 +612,53 @@ pub async fn exchange_custom_resource(
         lore_trace!("No stored authz token found for {cache_key:?}");
     }
 
+    let (token, acceptable_root_domains) = exchange_fresh(
+        auth_url,
+        identity,
+        resource,
+        &recipient_domain,
+        identity_token,
+    )
+    .await?;
+
+    lore_trace!("Cached authz token for {cache_key:?}");
+    authz.tokens.lock().insert(cache_key, token.clone());
+
+    if !supplied_credentials {
+        let _ = token_store::store_user_token(
+            &token_store_key,
+            identity,
+            &token,
+            acceptable_root_domains,
+        )
+        .await
+        .map_err(|err| {
+            lore_warn!("Failed to store token: {err}");
+        });
+    }
+
+    Ok(token)
+}
+
+/// Loads the authentication token, runs the exchange with the registered
+/// `Authentication` implementation and checks the result. Returns the
+/// authorization token and the root domains it may be sent to.
+async fn exchange_fresh(
+    auth_url: &str,
+    identity: &str,
+    resource: AuthzResource<'_>,
+    recipient_domain: &str,
+    identity_token: &str,
+) -> Result<(String, Vec<String>), ExchangeError> {
+    // Load authn token for the auth service domain
     lore_trace!("Authorizing using authn identity: {identity}");
+    let auth_domain = get_domain_or_empty(auth_url);
     let Some(auth_service_only_token) = lore_credential::user_info(
-        auth_url.as_str(),
+        auth_url,
         identity,
         tokens_only_for_recipient_domain(auth_domain),
         identity_token,
-        access_token,
+        "",
     )
     .await
     else {
@@ -652,28 +672,43 @@ pub async fn exchange_custom_resource(
 
     let time_start = Instant::now();
 
-    let auth_impl = authentication::find(&auth_url)
+    // Delegate to the Authentication implementation
+    let auth_impl = authentication::find(auth_url)
         .forward::<ExchangeError>("Unable to connect to auth exchange endpoint")?;
     // The correlation_id is no longer available from ExecutionContext in lore-transport.
     // Pass an empty string -- the gRPC interceptor may inject it from ambient state.
     let correlation_id = String::new();
 
     lore_trace!("Send auth exchange request");
-    let authz = auth_impl
-        .exchange_for_custom_resource(
-            &auth_url,
-            &auth_service_only_token.token,
-            resource_id,
-            &correlation_id,
-        )
-        .await
-        .map_err(|err| {
-            if err.is_not_authorized() {
-                ExchangeError::from(NotAuthorized)
-            } else {
-                ExchangeError::internal_with_context(err, "Failed to exchange token")
-            }
-        })?;
+    let authz = match resource {
+        AuthzResource::Repository(repository) => {
+            auth_impl
+                .exchange_for_repository(
+                    auth_url,
+                    &auth_service_only_token.token,
+                    repository,
+                    &correlation_id,
+                )
+                .await
+        }
+        AuthzResource::Custom(resource_id) => {
+            auth_impl
+                .exchange_for_custom_resource(
+                    auth_url,
+                    &auth_service_only_token.token,
+                    resource_id,
+                    &correlation_id,
+                )
+                .await
+        }
+    }
+    .map_err(|err| {
+        if err.is_not_authorized() {
+            ExchangeError::from(NotAuthorized)
+        } else {
+            ExchangeError::internal_with_context(err, "Failed to exchange token")
+        }
+    })?;
 
     let token = authz.token;
     if token.is_empty() {
@@ -682,7 +717,7 @@ pub async fn exchange_custom_resource(
     let decoded_token = insecure_decode_token(&token)
         .internal("Could not decode token")
         .map_err(ExchangeError::from)?;
-    verify_jwt_usage_for_remote(&decoded_token.claims, &recipient_domain).map_err(|err| {
+    verify_jwt_usage_for_remote(&decoded_token.claims, recipient_domain).map_err(|err| {
         lore_warn!("{err}");
         ExchangeError::internal_with_context(
             err,
@@ -695,24 +730,7 @@ pub async fn exchange_custom_resource(
         time_start.elapsed().as_millis()
     );
 
-    lore_trace!("Cached authz token for {cache_key:?}");
-
-    cache.insert(cache_key, token.clone());
-
-    if !supplied_credentials {
-        let _ = token_store::store_user_token(
-            &token_store_key,
-            identity,
-            &token,
-            decoded_token.claims.acceptable_root_domains(),
-        )
-        .await
-        .map_err(|err| {
-            lore_warn!("Failed to store token: {err}");
-        });
-    }
-
-    Ok(token)
+    Ok((token, decoded_token.claims.acceptable_root_domains()))
 }
 
 /// Resolves an identity and obtains authentication/authorization tokens.

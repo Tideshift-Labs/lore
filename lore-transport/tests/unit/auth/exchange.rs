@@ -109,13 +109,13 @@ async fn clear_authz_cache_evicts_seeded_entry() {
         String::new(),
     );
     cache()
+        .tokens
         .lock()
-        .await
         .insert(key.clone(), "token-value".to_string());
 
     clear_authz_cache().await;
 
-    assert!(!cache().lock().await.contains_key(&key));
+    assert!(!cache().tokens.lock().contains_key(&key));
 }
 
 #[tokio::test]
@@ -270,7 +270,7 @@ async fn setup_refresh_test() {
     token_store::reset_tokens()
         .await
         .expect("reset test token store");
-    cache().lock().await.clear();
+    cache().tokens.lock().clear();
 }
 
 fn base64_url(input: &[u8]) -> String {
@@ -914,5 +914,382 @@ async fn one_supplied_credential_is_never_served_anothers_authorization() {
         stub.exchanges.load(std::sync::atomic::Ordering::Acquire),
         2,
         "the second credential must not be served the first one's entry"
+    );
+}
+
+// Single flight (WP-115): the cache lock guards only the map, so first touches
+// of different keys exchange in parallel and concurrent misses on one key share
+// one exchange. Each test registers its own scheme, so its keys are its own.
+
+/// `sub` alice, `aud` example.com, expiring in 2033. Supplied as the identity
+/// token, so no test here reads or writes the token store.
+const SF_AUTHN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
+
+/// A repository exchanger that takes `delay` per call and records how many
+/// calls ran at once. Call `n` (from 0) never completes when `n < hang_first`,
+/// and fails when `n < fail_first`.
+struct DelayedAuthentication {
+    delay: Duration,
+    token: String,
+    hang_first: usize,
+    fail_first: usize,
+    calls: AtomicUsize,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: AtomicUsize,
+}
+
+impl DelayedAuthentication {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            token: jwt("alice", current_time_ms() + 3_600_000, "example.com"),
+            hang_first: 0,
+            fail_first: 0,
+            calls: AtomicUsize::new(0),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            max_in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+/// Counts one running exchange, also when the exchange is cancelled.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Authentication for DelayedAuthentication {
+    async fn start_auth_session(
+        &self,
+        _auth_url: &str,
+        _client_state: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthSession, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn poll_auth_session(
+        &self,
+        _auth_url: &str,
+        _client_state: &str,
+        _session_code: &str,
+        _correlation_id: &str,
+    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn exchange_external_token(
+        &self,
+        _auth_url: &str,
+        _token: &str,
+        _token_type: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn refresh_authentication(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn exchange_for_repository(
+        &self,
+        _auth_url: &str,
+        _authn_token: &str,
+        _repository: RepositoryId,
+        _correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let running = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        let _in_flight = InFlight(self.in_flight.clone());
+        self.max_in_flight.fetch_max(running, Ordering::SeqCst);
+        if call < self.hang_first {
+            std::future::pending::<()>().await;
+        }
+        tokio::time::sleep(self.delay).await;
+        if call < self.fail_first {
+            return Err(ProtocolError::from(Disconnected));
+        }
+        Ok(AuthorizationToken {
+            token: self.token.clone(),
+            expires_ms: u64::MAX,
+            acceptable_root_domains: vec!["example.com".to_string()],
+        })
+    }
+
+    async fn exchange_for_custom_resource(
+        &self,
+        _auth_url: &str,
+        _authn_token: &str,
+        _resource_id: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+}
+
+fn register_delayed(scheme: &str, provider: DelayedAuthentication) -> Arc<DelayedAuthentication> {
+    let provider = Arc::new(provider);
+    authentication::add(scheme, provider.clone()).expect("register provider");
+    provider
+}
+
+async fn sf_exchange(auth_url: &str, repository: RepositoryId) -> Result<String, ExchangeError> {
+    exchange(
+        auth_url,
+        "alice",
+        repository,
+        "example.com".to_string(),
+        SF_AUTHN,
+        "",
+    )
+    .await
+}
+
+fn sf_key(auth_url: &str, repository: RepositoryId) -> AuthzKey {
+    (
+        auth_url.to_string(),
+        "alice".to_string(),
+        repository.to_string(),
+        "example.com".to_string(),
+        lore_credential::token_fingerprint(SF_AUTHN),
+    )
+}
+
+fn no_flight_for(key: &AuthzKey) -> bool {
+    !cache().flights.lock().contains_key(key)
+}
+
+#[tokio::test]
+async fn misses_on_different_keys_exchange_in_parallel() {
+    let _guard = refresh_test_guard().await;
+    const KEYS: u8 = 8;
+    const DELAY: Duration = Duration::from_millis(200);
+    let auth_url = "sf-parallel://auth.example.com";
+    let provider = register_delayed("sf-parallel", DelayedAuthentication::new(DELAY));
+
+    let started = std::time::Instant::now();
+    let results = futures::future::join_all(
+        (1..=KEYS).map(|n| sf_exchange(auth_url, RepositoryId::from([n; 16]))),
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    for result in results {
+        assert_eq!(result.expect("each key authorizes"), provider.token);
+    }
+    assert_eq!(provider.calls(), usize::from(KEYS));
+    assert_eq!(
+        provider.max_in_flight.load(Ordering::SeqCst),
+        usize::from(KEYS),
+        "every key's exchange must run at once"
+    );
+    assert!(
+        elapsed < DELAY * u32::from(KEYS) / 2,
+        "{KEYS} keys at {DELAY:?} each took {elapsed:?}; the exchanges were serialized"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_misses_on_one_key_share_one_exchange() {
+    let _guard = refresh_test_guard().await;
+    let auth_url = "sf-same-key://auth.example.com";
+    let repository = RepositoryId::from([2; 16]);
+    let provider = register_delayed(
+        "sf-same-key",
+        DelayedAuthentication::new(Duration::from_millis(200)),
+    );
+
+    let results =
+        futures::future::join_all((0..8).map(|_| sf_exchange(auth_url, repository))).await;
+
+    for result in results {
+        assert_eq!(result.expect("every caller authorizes"), provider.token);
+    }
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the waiters must reuse the leader's token"
+    );
+    assert!(no_flight_for(&sf_key(auth_url, repository)));
+}
+
+#[tokio::test]
+async fn a_failed_exchange_lets_the_next_caller_retry() {
+    let _guard = refresh_test_guard().await;
+    let auth_url = "sf-retry://auth.example.com";
+    let repository = RepositoryId::from([3; 16]);
+    let mut fake = DelayedAuthentication::new(Duration::from_millis(20));
+    fake.fail_first = 1;
+    let provider = register_delayed("sf-retry", fake);
+
+    assert!(sf_exchange(auth_url, repository).await.is_err());
+    assert!(
+        !cache()
+            .tokens
+            .lock()
+            .contains_key(&sf_key(auth_url, repository))
+    );
+    assert_eq!(
+        sf_exchange(auth_url, repository)
+            .await
+            .expect("the retry authorizes"),
+        provider.token
+    );
+    assert_eq!(provider.calls(), 2);
+    assert!(no_flight_for(&sf_key(auth_url, repository)));
+}
+
+#[tokio::test]
+async fn a_caller_waiting_behind_a_failed_exchange_runs_its_own() {
+    let _guard = refresh_test_guard().await;
+    let auth_url = "sf-retry-waiter://auth.example.com";
+    let repository = RepositoryId::from([4; 16]);
+    let mut fake = DelayedAuthentication::new(Duration::from_millis(100));
+    fake.fail_first = 1;
+    let provider = register_delayed("sf-retry-waiter", fake);
+
+    let (leader, waiter) = tokio::join!(sf_exchange(auth_url, repository), async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sf_exchange(auth_url, repository).await
+    });
+
+    assert!(leader.is_err(), "the leader sees its own failure");
+    assert_eq!(waiter.expect("the waiter retries"), provider.token);
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(provider.max_in_flight.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_cancelled_leader_does_not_wedge_its_waiters() {
+    let _guard = refresh_test_guard().await;
+    let auth_url = "sf-cancel-leader://auth.example.com";
+    let repository = RepositoryId::from([5; 16]);
+    let mut fake = DelayedAuthentication::new(Duration::from_millis(50));
+    fake.hang_first = 1;
+    let provider = register_delayed("sf-cancel-leader", fake);
+
+    let leader = tokio::time::timeout(
+        Duration::from_millis(150),
+        sf_exchange(auth_url, repository),
+    );
+    let waiter = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sf_exchange(auth_url, repository).await
+    };
+    let (leader, waiter) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(leader, waiter)
+    })
+    .await
+    .expect("the waiter was wedged behind the cancelled leader");
+
+    assert!(leader.is_err(), "the leader was cancelled by its timeout");
+    assert_eq!(waiter.expect("the waiter authorizes"), provider.token);
+    assert_eq!(provider.calls(), 2);
+    assert_eq!(provider.in_flight.load(Ordering::SeqCst), 0);
+    assert!(no_flight_for(&sf_key(auth_url, repository)));
+}
+
+#[tokio::test]
+async fn a_cancelled_waiter_leaves_no_flight_behind() {
+    let _guard = refresh_test_guard().await;
+    let auth_url = "sf-cancel-waiter://auth.example.com";
+    let repository = RepositoryId::from([6; 16]);
+    let provider = register_delayed(
+        "sf-cancel-waiter",
+        DelayedAuthentication::new(Duration::from_millis(200)),
+    );
+
+    let (leader, waiter) = tokio::join!(sf_exchange(auth_url, repository), async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_millis(30), sf_exchange(auth_url, repository)).await
+    });
+
+    assert_eq!(leader.expect("the leader authorizes"), provider.token);
+    assert!(waiter.is_err(), "the waiter was cancelled by its timeout");
+    assert!(no_flight_for(&sf_key(auth_url, repository)));
+    assert_eq!(
+        sf_exchange(auth_url, repository)
+            .await
+            .expect("a later caller authorizes"),
+        provider.token
+    );
+    assert_eq!(
+        provider.calls(),
+        1,
+        "the later caller is served from the cache"
+    );
+}
+
+#[tokio::test]
+async fn an_expired_cached_token_is_exchanged_again() {
+    let _guard = refresh_test_guard().await;
+    let auth_url = "sf-expiry://auth.example.com";
+    let repository = RepositoryId::from([7; 16]);
+    let provider = register_delayed(
+        "sf-expiry",
+        DelayedAuthentication::new(Duration::from_millis(10)),
+    );
+    let key = sf_key(auth_url, repository);
+    let expired = jwt(
+        "alice",
+        current_time_ms().saturating_sub(1_000),
+        "example.com",
+    );
+    cache().tokens.lock().insert(key.clone(), expired.clone());
+
+    let token = sf_exchange(auth_url, repository)
+        .await
+        .expect("the expired entry is replaced");
+
+    assert_eq!(token, provider.token);
+    assert_ne!(token, expired);
+    assert_eq!(provider.calls(), 1);
+    assert_eq!(cache().tokens.lock().get(&key), Some(&provider.token));
+    sf_exchange(auth_url, repository)
+        .await
+        .expect("the fresh entry is served");
+    assert_eq!(provider.calls(), 1, "the fresh entry comes from the cache");
+}
+
+#[tokio::test]
+async fn a_clear_waits_for_a_running_exchange_and_removes_its_entry() {
+    let _guard = refresh_test_guard().await;
+    const DELAY: Duration = Duration::from_millis(200);
+    let auth_url = "sf-clear://auth.example.com";
+    let repository = RepositoryId::from([8; 16]);
+    let provider = register_delayed("sf-clear", DelayedAuthentication::new(DELAY));
+
+    let started = std::time::Instant::now();
+    let (exchanged, cleared_at) = tokio::join!(sf_exchange(auth_url, repository), async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        clear_authz_cache().await;
+        started.elapsed()
+    });
+
+    assert_eq!(exchanged.expect("the exchange completes"), provider.token);
+    assert!(
+        cleared_at >= DELAY,
+        "the clear returned after {cleared_at:?}, before the running exchange finished"
+    );
+    assert!(
+        !cache()
+            .tokens
+            .lock()
+            .contains_key(&sf_key(auth_url, repository)),
+        "an exchange running across a clear must not repopulate the cache"
     );
 }
