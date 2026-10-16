@@ -20,7 +20,10 @@ use std::time::Instant;
 use futures::future::join_all;
 use lore_base::types::Context as LoreContext;
 use lore_base::types::RepositoryId;
+use lore_proto::auth::CheckUserPermissionRequest;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::auth::AUTH_CONNECT_TIMEOUT;
+use lore_server::authnz::auth::AuthChannel;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -223,14 +226,7 @@ async fn concurrent_checks_share_one_connection() {
     let authorizer = AuthClientAuthorizer::new(server.url());
     // The very first calls race to dial: they must wait for one dial, not
     // open one each.
-    let started = Instant::now();
     let results = join_all((0..100).map(|_| check(&authorizer))).await;
-    // Informational: the in-process cost of 100 concurrent checks on loopback.
-    eprintln!(
-        "100 concurrent checks took {:?} over {} connection(s)",
-        started.elapsed(),
-        server.accepted()
-    );
     assert!(results.iter().all(Result::is_ok), "{results:?}");
     assert_eq!(server.calls.load(Ordering::SeqCst), 100);
     assert_eq!(
@@ -328,4 +324,146 @@ async fn an_abandoned_slow_check_does_not_block_the_next_one() {
         .expect("the next check must not wait behind the abandoned one")
         .unwrap();
     assert_eq!(server.accepted(), 1);
+}
+
+fn permission_request() -> tonic::Request<CheckUserPermissionRequest> {
+    tonic::Request::new(CheckUserPermissionRequest {
+        resource_id: vec![format!("urc-{}", repository())],
+        target_user: None,
+    })
+}
+
+/// Probe A: callers waiting on a dial to an address that never answers all
+/// fail within about one connect timeout, not one timeout each in turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn callers_on_a_silent_address_fail_together_within_the_connect_timeout() {
+    // TEST-NET style unroutable address: SYNs go unanswered (or the network
+    // refuses at once, which also passes).
+    let channel = AuthChannel::new("http://10.255.255.1:41339".to_string());
+    let started = Instant::now();
+    let results = join_all((0..4).map(|_| async {
+        let result = channel.client().await.map(|_| ());
+        (result, started.elapsed())
+    }))
+    .await;
+    for (result, elapsed) in &results {
+        let status = result.as_ref().unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+        assert!(
+            *elapsed < AUTH_CONNECT_TIMEOUT * 2,
+            "a caller failed after {elapsed:?}: waiters dialled in turn"
+        );
+    }
+    assert_eq!(channel.dial_attempts(), 1);
+}
+
+/// Probe B: fifty first callers to a refused port share one dial and fail
+/// together; the failure is not cached, so a call after a restart passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn first_callers_to_a_refused_port_share_one_dial_and_recover() {
+    let mut server = FakeServer::start();
+    server.stop().await;
+    let channel = AuthChannel::new(server.url());
+    let started = Instant::now();
+    let results = join_all((0..50).map(|_| channel.client())).await;
+    let elapsed = started.elapsed();
+    for result in &results {
+        let status = result.as_ref().map(|_| ()).unwrap_err();
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert_eq!(status.message(), "Failed to connect to lore auth service");
+    }
+    assert_eq!(channel.dial_attempts(), 1, "the waiters dialled again");
+    assert!(
+        elapsed < AUTH_CONNECT_TIMEOUT * 2,
+        "50 refused callers took {elapsed:?}"
+    );
+
+    server.serve();
+    let mut client = channel.client().await.unwrap();
+    client
+        .check_user_permission(permission_request())
+        .await
+        .unwrap();
+    assert_eq!(channel.dial_attempts(), 2);
+    assert_eq!(server.accepted(), 1);
+}
+
+/// A TCP relay that can cut every connection it carries.
+struct Proxy {
+    address: SocketAddr,
+    upstream: SocketAddr,
+    tasks: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Proxy {
+    fn start(upstream: SocketAddr) -> Self {
+        let mut proxy = Proxy {
+            address: "127.0.0.1:0".parse().unwrap(),
+            upstream,
+            tasks: Arc::default(),
+        };
+        proxy.serve();
+        proxy
+    }
+
+    fn url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+
+    fn serve(&mut self) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.set_reuseaddr(true).unwrap();
+        socket.bind(self.address).unwrap();
+        let listener = socket.listen(128).unwrap();
+        self.address = listener.local_addr().unwrap();
+        let upstream = self.upstream;
+        let tasks = self.tasks.clone();
+        let accept = lore_base::lore_spawn!(async move {
+            while let Ok((mut down, _)) = listener.accept().await {
+                let relay = lore_base::lore_spawn!(async move {
+                    if let Ok(mut up) = tokio::net::TcpStream::connect(upstream).await {
+                        let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+                    }
+                });
+                tasks.lock().unwrap().push(relay);
+            }
+        });
+        self.tasks.lock().unwrap().push(accept);
+    }
+
+    /// Stops listening and drops every relayed connection.
+    async fn cut(&mut self) {
+        let tasks: Vec<_> = self.tasks.lock().unwrap().drain(..).collect();
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_cut_mid_call_fails_that_call_and_the_next_redials() {
+    let server = FakeServer::start();
+    let mut proxy = Proxy::start(server.address);
+    let authorizer = AuthClientAuthorizer::new(proxy.url());
+    check(&authorizer).await.unwrap();
+
+    server.set_mode(HANG);
+    let in_flight = tokio::time::timeout(Duration::from_secs(10), check(&authorizer));
+    let cut = async {
+        while server.calls.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        proxy.cut().await;
+    };
+    let (in_flight, ()) = tokio::join!(in_flight, cut);
+    let status = in_flight
+        .expect("a cut connection must fail its call, not hang it")
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+
+    proxy.serve();
+    server.set_mode(ALLOW);
+    check(&authorizer).await.unwrap();
+    assert_eq!(server.accepted(), 2, "the next call should redial once");
 }
