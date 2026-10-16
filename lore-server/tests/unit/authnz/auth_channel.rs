@@ -48,7 +48,11 @@ fn repository() -> RepositoryId {
 struct FakeAuth {
     mode: Arc<AtomicU8>,
     calls: Arc<AtomicUsize>,
+    peers: Peers,
 }
+
+/// The client address of each call, in arrival order: tells connections apart.
+type Peers = Arc<std::sync::Mutex<Vec<SocketAddr>>>;
 
 impl tonic::server::NamedService for FakeAuth {
     const NAME: &'static str = "epic_urc.UrcAuthApi";
@@ -112,6 +116,13 @@ where
 
     fn call(&mut self, request: http::Request<B>) -> Self::Future {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(peer) = request
+            .extensions()
+            .get::<tonic::transport::server::TcpConnectInfo>()
+            .and_then(tonic::transport::server::TcpConnectInfo::remote_addr)
+        {
+            self.peers.lock().unwrap().push(peer);
+        }
         let method = CheckUserPermission(self.mode.load(Ordering::SeqCst));
         let mut grpc = tonic::server::Grpc::new(tonic_prost::ProstCodec::default());
         Box::pin(async move { Ok(grpc.unary(method, request).await) })
@@ -124,6 +135,7 @@ struct FakeServer {
     mode: Arc<AtomicU8>,
     calls: Arc<AtomicUsize>,
     accepted: Arc<AtomicUsize>,
+    peers: Peers,
     running: Option<(oneshot::Sender<()>, tokio::task::JoinHandle<()>)>,
 }
 
@@ -134,6 +146,7 @@ impl FakeServer {
             mode: Arc::new(AtomicU8::new(ALLOW)),
             calls: Arc::new(AtomicUsize::new(0)),
             accepted: Arc::new(AtomicUsize::new(0)),
+            peers: Peers::default(),
             running: None,
         };
         server.serve();
@@ -166,6 +179,7 @@ impl FakeServer {
         let service = FakeAuth {
             mode: self.mode.clone(),
             calls: self.calls.clone(),
+            peers: self.peers.clone(),
         };
         let (stop, stopped) = oneshot::channel::<()>();
         let task = lore_base::lore_spawn!(async move {
@@ -466,4 +480,131 @@ async fn a_connection_cut_mid_call_fails_that_call_and_the_next_redials() {
     server.set_mode(ALLOW);
     check(&authorizer).await.unwrap();
     assert_eq!(server.accepted(), 2, "the next call should redial once");
+}
+
+/// A TLS peer that accepts TCP and never answers: the handshake stalls.
+fn start_silent_tls_peer() -> (String, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(128).unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = lore_base::lore_spawn!(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    (format!("https://{address}"), task)
+}
+
+/// P5: a dial whose TLS handshake never completes fails every caller
+/// sharing it within about the connect timeout, and the next caller dials
+/// again rather than joining the stuck dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_tls_handshake_fails_the_shared_dial_within_the_timeout() {
+    let (url, peer) = start_silent_tls_peer();
+    let channel = AuthChannel::new(url);
+    let bound = AUTH_CONNECT_TIMEOUT + Duration::from_secs(3);
+    let started = Instant::now();
+    let results = tokio::time::timeout(
+        bound * 2,
+        join_all((0..4).map(|_| async {
+            let result = channel.client().await.map(|_| ());
+            (result, started.elapsed())
+        })),
+    )
+    .await
+    .expect("callers joined a dial that never ends");
+    for (result, elapsed) in &results {
+        let status = result.as_ref().unwrap_err();
+        assert_eq!(status.message(), "Failed to connect to lore auth service");
+        assert!(*elapsed < bound, "a caller failed after {elapsed:?}");
+    }
+    assert_eq!(channel.dial_attempts(), 1);
+
+    // The stuck dial is gone: the next caller starts its own, and it is
+    // bounded the same way.
+    let started = Instant::now();
+    let next = tokio::time::timeout(bound * 2, channel.client())
+        .await
+        .expect("the next caller joined the stuck dial");
+    assert!(next.is_err());
+    assert!(started.elapsed() < bound);
+    assert_eq!(channel.dial_attempts(), 2);
+
+    // The peer is fixed (here: it now refuses at once): the next dial sees
+    // the change rather than the old stall.
+    peer.abort();
+    let _ = peer.await;
+    let started = Instant::now();
+    assert!(channel.client().await.is_err());
+    assert!(started.elapsed() < bound);
+    assert_eq!(channel.dial_attempts(), 3);
+}
+
+/// P2: a caller that joined a dial but resumes only after that channel was
+/// discarded and replaced takes the replacement, so its calls run on (and
+/// may only discard) the installed channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_follower_takes_the_current_channel() {
+    let server = FakeServer::start();
+    let channel = AuthChannel::new(server.url());
+
+    let mut late = Box::pin(channel.client());
+    assert!(futures::poll!(&mut late).is_pending(), "joined dial 1");
+
+    // Dial 1 lands; a connection failure on it discards it.
+    let mut first = channel.client().await.unwrap();
+    server.set_mode(UNAVAILABLE);
+    first
+        .check_user_permission(permission_request())
+        .await
+        .unwrap_err();
+    server.set_mode(ALLOW);
+    // Dial 2 replaces it.
+    let mut second = channel.client().await.unwrap();
+    second
+        .check_user_permission(permission_request())
+        .await
+        .unwrap();
+    assert_eq!(channel.dial_attempts(), 2);
+
+    let mut late = late.await.unwrap();
+    late.check_user_permission(permission_request())
+        .await
+        .unwrap();
+    let peers = server.peers.lock().unwrap().clone();
+    assert_eq!(peers.len(), 3);
+    assert_ne!(peers[0], peers[1], "dial 2 should be its own connection");
+    assert_eq!(
+        peers[2], peers[1],
+        "the late follower used the discarded channel"
+    );
+    assert_eq!(channel.dial_attempts(), 2, "the late follower dialled");
+}
+
+/// P1b: a dial every caller abandoned still records its own failure, so the
+/// first caller after the service recovers dials afresh and succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_failed_dial_leaves_no_stale_failure() {
+    let mut server = FakeServer::start();
+    server.stop().await;
+    let channel = AuthChannel::new(server.url());
+    {
+        let mut abandoned = Box::pin(channel.client());
+        assert!(futures::poll!(&mut abandoned).is_pending());
+    }
+    // Let the abandoned dial run to its (refused) end.
+    tokio::time::sleep(AUTH_CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+
+    server.serve();
+    let mut client = channel
+        .client()
+        .await
+        .expect("the first caller after recovery got a stale failure");
+    client
+        .check_user_permission(permission_request())
+        .await
+        .unwrap();
+    assert_eq!(channel.dial_attempts(), 2);
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
@@ -38,10 +39,12 @@ use crate::grpc::ServerResultExt;
 
 type LoreAuthApiResult<T> = Result<Response<T>, Status>;
 
-/// FORK-LOCAL (Tideshift): ceiling on the TCP connect of a dial to the auth
-/// service (not DNS, not the TLS handshake). Every caller waiting on a dial
-/// waits at most this long for the connect. Matches the internal gRPC
-/// client's default; no per-call deadline exists on this path to stay under.
+/// FORK-LOCAL (Tideshift): ceiling on one whole dial to the auth service:
+/// DNS, TCP connect, TLS handshake and HTTP/2 handshake together. Every
+/// caller sharing a dial waits at most about this long for it. Also set as
+/// the endpoint's TCP connect timeout, which bounds the TCP step of tonic's
+/// own re-dials. Matches the internal gRPC client's default; no per-call
+/// deadline exists on this path to stay under.
 pub const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// FORK-LOCAL (Tideshift): TCP keep-alive on the shared auth connection, so a
 /// peer that vanished without closing is found while the connection idles.
@@ -82,19 +85,17 @@ fn auth_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
 }
 
 /// Dials `auth_url` and waits for the connection, with the errors the
-/// per-call path always returned. The endpoint build (which loads the native
-/// root store for `https`) and the connect (DNS, TCP, TLS, HTTP/2 handshake)
-/// are timed separately at debug level.
+/// per-call path always returned. Runs on the net runtime (see
+/// [`AuthChannel::start_dial`]). The endpoint build (which loads the native
+/// root store for `https`) and the connect are timed separately at debug
+/// level.
 async fn connect_auth_channel(auth_url: String) -> Result<Channel, Status> {
     let started = Instant::now();
     let endpoint = auth_endpoint(&auth_url)?;
     let endpoint_built = started.elapsed();
-    // Connect from net so the hyper/h2 driver tasks this spawns bind there
-    // rather than to the core runtime the caller runs on. No `LORE_CONTEXT`:
-    // the connection outlives the request that happens to open it.
-    let channel = lore_spawn_net_nocontext!(async move { endpoint.connect().await })
+    let channel = tokio::time::timeout(AUTH_CONNECT_TIMEOUT, endpoint.connect())
         .await
-        .warn_map_err(|_| Status::internal("lore auth connection task failed"))?
+        .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?
         .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?;
     debug!(
         endpoint_build_ms = endpoint_built.as_secs_f64() * 1000.0,
@@ -103,7 +104,6 @@ async fn connect_auth_channel(auth_url: String) -> Result<Channel, Status> {
     );
     Ok(channel)
 }
-
 /// Whether a failed call says the connection under it is unusable, rather
 /// than carrying the auth service's own answer. A status the service sent
 /// arrives with no source; one tonic built from a transport or buffer error
@@ -142,84 +142,117 @@ struct ChannelSlot {
     generation: u64,
 }
 
+impl ChannelSlot {
+    fn names(&self, attempt: u64) -> bool {
+        matches!(&self.state, ChannelState::Dialing { attempt: current, .. } if *current == attempt)
+    }
+}
+
+fn lock(slot: &Mutex<ChannelSlot>) -> MutexGuard<'_, ChannelSlot> {
+    // The slot holds no invariant a panicking holder could break halfway.
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// FORK-LOCAL (Tideshift): one long-lived channel to one auth URL, shared by
 /// every call. A tonic channel multiplexes calls over one HTTP/2 connection
 /// and re-dials it after the connection drops, so a call no longer pays for a
 /// DNS lookup, TCP connect and TLS handshake of its own.
 ///
 /// Callers arriving while a dial runs share that one dial and its result,
-/// failure included. A failed dial installs nothing, so the first call after
-/// it dials again. A call that fails on a broken connection discards the
-/// channel, so the next call dials a fresh one rather than reusing a channel
-/// that can no longer serve. The lock is never held across an await.
+/// failure included. The dial runs as its own task and records its own
+/// outcome, so it finishes, bounded by [`AUTH_CONNECT_TIMEOUT`], even when
+/// every caller waiting on it is cancelled. A failed dial leaves nothing
+/// behind, so the first call after it dials again. A call that fails on a
+/// broken connection discards the channel, so the next call dials a fresh
+/// one rather than reusing a channel that can no longer serve. The lock is
+/// never held across an await.
 pub struct AuthChannel {
     auth_url: String,
-    slot: Mutex<ChannelSlot>,
+    slot: Arc<Mutex<ChannelSlot>>,
 }
 
 impl AuthChannel {
     pub fn new(auth_url: String) -> Self {
         Self {
             auth_url,
-            slot: Mutex::new(ChannelSlot::default()),
+            slot: Arc::default(),
         }
-    }
-
-    fn slot(&self) -> MutexGuard<'_, ChannelSlot> {
-        // The slot holds no invariant a panicking holder could break halfway.
-        self.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Dials started so far: a diagnostic, and what tests count.
     pub fn dial_attempts(&self) -> u64 {
-        self.slot().attempts
+        lock(&self.slot).attempts
+    }
+
+    /// Starts dial `attempt` as a net-runtime task that installs its channel,
+    /// or clears the slot on failure, if the slot still names it. On the net
+    /// runtime so the hyper/h2 driver tasks it spawns bind there rather than
+    /// to the core runtime; without `LORE_CONTEXT`, as the connection
+    /// outlives the request that happens to open it.
+    fn start_dial(&self, slot: &mut ChannelSlot) -> (u64, SharedDial) {
+        slot.attempts += 1;
+        let attempt = slot.attempts;
+        let auth_url = self.auth_url.clone();
+        let shared = self.slot.clone();
+        let task = lore_spawn_net_nocontext!(async move {
+            let result = connect_auth_channel(auth_url).await;
+            let mut slot = lock(&shared);
+            if slot.names(attempt) {
+                match &result {
+                    Ok(channel) => {
+                        slot.generation = slot.generation.wrapping_add(1);
+                        slot.state = ChannelState::Ready(channel.clone());
+                    }
+                    Err(_) => slot.state = ChannelState::Empty,
+                }
+            }
+            result
+        });
+        let dial = async move {
+            task.await
+                .warn_map_err(|_| Status::internal("lore auth connection task failed"))?
+        }
+        .boxed()
+        .shared();
+        slot.state = ChannelState::Dialing {
+            attempt,
+            dial: dial.clone(),
+        };
+        (attempt, dial)
     }
 
     /// A client on the shared channel, dialling first when there is none.
     /// A failed dial is returned as the per-call path always returned it.
     pub async fn client(&self) -> Result<AuthClient<'_>, Status> {
         let (attempt, dial) = {
-            let mut slot = self.slot();
+            let mut slot = lock(&self.slot);
             match &slot.state {
                 ChannelState::Ready(channel) => {
                     let channel = channel.clone();
-                    return Ok(self.client_on(channel, slot.generation));
+                    return Ok(self.client_on(channel, Some(slot.generation)));
                 }
                 ChannelState::Dialing { attempt, dial } => (*attempt, dial.clone()),
-                ChannelState::Empty => {
-                    slot.attempts += 1;
-                    let attempt = slot.attempts;
-                    let dial = connect_auth_channel(self.auth_url.clone()).boxed().shared();
-                    slot.state = ChannelState::Dialing {
-                        attempt,
-                        dial: dial.clone(),
-                    };
-                    (attempt, dial)
-                }
+                ChannelState::Empty => self.start_dial(&mut slot),
             }
         };
         let result = dial.await;
-        let mut slot = self.slot();
-        let ours = matches!(
-            &slot.state,
-            ChannelState::Dialing { attempt: current, .. } if *current == attempt
-        );
+        let mut slot = lock(&self.slot);
         match result {
             Ok(channel) => {
-                if ours {
-                    slot.generation = slot.generation.wrapping_add(1);
-                    slot.state = ChannelState::Ready(channel.clone());
+                // A caller resuming late may find its channel discarded and
+                // replaced: it takes the current one, under that one's
+                // generation, rather than tagging an old channel with it.
+                if let ChannelState::Ready(current) = &slot.state {
+                    let current = current.clone();
+                    return Ok(self.client_on(current, Some(slot.generation)));
                 }
-                // A caller resuming late may find the channel already
-                // discarded; a generation no `Ready` holds never discards.
-                let generation = match &slot.state {
-                    ChannelState::Ready(_) => slot.generation,
-                    _ => slot.generation.wrapping_sub(1),
-                };
-                Ok(self.client_on(channel, generation))
+                // Already discarded, no replacement yet: a channel that may
+                // discard nothing.
+                Ok(self.client_on(channel, None))
             }
             Err(status) => {
-                if ours {
+                // Only a task that never finished leaves its attempt named.
+                if slot.names(attempt) {
                     slot.state = ChannelState::Empty;
                 }
                 Err(status)
@@ -227,7 +260,7 @@ impl AuthChannel {
         }
     }
 
-    fn client_on(&self, channel: Channel, generation: u64) -> AuthClient<'_> {
+    fn client_on(&self, channel: Channel, generation: Option<u64>) -> AuthClient<'_> {
         AuthClient {
             owner: self,
             generation,
@@ -236,7 +269,7 @@ impl AuthChannel {
     }
 
     fn discard(&self, generation: u64) {
-        let mut slot = self.slot();
+        let mut slot = lock(&self.slot);
         if matches!(slot.state, ChannelState::Ready(_)) && slot.generation == generation {
             slot.state = ChannelState::Empty;
         }
@@ -246,7 +279,9 @@ impl AuthChannel {
 /// One caller's handle on an [`AuthChannel`]'s connection.
 pub struct AuthClient<'a> {
     owner: &'a AuthChannel,
-    generation: u64,
+    /// The installed channel this client uses; `None` when it is not the
+    /// installed one, so its failures discard nothing.
+    generation: Option<u64>,
     helper: LoreAuthClientHelper,
 }
 
@@ -254,9 +289,10 @@ impl AuthClient<'_> {
     fn settle<T>(&self, result: LoreAuthApiResult<T>) -> LoreAuthApiResult<T> {
         if let Err(status) = &result
             && is_connection_failure(status)
+            && let Some(generation) = self.generation
         {
             debug!("Discarding the lore auth channel after a connection failure: {status}");
-            self.owner.discard(self.generation);
+            self.owner.discard(generation);
         }
         result
     }
@@ -277,7 +313,6 @@ impl AuthClient<'_> {
         self.settle(result)
     }
 }
-
 impl LoreAuthClientHelper {
     fn new(channel: Channel) -> LoreAuthClientHelper {
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
