@@ -180,6 +180,8 @@ impl RepositoryService {
                 query: Some(repository_v1::repository_get_request::Query::Id(id.into())),
             });
             inject_authorization(&mut request, authorization)?;
+            // No `inject_attempt_id`, on purpose: this is a read, which never has
+            // a dispatch attempt id, so `AuthnInterceptor` would add nothing here.
 
             let mut client = self.scoped.clone();
 

@@ -55,6 +55,14 @@ Durable, recurring testing lessons grouped by topic.
   `async fn <name>(`, take the first `self.checkout()` after it, assert exactly one header match) and
   compare before/after deltas. Always add a positive control that the same probe sees the leased/slow
   path take exactly one, or a stale line reads as a passing "zero".
+- **Exercising the real `exchange()` through `lore_transport::connect`** (recipe:
+  `lore-transport/tests/query_scoped_exchange.rs`): a fake EnvironmentService advertises
+  `auth_url = "<unique-scheme>://..."`; register a stub `Authentication` under that scheme
+  (`authentication::add`, process-global, so one scheme + identity + repo ids per test). Supplied
+  `identity_token` skips the token store but must be an unsigned JWT with `sub == identity` and
+  `aud` containing `127.0.0.1`, as must any token the stub returns. Connect with
+  `RepositoryId::default()` so the connect-time exchange does not fire. `cache()` is `test_pub`;
+  clear by `tokens.lock().retain(|k, _| k.1 != identity)`, not `clear_authz_cache()` (global).
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
 - **Closed metric-label sets**: pin the exact literal list in `ALL` order, then pin the real call
   sites, not just a hand-written table. For SQL-keyed labels (`drain_procedure_label`),

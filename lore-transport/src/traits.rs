@@ -523,6 +523,13 @@ pub trait Repository: Send + Sync {
     /// repository the caller lost or that was deleted is still `NotFound`. Any
     /// other exchange failure is returned as an error.
     ///
+    /// That holds only once this service exists. On a new connection the
+    /// connect-time exchange runs first, and a denial there fails the
+    /// connection with `NotAuthorized` before this is reached. The pooled
+    /// connection is shared across repositories, so that error may concern a
+    /// different repository; a caller that reads it as "gone" must confirm
+    /// with its own exchange for `id`.
+    ///
     /// A caller-supplied access token is presented as given, as the lock and
     /// revision clients do. It is not checked against `id`, so one scoped to a
     /// different repository reads as `NotFound`.

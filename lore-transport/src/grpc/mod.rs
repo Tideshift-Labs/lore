@@ -2522,7 +2522,9 @@ impl Repository for GRPCRepository {
             return self.query(Some(id), None).await;
         }
         // The recipient domain `GRPCAuth::new` uses, so this shares the
-        // `AUTHZ_CACHE` entry the lock and revision clients of `id` hold.
+        // `AUTHZ_CACHE` entry the lock and revision clients of `id` hold. An
+        // empty host (`unwrap_or_default`) is what `GRPCAuth::new` uses too,
+        // so even then both land on one cache key.
         let recipient_domain = self
             .connection
             .remote_url

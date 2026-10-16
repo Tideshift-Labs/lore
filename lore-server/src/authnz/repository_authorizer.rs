@@ -408,11 +408,15 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         // claim and are checked online, so revocation is observable at once on
         // them. An access token's grants hold for its lifetime, on this path as
         // on QUIC. That includes `RepositoryGet` by id, which the client sends
-        // with the repository's scoped token (lore-transport `query_scoped`):
-        // revocation lags by up to the token TTL (`LH_TOKEN_TTL_SECONDS`,
-        // default 300 s), the same as `BranchGet` and lock query. Once the
-        // client's exchange is denied it falls back to the identity token, so a
-        // removed or deleted repository still answers `NotFound`.
+        // with the repository's scoped token (lore-transport `query_scoped`),
+        // the same as `BranchGet` and lock query. Revocation lags by up to the
+        // token's lifetime, `min(LH_TOKEN_TTL_SECONDS (default 300 s), the
+        // credential's remaining life)`, plus the 60 s `exp` leeway
+        // `Validation::new` keeps in `auth/jwt.rs`. When the client's exchange
+        // is denied on a live connection it reads once with the identity token,
+        // which this path checks online, so a removed or deleted repository
+        // answers `NotFound`. A denial on a new connection fails the connect
+        // instead, and the caller decides what that means.
         if let Some(verdict) = self.check_repository_access_sync(token, repository_id, action) {
             return verdict;
         }
