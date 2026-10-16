@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 mod auth;
+mod auth_channel;
 pub(crate) mod auth_client_fixture;
 mod common;
 mod global_grants_authorizer;

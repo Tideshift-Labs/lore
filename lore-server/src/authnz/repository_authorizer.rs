@@ -14,7 +14,7 @@ use tonic::Code;
 use tonic::Status;
 use tracing::info;
 
-use super::auth::grpc_get_auth_client;
+use super::auth::AuthChannel;
 use super::common::create_request_with_authorization;
 use super::global_grants_authorizer::GlobalGrantsAuthorizer;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
@@ -238,12 +238,14 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
 
 /// Checks repository access against the Lore auth service.
 pub struct AuthClientAuthorizer {
-    auth_url: String,
+    auth: AuthChannel,
 }
 
 impl AuthClientAuthorizer {
     pub fn new(auth_url: String) -> Self {
-        Self { auth_url }
+        Self {
+            auth: AuthChannel::new(auth_url),
+        }
     }
 
     /// Takes the `authorization` header value verbatim.
@@ -264,9 +266,9 @@ impl AuthClientAuthorizer {
         authorization: Option<String>,
         resource_id: &str,
     ) -> Result<CheckUserPermissionResponse, Status> {
-        let mut client = grpc_get_auth_client(self.auth_url.clone()).await?;
         let request = check_user_permission_request(resource_id.to_string(), authorization)?;
 
+        let mut client = self.auth.client().await?;
         let permissions = client
             .check_user_permission(request)
             .await

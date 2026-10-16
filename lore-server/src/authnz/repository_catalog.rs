@@ -24,7 +24,7 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
-use super::auth::grpc_get_auth_client;
+use super::auth::AuthChannel;
 use super::common::create_request_with_authorization;
 use super::repository_authorizer::VerifiedToken;
 use super::repository_authorizer::bearer_header;
@@ -186,12 +186,14 @@ fn page(
 /// A `RepositoryCatalog` implementation using`UrcAuthApi`.
 /// Calls `LookupUserPermissions`.
 pub struct AuthClientRepositoryCatalog {
-    auth_url: String,
+    auth: AuthChannel,
 }
 
 impl AuthClientRepositoryCatalog {
     pub fn new(auth_url: String) -> Self {
-        Self { auth_url }
+        Self {
+            auth: AuthChannel::new(auth_url),
+        }
     }
 }
 
@@ -205,9 +207,9 @@ impl RepositoryCatalog for AuthClientRepositoryCatalog {
     ) -> Result<(Vec<RepositoryId>, Option<String>), Status> {
         lore_debug!("Repository fetch authorized repositories");
 
-        let mut client = grpc_get_auth_client(self.auth_url.clone()).await?;
         let request = lookup_request(bearer_header(token), page_size, page_token)?;
 
+        let mut client = self.auth.client().await?;
         let permissions = client
             .lookup_user_permissions(request)
             .await
