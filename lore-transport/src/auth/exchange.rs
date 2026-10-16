@@ -703,8 +703,20 @@ async fn exchange_fresh(
         }
     }
     .map_err(|err| {
+        // Kept by class so a caller can tell an unreachable or throttled auth
+        // service, or a session that needs signing in again, from a fault.
+        // Everything else, including a `NotFound`, stays `Internal`: an auth
+        // service answer must never read as a missing repository.
         if err.is_not_authorized() {
             ExchangeError::from(NotAuthorized)
+        } else if err.is_disconnected() {
+            ExchangeError::from(Disconnected)
+        } else if err.is_slow_down() {
+            ExchangeError::from(SlowDown)
+        } else if err.is_not_authenticated() {
+            ExchangeError::from(NotAuthenticated::new(format!(
+                "Failed to exchange token: {err}"
+            )))
         } else {
             ExchangeError::internal_with_context(err, "Failed to exchange token")
         }

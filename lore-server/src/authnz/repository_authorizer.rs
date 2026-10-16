@@ -405,9 +405,14 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         // service refuses access tokens as `CheckUserPermission` credentials
         // (`Unauthenticated: INVALID_FORMAT, field=authorization`), so the
         // claim is evaluated in place. Identity tokens carry no `resources`
-        // claim and are checked online — the identity-token paths are where
-        // revocation is observable. An access token's grants hold for its
-        // lifetime, on this path as on QUIC.
+        // claim and are checked online, so revocation is observable at once on
+        // them. An access token's grants hold for its lifetime, on this path as
+        // on QUIC. That includes `RepositoryGet` by id, which the client sends
+        // with the repository's scoped token (lore-transport `query_scoped`):
+        // revocation lags by up to the token TTL (`LH_TOKEN_TTL_SECONDS`,
+        // default 300 s), the same as `BranchGet` and lock query. Once the
+        // client's exchange is denied it falls back to the identity token, so a
+        // removed or deleted repository still answers `NotFound`.
         if let Some(verdict) = self.check_repository_access_sync(token, repository_id, action) {
             return verdict;
         }

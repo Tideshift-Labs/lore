@@ -1293,3 +1293,260 @@ async fn a_clear_waits_for_a_running_exchange_and_removes_its_entry() {
         "an exchange running across a clear must not repopulate the cache"
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// Error classes of a failed repository exchange survive `exchange()`: only NotAuthorized
+// means "denied"; an auth-service NotFound must never read as a missing repository.
+// ---------------------------------------------------------------------------------------
+
+/// A repository exchanger that always fails with the error `make_error` builds.
+struct FailingAuthentication {
+    make_error: fn() -> ProtocolError,
+}
+
+#[async_trait]
+impl Authentication for FailingAuthentication {
+    async fn start_auth_session(
+        &self,
+        _auth_url: &str,
+        _client_state: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthSession, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn poll_auth_session(
+        &self,
+        _auth_url: &str,
+        _client_state: &str,
+        _session_code: &str,
+        _correlation_id: &str,
+    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn exchange_external_token(
+        &self,
+        _auth_url: &str,
+        _token: &str,
+        _token_type: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn refresh_authentication(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+
+    async fn exchange_for_repository(
+        &self,
+        _auth_url: &str,
+        _authn_token: &str,
+        _repository: RepositoryId,
+        _correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        Err((self.make_error)())
+    }
+
+    async fn exchange_for_custom_resource(
+        &self,
+        _auth_url: &str,
+        _authn_token: &str,
+        _resource_id: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        Err(ProtocolError::internal("repository exchanges only"))
+    }
+}
+
+fn register_failing(scheme: &str, make_error: fn() -> ProtocolError) {
+    authentication::add(scheme, Arc::new(FailingAuthentication { make_error }))
+        .expect("register provider");
+}
+
+fn denied_error() -> ProtocolError {
+    ProtocolError::from(lore_base::error::NotAuthorized)
+}
+
+fn disconnected_error() -> ProtocolError {
+    ProtocolError::from(Disconnected)
+}
+
+fn slow_down_error() -> ProtocolError {
+    ProtocolError::from(lore_base::error::SlowDown)
+}
+
+fn not_authenticated_error() -> ProtocolError {
+    ProtocolError::from(NotAuthenticated::new("auth said no".to_string()))
+}
+
+fn not_found_error() -> ProtocolError {
+    ProtocolError::from(lore_base::error::NotFound)
+}
+
+#[tokio::test]
+async fn a_denied_repository_exchange_stays_not_authorized() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-denied", denied_error);
+
+    let err = sf_exchange("fe-denied://auth.example.com", RepositoryId::from([11; 16]))
+        .await
+        .expect_err("exchange must fail");
+
+    assert!(err.is_not_authorized(), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_disconnected_repository_exchange_stays_disconnected() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-disconnected", disconnected_error);
+
+    let err = sf_exchange(
+        "fe-disconnected://auth.example.com",
+        RepositoryId::from([12; 16]),
+    )
+    .await
+    .expect_err("exchange must fail");
+
+    assert!(err.is_disconnected(), "{err:?}");
+    assert!(!err.is_not_authorized(), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_slow_down_repository_exchange_stays_slow_down() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-slow-down", slow_down_error);
+
+    let err = sf_exchange(
+        "fe-slow-down://auth.example.com",
+        RepositoryId::from([13; 16]),
+    )
+    .await
+    .expect_err("exchange must fail");
+
+    assert!(err.is_slow_down(), "{err:?}");
+    assert!(!err.is_not_authorized(), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_not_authenticated_repository_exchange_stays_not_authenticated() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-not-authenticated", not_authenticated_error);
+
+    let err = sf_exchange(
+        "fe-not-authenticated://auth.example.com",
+        RepositoryId::from([14; 16]),
+    )
+    .await
+    .expect_err("exchange must fail");
+
+    assert!(err.is_not_authenticated(), "{err:?}");
+    assert!(!err.is_not_authorized(), "{err:?}");
+}
+
+#[tokio::test]
+async fn an_auth_service_not_found_is_internal_never_a_missing_repository() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-not-found", not_found_error);
+
+    let err = sf_exchange(
+        "fe-not-found://auth.example.com",
+        RepositoryId::from([15; 16]),
+    )
+    .await
+    .expect_err("exchange must fail");
+
+    assert!(!err.is_not_found(), "{err:?}");
+    assert!(!err.is_not_authorized(), "{err:?}");
+    assert!(err.is_internal(), "{err:?}");
+}
+
+/// Runs the real `exchange()` as the policy's exchange effect, with counting reads.
+async fn scoped_read_over_real_exchange(
+    auth_url: &str,
+    repository: RepositoryId,
+) -> (
+    Result<lore_transport::types::RepositoryData, ProtocolError>,
+    usize,
+    usize,
+) {
+    let scoped = AtomicUsize::new(0);
+    let identity = AtomicUsize::new(0);
+    let data = || lore_transport::types::RepositoryData {
+        id: repository,
+        name: "repo".to_string(),
+        metadata: Default::default(),
+        generation: None,
+    };
+    let result = lore_transport::grpc::scoped_repository_get(
+        || sf_exchange(auth_url, repository),
+        |_token| async {
+            scoped.fetch_add(1, Ordering::SeqCst);
+            Ok(data())
+        },
+        || async {
+            identity.fetch_add(1, Ordering::SeqCst);
+            Err(ProtocolError::from(lore_base::error::NotFound))
+        },
+    )
+    .await;
+    (
+        result,
+        scoped.load(Ordering::SeqCst),
+        identity.load(Ordering::SeqCst),
+    )
+}
+
+#[tokio::test]
+async fn real_exchange_denied_falls_back_to_one_identity_read() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-policy-denied", denied_error);
+
+    let (result, scoped, identity) = scoped_read_over_real_exchange(
+        "fe-policy-denied://auth.example.com",
+        RepositoryId::from([16; 16]),
+    )
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_not_found()));
+    assert_eq!(identity, 1);
+    assert_eq!(scoped, 0);
+}
+
+#[tokio::test]
+async fn real_exchange_disconnected_returns_disconnected_with_no_reads() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-policy-disconnected", disconnected_error);
+
+    let (result, scoped, identity) = scoped_read_over_real_exchange(
+        "fe-policy-disconnected://auth.example.com",
+        RepositoryId::from([17; 16]),
+    )
+    .await;
+
+    assert!(result.is_err_and(|err| err.is_disconnected()));
+    assert_eq!(identity, 0, "no fallback on a non-denial");
+    assert_eq!(scoped, 0);
+}
+
+#[tokio::test]
+async fn real_exchange_auth_not_found_does_not_read_as_a_missing_repository() {
+    let _guard = refresh_test_guard().await;
+    register_failing("fe-policy-not-found", not_found_error);
+
+    let (result, scoped, identity) = scoped_read_over_real_exchange(
+        "fe-policy-not-found://auth.example.com",
+        RepositoryId::from([18; 16]),
+    )
+    .await;
+
+    assert!(result.is_err_and(|err| !err.is_not_found()));
+    assert_eq!(identity, 0);
+    assert_eq!(scoped, 0);
+}

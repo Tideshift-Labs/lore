@@ -547,8 +547,8 @@ pub fn inject_correlation_id(request: &mut tonic::Request<()>) -> Result<(), ton
     Ok(())
 }
 
-pub fn inject_authorization(
-    request: &mut tonic::Request<()>,
+pub fn inject_authorization<T>(
+    request: &mut tonic::Request<T>,
     token: &str,
 ) -> Result<(), tonic::Status> {
     if token.is_empty() {
@@ -2380,6 +2380,50 @@ impl Revision for GRPCRevision {
     }
 }
 
+/// The policy behind [`Repository::query_scoped`], with its three effects passed
+/// in so the decision can be tested without an auth service or a server.
+///
+/// `exchange` obtains the repository-scoped authorization token (a cached one
+/// while it is current, else a fresh exchange). Then:
+///
+/// - **Granted:** `scoped_get` runs `RepositoryGet` with that token. The server
+///   answers from the token's `resources` claim, so a revocation is not seen
+///   until the token expires (`LH_TOKEN_TTL_SECONDS`, default 300 s), exactly as
+///   for `BranchGet` and lock query. A deleted repository is still `NotFound`.
+/// - **Denied** (`NotAuthorized`, the auth service's `PERMISSION_DENIED`):
+///   `identity_get` runs `RepositoryGet` once with the identity token. The
+///   server checks that online and answers `NotFound`, so a removed or deleted
+///   repository still reads as gone.
+/// - **Any other failure** (unavailable, timeout, not authenticated, ...): the
+///   error is returned. Neither read runs, so a failure to learn the answer is
+///   never turned into a read under some other credential.
+#[lore_macro::test_pub]
+async fn scoped_repository_get<X, XF, S, SF, I, IF>(
+    exchange: X,
+    scoped_get: S,
+    identity_get: I,
+) -> Result<RepositoryData, ProtocolError>
+where
+    X: FnOnce() -> XF,
+    XF: Future<Output = Result<String, crate::auth::exchange::ExchangeError>>,
+    S: FnOnce(String) -> SF,
+    SF: Future<Output = Result<RepositoryData, ProtocolError>>,
+    I: FnOnce() -> IF,
+    IF: Future<Output = Result<RepositoryData, ProtocolError>>,
+{
+    match exchange().await {
+        Ok(token) if token.is_empty() => Err(ProtocolError::internal(
+            "scoped authorization exchange returned an empty token",
+        )),
+        Ok(token) => scoped_get(token).await,
+        Err(err) if err.is_not_authorized() => {
+            lore_debug!("Scoped authorization denied, reading the repository as the identity");
+            identity_get().await
+        }
+        Err(err) => Err(err).forward::<ProtocolError>("scoped authorization exchange failed"),
+    }
+}
+
 /// Repository protocol implementation over gRPC
 struct GRPCRepository {
     connection: Arc<GRPCConnection>,
@@ -2466,6 +2510,52 @@ impl Repository for GRPCRepository {
             GrpcRpc::RepositoryQuery,
             || async { self.client.read().await.query(id, name).await },
             |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    async fn query_scoped(&self, id: RepositoryId) -> Result<RepositoryData, ProtocolError> {
+        let (identity_token, access_token) = self.credentials.tokens();
+        // Nothing to exchange against: no auth service and no supplied access
+        // token (an auth-off server), or no repository. Today's path.
+        if id.is_zero() || (self.auth_url.is_empty() && access_token.is_empty()) {
+            return self.query(Some(id), None).await;
+        }
+        // The recipient domain `GRPCAuth::new` uses, so this shares the
+        // `AUTHZ_CACHE` entry the lock and revision clients of `id` hold.
+        let recipient_domain = self
+            .connection
+            .remote_url
+            .host_str()
+            .unwrap_or_default()
+            .to_string();
+        scoped_repository_get(
+            || {
+                crate::auth::exchange::exchange(
+                    &self.auth_url,
+                    &self.identity,
+                    id,
+                    recipient_domain,
+                    &identity_token,
+                    &access_token,
+                )
+            },
+            |token| async move {
+                with_reconnect_classified(
+                    &self.connection,
+                    GrpcRpc::RepositoryQuery,
+                    || async {
+                        self.client
+                            .read()
+                            .await
+                            .query_id_with_authorization(id, &token)
+                            .await
+                    },
+                    |reconnect_id| self.reconnect(reconnect_id),
+                )
+                .await
+            },
+            || self.query(Some(id), None),
         )
         .await
     }

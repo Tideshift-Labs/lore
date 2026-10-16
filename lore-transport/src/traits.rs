@@ -511,6 +511,26 @@ pub trait Repository: Send + Sync {
         name: Option<&str>,
     ) -> Result<RepositoryData, ProtocolError>;
 
+    /// Get the record of a repository the caller already holds (its working
+    /// copy's own id), presenting that repository's scoped authorization token
+    /// rather than the identity token, so the server authorizes it in place.
+    ///
+    /// Use this only for that repository. A lookup by name, a clone, a list,
+    /// a create, or an id learned from anywhere else goes through
+    /// [`Self::query`] and the identity token.
+    ///
+    /// A denied exchange reads once with the identity token instead, so a
+    /// repository the caller lost or that was deleted is still `NotFound`. Any
+    /// other exchange failure is returned as an error.
+    ///
+    /// A caller-supplied access token is presented as given, as the lock and
+    /// revision clients do. It is not checked against `id`, so one scoped to a
+    /// different repository reads as `NotFound`.
+    ///
+    /// Required rather than defaulted, for the reason [`Admin::server_info`]
+    /// gives: a default would silently send the identity token.
+    async fn query_scoped(&self, id: RepositoryId) -> Result<RepositoryData, ProtocolError>;
+
     /// List all repositories
     async fn list(&self) -> Result<Vec<RepositoryData>, ProtocolError>;
 

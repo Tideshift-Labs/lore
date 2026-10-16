@@ -18,6 +18,7 @@ mod fenced_lock_token_wire_tests;
 mod lock_client;
 mod managed_not_prepared_proof_tests;
 mod not_prepared_proof_wire_tests;
+mod repository_scoped_get;
 mod revision_client;
 mod storage_client;
 

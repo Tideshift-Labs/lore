@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_base::error::NotFound;
 use lore_base::types::Context;
@@ -11,10 +12,13 @@ use tokio_stream::StreamExt;
 use super::AuthenticatedService;
 use super::AuthnInterceptor;
 use super::Channel;
+use super::CorrelationInterceptor;
 use super::GRPCAuthRef;
+use super::UnauthenticatedService;
 use super::grpc_retry;
 use super::handle_error;
 use super::inject_authn_bearer;
+use super::inject_authorization;
 use crate::error::ProtocolError;
 use crate::types::MetadataSetResult;
 use crate::types::RepositoryData;
@@ -22,6 +26,12 @@ use crate::types::RepositoryData;
 #[derive(Clone)]
 pub struct RepositoryService {
     client: RepositoryServiceClient<AuthenticatedService>,
+    /// The same channel without [`AuthnInterceptor`], for the one call that
+    /// presents a repository-scoped authorization token instead of the identity
+    /// token: [`Self::query_id_with_authorization`]. The interceptor would
+    /// overwrite a per-request `authorization` header, so that call cannot go
+    /// through `client`.
+    scoped: RepositoryServiceClient<UnauthenticatedService>,
     /// Kept beside the client so a governed mutation can stamp the human's own
     /// authentication bearer per dispatch.
     ///
@@ -35,12 +45,18 @@ pub struct RepositoryService {
 
 impl RepositoryService {
     pub fn new(channel: Channel, auth: GRPCAuthRef) -> Self {
+        let scoped =
+            RepositoryServiceClient::with_interceptor(channel.clone(), CorrelationInterceptor);
         let client = RepositoryServiceClient::with_interceptor(
             channel,
             AuthnInterceptor { auth: auth.clone() },
         );
 
-        Self { client, auth }
+        Self {
+            client,
+            scoped,
+            auth,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -145,16 +161,39 @@ impl RepositoryService {
             }
         };
 
-        if let Some(repository) = response.repository {
-            Ok(RepositoryData {
-                id: repository.id.into(),
-                name: repository.name,
-                metadata: repository.metadata.into(),
-                generation: response.repository_generation,
-            })
-        } else {
-            Err(ProtocolError::from(NotFound))
-        }
+        repository_data(response)
+    }
+
+    /// `RepositoryGet` by id, presenting `authorization` (a repository-scoped
+    /// authorization token for `id`) as the bearer instead of the identity
+    /// token. The server answers it from the token's `resources` claim, with no
+    /// online permission check. Only [`super::GRPCRepository`]'s
+    /// `query_scoped` calls this; see there for when it is used.
+    pub async fn query_id_with_authorization(
+        &self,
+        id: RepositoryId,
+        authorization: &str,
+    ) -> Result<RepositoryData, ProtocolError> {
+        let mut retry = grpc_retry();
+        let response = loop {
+            let mut request = tonic::Request::new(repository_v1::RepositoryGetRequest {
+                query: Some(repository_v1::repository_get_request::Query::Id(id.into())),
+            });
+            inject_authorization(&mut request, authorization)?;
+
+            let mut client = self.scoped.clone();
+
+            match client.repository_get(request).await {
+                Ok(response) => {
+                    break response.into_inner();
+                }
+                Err(status) => {
+                    handle_error(&mut retry, status).await?;
+                }
+            }
+        };
+
+        repository_data(response)
     }
 
     pub async fn list(&self) -> Result<Vec<RepositoryData>, ProtocolError> {
@@ -258,5 +297,21 @@ impl RepositoryService {
             success,
             current_hash,
         })
+    }
+}
+
+/// A `RepositoryGet` answer as [`RepositoryData`]; no record is `NotFound`.
+fn repository_data(
+    response: repository_v1::RepositoryGetResponse,
+) -> Result<RepositoryData, ProtocolError> {
+    if let Some(repository) = response.repository {
+        Ok(RepositoryData {
+            id: repository.id.into(),
+            name: repository.name,
+            metadata: repository.metadata.into(),
+            generation: response.repository_generation,
+        })
+    } else {
+        Err(ProtocolError::from(NotFound))
     }
 }

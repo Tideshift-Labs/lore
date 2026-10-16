@@ -222,13 +222,29 @@ struct RecordingRepository {
     log: CaptureLog,
 }
 
+/// The smallest repository record the client accepts as an answer.
+fn minimal_repository(id: tonic::codegen::Bytes) -> lore_proto::lore::model::v1::Repository {
+    lore_proto::lore::model::v1::Repository {
+        id,
+        name: "recorded".to_string(),
+        ..Default::default()
+    }
+}
+
 #[tonic::async_trait]
 impl RepositoryServiceV1 for RecordingRepository {
     async fn repository_create(
         &self,
-        _request: Request<repository_v1::RepositoryCreateRequest>,
+        request: Request<repository_v1::RepositoryCreateRequest>,
     ) -> Result<Response<repository_v1::RepositoryCreateResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        record(
+            &self.log,
+            "repository.repository_create",
+            request.metadata(),
+        );
+        Ok(Response::new(repository_v1::RepositoryCreateResponse {
+            repository: Some(minimal_repository(request.get_ref().id.clone())),
+        }))
     }
 
     async fn repository_delete(
@@ -247,9 +263,23 @@ impl RepositoryServiceV1 for RecordingRepository {
 
     async fn repository_get(
         &self,
-        _request: Request<repository_v1::RepositoryGetRequest>,
+        request: Request<repository_v1::RepositoryGetRequest>,
     ) -> Result<Response<repository_v1::RepositoryGetResponse>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        // Keyed by lookup mode so by-id and by-name calls are told apart.
+        let (key, id) = match &request.get_ref().query {
+            Some(repository_v1::repository_get_request::Query::Id(id)) => {
+                ("repository.repository_get.by_id", id.clone())
+            }
+            Some(repository_v1::repository_get_request::Query::Name(_)) => {
+                ("repository.repository_get.by_name", Default::default())
+            }
+            None => ("repository.repository_get.no_query", Default::default()),
+        };
+        record(&self.log, key, request.metadata());
+        Ok(Response::new(repository_v1::RepositoryGetResponse {
+            repository: Some(minimal_repository(id)),
+            repository_generation: None,
+        }))
     }
 
     type RepositoryListStream = ResponseStream<repository_v1::RepositoryListResponse>;
@@ -762,6 +792,126 @@ async fn repository_list_carries_no_authn_bearer_header() {
         .captured("repository.repository_list")
         .expect("repository_list must have been recorded");
     assert_eq!(captured.authn_bearer, None);
+}
+
+#[tokio::test]
+async fn repository_list_authorization_is_the_identity_token() {
+    let server = TestServer::start().await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let repository = connection.repository().await.expect("repository client");
+
+    repository.list().await.expect("list must succeed");
+
+    let captured = server
+        .captured("repository.repository_list")
+        .expect("repository_list must have been recorded");
+    assert_eq!(captured.authorization, Some(expected_authn_header()));
+}
+
+#[tokio::test]
+async fn repository_create_authorization_is_the_identity_token() {
+    let server = TestServer::start().await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let repository = connection.repository().await.expect("repository client");
+
+    repository
+        .create(
+            test_repository(),
+            "name",
+            "description",
+            Context::from([0x03u8; 16]),
+            "main",
+            "creator",
+            0,
+        )
+        .await
+        .expect("create must succeed");
+
+    let captured = server
+        .captured("repository.repository_create")
+        .expect("repository_create must have been recorded");
+    assert_eq!(captured.authorization, Some(expected_authn_header()));
+}
+
+// ---------------------------------------------------------------------------------------
+// RepositoryGet: `query_scoped` carries the repository-scoped authorization token; every
+// other lookup carries the identity token.
+// ---------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn query_scoped_carries_the_scoped_authorization_token_and_no_authn_bearer() {
+    let server = TestServer::start().await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let repository = connection.repository().await.expect("repository client");
+
+    let data = repository
+        .query_scoped(test_repository())
+        .await
+        .expect("query_scoped must succeed");
+
+    assert_eq!(data.id, test_repository(), "the request must be by id");
+    let captured = server
+        .captured("repository.repository_get.by_id")
+        .expect("a by-id repository_get must have been recorded");
+    assert_eq!(captured.authorization, Some(expected_authz_header()));
+    assert_eq!(captured.authn_bearer, None);
+    assert!(
+        server
+            .captured("repository.repository_get.by_name")
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn query_by_id_carries_the_identity_token() {
+    let server = TestServer::start().await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let repository = connection.repository().await.expect("repository client");
+
+    repository
+        .query(Some(test_repository()), None)
+        .await
+        .expect("query by id must succeed");
+
+    let captured = server
+        .captured("repository.repository_get.by_id")
+        .expect("a by-id repository_get must have been recorded");
+    assert_eq!(captured.authorization, Some(expected_authn_header()));
+}
+
+#[tokio::test]
+async fn query_by_name_carries_the_identity_token() {
+    let server = TestServer::start().await;
+    let connection = server.connect(AUTHN_TOKEN, AUTHZ_TOKEN).await;
+    let repository = connection.repository().await.expect("repository client");
+
+    repository
+        .query(None, Some("name"))
+        .await
+        .expect("query by name must succeed");
+
+    let captured = server
+        .captured("repository.repository_get.by_name")
+        .expect("a by-name repository_get must have been recorded");
+    assert_eq!(captured.authorization, Some(expected_authn_header()));
+}
+
+#[tokio::test]
+async fn query_scoped_without_an_access_token_or_auth_url_takes_the_identity_path() {
+    let server = TestServer::start().await;
+    // No supplied access token and an empty auth_url: nothing to exchange against.
+    let connection = server.connect(AUTHN_TOKEN, "").await;
+    let repository = connection.repository().await.expect("repository client");
+
+    repository
+        .query_scoped(test_repository())
+        .await
+        .expect("query_scoped must succeed");
+
+    let captured = server
+        .captured("repository.repository_get.by_id")
+        .expect("a by-id repository_get must have been recorded");
+    assert_eq!(captured.authorization, Some(expected_authn_header()));
 }
 
 #[tokio::test]
