@@ -22,6 +22,7 @@ use lore_base::types::Context as LoreContext;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::auth::AUTH_CALL_TIMEOUT;
 use lore_server::authnz::auth::AUTH_CONNECT_TIMEOUT;
 use lore_server::authnz::auth::AuthChannel;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
@@ -607,4 +608,42 @@ async fn an_abandoned_failed_dial_leaves_no_stale_failure() {
         .await
         .unwrap();
     assert_eq!(channel.dial_attempts(), 2);
+}
+
+/// On an established connection, a service that never answers an RPC fails
+/// that call within the call timeout, as `Internal`, and the next call
+/// redials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_rpc_the_service_never_answers_times_out_and_the_next_call_redials() {
+    let server = FakeServer::start();
+    let authorizer = AuthClientAuthorizer::new(server.url());
+    check(&authorizer).await.unwrap();
+
+    server.set_mode(HANG);
+    let started = Instant::now();
+    let status = tokio::time::timeout(AUTH_CALL_TIMEOUT * 3, check(&authorizer))
+        .await
+        .expect("an unanswered RPC was not bounded")
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= AUTH_CALL_TIMEOUT, "{elapsed:?}");
+    assert!(
+        elapsed < AUTH_CALL_TIMEOUT + Duration::from_secs(3),
+        "{elapsed:?}"
+    );
+    assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+    assert!(
+        status
+            .message()
+            .starts_with("Failed to call auth check_user_permission:"),
+        "{status:?}"
+    );
+
+    server.set_mode(ALLOW);
+    check(&authorizer).await.unwrap();
+    assert_eq!(
+        server.accepted(),
+        2,
+        "the timed-out channel should be replaced"
+    );
 }
