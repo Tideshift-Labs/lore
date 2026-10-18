@@ -118,7 +118,7 @@ impl UdsListener {
         unsafe {
             if WinSock::bind(
                 sock.get(),
-                &addr as *const SOCKADDR_UN as *const SOCKADDR,
+                <*const SOCKADDR_UN>::from(&addr).cast::<SOCKADDR>(),
                 std::mem::size_of_val(&addr) as i32,
             ) != 0
             {
@@ -148,7 +148,7 @@ impl UdsListener {
         unsafe {
             let res = WinSock::accept(
                 self.socket.get(),
-                &mut addr as *mut SOCKADDR_UN as *mut SOCKADDR,
+                <*mut SOCKADDR_UN>::from(&mut addr).cast::<SOCKADDR>(),
                 &mut addr_size as *mut i32,
             );
             if res == INVALID_SOCKET {
@@ -200,7 +200,7 @@ impl UdsStream {
         unsafe {
             if WinSock::connect(
                 sock.get(),
-                &addr as *const SOCKADDR_UN as *const SOCKADDR,
+                <*const SOCKADDR_UN>::from(&addr).cast::<SOCKADDR>(),
                 size_of_val(&addr) as i32,
             ) != 0
             {

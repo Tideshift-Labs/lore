@@ -35,8 +35,11 @@ mod tests {
     include!("helper.rs");
 
     /// The file the executable bit test carries across two revisions.
+    #[cfg(target_family = "unix")]
     const SCRIPT: &str = "script.sh";
+    #[cfg(target_family = "unix")]
     const FIRST: &[u8] = b"#!/bin/sh\necho first";
+    #[cfg(target_family = "unix")]
     const SECOND: &[u8] = b"#!/bin/sh\necho second";
 
     /// Syncs `instance` to `revision`, discarding local modifications where `reset` asks it to.

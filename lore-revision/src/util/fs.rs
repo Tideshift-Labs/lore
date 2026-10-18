@@ -41,6 +41,7 @@ const FILE_MODE_ALL_EXEC: u32 = 0o111;
 
 // On Windows we do not care about executable bit
 #[cfg(target_family = "windows")]
+#[allow(clippy::unused_async)]
 pub async fn metadata_set_executable(
     _path: impl AsRef<Path>,
     _metadata: &Metadata,

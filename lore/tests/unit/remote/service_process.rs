@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 use std::ffi::OsString;
 use std::path::PathBuf;
+#[cfg(target_family = "unix")]
 use std::process::Command;
+#[cfg(target_family = "unix")]
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+#[cfg(target_family = "unix")]
 use std::time::Duration;
 
 use lore::remote::service_process::*;

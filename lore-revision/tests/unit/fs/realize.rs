@@ -11,6 +11,7 @@ use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::realize::*;
 use lore_revision::node::Node;
+#[cfg(target_family = "unix")]
 use lore_revision::node::NodeFileMode;
 use lore_revision::node::NodeFlags;
 use lore_revision::node::NodeID;

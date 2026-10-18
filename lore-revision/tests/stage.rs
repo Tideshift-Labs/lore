@@ -11,6 +11,7 @@ mod tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
+    #[cfg(target_family = "unix")]
     use lore_base::types::Hash;
     use lore_revision::branch;
     use lore_revision::commit;
