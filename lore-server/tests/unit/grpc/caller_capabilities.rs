@@ -23,6 +23,7 @@ use tonic::body::Body;
 use tower::Layer;
 use tower::Service;
 
+mod quic_admission;
 pub(crate) mod read_repairs;
 
 fn headers(value: &str) -> HeaderMap {
@@ -334,18 +335,39 @@ fn guarded_settings() -> lore_server::settings::Settings {
     settings
 }
 
+/// Public QUIC no longer blocks the strict boot: `admit_quic` makes it read-only. The
+/// replication ingress (internal QUIC, internal gRPC) still does.
+#[test]
+fn required_policy_boots_with_public_quic_enabled() {
+    let mut settings = guarded_settings();
+    settings.server.quic.as_mut().unwrap().enabled = true;
+    validate_settings(&settings).unwrap();
+    for internal in 0..2 {
+        let mut settings = guarded_settings();
+        settings.server.quic.as_mut().unwrap().enabled = true;
+        match internal {
+            0 => settings.server.quic_internal.as_mut().unwrap().enabled = true,
+            1 => settings.server.grpc_internal.as_mut().unwrap().enabled = true,
+            _ => unreachable!(),
+        }
+        assert!(
+            validate_settings(&settings).is_err(),
+            "public QUIC must not open internal ingress {internal}"
+        );
+    }
+}
+
 #[test]
 fn required_policy_refuses_unguarded_transports_and_missing_auth() {
     validate_settings(&guarded_settings()).unwrap();
-    for change in 0..6 {
+    for change in 0..5 {
         let mut settings = guarded_settings();
         match change {
             0 => settings.server.auth = None,
-            1 => settings.server.quic.as_mut().unwrap().enabled = true,
-            2 => settings.server.quic_internal.as_mut().unwrap().enabled = true,
-            3 => settings.server.grpc_internal.as_mut().unwrap().enabled = true,
-            4 => settings.immutable_store.mode = "remote".into(),
-            5 => settings.mutable_store.mode = "remote".into(),
+            1 => settings.server.quic_internal.as_mut().unwrap().enabled = true,
+            2 => settings.server.grpc_internal.as_mut().unwrap().enabled = true,
+            3 => settings.immutable_store.mode = "remote".into(),
+            4 => settings.mutable_store.mode = "remote".into(),
             _ => unreachable!(),
         }
         assert!(

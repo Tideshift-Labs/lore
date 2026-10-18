@@ -1070,12 +1070,28 @@ async fn launch_maintenance_grpc_server(
     .await
 }
 
+/// The policy the public QUIC services enforce: the configured gRPC policy, else the
+/// compatible default.
+#[lore_macro::test_pub]
+fn quic_caller_capability_policy(
+    settings: &Settings,
+) -> crate::grpc::caller_capabilities::CallerCapabilityPolicy {
+    settings
+        .server
+        .grpc
+        .as_ref()
+        .map(|grpc| grpc.caller_capability_policy)
+        .unwrap_or_default()
+}
+
+#[lore_macro::test_pub]
 struct QuicPublicStreamHandler {
     service_store: ServiceStore,
 }
 
 impl QuicPublicStreamHandler {
     #[allow(clippy::too_many_arguments)]
+    #[lore_macro::test_pub]
     fn new(
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
@@ -1085,6 +1101,7 @@ impl QuicPublicStreamHandler {
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         limits: AdmissionLimits,
         user_agent_filter: Arc<UserAgentFilter>,
+        caller_capability_policy: crate::grpc::caller_capabilities::CallerCapabilityPolicy,
     ) -> Self {
         let mut service_store = ServiceStore::default();
 
@@ -1102,7 +1119,8 @@ impl QuicPublicStreamHandler {
                         local_store.clone(),
                         mutable_store.clone(),
                         enforce_write_permission,
-                    );
+                    )
+                    .with_caller_capability_policy(caller_capability_policy);
                     Box::new(StreamHandler::new(
                         Arc::new(storage_protocol),
                         context,
@@ -1139,7 +1157,8 @@ impl QuicPublicStreamHandler {
                         mutable_store.clone(),
                         enforce_write_permission,
                         user_agent_filter.clone(),
-                    );
+                    )
+                    .with_caller_capability_policy(caller_capability_policy);
                     Box::new(StreamHandler::new(Arc::new(v4_service), context, limits))
                         as Box<dyn StreamDataHandler>
                 }) as StreamDataHandlerBuilder,
@@ -3186,6 +3205,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
             let connection_registry = public_registry.clone();
+            // Same caller-capability policy as gRPC: required mode makes public QUIC read-only.
+            // Read before `settings.server.quic` is moved out below.
+            let caller_capability_policy = quic_caller_capability_policy(&settings);
 
             let quic_settings = settings
                 .server
@@ -3239,6 +3261,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     repository_authorizer,
                     limits,
                     user_agent_filter,
+                    caller_capability_policy,
                 )),
                 frequency,
                 quic_settings,

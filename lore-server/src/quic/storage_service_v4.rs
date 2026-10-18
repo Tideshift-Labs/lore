@@ -23,6 +23,8 @@ use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
+use crate::grpc::caller_capabilities::admit_quic;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -88,6 +90,8 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
         }
         MessageHandleError::Oversized => QuicServiceError::Oversized,
         MessageHandleError::OutcomeUnknown => QuicServiceError::OutcomeUnknown,
+        // Storage status 200 = unsupported-client: a final pre-dispatch refusal.
+        MessageHandleError::UnsupportedClient => QuicServiceError::ImplementationReserved,
         _ => QuicServiceError::Failed,
     }
 }
@@ -102,6 +106,7 @@ pub struct StorageServiceV4 {
     session_map: Arc<SessionMap>,
     enforce_write_permission: bool,
     user_agent_filter: Arc<UserAgentFilter>,
+    caller_capability_policy: CallerCapabilityPolicy,
 }
 
 impl StorageServiceV4 {
@@ -123,7 +128,16 @@ impl StorageServiceV4 {
             session_map: Arc::new(SessionMap::default()),
             enforce_write_permission,
             user_agent_filter,
+            caller_capability_policy: CallerCapabilityPolicy::default(),
         }
+    }
+
+    /// Set the caller-capability policy. Every production construction must call this
+    /// with the configured policy; `new` keeps the compatible default.
+    #[must_use]
+    pub fn with_caller_capability_policy(mut self, policy: CallerCapabilityPolicy) -> Self {
+        self.caller_capability_policy = policy;
+        self
     }
 
     /// Enforce the write-path permission for a storage command. Mirrors the
@@ -326,6 +340,8 @@ impl QuicService for StorageServiceV4 {
                 // write-vs-read classification is a deliberate decision, never a
                 // silent fall-through to "ungated".
                 use crate::quic::storage_service::ParsedStorageRequest as Req;
+                // Caller admission runs first, before write authorization (contract order).
+                admit_quic(self.caller_capability_policy, &parsed)?;
                 match &parsed {
                     Req::Put(_) => self.require_write(&permissions, "Put")?,
                     Req::PutResolved(_) => self.require_write(&permissions, "PutResolved")?,

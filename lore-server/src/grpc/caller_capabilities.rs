@@ -355,6 +355,39 @@ pub fn admit(
     }
 }
 
+/// QUIC storage admission. QUIC has no declaration carrier, so under the required policy
+/// public QUIC is read-only: every mutation is refused before write authorization and
+/// before any store effect. EXHAUSTIVE on purpose: a new command must be classified here.
+pub fn admit_quic(
+    policy: CallerCapabilityPolicy,
+    request: &crate::quic::storage_service::ParsedStorageRequest,
+) -> Result<(), crate::protocol::storage::messages::MessageHandleError> {
+    use crate::quic::storage_service::ParsedStorageRequest as Req;
+    if policy == CallerCapabilityPolicy::CompatibleSingleReplica {
+        return Ok(());
+    }
+    match request {
+        Req::Put(_)
+        | Req::PutResolved(_)
+        | Req::Copy(_)
+        | Req::MutableStoreOp(_)
+        | Req::MutableCas(_) => {
+            Err(crate::protocol::storage::messages::MessageHandleError::UnsupportedClient)
+        }
+        Req::Verify(verify) if verify.heal != 0 => {
+            Err(crate::protocol::storage::messages::MessageHandleError::UnsupportedClient)
+        }
+        Req::Verify(_)
+        | Req::Get(_)
+        | Req::GetResolved(_)
+        | Req::GetMetadata(_)
+        | Req::Query(_)
+        | Req::MutableLoad(_)
+        | Req::Connect(_)
+        | Req::Correlate(_) => Ok(()),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CallerCapabilityLayer {
     policy: CallerCapabilityPolicy,
@@ -434,20 +467,17 @@ pub fn validate_settings(settings: &crate::settings::Settings) -> anyhow::Result
             .is_some(),
         "required caller capability policy requires JWT authentication"
     );
+    // Public QUIC may stay on: `admit_quic` makes it read-only under this policy.
     anyhow::ensure!(
         !server
-            .quic
+            .quic_internal
             .as_ref()
             .is_some_and(|endpoint| endpoint.enabled)
-            && !server
-                .quic_internal
-                .as_ref()
-                .is_some_and(|endpoint| endpoint.enabled)
             && !server
                 .grpc_internal
                 .as_ref()
                 .is_some_and(|endpoint| endpoint.enabled),
-        "required caller capability policy forbids unguarded QUIC and internal replication ingress"
+        "required caller capability policy forbids internal QUIC and internal replication ingress"
     );
     anyhow::ensure!(
         server.grpc_public_services.forwarded_requests.is_none(),

@@ -99,6 +99,10 @@ pub enum MessageHandleError {
     /// traffic, so it is refused and named (row 72).
     #[error("{0} is not supported: this server has no local store")]
     LocalStoreUnavailable(&'static str),
+    /// The caller-capability policy refuses this command on this transport. A confirmed
+    /// pre-dispatch refusal: final, with no store effect.
+    #[error("unsupported client capability")]
+    UnsupportedClient,
 }
 
 impl From<StoreError> for MessageHandleError {

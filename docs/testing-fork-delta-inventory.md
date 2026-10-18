@@ -58,6 +58,16 @@ For detailed historical context, gotchas, and design invariants, see the [Append
 - **CR-033 cell dispatch authority: continuity family and separate-process service shell removed   [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-cell-dispatch-authority-continuity-family-and-separate-process-service-shell-removed-server). Gates: `cargo test -p lore-object-dispatch
   --test no_dispatch --test reserve_put --test upload -j 4` `cargo test -p lore-object-dispatch --test terminal_result -j 4` `cargo test -p lore-object-dispatch --test result_ack -j 4` `cargo test -p lore-object-dispatch --test result_discard -j 4` `cargo test -p lore-object-dispatch --test result_disposition -j 4` `cargo test -p lore-object-dispatch --test fetch_lease --test result_disposition --test
   payload_purge -j 4` `cargo test -p lore-object-dispatch --test cell_schema_install` `cargo test -p lore-object-dispatch --test provider_client -j 4` `pwsh -File lore-object-dispatch/tests/run-local-authority-live.ps1` `lore-object-dispatch/tests/run-provider-charge-live.ps1` `lore-object-dispatch/tests/run-budget-pin-refresh-live.ps1`
+- **WP-120 strict caller admission on QUIC (`admit_quic`, storage status 200) [SERVER]**: unit
+  table (every command x both policies x v4/urc0.2, counting stores, admission-before-authz) in
+  `lore-server/tests/unit/grpc/caller_capabilities/quic_admission.rs`; urc/0.2 answers
+  `GetResolved`/`PutResolved` `NotImplemented` with no store call, so "reached the store" holds
+  for v4 only. Live: in-process auth-ON cell in
+  `lore-integration-tests/tests/quic_strict_admission_test.rs` (strict gRPC needs a `JwtVerifier`,
+  or `with_jwt_verifier` errors at build). The settings-to-policy read in `async_main` is untested:
+  a strict real boot needs a fragment provider + domain enforcement. Gates: `cargo test -p
+  lore-server --test unit -j 4 -- grpc::caller_capabilities` `cargo test -p lore-integration-tests
+  --features integration_tests --test integration -j 4 -- quic_strict_admission`
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-charge-admission-deadline-horizon-guard-server). Gates: `cargo test -p lore-server --test unit -- charge_bound`
 - **CR-038 cell schema forward upgrade and spool metadata true-up [SERVER]**: migration 0028 trues
   up a released spool row's metadata charge to its actual retained size (was a flat 16,384-byte

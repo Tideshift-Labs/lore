@@ -33,6 +33,8 @@ use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
+use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
+use crate::grpc::caller_capabilities::admit_quic;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::UserAgentValue;
@@ -310,6 +312,8 @@ fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
         MessageHandleError::SlowDown => QuicServiceError::SlowDown,
         MessageHandleError::Oversized => QuicServiceError::Oversized,
         MessageHandleError::OutcomeUnknown => QuicServiceError::OutcomeUnknown,
+        // Storage status 200 = unsupported-client: a final pre-dispatch refusal.
+        MessageHandleError::UnsupportedClient => QuicServiceError::ImplementationReserved,
         _ => QuicServiceError::Failed,
     }
 }
@@ -412,6 +416,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::HandlerTimeout => "HandlerTimeout",
         MessageHandleError::SessionLimitReached => "SessionLimitReached",
         MessageHandleError::LocalStoreUnavailable(_) => "LocalStoreUnavailable",
+        MessageHandleError::UnsupportedClient => "UnsupportedClient",
     }
 }
 
@@ -435,6 +440,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::InvalidFragment
         | MessageHandleError::SessionLimitReached
         | MessageHandleError::LocalStoreUnavailable(_)
+        | MessageHandleError::UnsupportedClient
         | MessageHandleError::OutcomeUnknown => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
@@ -452,6 +458,7 @@ pub struct StorageService {
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     enforce_write_permission: bool,
+    caller_capability_policy: CallerCapabilityPolicy,
 }
 
 impl StorageService {
@@ -470,7 +477,16 @@ impl StorageService {
             local_store,
             mutable_store,
             enforce_write_permission,
+            caller_capability_policy: CallerCapabilityPolicy::default(),
         }
+    }
+
+    /// Set the caller-capability policy. Every production construction must call this
+    /// with the configured policy; `new` keeps the compatible default.
+    #[must_use]
+    pub fn with_caller_capability_policy(mut self, policy: CallerCapabilityPolicy) -> Self {
+        self.caller_capability_policy = policy;
+        self
     }
 
     /// Enforce the write-path permission for a storage command (read ≠ write).
@@ -534,6 +550,8 @@ impl QuicService for StorageService {
         // gated, Store/Cas write, Verify writes only when healing. EXHAUSTIVE on
         // purpose: a new variant from an upstream merge must fail to compile here
         // rather than silently fall through to "ungated".
+        // Caller admission runs first, before write authorization (contract order).
+        admit_quic(self.caller_capability_policy, &request)?;
         match &request {
             ParsedStorageRequest::Put(_) => self.require_write(&context, "Put")?,
             ParsedStorageRequest::PutResolved(_) => self.require_write(&context, "PutResolved")?,

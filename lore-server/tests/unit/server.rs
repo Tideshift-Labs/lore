@@ -798,3 +798,6 @@ mod wait_for_shutdown_tests {
         .expect("wait_for_shutdown returned an error");
     }
 }
+
+/// FORK-LOCAL (Tideshift): WP-120 public-QUIC caller-capability wiring.
+mod quic_caller_capability_wiring;

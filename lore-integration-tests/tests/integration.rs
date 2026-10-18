@@ -10,6 +10,7 @@ mod hashicorp;
 mod locks_test;
 mod presign_test;
 mod quic_session_rebind_test;
+mod quic_strict_admission_test;
 mod rebac_stub_policy_test;
 mod remote_store_test;
 mod replicated_store_test;

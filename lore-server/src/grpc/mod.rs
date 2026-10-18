@@ -201,9 +201,19 @@ pub fn map_message_handle_error_to_status(
             Code::Unimplemented,
             message.unwrap_or_else(|| error.to_string()),
         ),
+        MessageHandleError::UnsupportedClient => (
+            Code::FailedPrecondition,
+            message.unwrap_or_else(|| "unsupported client capability".into()),
+        ),
     };
 
     let mut status = Status::with_details(code, message, details.unwrap_or_default());
+    if matches!(error, MessageHandleError::UnsupportedClient) {
+        status.metadata_mut().insert(
+            caller_capabilities::ADMISSION_HEADER,
+            tonic::metadata::MetadataValue::from_static("unsupported-client"),
+        );
+    }
     if matches!(error, MessageHandleError::OutcomeUnknown) {
         status.metadata_mut().insert(
             lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
