@@ -27,6 +27,10 @@ drain_timeout_seconds = 0
 # During a graceful drain, close a connection with no stream activity for this
 # many seconds (keep-alives don't count); 0 disables the stall guard.
 drain_stall_timeout_seconds = 300
+# Seconds the health check reports 503 while gRPC and QUIC keep serving after
+# the shutdown signal, so a health-probing front stops routing here before
+# admission closes. Set above the front's detection time; 0 closes at once.
+lame_duck_seconds = 0
 
 # Disk space available to the local store directories. Only stores the server
 # writes at are watched, and a volume holding several of them is checked once.

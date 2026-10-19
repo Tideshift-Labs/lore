@@ -5,6 +5,7 @@
 
 mod rpc_tests;
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -12,6 +13,8 @@ use std::time::Duration;
 use lore_server::drain::ConnectionRegistry;
 use lore_server::drain::DrainConnection;
 use lore_server::drain::DrainState;
+use lore_server::drain::count_termination_signals;
+use lore_server::drain::lame_duck_then_shutdown;
 use lore_server::drain::run_drain;
 
 /// A `DrainConnection` double whose frame count and closed flag are
@@ -506,4 +509,307 @@ async fn shutdown_signal_with_graceful_drain_waits_for_active_then_resolves() {
         .await
         .expect("shutdown_signal should resolve once total_active() reaches zero")
         .expect("shutdown_signal task panicked");
+}
+
+fn lame_duck_harness() -> (
+    tokio::sync::watch::Sender<u32>,
+    tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<bool>,
+    Arc<DrainState>,
+) {
+    let (term_tx, _) = tokio::sync::watch::channel(0u32);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    (term_tx, shutdown_tx, shutdown_rx, DrainState::new())
+}
+
+#[test]
+fn begin_lame_duck_is_draining_but_not_drained_until_it_ends() {
+    let state = DrainState::new();
+    state.begin_lame_duck();
+    assert!(state.is_lame_duck());
+    assert!(state.is_draining());
+    assert!(!state.is_drained(), "lame duck must never read as drained");
+
+    state.end_lame_duck();
+    assert!(!state.is_lame_duck());
+    assert!(state.is_draining(), "end_lame_duck clears only lame_duck");
+    assert!(state.is_drained());
+}
+
+#[tokio::test(start_paused = true)]
+async fn lame_duck_period_holds_shutdown_then_fires() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx,
+        state.clone(),
+        false,
+        Some(Duration::from_secs(6)),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!*shutdown_rx.borrow(), "nothing flips before termination");
+    assert!(!state.is_draining());
+
+    term_tx.send(1).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(state.is_draining() && state.is_lame_duck());
+    assert!(!*shutdown_rx.borrow());
+
+    tokio::time::sleep(Duration::from_millis(5800)).await; // 5.9 s total
+    assert!(!*shutdown_rx.borrow(), "still lame duck at 5.9 s");
+    assert!(state.is_lame_duck());
+
+    tokio::time::sleep(Duration::from_millis(200)).await; // past 6 s
+    assert!(*shutdown_rx.borrow());
+    assert!(!state.is_lame_duck());
+    assert!(state.is_draining());
+    handle.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn lame_duck_ends_early_when_shutdown_is_sent_elsewhere() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx.clone(),
+        state.clone(),
+        false,
+        Some(Duration::from_secs(600)),
+    ));
+    term_tx.send(1).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(state.is_lame_duck());
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("must return promptly, not wait out the period")
+        .unwrap();
+    assert!(!state.is_lame_duck());
+    assert!(*shutdown_rx.borrow());
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_lame_duck_with_report_draining_drains_and_shuts_down_at_once() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    term_tx.send_replace(1);
+    lame_duck_then_shutdown(term_tx.subscribe(), shutdown_tx, state.clone(), true, None).await;
+    assert!(*shutdown_rx.borrow());
+    assert!(state.is_draining());
+    assert!(!state.is_lame_duck());
+}
+
+#[tokio::test(start_paused = true)]
+async fn no_lame_duck_without_report_draining_only_shuts_down() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    term_tx.send_replace(1);
+    lame_duck_then_shutdown(term_tx.subscribe(), shutdown_tx, state.clone(), false, None).await;
+    assert!(*shutdown_rx.borrow());
+    assert!(!state.is_draining());
+}
+
+#[tokio::test(start_paused = true)]
+async fn dropped_termination_sender_still_drains_on_endpoint_shutdown() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    let rx = term_tx.subscribe();
+    drop(term_tx);
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        rx,
+        shutdown_tx.clone(),
+        state.clone(),
+        true,
+        Some(Duration::from_secs(6)),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert!(!*shutdown_rx.borrow(), "a dropped listener is not a signal");
+    assert!(!state.is_draining());
+    assert!(
+        !handle.is_finished(),
+        "an endpoint exit can still end the server"
+    );
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("must return once shutdown is signalled")
+        .unwrap();
+    assert!(state.is_draining());
+    assert!(!state.is_lame_duck());
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_exit_shutdown_without_termination_marks_draining() {
+    // `wait_for_shutdown` sends the shutdown signal itself when an endpoint
+    // exits. Health must then go 503 and `/drain_status` must reach drained,
+    // with no lame duck because nothing is left to serve.
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx.clone(),
+        state.clone(),
+        true,
+        Some(Duration::from_secs(600)),
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!state.is_draining());
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("must return promptly, not run a lame duck")
+        .unwrap();
+    assert!(*shutdown_rx.borrow());
+    assert!(state.is_draining());
+    assert!(!state.is_lame_duck());
+    assert!(state.is_drained(), "an idle node must read as drained");
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_exit_shutdown_without_report_draining_leaves_health_alone() {
+    let (term_tx, shutdown_tx, _shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx.clone(),
+        state.clone(),
+        false,
+        None,
+    ));
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("must return promptly")
+        .unwrap();
+    assert!(!state.is_draining());
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_exit_before_termination_with_only_a_lame_duck_marks_draining() {
+    // `graceful_drain = false` but `lame_duck_seconds > 0`: the drain-status
+    // docs say either setting flips health, so an endpoint exit must too.
+    let (term_tx, shutdown_tx, _shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx.clone(),
+        state.clone(),
+        false,
+        Some(Duration::from_secs(600)),
+    ));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(!state.is_draining());
+
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("must return promptly, not run a lame duck")
+        .unwrap();
+    assert!(
+        state.is_draining(),
+        "a lame-duck setting alone must flip health"
+    );
+    assert!(!state.is_lame_duck());
+    assert!(state.is_drained());
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_exit_during_lame_duck_without_report_draining_keeps_draining() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx.clone(),
+        state.clone(),
+        false,
+        Some(Duration::from_secs(600)),
+    ));
+    term_tx.send(1).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(state.is_lame_duck());
+    assert!(!state.is_drained(), "never drained during the lame duck");
+
+    // The endpoint exit, as `wait_for_shutdown` sends it.
+    shutdown_tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("an endpoint exit must end the lame duck, not wait out the period")
+        .unwrap();
+    assert!(*shutdown_rx.borrow());
+    assert!(!state.is_lame_duck());
+    assert!(
+        state.is_draining(),
+        "health must stay 503 after the lame duck"
+    );
+    assert!(state.is_drained(), "an idle node must read as drained");
+}
+
+#[tokio::test(start_paused = true)]
+async fn count_termination_signals_counts_each_signal_until_the_stream_ends() {
+    let (term_tx, term_rx) = tokio::sync::watch::channel(0u32);
+    count_termination_signals(
+        futures::stream::iter(["SIGTERM", "SIGINT", "SIGTERM"]),
+        term_tx,
+    )
+    .await;
+    assert_eq!(*term_rx.borrow(), 3, "one count per signal");
+}
+
+#[tokio::test(start_paused = true)]
+async fn count_termination_signals_counts_nothing_for_a_closed_stream() {
+    let (term_tx, term_rx) = tokio::sync::watch::channel(0u32);
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        count_termination_signals(futures::stream::empty(), term_tx),
+    )
+    .await
+    .expect("a closed stream must end the listener, not spin");
+    assert_eq!(*term_rx.borrow(), 0, "a closed stream is not a signal");
+}
+
+#[tokio::test(start_paused = true)]
+async fn count_termination_signals_stops_once_nothing_watches() {
+    let (term_tx, term_rx) = tokio::sync::watch::channel(0u32);
+    let (signal_tx, signal_rx) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+    let handle = lore_base::lore_spawn!(count_termination_signals(
+        tokio_stream::wrappers::UnboundedReceiverStream::new(signal_rx),
+        term_tx,
+    ));
+    signal_tx.send("SIGTERM").unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(*term_rx.borrow(), 1);
+    assert!(
+        !handle.is_finished(),
+        "an open stream keeps the listener up"
+    );
+
+    drop(term_rx);
+    signal_tx.send("SIGINT").unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("the listener must stop once the count has no watcher")
+        .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn second_termination_signal_ends_lame_duck_early() {
+    let (term_tx, shutdown_tx, shutdown_rx, state) = lame_duck_harness();
+    let handle = lore_base::lore_spawn!(lame_duck_then_shutdown(
+        term_tx.subscribe(),
+        shutdown_tx,
+        state.clone(),
+        false,
+        Some(Duration::from_secs(600)),
+    ));
+    term_tx.send(1).unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(state.is_lame_duck());
+    assert!(!*shutdown_rx.borrow());
+
+    term_tx.send(2).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("a second signal must end the lame duck, not wait out the period")
+        .unwrap();
+    assert!(*shutdown_rx.borrow());
+    assert!(!state.is_lame_duck());
+    assert!(state.is_draining());
 }

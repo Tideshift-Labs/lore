@@ -652,6 +652,17 @@ pub struct ServerSettings {
     /// forever.
     #[serde(default = "default_drain_stall_timeout")]
     pub drain_stall_timeout_seconds: u32,
+    /// Seconds between the shutdown signal and the end of admission. For this
+    /// long the health check reports 503 while gRPC and QUIC keep serving, so
+    /// a front that probes health stops routing here before any request is
+    /// refused. Set it above the front's detection time. 0 (the default)
+    /// closes admission at the signal. The drain and connection-close
+    /// timeouts start after it, so an orchestrator's stop grace must exceed
+    /// this plus `drain_timeout_seconds` plus `connection_close_timeout_seconds`
+    /// plus `runtime_shutdown_timeout_seconds`. A second shutdown signal ends
+    /// the lame-duck period early.
+    #[serde(default)]
+    pub lame_duck_seconds: u32,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
     /// Disk space monitoring for the local store paths.

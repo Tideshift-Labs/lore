@@ -137,6 +137,36 @@ async fn test_draining_server_is_not_healthy() {
 }
 
 #[tokio::test]
+async fn test_lame_duck_server_is_not_healthy() {
+    // Lame duck still serves traffic, but health must already read 503 so a
+    // probing front stops routing here.
+    let drain = DrainState::new();
+    drain.begin_lame_duck();
+
+    let health = Arc::new(ServerHealth {
+        immutable_store: Weak::<lore_storage::LocalImmutableStore>::new(),
+        available: AtomicBool::new(true),
+        interval_timeout: None,
+        store_health_check: false,
+        drain: Some(drain),
+        write_behind: None,
+        event_relay: None,
+        fragment_prune: None,
+        cell_retention: None,
+    });
+
+    let app = axum::Router::new().route(
+        "/health_check",
+        routing::get(lore_server::http::health_check::handler).with_state(health),
+    );
+    let test_server = TestServer::new(app).unwrap();
+
+    let response = test_server.get("/health_check").await;
+
+    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[tokio::test]
 async fn test_non_draining_server_with_drain_state_is_healthy() {
     // A DrainState is present (graceful_drain enabled) but no drain has
     // been triggered yet — behavior must be unchanged from the

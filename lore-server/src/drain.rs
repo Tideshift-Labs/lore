@@ -199,6 +199,9 @@ impl<C> Drop for HandshakeGuard<C> {
 #[derive(Default)]
 pub struct DrainState {
     draining: AtomicBool,
+    /// True while the node reports unhealthy but still serves everything, so
+    /// the front stops routing to it before admission ends. Never drained.
+    lame_duck: AtomicBool,
     registries: Mutex<Vec<Arc<QuinnConnectionRegistry>>>,
     active_rpc_requests: AtomicU64,
     public_grpc_servers: AtomicU64,
@@ -215,12 +218,32 @@ impl DrainState {
 
     /// Marks the process as draining for the health/status surface. The
     /// per-endpoint accept loops flip via their own registry in `run_drain`.
+    ///
+    /// Release/Acquire (as for `lame_duck`): `begin_lame_duck` stores
+    /// `lame_duck` before `draining`, so a reader that sees `draining` also
+    /// sees `lame_duck` and `is_drained` cannot read true at the lame-duck start.
     pub fn begin_drain(&self) {
-        self.draining.store(true, Ordering::Relaxed);
+        self.draining.store(true, Ordering::Release);
     }
 
     pub fn is_draining(&self) -> bool {
-        self.draining.load(Ordering::Relaxed)
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Enters the lame-duck phase: health goes 503 at once, but nothing stops
+    /// serving and the node never reads as drained until it ends.
+    pub fn begin_lame_duck(&self) {
+        self.lame_duck.store(true, Ordering::Release);
+        self.begin_drain();
+    }
+
+    /// Ends the lame-duck phase; admission is about to close.
+    pub fn end_lame_duck(&self) {
+        self.lame_duck.store(false, Ordering::Release);
+    }
+
+    pub fn is_lame_duck(&self) -> bool {
+        self.lame_duck.load(Ordering::Acquire)
     }
 
     /// QUIC connections plus pending handshakes across all endpoints. RPCs have
@@ -263,7 +286,7 @@ impl DrainState {
 
     /// A zero request count alone is not proof that gRPC admission has ended.
     pub fn is_drained(&self) -> bool {
-        self.is_draining() && self.is_idle()
+        self.is_draining() && !self.is_lame_duck() && self.is_idle()
     }
 
     fn is_idle(&self) -> bool {
@@ -435,6 +458,107 @@ pub async fn run_drain<C: DrainConnection + Clone>(
         }
 
         ticker.tick().await;
+    }
+}
+
+/// Turn a termination signal into the shutdown signal every endpoint drains on.
+///
+/// With a lame-duck period the health check goes 503 at the signal while gRPC
+/// and QUIC keep admitting work, so a front that probes health stops routing
+/// here before admission closes. Only then does `shutdown_tx` fire. Without
+/// one, `report_draining` alone decides whether health flips, and the shutdown
+/// signal follows at once (the behavior before the lame-duck phase existed).
+///
+/// `termination_rx` counts the termination signals received. A second signal
+/// during the lame-duck period ends it early, so an operator can skip the wait.
+///
+/// An endpoint that exits sends the shutdown signal itself. Before any
+/// termination signal, that skips the lame duck and only marks the node as
+/// draining (when `report_draining` or a lame-duck period is set, as for a
+/// termination signal); during the lame-duck period, the wait ends early
+/// rather than serving on.
+pub async fn lame_duck_then_shutdown(
+    mut termination_rx: tokio::sync::watch::Receiver<u32>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    drain_state: Arc<DrainState>,
+    report_draining: bool,
+    lame_duck: Option<Duration>,
+) {
+    // A lame-duck period reports draining at the signal, so an endpoint exit
+    // must too: `/drain_status` documents either setting as flipping health.
+    let report_draining = report_draining || lame_duck.is_some();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let terminated = tokio::select! {
+        signalled = termination_rx.wait_for(|&n| n > 0) => signalled.is_ok(),
+        _ = shutdown_rx.wait_for(|&v| v) => false,
+    };
+    if !terminated {
+        // Shutdown came from an endpoint exit, or the signal listener is gone
+        // and only an endpoint exit can end the server now. This task holds a
+        // sender, so the wait cannot fail.
+        let _ = shutdown_rx.wait_for(|&v| v).await;
+        if report_draining {
+            info!(
+                "Graceful drain: shutdown without a termination signal, marking server as draining"
+            );
+            drain_state.begin_drain();
+        }
+        return;
+    }
+    match lame_duck {
+        Some(period) => {
+            drain_state.begin_lame_duck();
+            info!(
+                lame_duck_seconds = period.as_secs(),
+                "Lame duck: health reports 503, still serving gRPC and QUIC"
+            );
+            let second_signal = async {
+                if termination_rx.wait_for(|&n| n > 1).await.is_err() {
+                    // The listener is gone; only the period or a shutdown ends the wait.
+                    std::future::pending::<()>().await;
+                }
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(period) => {
+                    info!("Lame duck period elapsed: closing admission and draining");
+                }
+                _ = second_signal => {
+                    warn!("Lame duck ended early: second termination signal received");
+                }
+                _ = shutdown_rx.wait_for(|&v| v) => {
+                    warn!("Lame duck ended early: shutdown was already signalled");
+                }
+            }
+            drain_state.end_lame_duck();
+        }
+        None => {
+            if report_draining {
+                info!("Graceful drain: marking server as draining");
+                drain_state.begin_drain();
+            }
+        }
+    }
+    let _ = shutdown_tx.send(true);
+}
+
+/// Count each termination signal `signals` yields into `termination_tx`, which
+/// `lame_duck_then_shutdown` watches. Returns when the stream ends or nothing
+/// watches the count any more. The OS signal sources are wrapped by the
+/// server's `listen_for_termination`; a test can inject any stream here.
+pub async fn count_termination_signals<S>(
+    signals: S,
+    termination_tx: tokio::sync::watch::Sender<u32>,
+) where
+    S: futures::Stream<Item = &'static str>,
+{
+    use futures::StreamExt;
+    let mut signals = std::pin::pin!(signals);
+    while let Some(name) = signals.next().await {
+        info!("Received {name}. Initiating graceful shutdown");
+        termination_tx.send_modify(|count| *count = count.saturating_add(1));
+        if termination_tx.is_closed() {
+            return;
+        }
     }
 }
 

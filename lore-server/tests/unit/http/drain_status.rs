@@ -133,3 +133,30 @@ async fn drain_status_is_reachable_through_the_full_app_router_without_a_token()
 
     assert_eq!(response.status_code(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn lame_duck_is_reported_and_blocks_drained() {
+    let drain = DrainState::new();
+    drain.begin_lame_duck();
+    let test_server = app(health_with_drain(Some(drain.clone())));
+
+    let body: Value = test_server.get("/drain_status").await.json();
+    assert_eq!(body["lame_duck"], true);
+    assert_eq!(body["draining"], true);
+    assert_eq!(
+        body["drained"], false,
+        "lame duck must never read as drained"
+    );
+
+    drain.end_lame_duck();
+    let body: Value = test_server.get("/drain_status").await.json();
+    assert_eq!(body["lame_duck"], false);
+    assert_eq!(body["draining"], true);
+}
+
+#[tokio::test]
+async fn lame_duck_is_false_without_a_drain_state() {
+    let test_server = app(health_with_drain(None));
+    let body: Value = test_server.get("/drain_status").await.json();
+    assert_eq!(body["lame_duck"], false);
+}

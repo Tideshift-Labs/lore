@@ -2302,3 +2302,49 @@ fn test_config_validation_summary() {
     println!("╚════════════════════════════════════════════════════════════════╝");
     println!("\n");
 }
+
+/// Settings deserialize only from a `'static` string, so the two variants are
+/// built at compile time instead of by a runtime `replace`.
+macro_rules! lame_duck_config {
+    ($server_extra:literal) => {
+        concat!(
+            "[server]\nruntime_shutdown_timeout_seconds = 0\n",
+            $server_extra,
+            r#"
+            [server.http]
+            enabled = false
+            host = "127.0.0.1"
+            max_file_size = 1024
+            port = 8080
+            request_timeout_seconds = 30
+            request_body_timeout_seconds = 30
+            available_interval_seconds = 5
+            available_timeout_seconds = 30
+            store_health_check = false
+
+            [immutable_store]
+            mode = "local"
+
+            [immutable_store.local]
+            path = "/tmp/immutable"
+            flush_delay_seconds = 5
+
+            [mutable_store]
+            mode = "local"
+
+            [mutable_store.local]
+            path = "/tmp/mutable"
+            flush_delay_seconds = 5
+            "#
+        )
+    };
+}
+
+#[test]
+fn test_lame_duck_seconds_defaults_to_zero_when_absent() {
+    let settings: Settings = toml::from_str(lame_duck_config!("")).unwrap();
+    assert_eq!(settings.server.lame_duck_seconds, 0);
+
+    let settings: Settings = toml::from_str(lame_duck_config!("lame_duck_seconds = 6\n")).unwrap();
+    assert_eq!(settings.server.lame_duck_seconds, 6);
+}

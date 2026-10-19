@@ -475,9 +475,11 @@ async fn wait_for_shutdown(
     }
 }
 
-async fn listen_for_termination(shutdown_tx: tokio::sync::watch::Sender<bool>) -> Result<()> {
+/// Counts termination signals into `termination_tx`. The first starts the
+/// shutdown; a second during the lame-duck period ends that period early.
+async fn listen_for_termination(termination_tx: tokio::sync::watch::Sender<u32>) -> Result<()> {
     #[cfg(unix)]
-    let (mut ctrl_c, mut sigterm) = {
+    let (ctrl_c, sigterm) = {
         use tokio::signal::unix::SignalKind;
         use tokio::signal::unix::signal;
         (
@@ -486,27 +488,36 @@ async fn listen_for_termination(shutdown_tx: tokio::sync::watch::Sender<bool>) -
         )
     };
 
+    // Only `Some` is a signal. A stream that has closed yields `None` at once,
+    // so it disables its branch instead of spinning or counting fake signals;
+    // with both closed the stream ends.
     #[cfg(unix)]
-    tokio::select! {
-        _ = ctrl_c.recv() => {
-            info!("Received SIGINT. Initiating graceful shutdown");
-        },
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM. Initiating graceful shutdown");
-        }
-    }
+    let signals =
+        futures::stream::unfold((ctrl_c, sigterm), |(mut ctrl_c, mut sigterm)| async move {
+            let name = tokio::select! {
+                Some(()) = ctrl_c.recv() => "SIGINT",
+                Some(()) = sigterm.recv() => "SIGTERM",
+                else => return None,
+            };
+            Some((name, (ctrl_c, sigterm)))
+        });
 
+    // One persistent listener, so no signal is lost between two registrations.
     #[cfg(windows)]
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Received CTRL-C. Initiating graceful shutdown");
-        }
+    let signals = match tokio::signal::windows::ctrl_c() {
+        Ok(ctrl_c) => futures::stream::unfold(ctrl_c, |mut ctrl_c| async move {
+            ctrl_c.recv().await.map(|()| ("CTRL-C", ctrl_c))
+        }),
         Err(err) => {
-            eprintln!("Unable to listen for shutdown signal: {err}");
+            // As before the lame-duck phase: a server that cannot hear a
+            // shutdown signal shuts down rather than run unstoppable.
+            error!("Unable to listen for shutdown signal: {err}");
+            termination_tx.send_modify(|count| *count = count.saturating_add(1));
+            return Ok(());
         }
-    }
+    };
 
-    let _ = shutdown_tx.send(true);
+    crate::drain::count_termination_signals(signals, termination_tx).await;
     Ok(())
 }
 
@@ -2923,29 +2934,26 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         };
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
+    let (termination_tx, termination_rx) = tokio::sync::watch::channel(0u32);
     let mut endpoints = JoinSet::new();
 
     // Spawn signal listener outside the endpoint JoinSet so the drain
     // timeout only starts after the signal fires.
-    lore_spawn!({
-        let shutdown_tx = shutdown_tx.clone();
-        listen_for_termination(shutdown_tx)
-    });
+    lore_spawn!(listen_for_termination(termination_tx));
 
-    if graceful_drain {
-        // Flip the aggregate draining flag the moment the signal fires so the
-        // health check goes 503 and the LB starts pulling the node while the
-        // per-endpoint drains run.
-        lore_spawn!({
-            let drain_state = drain_state.clone();
-            let mut shutdown_rx = _shutdown_rx.clone();
-            async move {
-                let _ = shutdown_rx.wait_for(|&v| v).await;
-                info!("Graceful drain: marking server as draining");
-                drain_state.begin_drain();
-            }
-        });
-    }
+    // The signal flips the aggregate draining flag at once, so the health
+    // check goes 503 and the LB starts pulling the node. With a lame-duck
+    // period every endpoint keeps admitting work for that long before the
+    // shutdown signal (and so every drain and its timeout) starts.
+    let lame_duck = (settings.server.lame_duck_seconds > 0)
+        .then(|| Duration::from_secs(settings.server.lame_duck_seconds as u64));
+    lore_spawn!(crate::drain::lame_duck_then_shutdown(
+        termination_rx,
+        shutdown_tx.clone(),
+        drain_state.clone(),
+        graceful_drain,
+        lame_duck,
+    ));
 
     // Declared outside the maintenance branch so the HTTP surface below can
     // report the facets whether or not a relay was built. A maintenance-mode
