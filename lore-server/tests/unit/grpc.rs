@@ -10,6 +10,7 @@ mod forwarded_requests;
 mod forwarded_revision;
 mod generation_store;
 mod handlers;
+mod listener_shutdown;
 mod lock_service;
 mod notification_service;
 mod repository;

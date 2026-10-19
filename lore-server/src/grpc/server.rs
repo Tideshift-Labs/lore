@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -28,11 +31,13 @@ use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use serde::Deserialize;
+use tokio_stream::Stream;
 use tonic::service::Routes;
 use tonic::transport::Certificate;
 use tonic::transport::Identity;
 use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::Server;
+use tonic::transport::server::TcpIncoming;
 use tower::Layer;
 use tower::ServiceBuilder;
 use tower::layer::util::Stack;
@@ -1184,12 +1189,11 @@ impl GrpcServerBuilder<WantsAddress> {
         addr: SocketAddr,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
-        lore_spawn_net!(serve_with_drain_guard(
-            self.0.public_grpc_guard,
-            async move { self.0.router.serve_with_shutdown(addr, signal).await }
-        ))
-        .await??;
-        Ok(())
+        // Bound the way tonic's own `serve_with_shutdown` binds, so the socket
+        // options are unchanged; serving it ourselves is what lets the listener
+        // close at the signal.
+        let listener = std::net::TcpListener::bind(addr)?;
+        self.serve_with_listener(listener, signal).await
     }
 
     /// Serve on a socket the caller already bound, so the port is held from the moment it is
@@ -1213,11 +1217,13 @@ impl GrpcServerBuilder<WantsAddress> {
             async move {
                 listener.set_nonblocking(true)?;
                 let listener = tokio::net::TcpListener::from_std(listener)?;
+                // tonic's own signal never fires: the incoming stream ends at
+                // `signal` instead, and tonic drains gracefully when it does.
                 self.0
                     .router
                     .serve_with_incoming_shutdown(
-                        tokio_stream::wrappers::TcpListenerStream::new(listener),
-                        signal,
+                        ShutdownIncoming::new(listener, signal),
+                        std::future::pending(),
                     )
                     .await
                     .map_err(anyhow::Error::from)
@@ -1225,6 +1231,48 @@ impl GrpcServerBuilder<WantsAddress> {
         ))
         .await??;
         Ok(())
+    }
+}
+
+/// Accepts on a listener until the shutdown signal resolves, then closes it.
+///
+/// tonic stops accepting at its shutdown signal but holds the listener open until every
+/// connection it served has closed. A new connect then completes in the kernel and waits in
+/// the backlog, never handshaken, for as long as the slowest in-flight stream on an old
+/// connection runs. Ending the stream here drops the socket at the signal, so a new connect is
+/// refused at once, while tonic still drains the connections it already has.
+///
+/// On Linux, a connection still in the backlog (completed but not yet accepted) gets a RST when
+/// the listener drops; the lame-duck period in front makes this rare.
+struct ShutdownIncoming<F> {
+    incoming: Option<TcpIncoming>,
+    signal: Pin<Box<F>>,
+}
+
+impl<F: Future<Output = ()>> ShutdownIncoming<F> {
+    fn new(listener: tokio::net::TcpListener, signal: F) -> Self {
+        Self {
+            // `TCP_NODELAY` as tonic's own bind sets it.
+            incoming: Some(TcpIncoming::from(listener).with_nodelay(Some(true))),
+            signal: Box::pin(signal),
+        }
+    }
+}
+
+impl<F: Future<Output = ()>> Stream for ShutdownIncoming<F> {
+    type Item = std::io::Result<tokio::net::TcpStream>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        // The signal is not polled again once the listener is gone.
+        if this.incoming.is_some() && this.signal.as_mut().poll(cx).is_ready() {
+            info!("gRPC listener closed: new connections are refused while existing ones drain");
+            this.incoming = None;
+        }
+        match this.incoming.as_mut() {
+            Some(incoming) => Pin::new(incoming).poll_next(cx),
+            None => Poll::Ready(None),
+        }
     }
 }
 
