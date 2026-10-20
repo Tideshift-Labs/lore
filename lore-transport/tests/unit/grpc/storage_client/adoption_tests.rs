@@ -115,6 +115,16 @@ enum Reply {
     Loss,
     Refusal,
     Hold,
+    /// Never return from the first Put open: no response headers, so a client request occupies
+    /// the channel. Later opens are answered normally.
+    StallOpen,
+    /// Answer after this pause. The client channel also admits one request at a time, so the
+    /// others queue on the client before the transport takes their message.
+    Paced(Duration),
+    /// The server serialises Puts on a mutex and answers each after this pause once it holds it.
+    Serialized(Duration),
+    /// Answer after this pause; the server admits one HTTP/2 stream at a time.
+    OneStream(Duration),
     ItemCancelled,
     ItemAborted,
     ItemUnknown(u32, &'static str, &'static str),
@@ -132,6 +142,9 @@ struct FixtureServer {
     seen: Arc<parking_lot::Mutex<Vec<Seen>>>,
     items: Arc<AtomicUsize>,
     reply: Reply,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    /// Ends the stalled first open (see `Reply::StallOpen`), freeing the client's slot.
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl FixtureServer {
@@ -179,6 +192,12 @@ impl Service for FixtureServer {
         if matches!(self.reply, Reply::Refusal) {
             return Err(refusal());
         }
+        // Only the first open stalls; a later one is served, so a message that leaks onto a
+        // freed slot is read and counted.
+        if matches!(self.reply, Reply::StallOpen) && self.seen.lock().len() == 1 {
+            self.release.notified().await;
+            return Err(Status::unavailable("slot released"));
+        }
         let attempt = request
             .metadata()
             .get("lore-attempt-id")
@@ -190,6 +209,7 @@ impl Service for FixtureServer {
         let items = self.items.clone();
         let journal = self.journal.clone();
         let reply = self.reply;
+        let gate = self.gate.clone();
         Ok(Response::new(Box::pin(async_stream::stream! {
             while let Some(Ok(item)) = requests.next().await {
                 if managed {
@@ -203,6 +223,19 @@ impl Service for FixtureServer {
                 match reply {
                     Reply::Loss => { yield Err(Status::unavailable("response lost")); return; }
                     Reply::Hold => { std::future::pending::<()>().await; }
+                    Reply::Serialized(pause) => {
+                        let _turn = gate.lock().await;
+                        tokio::time::sleep(pause).await;
+                        yield Ok(storage_v1::PutResponse { address: item.address, status: None });
+                    }
+                    Reply::OneStream(pause) => {
+                        tokio::time::sleep(pause).await;
+                        yield Ok(storage_v1::PutResponse { address: item.address, status: None });
+                    }
+                    Reply::Paced(pause) => {
+                        tokio::time::sleep(pause).await;
+                        yield Ok(storage_v1::PutResponse { address: item.address, status: None });
+                    }
                     Reply::ItemCancelled => yield Ok(storage_v1::PutResponse { address: item.address, status: Some(model_v1::ItemStatus { code: 1, message: "decisive per-item cancellation".into(), ..Default::default() }) }),
                     Reply::ItemAborted => yield Ok(storage_v1::PutResponse { address: item.address, status: Some(model_v1::ItemStatus { code: 10, message: "decisive per-item abort".into(), ..Default::default() }) }),
                     Reply::ItemUnknown(version, operation, attempt) => yield Ok(storage_v1::PutResponse { address: item.address, status: Some(model_v1::ItemStatus { code: 0, outcome_unknown_version: version, outcome_unknown_operation: operation.into(), outcome_unknown_attempt: attempt.into(), ..Default::default() }) }),
@@ -305,6 +338,7 @@ struct Fixture {
     journal: Arc<Journal>,
     seen: Arc<parking_lot::Mutex<Vec<Seen>>>,
     items: Arc<AtomicUsize>,
+    release: Arc<tokio::sync::Notify>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -316,9 +350,13 @@ impl Drop for Fixture {
 
 impl Fixture {
     async fn new(reply: Reply) -> Self {
+        Self::with_idle(reply, None).await
+    }
+    async fn with_idle(reply: Reply, idle: Option<Duration>) -> Self {
         let journal = Arc::new(Journal::default());
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let items = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let service = FixtureServer {
@@ -326,19 +364,22 @@ impl Fixture {
             seen: seen.clone(),
             items: items.clone(),
             reply,
+            gate: Arc::default(),
+            release: release.clone(),
         };
         let server = lore_base::lore_spawn!(async move {
             tonic::transport::Server::builder()
+                .max_concurrent_streams(matches!(reply, Reply::OneStream(_)).then_some(1))
                 .add_service(StorageServiceServer::new(service))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await
                 .unwrap();
         });
-        let channel = tonic::transport::Channel::from_shared(url.clone())
-            .unwrap()
-            .connect()
-            .await
-            .unwrap();
+        let mut endpoint = tonic::transport::Channel::from_shared(url.clone()).unwrap();
+        if matches!(reply, Reply::Paced(_) | Reply::StallOpen) {
+            endpoint = endpoint.concurrency_limit(1);
+        }
+        let channel = endpoint.connect().await.unwrap();
         let channel = tower::ServiceBuilder::new()
             .layer(lore_transport::grpc::RequestLoggerLayer {})
             .service(channel);
@@ -346,11 +387,17 @@ impl Fixture {
             url.parse().unwrap(),
             channel,
         ));
+        let service = StorageService::new(connection);
+        let service = match idle {
+            Some(idle) => service.with_stream_idle_timeout(idle),
+            None => service,
+        };
         Self {
-            service: StorageService::new(connection),
+            service,
             journal,
             seen,
             items,
+            release,
             server,
         }
     }
@@ -826,4 +873,260 @@ async fn resolved_put_and_mutable_unaries_journal_before_loss_without_replay() {
         assert!(seen[0].journaled_before_body);
         assert_eq!(seen[0].attempt, Some(unresolved[0].attempt_id.as_uuid()));
     }
+}
+
+/// A managed single-message Put whose answer never comes is bounded by the idle duration and
+/// reads as an unknown outcome; the journal keeps the attempt unresolved. Pre-change the put
+/// waits forever (the fixture's own 5 s bound then fails the test).
+#[tokio::test]
+async fn silent_managed_put_is_bounded_unknown_and_stays_unresolved() {
+    let f = Fixture::with_idle(Reply::Hold, Some(Duration::from_secs(1))).await;
+    let started = std::time::Instant::now();
+    let error = with_caller_operation(f.operation(), f.put(40))
+        .await
+        .unwrap_err();
+    assert!(error.is_outcome_unknown(), "{error:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "must wait out the idle bound, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(f.items.load(Ordering::SeqCst), 1);
+    assert_eq!(f.journal.unresolved().await.unwrap().len(), 1);
+}
+
+/// Time spent queued behind other uploads is not idleness: 8 concurrent managed Puts against a
+/// server that answers one Put per 300 ms (idle 1 s) all succeed, although the last waits 2.4 s.
+/// Measured before the fix: 3 Ok, 5 unknown outcomes.
+#[tokio::test]
+async fn queued_managed_puts_are_not_cut_by_the_idle_bound() {
+    let f = Fixture::with_idle(
+        Reply::Paced(Duration::from_millis(300)),
+        Some(Duration::from_secs(1)),
+    )
+    .await;
+    let results = futures::future::join_all(
+        (0..8u8).map(|tag| with_caller_operation(f.operation(), f.put(50 + tag))),
+    )
+    .await;
+    for result in results {
+        result.expect("a queued managed put must succeed");
+    }
+    assert_eq!(f.items.load(Ordering::SeqCst), 8);
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
+}
+
+async fn eight_queued_managed_puts(reply: Reply) {
+    let f = Fixture::with_idle(reply, Some(Duration::from_secs(1))).await;
+    // Warm-up: let the server's SETTINGS (one stream at a time) reach the client first. A burst
+    // sent before them is refused by the server with REFUSED_STREAM, which is not queueing.
+    // Managed, so its stream closes: a pooled plain Put would hold the only slot.
+    with_caller_operation(f.operation(), f.put(59))
+        .await
+        .unwrap();
+    let results = futures::future::join_all(
+        (0..8u8).map(|tag| with_caller_operation(f.operation(), f.put(60 + tag))),
+    )
+    .await;
+    for result in results {
+        let ok = result.as_ref().is_ok();
+        assert!(
+            ok,
+            "a put queued behind others must succeed: {:?}",
+            result.err()
+        );
+    }
+    assert_eq!(f.items.load(Ordering::SeqCst), 9, "warm-up plus eight");
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
+}
+
+/// The server serialises Puts on a mutex and answers each 300 ms after taking it. The shared
+/// progress clock moves with every answer, so the queue is not silence.
+#[tokio::test]
+async fn server_side_mutex_queue_does_not_cut_managed_puts() {
+    eight_queued_managed_puts(Reply::Serialized(Duration::from_millis(300))).await;
+}
+
+/// The same with the server admitting one HTTP/2 stream at a time.
+#[tokio::test]
+async fn single_stream_server_queue_does_not_cut_managed_puts() {
+    eight_queued_managed_puts(Reply::OneStream(Duration::from_millis(300))).await;
+}
+
+/// No stream slot: the channel admits one request at a time and a stalled open holds it, so a
+/// managed Put's message is never taken. After the idle bound the attempt is settled `NotApplied`
+/// and the call returns `Disconnected` for the reconnect layer; never Unresolved or an unknown
+/// outcome, and never a hang. The server sees no Put message at all.
+///
+/// A peer that advertises `max_concurrent_streams(0)` behaves the same way: the body is never
+/// polled, so the Put is not sent (observed by the third review pass: `Disconnected`, `NotApplied`).
+#[tokio::test]
+async fn managed_put_with_no_stream_slot_is_not_applied_and_disconnected() {
+    let f = Fixture::with_idle(Reply::StallOpen, Some(Duration::from_secs(1))).await;
+    // A second service on the same channel, with the default 60 s idle, holds the only slot.
+    let blocker = Arc::new(StorageService::new(f.service.connection_for_test().clone()));
+    let blocker_ctx = f.context();
+    #[allow(clippy::disallowed_methods)] // Test-local slot holder.
+    let held = tokio::spawn({
+        let blocker = blocker.clone();
+        async move {
+            let _ = blocker
+                .put(
+                    0,
+                    &blocker_ctx,
+                    Address::zero_context_hash(Hash::from([69; 32])),
+                    Fragment {
+                        flags: 0,
+                        size_payload: 1,
+                        size_content: 1,
+                    },
+                    Some(Bytes::from_static(b"x")),
+                )
+                .await;
+        }
+    });
+    while f.seen.lock().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let operation = f.operation();
+    let started = std::time::Instant::now();
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        with_caller_operation(
+            operation,
+            f.service.put(
+                0,
+                &f.context(),
+                Address::zero_context_hash(Hash::from([70; 32])),
+                Fragment {
+                    flags: 0,
+                    size_payload: 1,
+                    size_content: 1,
+                },
+                Some(Bytes::from_static(b"x")),
+            ),
+        ),
+    )
+    .await
+    .expect("a slot that never comes must not hang the put")
+    .unwrap_err();
+    assert!(error.is_disconnected(), "{error:?}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
+    let records = f.journal.records.lock().clone();
+    assert_eq!(records.len(), 1);
+    let record = f
+        .journal
+        .lookup(&records[0].attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.state,
+        lore_transport::attempt_store::AttemptState::Resolved(AttemptResolution::NotApplied)
+    );
+    assert_eq!(
+        f.items.load(Ordering::SeqCst),
+        0,
+        "no Put message reached the server"
+    );
+    assert_eq!(
+        f.seen.lock().len(),
+        1,
+        "only the slot holder's open arrived"
+    );
+    held.abort();
+}
+
+/// One round: the slot is held, a managed Put is abandoned unsent, then the slot is freed.
+async fn abandoned_put_round(tag: u8) {
+    let f = Fixture::with_idle(Reply::StallOpen, Some(Duration::from_secs(1))).await;
+    let blocker = Arc::new(StorageService::new(f.service.connection_for_test().clone()));
+    let blocker_ctx = f.context();
+    #[allow(clippy::disallowed_methods)] // Test-local slot holder.
+    let held = tokio::spawn({
+        let blocker = blocker.clone();
+        async move {
+            let _ = blocker
+                .put(
+                    0,
+                    &blocker_ctx,
+                    Address::zero_context_hash(Hash::from([tag; 32])),
+                    Fragment {
+                        flags: 0,
+                        size_payload: 1,
+                        size_content: 1,
+                    },
+                    Some(Bytes::from_static(b"x")),
+                )
+                .await;
+        }
+    });
+    while f.seen.lock().is_empty() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        with_caller_operation(
+            f.operation(),
+            f.service.put(
+                0,
+                &f.context(),
+                Address::zero_context_hash(Hash::from([tag.wrapping_add(100); 32])),
+                Fragment {
+                    flags: 0,
+                    size_payload: 1,
+                    size_content: 1,
+                },
+                Some(Bytes::from_static(b"x")),
+            ),
+        ),
+    )
+    .await
+    .expect("a slot that never comes must not hang the put")
+    .unwrap_err();
+    assert!(error.is_disconnected(), "round {tag}: {error:?}");
+    let records = f.journal.records.lock().clone();
+    assert_eq!(records.len(), 1, "round {tag}");
+    let record = f
+        .journal
+        .lookup(&records[0].attempt_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record.state,
+        lore_transport::attempt_store::AttemptState::Resolved(AttemptResolution::NotApplied),
+        "round {tag}"
+    );
+    // Free the slot: the server ends the stalled open.
+    f.release.notify_one();
+    let _ = held.await;
+    drop(blocker);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        f.items.load(Ordering::SeqCst),
+        0,
+        "round {tag}: an abandoned put's message reached the server once the slot freed"
+    );
+    // The slot really is free: a fresh put goes through, and is the only message the server
+    // ever read.
+    with_caller_operation(f.operation(), f.put(tag.wrapping_add(50)))
+        .await
+        .unwrap_or_else(|e| panic!("round {tag}: the freed slot did not serve a fresh put: {e:?}"));
+    assert_eq!(f.items.load(Ordering::SeqCst), 1, "round {tag}");
+    assert!(
+        f.journal.unresolved().await.unwrap().is_empty(),
+        "round {tag}"
+    );
+}
+
+/// An abandoned managed Put (settled `NotApplied`, returned `Disconnected`) must never be sent
+/// afterwards, when the slot it was queued for finally frees: the reconnect layer may resend it
+/// under a fresh attempt, and a leaked original would apply twice. The leak was a race, so the
+/// case runs many times at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_abandoned_managed_put_is_never_sent_when_the_slot_frees() {
+    futures::future::join_all((0..10u8).map(abandoned_put_round)).await;
 }

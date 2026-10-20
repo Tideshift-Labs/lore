@@ -41,6 +41,15 @@ Durable, recurring testing lessons grouped by topic.
   skip), arms `<anchor>.hold` BEFORE starting the operation, and drives the race inside
   `tokio::join!(operation, async { wait .reached; race; remove .hold })` (no spawn needed; the
   paused GET holds no DB resource). Reference: `lore-postgres/src/store/fragment_write_behind_staged_read_tests.rs`.
+- **Hang regressions over h2 (`lore-transport`)**: symptom: a tonic server cannot reproduce a
+  proxy-only hang. Cause: tonic closes the request body with its trailers-only refusal; a front
+  that keeps the body open does not. Do: a raw `h2::server` (dev-dep) that answers trailers-only
+  and keeps draining the body, plus a per-call `tokio::time::timeout` that panics, so a hang is a
+  named failure. Reference: `lore-transport/tests/unit/grpc/storage_client/stream_deadline_tests.rs`.
+  Seam: `StorageService::with_stream_idle_timeout` (feature `test-util`).
+- **tonic `connect_timeout` is not a handshake bound**: a peer that accepts TCP and never speaks h2
+  still returns from `Endpoint::connect()`; only the per-RPC `timeout` ends the call (30 s on the
+  auth channel, measured). Those two tests are `#[ignore]` (real 30 s): run with `-- --ignored`.
 
 ## Fixtures and white-box seams
 

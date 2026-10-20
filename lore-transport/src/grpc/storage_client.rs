@@ -3,9 +3,12 @@
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::BufMut;
 use bytes::Bytes;
@@ -17,6 +20,7 @@ use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_error;
 use lore_base::lore_spawn_net;
+use lore_base::lore_warn;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -30,10 +34,13 @@ use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::storage::v1 as storage_v1;
 use lore_proto::lore::storage::v1::storage_service_client::StorageServiceClient;
 use prost::Message;
+use tokio::sync::Notify;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio::time::Instant;
 use tokio_stream::StreamExt;
+use tokio_util::sync::CancellationToken;
 use tonic::metadata::MetadataValue;
 
 use super::CORRELATION_ID_HEADER;
@@ -123,15 +130,184 @@ impl Verb {
 
 type StreamItem<K, S> = (K, oneshot::Sender<Result<S, ProtocolError>>);
 
-/// A live stream's request channel plus whether its RPC ever opened.
+/// How long a stream may hold an unanswered request without making any progress before the
+/// request gives up on it, unless `LORE_GRPC_STREAM_IDLE_TIMEOUT` (seconds) says otherwise.
 ///
-/// `opened` is what lets `StreamCache::request` tell a stream that died mid-flight from one
-/// that never established, since the sender is handed out before the RPC is attempted. By
-/// the time a request observes a failure the flag has settled: either the reader task
-/// answered it, or the task exited and dropped the channel.
+/// Progress, not age: a request taken off the stream by the transport and any response at all
+/// both count, so a long upload that keeps moving is never cut. Fragments are at most
+/// `FRAGMENT_SIZE_THRESHOLD`, so one request never needs anything like this long on its own.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+
+/// How long a request whose stream has closed waits for that stream's own drain to answer it.
+/// The drain runs right after the close, so this only bounds a drain that never comes.
+const CLOSED_STREAM_GRACE: Duration = Duration::from_secs(1);
+
+fn stream_idle_timeout() -> Duration {
+    let secs = std::env::var("LORE_GRPC_STREAM_IDLE_TIMEOUT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(STREAM_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
+
+/// What a stream's request generator, its reader task and its waiters share.
+///
+/// Kept apart from [`StreamState`] so the task and the generator never hold the request
+/// sender: the cache dropping its handle has to end the generator, and through it the RPC.
+struct StreamLife {
+    /// Lets `StreamCache::request` tell a stream that died mid-flight from one that never
+    /// established, since the sender is handed out before the RPC is attempted. By the time
+    /// a request observes a failure the flag has settled.
+    opened: AtomicBool,
+    /// The open was refused by the server's caller-admission layer. The admission contract
+    /// (`grpc-caller-capability-admission-v1`, "Admission and refusal") places that refusal
+    /// before the body is polled, with no request-stream item effect. So nothing sent on this
+    /// stream was applied, and every request on it fails with this refusal rather than an
+    /// unknown outcome. Kept apart from `terminal`, which an idle expiry may have set first.
+    refusal: OnceLock<ProtocolError>,
+    /// Set when a waiter closed the stream for want of progress.
+    idle_expired: AtomicBool,
+    /// Cancelled when the reader task exits, or when a waiter gives up on a stream that has
+    /// stopped making progress. The task, the generator and every waiter stop on it, so no
+    /// request can be taken onto a stream nobody will answer.
+    closed: CancellationToken,
+    /// What the stream ended with, for whoever fails a request after `closed`.
+    terminal: OnceLock<ProtocolError>,
+    started: Instant,
+    /// Milliseconds after `started` of the stream's last progress.
+    progress: AtomicU64,
+    idle: Duration,
+}
+
+impl StreamLife {
+    fn new(idle: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            opened: AtomicBool::new(false),
+            refusal: OnceLock::new(),
+            idle_expired: AtomicBool::new(false),
+            closed: CancellationToken::new(),
+            terminal: OnceLock::new(),
+            started: Instant::now(),
+            progress: AtomicU64::new(0),
+            idle,
+        })
+    }
+
+    fn elapsed_millis(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn mark_progress(&self) {
+        self.progress
+            .fetch_max(self.elapsed_millis(), Ordering::Relaxed);
+    }
+
+    /// The terminal is set before the token is cancelled, so anything woken by the token
+    /// reads the reason the stream ended rather than a default.
+    fn close(&self, terminal: ProtocolError) {
+        let _ = self.terminal.set(terminal);
+        self.closed.cancel();
+    }
+
+    fn terminal(&self) -> ProtocolError {
+        self.terminal
+            .get()
+            .cloned()
+            .unwrap_or_else(|| ProtocolError::from(Disconnected))
+    }
+
+    fn refusal(&self) -> Option<ProtocolError> {
+        self.refusal.get().cloned()
+    }
+
+    /// Classify a failed open. Only the exact admission marker proves the server read nothing.
+    fn open_failure(&self, verb: Verb, status: tonic::Status) -> ProtocolError {
+        lore_debug!("{} request failed: {status}", verb.label());
+        let refused = crate::error::is_unsupported_client_status(&status);
+        let error = ProtocolError::from(status);
+        if refused {
+            let _ = self.refusal.set(error.clone());
+        }
+        error
+    }
+
+    /// Wait for `answer` while the stream keeps making progress.
+    ///
+    /// A stream with nothing moving for `idle` is closed here, which ends its task and fails
+    /// everything on it as a stream death. `StreamCache::request` then hands a read back for a
+    /// reconnect and reports a dispatched mutation as an unknown outcome. `None` means no
+    /// answer arrived.
+    async fn await_answer<S>(
+        &self,
+        verb: Verb,
+        mut answer: oneshot::Receiver<Result<S, ProtocolError>>,
+    ) -> Option<Result<S, ProtocolError>> {
+        let since = self.elapsed_millis();
+        loop {
+            let last = self.progress.load(Ordering::Relaxed).max(since);
+            let deadline = self.started + Duration::from_millis(last) + self.idle;
+            tokio::select! {
+                biased;
+                result = &mut answer => {
+                    if result.is_err() {
+                        self.settle().await;
+                    }
+                    return result.ok();
+                }
+                () = self.closed.cancelled() => break,
+                () = tokio::time::sleep_until(deadline) => {
+                    if self.progress.load(Ordering::Relaxed) > last {
+                        continue;
+                    }
+                    let message = format!(
+                        "{} stream made no progress for {} s; closing it",
+                        verb.label(),
+                        self.idle.as_secs()
+                    );
+                    lore_warn!("{message}");
+                    let mut err = ProtocolError::from(Disconnected);
+                    err.push_trace(lore_error_set::Location::with_context(
+                        file!(),
+                        line!(),
+                        column!(),
+                        Arc::from(message),
+                    ));
+                    self.idle_expired.store(true, Ordering::SeqCst);
+                    self.close(err);
+                    break;
+                }
+            }
+        }
+        tokio::time::timeout(CLOSED_STREAM_GRACE, answer)
+            .await
+            .ok()
+            .and_then(Result::ok)
+    }
+
+    /// Wait briefly for the task to close the stream.
+    ///
+    /// A request that lost its channel before the task finished, because the transport dropped
+    /// the request body first, cannot yet tell a refused open from a dead stream. The task
+    /// records which it was before it closes.
+    async fn settle(&self) {
+        let _ = tokio::time::timeout(CLOSED_STREAM_GRACE, self.closed.cancelled()).await;
+    }
+}
+
+/// A live stream's request channel plus the state it shares with its task.
 struct StreamState<K, S> {
     sender: mpsc::Sender<StreamItem<K, S>>,
-    opened: AtomicBool,
+    life: Arc<StreamLife>,
+}
+
+impl<K, S> StreamState<K, S> {
+    fn new(sender: mpsc::Sender<StreamItem<K, S>>, idle: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            sender,
+            life: StreamLife::new(idle),
+        })
+    }
 }
 
 type StreamHandle<K, S> = Arc<StreamState<K, S>>;
@@ -252,16 +428,19 @@ impl StreamResponse for storage_v1::CopyResponse {
 /// also what lets `StreamCache::request` replay them: the ordinary ways a connection dies
 /// arrive as `Internal` or `Cancelled` (`Status::from_h2_error`), neither of which a caller
 /// would otherwise retry. The real status is kept on the error's trace.
+///
+/// Returns the error everything still outstanding fails with; [`run_stream`] does the failing.
 async fn pump_responses<R>(
     mut stream: tonic::Streaming<R>,
-    inflight: Arc<Inflight<R::Success>>,
+    inflight: &Inflight<R::Success>,
+    life: &StreamLife,
     verb: Verb,
-) where
+) -> ProtocolError
+where
     R: StreamResponse,
 {
-    let mut terminal = ProtocolError::from(Disconnected);
-
     while let Some(message) = stream.next().await {
+        life.mark_progress();
         let response = match message {
             Ok(response) => response,
             Err(status) => {
@@ -272,8 +451,7 @@ async fn pump_responses<R>(
                     column!(),
                     Arc::from(format!("{} stream terminated: {status}", verb.label())),
                 ));
-                terminal = err;
-                break;
+                return err;
             }
         };
 
@@ -299,13 +477,227 @@ async fn pump_responses<R>(
         }
     }
 
-    fail_inflight(&inflight, verb, &terminal);
+    ProtocolError::from(Disconnected)
+}
+
+/// Run an address-keyed stream's RPC to its end, then close the stream and fail whatever it
+/// left unanswered.
+///
+/// The close comes before the drain. A request the generator registers after the drain then
+/// finds the stream closed and settles itself, so none is left waiting on a task that is gone.
+/// A waiter closing the stream for want of progress ends the RPC here as well.
+async fn run_stream<R>(
+    life: Arc<StreamLife>,
+    inflight: Arc<Inflight<R::Success>>,
+    verb: Verb,
+    open: impl Future<Output = Result<tonic::Response<tonic::Streaming<R>>, tonic::Status>>,
+) where
+    R: StreamResponse,
+{
+    let terminal = tokio::select! {
+        biased;
+        () = life.closed.cancelled() => life.terminal(),
+        terminal = async {
+            match open.await {
+                Ok(response) => {
+                    life.opened.store(true, Ordering::SeqCst);
+                    life.mark_progress();
+                    pump_responses(response.into_inner(), &inflight, &life, verb).await
+                }
+                // A failure to open keeps its real status rather than becoming a disconnect:
+                // it applies equally to everything queued behind it, and an `Unauthenticated`
+                // or an admission refusal should reach the caller instead of being replayed.
+                Err(status) => life.open_failure(verb, status),
+            }
+        } => terminal,
+    };
+    life.close(terminal.clone());
+    fail_inflight(&inflight, verb, &life.terminal());
+}
+
+/// The request side of an address-keyed stream.
+///
+/// Ends as soon as the stream closes. A front can keep the request body open after the
+/// response has ended, and a generator that kept reading would register requests no task will
+/// ever answer. Requests still queued when it ends fail with the stream's terminal error.
+fn request_stream<K, S, T>(
+    mut rx: mpsc::Receiver<StreamItem<K, S>>,
+    inflight: Arc<Inflight<S>>,
+    life: Arc<StreamLife>,
+    verb: Verb,
+    route: fn(K) -> Option<(Address, T)>,
+) -> impl tokio_stream::Stream<Item = T> + Send + 'static
+where
+    K: Send + 'static,
+    S: Send + 'static,
+    T: Send + 'static,
+{
+    async_stream::stream! {
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = life.closed.cancelled() => None,
+                item = rx.recv() => item,
+            };
+            let Some((request, sender)) = item else {
+                break;
+            };
+            let Some((address, message)) = route(request) else {
+                lore_debug!("Missing address in {} request", verb.label());
+                let _ = sender.send(Err(ProtocolError::internal(format!(
+                    "{}: missing address",
+                    verb.label()
+                ))));
+                continue;
+            };
+            if register(&inflight, address, sender) {
+                life.mark_progress();
+                yield message;
+                life.mark_progress();
+            }
+            // The task closes before it drains, and the drain takes the shard lock this register
+            // took, so either the drain saw this request or this check sees the close. The check
+            // runs after the yield: if the transport drops the body at the yield instead, the
+            // request stays in the map the task drains, and its waiter is bounded by that drain
+            // or by the idle wait.
+            if life.closed.is_cancelled() {
+                fail_inflight(&inflight, verb, &life.terminal());
+                break;
+            }
+        }
+        rx.close();
+        let mut queued = Vec::new();
+        while let Ok((_, sender)) = rx.try_recv() {
+            queued.push(sender);
+        }
+        if !queued.is_empty() {
+            let terminal = life.terminal();
+            for sender in queued {
+                let _ = sender.send(Err(terminal.clone()));
+            }
+        }
+    }
+}
+
+/// Requests on a resolved stream, keyed by the `request_id` its response echoes.
+type Pending<S> = DashMap<u64, oneshot::Sender<Result<S, ProtocolError>>>;
+
+fn drain_pending<S>(pending: &Pending<S>, err: &ProtocolError) {
+    let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
+    for id in ids {
+        if let Some((_, sender)) = pending.remove(&id) {
+            let _ = sender.send(Err(err.clone()));
+        }
+    }
+}
+
+/// [`request_stream`] for the resolved verbs, which correlate by `request_id`.
+fn resolved_request_stream<Q, S>(
+    mut rx: mpsc::Receiver<StreamItem<Q, S>>,
+    pending: Arc<Pending<S>>,
+    life: Arc<StreamLife>,
+    request_id: fn(&Q) -> u64,
+) -> impl tokio_stream::Stream<Item = Q> + Send + 'static
+where
+    Q: Send + 'static,
+    S: Send + 'static,
+{
+    async_stream::stream! {
+        loop {
+            let item = tokio::select! {
+                biased;
+                () = life.closed.cancelled() => None,
+                item = rx.recv() => item,
+            };
+            let Some((request, sender)) = item else {
+                break;
+            };
+            pending.insert(request_id(&request), sender);
+            life.mark_progress();
+            yield request;
+            life.mark_progress();
+            if life.closed.is_cancelled() {
+                drain_pending(&pending, &life.terminal());
+                break;
+            }
+        }
+        rx.close();
+        let mut queued = Vec::new();
+        while let Ok((_, sender)) = rx.try_recv() {
+            queued.push(sender);
+        }
+        if !queued.is_empty() {
+            let terminal = life.terminal();
+            for sender in queued {
+                let _ = sender.send(Err(terminal.clone()));
+            }
+        }
+    }
+}
+
+/// Reader for a resolved stream, correlating by `request_id`.
+///
+/// `pump_responses` keys on the address the server echoes back, which the resolved verbs
+/// cannot use: the address is what the request is asking for, not what identifies it. The
+/// close and the drain on exit follow the same contract as [`run_stream`]. A stream status
+/// fails what is outstanding with that status, and a clean end with an internal error, as
+/// these verbs always have.
+async fn run_resolved_stream<R>(
+    life: Arc<StreamLife>,
+    pending: Arc<Pending<Arc<R>>>,
+    verb: Verb,
+    open: impl Future<Output = Result<tonic::Response<tonic::Streaming<R>>, tonic::Status>>,
+    request_id: fn(&R) -> u64,
+    status: fn(&R) -> Option<&lore_proto::lore::model::v1::ItemStatus>,
+) where
+    R: Send + Sync + 'static,
+{
+    let terminal = tokio::select! {
+        biased;
+        () = life.closed.cancelled() => life.terminal(),
+        terminal = async {
+            let mut responses = match open.await {
+                Ok(response) => {
+                    life.opened.store(true, Ordering::SeqCst);
+                    life.mark_progress();
+                    response.into_inner()
+                }
+                Err(status) => return life.open_failure(verb, status),
+            };
+            loop {
+                match responses.next().await {
+                    Some(Ok(response)) => {
+                        life.mark_progress();
+                        let id = request_id(&response);
+                        let Some((_, sender)) = pending.remove(&id) else {
+                            lore_error!("{} unexpected result for request_id {id}", verb.label());
+                            continue;
+                        };
+                        let result = match item_status_error(status(&response)) {
+                            Some(err) => Err(err),
+                            None => Ok(Arc::new(response)),
+                        };
+                        let _ = sender.send(result);
+                    }
+                    Some(Err(status)) => return ProtocolError::from(status),
+                    None => {
+                        return ProtocolError::internal(format!(
+                            "{}: stream closed before responding",
+                            verb.label()
+                        ));
+                    }
+                }
+            }
+        } => terminal,
+    };
+    life.close(terminal);
+    drain_pending(&pending, &life.terminal());
 }
 
 /// The hot path is a single `DashMap` read plus an `Arc` clone — no write lock and no second
-/// level of indirection. A dead stream announces itself by failing the send, so nothing polls
-/// for liveness and the reader tasks never touch this map: the request path is its only
-/// mutator, which is what makes rotation race-free.
+/// level of indirection. A dead stream announces itself through its closed token or by failing
+/// the send, and a waiter's idle timer is the only liveness check. The reader tasks never touch
+/// this map: the request path is its only mutator, which is what makes rotation race-free.
 struct StreamCache<K, S> {
     streams: DashMap<(u32, Verb), StreamHandle<K, S>>,
 }
@@ -370,12 +762,14 @@ impl<K: Clone, S> StreamCache<K, S> {
     /// Reconnect and reissue on a stream death, the way the QUIC client's
     /// `send_with_reconnect` does, so a caller never sees one.
     ///
-    /// A death shows up three ways, all handled here: reserving a place in the queue fails
-    /// because the receiver is already gone (nothing has been sent, so nothing is lost), the
-    /// reader answers with a disconnect, or it exits without answering at all. Anything else the
-    /// reader answers is the server's verdict on this request and goes straight back —
-    /// matching QUIC, where `NotFound`, `SlowDown` and `NotAuthorized` bubble rather than
-    /// provoking a reconnect.
+    /// A death shows up these ways, all handled here: the stream is already closed when the
+    /// request finds it, reserving a place in the queue fails because the receiver is already
+    /// gone (nothing has been sent in either case, so nothing is lost), the reader answers with
+    /// a disconnect, it exits without answering at all, or nothing on the stream moves for the
+    /// idle bound and the wait closes it. Anything else the reader answers is the server's
+    /// verdict on this request and goes straight back — matching QUIC, where `NotFound`,
+    /// `SlowDown` and `NotAuthorized` bubble rather than provoking a reconnect. A refused open
+    /// is final for every request on that stream; see [`StreamLife::refusal`].
     ///
     /// Reissuing continues while the remote is still reachable. A replacement stream that will
     /// not open means the channel is suspect rather than the stream, so it hands straight back
@@ -422,15 +816,21 @@ impl<K: Clone, S> StreamCache<K, S> {
             //
             // The slot is reserved before the payload is cloned (upstream cd2613e9), so a
             // waiting send holds no copy of it.
+            //
+            // A closed stream takes nothing. Its generator has stopped reading, so a send would
+            // only park the request until a drain answered it, and would count as a dispatch
+            // that never happened.
             let mut dispatched = false;
-            let answer = match handle.sender.reserve().await {
-                Ok(permit) => {
-                    let (tx, rx) = oneshot::channel();
-                    permit.send((payload.clone(), tx));
-                    dispatched = true;
-                    rx.await.ok()
-                }
-                Err(_) => None,
+            let answer = if handle.life.closed.is_cancelled() {
+                None
+            } else if let Ok(permit) = handle.sender.reserve().await {
+                let (tx, rx) = oneshot::channel();
+                permit.send((payload.clone(), tx));
+                dispatched = true;
+                handle.life.await_answer(key.1, rx).await
+            } else {
+                handle.life.settle().await;
+                None
             };
             let server_verdict =
                 answer.filter(|answer| !matches!(answer, Err(err) if err.is_disconnected()));
@@ -438,14 +838,39 @@ impl<K: Clone, S> StreamCache<K, S> {
                 return result;
             }
 
+            // Checked before the replay class: the admission layer refused the stream before
+            // the handler read any request on it, so this request is known not applied, whether
+            // or not it was queued. The refusal is final; reconnecting would only be refused again.
+            if let Some(refusal) = handle.life.refusal() {
+                self.discard(key, &handle);
+                return Err(refusal);
+            }
+
+            let idle_expired = handle.life.idle_expired.load(Ordering::SeqCst);
             if dispatched && replay == ReplayClass::MutableNoReplay {
                 // Do not discard the handle: whether this stream is reusable is a separate
                 // question from whether this mutation may be repeated, and the next caller's
                 // rotation decides it.
-                return Err(outcome_unknown(rpc.wire_name(), &attempt));
+                let mut err = outcome_unknown(rpc.wire_name(), &attempt);
+                if idle_expired {
+                    err.push_trace(lore_error_set::Location::with_context(
+                        file!(),
+                        line!(),
+                        column!(),
+                        Arc::from(format!(
+                            "no answer from the {} stream for {} s",
+                            key.1.label(),
+                            handle.life.idle.as_secs()
+                        )),
+                    ));
+                }
+                return Err(err);
             }
 
-            if !handle.opened.load(Ordering::Relaxed) {
+            // A stream that went silent says the channel is suspect, as a refused open does.
+            // Handing back to `GRPCStorage`'s reconnect rather than reissuing here bounds a read
+            // to one idle wait per reconnect, instead of one per stream reissue as well.
+            if idle_expired || !handle.life.opened.load(Ordering::SeqCst) {
                 self.discard(key, &handle);
                 return Err(ProtocolError::from(Disconnected));
             }
@@ -477,6 +902,9 @@ pub struct StorageService {
     put_resolved_streams:
         StreamCache<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>>,
     get_put_limiter: Semaphore,
+    /// See [`STREAM_IDLE_TIMEOUT_SECS`]. Also bounds a managed single-message mutation.
+    stream_idle: Duration,
+    managed_progress: ManagedProgress,
 }
 
 fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
@@ -526,6 +954,154 @@ fn stream_lost(rpc: GrpcRpc) -> ProtocolError {
     )
 }
 
+const CLAIM_PENDING: u8 = 0;
+const CLAIM_TAKEN: u8 = 1;
+const CLAIM_ABANDONED: u8 = 2;
+
+/// Who owns a managed call's one message: still pending, taken by the transport for sending, or
+/// abandoned by the caller as never sent. One compare-and-swap decides between the last two, so
+/// a call reported not sent can never have its message sent afterwards, even when the transport
+/// opens the stream late and polls the body after the caller gave up.
+struct ManagedClaim {
+    state: AtomicU8,
+    taken: Notify,
+}
+
+impl ManagedClaim {
+    /// The caller gives up on a message the transport has not taken. False when it was taken.
+    fn abandon(&self) -> bool {
+        self.state
+            .compare_exchange(
+                CLAIM_PENDING,
+                CLAIM_ABANDONED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+}
+
+/// The one-message request body of a managed mutation, and the claim on its message. The body
+/// yields the message only if it wins the claim; an abandoned body ends empty.
+fn managed_body<T: Send + 'static>(
+    request: T,
+) -> (
+    impl tokio_stream::Stream<Item = T> + Send + 'static,
+    Arc<ManagedClaim>,
+) {
+    let claim = Arc::new(ManagedClaim {
+        state: AtomicU8::new(CLAIM_PENDING),
+        taken: Notify::new(),
+    });
+    let body_claim = claim.clone();
+    let body = async_stream::stream! {
+        if body_claim
+            .state
+            .compare_exchange(CLAIM_PENDING, CLAIM_TAKEN, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            body_claim.taken.notify_one();
+            yield request;
+        }
+    };
+    (body, claim)
+}
+
+/// When any managed single-message call on one service last made progress: its message was
+/// taken by the transport, or it got an answer.
+///
+/// Shared across the calls because they share the connection and the server's capacity. A call
+/// queued behind others, on the client or on the server, is waiting, not stalled, while any of
+/// them is still moving; the same reading the stream path takes per stream.
+struct ManagedProgress {
+    started: Instant,
+    last: AtomicU64,
+}
+
+impl ManagedProgress {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) -> u64 {
+        u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn mark(&self) {
+        self.last.fetch_max(self.now(), Ordering::Relaxed);
+    }
+
+    fn last(&self) -> u64 {
+        self.last.load(Ordering::Relaxed)
+    }
+}
+
+/// A managed single-message mutation, bounded by silence rather than by age.
+///
+/// Before the transport takes the one message, `idle` with no managed progress at all ends the
+/// call as [`crate::error::RequestNotSent`]: the message provably never left, so the journal
+/// settles it not applied and the reconnect layer may send it again. After it is taken, the same
+/// silence is an unknown outcome, because the request may have reached the server.
+async fn bounded_managed<T>(
+    rpc: GrpcRpc,
+    idle: Duration,
+    progress: &ManagedProgress,
+    claim: Arc<ManagedClaim>,
+    future: impl Future<Output = Result<T, ProtocolError>>,
+) -> Result<T, ProtocolError> {
+    tokio::pin!(future);
+    let mut base = progress.now();
+    let mut sent = false;
+    loop {
+        let last = progress.last().max(base);
+        let deadline = progress.started + Duration::from_millis(last) + idle;
+        tokio::select! {
+            biased;
+            result = &mut future => {
+                progress.mark();
+                return result;
+            }
+            () = claim.taken.notified(), if !sent => {
+                sent = true;
+                progress.mark();
+                base = progress.now();
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                if progress.last() > last {
+                    continue;
+                }
+                if sent {
+                    lore_warn!(
+                        "{} got no answer for {:?}; its outcome is unknown",
+                        rpc.wire_name(),
+                        idle
+                    );
+                    return Err(stream_lost(rpc));
+                }
+                if !claim.abandon() {
+                    // The transport took the message as the bound ran out: it may be on its way.
+                    sent = true;
+                    progress.mark();
+                    base = progress.now();
+                    continue;
+                }
+                lore_warn!(
+                    "{} was not taken for sending within {:?}; it was not sent",
+                    rpc.wire_name(),
+                    idle
+                );
+                return Err(ProtocolError::internal_with_context(
+                    crate::error::RequestNotSent,
+                    "no stream took the request",
+                ));
+            }
+        }
+    }
+}
+
 fn managed_stream_status(status: tonic::Status, rpc: GrpcRpc) -> ProtocolError {
     if crate::error::is_unsupported_client_status(&status) {
         ProtocolError::from(status)
@@ -560,7 +1136,16 @@ impl StorageService {
             get_resolved_streams: StreamCache::new(),
             put_resolved_streams: StreamCache::new(),
             get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            stream_idle: stream_idle_timeout(),
+            managed_progress: ManagedProgress::new(),
         }
+    }
+
+    /// The same service with a different idle bound, for tests that cannot wait the default.
+    #[cfg(feature = "test-util")]
+    pub fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
+        self.stream_idle = idle;
+        self
     }
 
     /// Remove streams for a session. Dropping the senders terminates the stream tasks.
@@ -696,31 +1281,38 @@ impl StorageService {
         if crate::caller_operation::current_caller_operation().is_some() {
             let mut canonical = request.clone();
             canonical.payload = canonical.payload.map(|_| Bytes::new());
+            let (body, claim) = managed_body(request);
             return crate::caller_operation::dispatch(
                 ctx.partition,
                 GrpcRpc::StoragePut,
                 canonical.encode_to_vec(),
                 self.connection.remote_url.to_string(),
                 ctx.auth_token.clone(),
-                async {
-                    let mut req = tonic::Request::new(tokio_stream::iter([request]));
-                    inject_managed_metadata(&mut req, ctx);
-                    let mut client = StorageServiceClient::new(self.connection.channel());
-                    let mut responses = client
-                        .put(req)
-                        .await
-                        .map_err(ProtocolError::from)?
-                        .into_inner();
-                    let response = responses
-                        .message()
-                        .await
-                        .map_err(|status| managed_stream_status(status, GrpcRpc::StoragePut))?
-                        .ok_or_else(|| stream_lost(GrpcRpc::StoragePut))?;
-                    if response.key() != Some(address) {
-                        return Err(stream_lost(GrpcRpc::StoragePut));
-                    }
-                    response.into_result().map_err(decisive_item_error)
-                },
+                bounded_managed(
+                    GrpcRpc::StoragePut,
+                    self.stream_idle,
+                    &self.managed_progress,
+                    claim,
+                    Box::pin(async {
+                        let mut req = tonic::Request::new(body);
+                        inject_managed_metadata(&mut req, ctx);
+                        let mut client = StorageServiceClient::new(self.connection.channel());
+                        let mut responses = client
+                            .put(req)
+                            .await
+                            .map_err(ProtocolError::from)?
+                            .into_inner();
+                        let response = responses
+                            .message()
+                            .await
+                            .map_err(|status| managed_stream_status(status, GrpcRpc::StoragePut))?
+                            .ok_or_else(|| stream_lost(GrpcRpc::StoragePut))?;
+                        if response.key() != Some(address) {
+                            return Err(stream_lost(GrpcRpc::StoragePut));
+                        }
+                        response.into_result().map_err(decisive_item_error)
+                    }),
+                ),
             )
             .await;
         }
@@ -849,31 +1441,39 @@ impl StorageService {
         };
 
         if crate::caller_operation::current_caller_operation().is_some() {
+            let canonical = request.encode_to_vec();
+            let (body, claim) = managed_body(request);
             return crate::caller_operation::dispatch(
                 ctx.partition,
                 GrpcRpc::StorageCopy,
-                request.encode_to_vec(),
+                canonical,
                 self.connection.remote_url.to_string(),
                 ctx.auth_token.clone(),
-                async {
-                    let mut req = tonic::Request::new(tokio_stream::iter([request]));
-                    inject_managed_metadata(&mut req, ctx);
-                    let mut client = StorageServiceClient::new(self.connection.channel());
-                    let mut responses = client
-                        .copy(req)
-                        .await
-                        .map_err(ProtocolError::from)?
-                        .into_inner();
-                    let response = responses
-                        .message()
-                        .await
-                        .map_err(|status| managed_stream_status(status, GrpcRpc::StorageCopy))?
-                        .ok_or_else(|| stream_lost(GrpcRpc::StorageCopy))?;
-                    if response.key() != Some(source_address) {
-                        return Err(stream_lost(GrpcRpc::StorageCopy));
-                    }
-                    response.into_result().map_err(decisive_item_error)
-                },
+                bounded_managed(
+                    GrpcRpc::StorageCopy,
+                    self.stream_idle,
+                    &self.managed_progress,
+                    claim,
+                    Box::pin(async {
+                        let mut req = tonic::Request::new(body);
+                        inject_managed_metadata(&mut req, ctx);
+                        let mut client = StorageServiceClient::new(self.connection.channel());
+                        let mut responses = client
+                            .copy(req)
+                            .await
+                            .map_err(ProtocolError::from)?
+                            .into_inner();
+                        let response = responses
+                            .message()
+                            .await
+                            .map_err(|status| managed_stream_status(status, GrpcRpc::StorageCopy))?
+                            .ok_or_else(|| stream_lost(GrpcRpc::StorageCopy))?;
+                        if response.key() != Some(source_address) {
+                            return Err(stream_lost(GrpcRpc::StorageCopy));
+                        }
+                        response.into_result().map_err(decisive_item_error)
+                    }),
+                ),
             )
             .await;
         }
@@ -1024,15 +1624,8 @@ impl StorageService {
         Ok(Hash::from(&res.current_value[..]))
     }
 
-    /// A failure to open the RPC keeps its real status rather than becoming a disconnect: it
-    /// applies equally to everything queued behind it, and an `Unauthenticated` or
-    /// `Unimplemented` there should reach the caller instead of being replayed.
-    /// Reader for a resolved stream, correlating by `request_id`.
-    ///
-    /// `pump_responses` keys on the address the server echoes back, which the resolved verbs
-    /// cannot use: the address is what the request is asking for, not what identifies it. The
-    /// `opened` flag and the drain on exit follow the same contract as the address-keyed verbs,
-    /// so a stream that dies mid-flight fails its waiters rather than leaving them parked.
+    /// Resolve `key` in `context` and fetch the fragment it names. The stream correlates by
+    /// `request_id`; see [`run_resolved_stream`].
     pub async fn get_resolved(
         &self,
         session_id: u32,
@@ -1145,36 +1738,43 @@ impl StorageService {
             let mut canonical = request.clone();
             canonical.payload = Bytes::new();
             canonical.request_id = 0;
+            let (body, claim) = managed_body(request);
             return crate::caller_operation::dispatch(
                 ctx.partition,
                 GrpcRpc::StoragePutResolved,
                 canonical.encode_to_vec(),
                 self.connection.remote_url.to_string(),
                 ctx.auth_token.clone(),
-                async {
-                    let mut req = tonic::Request::new(tokio_stream::iter([request]));
-                    inject_managed_metadata(&mut req, ctx);
-                    let mut client = StorageServiceClient::new(self.connection.channel());
-                    let mut responses = client
-                        .put_resolved(req)
-                        .await
-                        .map_err(ProtocolError::from)?
-                        .into_inner();
-                    let response = responses
-                        .message()
-                        .await
-                        .map_err(|status| {
-                            managed_stream_status(status, GrpcRpc::StoragePutResolved)
-                        })?
-                        .ok_or_else(|| stream_lost(GrpcRpc::StoragePutResolved))?;
-                    if response.request_id != request_id {
-                        return Err(stream_lost(GrpcRpc::StoragePutResolved));
-                    }
-                    match item_status_error(response.status.as_ref()) {
-                        Some(error) => Err(decisive_item_error(error)),
-                        None => Ok(()),
-                    }
-                },
+                bounded_managed(
+                    GrpcRpc::StoragePutResolved,
+                    self.stream_idle,
+                    &self.managed_progress,
+                    claim,
+                    Box::pin(async {
+                        let mut req = tonic::Request::new(body);
+                        inject_managed_metadata(&mut req, ctx);
+                        let mut client = StorageServiceClient::new(self.connection.channel());
+                        let mut responses = client
+                            .put_resolved(req)
+                            .await
+                            .map_err(ProtocolError::from)?
+                            .into_inner();
+                        let response = responses
+                            .message()
+                            .await
+                            .map_err(|status| {
+                                managed_stream_status(status, GrpcRpc::StoragePutResolved)
+                            })?
+                            .ok_or_else(|| stream_lost(GrpcRpc::StoragePutResolved))?;
+                        if response.request_id != request_id {
+                            return Err(stream_lost(GrpcRpc::StoragePutResolved));
+                        }
+                        match item_status_error(response.status.as_ref()) {
+                            Some(error) => Err(decisive_item_error(error)),
+                            None => Ok(()),
+                        }
+                    }),
+                ),
             )
             .await;
         }
@@ -1201,79 +1801,30 @@ impl StorageService {
         ctx: &GrpcSessionContext,
     ) -> StreamHandle<storage_v1::GetResolvedRequest, Arc<storage_v1::GetResolvedResponse>> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
-        let pending = Arc::new(DashMap::<
-            u64,
-            oneshot::Sender<Result<Arc<storage_v1::GetResolvedResponse>, ProtocolError>>,
-        >::new());
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let handle = StreamState::new(tx, self.stream_idle);
+        let pending: Arc<Pending<Arc<storage_v1::GetResolvedResponse>>> = Arc::new(DashMap::new());
+        let requests = resolved_request_stream(
+            rx,
+            pending.clone(),
+            handle.life.clone(),
+            |request: &storage_v1::GetResolvedRequest| request.request_id,
+        );
 
-        let request_pending = pending.clone();
-        let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let request: storage_v1::GetResolvedRequest = request;
-                request_pending.insert(request.request_id, sender);
-                yield request;
-            }
-        };
-
+        let life = handle.life.clone();
         let ctx = ctx.clone();
         lore_spawn_net!(async move {
             let mut req = tonic::Request::new(requests);
             inject_metadata(&mut req, &ctx);
-
-            let drain = |err: ProtocolError| {
-                let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
-                for id in ids {
-                    if let Some((_, sender)) = pending.remove(&id) {
-                        let _ = sender.send(Err(err.clone()));
-                    }
-                }
-            };
-
-            let mut responses = match client.get_resolved(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    response.into_inner()
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::GetResolved.label());
-                    drain(ProtocolError::from(status));
-                    return;
-                }
-            };
-
-            while let Some(response) = responses.next().await {
-                match response {
-                    Ok(response) => {
-                        let Some((_, sender)) = pending.remove(&response.request_id) else {
-                            lore_error!(
-                                "{} unexpected result for request_id {}",
-                                Verb::GetResolved.label(),
-                                response.request_id
-                            );
-                            continue;
-                        };
-                        let result = match item_status_error(response.status.as_ref()) {
-                            Some(err) => Err(err),
-                            None => Ok(Arc::new(response)),
-                        };
-                        let _ = sender.send(result);
-                    }
-                    Err(status) => {
-                        drain(ProtocolError::from(status));
-                        return;
-                    }
-                }
-            }
-
-            drain(ProtocolError::internal(
-                "get_resolved: stream closed before responding",
-            ));
+            run_resolved_stream(
+                life,
+                pending,
+                Verb::GetResolved,
+                client.get_resolved(req),
+                |response: &storage_v1::GetResolvedResponse| response.request_id,
+                |response: &storage_v1::GetResolvedResponse| response.status.as_ref(),
+            )
+            .await;
         });
 
         handle
@@ -1285,79 +1836,30 @@ impl StorageService {
         ctx: &GrpcSessionContext,
     ) -> StreamHandle<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
-        let pending = Arc::new(DashMap::<
-            u64,
-            oneshot::Sender<Result<Arc<storage_v1::PutResolvedResponse>, ProtocolError>>,
-        >::new());
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let handle = StreamState::new(tx, self.stream_idle);
+        let pending: Arc<Pending<Arc<storage_v1::PutResolvedResponse>>> = Arc::new(DashMap::new());
+        let requests = resolved_request_stream(
+            rx,
+            pending.clone(),
+            handle.life.clone(),
+            |request: &storage_v1::PutResolvedRequest| request.request_id,
+        );
 
-        let request_pending = pending.clone();
-        let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let request: storage_v1::PutResolvedRequest = request;
-                request_pending.insert(request.request_id, sender);
-                yield request;
-            }
-        };
-
+        let life = handle.life.clone();
         let ctx = ctx.clone();
         lore_spawn_net!(async move {
             let mut req = tonic::Request::new(requests);
             inject_metadata(&mut req, &ctx);
-
-            let drain = |err: ProtocolError| {
-                let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
-                for id in ids {
-                    if let Some((_, sender)) = pending.remove(&id) {
-                        let _ = sender.send(Err(err.clone()));
-                    }
-                }
-            };
-
-            let mut responses = match client.put_resolved(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    response.into_inner()
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::PutResolved.label());
-                    drain(ProtocolError::from(status));
-                    return;
-                }
-            };
-
-            while let Some(response) = responses.next().await {
-                match response {
-                    Ok(response) => {
-                        let Some((_, sender)) = pending.remove(&response.request_id) else {
-                            lore_error!(
-                                "{} unexpected result for request_id {}",
-                                Verb::PutResolved.label(),
-                                response.request_id
-                            );
-                            continue;
-                        };
-                        let result = match item_status_error(response.status.as_ref()) {
-                            Some(err) => Err(err),
-                            None => Ok(Arc::new(response)),
-                        };
-                        let _ = sender.send(result);
-                    }
-                    Err(status) => {
-                        drain(ProtocolError::from(status));
-                        return;
-                    }
-                }
-            }
-
-            drain(ProtocolError::internal(
-                "put_resolved: stream closed before responding",
-            ));
+            run_resolved_stream(
+                life,
+                pending,
+                Verb::PutResolved,
+                client.put_resolved(req),
+                |response: &storage_v1::PutResolvedResponse| response.request_id,
+                |response: &storage_v1::PutResolvedResponse| response.status.as_ref(),
+            )
+            .await;
         });
 
         handle
@@ -1368,83 +1870,50 @@ impl StorageService {
         ctx: &GrpcSessionContext,
     ) -> StreamHandle<Address, (model_v1::Fragment, Bytes)> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let handle = StreamState::new(tx, self.stream_idle);
         let inflight: Arc<Inflight<(model_v1::Fragment, Bytes)>> = Arc::new(DashMap::new());
+        let requests = request_stream(
+            rx,
+            inflight.clone(),
+            handle.life.clone(),
+            Verb::Get,
+            |address: Address| Some((address, model_v1::Address::from(address))),
+        );
 
-        let request_inflight = inflight.clone();
-        let requests = async_stream::stream! {
-            while let Some((address, sender)) = rx.recv().await {
-                if register(&request_inflight, address, sender) {
-                    yield model_v1::Address::from(address);
-                }
-            }
-        };
-
+        let life = handle.life.clone();
         let ctx = ctx.clone();
         lore_spawn_net!(async move {
             let mut req = tonic::Request::new(requests);
             inject_metadata(&mut req, &ctx);
-
-            match client.get(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Get).await;
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::Get.label());
-                    fail_inflight(&inflight, Verb::Get, &ProtocolError::from(status));
-                }
-            }
+            run_stream(life, inflight, Verb::Get, client.get(req)).await;
         });
 
         handle
     }
 
-    /// A failure to open the RPC keeps its real status rather than becoming a disconnect: it
-    /// applies equally to everything queued behind it, and an `Unauthenticated` or
-    /// `Unimplemented` there should reach the caller instead of being replayed.
     fn spawn_get_metadata_stream(
         &self,
         ctx: &GrpcSessionContext,
     ) -> StreamHandle<Address, (model_v1::Fragment, Bytes)> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let handle = StreamState::new(tx, self.stream_idle);
         let inflight: Arc<Inflight<(model_v1::Fragment, Bytes)>> = Arc::new(DashMap::new());
+        let requests = request_stream(
+            rx,
+            inflight.clone(),
+            handle.life.clone(),
+            Verb::GetMetadata,
+            |address: Address| Some((address, model_v1::Address::from(address))),
+        );
 
-        let request_inflight = inflight.clone();
-        let requests = async_stream::stream! {
-            while let Some((address, sender)) = rx.recv().await {
-                if register(&request_inflight, address, sender) {
-                    yield model_v1::Address::from(address);
-                }
-            }
-        };
-
+        let life = handle.life.clone();
         let ctx = ctx.clone();
         lore_spawn_net!(async move {
             let mut req = tonic::Request::new(requests);
             inject_metadata(&mut req, &ctx);
-
-            match client.get_metadata(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::GetMetadata).await;
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::GetMetadata.label());
-                    fail_inflight(&inflight, Verb::GetMetadata, &ProtocolError::from(status));
-                }
-            }
+            run_stream(life, inflight, Verb::GetMetadata, client.get_metadata(req)).await;
         });
 
         handle
@@ -1455,44 +1924,27 @@ impl StorageService {
         ctx: &GrpcSessionContext,
     ) -> StreamHandle<storage_v1::PutRequest, ()> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) =
+        let (tx, rx) =
             mpsc::channel::<StreamItem<storage_v1::PutRequest, ()>>(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
+        let handle = StreamState::new(tx, self.stream_idle);
         let inflight: Arc<Inflight<()>> = Arc::new(DashMap::new());
+        let requests = request_stream(
+            rx,
+            inflight.clone(),
+            handle.life.clone(),
+            Verb::Put,
+            |request: storage_v1::PutRequest| {
+                let address = request.address.as_ref().map(Address::from)?;
+                Some((address, request))
+            },
+        );
 
-        let request_inflight = inflight.clone();
-        let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let Some(address) = request.address.as_ref().map(Address::from) else {
-                    lore_debug!("Missing address in put request");
-                    let _ = sender.send(Err(ProtocolError::internal("put: missing address")));
-                    continue;
-                };
-                if register(&request_inflight, address, sender) {
-                    yield request;
-                }
-            }
-        };
-
+        let life = handle.life.clone();
         let ctx = ctx.clone();
         lore_spawn_net!(async move {
             let mut req = tonic::Request::new(requests);
             inject_metadata(&mut req, &ctx);
-
-            match client.put(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Put).await;
-                }
-                Err(status) => {
-                    lore_debug!("put request failed: {status}");
-                    fail_inflight(&inflight, Verb::Put, &ProtocolError::from(status));
-                }
-            }
+            run_stream(life, inflight, Verb::Put, client.put(req)).await;
         });
 
         handle
@@ -1503,44 +1955,27 @@ impl StorageService {
         ctx: &GrpcSessionContext,
     ) -> StreamHandle<storage_v1::CopyRequest, ()> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) =
+        let (tx, rx) =
             mpsc::channel::<StreamItem<storage_v1::CopyRequest, ()>>(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
+        let handle = StreamState::new(tx, self.stream_idle);
         let inflight: Arc<Inflight<()>> = Arc::new(DashMap::new());
+        let requests = request_stream(
+            rx,
+            inflight.clone(),
+            handle.life.clone(),
+            Verb::Copy,
+            |request: storage_v1::CopyRequest| {
+                let address = request.source_address.as_ref().map(Address::from)?;
+                Some((address, request))
+            },
+        );
 
-        let request_inflight = inflight.clone();
-        let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let Some(address) = request.source_address.as_ref().map(Address::from) else {
-                    lore_debug!("Missing source_address in copy request");
-                    let _ = sender.send(Err(ProtocolError::internal("copy: missing source_address")));
-                    continue;
-                };
-                if register(&request_inflight, address, sender) {
-                    yield request;
-                }
-            }
-        };
-
+        let life = handle.life.clone();
         let ctx = ctx.clone();
         lore_spawn_net!(async move {
             let mut req = tonic::Request::new(requests);
             inject_metadata(&mut req, &ctx);
-
-            match client.copy(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Copy).await;
-                }
-                Err(status) => {
-                    lore_debug!("copy request failed: {status}");
-                    fail_inflight(&inflight, Verb::Copy, &ProtocolError::from(status));
-                }
-            }
+            run_stream(life, inflight, Verb::Copy, client.copy(req)).await;
         });
 
         handle

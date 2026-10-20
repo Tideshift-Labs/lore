@@ -54,6 +54,7 @@ lore-macro = { workspace = true }
 # as `lore-server`'s dev-dependency on it.
 tokio = { workspace = true, features = ["test-util"] }
 axum = { workspace = true }
+h2 = "0.4.19"
 libc = { workspace = true }
 lore-transport = { workspace = true, features = ["test-util"] }
 

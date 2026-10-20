@@ -2,6 +2,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 mod adoption_tests;
+mod stream_deadline_tests;
 
 use std::net::SocketAddr;
 use std::pin::Pin;

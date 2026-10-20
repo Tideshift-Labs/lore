@@ -431,6 +431,24 @@ pub(crate) async fn dispatch_recorded_result<T, F: Future<Output = Result<T, Pro
             crate::outcome::with_dispatch_attempt(attempt, future),
         )
         .await;
+    // Positive proof the message never left settles the attempt not applied. The caller sees
+    // `Disconnected`, which the reconnect layer may resend under a fresh attempt.
+    if let Err(error) = &result
+        && crate::error::is_request_not_sent(error)
+    {
+        settle(&context, attempt, &result).await?;
+        let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
+        lore_error_set::ErrorSet::push_trace(
+            &mut disconnected,
+            lore_error_set::Location::with_context(
+                file!(),
+                line!(),
+                column!(),
+                Arc::from(format!("{}: {error}", rpc.wire_name())),
+            ),
+        );
+        return Ok(Err(disconnected));
+    }
     let result = match result {
         Err(error)
             if error.is_outcome_unknown()

@@ -332,6 +332,25 @@ pub enum ProtocolError {
     OutcomeUnknown,
 }
 
+/// Typed proof that a managed single-message mutation never left: the transport did not take
+/// its one request message within the idle bound. It rides inside `ProtocolError::Internal`;
+/// only the managed journal settle acts on it, settling the attempt not applied and reporting
+/// `Disconnected`, which the reconnect layer may resend.
+#[derive(Debug, Clone, Error)]
+#[error("request was not sent: the transport never took it")]
+pub(crate) struct RequestNotSent;
+
+pub(crate) fn is_request_not_sent(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<RequestNotSent>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {

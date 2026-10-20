@@ -3218,6 +3218,7 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
+ "h2",
  "http 1.4.0",
  "libc",
  "lore-base",
