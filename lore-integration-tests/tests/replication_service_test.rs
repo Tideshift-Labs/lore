@@ -26,6 +26,7 @@ mod replication_service_tests {
     use lore_proto::rpc::replication_service_client::ReplicationServiceClient;
     use lore_revision::fragment::generate_random;
     use lore_revision::util;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::GrpcInternalServerBuilder;
     use lore_server::store::grpc_replica::ReplicationClient;
     use lore_server::store::grpc_replica::ReplicationClientError;
@@ -159,6 +160,11 @@ mod replication_service_tests {
                 // real one; the builder takes an `Option` precisely so a harness that needs
                 // none can say so rather than construct a coordinator it will not use.
                 None,
+                // Auth off, as `server.rs` configures a server with no `[server.auth]`: no
+                // verifier, and the authorizer that selection yields. Only the forwarded
+                // repository service reads either, and this suite never calls it.
+                None,
+                Arc::new(AllowAllRepositoryAuthorizer),
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),
