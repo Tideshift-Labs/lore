@@ -65,6 +65,9 @@ type AuthzKey = (
     CredentialFingerprint,
 );
 
+/// A key's flight lock and the number of callers waiting on or holding it.
+type Flight = (Arc<Mutex<()>>, usize);
+
 /// The in-memory authorization cache.
 ///
 /// `tokens` is held only for one map read or write, never across an await.
@@ -81,7 +84,7 @@ type AuthzKey = (
 struct AuthzCache {
     epoch: tokio::sync::RwLock<()>,
     tokens: parking_lot::Mutex<HashMap<AuthzKey, String>>,
-    flights: parking_lot::Mutex<HashMap<AuthzKey, (Arc<Mutex<()>>, usize)>>,
+    flights: parking_lot::Mutex<HashMap<AuthzKey, Flight>>,
 }
 
 static AUTHZ_CACHE: std::sync::OnceLock<AuthzCache> = std::sync::OnceLock::new();
