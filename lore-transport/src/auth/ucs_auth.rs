@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::ExchangeExternalTokenForUserTokenRequest;
@@ -58,6 +61,13 @@ fn resource_id(repository: RepositoryId) -> String {
     format!("urc-{repository}")
 }
 
+/// Bounds on the auth channel. Without them an auth endpoint that accepts and never answers
+/// blocks its caller forever, and a session rebind holds its lock across that wait.
+const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTH_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const AUTH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const AUTH_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Creates a gRPC client with correlation ID interceptor, connected to the
 /// auth endpoint.
 async fn connect_client(
@@ -70,7 +80,11 @@ async fn connect_client(
 > {
     let endpoint = grpc_endpoint(auth_url);
     let mut endpoint_config = tonic::transport::Endpoint::new(endpoint.clone())
-        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
+        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?
+        .connect_timeout(AUTH_CONNECT_TIMEOUT)
+        .timeout(AUTH_RPC_TIMEOUT)
+        .http2_keep_alive_interval(AUTH_KEEP_ALIVE_INTERVAL)
+        .keep_alive_timeout(AUTH_KEEP_ALIVE_TIMEOUT);
     // Trust the OS/native root store for TLS, matching the data channel
     // (`grpc::connect_to_endpoint`) and loreserver's own auth client
     // (`lore-server/src/authnz/auth.rs`). Without this, tonic establishes no

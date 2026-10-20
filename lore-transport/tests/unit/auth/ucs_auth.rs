@@ -12,6 +12,7 @@ use lore_base::types::RepositoryId;
 use lore_proto::auth::RefreshAuthSessionRequest;
 use lore_proto::auth::UserToken;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
+use lore_transport::Authentication;
 use lore_transport::auth::ucs_auth::*;
 
 #[derive(Clone, Default)]
@@ -246,5 +247,103 @@ fn required_authentication_token_reports_empty_refresh_response() {
         error
             .to_string()
             .contains("empty user token in refresh response")
+    );
+}
+
+/// Holds a TCP connection open without ever speaking HTTP/2, so the client's handshake can
+/// never complete. Returns the url.
+async fn mute_listener() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    #[allow(clippy::disallowed_methods)] // Test-local server task.
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = listener.accept().await {
+            held.push(socket);
+        }
+    });
+    url
+}
+
+/// An HTTP/2 server that completes the handshake and accepts requests but never answers them.
+async fn unanswering_h2_server() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    #[allow(clippy::disallowed_methods)] // Test-local server task.
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            #[allow(clippy::disallowed_methods)] // Test-local connection task.
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(socket).await else {
+                    return;
+                };
+                let mut held = Vec::new();
+                while let Some(Ok(request)) = conn.accept().await {
+                    held.push(request);
+                }
+            });
+        }
+    });
+    url
+}
+
+/// Nothing listening: the connect fails fast with an error rather than hanging.
+#[tokio::test]
+async fn auth_call_against_a_closed_port_errors_promptly() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        UcsAuthentication.exchange_for_custom_resource(&url, "token", "urc-x", "corr"),
+    )
+    .await
+    .expect("a refused connection must not hang");
+    assert!(result.is_err(), "no server cannot yield a token");
+}
+
+/// An endpoint that accepts the TCP connection and never completes the HTTP/2 handshake must
+/// produce an error, not block its caller (and a session rebind's lock) forever.
+///
+/// Measured: the 5 s `connect_timeout` does NOT end this wait (tonic's `connect()` returns
+/// before the HTTP/2 handshake finishes); the 30 s per-RPC timeout does, as `Cancelled` /
+/// `TimeoutExpired`. Ignored by default only because the bound is 30 s of real time.
+#[tokio::test]
+#[ignore = "waits out the 30 s per-RPC timeout in real time"]
+async fn auth_call_against_an_endpoint_that_never_handshakes_errors_at_the_rpc_timeout() {
+    let url = mute_listener().await;
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        UcsAuthentication.exchange_for_custom_resource(&url, "token", "urc-x", "corr"),
+    )
+    .await
+    .expect("the auth channel must bound a handshake that never completes");
+    assert!(result.is_err(), "no answer cannot be a token");
+    let took = started.elapsed();
+    assert!(
+        took >= std::time::Duration::from_secs(25) && took < std::time::Duration::from_secs(40),
+        "expected the 30 s RPC bound, took {took:?}"
+    );
+}
+
+/// A server that handshakes but never answers the RPC is cut by the 30 s per-RPC timeout.
+/// Ignored by default only because the bound is real wall time.
+#[tokio::test]
+#[ignore = "waits out the 30 s per-RPC timeout in real time"]
+async fn auth_call_against_an_unanswering_server_errors_at_the_rpc_timeout() {
+    let url = unanswering_h2_server().await;
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(45),
+        UcsAuthentication.exchange_for_custom_resource(&url, "token", "urc-x", "corr"),
+    )
+    .await
+    .expect("the per-RPC timeout must end the call");
+    assert!(result.is_err(), "no answer cannot be a token");
+    let took = started.elapsed();
+    assert!(
+        took >= std::time::Duration::from_secs(25) && took < std::time::Duration::from_secs(40),
+        "expected the 30 s RPC bound, took {took:?}"
     );
 }
