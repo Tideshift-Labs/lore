@@ -2767,6 +2767,13 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 configured_domain,
             )
         };
+    crate::domain::require_armed_domain_enforcement(
+        &settings,
+        configured_domain
+            .mutable_enforcement
+            .as_ref()
+            .is_some_and(lore_postgres::domain::bypass::DomainEnforcement::is_enabled),
+    )?;
 
     // A retention handle is published only by the constructed Postgres store's
     // coordinated route. Merely configuring a domain coordinator does not prove it.

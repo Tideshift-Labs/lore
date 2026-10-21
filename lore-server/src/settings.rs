@@ -833,6 +833,11 @@ pub struct MutableStoreSettings {
     pub local: Option<LocalMutableStoreSettings>,
     pub mode: String,
     pub remote: Option<RemoteStoreSettings>,
+    /// FORK-LOCAL (Tideshift): refuse to serve unless CR-029 domain
+    /// enforcement is armed. Needs `mode = "postgres"`; arm the cell with
+    /// `loreserver domain cutover` first. Off by default.
+    #[serde(default)]
+    pub require_domain_enforcement: bool,
 }
 
 #[derive(Clone, Default, Debug, Deserialize)]

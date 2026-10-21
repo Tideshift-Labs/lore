@@ -3524,6 +3524,31 @@ fn resolve_lock_fencing(readiness: &LockFencingReadiness, settings: &Settings) -
     Ok(true)
 }
 
+/// FORK-LOCAL (Tideshift): refuse to serve when `[mutable_store]
+/// require_domain_enforcement` is on and CR-029 enforcement is not armed.
+///
+/// Called by the serving path only, after [`configure_domain_context`] and
+/// before any listener starts. Maintenance subcommands, `domain cutover`
+/// among them, never call it, so the setting cannot block the command that
+/// clears it. `armed` is the enforcement flag the mutable store was given, not
+/// a fresh read: it is what this process will actually enforce.
+pub fn require_armed_domain_enforcement(settings: &Settings, armed: bool) -> Result<()> {
+    if !settings.mutable_store.require_domain_enforcement || armed {
+        return Ok(());
+    }
+    if settings.mutable_store.mode != POSTGRES_MODE {
+        return Err(anyhow!(
+            "[mutable_store] require_domain_enforcement is true, but mutable_store.mode is {:?}; \
+             domain enforcement needs mutable_store.mode = \"postgres\"",
+            settings.mutable_store.mode
+        ));
+    }
+    Err(anyhow!(
+        "[mutable_store] require_domain_enforcement is true, but domain enforcement is not armed \
+         on this cell. To fix this, {CUTOVER_HINT}"
+    ))
+}
+
 /// Decide whether this cell may enforce, refusing readiness rather than
 /// enforcing over an incomplete backfill.
 ///

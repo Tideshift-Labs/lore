@@ -7,6 +7,7 @@ mod backfill_source;
 mod creation_readback_tests;
 mod operator;
 mod p12_tests;
+mod require_domain_enforcement;
 mod schema_operator;
 
 use std::sync::Arc;
