@@ -1222,7 +1222,7 @@ impl GrpcServerBuilder<WantsAddress> {
                 self.0
                     .router
                     .serve_with_incoming_shutdown(
-                        ShutdownIncoming::new(listener, signal),
+                        ShutdownIncoming::new("public", listener, signal),
                         std::future::pending(),
                     )
                     .await
@@ -1244,14 +1244,20 @@ impl GrpcServerBuilder<WantsAddress> {
 ///
 /// On Linux, a connection still in the backlog (completed but not yet accepted) gets a RST when
 /// the listener drops; the lame-duck period in front makes this rare.
-struct ShutdownIncoming<F> {
+///
+/// Every tonic server in this crate serves through it: the public, internal and maintenance
+/// listeners.
+pub(crate) struct ShutdownIncoming<F> {
+    /// Names the listener in the close log line.
+    name: &'static str,
     incoming: Option<TcpIncoming>,
     signal: Pin<Box<F>>,
 }
 
 impl<F: Future<Output = ()>> ShutdownIncoming<F> {
-    fn new(listener: tokio::net::TcpListener, signal: F) -> Self {
+    pub(crate) fn new(name: &'static str, listener: tokio::net::TcpListener, signal: F) -> Self {
         Self {
+            name,
             // `TCP_NODELAY` as tonic's own bind sets it.
             incoming: Some(TcpIncoming::from(listener).with_nodelay(Some(true))),
             signal: Box::pin(signal),
@@ -1266,7 +1272,10 @@ impl<F: Future<Output = ()>> Stream for ShutdownIncoming<F> {
         let this = &mut *self;
         // The signal is not polled again once the listener is gone.
         if this.incoming.is_some() && this.signal.as_mut().poll(cx).is_ready() {
-            info!("gRPC listener closed: new connections are refused while existing ones drain");
+            info!(
+                listener = this.name,
+                "gRPC listener closed: new connections are refused while existing ones drain"
+            );
             this.incoming = None;
         }
         match this.incoming.as_mut() {
@@ -1312,7 +1321,21 @@ pub async fn serve_maintenance(
         .add_service(environment_v1_server::EnvironmentServiceServer::new(
             environment_v1_svc,
         ));
-    lore_spawn_net!(async move { router.serve_with_shutdown(addr, signal).await }).await??;
+    // Bound and served as the public listener is, so this one also closes at
+    // the signal rather than when its last connection does.
+    let listener = std::net::TcpListener::bind(addr)?;
+    lore_spawn_net!(async move {
+        listener.set_nonblocking(true)?;
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        router
+            .serve_with_incoming_shutdown(
+                ShutdownIncoming::new("maintenance", listener, signal),
+                std::future::pending(),
+            )
+            .await
+            .map_err(anyhow::Error::from)
+    })
+    .await??;
 
     Ok(())
 }

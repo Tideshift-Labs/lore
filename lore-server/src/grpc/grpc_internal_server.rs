@@ -34,6 +34,7 @@ use crate::grpc;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
+use crate::grpc::server::ShutdownIncoming;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 
@@ -294,13 +295,14 @@ impl GrpcInternalServerBuilder<WantsAddress> {
         addr: SocketAddr,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
-            .await??;
-        Ok(())
+        let listener = std::net::TcpListener::bind(addr)?;
+        self.serve_with_listener(listener, signal).await
     }
 
     /// Serve on a socket the caller already bound; see
-    /// [`super::server::GrpcServerBuilder::serve_with_listener`], which this mirrors.
+    /// [`super::server::GrpcServerBuilder::serve_with_listener`], which this mirrors,
+    /// including the listener closing at the signal rather than when the last
+    /// connection does.
     pub async fn serve_with_listener(
         self,
         listener: std::net::TcpListener,
@@ -312,8 +314,8 @@ impl GrpcInternalServerBuilder<WantsAddress> {
             self.0
                 .router
                 .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    signal,
+                    ShutdownIncoming::new("internal", listener, signal),
+                    std::future::pending(),
                 )
                 .await?;
             Ok::<(), anyhow::Error>(())
