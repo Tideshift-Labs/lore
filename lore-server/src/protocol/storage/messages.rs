@@ -11,6 +11,7 @@ use bytes::Bytes;
 use enum_dispatch::enum_dispatch;
 use lore_base::types::Address;
 use lore_base::types::Hash;
+use lore_base::types::KeyType;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_storage::StoreError;
@@ -103,6 +104,12 @@ pub enum MessageHandleError {
     /// pre-dispatch refusal: final, with no store effect.
     #[error("unsupported client capability")]
     UnsupportedClient,
+    /// FORK-LOCAL (Tideshift): a client asked a generic mutable RPC to write a
+    /// key type the server owns (branch tip, repository or branch identity or
+    /// metadata, instance). Final, with no store effect. See
+    /// [`crate::protocol::storage::mutable_store_handler::refuse_domain_key`].
+    #[error("{}", lore_postgres::domain::bypass::rejection_message(*.0))]
+    DomainKeyRefused(KeyType),
 }
 
 impl From<StoreError> for MessageHandleError {

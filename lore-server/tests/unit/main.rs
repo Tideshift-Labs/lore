@@ -12,6 +12,7 @@ mod cache;
 mod correlation;
 mod domain;
 mod domain_intent;
+mod domain_key_refusal;
 mod drain;
 mod event_relay;
 mod execution_state;

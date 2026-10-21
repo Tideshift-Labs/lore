@@ -50,6 +50,34 @@ impl MutableStoreOp {
     }
 }
 
+/// FORK-LOCAL (Tideshift): refuse a client write to a server-owned key type.
+///
+/// The seven generic mutable RPCs (v0 and v1 gRPC `MutableStore` and
+/// `MutableCompareAndSwap`, and the `urc/0.2` and `lore-storage/0.4` QUIC
+/// `MutableStore` and `MutableCas` commands) pass the wire `KeyType` through
+/// and check only repository `write`. Without this, a writer could move a
+/// branch tip or rewrite repository or branch metadata and skip push checks,
+/// branch protection, locks and the event outbox. Every one of those RPCs
+/// reaches the store through [`handle_mutable_store`] or
+/// [`super::mutable_cas::handle_mutable_cas`], and nothing inside the server
+/// calls either, so the check here covers every store backend and every
+/// transport without touching server-internal writers (push, metadata set,
+/// replication, the domain coordinator).
+///
+/// The fenced set is the CR-029 domain-owned set, so a new `KeyType` has to be
+/// classified there before it compiles. Policy-independent and
+/// enforcement-independent: an unarmed or non-Postgres cell refuses too.
+pub fn refuse_domain_key(key_type: KeyType) -> Result<(), MessageHandleError> {
+    if lore_postgres::domain::bypass::is_domain_owned(key_type) {
+        warn!(
+            ?key_type,
+            "Refusing a client write to a server-owned key type"
+        );
+        return Err(MessageHandleError::DomainKeyRefused(key_type));
+    }
+    Ok(())
+}
+
 pub async fn handle_mutable_store(
     key: Hash,
     value: Hash,
@@ -59,6 +87,7 @@ pub async fn handle_mutable_store(
     user_id: String,
     mutable_store: Arc<dyn MutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
+    refuse_domain_key(key_type)?;
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(

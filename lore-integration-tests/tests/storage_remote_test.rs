@@ -3804,7 +3804,10 @@ mod storage_remote_tests {
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
 
-    const REMOTE_KEY_TYPE: KeyType = KeyType::BranchLatestPointer;
+    /// These cases exercise the generic mutable RPC's mechanics, so they use a key type a client
+    /// may write. The server refuses the server-owned (domain) key types on this path
+    /// (`mutable_remote_refuses_server_owned_key_types`).
+    const REMOTE_KEY_TYPE: KeyType = KeyType::Untyped;
 
     fn remote_globals() -> LoreGlobalArgs {
         LoreGlobalArgs {
@@ -3821,6 +3824,19 @@ mod storage_remote_tests {
         partition: lore_base::types::Partition,
         key: Hash,
         value: Hash,
+    ) -> (i32, Vec<(u64, i32)>) {
+        mutable_store_via_handle_typed(handle_id, globals, partition, key, value, REMOTE_KEY_TYPE)
+            .await
+    }
+
+    /// [`mutable_store_via_handle`] with an explicit key type.
+    async fn mutable_store_via_handle_typed(
+        handle_id: u64,
+        globals: LoreGlobalArgs,
+        partition: lore_base::types::Partition,
+        key: Hash,
+        value: Hash,
+        key_type: KeyType,
     ) -> (i32, Vec<(u64, i32)>) {
         use lore::storage::mutable_store;
         use lore::storage::mutable_store::LoreStorageMutableStoreArgs;
@@ -3846,7 +3862,7 @@ mod storage_remote_tests {
                     partition,
                     key,
                     value,
-                    key_type: REMOTE_KEY_TYPE,
+                    key_type,
                 }]),
             },
             callback,
@@ -4013,6 +4029,179 @@ mod storage_remote_tests {
                         .await
                         .expect("server must hold the swapped value");
                     assert_eq!(on_server, next, "server value must reflect the swap");
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Compare-and-swap through the handle on the remote store. Returns the call status and the
+    /// per-item `(previous, error_code)` outcomes.
+    async fn mutable_cas_via_handle_typed(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        key: Hash,
+        expected: Hash,
+        value: Hash,
+        key_type: KeyType,
+    ) -> (i32, Vec<(Hash, i32)>) {
+        use lore::storage::mutable_compare_and_swap;
+        use lore::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs;
+        use lore::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapItem;
+        use lore_revision::interface::LoreArray;
+
+        let captured: Arc<Mutex<Vec<(Hash, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_cb = captured.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::StorageMutableCompareAndSwapItemComplete(data) = event {
+                captured_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((data.previous, data.error.error_code));
+            }
+        }));
+        let status = mutable_compare_and_swap::mutable_compare_and_swap(
+            remote_globals(),
+            LoreStorageMutableCompareAndSwapArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStorageMutableCompareAndSwapItem {
+                    id: 1,
+                    partition,
+                    key,
+                    expected,
+                    value,
+                    key_type,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        let events = captured.lock().unwrap().clone();
+        (status, events)
+    }
+
+    /// The server refuses a client write to a server-owned (domain) key type on the generic
+    /// mutable RPCs, over both transports, and the refused write leaves no trace on the backend.
+    /// `Untyped` is the positive control: the same calls succeed for a key type a client may
+    /// write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mutable_remote_refuses_server_owned_key_types() -> TestResult {
+        const SERVER_OWNED: [KeyType; 6] = [
+            KeyType::RepositoryId,
+            KeyType::RepositoryMetadata,
+            KeyType::BranchId,
+            KeyType::BranchMetadata,
+            KeyType::BranchLatestPointer,
+            KeyType::Instance,
+        ];
+
+        let execution = setup_execution("storage-remote-mutable-domain-refusal".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let handle_id = open_remote_handle(&server).await;
+                    let partition = lore_base::types::Partition::from([0xd1u8; 16]);
+                    let value = Hash::from([0xd3u8; 32]);
+                    let next = Hash::from([0xd4u8; 32]);
+
+                    for (index, key_type) in SERVER_OWNED.into_iter().enumerate() {
+                        let key = Hash::from([0xd2u8 + index as u8; 32]);
+
+                        let (status, completes) = mutable_store_via_handle_typed(
+                            handle_id,
+                            remote_globals(),
+                            partition,
+                            key,
+                            value,
+                            key_type,
+                        )
+                        .await;
+                        assert_ne!(
+                            status, 0,
+                            "{transport:?} {key_type:?}: a remote store must be refused"
+                        );
+                        assert!(
+                            completes.iter().all(|(_, code)| *code != 0),
+                            "{transport:?} {key_type:?}: no item may report success: {completes:?}"
+                        );
+                        assert!(
+                            server
+                                .backend_mutable
+                                .clone()
+                                .load(partition, key, key_type)
+                                .await
+                                .is_err(),
+                            "{transport:?} {key_type:?}: the refused store must not land"
+                        );
+
+                        // Seed the server directly so the swap's `expected` is correct and only
+                        // the refusal can stop it.
+                        server
+                            .backend_mutable
+                            .clone()
+                            .store(partition, key, value, key_type)
+                            .await
+                            .expect("seed the backend directly");
+                        let (status, events) = mutable_cas_via_handle_typed(
+                            handle_id, partition, key, value, next, key_type,
+                        )
+                        .await;
+                        assert_ne!(
+                            status, 0,
+                            "{transport:?} {key_type:?}: a remote swap must be refused"
+                        );
+                        assert!(
+                            events.iter().all(|(_, code)| *code != 0),
+                            "{transport:?} {key_type:?}: no item may report success: {events:?}"
+                        );
+                        assert_eq!(
+                            server
+                                .backend_mutable
+                                .clone()
+                                .load(partition, key, key_type)
+                                .await
+                                .expect("seeded value"),
+                            value,
+                            "{transport:?} {key_type:?}: the refused swap must not land"
+                        );
+                    }
+
+                    // Positive control, same calls, a key type a client may write.
+                    let key = Hash::from([0xe0u8; 32]);
+                    let (status, completes) = mutable_store_via_handle_typed(
+                        handle_id,
+                        remote_globals(),
+                        partition,
+                        key,
+                        value,
+                        KeyType::Untyped,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}: Untyped store must succeed");
+                    assert_eq!(completes, vec![(1, 0)]);
+                    let (status, events) = mutable_cas_via_handle_typed(
+                        handle_id,
+                        partition,
+                        key,
+                        value,
+                        next,
+                        KeyType::Untyped,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "{transport:?}: Untyped swap must succeed");
+                    assert_eq!(events, vec![(value, 0)]);
+                    assert_eq!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, key, KeyType::Untyped)
+                            .await
+                            .expect("untyped value"),
+                        next
+                    );
 
                     close_handle(handle_id).await;
                 }

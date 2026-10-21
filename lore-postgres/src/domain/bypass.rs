@@ -16,6 +16,11 @@
 //! the gRPC five, so a handler-level check would have to be written twice and
 //! kept in step forever. One check at the store is reached by all seven.
 //!
+//! Since 2026-10-21 `lore-server` also refuses [`is_domain_owned`] key types on
+//! all seven RPCs, for every store and with or without enforcement, at the two
+//! protocol handlers they share (`mutable_store_handler::refuse_domain_key`).
+//! This store guard stays as defence in depth.
+//!
 //! No trait default, no downcast, no silent fallback: a rejected write returns
 //! an explicit error naming the key type. A guard that quietly degraded to
 //! "allow" on an unrecognised configuration would be worse than no guard, because

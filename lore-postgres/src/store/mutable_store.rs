@@ -81,12 +81,12 @@ impl PostgresMutableStore {
 
     /// Reject a domain-owned key write while enforcement is on.
     ///
-    /// This is the single choke point for all seven generic mutable RPCs — the
-    /// v0/v1 gRPC pairs and the two QUIC command families — which pass the wire
-    /// `KeyType` through untouched and authorize only repository-level `write`.
-    /// Putting the check at the store rather than in the handlers is deliberate:
-    /// two of the seven use a different authorization path, so a handler-level
-    /// check would have to exist twice and stay in step.
+    /// The seven generic mutable RPCs — the v0/v1 gRPC pairs and the two QUIC
+    /// command families — pass the wire `KeyType` through untouched and
+    /// authorize only repository-level `write`. `lore-server` now refuses these
+    /// key types for every store at its shared protocol handlers
+    /// (`mutable_store_handler::refuse_domain_key`), so this store-level check
+    /// is defence in depth for a Postgres cell with enforcement armed.
     fn reject_domain_key(&self, key_type: KeyType) -> Result<(), StoreError> {
         if self.enforcement.is_enabled() && crate::domain::bypass::is_domain_owned(key_type) {
             return Err(StoreError::internal(

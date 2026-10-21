@@ -65,6 +65,7 @@ pub async fn handle_mutable_cas(
     user_id: String,
     mutable_store: Arc<dyn MutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
+    crate::protocol::storage::mutable_store_handler::refuse_domain_key(key_type)?;
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(

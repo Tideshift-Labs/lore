@@ -53,6 +53,27 @@ Durable, recurring testing lessons grouped by topic.
 
 ## Fixtures and white-box seams
 
+- **One refusal across several transports (`lore-server`)**: table-drive it through a small
+  `Transport` trait (`store`/`cas`/`assert_refusal`) over a counting `MutableStore` wrapper plus a
+  pre-seeded read-back, so each case proves both the wire answer and no store effect; add a positive
+  control per transport. Services are built with their public constructors (`LoreStorageService` for
+  v0+v1 gRPC, `StorageService`/`StorageServiceV4` with `Arc::new(None)` verifier = auth off). Worked
+  example: `lore-server/tests/unit/domain_key_refusal.rs`.
+- **HTTP in-flight/drain through the real `create_router`**: `ServerHealth::new_without_availability`
+  then set `health.drain`; drive with `tower::ServiceExt::oneshot` (not `TestServer`) and a
+  `Body::from_stream(ReceiverStream)` so the PUT blocks on its body while you read
+  `DrainState::active_rpc_requests()`. `CoreHopLayer` spawns on call, so use
+  `flavor = "multi_thread"` and poll the counter with a deadline. See
+  `lore-server/tests/unit/http/content_upload_drain.rs`.
+- **Source-pin ordering inside `async_main`**: strip `//` lines, then compare byte offsets of the
+  call, the last `configure_domain_context(`, and each `launch_*_server(`; assert the call text ends
+  `)?` and names its input. A block comment would still pass a text pin, so mutation-probe by deleting the
+  statement, not commenting it. `lore-server/tests/unit/domain/require_domain_enforcement.rs`.
+- **`lore-integration-tests` remote mutable cases use `KeyType::Untyped`**: the server refuses
+  domain-owned key types on the generic mutable RPCs. `storage_mutable_test.rs` is local-handle only
+  and unaffected. Run: `cargo test -j 4 -p lore-integration-tests --features integration_tests --test
+  integration -- storage_remote_test` (in-process servers, no compose; first build ~6 min).
+
 - **Identity preservation**: Versioned derivations must preserve old identities. Test V2 successors against explicit V1 predecessors.
 - **Testing scope**: Same-file `#[cfg(test)] mod tests` can inspect private state, sibling modules cannot.
 - **Immutable-store fixtures**: Use behavior-based fixtures (canned responses, selective fault injection).

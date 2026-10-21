@@ -205,6 +205,10 @@ pub fn map_message_handle_error_to_status(
             Code::FailedPrecondition,
             message.unwrap_or_else(|| "unsupported client capability".into()),
         ),
+        MessageHandleError::DomainKeyRefused(_) => (
+            Code::PermissionDenied,
+            message.unwrap_or_else(|| error.to_string()),
+        ),
     };
 
     let mut status = Status::with_details(code, message, details.unwrap_or_default());
