@@ -234,6 +234,7 @@ pub fn create_router(
         ))
         .with_state(shared_state.clone());
 
+    let upload_drain = health.drain.clone();
     let server_health = Arc::new(health);
     let unauthenticated_router = Router::new()
         .route(
@@ -273,6 +274,12 @@ pub fn create_router(
         .layer(middleware::from_fn_with_state(
             settings.caller_capability_policy,
             caller_capability_admission,
+        ))
+        // Outside admission, as `GrpcDrainLayer` sits outside the gRPC
+        // `CallerCapabilityLayer`.
+        .layer(middleware::from_fn_with_state(
+            upload_drain,
+            content_upload_drain,
         ))
         .layer(middleware::from_fn(lore_http_tracing))
         .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build())
@@ -377,6 +384,38 @@ pub async fn caller_capability_admission(
         )
             .into_response();
     }
+    next.run(request).await
+}
+
+/// FORK-LOCAL (Tideshift): the drain gate for HTTP content uploads, matching
+/// public gRPC.
+///
+/// A PUT is counted as public RPC work for as long as it runs, so a graceful
+/// drain waits for it as it waits for a gRPC `Put` (`GrpcDrainLayer`). Once
+/// admission closes (draining, lame duck over), a new PUT is refused with 503
+/// before its body is read, as tonic refuses a new call after shutdown; the
+/// client retries on another node. During the lame-duck period PUTs are still
+/// served, as gRPC is. Reads, health and drain status are not affected, so a
+/// deploy controller can poll `/drain_status` through the drain.
+pub async fn content_upload_drain(
+    axum::extract::State(drain): axum::extract::State<Option<Arc<DrainState>>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let Some(drain) = drain.filter(|_| request.method() == http::Method::PUT) else {
+        return next.run(request).await;
+    };
+    if drain.is_draining() && !drain.is_lame_duck() {
+        return (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            [(http::header::RETRY_AFTER, "1")],
+            "server draining",
+        )
+            .into_response();
+    }
+    let _guard = drain.begin_rpc();
     next.run(request).await
 }
 

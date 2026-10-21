@@ -451,7 +451,10 @@ pub(crate) fn validate_serving_fragment_route(
     Ok(())
 }
 
-/// Run before storage or listeners start. These transports have no equivalent gate yet.
+/// Run before storage or listeners start. Internal, forwarded and store-forwarding ingress
+/// have no admission gate, so the required policy forbids them. Public QUIC (`admit_quic`)
+/// and HTTP content PUT (`http::server::caller_capability_admission`, plus
+/// `content_upload_drain`) carry their own.
 pub fn validate_settings(settings: &crate::settings::Settings) -> anyhow::Result<()> {
     let server = &settings.server;
     if !server.grpc.as_ref().is_some_and(|grpc| {

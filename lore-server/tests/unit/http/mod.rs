@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+mod content_upload_drain;
 mod drain_status;
 mod event_readiness;
 mod health_check;
