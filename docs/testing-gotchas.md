@@ -72,6 +72,13 @@ Durable, recurring testing lessons grouped by topic.
   `aud` containing `127.0.0.1`, as must any token the stub returns. Connect with
   `RepositoryId::default()` so the connect-time exchange does not fire. `cache()` is `test_pub`;
   clear by `tokens.lock().retain(|k, _| k.1 != identity)`, not `clear_authz_cache()` (global).
+- **Attempt-journal scan vs marker hit** (`lore-revision/tests/admission_marker.rs`): the
+  `phase_diagnostics::Probe` `child_parse` delta is the discriminator (a full scan parses every child
+  on disk; a hit parses only pending). Install the probe and publication probe on
+  `std::fs::canonicalize(tempdir)`: the repository fence canonicalizes (`\\?\` on Windows) and probes
+  match by `starts_with`, so a plain tempdir path silently counts zero. To isolate one fingerprint
+  input, edit the root JSON (keeping `validated`) or the child file directly. Existing-file `child_read`
+  counts double (pending and settled paths both read), so assert on parses.
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
 - **Closed metric-label sets**: pin the exact literal list in `ALL` order, then pin the real call
   sites, not just a hand-written table. For SQL-keyed labels (`drain_procedure_label`),

@@ -336,6 +336,36 @@ impl RepositoryAttemptStore {
         Ok(document.parents)
     }
 
+    /// Ordinary write admission. Settled history gets the same full validation as
+    /// `managed_parents`, but only when the root's `validated` marker does not match the
+    /// current settled fingerprint; a passing scan then records the marker with the root.
+    /// Recovery and operation status call `managed_parents`, which always scans in full.
+    pub async fn admission_parents(&self) -> Result<Vec<ManagedParent>, ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load(&guard)?;
+        Self::validate_parents(&document)?;
+        let fingerprint = self.settled_fingerprint(&guard, &document)?;
+        if fingerprint.is_some() && document.validated == fingerprint {
+            self.children(&document, true)?;
+        } else {
+            self.children(&document, false)?;
+            if fingerprint.is_some() {
+                // Atomic with the root, and both outcomes are sound: a crash or failure leaves
+                // either this marker or the old one, which no longer matches, so the next
+                // admission scans in full again. The marker is
+                // only a cache: failing to write it (for example a read-only legacy root)
+                // must not refuse a command whose full scan passed. A root rewritten here drops
+                // any field this build does not know, as every root write already does.
+                document.validated = fingerprint;
+                if let Err(error) = self.store(&guard, &document) {
+                    crate::lore_warn!("Could not record attempt journal validation: {error}");
+                }
+            }
+        }
+        Ok(document.parents)
+    }
+
     pub(super) fn validate_parents(document: &StoredDocument) -> Result<(), ProtocolError> {
         let mut seen = std::collections::HashSet::new();
         for parent in &document.parents {

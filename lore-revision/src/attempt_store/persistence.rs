@@ -789,6 +789,77 @@ impl RepositoryAttemptStore {
     }
 }
 
+/// Bump when the full scan accepts less than before (a stricter `validate_child` or
+/// `children` rule), so markers written under the weaker rules stop matching.
+const SETTLED_FINGERPRINT_VERSION: u32 = 1;
+
+impl RepositoryAttemptStore {
+    /// Identity of the settled history that a full scan would read, from one directory
+    /// enumeration and no child opens: generation, parent and legacy-intent identities, and each
+    /// settled child's name, length and modification time. Every journal writer replaces a
+    /// child by rename, so any add, move or rewrite changes it. Accepted residual: a rewrite by
+    /// a non-Lore writer that keeps name, length and mtime is not seen until recovery's full
+    /// scan. `None` (no generation, or no usable mtime) means always scan in full.
+    pub(super) fn settled_fingerprint(
+        &self,
+        _guard: &FSLock,
+        document: &StoredDocument,
+    ) -> Result<Option<StoredValidation>, ProtocolError> {
+        let Some(current) = document.generation.as_deref() else {
+            return Ok(None);
+        };
+        #[cfg(feature = "test-util")]
+        let _fingerprint = phase_diagnostics::start(self.path.as_deref(), "settled_fingerprint");
+        let generation = self.generation(document)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut field = |bytes: &[u8]| {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        field(b"lore-attempt-settled");
+        field(&SETTLED_FINGERPRINT_VERSION.to_le_bytes());
+        field(current.as_bytes());
+        field(&(document.parents.len() as u64).to_le_bytes());
+        for parent in &document.parents {
+            field(parent.id.as_bytes());
+            field(&parent.version.to_le_bytes());
+        }
+        let mut legacy = document
+            .managed
+            .iter()
+            .map(|intent| (intent.attempt.as_str(), intent.parent.as_str()))
+            .collect::<Vec<_>>();
+        legacy.sort_unstable();
+        field(&(legacy.len() as u64).to_le_bytes());
+        for (attempt, parent) in legacy {
+            field(attempt.as_bytes());
+            field(parent.as_bytes());
+        }
+        let mut settled = child_entries(&generation.join("settled"))?;
+        settled.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        field(&(settled.len() as u64).to_le_bytes());
+        for (id, entry) in &settled {
+            let metadata = entry
+                .metadata()
+                .map_err(|error| io_error("inspect child", &entry.path(), error))?;
+            let Some(modified) = metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+            else {
+                return Ok(None);
+            };
+            field(id.as_bytes());
+            field(&metadata.len().to_le_bytes());
+            field(&modified.as_nanos().to_le_bytes());
+        }
+        Ok(Some(StoredValidation {
+            version: SETTLED_FINGERPRINT_VERSION,
+            fingerprint: hasher.finalize().to_hex().to_string(),
+        }))
+    }
+}
+
 /// Settled children one store instance has fully validated in this process.
 #[derive(Default)]
 pub(super) struct SettledCache {

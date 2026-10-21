@@ -82,7 +82,7 @@ impl RepositoryMutationGuard {
         if !nested
             && !recovery
             && (store
-                .managed_parents()
+                .admission_parents()
                 .await?
                 .iter()
                 .any(|parent| !parent.complete)
@@ -95,7 +95,7 @@ impl RepositoryMutationGuard {
         if !nested && !recovery {
             for (_, legacy) in &legacy_stores {
                 if legacy
-                    .managed_parents()
+                    .admission_parents()
                     .await?
                     .iter()
                     .any(|parent| !parent.complete)

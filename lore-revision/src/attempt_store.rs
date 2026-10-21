@@ -248,6 +248,18 @@ struct StoredDocument {
     attempts: Vec<StoredAttempt>,
     #[serde(default)]
     ownership: Vec<StoredOwnership>,
+    /// Settled history the last full admission scan accepted. Additive: an older build ignores
+    /// it, and its next root write drops it, which forces a full scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    validated: Option<StoredValidation>,
+}
+
+/// Fingerprint of the settled history one full scan validated; see `settled_fingerprint`.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[lore_macro::test_pub]
+struct StoredValidation {
+    version: u32,
+    fingerprint: String,
 }
 
 /// Durable parent identity. A missing namespace means no child was admitted yet.
