@@ -209,7 +209,8 @@ fn publish_directory(path: &Path) -> Result<(), ProtocolError> {
 }
 
 /// On error publication may already have happened. Preserve both names and let the next
-/// locked operation reload disk state; callers must not dispatch after this error.
+/// locked operation reload disk state; callers must not dispatch after this error, unless
+/// both outcomes are equally sound (admission's marker write, which only caches a verdict).
 #[allow(clippy::disallowed_methods)]
 fn publish(source: &Path, destination: &Path, replace: bool) -> Result<(), ProtocolError> {
     #[cfg(feature = "test-util")]
@@ -818,6 +819,7 @@ impl RepositoryAttemptStore {
         };
         field(b"lore-attempt-settled");
         field(&SETTLED_FINGERPRINT_VERSION.to_le_bytes());
+        field(&[ATTEMPT_STORE_VERSION]);
         field(current.as_bytes());
         field(&(document.parents.len() as u64).to_le_bytes());
         for parent in &document.parents {

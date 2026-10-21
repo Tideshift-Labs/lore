@@ -745,8 +745,40 @@ async fn failed_marker_write_is_best_effort_and_the_next_admission_scans_and_wri
     assert_rescans(&journal, None, None).await;
 }
 
-// A root the process cannot replace (read-only attribute; rename-replace fails) must not refuse
-// admission once the full scan passed; the marker just stays absent.
+// The publication already happened when this point fails: the call errors, but the marker is
+// on disk and describes the state the full scan validated, so the next admission is a hit.
+#[tokio::test]
+async fn marker_write_failing_after_rename_admits_and_the_published_marker_is_trusted() {
+    let journal = completed(3).await;
+    let root = journal.path.join("attempts");
+    let fired = Arc::new(AtomicBool::new(false));
+    let probe = {
+        let fired = fired.clone();
+        install_publication_probe(journal.path.clone(), move |point, _, destination| {
+            if point == PublicationPoint::AfterRenameBeforeDirectorySync && destination == root {
+                fired.store(true, Ordering::SeqCst);
+                Err(ProtocolError::internal("injected post-rename failure"))
+            } else {
+                Ok(())
+            }
+        })
+    };
+    let seen = admit(&journal).await;
+    seen.result.unwrap();
+    assert!(
+        fired.load(Ordering::SeqCst),
+        "the root write must be reached"
+    );
+    assert_eq!(seen.parses, 3, "the scan finished before the marker write");
+    assert!(marker(&journal.path).is_some(), "the rename published it");
+    drop(probe);
+    assert_hit(&journal).await;
+}
+
+// A root the process cannot replace must not refuse admission once the full scan passed; the
+// marker just stays absent. Windows only: the read-only attribute blocks a rename-replace there,
+// while Unix rename permission belongs to the directory, not the file.
+#[cfg(windows)]
 #[tokio::test]
 async fn read_only_root_admits_after_a_full_scan_and_never_gets_a_marker() {
     let journal = completed(3).await;
