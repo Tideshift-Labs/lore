@@ -79,9 +79,10 @@ pub enum ParsedStorageRequestV4 {
 
 fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
     match error {
-        MessageHandleError::AuthorizationFailure(_) | MessageHandleError::MissingToken => {
-            QuicServiceError::NotAuthorized
-        }
+        // FORK-LOCAL (Tideshift): a refused domain key is a permission refusal.
+        MessageHandleError::AuthorizationFailure(_)
+        | MessageHandleError::MissingToken
+        | MessageHandleError::DomainKeyRefused(_) => QuicServiceError::NotAuthorized,
         MessageHandleError::FragmentNotFound | MessageHandleError::MutableDataNotFound(_) => {
             QuicServiceError::NotFound
         }

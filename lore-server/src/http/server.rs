@@ -407,7 +407,12 @@ pub async fn content_upload_drain(
     let Some(drain) = drain.filter(|_| request.method() == http::Method::PUT) else {
         return next.run(request).await;
     };
+    // Count first, then check. Checking first left a window in which the lame
+    // duck could end and `wait_idle` read zero between an admitted PUT's check
+    // and its count, so the drain finished with the PUT still to run.
+    let guard = drain.begin_rpc();
     if drain.is_draining() && !drain.is_lame_duck() {
+        drop(guard);
         return (
             http::StatusCode::SERVICE_UNAVAILABLE,
             [(http::header::RETRY_AFTER, "1")],
@@ -415,8 +420,9 @@ pub async fn content_upload_drain(
         )
             .into_response();
     }
-    let _guard = drain.begin_rpc();
-    next.run(request).await
+    let response = next.run(request).await;
+    drop(guard);
+    response
 }
 
 impl LoreHttpServer {

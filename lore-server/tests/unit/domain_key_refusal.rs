@@ -592,9 +592,11 @@ async fn a_read_only_token_meets_the_permission_gate_before_the_key_refusal() {
 // thing between the command and the store is the refusal.
 // ---------------------------------------------------------------------------
 
-/// The wire status a QUIC refusal must carry: the generic failure. Not
-/// `NotAuthorized` (that is the permission gate) and not 200
-/// (`ImplementationReserved`, the unsupported-client refusal).
+/// The wire status a QUIC refusal must carry: `NotAuthorized`, the most
+/// specific permission refusal QUIC has. Not the generic failure and not 200
+/// (`ImplementationReserved`, the unsupported-client refusal). QUIC carries no
+/// message, so a client sees the same status as a write-gate refusal; only the
+/// server-side error text names the key type.
 fn quic_refusal(
     error: &MessageHandleError,
     info: &lore_server::quic::ProtocolErrorInfo,
@@ -612,12 +614,12 @@ fn quic_refusal(
 fn assert_quic_refusal(refusal: &Refusal, key_type: KeyType) {
     assert_eq!(
         refusal.wire,
-        format!("{}", QuicServiceError::Failed as QuicErrorStatus),
-        "{key_type:?}: QUIC must answer the generic failure status"
+        format!("{}", QuicServiceError::NotAuthorized as QuicErrorStatus),
+        "{key_type:?}: QUIC must answer the permission refusal status"
     );
     assert_ne!(
         refusal.wire,
-        format!("{}", QuicServiceError::NotAuthorized as QuicErrorStatus)
+        format!("{}", QuicServiceError::Failed as QuicErrorStatus)
     );
     assert_ne!(
         refusal.wire,

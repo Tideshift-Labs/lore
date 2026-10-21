@@ -41,6 +41,14 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `/health_check` returns 503 while draining and `/drain_status` exposes state. Gates:
   `drain::`, `server::wait_for_shutdown_tests`, `settings::`, `health_check::`, and
   `drain_status::`. Cross-process signal behavior remains a live/e2e responsibility.
+  HTTP content PUT is counted before its admission check. Gate: `content_upload_drain`.
+- **Domain-key refusal on generic mutable RPCs [SERVER], upstream divergence**: gRPC and QUIC
+  `MutableStore`/`MutableCas` refuse CR-029 domain-owned key types (QUIC status `NotAuthorized`).
+  So `mutable_store.mode = "remote"` cannot carry a server's own pushes or branch and repository
+  writes. Upstream ships that topology (Helm handler pod, `contrib/aws`); the fork refuses to boot it
+  while revision gRPC, repository gRPC or internal gRPC is on. A read-only thin front still boots.
+  Gates: `domain_key_refusal`,
+  `domain::remote_mutable_store`, `storage_remote_test`, and `test_server_services.py`.
 - **CR-010 notification subscription authorization [SERVER]**: the repository in the subscribe body
   must match token authorization. Gate: `grpc::notification_service::tests`.
 - **CR-011 repository metadata authorization [SERVER]**: v0/v1 metadata get/set and storage stats

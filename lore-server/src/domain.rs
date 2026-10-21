@@ -86,6 +86,7 @@ use crate::store::configuration::resolve_plugin_config_with_fallback;
 /// The `mode` string that selects the Postgres backend.
 #[lore_macro::test_pub]
 const POSTGRES_MODE: &str = "postgres";
+const REMOTE_MODE: &str = "remote";
 #[lore_macro::test_pub]
 const CONTROL_PLANE_SERVICE_SUBJECT: &str = "lorehub-control-plane";
 /// CR-029 semantic method shared by both local branch-delete adapters.
@@ -3546,6 +3547,72 @@ pub fn require_armed_domain_enforcement(settings: &Settings, armed: bool) -> Res
     Err(anyhow!(
         "[mutable_store] require_domain_enforcement is true, but domain enforcement is not armed \
          on this cell. To fix this, {CUTOVER_HINT}"
+    ))
+}
+
+/// FORK-LOCAL (Tideshift): the surfaces of this server that write domain-owned
+/// keys through its own mutable store, by config name, in the order checked.
+///
+/// The public gRPC revision (push, branch create, delete and metadata) and
+/// repository (create, metadata set) services, and internal gRPC, whose
+/// forwarding endpoint reaches the same handlers. Not listed: storage gRPC and
+/// public QUIC (their client mutable writes are refused for domain keys before
+/// any store call, and `PutResolved` writes `Resolve`), admin (`Obliterate`
+/// does not use the mutable store), thin-client, environment, lock and
+/// notification RPCs, HTTP (immutable writes only) and internal QUIC
+/// (immutable replication).
+pub fn mutable_store_domain_writers(settings: &Settings) -> Vec<&'static str> {
+    let server = &settings.server;
+    let services = &server.grpc_public_services;
+    [
+        (
+            "[server.grpc_public_services.revision_service]",
+            services.revision_service.enabled,
+        ),
+        (
+            "[server.grpc_public_services.repository_service]",
+            services.repository_service.enabled,
+        ),
+        (
+            "[server.grpc_internal]",
+            server
+                .grpc_internal
+                .as_ref()
+                .is_some_and(|grpc| grpc.enabled),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(name, enabled)| enabled.then_some(name))
+    .collect()
+}
+
+/// FORK-LOCAL (Tideshift): refuse to serve writes through a remote mutable
+/// store.
+///
+/// `mutable_store.mode = "remote"` sends this server's own domain writes (a
+/// push's tip CAS, branch create, metadata set) to the server
+/// behind it over the generic mutable-store RPCs. The fork refuses every
+/// domain-owned key type on those RPCs (`refuse_domain_key`), so each such
+/// write would fail at runtime. Upstream ships this topology (the Helm handler
+/// pod, `thin.example.toml`); the fork does not. A read-only front, with every
+/// [`mutable_store_domain_writers`] surface off, still boots.
+///
+/// Called by the serving path only, before any listener starts. Maintenance
+/// mode serves no store RPC and is not checked.
+pub fn refuse_remote_mutable_store_writers(settings: &Settings) -> Result<()> {
+    if settings.mutable_store.mode != REMOTE_MODE {
+        return Ok(());
+    }
+    let writers = mutable_store_domain_writers(settings);
+    if writers.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "mutable_store.mode = \"remote\" cannot serve writes on this fork: the remote server \
+         refuses domain-owned key types on its generic mutable-store RPCs, so pushes, branch \
+         and repository writes from this server would fail. Disable {} for a read-only front, \
+         or use a local or postgres mutable store",
+        writers.join(", ")
     ))
 }
 

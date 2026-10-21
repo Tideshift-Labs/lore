@@ -2874,6 +2874,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     } else {
         false
     };
+    if !is_maintenance {
+        crate::domain::refuse_remote_mutable_store_writers(&settings)?;
+    }
 
     let jwt_verifier = match settings.server.auth.as_ref() {
         Some(auth) => {

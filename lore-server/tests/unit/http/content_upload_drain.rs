@@ -365,6 +365,43 @@ async fn an_in_flight_put_is_counted_survives_a_drain_and_is_released() {
     .await;
 }
 
+const HTTP_SERVER: &str = include_str!("../../../src/http/server.rs");
+
+/// The gate counts a PUT before it checks admission. Checking first left a
+/// window between an admitted PUT's check and its count in which the lame duck
+/// could end and `wait_idle` read zero, so the drain finished with the PUT
+/// still to run. The window is too narrow to hit from a test, so the order is
+/// pinned in source.
+#[test]
+fn the_gate_counts_a_put_before_it_checks_admission() {
+    let start = HTTP_SERVER
+        .find("pub async fn content_upload_drain(")
+        .expect("the gate must exist");
+    let body = &HTTP_SERVER[start..];
+    let body = &body[..body.find("\n}\n").expect("end of the gate")];
+    let code = body
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let counted_at = code.find(".begin_rpc()").expect("the gate must count");
+    let checked_at = code.find(".is_draining()").expect("the gate must check");
+    assert!(
+        counted_at < checked_at,
+        "begin_rpc must run before the admission check"
+    );
+    let refused_at = code.find("SERVICE_UNAVAILABLE").expect("the refusal");
+    let dropped_at = code[checked_at..]
+        .find("drop(guard)")
+        .map(|at| at + checked_at)
+        .expect("the refusal must drop the guard");
+    assert!(
+        dropped_at < refused_at,
+        "the guard must be released before the refusal returns"
+    );
+}
+
 /// The guard releases on a failed request too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refused_put_releases_the_count() {
