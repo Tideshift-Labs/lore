@@ -714,7 +714,11 @@ impl RepositoryAttemptStore {
     /// The settled half of `children(document, false)`'s validation, without returning the
     /// children. A settled child this store already validated is parsed again only when its
     /// length or modification time changed, or its parent left the root.
-    pub(super) fn check_settled(&self, document: &StoredDocument) -> Result<(), ProtocolError> {
+    pub(super) fn check_settled(
+        &self,
+        _guard: &FSLock,
+        document: &StoredDocument,
+    ) -> Result<(), ProtocolError> {
         let Some(current) = document.generation.as_deref() else {
             return Ok(());
         };
@@ -743,7 +747,11 @@ impl RepositoryAttemptStore {
             cache.generation = Some(current.to_owned());
             cache.entries.clear();
         }
-        for (id, entry) in child_entries(&generation.join("settled"))? {
+        let settled = child_entries(&generation.join("settled"))?;
+        // A file that left settled must not be trusted if it later returns with old metadata.
+        let present = settled.iter().map(|(id, _)| id).collect::<HashSet<_>>();
+        cache.entries.retain(|id, _| present.contains(id));
+        for (id, entry) in &settled {
             if !seen.insert(id.clone()) {
                 return Err(ProtocolError::internal("duplicate journal child identity"));
             }
@@ -752,7 +760,7 @@ impl RepositoryAttemptStore {
                 .map_err(|error| io_error("inspect child", &entry.path(), error))?;
             // A filesystem without modification times always parses.
             let modified = metadata.modified().ok();
-            if cache.entries.get(&id).is_some_and(|validated| {
+            if cache.entries.get(id).is_some_and(|validated| {
                 Some(validated.modified) == modified
                     && validated.len == metadata.len()
                     && validated
@@ -762,13 +770,13 @@ impl RepositoryAttemptStore {
             }) {
                 continue;
             }
-            cache.entries.remove(&id);
+            cache.entries.remove(id);
             let (child, _) = self
-                .child(document, &id)?
+                .child(document, id)?
                 .ok_or_else(|| ProtocolError::internal("journal child disappeared"))?;
             if let Some(modified) = modified {
                 cache.entries.insert(
-                    id,
+                    id.clone(),
                     ValidatedSettled {
                         len: metadata.len(),
                         modified,

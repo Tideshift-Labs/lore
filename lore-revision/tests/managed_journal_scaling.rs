@@ -293,6 +293,175 @@ async fn cached_settled_child_rewritten_with_wrong_identity_blocks_begin_and_fin
     );
 }
 
+fn next_parent() -> ManagedParent {
+    ManagedParent {
+        version: 1,
+        id: Uuid::now_v7().to_string(),
+        root: "journal-scaling".into(),
+        operation: "compact".into(),
+        normalized_intent: "journal-scaling".into(),
+        namespace: None,
+        complete: false,
+        parent_uncertainty_code: None,
+        body_completed: false,
+    }
+}
+
+/// Two cycles on one store instance, so both settled children are in its validation cache.
+/// Returns `(store, first parent, second parent, settled children)`.
+async fn two_cached_cycles(
+    dir: &Path,
+) -> (RepositoryAttemptStore, Uuid, Uuid, Vec<std::path::PathBuf>) {
+    let store = RepositoryAttemptStore::in_directory(dir);
+    let first = full_cycle(&store).await;
+    let second = full_cycle(&store).await;
+    let files = settled_files(dir);
+    assert_eq!(files.len(), 2, "both settled children must be on disk");
+    (store, first, second, files)
+}
+
+fn set_mtime(path: &Path, time: std::time::SystemTime) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+}
+
+/// Same byte length as the original: flips one hex digit of the stored attempt id so the
+/// identity no longer matches the filename.
+fn same_length_wrong_identity(original: &[u8]) -> Vec<u8> {
+    let mut body: serde_json::Value = serde_json::from_slice(original).unwrap();
+    let id = body["attempt"]["attempt_id"].as_str().unwrap().to_owned();
+    let mut digits: Vec<char> = id.chars().collect();
+    let last = digits.len() - 1;
+    digits[last] = if digits[last] == '0' { '1' } else { '0' };
+    body["attempt"]["attempt_id"] = serde_json::json!(digits.into_iter().collect::<String>());
+    let rewritten = serde_json::to_vec(&body).unwrap();
+    assert_eq!(rewritten.len(), original.len(), "fixture must keep length");
+    assert_ne!(rewritten, original);
+    rewritten
+}
+
+async fn assert_begin_and_finish_fail(store: &RepositoryAttemptStore, finish: Uuid, reason: &str) {
+    assert_protocol_error(store.begin_parent(next_parent()).await, reason);
+    assert_protocol_error(store.finish_parent(finish).await, reason);
+}
+
+// mtime is the only change a same-length rewrite leaves for the cache to see.
+#[tokio::test]
+async fn cached_settled_child_same_length_rewrite_with_new_mtime_blocks_begin_and_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _first, second, files) = two_cached_cycles(dir.path()).await;
+    let original = std::fs::read(&files[0]).unwrap();
+    let before = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+    std::fs::write(&files[0], same_length_wrong_identity(&original)).unwrap();
+    set_mtime(&files[0], before + std::time::Duration::from_secs(10));
+    assert_eq!(
+        std::fs::metadata(&files[0]).unwrap().len() as usize,
+        original.len()
+    );
+    assert_begin_and_finish_fail(&store, second, "invalid journal child version or identity").await;
+}
+
+#[tokio::test]
+async fn cached_settled_child_whose_parent_left_the_root_blocks_begin_and_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, first, second, _files) = two_cached_cycles(dir.path()).await;
+    let root = dir.path().join("attempts");
+    let bytes = std::fs::read(&root).unwrap();
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+    let parents = document["parents"].as_array_mut().unwrap();
+    let before = parents.len();
+    parents.retain(|parent| parent["id"] != first.to_string());
+    assert_eq!(parents.len(), before - 1, "first parent must be removed");
+    let mut edited = vec![bytes[0]];
+    edited.extend(serde_json::to_vec(&document).unwrap());
+    std::fs::write(&root, edited).unwrap();
+    assert_begin_and_finish_fail(&store, second, "invalid managed child binding").await;
+}
+
+#[tokio::test]
+async fn cached_settled_child_copied_into_pending_blocks_begin_and_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _first, second, files) = two_cached_cycles(dir.path()).await;
+    let twin = files[0]
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join("pending")
+        .join(files[0].file_name().unwrap());
+    std::fs::copy(&files[0], &twin).unwrap();
+    assert_begin_and_finish_fail(&store, second, "duplicate journal child identity").await;
+}
+
+#[tokio::test]
+async fn cached_settled_child_rewritten_unresolved_blocks_begin_and_finish() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _first, second, files) = two_cached_cycles(dir.path()).await;
+    let original = std::fs::read(&files[0]).unwrap();
+    let before = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+    let mut body: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    body["attempt"]["state"] = serde_json::json!({"state": "unresolved"});
+    let rewritten = serde_json::to_vec(&body).unwrap();
+    assert_ne!(rewritten.len(), original.len());
+    std::fs::write(&files[0], rewritten).unwrap();
+    set_mtime(&files[0], before + std::time::Duration::from_secs(10));
+    assert_begin_and_finish_fail(&store, second, "unresolved child in settled journal").await;
+}
+
+// A child that left settled/ drops out of the cache, so returning with its old length and
+// mtime but different bytes is still parsed. Moving a settled child away is a valid state
+// (completed parents are not re-checked for missing children), so a later cycle succeeds.
+#[tokio::test]
+async fn settled_child_that_left_and_returned_with_old_metadata_is_revalidated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _first, _second, files) = two_cached_cycles(dir.path()).await;
+    let parked = tempfile::tempdir().unwrap();
+    let original = std::fs::read(&files[0]).unwrap();
+    let modified = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+    let away = parked.path().join(files[0].file_name().unwrap());
+    std::fs::rename(&files[0], &away).unwrap();
+
+    let third = full_cycle(&store).await; // begin_parent prunes the departed entry.
+
+    std::fs::write(&away, same_length_wrong_identity(&original)).unwrap();
+    set_mtime(&away, modified);
+    std::fs::rename(&away, &files[0]).unwrap();
+    assert_eq!(
+        std::fs::metadata(&files[0]).unwrap().modified().unwrap(),
+        modified
+    );
+    assert_begin_and_finish_fail(&store, third, "invalid journal child version or identity").await;
+}
+
+// DOCUMENTED RESIDUAL: the cache trusts (length, mtime). A rewrite that keeps both is not seen
+// by the instance that cached the child; a fresh instance has no cache and does see it.
+#[tokio::test]
+async fn residual_same_length_same_mtime_rewrite_is_missed_by_cached_instance_but_not_a_fresh_one()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let (store, _first, second, files) = two_cached_cycles(dir.path()).await;
+    let original = std::fs::read(&files[0]).unwrap();
+    let modified = std::fs::metadata(&files[0]).unwrap().modified().unwrap();
+    std::fs::write(&files[0], same_length_wrong_identity(&original)).unwrap();
+    set_mtime(&files[0], modified);
+    let metadata = std::fs::metadata(&files[0]).unwrap();
+    assert_eq!(metadata.modified().unwrap(), modified);
+    assert_eq!(metadata.len() as usize, original.len());
+
+    // Missed: the corrupt child is trusted by the cached instance.
+    store.finish_parent(second).await.unwrap();
+    store.begin_parent(next_parent()).await.unwrap();
+
+    let fresh = RepositoryAttemptStore::in_directory(dir.path());
+    assert_protocol_error(
+        fresh.managed_parents().await,
+        "invalid journal child version or identity",
+    );
+}
+
 // Run with --release -- --ignored --exact managed_storage_put_scaling --nocapture.
 // LORE_MANAGED_JOURNAL_SIZES selects a comma-separated subset of 1..=4000; default 1000,2000,4000.
 // No time threshold: record/resolve and reopen verification have separate descriptive timings.
