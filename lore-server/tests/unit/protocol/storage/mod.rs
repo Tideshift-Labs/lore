@@ -13,6 +13,7 @@ mod mutable_store_handler;
 mod ping;
 mod put;
 mod put_resolved;
+mod put_structure;
 mod query;
 mod session;
 mod verify;

@@ -22,6 +22,15 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   `lorehub_notify`; lock hashes disambiguate event ids without changing payload shape.
   Gate: `cargo test -p lore-server --test unit hooks` and
   `cargo test -p lore-server --test unit grpc::lock_service`.
+- **Fragment list/plain address swap [SERVER]**: a list's address is the hash of its reference
+  bytes R, so plain R shares it. Put validates structure, stores compare size + `PayloadFragmented`
+  on an existing hash, and push verification compares file-node size to the stored `size_content`.
+  Gates: `cargo test -p lore-server --test unit put_structure`,
+  `cargo test -p lore-storage --test unit local::immutable_store::representation`, and live
+  `cargo test -p lore-postgres --test immutable_store_representation -- --ignored` (disposable
+  Postgres + MinIO; the coordinated/staged routes need the Linux adapter fixture and are not
+  covered there). A test can build reference bytes by hand (hash 32 bytes + u64 LE offset) where
+  the crate has no `zerocopy` dev-dependency.
 - **No-op push side-effect suppression [SERVER]**: a successful re-push of the current head emits no
   notification, hook, `branch_pushed`, or pushed-counter increment. Gates:
   `grpc::handlers::branch_push` and `grpc::revision::v1::branch_push::test`.

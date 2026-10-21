@@ -516,3 +516,65 @@ fn governed_transport_attests_region_and_endpoint_from_the_cloned_sdk_config() {
         "negative control replacing resolved values with labels must fail"
     );
 }
+
+/// The `AlreadyReadable` arm of `begin` answers the put from a published epoch, so before the
+/// representation comparison it returned the witness with no check that the stored bytes were
+/// the ones offered. The comparison must come first, in both coordinated entry points.
+fn assert_already_readable_compares_before_returning(function_source: &str, name: &str) {
+    let compact: String = function_source
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let arm = compact
+        .find("BeginOutcome::AlreadyReadable(witness)=>")
+        .unwrap_or_else(|| panic!("{name} must have an AlreadyReadable arm"));
+    let tail = &compact[arm..];
+    let compare = tail
+        .find("Self::refuse_readable_mismatch(")
+        .unwrap_or_else(|| panic!("{name}: the AlreadyReadable arm must compare representations"));
+    let returned = tail
+        .find("returnOk(*witness)")
+        .unwrap_or_else(|| panic!("{name}: the AlreadyReadable arm must return the witness"));
+    assert!(
+        compare < returned,
+        "{name}: the representation comparison must precede `return Ok(*witness)`"
+    );
+}
+
+#[test]
+fn the_direct_coordinated_route_compares_a_readable_epoch_before_answering() {
+    let immutable = source("src/store/immutable_store.rs");
+    assert_already_readable_compares_before_returning(
+        function(&immutable, "async fn upload_coordinated_representation("),
+        "upload_coordinated_representation",
+    );
+}
+
+#[test]
+fn the_staged_route_compares_a_readable_epoch_before_answering() {
+    let immutable = source("src/store/immutable_store.rs");
+    assert_already_readable_compares_before_returning(
+        function(&immutable, "async fn put_staged("),
+        "put_staged",
+    );
+}
+
+#[test]
+fn the_readable_mismatch_refusal_reads_the_witness_and_applies_the_representation_rule() {
+    let immutable = source("src/store/immutable_store.rs");
+    let refusal = function(&immutable, "async fn refuse_readable_mismatch(");
+    let compact: String = refusal
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let read = compact
+        .find(".witness_representation(")
+        .expect("the refusal must read the witnessed representation");
+    let apply = compact
+        .find("refuse_representation_mismatch(")
+        .expect("the refusal must apply the representation rule");
+    assert!(
+        read < apply,
+        "the witnessed representation must be read before the rule is applied"
+    );
+}

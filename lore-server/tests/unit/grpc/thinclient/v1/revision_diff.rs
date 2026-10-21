@@ -93,10 +93,12 @@ async fn push_revision(
         )
         .await
         .expect("immutable::write");
+        // Push verification compares a file node's size with the stored content's.
         let node = Node {
             flags: NodeFlags::File.bits(),
             name_hash: hash_string(name),
             address,
+            size: bytes.len() as u64,
             ..Default::default()
         };
         state

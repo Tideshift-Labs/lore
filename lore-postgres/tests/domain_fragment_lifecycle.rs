@@ -818,6 +818,89 @@ async fn payload_free_coordinated_preflight_distinguishes_exact_readable_from_ne
     ));
 }
 
+/// A put that finds the hash already readable compares its own representation against the
+/// published manifest, because a fragment list and a plain fragment can share a hash.
+/// `witness_representation` is that read: the exact manifest's decoded size and payload flags,
+/// and nothing for a witness naming a manifest or epoch no epoch row carries.
+#[tokio::test]
+#[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
+async fn witness_representation_reports_the_published_manifest_size_and_flags_for_an_exact_witness()
+{
+    let Some(url) = pg_url() else {
+        panic!("runner must provide LORE_TEST_PG_URL");
+    };
+    let store = store(&url).await;
+    let coordinator = store.fragment_coordinator();
+    let hash = random_hash();
+    let object_key = legacy_key(&hash);
+
+    let BeginOutcome::Admitted(intent) = coordinator
+        .begin_direct_write(&hash, &object_key)
+        .await
+        .expect("begin the publication")
+    else {
+        panic!("a fresh hash must admit");
+    };
+    let mut published = manifest(&object_key, 0x61, EpochAuthority::Remote);
+    published.size_payload = 80;
+    published.size_content = 4096;
+    published.payload_flags = 2;
+    assert_eq!(
+        coordinator
+            .commit_remote(&intent, IoObservation::Valid(published))
+            .await
+            .expect("publish the manifest"),
+        CommitVerdict::Published
+    );
+
+    let BeginOutcome::AlreadyReadable(witness) = coordinator
+        .begin_direct_write(&hash, &object_key)
+        .await
+        .expect("a second write finds the published epoch")
+    else {
+        panic!("a published hash must answer AlreadyReadable");
+    };
+    assert_eq!(
+        coordinator
+            .witness_representation(&witness)
+            .await
+            .expect("read the witnessed representation"),
+        Some((4096, 2))
+    );
+
+    let mut wrong_manifest = (*witness).clone();
+    wrong_manifest.manifest_id = Some(vec![0xEE; 32]);
+    assert_eq!(
+        coordinator
+            .witness_representation(&wrong_manifest)
+            .await
+            .expect("read a witness naming another manifest"),
+        None,
+        "a manifest no epoch row carries has no representation"
+    );
+
+    let mut wrong_epoch = (*witness).clone();
+    wrong_epoch.epoch += 1;
+    assert_eq!(
+        coordinator
+            .witness_representation(&wrong_epoch)
+            .await
+            .expect("read a witness naming another epoch"),
+        None,
+        "an epoch the hash never reached has no representation"
+    );
+
+    let mut no_manifest = (*witness).clone();
+    no_manifest.manifest_id = None;
+    assert_eq!(
+        coordinator
+            .witness_representation(&no_manifest)
+            .await
+            .expect("read a witness without a manifest"),
+        None
+    );
+}
+
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state() {

@@ -94,6 +94,7 @@ $inventory = @(
             'direct_write_preserves_preexisting_deletion_and_tombstone_fences',
             'normal_direct_write_uses_legacy_key_and_missing_reoffer_uses_repair_epoch_key',
             'payload_free_coordinated_preflight_distinguishes_exact_readable_from_new_publication',
+            'witness_representation_reports_the_published_manifest_size_and_flags_for_an_exact_witness',
             'durable_write_claims_bind_replay_authorize_settle_and_expiry_to_database_state',
             'write_capability_cutover_is_exact_idempotent_and_database_attested',
             'claim_inventory_and_prune_preserve_cleanup_targets_and_bound_terminal_deletion',

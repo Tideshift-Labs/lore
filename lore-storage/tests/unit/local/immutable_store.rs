@@ -26,6 +26,7 @@ use zerocopy::IntoBytes;
 mod info;
 #[cfg(feature = "oodle")]
 mod oodle_migration;
+mod representation;
 
 use lore_storage::local::immutable_store::*;
 
