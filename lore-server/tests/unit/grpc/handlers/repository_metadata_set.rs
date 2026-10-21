@@ -336,6 +336,7 @@ mod admin_required {
     use lore_server::auth::jwt::ResourcePermission;
     use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
     use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
     use lore_server::grpc::handlers::repository_metadata_set::handler;
     use tonic::Code;
     use tonic::Request;
@@ -508,6 +509,101 @@ mod admin_required {
         let (result, current, _, updated) =
             set_metadata(56, None, &["read", "write", "admin"]).await;
         assert!(result.expect("an online admin answer sets metadata"));
+        assert_eq!(current, updated);
+    }
+
+    /// One CAS under the `ResourceGrantsAuthorizer` tier, the one Lorehub
+    /// cells run, with a token granting `permissions` on the repository.
+    async fn set_metadata_resource_grants(
+        seed: u8,
+        permissions: &[&str],
+    ) -> (Result<bool, Status>, Hash, Hash, Hash) {
+        let repository_id = RepositoryId::from([seed; 16]);
+        let (immutable, mutable) = new_test_stores().await;
+        let original = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "acme",
+            "original",
+        )
+        .await;
+        let updated = repository::metadata_store(
+            Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository_id,
+            )),
+            RepositoryMetadata {
+                name: "acme".to_string(),
+                description: "updated description".to_string(),
+                default_branch: Default::default(),
+                default_branch_name: "main".to_string(),
+                creator: "alice".to_string(),
+                created: 0,
+            },
+        )
+        .await
+        .expect("serialize updated metadata");
+
+        let mut request = Request::new(RepositoryMetadataSetRequest {
+            repository_id: repository_id.into(),
+            expected_hash: original.into(),
+            new_hash: updated.into(),
+        });
+        request
+            .extensions_mut()
+            .insert(claim_token(format!("urc-{repository_id}"), permissions));
+        request
+            .extensions_mut()
+            .insert(RawToken("test-token".into()));
+
+        let authorizer = ResourceGrantsAuthorizer::new(
+            "resources".to_string(),
+            "resource_id".to_string(),
+            None,
+            "urc-{id}".to_string(),
+            "urc-*".to_string(),
+        );
+        let result = handler(
+            request,
+            Arc::new(authorizer),
+            immutable.clone(),
+            mutable.clone(),
+            None,
+        )
+        .await
+        .map(|response| response.into_inner().success);
+
+        let current = repository::metadata_hash(Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            mutable,
+            repository_id,
+        )))
+        .await
+        .expect("metadata must still be readable");
+        (result, current, original, updated)
+    }
+
+    #[tokio::test]
+    async fn resource_grants_tier_refuses_viewer_and_write_only_without_a_cas() {
+        for (seed, permissions) in [(60u8, &["read"][..]), (61, &["read", "write"][..])] {
+            let (result, current, original, _) =
+                set_metadata_resource_grants(seed, permissions).await;
+            let err = result.expect_err("a non-admin grant must not set repository metadata");
+            assert_eq!(err.code(), Code::PermissionDenied, "{permissions:?}");
+            assert_eq!(
+                current, original,
+                "a refused request must not perform the CAS ({permissions:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_grants_tier_admin_sets_metadata() {
+        let (result, current, _, updated) =
+            set_metadata_resource_grants(62, &["read", "write", "admin"]).await;
+        assert!(result.expect("an admin grant sets metadata"));
         assert_eq!(current, updated);
     }
 }

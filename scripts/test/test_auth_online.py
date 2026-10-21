@@ -1074,8 +1074,12 @@ def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
     commit_file(owner.repo, "one.txt", "from the owner")
     member = provision_member(
-        auth_env, make_actor, owner, "member-push", ("read", "write")
+        auth_env, make_actor, owner, "member-push", ("read", "write", "admin")
     )
+
+    # Repository metadata is an admin act, so the probe below proves
+    # revocation only if the same member's write succeeds before it.
+    member.repo.repository_metadata_set(["probe", "granted"])
 
     # Granted: the member's work flows both ways. Each writer syncs before
     # committing, since both push to the same branch.

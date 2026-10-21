@@ -488,6 +488,7 @@ mod authorization {
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
     use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
     use lore_server::grpc::repository::v1::repository_metadata_set::handler;
     use tonic::Request;
 
@@ -834,5 +835,117 @@ mod authorization {
             current, original,
             "a refused request must not perform the CAS"
         );
+    }
+
+    /// An identity token whose online answer includes `admin` publishes the
+    /// update, and the pointer moves.
+    #[tokio::test]
+    async fn an_identity_token_with_online_admin_sets_metadata() {
+        let repository_id = RepositoryId::from([46u8; 16]);
+        let (immutable, mutable) = new_test_stores().await;
+        let original = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "acme",
+            "original",
+        )
+        .await;
+        let updated = build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
+        let auth_url =
+            start_stub_auth_server_granting(repository_id, &["read", "write", "admin"]).await;
+
+        let response = handler(
+            request_for(repository_id, original, updated),
+            Arc::new(AuthClientAuthorizer::new(auth_url)),
+            immutable.clone(),
+            mutable.clone(),
+            None,
+        )
+        .await
+        .expect("an online admin answer sets metadata");
+        assert_eq!(Hash::from(response.into_inner().metadata), updated);
+
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            mutable,
+            repository_id,
+        ));
+        let current = repository::metadata_hash(repository)
+            .await
+            .expect("metadata must still be readable");
+        assert_eq!(current, updated);
+    }
+
+    /// Runs one CAS under the `ResourceGrantsAuthorizer` tier, the one
+    /// Lorehub cells run, with a token granting `permissions`.
+    async fn set_with_resource_grants(
+        seed: u8,
+        permissions: &[&str],
+    ) -> (Result<Hash, tonic::Status>, Hash, Hash, Hash) {
+        let repository_id = RepositoryId::from([seed; 16]);
+        let (immutable, mutable) = new_test_stores().await;
+        let original = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "acme",
+            "original",
+        )
+        .await;
+        let updated = build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
+        let authorizer = ResourceGrantsAuthorizer::new(
+            "resources".to_string(),
+            "resource_id".to_string(),
+            None,
+            "urc-{id}".to_string(),
+            "urc-*".to_string(),
+        );
+
+        let result = handler(
+            request_with_token(
+                repository_id,
+                original,
+                updated,
+                claim_token(format!("urc-{repository_id}"), permissions),
+            ),
+            Arc::new(authorizer),
+            immutable.clone(),
+            mutable.clone(),
+            None,
+        )
+        .await
+        .map(|response| Hash::from(response.into_inner().metadata));
+
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            mutable,
+            repository_id,
+        ));
+        let current = repository::metadata_hash(repository)
+            .await
+            .expect("metadata must still be readable");
+        (result, current, original, updated)
+    }
+
+    #[tokio::test]
+    async fn resource_grants_tier_refuses_viewer_and_write_only_without_a_cas() {
+        for (seed, permissions) in [(47u8, &["read"][..]), (48, &["read", "write"][..])] {
+            let (result, current, original, _) = set_with_resource_grants(seed, permissions).await;
+            let err = result.expect_err("a non-admin grant must not set repository metadata");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied, "{permissions:?}");
+            assert_eq!(
+                current, original,
+                "a refused request must not perform the CAS ({permissions:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_grants_tier_admin_sets_metadata() {
+        let (result, current, _, updated) =
+            set_with_resource_grants(49, &["read", "write", "admin"]).await;
+        assert_eq!(result.expect("an admin grant sets metadata"), updated);
+        assert_eq!(current, updated);
     }
 }
