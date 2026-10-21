@@ -1790,7 +1790,10 @@ impl PostgresImmutableStore {
             .await
             .map_err(domain_store_err)?;
         let intent = match begin {
-            BeginOutcome::AlreadyReadable(witness) => return Ok(*witness),
+            BeginOutcome::AlreadyReadable(witness) => {
+                Self::refuse_readable_mismatch(coordinator, &witness, address, fragment).await?;
+                return Ok(*witness);
+            }
             BeginOutcome::Fenced(_) => return Err(StoreError::from(SlowDown)),
             BeginOutcome::WriteClaimBlocked { .. } => {
                 return Err(StoreError::from(SlowDown));
@@ -1838,6 +1841,32 @@ impl PostgresImmutableStore {
             return Err(StoreError::from(SlowDown));
         }
         Ok(witness)
+    }
+
+    /// Refuse a put whose representation differs from the readable epoch it
+    /// found under the same hash.
+    ///
+    /// An epoch whose manifest row is gone is not compared: the coordinator
+    /// answered readable from its own snapshot, and refusing there would turn a
+    /// concurrent lifecycle change into a collision.
+    async fn refuse_readable_mismatch(
+        coordinator: &PostgresFragmentCoordinator,
+        witness: &crate::domain::fragments::EpochWitness,
+        address: Address,
+        fragment: Fragment,
+    ) -> Result<(), StoreError> {
+        let Some((size_content, payload_flags)) = coordinator
+            .witness_representation(witness)
+            .await
+            .map_err(domain_store_err)?
+        else {
+            return Ok(());
+        };
+        let size_content = u64::try_from(size_content)
+            .map_err(|error| StoreError::internal_with_context(error, "manifest size_content"))?;
+        let payload_flags = u32::try_from(payload_flags)
+            .map_err(|error| StoreError::internal_with_context(error, "manifest payload_flags"))?;
+        refuse_representation_mismatch(address, size_content, payload_flags, fragment)
     }
 
     /// The shared write-side preflight, run before any epoch is allocated.
@@ -1932,7 +1961,10 @@ impl PostgresImmutableStore {
             .await
             .map_err(begin_stage_err)?;
         let intent = match begin {
-            BeginOutcome::AlreadyReadable(witness) => return Ok(*witness),
+            BeginOutcome::AlreadyReadable(witness) => {
+                Self::refuse_readable_mismatch(coordinator, &witness, address, fragment).await?;
+                return Ok(*witness);
+            }
             // Retryable backpressure, not an error, on both arms. `Fenced`
             // means another operation on this hash won the head; with L1's
             // write-claim barrier in its UNION form, `WriteClaimBlocked` can
@@ -2538,6 +2570,45 @@ enum CoordinatedLoad {
     RetryLeased,
 }
 
+/// Refuse `fragment` when it names different content than the representation
+/// already stored under its hash.
+///
+/// A fragment list and a plain fragment can share a hash: the list's hash is
+/// over its reference bytes, and the same bytes stored plain hash the same. So
+/// the structure bit takes part beside the decoded size. Encoding and tier bits
+/// do not; the same content may be stored compressed or not. A differing
+/// `PayloadRevisionState` is logged only for now.
+fn refuse_representation_mismatch(
+    address: Address,
+    stored_size_content: u64,
+    stored_flags: u32,
+    fragment: Fragment,
+) -> Result<(), StoreError> {
+    let differing = (stored_flags ^ fragment.flags) & CONTENT_STRUCTURE_MASK;
+    if stored_size_content != fragment.size_content
+        || differing & FragmentFlags::PayloadFragmented.bits() != 0
+    {
+        tracing::warn!(
+            %address,
+            stored_size_content,
+            stored_flags,
+            offered_size_content = fragment.size_content,
+            offered_flags = fragment.flags,
+            "fragment put refused: representation differs from the stored one"
+        );
+        return Err(StoreError::internal("Hash collision"));
+    }
+    if differing != 0 {
+        tracing::warn!(
+            %address,
+            stored_flags,
+            offered_flags = fragment.flags,
+            "fragment put offers a different revision-state flag than the stored one"
+        );
+    }
+    Ok(())
+}
+
 /// Map a query/execute error; transient failures become `SlowDown` so clients
 /// retry rather than treat them as permanent (A2).
 fn domain_store_err(error: crate::domain::errors::DomainError) -> StoreError {
@@ -2948,6 +3019,18 @@ impl ImmutableStore for PostgresImmutableStore {
                 return Err(StoreError::from(SlowDown));
             }
             Some(FragmentState::Stored) if associated => {
+                match self.head_fragment(address.hash).await {
+                    Ok(authoritative) => refuse_representation_mismatch(
+                        address,
+                        authoritative.size_content,
+                        authoritative.flags,
+                        fragment,
+                    )?,
+                    // A missing object is repaired by the read path; this put
+                    // keeps its earlier answer.
+                    Err(error) if error.is_address_not_found() => {}
+                    Err(error) => return Err(error),
+                }
                 return tx.commit().await.map_err(db_err);
             }
             Some(FragmentState::Stored) => {
@@ -2956,9 +3039,12 @@ impl ImmutableStore for PostgresImmutableStore {
                 }
                 match self.head_fragment(address.hash).await {
                     Ok(authoritative) => {
-                        if authoritative.size_content != fragment.size_content {
-                            return Err(StoreError::internal("Hash collision"));
-                        }
+                        refuse_representation_mismatch(
+                            address,
+                            authoritative.size_content,
+                            authoritative.flags,
+                            fragment,
+                        )?;
                         Self::upsert_metering_tx(&tx, address.hash, authoritative).await?;
                         Self::associate_fragment_tx(&tx, repository, address).await?;
                         return tx.commit().await.map_err(db_err);

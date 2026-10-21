@@ -2261,6 +2261,32 @@ impl PostgresFragmentCoordinator {
             .collect())
     }
 
+    /// The decoded size and persisted payload flags of the exact manifest
+    /// `witness` names, or `None` when no epoch row carries it.
+    ///
+    /// A put that finds the hash already readable compares its own
+    /// representation against this before it is answered: a fragment list and
+    /// a plain fragment can share a hash, so the hash alone does not say the
+    /// stored bytes are the ones the caller offered.
+    pub async fn witness_representation(
+        &self,
+        witness: &EpochWitness,
+    ) -> Result<Option<(i64, i64)>, DomainError> {
+        let Some(manifest_id) = witness.manifest_id.as_ref() else {
+            return Ok(None);
+        };
+        let client = self.checkout().await?;
+        let row = client
+            .query_opt(
+                "SELECT size_content, payload_flags FROM lore_fragment_epochs \
+                  WHERE hash = $1 AND epoch = $2 AND manifest_id = $3",
+                &[&witness.hash, &witness.epoch, manifest_id],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("witness representation", error))?;
+        Ok(row.map(|row| (row.get("size_content"), row.get("payload_flags"))))
+    }
+
     /// Aggregate only fragments that satisfy the same repository,
     /// association, head, manifest, and disposition clauses as `resolve`.
     /// Manifest sizes are immutable authority, so no provider I/O or repair

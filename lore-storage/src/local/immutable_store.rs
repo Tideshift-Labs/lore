@@ -114,6 +114,18 @@ const CHUNK_SIZE_U32: usize = 256;
 // 32 entries makes the ImmutableStoreEntry growvec chunks 3072 bytes in size
 const CHUNK_SIZE_ENTRY: usize = 32;
 
+/// Whether `fragment` describes different content than the entry already stored
+/// under its hash.
+///
+/// A fragment list and a plain fragment can share a hash: the list's hash is
+/// over its reference bytes, and the same bytes stored plain hash the same. So
+/// the structure bit is part of what the hash names, beside the content size.
+/// Compression and tier bits are not; the same content may be stored either way.
+fn representation_differs(fragment: &Fragment, stored_size: u64, stored_flags: u32) -> bool {
+    fragment.size_content != stored_size
+        || (fragment.flags ^ stored_flags) & FragmentFlags::PayloadFragmented.bits() != 0
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default, Eq, Hash, IntoBytes, FromBytes, Immutable, PartialEq)]
 pub struct ImmutableData {
@@ -1755,12 +1767,16 @@ impl LocalImmutableStore {
         if matched_hash {
             let entry_index = bucket.sorted_index[match_slot] as usize;
             let data = bucket.entry[entry_index].data;
-            if data.size_content != fragment.size_content {
+            if representation_differs(&fragment, data.size_content, data.flags) {
                 if (data.flags & FragmentFlags::PayloadObliterated) == 0 {
                     // Same hash, different content - we have a collision
                     return Err(LocalImmutableStoreError::internal(format!(
-                        "Hash collision in immutable store for {} size {}, previous entry has size {}",
-                        address.hash, fragment.size_content as usize, data.size_content as usize,
+                        "Hash collision in immutable store for {} size {} flags {}, previous entry has size {} flags {}",
+                        address.hash,
+                        fragment.size_content as usize,
+                        fragment.flags,
+                        data.size_content as usize,
+                        data.flags,
                     )));
                 } else {
                     lore_base::lore_warn!(
@@ -3779,7 +3795,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             })?;
 
         if find.matching != StoreMatch::MatchNone
-            && fragment.size_content != find.data.size_content
+            && representation_differs(&fragment, find.data.size_content, find.data.flags)
             && (!force || payload.is_none())
         {
             if (find.data.flags & FragmentFlags::PayloadObliterated) == 0 {

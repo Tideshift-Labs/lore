@@ -7795,6 +7795,46 @@ pub async fn collect_new_fragments(
     state_to: Arc<State>,
     ignore_durably_stored: bool,
 ) -> Result<Vec<Address>, StateError> {
+    collect_new_fragments_impl(
+        repository,
+        state_from,
+        state_to,
+        ignore_durably_stored,
+        false,
+    )
+    .await
+}
+
+/// [`collect_new_fragments`] for a server verifying a push: each new or modified file node's
+/// recorded size must also match the `size_content` of the fragment the store holds at its
+/// address, or the walk fails with `InvalidArguments`.
+///
+/// The address alone cannot prove the stored fragment is the file's content, since a fragment
+/// list and a plain fragment can share a hash. The size can: the store reports it from the
+/// same metadata read the walk already makes, so the check costs no extra read.
+pub async fn collect_new_fragments_verifying_file_sizes(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    ignore_durably_stored: bool,
+) -> Result<Vec<Address>, StateError> {
+    collect_new_fragments_impl(
+        repository,
+        state_from,
+        state_to,
+        ignore_durably_stored,
+        true,
+    )
+    .await
+}
+
+async fn collect_new_fragments_impl(
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_to: Arc<State>,
+    ignore_durably_stored: bool,
+    verify_file_sizes: bool,
+) -> Result<Vec<Address>, StateError> {
     let from_state_address = lore_spawn!({
         let repository = repository.clone();
         let state = state_from.clone();
@@ -7875,6 +7915,7 @@ pub async fn collect_new_fragments(
                 ROOT_NODE,
                 ROOT_NODE,
                 ignore_durably_stored,
+                verify_file_sizes,
             )
             .await
         }
@@ -8213,6 +8254,7 @@ async fn collect_new_file_fragments(
     node_from: NodeID,
     node_to: NodeID,
     ignore_durably_stored: bool,
+    verify_file_sizes: bool,
 ) -> Result<Vec<Address>, StateError> {
     let (from, to) = join!(
         state_from.collect_children_unsorted(
@@ -8268,8 +8310,15 @@ async fn collect_new_file_fragments(
             if to_node.is_file() {
                 let repository = to.repository.clone();
                 let address = [to_node.address];
+                let size = [to_node.size];
                 lore_spawn!(tasks, async move {
-                    collect_new_addresses(repository, &address, ignore_durably_stored).await
+                    collect_new_addresses_sized(
+                        repository,
+                        &address,
+                        verify_file_sizes.then_some(size.as_slice()),
+                        ignore_durably_stored,
+                    )
+                    .await
                 });
             } else {
                 let repository = to.repository.clone();
@@ -8283,6 +8332,7 @@ async fn collect_new_file_fragments(
                         from_node_id,
                         to_node_id,
                         ignore_durably_stored,
+                        verify_file_sizes,
                     )
                     .await
                 });
@@ -8320,6 +8370,7 @@ fn collect_new_file_fragments_recurse(
     node_from: NodeID,
     node_to: NodeID,
     ignore_durably_stored: bool,
+    verify_file_sizes: bool,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + 'static>> {
     Box::pin(collect_new_file_fragments(
         repository,
@@ -8328,6 +8379,7 @@ fn collect_new_file_fragments_recurse(
         node_from,
         node_to,
         ignore_durably_stored,
+        verify_file_sizes,
     ))
 }
 
@@ -8479,16 +8531,33 @@ async fn collect_new_addresses(
     addresses: &[Address],
     ignore_durably_stored: bool,
 ) -> Result<Vec<Address>, StateError> {
+    collect_new_addresses_sized(repository, addresses, None, ignore_durably_stored).await
+}
+
+/// [`collect_new_addresses`], also refusing a stored fragment whose content size is not the
+/// one `sizes` records for its address.
+///
+/// `sizes`, when given, holds one expected content size per address. A file node records its
+/// content size beside its address, and the stored fragment's `size_content` must agree: a
+/// fragment list and a plain fragment can share a hash, so a store holding the wrong one
+/// reports a different size. An address the store does not hold is not compared.
+async fn collect_new_addresses_sized(
+    repository: Arc<RepositoryContext>,
+    addresses: &[Address],
+    sizes: Option<&[u64]>,
+    ignore_durably_stored: bool,
+) -> Result<Vec<Address>, StateError> {
     let mut new_addresses = Vec::with_capacity(addresses.len());
 
     const MAX_TASKS: usize = 1000;
     let mut task = JoinSet::new();
-    for address in addresses {
+    for (index, address) in addresses.iter().enumerate() {
         if address.hash.is_zero() {
             continue;
         }
 
         let address = *address;
+        let expected_size = sizes.and_then(|sizes| sizes.get(index).copied());
         let repository = repository.clone();
         lore_spawn!(task, {
             async move {
@@ -8504,6 +8573,18 @@ async fn collect_new_addresses(
                     Err(_) => return Ok(Some(vec![address])),
                 };
 
+                if let Some(expected_size) = expected_size
+                    && query.match_made != StoreMatch::MatchNone
+                    && query.fragment.size_content != expected_size
+                {
+                    return Err(StateError::from(InvalidArguments {
+                        reason: format!(
+                            "file content '{address}' is stored with size {} but the revision implies {expected_size}",
+                            query.fragment.size_content
+                        ),
+                    }));
+                }
+
                 let mut addresses = vec![];
                 if query.fragment.flags & FragmentFlags::PayloadFragmented != 0 {
                     match immutable::load_raw(
@@ -8515,18 +8596,24 @@ async fn collect_new_addresses(
                     {
                         Ok((_fragment, buffer)) => {
                             let buffer = buffer.to_aligned::<FragmentReference>();
-                            let mut subaddress =
-                                Vec::with_capacity(buffer.count::<FragmentReference>());
-                            for reference in buffer.as_type_slice::<FragmentReference>().iter() {
+                            let references = buffer.as_type_slice::<FragmentReference>();
+                            let mut subaddress = Vec::with_capacity(references.len());
+                            for reference in references.iter() {
                                 subaddress.push(Address {
                                     context: address.context,
                                     hash: reference.hash,
                                 });
                             }
+                            // Each child covers the content up to the next one's offset, and the
+                            // last up to the end of this list's content, so every level of a
+                            // list is held to the size its parent implies.
+                            let child_sizes = expected_size
+                                .map(|_| fragment_list_child_sizes(references, query.fragment));
 
-                            match collect_new_addresses_recurse(
+                            match collect_new_addresses_sized_recurse(
                                 repository.clone(),
-                                subaddress.as_slice(),
+                                subaddress,
+                                child_sizes,
                                 ignore_durably_stored,
                             )
                             .await
@@ -8534,6 +8621,11 @@ async fn collect_new_addresses(
                                 Ok(mut subaddress) => addresses.append(&mut subaddress),
                                 Err(StateError::SlowDown(traced)) => {
                                     return Err(StateError::SlowDown(traced));
+                                }
+                                Err(error @ StateError::InvalidArguments(_))
+                                    if expected_size.is_some() =>
+                                {
+                                    return Err(error);
                                 }
                                 Err(_) => {}
                             }
@@ -8578,16 +8670,41 @@ async fn collect_new_addresses(
     Ok(new_addresses)
 }
 
-fn collect_new_addresses_recurse(
+fn collect_new_addresses_sized_recurse(
     repository: Arc<RepositoryContext>,
-    addresses: &[Address],
+    addresses: Vec<Address>,
+    sizes: Option<Vec<u64>>,
     ignore_durably_stored: bool,
-) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + '_>> {
-    Box::pin(collect_new_addresses(
-        repository,
-        addresses,
-        ignore_durably_stored,
-    ))
+) -> Pin<Box<dyn Future<Output = Result<Vec<Address>, StateError>> + Send + 'static>> {
+    Box::pin(async move {
+        collect_new_addresses_sized(
+            repository,
+            &addresses,
+            sizes.as_deref(),
+            ignore_durably_stored,
+        )
+        .await
+    })
+}
+
+/// The content size each reference of a fragment list covers: up to the next reference's offset,
+/// and for the last up to the end of the list's own content. A malformed span reads as zero,
+/// which no stored child matches.
+fn fragment_list_child_sizes(references: &[FragmentReference], list: Fragment) -> Vec<u64> {
+    let Some(first) = references.first() else {
+        return Vec::new();
+    };
+    let end = first.offset_content.saturating_add(list.size_content);
+    references
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            let next = references
+                .get(index + 1)
+                .map_or(end, |next| next.offset_content);
+            next.saturating_sub(reference.offset_content)
+        })
+        .collect()
 }
 
 /// Applies a set of node-level changes to a state tree without touching the filesystem.

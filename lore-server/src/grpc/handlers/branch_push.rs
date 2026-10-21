@@ -33,6 +33,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::state::StateError;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
@@ -1285,7 +1286,10 @@ async fn collect_new_addresses(
                          repository: Arc<RepositoryContext>,
                          to_state: Arc<State>,
                          collected: Arc<Mutex<Vec<Address>>>| {
-        let mut fragments = state::collect_new_fragments(
+        // A file node whose recorded size disagrees with the stored fragment is refused here.
+        // The client may have skipped the upload because the store reported the hash present,
+        // so no put ever compared what the store holds against the file.
+        let mut fragments = state::collect_new_fragments_verifying_file_sizes(
             repository,
             parent_state,
             to_state,
@@ -1296,6 +1300,15 @@ async fn collect_new_addresses(
             .filter_slow_down()
             .map_err(|status| push_store_refusal("fragment_collect", status))?
             .warn_map_err(|err| {
+                // Only the size check raises InvalidArguments on this walk; the wording guard keeps
+                // a future producer from borrowing this message.
+                if let StateError::InvalidArguments(reason) = &err
+                    && reason.to_string().contains("is stored with size")
+                {
+                    return Status::invalid_argument(format!(
+                        "Push names file content the store holds differently: {reason}"
+                    ));
+                }
                 if let Some(converted_error) = err.as_address_not_found() {
                     return address_not_found_status(
                         converted_error,

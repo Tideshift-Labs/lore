@@ -12,9 +12,13 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
+use lore_base::types::FragmentReference;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
+use lore_storage::TypedBytes;
 use lore_storage::validate_fragment_list;
 use lore_storage::validate_fragment_metadata;
 use lore_telemetry::InstrumentProvider;
@@ -207,6 +211,119 @@ impl Put {
         Ok(())
     }
 
+    /// Bind the put's structure to what its address can mean.
+    ///
+    /// A list's address is the hash of its reference bytes, and a plain
+    /// fragment's address is the hash of its content, so the same bytes name both.
+    /// The hash alone cannot tell them apart, so this checks what it can against
+    /// the store:
+    ///
+    /// - A list must declare the content its references cover: the span from the
+    ///   first to the last offset plus the last child's stored size, when the last
+    ///   child is already stored.
+    /// - A plain fragment whose content parses as a list, and whose last reference
+    ///   names a fragment this repository holds, is refused. Honest content cannot
+    ///   name a stored hash by chance, so only a forged copy of a list matches.
+    ///
+    /// This does not stop a plain copy uploaded before the list's children exist.
+    /// The store refuses the later list as a collision, and push verification
+    /// refuses a revision whose file size does not match the stored fragment.
+    #[lore_macro::test_pub]
+    async fn validate_structure(
+        &self,
+        repository: RepositoryId,
+        immutable_store: &Arc<dyn ImmutableStore>,
+    ) -> Result<(), MessageHandleError> {
+        let Some(payload) = self.payload.as_ref() else {
+            return Ok(());
+        };
+
+        if self.fragment.flags & FragmentFlags::PayloadFragmented != 0 {
+            let references = payload.clone().to_aligned::<FragmentReference>();
+            let references = references.as_type_slice::<FragmentReference>();
+            let (Some(first), Some(last)) = (references.first(), references.last()) else {
+                return Err(MessageHandleError::InvalidFragment);
+            };
+            let child = Address {
+                context: self.address.context,
+                hash: last.hash,
+            };
+            // A push uploads a list and its children in parallel, so the last child may not
+            // have landed yet. Such a list is not compared here; push verification compares
+            // every list level against the sizes the file node implies.
+            let stored = match immutable_store
+                .clone()
+                .get_metadata(repository, child)
+                .await
+            {
+                Ok(stored) if stored.match_made != StoreMatch::MatchNone => stored.fragment,
+                Ok(_) => return Ok(()),
+                Err(StoreError::SlowDown(_)) => return Err(MessageHandleError::SlowDown),
+                Err(err) if err.is_address_not_found() => return Ok(()),
+                Err(err) => return Err(MessageHandleError::from(err)),
+            };
+            let covered = (last.offset_content - first.offset_content)
+                .checked_add(stored.size_content)
+                .ok_or_else(|| self.refuse_structure("the covered size overflows"))?;
+            if covered != self.fragment.size_content {
+                return Err(self.refuse_structure("size_content does not match its children"));
+            }
+            return Ok(());
+        }
+
+        let reference_size = size_of::<FragmentReference>() as u64;
+        let size_content = self.fragment.size_content;
+        if size_content < 2 * reference_size || !size_content.is_multiple_of(reference_size) {
+            return Ok(());
+        }
+        let content = if self.fragment.flags & FragmentFlags::PayloadCompressed != 0 {
+            match lore_storage::decompress(self.fragment, payload.as_ref()) {
+                Ok((_, content)) => content.freeze(),
+                Err(_) => return Err(MessageHandleError::HashFailed),
+            }
+        } else {
+            payload.clone()
+        };
+        let references = content.to_aligned::<FragmentReference>();
+        let references = references.as_type_slice::<FragmentReference>();
+        // The shape `validate_fragment_list` accepts, without a declared size:
+        // at least two references at strictly increasing offsets.
+        let list_shaped = references.len() >= 2
+            && references
+                .windows(2)
+                .all(|pair| pair[0].offset_content < pair[1].offset_content);
+        let (true, Some(last)) = (list_shaped, references.last()) else {
+            return Ok(());
+        };
+        let probe = [Address {
+            context: self.address.context,
+            hash: last.hash,
+        }];
+        let mut resolved = [StoreMatchResult::default()];
+        match immutable_store
+            .clone()
+            .query(repository, &probe, &mut resolved)
+            .await
+        {
+            Ok(()) if resolved[0].match_made != StoreMatch::MatchNone => {
+                Err(self.refuse_structure("a plain fragment encodes a list over stored fragments"))
+            }
+            Ok(()) => Ok(()),
+            Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
+            Err(err) => Err(MessageHandleError::from(err)),
+        }
+    }
+
+    fn refuse_structure(&self, reason: &str) -> MessageHandleError {
+        warn!(
+            fragment = ?self.fragment,
+            {ADDRESS} = %self.address,
+            reason,
+            "Put rejected: fragment structure does not match its address"
+        );
+        MessageHandleError::InvalidFragment
+    }
+
     #[cfg(feature = "test-util")]
     pub fn to_bytes(&self) -> Bytes {
         use zerocopy::IntoBytes;
@@ -281,6 +398,7 @@ pub async fn handle_put(
         .scope(execution, async move {
             put.validate_fragment()?;
             put.validate_hash()?;
+            put.validate_structure(repository, &immutable_store).await?;
 
             let mut fragment = fragment;
             fragment.flags &= !FragmentFlags::PayloadStored;
