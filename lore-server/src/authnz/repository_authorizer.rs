@@ -201,6 +201,37 @@ impl dyn RepositoryAuthorizer {
             .await
             .is_ok()
     }
+
+    /// FORK-LOCAL (Tideshift): require `action` on a body-supplied
+    /// `repository_id`, for a handler not behind the partition-access layer.
+    ///
+    /// An unreachable repository answers [`no_repository_access_status`]
+    /// exactly as a reachability-only check does, so an unauthorized caller
+    /// still learns nothing. A reachable repository without `action` answers
+    /// `permission_denied`. Asks the authorizer once when it can enumerate
+    /// grants, so an identity token costs one online round trip. Under
+    /// `AllowAll` (no `[server.auth]`) every action is granted, as before.
+    ///
+    /// [`no_repository_access_status`]: crate::grpc::no_repository_access_status
+    pub async fn require_action(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: &str,
+    ) -> Result<(), Status> {
+        let permitted = match self.granted_access(token, repository_id).await? {
+            Some(grants) => grants.permits(action),
+            None => self
+                .check_repository_access(token, repository_id, Some(action))
+                .await
+                .is_ok(),
+        };
+        if permitted {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("Permission denied"))
+        }
+    }
 }
 
 /// Always allows access. Selected when no `[server.auth]` is configured:

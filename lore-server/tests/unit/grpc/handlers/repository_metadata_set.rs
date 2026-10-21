@@ -185,10 +185,10 @@ impl RepositoryAuthorizer for DenyAllRepositoryAuthorizer {
     }
 }
 
-/// Permits, recording that the handler asked with `action: None`.
+/// Permits, recording the action of every question the handler asked.
 #[derive(Default)]
 struct RecordingPermitAuthorizer {
-    called_with_action_none: std::sync::atomic::AtomicBool,
+    actions: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -199,8 +199,7 @@ impl RepositoryAuthorizer for RecordingPermitAuthorizer {
         _repository_id: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status> {
-        self.called_with_action_none
-            .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+        self.actions.lock().unwrap().push(action.map(str::to_owned));
         Ok(())
     }
 }
@@ -312,11 +311,203 @@ async fn auth_configured_with_access_allows_operation() {
             handler(request, authorizer.clone(), immutable, mutable, None)
                 .await
                 .unwrap();
-            assert!(
-                authorizer
-                    .called_with_action_none
-                    .load(std::sync::atomic::Ordering::SeqCst)
+            // Reachability first, then the admin action, on an authorizer
+            // that cannot enumerate grants.
+            assert_eq!(
+                *authorizer.actions.lock().unwrap(),
+                vec![None, Some("admin".to_owned())]
             );
         })
         .await;
+}
+
+// FORK-LOCAL (Tideshift): repository metadata is an admin act. A token that
+// reaches the repository with any other grant is refused before the CAS.
+mod admin_required {
+    use std::sync::Arc;
+
+    use lore_base::types::Hash;
+    use lore_base::types::RepositoryId;
+    use lore_proto::RepositoryMetadataSetRequest;
+    use lore_revision::repository;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryMetadata;
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::grpc::handlers::repository_metadata_set::handler;
+    use tonic::Code;
+    use tonic::Request;
+    use tonic::Status;
+
+    use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
+    use crate::grpc::handlers::repository_query::authz_test_support::seed_repository_metadata;
+    use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server_granting;
+
+    fn claim_token(resource_id: String, permissions: &[&str]) -> AuthorizationToken {
+        AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id,
+                permission: permissions.iter().map(|p| p.to_string()).collect(),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// One CAS carrying `token` (claim token) or an identity token answered
+    /// online by a stub granting `online` (when `token` is `None`). Returns
+    /// the result, the pointer afterwards, the original and the update.
+    async fn set_metadata(
+        seed: u8,
+        token: Option<Box<dyn FnOnce(RepositoryId) -> AuthorizationToken>>,
+        online: &[&str],
+    ) -> (Result<bool, Status>, Hash, Hash, Hash) {
+        let repository_id = RepositoryId::from([seed; 16]);
+        let (immutable, mutable) = new_test_stores().await;
+        let original = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "acme",
+            "original",
+        )
+        .await;
+        let updated = repository::metadata_store(
+            Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                repository_id,
+            )),
+            RepositoryMetadata {
+                name: "acme".to_string(),
+                description: "updated description".to_string(),
+                default_branch: Default::default(),
+                default_branch_name: "main".to_string(),
+                creator: "alice".to_string(),
+                created: 0,
+            },
+        )
+        .await
+        .expect("serialize updated metadata");
+
+        let mut request = Request::new(RepositoryMetadataSetRequest {
+            repository_id: repository_id.into(),
+            expected_hash: original.into(),
+            new_hash: updated.into(),
+        });
+        // A claim token is answered in place, so its URL is never dialled.
+        let auth_url = if let Some(token) = token {
+            request.extensions_mut().insert(token(repository_id));
+            "http://127.0.0.1:1".to_string()
+        } else {
+            request
+                .extensions_mut()
+                .insert(AuthorizationToken::default());
+            start_stub_auth_server_granting(repository_id, online).await
+        };
+        request
+            .extensions_mut()
+            .insert(RawToken("test-token".into()));
+
+        let result = handler(
+            request,
+            Arc::new(AuthClientAuthorizer::new(auth_url)),
+            immutable.clone(),
+            mutable.clone(),
+            None,
+        )
+        .await
+        .map(|response| response.into_inner().success);
+
+        let current = repository::metadata_hash(Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            mutable,
+            repository_id,
+        )))
+        .await
+        .expect("metadata must still be readable");
+        (result, current, original, updated)
+    }
+
+    fn scoped(
+        permissions: &'static [&'static str],
+    ) -> Option<Box<dyn FnOnce(RepositoryId) -> AuthorizationToken>> {
+        Some(Box::new(move |id| {
+            claim_token(format!("urc-{id}"), permissions)
+        }))
+    }
+
+    #[tokio::test]
+    async fn a_viewer_token_is_refused_and_does_not_cas() {
+        let (result, current, original, _) = set_metadata(50, scoped(&["read"]), &[]).await;
+        let err = result.expect_err("a read grant must not set repository metadata");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            current, original,
+            "a refused request must not perform the CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_token_without_admin_is_refused_and_does_not_cas() {
+        let (result, current, original, _) =
+            set_metadata(51, scoped(&["read", "write"]), &[]).await;
+        let err = result.expect_err("a write grant must not set repository metadata");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            current, original,
+            "a refused request must not perform the CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_token_sets_metadata() {
+        let (result, current, _, updated) =
+            set_metadata(52, scoped(&["read", "write", "admin"]), &[]).await;
+        assert!(result.expect("an admin grant sets metadata"));
+        assert_eq!(current, updated);
+    }
+
+    #[tokio::test]
+    async fn a_service_account_with_wildcard_admin_sets_metadata() {
+        let token = Box::new(|_| AuthorizationToken {
+            is_service_account: Some(true),
+            ..claim_token("urc-*".into(), &["admin"])
+        });
+        let (result, current, _, updated) = set_metadata(53, Some(token), &[]).await;
+        assert!(result.expect("a wildcard admin service token sets metadata"));
+        assert_eq!(current, updated);
+    }
+
+    #[tokio::test]
+    async fn a_service_account_is_not_exempt_from_the_admin_requirement() {
+        let token = Box::new(|_| AuthorizationToken {
+            is_service_account: Some(true),
+            ..claim_token("urc-*".into(), &["read", "write"])
+        });
+        let (result, current, original, _) = set_metadata(54, Some(token), &[]).await;
+        let err = result.expect_err("no service-account bypass exists for this RPC");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(current, original);
+    }
+
+    #[tokio::test]
+    async fn an_identity_token_without_online_admin_is_refused_and_does_not_cas() {
+        let (result, current, original, _) = set_metadata(55, None, &["read", "write"]).await;
+        let err = result.expect_err("an online read + write answer must not set metadata");
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(
+            current, original,
+            "a refused request must not perform the CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_identity_token_with_online_admin_sets_metadata() {
+        let (result, current, _, updated) =
+            set_metadata(56, None, &["read", "write", "admin"]).await;
+        assert!(result.expect("an online admin answer sets metadata"));
+        assert_eq!(current, updated);
+    }
 }

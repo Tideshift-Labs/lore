@@ -171,6 +171,7 @@ pub(crate) mod authz_test_support {
     #[derive(Clone)]
     struct StubAuthService {
         allowed_repository_id: RepositoryId,
+        permissions: Vec<String>,
     }
 
     impl tonic::server::NamedService for StubAuthService {
@@ -208,7 +209,7 @@ pub(crate) mod authz_test_support {
             }
 
             #[allow(non_camel_case_types)]
-            struct CheckUserPermissionSvc(RepositoryId);
+            struct CheckUserPermissionSvc(RepositoryId, Vec<String>);
             impl tonic::server::UnaryService<lore_proto::auth::CheckUserPermissionRequest>
                 for CheckUserPermissionSvc
             {
@@ -220,6 +221,7 @@ pub(crate) mod authz_test_support {
                     request: tonic::Request<lore_proto::auth::CheckUserPermissionRequest>,
                 ) -> Self::Future {
                     let allowed_resource_id = format!("urc-{}", self.0);
+                    let permission = self.1.clone();
                     let fut = async move {
                         let resource_id = request
                             .into_inner()
@@ -233,10 +235,7 @@ pub(crate) mod authz_test_support {
                                     allowed_resource_permission: vec![
                                         lore_proto::auth::ResourcePermission {
                                             resource_id,
-                                            permission: vec![
-                                                "read".to_string(),
-                                                "write".to_string(),
-                                            ],
+                                            permission,
                                         },
                                     ],
                                     denied_resource_permission: vec![],
@@ -252,7 +251,8 @@ pub(crate) mod authz_test_support {
                 }
             }
 
-            let method = CheckUserPermissionSvc(self.allowed_repository_id);
+            let method =
+                CheckUserPermissionSvc(self.allowed_repository_id, self.permissions.clone());
             let codec = tonic_prost::ProstCodec::default();
             let mut grpc = tonic::server::Grpc::new(codec);
             let fut = async move {
@@ -279,6 +279,16 @@ pub(crate) mod authz_test_support {
     /// backlog queues connection attempts even before the spawned task
     /// starts polling `accept`, so no readiness sleep is needed either.
     pub(crate) async fn start_stub_auth_server(allowed_repository_id: RepositoryId) -> String {
+        start_stub_auth_server_granting(allowed_repository_id, &["read", "write"]).await
+    }
+
+    /// [`start_stub_auth_server`], answering `permissions` for the allowed
+    /// repository instead of `read` + `write`.
+    pub(crate) async fn start_stub_auth_server_granting(
+        allowed_repository_id: RepositoryId,
+        permissions: &[&str],
+    ) -> String {
+        let permissions = permissions.iter().map(|p| p.to_string()).collect();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -289,6 +299,7 @@ pub(crate) mod authz_test_support {
             let _ = tonic::transport::Server::builder()
                 .add_service(StubAuthService {
                     allowed_repository_id,
+                    permissions,
                 })
                 .serve_with_incoming(incoming)
                 .await;

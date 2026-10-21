@@ -67,10 +67,10 @@ mod auth_guard {
         }
     }
 
-    /// Permits, recording that the handler asked with `action: None`.
+    /// Permits, recording the action of every question the handler asked.
     #[derive(Default)]
     struct RecordingPermitAuthorizer {
-        called_with_action_none: std::sync::atomic::AtomicBool,
+        actions: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -81,8 +81,7 @@ mod auth_guard {
             _repository_id: RepositoryId,
             action: Option<&str>,
         ) -> Result<(), Status> {
-            self.called_with_action_none
-                .store(action.is_none(), std::sync::atomic::Ordering::SeqCst);
+            self.actions.lock().unwrap().push(action.map(str::to_owned));
             Ok(())
         }
     }
@@ -322,10 +321,11 @@ mod auth_guard {
                 handler(request, authorizer.clone(), immutable, mutable, None)
                     .await
                     .unwrap();
-                assert!(
-                    authorizer
-                        .called_with_action_none
-                        .load(std::sync::atomic::Ordering::SeqCst)
+                // Reachability first, then the admin action, on an
+                // authorizer that cannot enumerate grants.
+                assert_eq!(
+                    *authorizer.actions.lock().unwrap(),
+                    vec![None, Some("admin".to_owned())]
                 );
             })
             .await;
@@ -484,6 +484,7 @@ mod authorization {
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryMetadata;
     use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::ResourcePermission;
     use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
     use lore_server::authnz::repository_authorizer::RawToken;
@@ -493,6 +494,7 @@ mod authorization {
     use crate::grpc::handlers::repository_query::authz_test_support::new_test_stores;
     use crate::grpc::handlers::repository_query::authz_test_support::seed_repository_metadata;
     use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server;
+    use crate::grpc::handlers::repository_query::authz_test_support::start_stub_auth_server_granting;
 
     fn request_for(
         repository_id: RepositoryId,
@@ -608,7 +610,8 @@ mod authorization {
         )
         .await;
         let updated = build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
-        let auth_url = start_stub_auth_server(repository_id).await;
+        let auth_url =
+            start_stub_auth_server_granting(repository_id, &["read", "write", "admin"]).await;
 
         let response = handler(
             request_for(repository_id, expected, updated),
@@ -650,5 +653,186 @@ mod authorization {
         .expect("auth-off must leave behavior unchanged");
 
         assert_eq!(Hash::from(response.into_inner().metadata), updated);
+    }
+
+    // FORK-LOCAL (Tideshift): repository metadata is an admin act. A token
+    // that reaches the repository with any other grant is refused before
+    // the CAS.
+
+    /// A request carrying an exchanged access token whose `resources` claim
+    /// holds `token`'s grants, as the Lorehub mint issues it.
+    fn request_with_token(
+        repository_id: RepositoryId,
+        expected: Hash,
+        updated: Hash,
+        token: AuthorizationToken,
+    ) -> Request<RepositoryMetadataSetRequest> {
+        let mut request = Request::new(RepositoryMetadataSetRequest {
+            id: repository_id.into(),
+            expected: expected.into(),
+            updated: updated.into(),
+        });
+        request.extensions_mut().insert(token);
+        request
+            .extensions_mut()
+            .insert(RawToken("test-token".into()));
+        request
+    }
+
+    fn claim_token(resource_id: String, permissions: &[&str]) -> AuthorizationToken {
+        AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id,
+                permission: permissions.iter().map(|p| p.to_string()).collect(),
+            }]),
+            ..Default::default()
+        }
+    }
+
+    /// Runs one CAS with `token` against a seeded repository under the
+    /// claim-answering `AuthClient` authorizer, and returns the result plus
+    /// the pointer afterwards and the update it tried to publish.
+    async fn set_with_claim_token(
+        seed: u8,
+        token: impl FnOnce(RepositoryId) -> AuthorizationToken,
+    ) -> (Result<Hash, tonic::Status>, Hash, Hash, Hash) {
+        let repository_id = RepositoryId::from([seed; 16]);
+        let (immutable, mutable) = new_test_stores().await;
+        let original = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "acme",
+            "original",
+        )
+        .await;
+        let updated = build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
+        // A claim token is answered in place, so this URL is never dialled.
+        let authorizer = Arc::new(AuthClientAuthorizer::new("http://127.0.0.1:1".into()));
+
+        let result = handler(
+            request_with_token(repository_id, original, updated, token(repository_id)),
+            authorizer,
+            immutable.clone(),
+            mutable.clone(),
+            None,
+        )
+        .await
+        .map(|response| Hash::from(response.into_inner().metadata));
+
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            mutable,
+            repository_id,
+        ));
+        let current = repository::metadata_hash(repository)
+            .await
+            .expect("metadata must still be readable");
+        (result, current, original, updated)
+    }
+
+    #[tokio::test]
+    async fn a_viewer_token_is_refused_and_does_not_cas() {
+        let (result, current, original, _) =
+            set_with_claim_token(40, |id| claim_token(format!("urc-{id}"), &["read"])).await;
+        let err = result.expect_err("a read grant must not set repository metadata");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            current, original,
+            "a refused request must not perform the CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_token_without_admin_is_refused_and_does_not_cas() {
+        let (result, current, original, _) = set_with_claim_token(41, |id| {
+            claim_token(format!("urc-{id}"), &["read", "write"])
+        })
+        .await;
+        let err = result.expect_err("a write grant must not set repository metadata");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(
+            current, original,
+            "a refused request must not perform the CAS"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_admin_token_sets_metadata() {
+        let (result, current, _, updated) = set_with_claim_token(42, |id| {
+            claim_token(format!("urc-{id}"), &["read", "write", "admin"])
+        })
+        .await;
+        assert_eq!(result.expect("an admin grant sets metadata"), updated);
+        assert_eq!(current, updated);
+    }
+
+    #[tokio::test]
+    async fn a_service_account_with_wildcard_admin_sets_metadata() {
+        let (result, current, _, updated) = set_with_claim_token(43, |_| AuthorizationToken {
+            is_service_account: Some(true),
+            ..claim_token("urc-*".into(), &["admin"])
+        })
+        .await;
+        assert_eq!(
+            result.expect("a wildcard admin service token sets metadata"),
+            updated
+        );
+        assert_eq!(current, updated);
+    }
+
+    #[tokio::test]
+    async fn a_service_account_is_not_exempt_from_the_admin_requirement() {
+        let (result, current, original, _) = set_with_claim_token(44, |_| AuthorizationToken {
+            is_service_account: Some(true),
+            ..claim_token("urc-*".into(), &["read", "write"])
+        })
+        .await;
+        let err = result.expect_err("no service-account bypass exists for this RPC");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert_eq!(current, original);
+    }
+
+    /// An identity token (no `resources` claim) is checked online. The auth
+    /// service answering `read` + `write` reaches the repository but does not
+    /// grant `admin`.
+    #[tokio::test]
+    async fn an_identity_token_without_online_admin_is_refused_and_does_not_cas() {
+        let repository_id = RepositoryId::from([45u8; 16]);
+        let (immutable, mutable) = new_test_stores().await;
+        let original = seed_repository_metadata(
+            immutable.clone(),
+            mutable.clone(),
+            repository_id,
+            "acme",
+            "original",
+        )
+        .await;
+        let updated = build_valid_update(immutable.clone(), mutable.clone(), repository_id).await;
+        let auth_url = start_stub_auth_server(repository_id).await;
+
+        let err = handler(
+            request_for(repository_id, original, updated),
+            Arc::new(AuthClientAuthorizer::new(auth_url)),
+            immutable.clone(),
+            mutable.clone(),
+            None,
+        )
+        .await
+        .expect_err("an online read + write answer must not set repository metadata");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable,
+            mutable,
+            repository_id,
+        ));
+        let current = repository::metadata_hash(repository)
+            .await
+            .expect("metadata must still be readable");
+        assert_eq!(
+            current, original,
+            "a refused request must not perform the CAS"
+        );
     }
 }

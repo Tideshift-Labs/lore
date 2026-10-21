@@ -36,7 +36,6 @@ use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
-use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -119,14 +118,14 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            // FORK-LOCAL (Tideshift): admin, not any grant; see the v0 handler.
             authorizer
-                .check_repository_access(
+                .require_action(
                     get_verified_token(&extensions).as_ref(),
                     repository_id.into(),
-                    None,
+                    "admin",
                 )
-                .await
-                .map_err(|_err| no_repository_access_status())?;
+                .await?;
 
             let current_metadata = if !expected.is_zero() {
                 Metadata::deserialize(repository.clone(), expected)
