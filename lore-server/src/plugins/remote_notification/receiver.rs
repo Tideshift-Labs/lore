@@ -1195,8 +1195,19 @@ impl DurableReceiver {
     }
 
     /// Read and dispose of at most one delivery.
+    ///
+    /// The read gives way to cancellation. The gateway sends nothing on an idle
+    /// stream, so an uncancellable read held shutdown until the server's
+    /// force-close deadline. Only the read is raced: a delivery already read is
+    /// disposed of in full. Dropping the read loses nothing, because nothing was
+    /// acknowledged and the broker redelivers it.
     pub async fn step(&self, session: &mut ReceiverSession) -> StepOutcome {
-        let delivery = match self.runtime.stream.next().await {
+        let read = tokio::select! {
+            biased;
+            read = self.runtime.stream.next() => read,
+            () = self.cancel.cancelled() => return StepOutcome::Transient(REASON_STOPPED),
+        };
+        let delivery = match read {
             Ok(delivery) => delivery,
             Err(StreamError::Transient(message)) => {
                 debug!(%message, "durable stream read failed transiently");

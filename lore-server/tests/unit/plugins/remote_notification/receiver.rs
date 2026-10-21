@@ -1381,6 +1381,93 @@ async fn shutdown_checkpoints_an_applied_event_before_returning() {
     assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
 }
 
+/// A real gateway sends one `CaughtUp` on an idle durable consumer and then
+/// nothing. `FakeDurableStream` answers `CaughtUp` forever instead, which
+/// returns at once and so hides a read that cannot be cancelled. After its
+/// first `CaughtUp`, this stream's `next` blocks until dropped.
+#[derive(Debug)]
+struct IdleBlockingStream {
+    stream: FakeDurableStream,
+    caught_up: std::sync::atomic::AtomicBool,
+    /// Notified each time a read starts to block.
+    blocked: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl DurableStreamSource for IdleBlockingStream {
+    async fn capture(
+        &self,
+        request: &CaptureRequest,
+    ) -> Result<CapturedStreamPosition, StreamError> {
+        self.stream.capture(request).await
+    }
+
+    async fn next(&self) -> Result<StreamDelivery, StreamError> {
+        if self.caught_up.load(std::sync::atomic::Ordering::SeqCst) {
+            self.blocked.notify_one();
+            std::future::pending::<()>().await;
+        }
+        let delivery = self.stream.next().await?;
+        if matches!(delivery, StreamDelivery::CaughtUp) {
+            self.caught_up
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Ok(delivery)
+    }
+
+    async fn ack(&self, broker_sequence: i64) -> Result<(), StreamError> {
+        self.stream.ack(broker_sequence).await
+    }
+}
+
+/// Shutdown reaches a receiver whose steady-state read is blocked on an idle
+/// stream. The read used to be uncancellable, so the run never returned and the
+/// server waited for its force-close deadline.
+#[tokio::test]
+async fn shutdown_interrupts_a_read_blocked_on_an_idle_stream() {
+    let store = InMemoryReceiverStore::new(CELL);
+    let target = RecordingInvalidationTarget::new();
+    let blocked = Arc::new(tokio::sync::Notify::new());
+    let receiver = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream: Arc::new(IdleBlockingStream {
+                stream: FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900),
+                caught_up: std::sync::atomic::AtomicBool::new(false),
+                blocked: blocked.clone(),
+            }),
+            target: Arc::new(target),
+        },
+    )
+    .expect("the test config declares a required receiver");
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+    // The signal goes only once the ready loop is blocked in its read;
+    // otherwise the loop could see the cancellation before reading.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::select! {
+            result = &mut run => panic!("receiver stopped before shutdown: {result:?}"),
+            () = blocked.notified() => {}
+        }
+    })
+    .await
+    .expect("receiver must reach its blocked read");
+    assert!(
+        readiness.is_ready(),
+        "the blocked read is the ready steady state"
+    );
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("shutdown must not wait for a read the idle stream never completes")
+        .expect("shutdown succeeds");
+    assert_eq!(store.member_state(IDENTITY, 1).as_deref(), Some("draining"));
+    assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
+}
+
 /// Run a bootstrapped receiver until it is ready, optionally apply one
 /// event, then shut it down gracefully. Returns the store calls made from
 /// the shutdown signal on.
