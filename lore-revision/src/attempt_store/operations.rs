@@ -402,12 +402,15 @@ impl RepositoryAttemptStore {
         let guard = self.guard().await?;
         let mut document = self.load_for_write(&guard)?;
         Self::validate_parents(&document)?;
+        // Settled history is still validated, but each settled child is parsed once per store
+        // instance rather than once per parent; reparsing made each parent cost all history.
+        self.check_settled(&document)?;
         if document
             .parents
             .iter()
             .any(|old| !old.complete || old.id == parent.id)
             || self
-                .children(&document, false)?
+                .children(&document, true)?
                 .iter()
                 .any(|child| child.attempt.state.is_unresolved())
         {
@@ -462,7 +465,9 @@ impl RepositoryAttemptStore {
         let _local = self.write_guard.lock().await;
         let guard = self.guard().await?;
         let mut document = self.load_for_write(&guard)?;
-        let children = self.children(&document, false)?;
+        // A settled child is never unresolved once validated; see `begin_parent`.
+        self.check_settled(&document)?;
+        let children = self.children(&document, true)?;
         self.finish_loaded_parent(&guard, &mut document, parent, &children)
     }
 

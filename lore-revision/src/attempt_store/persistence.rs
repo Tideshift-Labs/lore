@@ -698,30 +698,121 @@ impl RepositoryAttemptStore {
             .map(|child| child.attempt.clone())
             .collect::<HashSet<_>>();
         for directory in directories {
-            let path = generation.join(directory);
-            for entry in std::fs::read_dir(&path)
-                .map_err(|error| io_error("enumerate children", &path, error))?
-            {
-                let entry = entry.map_err(|error| io_error("enumerate child", &path, error))?;
-                let name = entry.file_name();
-                let name = name
-                    .to_str()
-                    .ok_or_else(|| ProtocolError::internal("invalid journal child filename"))?;
-                if name.ends_with(TEMP_SUFFIX) {
-                    continue;
-                }
-                let id = name
-                    .strip_suffix(".json")
-                    .ok_or_else(|| ProtocolError::internal("unexpected journal child filename"))?;
-                if !seen.insert(id.to_owned()) {
+            for (id, _) in child_entries(&generation.join(directory))? {
+                if !seen.insert(id.clone()) {
                     return Err(ProtocolError::internal("duplicate journal child identity"));
                 }
                 let (child, _) = self
-                    .child(document, id)?
+                    .child(document, &id)?
                     .ok_or_else(|| ProtocolError::internal("journal child disappeared"))?;
                 children.push(child);
             }
         }
         Ok(children)
     }
+
+    /// The settled half of `children(document, false)`'s validation, without returning the
+    /// children. A settled child this store already validated is parsed again only when its
+    /// length or modification time changed, or its parent left the root.
+    pub(super) fn check_settled(&self, document: &StoredDocument) -> Result<(), ProtocolError> {
+        let Some(current) = document.generation.as_deref() else {
+            return Ok(());
+        };
+        let generation = self.generation(document)?;
+        let mut seen = document
+            .managed
+            .iter()
+            .map(|child| child.attempt.clone())
+            .collect::<HashSet<_>>();
+        for (id, _) in child_entries(&generation.join("pending"))? {
+            if !seen.insert(id) {
+                return Err(ProtocolError::internal("duplicate journal child identity"));
+            }
+        }
+        let parents = document
+            .parents
+            .iter()
+            .filter(|parent| parent.version == 1)
+            .map(|parent| parent.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut cache = self
+            .settled
+            .lock()
+            .map_err(|_err| ProtocolError::internal("settled validation cache poisoned"))?;
+        if cache.generation.as_deref() != Some(current) {
+            cache.generation = Some(current.to_owned());
+            cache.entries.clear();
+        }
+        for (id, entry) in child_entries(&generation.join("settled"))? {
+            if !seen.insert(id.clone()) {
+                return Err(ProtocolError::internal("duplicate journal child identity"));
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| io_error("inspect child", &entry.path(), error))?;
+            // A filesystem without modification times always parses.
+            let modified = metadata.modified().ok();
+            if cache.entries.get(&id).is_some_and(|validated| {
+                Some(validated.modified) == modified
+                    && validated.len == metadata.len()
+                    && validated
+                        .parent
+                        .as_deref()
+                        .is_none_or(|parent| parents.contains(parent))
+            }) {
+                continue;
+            }
+            cache.entries.remove(&id);
+            let (child, _) = self
+                .child(document, &id)?
+                .ok_or_else(|| ProtocolError::internal("journal child disappeared"))?;
+            if let Some(modified) = modified {
+                cache.entries.insert(
+                    id,
+                    ValidatedSettled {
+                        len: metadata.len(),
+                        modified,
+                        parent: child.managed.map(|managed| managed.parent),
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Settled children one store instance has fully validated in this process.
+#[derive(Default)]
+pub(super) struct SettledCache {
+    generation: Option<String>,
+    entries: HashMap<String, ValidatedSettled>,
+}
+
+struct ValidatedSettled {
+    len: u64,
+    modified: std::time::SystemTime,
+    parent: Option<String>,
+}
+
+/// Child identities in one journal directory, skipping unpublished temporaries.
+fn child_entries(path: &Path) -> Result<Vec<(String, std::fs::DirEntry)>, ProtocolError> {
+    let mut entries = Vec::new();
+    for entry in
+        std::fs::read_dir(path).map_err(|error| io_error("enumerate children", path, error))?
+    {
+        let entry = entry.map_err(|error| io_error("enumerate child", path, error))?;
+        let name = entry.file_name();
+        let name = name
+            .to_str()
+            .ok_or_else(|| ProtocolError::internal("invalid journal child filename"))?;
+        if name.ends_with(TEMP_SUFFIX) {
+            continue;
+        }
+        let id = name
+            .strip_suffix(".json")
+            .ok_or_else(|| ProtocolError::internal("unexpected journal child filename"))?
+            .to_owned();
+        entries.push((id, entry));
+    }
+    Ok(entries)
 }

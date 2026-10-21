@@ -125,6 +125,9 @@ pub struct RepositoryAttemptStore {
     /// retry loop with a sleep in it — correct, but paying wall-clock time to discover a
     /// contention this process can settle for free.
     write_guard: tokio::sync::Mutex<()>,
+    /// Settled children already validated by this instance. Read and written only while
+    /// `write_guard` and the journal `FSLock` are held.
+    settled: std::sync::Mutex<persistence::SettledCache>,
 }
 
 impl RepositoryAttemptStore {
@@ -140,6 +143,7 @@ impl RepositoryAttemptStore {
                 .ok()
                 .map(|dot_directory| dot_directory.join(ATTEMPT_STORE_FILE)),
             write_guard: tokio::sync::Mutex::new(()),
+            settled: std::sync::Mutex::default(),
         }
     }
 
@@ -151,6 +155,7 @@ impl RepositoryAttemptStore {
         Self {
             path: Some(dot_directory.into().join(ATTEMPT_STORE_FILE)),
             write_guard: tokio::sync::Mutex::new(()),
+            settled: std::sync::Mutex::default(),
         }
     }
 
