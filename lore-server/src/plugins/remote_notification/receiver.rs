@@ -416,15 +416,34 @@ impl ReceiverSession {
         self.events_since_checkpoint = self.events_since_checkpoint.saturating_add(1);
     }
 
+    /// True when the projection does not yet hold everything this generation
+    /// proved: a frontier move or a park since the last accepted report.
+    fn has_unreported_work(&self) -> bool {
+        self.reported_frontier != Some(self.frontier.contiguous_frontier())
+            || self.events_since_checkpoint != 0
+    }
+
     #[lore_macro::test_pub]
     fn needs_checkpoint(&self, config: &ReceiverConfig) -> bool {
-        if self.reported_frontier == Some(self.frontier.contiguous_frontier())
-            && self.events_since_checkpoint == 0
-        {
+        if !self.has_unreported_work() {
             return false;
         }
         self.events_since_checkpoint >= config.checkpoint_every_events
             || self.last_checkpoint.elapsed() >= config.checkpoint_interval
+    }
+
+    /// When the interval term of [`Self::needs_checkpoint`] comes due, or
+    /// `None` when nothing is unreported and so nothing can come due.
+    ///
+    /// The steady-state read races this deadline. The gateway sends nothing on
+    /// an idle stream, so a burst's last acknowledgements would otherwise stay
+    /// unreported until the next delivery (WP-115 ledger row 64).
+    #[lore_macro::test_pub]
+    fn checkpoint_deadline(&self, config: &ReceiverConfig) -> Option<Instant> {
+        if !self.has_unreported_work() {
+            return None;
+        }
+        self.last_checkpoint.checked_add(config.checkpoint_interval)
     }
 }
 
@@ -1138,7 +1157,27 @@ impl DurableReceiver {
     async fn steady_state(&self, session: &mut ReceiverSession) {
         let mut backoff = self.backoff_initial;
         while !self.cancel.is_cancelled() {
-            let outcome = self.step(session).await;
+            let deadline = session.checkpoint_deadline(&self.receiver);
+            let Some(outcome) = self.step_until(session, deadline).await else {
+                // The checkpoint came due while the stream was idle. A refused
+                // report leaves the deadline in the past, so back off before
+                // the next attempt rather than spin on the store.
+                match self.checkpoint(session).await {
+                    Ok(()) => self
+                        .readiness
+                        .set_from_session(session, self.receiver.lag_readiness_threshold),
+                    Err(failure) => {
+                        self.readiness
+                            .set_blocked(failure.reason(), Some(session.membership_generation));
+                        if matches!(failure, BootstrapFailure::Retired(_)) {
+                            return;
+                        }
+                        self.sleep(backoff).await;
+                        backoff = (backoff * 2).min(self.backoff_max);
+                    }
+                }
+                continue;
+            };
             self.readiness
                 .set_from_session(session, self.receiver.lag_readiness_threshold);
 
@@ -1202,11 +1241,46 @@ impl DurableReceiver {
     /// disposed of in full. Dropping the read loses nothing, because nothing was
     /// acknowledged and the broker redelivers it.
     pub async fn step(&self, session: &mut ReceiverSession) -> StepOutcome {
+        // With no deadline the read never gives way to one.
+        self.step_until(session, None)
+            .await
+            .unwrap_or(StepOutcome::Idle)
+    }
+
+    /// [`Self::step`], with the read also giving way to a checkpoint
+    /// deadline. `None` means the deadline passed first and nothing was read.
+    ///
+    /// Dropping the read for the deadline is as safe as dropping it for
+    /// cancellation: nothing was observed or acknowledged, and the next call
+    /// reads the same message. Cancellation still wins a tie.
+    async fn step_until(
+        &self,
+        session: &mut ReceiverSession,
+        deadline: Option<Instant>,
+    ) -> Option<StepOutcome> {
+        let checkpoint_due = async {
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
         let read = tokio::select! {
             biased;
             read = self.runtime.stream.next() => read,
-            () = self.cancel.cancelled() => return StepOutcome::Transient(REASON_STOPPED),
+            () = self.cancel.cancelled() => return Some(StepOutcome::Transient(REASON_STOPPED)),
+            () = checkpoint_due => return None,
         };
+        Some(self.dispose_read(session, read).await)
+    }
+
+    /// Dispose of one completed read.
+    async fn dispose_read(
+        &self,
+        session: &mut ReceiverSession,
+        read: Result<StreamDelivery, StreamError>,
+    ) -> StepOutcome {
         let delivery = match read {
             Ok(delivery) => delivery,
             Err(StreamError::Transient(message)) => {

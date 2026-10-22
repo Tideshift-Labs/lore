@@ -24,6 +24,7 @@ use lore_server::plugins::remote_notification::envelope::EventId;
 use lore_server::plugins::remote_notification::receiver::*;
 use lore_server::plugins::remote_notification::receiver_store::InMemoryReceiverStore;
 use lore_server::plugins::remote_notification::receiver_store::ReceiverStore;
+use lore_server::plugins::remote_notification::receiver_store::ReceiverStoreError;
 use lore_server::plugins::remote_notification::receiver_store::StoreCall;
 use lore_server::plugins::remote_notification::stream::CaptureRequest;
 use lore_server::plugins::remote_notification::stream::CapturedStreamPosition;
@@ -1466,6 +1467,296 @@ async fn shutdown_interrupts_a_read_blocked_on_an_idle_stream() {
         .expect("shutdown succeeds");
     assert_eq!(store.member_state(IDENTITY, 1).as_deref(), Some("draining"));
     assert_eq!(readiness.snapshot().reason, Some(REASON_STOPPED));
+}
+
+/// The gateway's idle shape: one `CaughtUp` once nothing is pending, then
+/// silence until the next push. `FakeDurableStream` answers `CaughtUp` at
+/// once on every read, which re-runs the idle cadence check and hides a
+/// checkpoint that only an idle step could send.
+#[derive(Debug)]
+struct QuietAfterCaughtUpStream {
+    stream: FakeDurableStream,
+    quiet: std::sync::atomic::AtomicBool,
+    pushed: Arc<tokio::sync::Notify>,
+}
+
+impl QuietAfterCaughtUpStream {
+    fn new(stream: FakeDurableStream) -> Self {
+        Self {
+            stream,
+            quiet: std::sync::atomic::AtomicBool::new(false),
+            pushed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DurableStreamSource for QuietAfterCaughtUpStream {
+    async fn capture(
+        &self,
+        request: &CaptureRequest,
+    ) -> Result<CapturedStreamPosition, StreamError> {
+        self.stream.capture(request).await
+    }
+
+    async fn next(&self) -> Result<StreamDelivery, StreamError> {
+        loop {
+            let delivery = self.stream.next().await?;
+            if !matches!(delivery, StreamDelivery::CaughtUp) {
+                self.quiet.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Ok(delivery);
+            }
+            if !self.quiet.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return Ok(delivery);
+            }
+            // A stored permit survives a dropped wait, so a push is not lost.
+            self.pushed.notified().await;
+        }
+    }
+
+    async fn ack(&self, broker_sequence: i64) -> Result<(), StreamError> {
+        self.stream.ack(broker_sequence).await
+    }
+}
+
+/// A receiver over [`QuietAfterCaughtUpStream`] whose checkpoints come due by
+/// the interval alone.
+fn quiet_receiver(
+    store: &InMemoryReceiverStore,
+    stream: Arc<QuietAfterCaughtUpStream>,
+) -> DurableReceiver {
+    let mut receiver = DurableReceiver::new(
+        &config(),
+        ReceiverRuntime {
+            store: Arc::new(store.clone()),
+            stream,
+            target: Arc::new(RecordingInvalidationTarget::new()),
+        },
+    )
+    .expect("the test config declares a required receiver");
+    receiver.receiver.checkpoint_interval = Duration::from_millis(300);
+    receiver.receiver.checkpoint_every_events = 10_000;
+    receiver
+}
+
+fn checkpoint_reports(store: &InMemoryReceiverStore) -> Vec<CheckpointReport> {
+    store
+        .calls()
+        .into_iter()
+        .filter_map(|call| match call {
+            StoreCall::Checkpoint(report) => Some(*report),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Drive `run` until `condition` holds, failing if the run returns first.
+async fn drive_until<F, R>(
+    run: &mut std::pin::Pin<&mut F>,
+    within: Duration,
+    what: &str,
+    mut condition: impl FnMut() -> bool,
+) where
+    F: std::future::Future<Output = R>,
+    R: std::fmt::Debug,
+{
+    tokio::time::timeout(within, async {
+        while !condition() {
+            tokio::select! {
+                result = run.as_mut() => panic!("receiver stopped early: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_elapsed| panic!("timed out waiting for {what}"));
+}
+
+/// Keep `run` going for `window`, failing if it returns.
+async fn drive_for<F, R>(run: &mut std::pin::Pin<&mut F>, window: Duration)
+where
+    F: std::future::Future<Output = R>,
+    R: std::fmt::Debug,
+{
+    tokio::select! {
+        result = run.as_mut() => panic!("receiver stopped early: {result:?}"),
+        () = tokio::time::sleep(window) => {}
+    }
+}
+
+/// WP-115 ledger row 64. The last acknowledgements of a burst used to stay
+/// unreported while the stream was idle: the interval was checked only on an
+/// idle step, and the read after it blocks until the next delivery.
+#[tokio::test]
+async fn an_idle_stream_still_reports_a_burst_once_the_interval_passes() {
+    let store = InMemoryReceiverStore::new(CELL);
+    let fake = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
+    let stream = Arc::new(QuietAfterCaughtUpStream::new(fake.clone()));
+    let receiver = quiet_receiver(&store, stream.clone());
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+
+    drive_until(&mut run, Duration::from_secs(2), "readiness", || {
+        readiness.is_ready()
+    })
+    .await;
+    for (offset, ordinal) in (0..3).zip(1..) {
+        fake.push_envelope(900 + offset, durable(0x9f, ordinal, None));
+    }
+    stream.pushed.notify_one();
+    drive_until(&mut run, Duration::from_secs(2), "the burst's acks", || {
+        fake.acked().len() == 3
+    })
+    .await;
+    // Nothing more is delivered. Only the interval can report the burst.
+    drive_until(
+        &mut run,
+        Duration::from_secs(2),
+        "the idle checkpoint",
+        || store.projected_frontier() == Some(902),
+    )
+    .await;
+    assert_eq!(fake.acked(), vec![900, 901, 902]);
+
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("receiver must finish promptly")
+        .expect("shutdown succeeds");
+}
+
+/// A deadline exists only while something is unreported, so a reported idle
+/// receiver neither re-sends nor wakes on a timer.
+#[tokio::test]
+async fn a_reported_idle_receiver_sends_no_further_checkpoint() {
+    let store = InMemoryReceiverStore::new(CELL);
+    let fake = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
+    let stream = Arc::new(QuietAfterCaughtUpStream::new(fake.clone()));
+    let receiver = quiet_receiver(&store, stream.clone());
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+
+    drive_until(&mut run, Duration::from_secs(2), "readiness", || {
+        readiness.is_ready()
+    })
+    .await;
+    fake.push_envelope(900, durable(0x9f, 1, None));
+    stream.pushed.notify_one();
+    drive_until(
+        &mut run,
+        Duration::from_secs(2),
+        "the idle checkpoint",
+        || store.projected_frontier() == Some(900),
+    )
+    .await;
+    let reported = checkpoint_reports(&store).len();
+    drive_for(&mut run, Duration::from_millis(1_000)).await;
+    assert_eq!(
+        checkpoint_reports(&store).len(),
+        reported,
+        "three idle intervals with nothing unreported must send nothing"
+    );
+
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("receiver must finish promptly")
+        .expect("shutdown succeeds");
+}
+
+/// Cancellation wins over a pending checkpoint deadline, and the draining
+/// write still reports what the deadline had not yet sent.
+#[tokio::test]
+async fn shutdown_wins_over_a_pending_checkpoint_deadline() {
+    let store = InMemoryReceiverStore::new(CELL);
+    let fake = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
+    let stream = Arc::new(QuietAfterCaughtUpStream::new(fake.clone()));
+    let mut receiver = quiet_receiver(&store, stream.clone());
+    receiver.receiver.checkpoint_interval = Duration::from_secs(60);
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+
+    drive_until(&mut run, Duration::from_secs(2), "readiness", || {
+        readiness.is_ready()
+    })
+    .await;
+    fake.push_envelope(900, durable(0x9f, 1, None));
+    stream.pushed.notify_one();
+    drive_until(&mut run, Duration::from_secs(2), "the ack", || {
+        fake.acked().len() == 1
+    })
+    .await;
+    let before_shutdown = store.calls().len();
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("shutdown must not wait for the 60 s checkpoint deadline")
+        .expect("shutdown succeeds");
+    let after: Vec<StoreCall> = store.calls()[before_shutdown..].to_vec();
+    assert!(
+        !after
+            .iter()
+            .any(|call| matches!(call, StoreCall::Checkpoint(_))),
+        "the deadline must not fire an ordinary checkpoint on the way out: {after:?}"
+    );
+    assert!(after.iter().any(|call| matches!(
+        call,
+        StoreCall::DrainingCheckpoint(report) if report.contiguous_frontier == 900
+    )));
+    assert_eq!(store.member_state(IDENTITY, 1).as_deref(), Some("draining"));
+}
+
+/// A refused idle checkpoint leaves its deadline in the past. The retry
+/// backs off instead of spinning on the store.
+#[tokio::test]
+async fn a_failing_idle_checkpoint_backs_off_rather_than_spinning() {
+    let store = InMemoryReceiverStore::new(CELL);
+    let fake = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
+    let stream = Arc::new(QuietAfterCaughtUpStream::new(fake.clone()));
+    let mut receiver = quiet_receiver(&store, stream.clone());
+    receiver.receiver.checkpoint_interval = Duration::from_millis(50);
+    receiver.backoff_initial = Duration::from_millis(100);
+    receiver.backoff_max = Duration::from_millis(100);
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+
+    drive_until(&mut run, Duration::from_secs(2), "readiness", || {
+        readiness.is_ready()
+    })
+    .await;
+    for _ in 0..1_000 {
+        store.next_checkpoint(Err(ReceiverStoreError::Unavailable(
+            "store down".to_string(),
+        )));
+    }
+    let before = checkpoint_reports(&store).len();
+    fake.push_envelope(900, durable(0x9f, 1, None));
+    stream.pushed.notify_one();
+    drive_until(&mut run, Duration::from_secs(2), "the ack", || {
+        fake.acked().len() == 1
+    })
+    .await;
+    drive_for(&mut run, Duration::from_millis(600)).await;
+    let attempts = checkpoint_reports(&store).len() - before;
+    assert!(
+        (2..=10).contains(&attempts),
+        "a 100 ms backoff over 600 ms allows a handful of attempts, not {attempts}"
+    );
+    assert_eq!(readiness.snapshot().reason, Some(REASON_STORE_UNAVAILABLE));
+
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("receiver must finish promptly")
+        .expect("shutdown succeeds");
 }
 
 /// Run a bootstrapped receiver until it is ready, optionally apply one
