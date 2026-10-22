@@ -343,8 +343,8 @@ mod injected_fault_tests {
     }
 
     /// WP-119 case O's own live bug, pinned: an exactly-once assertion must
-    /// name the `AggregateKey` it counts -- (repository, event_kind,
-    /// aggregate_kind, aggregate_identity) -- not just the repository. A
+    /// name the `AggregateKey` it counts -- (repository, `event_kind`,
+    /// `aggregate_kind`, `aggregate_identity`) -- not just the repository. A
     /// governed repository create appends `repository.published` and
     /// `branch.created` before any push appends `branch.pushed`; the live
     /// case's own bug counted applies by repository alone and answered 3

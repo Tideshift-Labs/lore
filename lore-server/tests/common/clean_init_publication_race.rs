@@ -14,6 +14,7 @@ use super::*;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "isolated failure_generator process; run-fragment-clean-init-live.ps1 -PublicationRaceOnly"]
+#[allow(clippy::large_futures)]
 async fn ordinary_put_after_committed_upload_loses_readable_epoch_and_returns_slow_down() {
     let fixture = fixture::Fixture::new().await;
     fixture.initialize().await.unwrap();

@@ -85,7 +85,7 @@
 //! | `receiver.stream.drop` | message deliveries | Swallow that message and answer `CaughtUp`. It is never acknowledged, so the broker redelivers it after `ack_wait`. |
 //! | `receiver.stream.duplicate` | message deliveries | Deliver that message, then a byte-identical copy of it on the next read. |
 //! | `receiver.stream.poison` | message deliveries | Corrupt that message so `decode_durable_delivery` refuses it. |
-//! | `receiver.stream.transient` | `next` calls | Answer `StreamError::Transient` once. |
+//! | `receiver.stream.transient` | completed `next` calls (a dropped read takes no ordinal) | Answer `StreamError::Transient` once. |
 //! | `receiver.ack.transient` | `ack` calls | Answer `StreamError::Transient` once. |
 //!
 //! # An armed anchor fires on TRAFFIC, not on wall-clock time
@@ -365,16 +365,13 @@ mod injected {
                     );
                     continue;
                 };
-                let trigger = match Trigger::parse(ordinal.trim()) {
-                    Some(trigger) => trigger,
-                    None => {
-                        warn!(
-                            entry,
-                            "{FAULTS_ENV} triggers are `next` or a positive 1-based ordinal; \
-                             dropping this entry"
-                        );
-                        continue;
-                    }
+                let Some(trigger) = Trigger::parse(ordinal.trim()) else {
+                    warn!(
+                        entry,
+                        "{FAULTS_ENV} triggers are `next` or a positive 1-based ordinal; \
+                         dropping this entry"
+                    );
+                    continue;
                 };
                 if trigger == Trigger::Armed && std::env::var_os(super::FAULT_DIR_ENV).is_none() {
                     warn!(
@@ -544,7 +541,8 @@ mod injected {
         config: FaultConfig,
         /// Message deliveries observed from the inner source.
         deliveries: AtomicU64,
-        /// `next` calls made against this decorator.
+        /// `next` calls that completed against this decorator. A dropped call
+        /// is not counted.
         next_calls: AtomicU64,
         /// `ack` calls made against this decorator.
         ack_calls: AtomicU64,
@@ -688,15 +686,16 @@ mod injected {
         /// `RECEIVER_FAULT anchor=` must match a FIRING and nothing else — not
         /// the armed banner, which names the same anchors at startup.
         fn log_firing(anchor: Anchor, ordinal: u64, sequence: Option<i64>) {
-            match sequence {
-                Some(sequence) => warn!(
+            if let Some(sequence) = sequence {
+                warn!(
                     "{EVIDENCE_PREFIX} anchor={} ordinal={ordinal} broker_sequence={sequence}",
                     anchor.name()
-                ),
-                None => warn!(
+                );
+            } else {
+                warn!(
                     "{EVIDENCE_PREFIX} anchor={} ordinal={ordinal}",
                     anchor.name()
-                ),
+                );
             }
         }
 
@@ -821,15 +820,42 @@ mod injected {
         }
 
         async fn next(&self) -> Result<StreamDelivery, StreamError> {
-            let call = self.next_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            // The ordinal counts COMPLETED calls. The receiver drops a read
+            // blocked on an idle stream when shutdown or a checkpoint deadline
+            // wins, and how many such reads happen depends on timing. A dropped
+            // read never reaches the increment below, so it takes no ordinal.
+            // The receiver reads serially, so load-then-add is not a race.
+            let call = self.next_calls.load(Ordering::Relaxed) + 1;
 
             if self.fires(Anchor::StreamTransient, self.config.stream_transient, call) {
+                self.next_calls.fetch_add(1, Ordering::Relaxed);
                 Self::log_firing(Anchor::StreamTransient, call, None);
                 return Err(StreamError::Transient(
                     "injected by LORE_RECEIVER_FAULTS".to_string(),
                 ));
             }
 
+            let read = self.read().await;
+            self.next_calls.fetch_add(1, Ordering::Relaxed);
+            read
+        }
+
+        async fn ack(&self, broker_sequence: i64) -> Result<(), StreamError> {
+            let call = self.ack_calls.fetch_add(1, Ordering::Relaxed) + 1;
+            if self.fires(Anchor::AckTransient, self.config.ack_transient, call) {
+                Self::log_firing(Anchor::AckTransient, call, Some(broker_sequence));
+                return Err(StreamError::Transient(
+                    "injected by LORE_RECEIVER_FAULTS".to_string(),
+                ));
+            }
+            self.inner.ack(broker_sequence).await
+        }
+    }
+
+    impl FaultyDurableStream {
+        /// One `next` past the transient anchor: the replay, then the inner
+        /// read and the message-counted anchors.
+        async fn read(&self) -> Result<StreamDelivery, StreamError> {
             // A pending duplicate is served before the inner source is read, so
             // the copy lands on the very next delivery rather than an arbitrary
             // number of reads later. It deliberately does NOT advance the
@@ -902,17 +928,6 @@ mod injected {
             }
 
             Ok(StreamDelivery::Message(Box::new(delivered)))
-        }
-
-        async fn ack(&self, broker_sequence: i64) -> Result<(), StreamError> {
-            let call = self.ack_calls.fetch_add(1, Ordering::Relaxed) + 1;
-            if self.fires(Anchor::AckTransient, self.config.ack_transient, call) {
-                Self::log_firing(Anchor::AckTransient, call, Some(broker_sequence));
-                return Err(StreamError::Transient(
-                    "injected by LORE_RECEIVER_FAULTS".to_string(),
-                ));
-            }
-            self.inner.ack(broker_sequence).await
         }
     }
 

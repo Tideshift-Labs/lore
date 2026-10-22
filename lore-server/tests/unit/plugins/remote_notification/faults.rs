@@ -22,6 +22,7 @@ use lore_server::plugins::remote_notification::envelope::EnvelopeCommon;
 use lore_server::plugins::remote_notification::envelope::EventId;
 use lore_server::plugins::remote_notification::faults::*;
 use lore_server::plugins::remote_notification::stream::CaptureRequest;
+use lore_server::plugins::remote_notification::stream::CapturedStreamPosition;
 use lore_server::plugins::remote_notification::stream::DurableStreamSource;
 use lore_server::plugins::remote_notification::stream::FakeDurableStream;
 use lore_server::plugins::remote_notification::stream::StreamDelivery;
@@ -406,6 +407,80 @@ async fn stream_transient_fails_exactly_the_nth_next_call_and_is_spent_after() {
     assert!(matches!(
         decorated.next().await,
         Ok(StreamDelivery::Message(_))
+    ));
+}
+
+/// An inner source that answers `CaughtUp` once per permit and blocks
+/// otherwise, like an idle gateway stream.
+#[derive(Debug)]
+struct GatedStream {
+    inner: FakeDurableStream,
+    permits: Arc<tokio::sync::Semaphore>,
+}
+
+#[async_trait::async_trait]
+impl DurableStreamSource for GatedStream {
+    async fn capture(
+        &self,
+        request: &CaptureRequest,
+    ) -> Result<CapturedStreamPosition, StreamError> {
+        self.inner.capture(request).await
+    }
+
+    async fn next(&self) -> Result<StreamDelivery, StreamError> {
+        self.permits
+            .acquire()
+            .await
+            .expect("the test never closes the semaphore")
+            .forget();
+        Ok(StreamDelivery::CaughtUp)
+    }
+
+    async fn ack(&self, broker_sequence: i64) -> Result<(), StreamError> {
+        self.inner.ack(broker_sequence).await
+    }
+}
+
+/// The receiver drops a read blocked on an idle stream when shutdown or a
+/// checkpoint deadline wins. How often that happens depends on timing, so a
+/// dropped read must not take a `receiver.stream.transient` ordinal.
+#[tokio::test]
+async fn stream_transient_does_not_count_a_dropped_next_call() {
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let decorated = FaultyDurableStream::with_dir(
+        Arc::new(GatedStream {
+            inner: fake(1),
+            permits: permits.clone(),
+        }),
+        FaultConfig {
+            stream_transient: Some(Trigger::Ordinal(3)),
+            ..Default::default()
+        },
+        None,
+    );
+
+    // Call 1 completes.
+    assert!(matches!(
+        decorated.next().await,
+        Ok(StreamDelivery::CaughtUp)
+    ));
+    // A blocked read is dropped, as the receiver's select drops it.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), decorated.next())
+            .await
+            .is_err(),
+        "with no permit the read blocks"
+    );
+    // Call 2 completes: the dropped read took no ordinal.
+    permits.add_permits(1);
+    assert!(
+        matches!(decorated.next().await, Ok(StreamDelivery::CaughtUp)),
+        "a dropped read must not move the transient anchor one call earlier"
+    );
+    // Call 3 is the armed one.
+    assert!(matches!(
+        decorated.next().await,
+        Err(StreamError::Transient(_))
     ));
 }
 
