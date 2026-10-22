@@ -116,6 +116,8 @@ impl Fixture {
                     let node = Node {
                         flags: NodeFlags::File.bits(),
                         name_hash: hash_string(&name),
+                        // Push verifies a file's size against the stored fragment.
+                        size: fragment.size_content,
                         address,
                         ..Default::default()
                     };
@@ -267,6 +269,19 @@ async fn wait_for_blocked_backend(observer: &Client, blocker: i32) -> i32 {
     }).await.expect("PostgreSQL must report the intended blocking edge")
 }
 
+/// Waits until `push` pauses at final publication. A push that ends first
+/// fails the case now with its result; otherwise the caller would wait for a
+/// pause that never comes and the watchdog would hide the push error.
+async fn until_paused<F>(mut push: std::pin::Pin<&mut F>, store: &PausedStore)
+where
+    F: std::future::Future<Output = Result<Hash, Status>>,
+{
+    tokio::select! {
+        result = push.as_mut() => panic!("push ended before final publication: {result:?}"),
+        () = store.reached.notified() => {}
+    }
+}
+
 async fn mutation_first(url: &str, v1: bool, change: Change, required: bool) {
     // boxed: future is ~30 KB on the stack
     Box::pin(mutation_first_count(url, v1, change, required, 1)).await;
@@ -329,7 +344,6 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
     fixture.immutable.queried.lock().unwrap().clear();
     let push = fixture.push(v1);
     let mutate = async {
-        fixture.store.reached.notified().await;
         let coordinator = &fixture.immutable.coordinator;
         let mutation = async {
             match change {
@@ -453,6 +467,8 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
     };
     // boxed: future is ~29 KB on the stack
     let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(30), async {
+        let mut push = std::pin::pin!(push);
+        until_paused(push.as_mut(), &fixture.store).await;
         tokio::join!(push, mutate)
     }))
     .await
@@ -627,7 +643,6 @@ async fn push_first_count(url: &str, v1: bool, change: Change, required: bool, c
     fixture.immutable.queried.lock().unwrap().clear();
     let publication = fixture.push(v1);
     let race = async {
-        fixture.store.reached.notified().await;
         fixture.store.resume.notify_one();
         // The actual publication transaction has Repository and is now waiting
         // on our Branch lock. Its backend ID comes from PostgreSQL, not timing.
@@ -711,6 +726,8 @@ async fn push_first_count(url: &str, v1: bool, change: Change, required: bool, c
     };
     // boxed: future is ~29 KB on the stack
     let (result, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(30), async {
+        let mut publication = std::pin::pin!(publication);
+        until_paused(publication.as_mut(), &fixture.store).await;
         tokio::join!(publication, race)
     }))
     .await
@@ -907,7 +924,6 @@ async fn unchanged_fast_path_publishes_while_fragment_and_association_tables_are
     let observer = direct_client(&url).await;
     let operation = fixture.push(false);
     let gate = async {
-        fixture.store.reached.notified().await;
         holder.batch_execute("BEGIN; LOCK TABLE lore_fragment_lifecycle, lore_fragment_associations IN ACCESS EXCLUSIVE MODE").await.unwrap();
         observer
             .batch_execute("SET lock_timeout = '100ms'")
@@ -926,6 +942,8 @@ async fn unchanged_fast_path_publishes_while_fragment_and_association_tables_are
         fixture.store.resume.notify_one();
     };
     let result = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut operation = std::pin::pin!(operation);
+        until_paused(operation.as_mut(), &fixture.store).await;
         tokio::join!(operation, gate)
     })
     .await
