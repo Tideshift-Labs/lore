@@ -1759,6 +1759,64 @@ async fn a_failing_idle_checkpoint_backs_off_rather_than_spinning() {
         .expect("shutdown succeeds");
 }
 
+/// A successful idle checkpoint ends the failure run, so the next transient
+/// read waits the initial backoff, not the one the refused reports grew to.
+#[tokio::test]
+async fn a_successful_idle_checkpoint_resets_the_backoff() {
+    let store = InMemoryReceiverStore::new(CELL);
+    let fake = FakeDurableStream::at(StreamPlacement::new("DURABLE-sfo3-cell-a", 8), 900);
+    let stream = Arc::new(QuietAfterCaughtUpStream::new(fake.clone()));
+    let mut receiver = quiet_receiver(&store, stream.clone());
+    receiver.receiver.checkpoint_interval = Duration::from_millis(20);
+    receiver.backoff_initial = Duration::from_millis(20);
+    receiver.backoff_max = Duration::from_secs(5);
+    let readiness = receiver.readiness();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let run = receiver.run_with_shutdown(shutdown_rx);
+    tokio::pin!(run);
+
+    drive_until(&mut run, Duration::from_secs(2), "readiness", || {
+        readiness.is_ready()
+    })
+    .await;
+    // Seven refusals grow the backoff to at least 640 ms. The Idle step may
+    // spend one of them without growing it.
+    for _ in 0..7 {
+        store.next_checkpoint(Err(ReceiverStoreError::Unavailable(
+            "store down".to_string(),
+        )));
+    }
+    fake.push_envelope(900, durable(0x9f, 1, None));
+    stream.pushed.notify_one();
+    drive_until(
+        &mut run,
+        Duration::from_secs(5),
+        "the idle checkpoint that finally succeeds",
+        || store.projected_frontier() == Some(900),
+    )
+    .await;
+
+    // One transient read, then a delivery. The read waits out the current
+    // backoff before the delivery is read and acknowledged.
+    fake.push_error(StreamError::Transient("blip".to_string()));
+    fake.push_envelope(901, durable(0x9f, 2, None));
+    stream.pushed.notify_one();
+    drive_until(
+        &mut run,
+        Duration::from_millis(400),
+        "the delivery after one transient read at the initial backoff",
+        || fake.acked().len() == 2,
+    )
+    .await;
+    assert_eq!(fake.acked(), vec![900, 901]);
+
+    shutdown_tx.send(true).expect("receiver observes shutdown");
+    tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("receiver must finish promptly")
+        .expect("shutdown succeeds");
+}
+
 /// Run a bootstrapped receiver until it is ready, optionally apply one
 /// event, then shut it down gracefully. Returns the store calls made from
 /// the shutdown signal on.

@@ -1163,9 +1163,11 @@ impl DurableReceiver {
                 // report leaves the deadline in the past, so back off before
                 // the next attempt rather than spin on the store.
                 match self.checkpoint(session).await {
-                    Ok(()) => self
-                        .readiness
-                        .set_from_session(session, self.receiver.lag_readiness_threshold),
+                    Ok(()) => {
+                        backoff = self.backoff_initial;
+                        self.readiness
+                            .set_from_session(session, self.receiver.lag_readiness_threshold);
+                    }
                     Err(failure) => {
                         self.readiness
                             .set_blocked(failure.reason(), Some(session.membership_generation));
