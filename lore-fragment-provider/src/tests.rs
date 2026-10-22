@@ -2824,13 +2824,6 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         boundary_token: paths.boundary_binding().boundary_token().into(),
         observation_digest: hex::encode(paths.observation_binding_blake3()),
     };
-    let canonical = expected.canonical_bytes().unwrap();
-    let reserve = format!(
-        "SELECT object_store_retention.drain_reserve_v1({}::jsonb,decode('{}','hex'),decode('{}','hex'))",
-        quoted(&serde_json::to_string(&expected).unwrap()),
-        hex::encode(&canonical),
-        blake3::hash(&canonical).to_hex()
-    );
     let mut plan = FragmentDrainReservationPlan::new(input.clone());
     let reservation = capability
         .reserve_spool(&mut plan)
