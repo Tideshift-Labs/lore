@@ -113,9 +113,22 @@ fn counter(probe: &phase_diagnostics::Probe, phase: &'static str) -> usize {
     probe.snapshot().get(phase).map_or(0, |metric| metric.count)
 }
 
+/// Removes the root's admission marker, so the next `begin_parent` cannot trust the listing.
+fn drop_marker(path: &Path) {
+    let root = path.join("attempts");
+    let Ok(bytes) = std::fs::read(&root) else {
+        return; // The first cycle has no journal yet.
+    };
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes[1..]).unwrap();
+    document.as_object_mut().unwrap().remove("validated");
+    let mut edited = vec![bytes[0]];
+    edited.extend(serde_json::to_vec(&document).unwrap());
+    std::fs::write(&root, edited).unwrap();
+}
+
 /// Per-cycle `(child_read, child_parse)` deltas. `fresh_store` builds a new store instance (and so
 /// an empty settled-validation cache) for every cycle, which is the pre-cache cost shape.
-async fn cycle_reads(cycles: usize, fresh_store: bool) -> Vec<(usize, usize)> {
+async fn cycle_reads(cycles: usize, fresh_store: bool, strip_marker: bool) -> Vec<(usize, usize)> {
     let dir = tempfile::tempdir().unwrap();
     let probe = phase_diagnostics::Probe::install(dir.path().to_path_buf());
     let shared = RepositoryAttemptStore::in_directory(dir.path());
@@ -125,6 +138,9 @@ async fn cycle_reads(cycles: usize, fresh_store: bool) -> Vec<(usize, usize)> {
             counter(&probe, "child_read"),
             counter(&probe, "child_parse"),
         );
+        if strip_marker {
+            drop_marker(dir.path());
+        }
         if fresh_store {
             full_cycle(&RepositoryAttemptStore::in_directory(dir.path())).await;
         } else {
@@ -160,7 +176,7 @@ async fn parent_cycle_child_reads_stay_flat_on_one_store_instance() {
         cycles >= 300,
         "need disjoint first and last 100-cycle windows"
     );
-    let deltas = cycle_reads(cycles, false).await;
+    let deltas = cycle_reads(cycles, false, false).await;
     let first = window_sum(&deltas, 0..100);
     let last = window_sum(&deltas, cycles - 100..cycles);
     eprintln!(
@@ -181,24 +197,42 @@ async fn parent_cycle_child_reads_stay_flat_on_one_store_instance() {
     );
 }
 
-// Discrimination control: a fresh instance per cycle has an empty cache, so it must show the
-// per-parent full-history cost the cache removes. Fewer cycles: this shape is O(n^2).
+// A fresh instance has an empty cache, but `finish_parent` leaves the admission marker and
+// `begin_parent` trusts a matching marker, so a store per cycle (the CLI shape) stays flat too.
 #[tokio::test]
-async fn parent_cycle_child_reads_grow_with_a_fresh_store_instance_per_cycle() {
+async fn parent_cycle_child_reads_stay_flat_with_a_fresh_store_instance_per_cycle() {
     let cycles = 300;
-    let deltas = cycle_reads(cycles, true).await;
+    let deltas = cycle_reads(cycles, true, false).await;
     let first = window_sum(&deltas, 0..100);
     let last = window_sum(&deltas, cycles - 100..cycles);
     eprintln!(
         "fresh store cycles={cycles} first100(read,parse)={first:?} last100(read,parse)={last:?}"
     );
-    assert!(first.0 > 0, "probe saw no child reads");
+    assert!(first.0 > 0 && first.1 > 0, "probe saw no child reads");
     assert!(
-        last.0 > first.0 * 2 && last.1 > first.1 * 2,
-        "fresh-instance control did not grow: first100={first:?} last100={last:?}"
+        last.0 <= first.0 + first.0 / 10 && last.1 <= first.1 + first.1 / 10,
+        "fresh-instance cost grew with history: first100={first:?} last100={last:?}"
     );
 }
 
+// Discrimination control: a fresh instance whose marker is gone cannot trust the listing, so it
+// must show the per-parent full-history cost the marker removes. Fewer cycles: O(n^2).
+#[tokio::test]
+async fn parent_cycle_child_reads_grow_with_a_fresh_store_instance_and_no_marker() {
+    let cycles = 300;
+    let deltas = cycle_reads(cycles, true, true).await;
+    let first = window_sum(&deltas, 0..100);
+    let last = window_sum(&deltas, cycles - 100..cycles);
+    eprintln!(
+        "no-marker fresh store cycles={cycles} first100(read,parse)={first:?} \
+         last100(read,parse)={last:?}"
+    );
+    assert!(first.0 > 0, "probe saw no child reads");
+    assert!(
+        last.0 > first.0 * 2 && last.1 > first.1 * 2,
+        "no-marker control did not grow: first100={first:?} last100={last:?}"
+    );
+}
 fn settled_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(root).unwrap() {
@@ -393,7 +427,9 @@ async fn cached_settled_child_copied_into_pending_blocks_begin_and_finish() {
         .join("pending")
         .join(files[0].file_name().unwrap());
     std::fs::copy(&files[0], &twin).unwrap();
-    assert_begin_and_finish_fail(&store, second, "duplicate journal child identity").await;
+    // A marker-trusted begin skips the settled scan, so the twin is rejected by the per-child
+    // load instead ("... in pending and settled"); both messages share this prefix.
+    assert_begin_and_finish_fail(&store, second, "duplicate journal child").await;
 }
 
 #[tokio::test]

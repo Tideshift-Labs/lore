@@ -136,13 +136,28 @@ fn journal() -> Journal {
     }
 }
 
-/// `cycles` completed parents, one settled child each.
+/// `cycles` completed parents, one settled child each. `finish_parent` records the marker, so the
+/// journal comes back marked; use `completed_unmarked` for one no admission has seen.
 async fn completed(cycles: usize) -> Journal {
     let journal = journal();
     for _ in 0..cycles {
         full_cycle(&journal.store).await;
     }
     journal
+}
+
+/// Like `completed`, with the marker removed from the root: a journal written before
+/// `finish_parent` recorded one, so the first admission must scan in full.
+async fn completed_unmarked(cycles: usize) -> Journal {
+    let journal = completed(cycles).await;
+    strip_marker(&journal.path);
+    journal
+}
+
+fn strip_marker(path: &Path) {
+    let mut root = read_root(path);
+    root.as_object_mut().unwrap().remove("validated");
+    write_root(path, &root);
 }
 
 fn counter(probe: &phase_diagnostics::Probe, phase: &'static str) -> usize {
@@ -296,7 +311,7 @@ async fn prime(journal: &Journal) -> Value {
 
 #[tokio::test]
 async fn second_admission_reads_no_settled_children() {
-    let journal = completed(3).await;
+    let journal = completed_unmarked(3).await;
     assert!(
         marker(&journal.path).is_none(),
         "journal writers never create the marker"
@@ -727,7 +742,7 @@ fn injected_root_write_failure(
 
 #[tokio::test]
 async fn failed_marker_write_is_best_effort_and_the_next_admission_scans_and_writes_it() {
-    let journal = completed(3).await;
+    let journal = completed_unmarked(3).await;
     let before = root_bytes(&journal.path);
     let fired = Arc::new(AtomicBool::new(false));
     let probe = injected_root_write_failure(&journal.path, &fired);
@@ -749,7 +764,7 @@ async fn failed_marker_write_is_best_effort_and_the_next_admission_scans_and_wri
 // on disk and describes the state the full scan validated, so the next admission is a hit.
 #[tokio::test]
 async fn marker_write_failing_after_rename_admits_and_the_published_marker_is_trusted() {
-    let journal = completed(3).await;
+    let journal = completed_unmarked(3).await;
     let root = journal.path.join("attempts");
     let fired = Arc::new(AtomicBool::new(false));
     let probe = {
@@ -781,7 +796,7 @@ async fn marker_write_failing_after_rename_admits_and_the_published_marker_is_tr
 #[cfg(windows)]
 #[tokio::test]
 async fn read_only_root_admits_after_a_full_scan_and_never_gets_a_marker() {
-    let journal = completed(3).await;
+    let journal = completed_unmarked(3).await;
     let root = journal.path.join("attempts");
     let original = std::fs::metadata(&root).unwrap().permissions();
     let mut permissions = original.clone();
@@ -857,7 +872,7 @@ async fn settled_add_after_marker_with_no_root_write_rescans_in_full_after_resta
 
 #[tokio::test]
 async fn root_without_the_field_loads_and_admits_with_a_full_scan() {
-    let journal = completed(3).await;
+    let journal = completed_unmarked(3).await;
     assert!(
         read_root(&journal.path)
             .as_object()
@@ -931,6 +946,7 @@ async fn fence_acquire_uses_marker_admission_for_main_and_legacy_journals() {
         for _ in 0..2 {
             full_cycle(&store).await;
         }
+        strip_marker(&path);
     }
     let parses = |probe: &phase_diagnostics::Probe| counter(probe, "child_parse");
     let before = parses(&probe);

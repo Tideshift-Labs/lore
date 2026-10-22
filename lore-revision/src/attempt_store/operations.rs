@@ -338,7 +338,8 @@ impl RepositoryAttemptStore {
 
     /// Ordinary write admission. Settled history gets the same full validation as
     /// `managed_parents`, but only when the root's `validated` marker does not match the
-    /// current settled fingerprint; a passing scan then records the marker with the root.
+    /// current settled fingerprint; a passing scan then records the marker with the root, as
+    /// `finish_parent` also does.
     /// Recovery and operation status call `managed_parents`, which always scans in full.
     pub async fn admission_parents(&self) -> Result<Vec<ManagedParent>, ProtocolError> {
         let _local = self.write_guard.lock().await;
@@ -434,7 +435,25 @@ impl RepositoryAttemptStore {
         Self::validate_parents(&document)?;
         // Settled history is still validated, but each settled child is parsed once per store
         // instance rather than once per parent; reparsing made each parent cost all history.
-        self.check_settled(&guard, &document)?;
+        // When the admission marker matches, the listing is trusted without a parse. That needs
+        // every parent complete (an unknown parent must not be one still running), and it
+        // leaves `finish_parent` unable to prune parents, so a full parse still runs when
+        // enough old parents wait or the last one is a day old.
+        let mut listing = self.settled_listing(&document)?;
+        let marker = Self::fingerprint_of(&document, &mut listing);
+        if marker.is_some()
+            && document.validated == marker
+            && document.parents.iter().all(|old| old.complete)
+            && !Self::full_scan_due(&document)
+        {
+            self.seed_settled(&guard, &document, &listing)?;
+        } else {
+            self.check_settled(&guard, &document, true)?;
+            document
+                .pruned
+                .get_or_insert_with(Default::default)
+                .full_scan_unix_millis = Some(now_unix_millis());
+        }
         if document
             .parents
             .iter()
@@ -491,19 +510,52 @@ impl RepositoryAttemptStore {
         Ok(())
     }
 
+    /// Completes a parent, prunes expired settled history (see `prune_settled`), and refreshes
+    /// the admission marker over the settled history it just validated, all in one root write,
+    /// so the next admission does not rescan. Recovery's `reconcile_parent` neither prunes nor
+    /// records a marker.
     pub async fn finish_parent(&self, parent: Uuid) -> Result<(), ProtocolError> {
         let _local = self.write_guard.lock().await;
         let guard = self.guard().await?;
         let mut document = self.load_for_write(&guard)?;
-        // A settled child is never unresolved once validated; see `begin_parent`.
-        self.check_settled(&guard, &document)?;
+        // A settled child is never unresolved once validated or vouched for by the marker; see
+        // `begin_parent`. A rewrite that kept name, length and mtime is recovery's to catch.
+        let settled = self.check_settled(&guard, &document, false)?;
         let children = self.children(&document, true)?;
-        self.finish_loaded_parent(&guard, &mut document, parent, &children)
+        Self::complete_loaded_parent(&mut document, parent, &children)?;
+        let (settled, vouched) = self.prune_settled(
+            &guard,
+            &mut document,
+            settled,
+            &children,
+            &parent.to_string(),
+        )?;
+        // Pending children are not part of the marker; admission validates them every time.
+        // `check_settled` skips a child it parsed earlier in this process, or that a matching
+        // marker vouched for at `begin_parent`, when name, length and mtime match: the residual
+        // the fingerprint itself accepts. So trust can carry from one marker to the next until
+        // `full_scan_due` (a day, or enough old parents) or recovery's full scan parses again;
+        // a non-Lore rewrite that keeps all three is caught only there.
+        document.validated = if vouched {
+            Self::validated_fingerprint(&guard, &document, &settled)
+        } else {
+            None
+        };
+        self.store(&guard, &document)
     }
 
     fn finish_loaded_parent(
         &self,
         guard: &FSLock,
+        document: &mut StoredDocument,
+        parent: Uuid,
+        children: &[StoredChild],
+    ) -> Result<(), ProtocolError> {
+        Self::complete_loaded_parent(document, parent, children)?;
+        self.store(guard, document)
+    }
+
+    fn complete_loaded_parent(
         document: &mut StoredDocument,
         parent: Uuid,
         children: &[StoredChild],
@@ -528,7 +580,7 @@ impl RepositoryAttemptStore {
             ));
         }
         parent.complete = true;
-        self.store(guard, document)
+        Ok(())
     }
 
     pub async fn recovery_context(

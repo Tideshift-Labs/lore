@@ -248,10 +248,29 @@ struct StoredDocument {
     attempts: Vec<StoredAttempt>,
     #[serde(default)]
     ownership: Vec<StoredOwnership>,
-    /// Settled history the last full admission scan accepted. Additive: an older build ignores
-    /// it, and its next root write drops it, which forces a full scan.
+    /// Settled history last accepted by an admission full scan or by `finish_parent`'s
+    /// `check_settled`. Additive: an older build ignores it, and its next root write drops it,
+    /// which forces a full scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     validated: Option<StoredValidation>,
+    /// Running totals of settled history `finish_parent` deleted, and the time of the last full
+    /// parse. No validity check reads it, because recovery needs only incomplete parents and
+    /// pending children; a crash between a deletion and the root write that counts it loses
+    /// only the count, and a lost scan time only causes an earlier full parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pruned: Option<StoredPruned>,
+}
+
+/// See `StoredDocument::pruned`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[lore_macro::test_pub]
+struct StoredPruned {
+    children: u64,
+    parents: u64,
+    /// When `begin_parent` last parsed every settled child rather than trusting the marker.
+    /// Parent pruning needs such a pass; see `begin_parent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    full_scan_unix_millis: Option<i64>,
 }
 
 /// Fingerprint of the settled history one full scan validated; see `settled_fingerprint`.

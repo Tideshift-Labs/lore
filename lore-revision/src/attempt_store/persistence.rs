@@ -714,14 +714,18 @@ impl RepositoryAttemptStore {
 
     /// The settled half of `children(document, false)`'s validation, without returning the
     /// children. A settled child this store already validated is parsed again only when its
-    /// length or modification time changed, or its parent left the root.
+    /// length or modification time changed, or its parent left the root. Returns the listing it
+    /// validated, which `finish_parent` prunes and fingerprints without listing again.
+    /// `resolve_unknown` also parses children `seed_settled` trusted without a parent, so the
+    /// returned listing names every parent; parent pruning needs that.
     pub(super) fn check_settled(
         &self,
         _guard: &FSLock,
         document: &StoredDocument,
-    ) -> Result<(), ProtocolError> {
+        resolve_unknown: bool,
+    ) -> Result<Vec<SettledEntry>, ProtocolError> {
         let Some(current) = document.generation.as_deref() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let generation = self.generation(document)?;
         let mut seen = document
@@ -752,7 +756,8 @@ impl RepositoryAttemptStore {
         // A file that left settled must not be trusted if it later returns with old metadata.
         let present = settled.iter().map(|(id, _)| id).collect::<HashSet<_>>();
         cache.entries.retain(|id, _| present.contains(id));
-        for (id, entry) in &settled {
+        let mut validated = Vec::with_capacity(settled.len());
+        for (id, entry) in settled {
             if !seen.insert(id.clone()) {
                 return Err(ProtocolError::internal("duplicate journal child identity"));
             }
@@ -761,32 +766,358 @@ impl RepositoryAttemptStore {
                 .map_err(|error| io_error("inspect child", &entry.path(), error))?;
             // A filesystem without modification times always parses.
             let modified = metadata.modified().ok();
-            if cache.entries.get(id).is_some_and(|validated| {
-                Some(validated.modified) == modified
-                    && validated.len == metadata.len()
-                    && validated
-                        .parent
-                        .as_deref()
-                        .is_none_or(|parent| parents.contains(parent))
+            // An unknown parent was present when the marker vouched for it, and a parent leaves
+            // the root only through a prune that saw every parent in the listing.
+            if let Some(cached) = cache.entries.get(&id).filter(|cached| {
+                Some(cached.modified) == modified
+                    && cached.len == metadata.len()
+                    && match &cached.parent {
+                        SettledParent::Unmanaged => true,
+                        SettledParent::Managed(parent) => parents.contains(parent.as_str()),
+                        SettledParent::Unknown => !resolve_unknown,
+                    }
             }) {
+                validated.push(SettledEntry {
+                    parent: cached.parent.clone(),
+                    id,
+                    len: metadata.len(),
+                    modified,
+                });
                 continue;
             }
-            cache.entries.remove(id);
+            cache.entries.remove(&id);
             let (child, _) = self
-                .child(document, id)?
+                .child(document, &id)?
                 .ok_or_else(|| ProtocolError::internal("journal child disappeared"))?;
+            let parent = SettledParent::of(&child);
             if let Some(modified) = modified {
                 cache.entries.insert(
                     id.clone(),
                     ValidatedSettled {
                         len: metadata.len(),
                         modified,
-                        parent: child.managed.map(|managed| managed.parent),
+                        parent: parent.clone(),
                     },
                 );
             }
+            validated.push(SettledEntry {
+                id,
+                len: metadata.len(),
+                modified,
+                parent,
+            });
+        }
+        Ok(validated)
+    }
+
+    /// Trust a settled `listing` the admission marker vouched for without parsing it: a child
+    /// the cache does not already hold at that length and mtime is recorded with an unknown
+    /// parent. Valid only while every parent in the root is complete, as `begin_parent`
+    /// requires, so a later `prune_settled` may age such a child out; it removes no parent while
+    /// any unknown one remains.
+    pub(super) fn seed_settled(
+        &self,
+        _guard: &FSLock,
+        document: &StoredDocument,
+        listing: &[SettledListing],
+    ) -> Result<(), ProtocolError> {
+        let Some(current) = document.generation.as_deref() else {
+            return Ok(());
+        };
+        let mut cache = self
+            .settled
+            .lock()
+            .map_err(|_err| ProtocolError::internal("settled validation cache poisoned"))?;
+        if cache.generation.as_deref() != Some(current) {
+            cache.generation = Some(current.to_owned());
+            cache.entries.clear();
+        }
+        let present = listing.iter().map(|(id, _, _)| id).collect::<HashSet<_>>();
+        cache.entries.retain(|id, _| present.contains(id));
+        for (id, len, modified) in listing {
+            let Some(modified) = *modified else {
+                continue;
+            };
+            if cache
+                .entries
+                .get(id)
+                .is_some_and(|cached| cached.len == *len && cached.modified == modified)
+            {
+                continue;
+            }
+            cache.entries.insert(
+                id.clone(),
+                ValidatedSettled {
+                    len: *len,
+                    modified,
+                    parent: SettledParent::Unknown,
+                },
+            );
         }
         Ok(())
+    }
+
+    /// Delete settled children older than [`SETTLED_RETENTION`], at most
+    /// [`PRUNE_CHILDREN_PER_CALL`] per call, then drop complete parents nothing references any
+    /// more. `settled` must be `check_settled`'s listing under the same guard; the entries that
+    /// remain are returned, with `false` when a trusted child failed to parse, so the caller
+    /// must not record a marker over them. Best effort: a failure logs and keeps what it could
+    /// not prove gone.
+    ///
+    /// Files go first and the caller's root write comes after, never the reverse. A root that
+    /// lost a parent while one of its children survived would fail `validate_child` and close
+    /// the write fence. So a parent leaves only when no child named it before this call's
+    /// deletes: its last child went in an earlier call, whose deletion a synced directory
+    /// (Unix) or that call's write-through root publication (Windows, where NTFS journals
+    /// metadata in order) already made durable. A crash at any point leaves every remaining
+    /// child bound to a parent in the root. The children of `current`, the parent being
+    /// finished, are kept: until its completion is in the root, recovery needs them as
+    /// positive settlement evidence.
+    // The journal is an authorized writer; it deletes only settled children under its lock.
+    #[allow(clippy::disallowed_methods)]
+    pub(super) fn prune_settled(
+        &self,
+        _guard: &FSLock,
+        document: &mut StoredDocument,
+        settled: Vec<SettledEntry>,
+        pending: &[StoredChild],
+        current: &str,
+    ) -> Result<(Vec<SettledEntry>, bool), ProtocolError> {
+        #[cfg(feature = "test-util")]
+        let _prune = phase_diagnostics::start(self.path.as_deref(), "settled_prune");
+        let Some(cutoff) = std::time::SystemTime::now().checked_sub(SETTLED_RETENTION) else {
+            return Ok((settled, true));
+        };
+        let settled_directory = self.generation(document)?.join("settled");
+        let complete = document
+            .parents
+            .iter()
+            .filter(|parent| parent.complete && parent.id != current)
+            .map(|parent| parent.id.as_str())
+            .collect::<HashSet<_>>();
+        // Taken before any delete, so a parent outlives its last child by one call. A child
+        // whose parent is unknown might name any parent, so then no parent leaves.
+        let all_known = settled
+            .iter()
+            .all(|entry| !matches!(entry.parent, SettledParent::Unknown));
+        let unreferenced = if !all_known {
+            HashSet::new()
+        } else {
+            let referenced = settled
+                .iter()
+                .filter_map(|entry| entry.parent.name())
+                .chain(
+                    pending
+                        .iter()
+                        .filter_map(|child| child.managed.as_ref())
+                        .map(|managed| managed.parent.as_str()),
+                )
+                .chain(document.managed.iter().map(|intent| intent.parent.as_str()))
+                .collect::<HashSet<_>>();
+            complete
+                .iter()
+                .filter(|parent| {
+                    !referenced.contains(*parent) && parent_created_before(parent, cutoff)
+                })
+                .map(|parent| (*parent).to_owned())
+                .collect::<HashSet<_>>()
+        };
+        let mut removed = 0u64;
+        let mut gone = 0u64;
+        let mut failures = 0usize;
+        let mut damaged = HashSet::new();
+        let mut remaining = Vec::with_capacity(settled.len());
+        for mut entry in settled {
+            let old = entry.modified.is_some_and(|modified| modified < cutoff);
+            if failures >= PRUNE_FAILURES_PER_CALL
+                || !old
+                || removed + gone >= PRUNE_CHILDREN_PER_CALL
+            {
+                remaining.push(entry);
+                continue;
+            }
+            if matches!(entry.parent, SettledParent::Unknown) {
+                // Bounded by the deletion budget: at most one parse per child this call may
+                // delete. A child the marker vouched for that no longer parses is damaged
+                // history: keep it and let the caller drop the marker, so the next admission
+                // scans in full and closes the write fence on it.
+                match self.child(document, &entry.id) {
+                    Ok(Some((child, _))) => entry.parent = SettledParent::of(&child),
+                    Ok(None) => {
+                        gone += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        crate::lore_warn!("Could not read settled attempt {}: {error}", entry.id);
+                        damaged.insert(entry.id.clone());
+                        failures += 1;
+                        remaining.push(entry);
+                        continue;
+                    }
+                }
+            }
+            if entry
+                .parent
+                .name()
+                .is_some_and(|parent| !complete.contains(parent))
+            {
+                remaining.push(entry);
+                continue;
+            }
+            let path = settled_directory.join(format!("{}.json", entry.id));
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                // Gone without this call deleting it: leave the count to whoever did.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => gone += 1,
+                // One held file must not stop the rest; a directory-wide failure stops soon.
+                Err(error) => {
+                    crate::lore_warn!("Could not prune settled attempt {}: {error}", entry.id);
+                    failures += 1;
+                    remaining.push(entry);
+                }
+            }
+        }
+        // The cache keeps what this call learned: deleted children leave it, a resolved parent
+        // replaces Unknown, and a damaged child leaves it so every later `check_settled` parses
+        // it again and fails, rather than trusting it into a new marker.
+        let mut cache = self
+            .settled
+            .lock()
+            .map_err(|_err| ProtocolError::internal("settled validation cache poisoned"))?;
+        let kept = remaining
+            .iter()
+            .filter(|entry| !damaged.contains(&entry.id))
+            .map(|entry| (&entry.id, &entry.parent))
+            .collect::<HashMap<_, _>>();
+        cache.entries.retain(|id, cached| {
+            let Some(parent) = kept.get(id) else {
+                return false;
+            };
+            if matches!(cached.parent, SettledParent::Unknown) {
+                cached.parent = (*parent).clone();
+            }
+            // Damage under the marker voids what it vouched for: parse the rest again.
+            damaged.is_empty() || !matches!(cached.parent, SettledParent::Unknown)
+        });
+        drop(cache);
+        // On Unix this also makes an earlier call's deletes durable if its own sync failed. A
+        // failed delete in this call does not matter here: no unreferenced parent named it.
+        let durable = if unreferenced.is_empty() && removed == 0 {
+            true
+        } else if let Err(error) = sync_directory(Some(&settled_directory)) {
+            crate::lore_warn!("Could not sync pruned attempt journal: {error}");
+            false
+        } else {
+            true
+        };
+        let mut pruned_parents = 0u64;
+        if durable && !unreferenced.is_empty() {
+            let before = document.parents.len();
+            document
+                .parents
+                .retain(|parent| !unreferenced.contains(&parent.id));
+            pruned_parents = (before - document.parents.len()) as u64;
+        }
+        if removed > 0 || pruned_parents > 0 {
+            let summary = document.pruned.get_or_insert_with(Default::default);
+            summary.children = summary.children.saturating_add(removed);
+            summary.parents = summary.parents.saturating_add(pruned_parents);
+        }
+        Ok((remaining, damaged.is_empty()))
+    }
+}
+
+/// How long a settled child stays after settlement before `finish_parent` may delete it.
+pub(super) const SETTLED_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Bound on one `finish_parent`'s deletions, so a large backlog drains over many calls.
+pub(super) const PRUNE_CHILDREN_PER_CALL: u64 = 1024;
+
+/// Failed reads or deletes after which one `finish_parent` stops pruning.
+const PRUNE_FAILURES_PER_CALL: usize = 8;
+
+/// Complete parents old enough to prune that make `begin_parent` parse in full, so the next
+/// `finish_parent` knows every child's parent and can remove them. Each costs one root row.
+pub(super) const FULL_SCAN_PARENT_THRESHOLD: usize = 256;
+
+/// Longest gap between two full parses at `begin_parent`.
+pub(super) const FULL_SCAN_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+impl RepositoryAttemptStore {
+    /// Whether `begin_parent` must parse every settled child even when the marker matches:
+    /// no full parse is recorded, the last is older than [`FULL_SCAN_INTERVAL`] (or in the
+    /// future, after a clock change), or [`FULL_SCAN_PARENT_THRESHOLD`] parents are waiting.
+    pub(super) fn full_scan_due(document: &StoredDocument) -> bool {
+        let now = std::time::SystemTime::now();
+        let interval = i64::try_from(FULL_SCAN_INTERVAL.as_millis()).unwrap_or(i64::MAX);
+        let current = now_unix_millis();
+        let stale = document
+            .pruned
+            .as_ref()
+            .and_then(|pruned| pruned.full_scan_unix_millis)
+            .is_none_or(|last| last > current || current.saturating_sub(last) >= interval);
+        stale
+            || now.checked_sub(SETTLED_RETENTION).is_some_and(|cutoff| {
+                document
+                    .parents
+                    .iter()
+                    .filter(|parent| parent.complete && parent_created_before(&parent.id, cutoff))
+                    .count()
+                    >= FULL_SCAN_PARENT_THRESHOLD
+            })
+    }
+}
+
+/// Whether a parent identity is a `UUIDv7` minted before `cutoff`. Any other identity has no
+/// creation time, so it is never old enough to prune.
+fn parent_created_before(id: &str, cutoff: std::time::SystemTime) -> bool {
+    Uuid::parse_str(id)
+        .ok()
+        .filter(|uuid| uuid.get_version_num() == 7)
+        .and_then(|uuid| uuid.get_timestamp())
+        .is_some_and(|timestamp| {
+            let (seconds, nanos) = timestamp.to_unix();
+            std::time::UNIX_EPOCH
+                .checked_add(std::time::Duration::new(seconds, nanos))
+                .is_some_and(|created| created < cutoff)
+        })
+}
+
+/// One settled child as `check_settled` validated it.
+pub(super) struct SettledEntry {
+    id: String,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    parent: SettledParent,
+}
+
+/// A settled child's name, length and modification time, from one directory listing.
+pub(super) type SettledListing = (String, u64, Option<std::time::SystemTime>);
+
+/// The managed parent a validated settled child names.
+#[derive(Clone)]
+pub(super) enum SettledParent {
+    /// No managed intent.
+    Unmanaged,
+    Managed(String),
+    /// Trusted through the admission marker without a parse; see `seed_settled`.
+    Unknown,
+}
+
+impl SettledParent {
+    fn of(child: &StoredChild) -> Self {
+        child.managed.as_ref().map_or(Self::Unmanaged, |managed| {
+            Self::Managed(managed.parent.clone())
+        })
+    }
+
+    fn name(&self) -> Option<&str> {
+        match self {
+            Self::Managed(parent) => Some(parent),
+            Self::Unmanaged | Self::Unknown => None,
+        }
     }
 }
 
@@ -806,12 +1137,58 @@ impl RepositoryAttemptStore {
         _guard: &FSLock,
         document: &StoredDocument,
     ) -> Result<Option<StoredValidation>, ProtocolError> {
-        let Some(current) = document.generation.as_deref() else {
+        if document.generation.is_none() {
             return Ok(None);
-        };
+        }
         #[cfg(feature = "test-util")]
         let _fingerprint = phase_diagnostics::start(self.path.as_deref(), "settled_fingerprint");
+        let mut settled = self.settled_listing(document)?;
+        Ok(Self::fingerprint_of(document, &mut settled))
+    }
+
+    /// One enumeration of the settled directory, with no child opens.
+    pub(super) fn settled_listing(
+        &self,
+        document: &StoredDocument,
+    ) -> Result<Vec<SettledListing>, ProtocolError> {
+        if document.generation.is_none() {
+            return Ok(Vec::new());
+        }
         let generation = self.generation(document)?;
+        let mut settled = Vec::new();
+        for (id, entry) in child_entries(&generation.join("settled"))? {
+            let metadata = entry
+                .metadata()
+                .map_err(|error| io_error("inspect child", &entry.path(), error))?;
+            settled.push((id, metadata.len(), metadata.modified().ok()));
+        }
+        Ok(settled)
+    }
+
+    /// The marker for settled history `check_settled` (and any pruning after it) just validated,
+    /// from the same listing, so `finish_parent` records it without a second enumeration.
+    pub(super) fn validated_fingerprint(
+        _guard: &FSLock,
+        document: &StoredDocument,
+        settled: &[SettledEntry],
+    ) -> Option<StoredValidation> {
+        document.generation.as_ref()?;
+        Self::fingerprint_of(
+            document,
+            &mut settled
+                .iter()
+                .map(|entry| (entry.id.clone(), entry.len, entry.modified))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// One hash over a settled listing, which it sorts. Every marker goes through here, so a
+    /// marker `finish_parent` records matches the one the next admission computes from disk.
+    pub(super) fn fingerprint_of(
+        document: &StoredDocument,
+        settled: &mut [SettledListing],
+    ) -> Option<StoredValidation> {
+        let current = document.generation.as_deref()?;
         let mut hasher = blake3::Hasher::new();
         let mut field = |bytes: &[u8]| {
             hasher.update(&(bytes.len() as u64).to_le_bytes());
@@ -837,28 +1214,19 @@ impl RepositoryAttemptStore {
             field(attempt.as_bytes());
             field(parent.as_bytes());
         }
-        let mut settled = child_entries(&generation.join("settled"))?;
         settled.sort_unstable_by(|left, right| left.0.cmp(&right.0));
         field(&(settled.len() as u64).to_le_bytes());
-        for (id, entry) in &settled {
-            let metadata = entry
-                .metadata()
-                .map_err(|error| io_error("inspect child", &entry.path(), error))?;
-            let Some(modified) = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            else {
-                return Ok(None);
-            };
+        for (id, len, modified) in settled.iter() {
+            let modified = modified
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())?;
             field(id.as_bytes());
-            field(&metadata.len().to_le_bytes());
+            field(&len.to_le_bytes());
             field(&modified.as_nanos().to_le_bytes());
         }
-        Ok(Some(StoredValidation {
+        Some(StoredValidation {
             version: SETTLED_FINGERPRINT_VERSION,
             fingerprint: hasher.finalize().to_hex().to_string(),
-        }))
+        })
     }
 }
 
@@ -872,7 +1240,7 @@ pub(super) struct SettledCache {
 struct ValidatedSettled {
     len: u64,
     modified: std::time::SystemTime,
-    parent: Option<String>,
+    parent: SettledParent,
 }
 
 /// Child identities in one journal directory, skipping unpublished temporaries.

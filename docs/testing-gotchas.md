@@ -99,7 +99,17 @@ Durable, recurring testing lessons grouped by topic.
   `std::fs::canonicalize(tempdir)`: the repository fence canonicalizes (`\\?\` on Windows) and probes
   match by `starts_with`, so a plain tempdir path silently counts zero. To isolate one fingerprint
   input, edit the root JSON (keeping `validated`) or the child file directly. Existing-file `child_read`
-  counts double (pending and settled paths both read), so assert on parses.
+  counts double (pending and settled paths both read), so assert on parses. `finish_parent` now
+  records the marker (and prunes settled children older than 7 days; `tests/attempt_prune.rs`), so a
+  fixture that needs an "unseen" journal strips `validated` from the root (`completed_unmarked`).
+  Age children with `File::set_modified`; age parents via `Uuid::new_v7(Timestamp::from_unix(NoContext, ..))`.
+  `begin_parent` refuses a second open parent, so build an incomplete one by editing `complete` in
+  the root. `cargo clippy -p lore-revision --all-features` fails on `lore-storage`'s `oodle`
+  (`OODLE_LIB_DIR not set`); list the other features explicitly.
+- **Mutation probes and cargo freshness**: restore a mutated source by writing its bytes back, never
+  with PowerShell `Copy-Item` from a backup. `Copy-Item` keeps the backup's old mtime, so cargo sees
+  the mutated build as newer and later runs test a stale binary that still holds the mutation. A
+  shared-tree test run read a red regression this way (2026-10-22). If in doubt, touch the file.
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
 - **Closed metric-label sets**: pin the exact literal list in `ALL` order, then pin the real call
   sites, not just a hand-written table. For SQL-keyed labels (`drain_procedure_label`),
