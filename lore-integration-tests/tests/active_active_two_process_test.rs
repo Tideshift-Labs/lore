@@ -3267,7 +3267,10 @@ mod active_active_two_process_tests {
         // `next` that the gateway's `Consume` stream has not answered. Arming a
         // quiet receiver therefore fires nothing until traffic wakes that call,
         // which is how this case first failed — a sixty-second timeout that
-        // reads like a broken decorator and is really a long-poll.
+        // reads like a broken decorator and is really a long-poll. Since Lore
+        // 90c91176 a receiver with unreported work also re-enters `next` at its
+        // checkpoint deadline, which could fire the trigger before the push.
+        // After quiescence nothing is unreported, so no deadline is set.
         b.arm_receiver_fault(FAULT_STREAM_TRANSIENT);
         let target = PushTarget {
             through: &a,
