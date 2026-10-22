@@ -110,6 +110,7 @@ Durable, recurring testing lessons grouped by topic.
   with PowerShell `Copy-Item` from a backup. `Copy-Item` keeps the backup's old mtime, so cargo sees
   the mutated build as newer and later runs test a stale binary that still holds the mutation. A
   shared-tree test run read a red regression this way (2026-10-22). If in doubt, touch the file.
+- **A regression test must be forced red**: a regression test can pass without the fix (vacuous: it never reaches the broken path). Before trusting one, remove or mutate the fix and watch the test fail, then restore (freshness rule above). `a_repeat_finish_on_the_same_instance_does_not_trust_an_evicted_damaged_child` (`tests/attempt_prune.rs`, `0816351d`) was shown red without the cache eviction and green with it.
 - **Fault injection**: Inject faults by key identity rather than call ordinal. Stand in for real-process conditions by calling production write paths directly to ensure real fences are exercised.
 - **Closed metric-label sets**: pin the exact literal list in `ALL` order, then pin the real call
   sites, not just a hand-written table. For SQL-keyed labels (`drain_procedure_label`),
