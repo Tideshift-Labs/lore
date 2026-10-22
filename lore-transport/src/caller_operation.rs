@@ -88,6 +88,16 @@ pub fn recovery_receipt_method_matches(recorded_rpc: &str, receipt_method: &str)
     )
 }
 
+/// Whether a recorded child is a fragment Put from a build that still journaled them.
+///
+/// Fragment Puts write no child since 2026-10-22. Old journals may still hold unresolved ones,
+/// and no receipt can settle them. A Put is content-addressed and the server ignores its attempt
+/// id, so recovery settles such a child as not applied without a read: nothing is owed, and the
+/// next push uploads whatever the remote lacks.
+pub fn is_legacy_fragment_put(recorded_rpc: &str) -> bool {
+    recorded_rpc == GrpcRpc::StoragePut.wire_name()
+}
+
 /// Read the exact repository credential selection without declaring or dispatching a mutation.
 /// The signature remains verified by the peer; this snapshot binds subsequent dispatches.
 pub async fn selected_caller_namespace(

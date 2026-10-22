@@ -1,8 +1,32 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_transport::caller_operation::canonical_endpoint;
+use lore_transport::caller_operation::is_legacy_fragment_put;
 use lore_transport::caller_operation::recovery_dial_url;
 use lore_transport::caller_operation::recovery_receipt_method_matches;
+
+/// Only the fragment Put an older build journaled is legacy; every other storage child stays
+/// journaled and so must not be mistaken for it.
+#[test]
+fn only_the_exact_fragment_put_is_a_legacy_unjournaled_child() {
+    assert!(is_legacy_fragment_put("StorageService.Put"));
+    for other in [
+        "",
+        "StorageService.PutResolved",
+        "StorageService.Copy",
+        "StorageService.Verify",
+        "StorageService.MutableStore",
+        "StorageService.MutableCompareAndSwap",
+        "RevisionService.BranchPush",
+        "RevisionService.BranchCreate",
+        "LockService.Lock",
+        "StorageService.Put ",
+        "storageservice.put",
+        "Put",
+    ] {
+        assert!(!is_legacy_fragment_put(other), "{other:?}");
+    }
+}
 
 #[test]
 fn recovery_dial_receipt_method_matrix_accepts_only_exact_supported_server_pairs() {

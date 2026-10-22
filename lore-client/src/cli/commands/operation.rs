@@ -106,7 +106,17 @@ where
         for child in store.unresolved().await.map_err(|error| {
             ProtocolError::internal(format!("{source}: cannot read blockers: {error}"))
         })? {
-            // Storage has no attributable receipt rail. Never infer its result from content.
+            if lore_transport::caller_operation::is_legacy_fragment_put(&child.operation) {
+                store
+                    .resolve(
+                        &child.attempt_id,
+                        lore_transport::AttemptResolution::NotApplied,
+                    )
+                    .await?;
+                continue;
+            }
+            // Other storage mutations have no attributable receipt rail. Never infer their
+            // result from content.
             if !matches!(
                 child.operation.as_str(),
                 "RevisionService.BranchPush"

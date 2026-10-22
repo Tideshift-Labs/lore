@@ -86,7 +86,10 @@ lore-storage = { workspace = true }
 # ownership-token threading without a durable `RepositoryAttemptStore`. Unifies with the plain
 # `lore-transport` dependency above for `cargo test`, the same way `lore` and `loreserver` already
 # pick the feature up on a workspace-wide `--all-targets` build (see the type's own doc comment).
-lore-transport = { workspace = true, features = ["test_seams"] }
+#
+# `test-util` exposes `GRPCConnection::for_test`, which `tests/put_fence.rs` uses to drive the real
+# storage client against a local fixture server (a managed Put's lost answer vs the fence).
+lore-transport = { workspace = true, features = ["test_seams", "test-util"] }
 # An in-memory meter, so a counter test reads only its own counts.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 serde_json = { workspace = true }

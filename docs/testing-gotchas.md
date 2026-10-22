@@ -487,3 +487,4 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
   `lore-postgres/tests/write_behind_drain_reserve.rs`.
 - **Appending to an `eol=lf` file with `Add-Content` writes CRLF** -> rewrite with
   `[IO.File]::WriteAllText` and an LF-normalised string, then `git ls-files --eol <path>`.
+- **`lore-integration-tests --features integration_tests` has 51 pre-existing failures without LocalStack/Dynamo** (`aws_store_test` 30, `locks_test` 14, `dynamodb_test` 7). They are infra-gated, not regressions; filter them out (`-- storage_copy_on_write quic_strict_admission`) rather than reading the red as yours.

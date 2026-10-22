@@ -32,7 +32,6 @@ use lore_transport::caller_operation::with_caller_operation;
 use lore_transport::error::ProtocolError;
 use lore_transport::grpc::storage_client::*;
 use lore_transport::outcome::AttemptId;
-use prost::Message;
 use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::Response;
@@ -213,11 +212,13 @@ impl Service for FixtureServer {
         Ok(Response::new(Box::pin(async_stream::stream! {
             while let Some(Ok(item)) = requests.next().await {
                 if managed {
-                    let index = journal.records.lock().iter().position(|r| Some(r.attempt_id.as_uuid()) == attempt).expect("wire attempt already journaled");
-                    let intent = journal.intents.lock()[index].clone();
-                    let mut expected = item.clone();
-                    expected.payload = expected.payload.map(|_| Bytes::new());
-                    assert_eq!(intent.canonical_request, expected.encode_to_vec(), "persisted intent must describe the real wire request");
+                    // A fragment Put writes no journal child: its wire attempt id is minted for
+                    // correlation only and is never in the journal.
+                    assert!(attempt.is_some(), "a managed Put still carries an attempt id");
+                    assert!(
+                        !journal.records.lock().iter().any(|r| Some(r.attempt_id.as_uuid()) == attempt),
+                        "a managed Put must not be journaled"
+                    );
                 }
                 items.fetch_add(1, Ordering::SeqCst);
                 match reply {
@@ -434,6 +435,25 @@ impl Fixture {
         .await
         .expect("bounded put")
     }
+    /// A still-journaled managed mutation, for the generic journal properties a Put no longer
+    /// carries. The fixture server loses its answer, so the call is always an unknown outcome.
+    async fn journaled_mutation(
+        &self,
+        ctx: &GrpcSessionContext,
+        tag: u8,
+    ) -> Result<(), ProtocolError> {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.service.mutable_store(
+                ctx,
+                Hash::from([tag; 32]),
+                Hash::from([tag.wrapping_add(1); 32]),
+                KeyType::Resolve,
+            ),
+        )
+        .await
+        .expect("bounded mutable store")
+    }
 }
 
 #[tokio::test]
@@ -456,19 +476,17 @@ async fn pooled_puts_do_not_leak_adoption_in_either_order() {
                 observation.capability.as_deref(),
                 Some("outcome_unknown_v1")
             );
-            assert!(observation.journaled_before_body);
+            assert!(observation.attempt.is_some());
+            assert!(!observation.journaled_before_body);
         }
         assert!(seen.iter().any(|s| s.capability.is_none()));
-        assert_eq!(
-            f.journal.records.lock().len(),
-            if adopted_first { 2 } else { 1 }
-        );
+        assert!(f.journal.records.lock().is_empty());
         assert_eq!(f.items.load(Ordering::SeqCst), 3);
     }
 }
 
 #[tokio::test]
-async fn concurrent_same_address_mutations_have_distinct_journaled_ids() {
+async fn concurrent_same_address_puts_have_distinct_unjournaled_ids() {
     let f = Fixture::new(Reply::Success).await;
     let (a, b, legacy) = tokio::join!(
         with_caller_operation(f.operation(), f.put(2)),
@@ -482,18 +500,56 @@ async fn concurrent_same_address_mutations_have_distinct_journaled_ids() {
     let adopted: Vec<_> = seen.iter().filter(|s| s.capability.is_some()).collect();
     assert_eq!(adopted.len(), 2);
     assert_ne!(adopted[0].attempt, adopted[1].attempt);
-    assert!(adopted.iter().all(|s| s.journaled_before_body));
+    assert!(adopted.iter().all(|s| s.attempt.is_some()));
+    assert!(adopted.iter().all(|s| !s.journaled_before_body));
+    assert!(f.journal.records.lock().is_empty());
     assert_eq!(f.items.load(Ordering::SeqCst), 3);
 }
 
+/// A managed Put writes nothing to the journal on success, yet still declares the capability and
+/// carries a fresh attempt id on every call.
+#[tokio::test]
+async fn managed_put_records_nothing_but_still_declares_and_mints_an_attempt_id() {
+    let f = Fixture::new(Reply::Success).await;
+    let operation = f.operation();
+    with_caller_operation(operation, async {
+        f.put(21).await.unwrap();
+        f.put(22).await.unwrap();
+        f.put(21).await.unwrap();
+    })
+    .await;
+    assert!(f.journal.records.lock().is_empty());
+    assert!(f.journal.intents.lock().is_empty());
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
+    let seen = f.seen.lock();
+    assert_eq!(seen.len(), 3);
+    for observation in seen.iter() {
+        assert_eq!(
+            observation.capability.as_deref(),
+            Some("outcome_unknown_v1")
+        );
+        assert!(observation.attempt.is_some());
+    }
+    assert_ne!(seen[0].attempt, seen[1].attempt);
+    assert_ne!(
+        seen[0].attempt, seen[2].attempt,
+        "same address, new attempt"
+    );
+    assert_ne!(seen[1].attempt, seen[2].attempt);
+    assert_eq!(f.items.load(Ordering::SeqCst), 3);
+}
+
+/// The generic journal properties below used to ride on Put; they now use a still-journaled
+/// RPC (`MutableStore`). Every journaled child binds to the one explicit parent.
 #[tokio::test]
 async fn every_item_binds_to_the_same_explicit_parent_and_unique_child() {
     let f = Fixture::new(Reply::Success).await;
     let operation = f.operation();
     let parent = operation.parent_id();
+    let ctx = f.context();
     with_caller_operation(operation, async {
-        f.put(21).await.unwrap();
-        f.put(22).await.unwrap();
+        let _ = f.journaled_mutation(&ctx, 21).await;
+        let _ = f.journaled_mutation(&ctx, 22).await;
     })
     .await;
     let intents = f.journal.intents.lock();
@@ -509,7 +565,8 @@ async fn every_item_binds_to_the_same_explicit_parent_and_unique_child() {
 async fn journal_failure_opens_no_rpc_and_enqueues_no_item() {
     let f = Fixture::new(Reply::Success).await;
     f.journal.fail_record.store(true, Ordering::SeqCst);
-    let error = with_caller_operation(f.operation(), f.put(3))
+    let ctx = f.context();
+    let error = with_caller_operation(f.operation(), f.journaled_mutation(&ctx, 3))
         .await
         .unwrap_err();
     assert!(!error.is_outcome_unknown());
@@ -517,28 +574,40 @@ async fn journal_failure_opens_no_rpc_and_enqueues_no_item() {
     assert_eq!(f.items.load(Ordering::SeqCst), 0);
 }
 
+/// A journal that fails to record or settle is irrelevant to a Put: it never touches the store.
 #[tokio::test]
-async fn put_response_loss_keeps_attempt_unresolved_without_replay() {
+async fn put_does_not_depend_on_the_journal_working() {
+    let f = Fixture::new(Reply::Success).await;
+    f.journal.fail_record.store(true, Ordering::SeqCst);
+    f.journal.fail_settle.store(true, Ordering::SeqCst);
+    with_caller_operation(f.operation(), f.put(14))
+        .await
+        .unwrap();
+    assert_eq!(f.items.load(Ordering::SeqCst), 1);
+    assert!(f.journal.records.lock().is_empty());
+}
+
+/// A lost answer is a plain retryable failure of the push: not an unknown outcome (which would
+/// hold the fence), not `Disconnected` (which the reconnect layer would resend), and the one
+/// message is sent exactly once. Nothing is recorded.
+#[tokio::test]
+async fn put_response_loss_is_a_retryable_internal_error_without_replay_or_journal() {
     let f = Fixture::new(Reply::Loss).await;
     let error = with_caller_operation(f.operation(), f.put(4))
         .await
         .unwrap_err();
-    assert!(error.is_outcome_unknown(), "{error:?}");
+    assert!(matches!(error, ProtocolError::Internal(_)), "{error:?}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(!error.is_disconnected(), "{error:?}");
+    let text = error.to_string();
+    assert!(
+        text.contains("StorageService.Put") && text.contains("lost its answer"),
+        "{text}"
+    );
     assert_eq!(f.items.load(Ordering::SeqCst), 1);
-    assert_eq!(f.seen.lock().len(), 1);
-    assert_eq!(f.journal.unresolved().await.unwrap().len(), 1);
-}
-
-#[tokio::test]
-async fn settlement_failure_after_success_keeps_unresolved_durable_state() {
-    let f = Fixture::new(Reply::Success).await;
-    f.journal.fail_settle.store(true, Ordering::SeqCst);
-    let error = with_caller_operation(f.operation(), f.put(14))
-        .await
-        .unwrap_err();
-    assert!(error.is_outcome_unknown(), "{error:?}");
-    assert_eq!(f.items.load(Ordering::SeqCst), 1);
-    assert_eq!(f.journal.unresolved().await.unwrap().len(), 1);
+    assert_eq!(f.seen.lock().len(), 1, "exactly one wire request");
+    assert!(f.journal.records.lock().is_empty());
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -554,6 +623,11 @@ async fn exact_admission_refusal_is_decisive_with_no_body_effect() {
     assert!(!error.is_outcome_unknown());
     assert_eq!(f.items.load(Ordering::SeqCst), 0);
     assert_eq!(f.seen.lock().len(), 1);
+    assert_eq!(
+        f.seen.lock()[0].capability.as_deref(),
+        Some("outcome_unknown_v1")
+    );
+    assert!(f.journal.records.lock().is_empty());
     assert!(f.journal.unresolved().await.unwrap().is_empty());
 }
 
@@ -579,12 +653,60 @@ async fn a_legacy_store_cannot_implicitly_promise_managed_journaling() {
         RepositoryId::from([0x11; 16]),
         Arc::new(VolatileAttemptStore::new()),
     );
-    let error = with_caller_operation(operation, f.put(16))
+    let ctx = f.context();
+    let error = with_caller_operation(operation, f.journaled_mutation(&ctx, 16))
         .await
         .unwrap_err();
     assert!(!error.is_outcome_unknown());
     assert!(f.seen.lock().is_empty());
     assert_eq!(f.items.load(Ordering::SeqCst), 0);
+}
+
+/// A managed Put whose session partition differs from the operation's repository is refused
+/// before anything is sent or written.
+#[tokio::test]
+async fn managed_put_for_another_repository_is_refused_with_no_wire_request_or_journal_write() {
+    let f = Fixture::new(Reply::Success).await;
+    let mut ctx = f.context();
+    ctx.partition = Partition::from(Context::from([0x22; 16]));
+    let error = with_caller_operation(
+        f.operation(),
+        f.service.put(
+            0,
+            &ctx,
+            Address::zero_context_hash(Hash::from([71; 32])),
+            Fragment {
+                flags: 0,
+                size_payload: 1,
+                size_content: 1,
+            },
+            Some(Bytes::from_static(b"x")),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("repository mismatch"),
+        "{error:?}"
+    );
+    assert!(!error.is_outcome_unknown());
+    assert!(!error.is_disconnected());
+    assert!(f.seen.lock().is_empty(), "no wire request");
+    assert_eq!(f.items.load(Ordering::SeqCst), 0);
+    assert!(f.journal.records.lock().is_empty());
+}
+
+/// A Put records nothing, so it does not need a journal that can promise managed journaling.
+#[tokio::test]
+async fn a_legacy_store_does_not_stop_an_unjournaled_put() {
+    let f = Fixture::new(Reply::Success).await;
+    let operation = CallerOperationContext::new(
+        Uuid::now_v7(),
+        RepositoryId::from([0x11; 16]),
+        Arc::new(VolatileAttemptStore::new()),
+    );
+    with_caller_operation(operation, f.put(16)).await.unwrap();
+    assert_eq!(f.items.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -595,7 +717,50 @@ async fn an_unmarked_in_band_aborted_response_is_decisive() {
         .unwrap_err();
     assert!(!error.is_outcome_unknown(), "{error:?}");
     assert_eq!(f.items.load(Ordering::SeqCst), 1);
+    assert!(f.journal.records.lock().is_empty());
     assert!(f.journal.unresolved().await.unwrap().is_empty());
+}
+
+/// The mapping of a managed Put's wire result: every way of losing the answer becomes the same
+/// retryable internal error, and decisive refusals pass through untouched.
+#[test]
+fn unjournaled_put_result_maps_lost_answers_and_passes_decisive_errors_through() {
+    let attempt = AttemptId::new();
+    assert!(unjournaled_put_result(Ok(()), &attempt).is_ok());
+    let lost = [
+        lore_transport::outcome::outcome_unknown("StorageService.Put", &attempt),
+        ProtocolError::from(lore_base::error::Disconnected),
+        ProtocolError::from(Status::cancelled("answer lost")),
+        ProtocolError::from(Status::deadline_exceeded("answer lost")),
+    ];
+    for error in lost {
+        let shown = format!("{error:?}");
+        let mapped = unjournaled_put_result(Err(error), &attempt).unwrap_err();
+        assert!(
+            matches!(mapped, ProtocolError::Internal(_)),
+            "{shown} -> {mapped:?}"
+        );
+        assert!(!mapped.is_outcome_unknown(), "{shown} -> {mapped:?}");
+        assert!(!mapped.is_disconnected(), "{shown} -> {mapped:?}");
+        let text = mapped.to_string();
+        assert!(text.contains(&attempt.to_string()), "{text}");
+        assert!(text.contains("Pushing again is safe"), "{text}");
+    }
+    let refused =
+        unjournaled_put_result(Err(ProtocolError::from(refusal())), &attempt).unwrap_err();
+    assert!(
+        lore_transport::error::is_unsupported_client(&refused),
+        "{refused:?}"
+    );
+    let denied = unjournaled_put_result(
+        Err(ProtocolError::from(Status::permission_denied("no"))),
+        &attempt,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(denied, ProtocolError::NotAuthorized(_)),
+        "{denied:?}"
+    );
 }
 
 #[test]
@@ -620,8 +785,10 @@ fn item_parser_preserves_future_and_incomplete_uncertainty_before_ok() {
     }
 }
 
+/// An in-band uncertainty marker on a Put answer is the same lost answer as a dropped stream:
+/// a retryable internal error, never an unknown outcome and never a journal child.
 #[tokio::test]
-async fn future_and_incomplete_wire_markers_keep_the_managed_child_unresolved() {
+async fn future_and_incomplete_wire_markers_on_a_put_are_a_retryable_internal_error() {
     for (version, operation, attempt) in [
         (1, "", ""),
         (77, "", ""),
@@ -632,12 +799,14 @@ async fn future_and_incomplete_wire_markers_keep_the_managed_child_unresolved() 
         let error = with_caller_operation(f.operation(), f.put(17))
             .await
             .unwrap_err();
-        let ProtocolError::OutcomeUnknown(unknown) = error else {
-            panic!("marker must preserve semantic uncertainty: {error:?}");
-        };
-        let pending = f.journal.unresolved().await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(unknown.attempt_id, pending[0].attempt_id.to_string());
+        assert!(
+            matches!(error, ProtocolError::Internal(_)),
+            "marker must read as a retryable lost answer: {error:?}"
+        );
+        assert!(!error.is_outcome_unknown(), "{error:?}");
+        assert!(!error.is_disconnected(), "{error:?}");
+        assert!(f.journal.records.lock().is_empty());
+        assert!(f.journal.unresolved().await.unwrap().is_empty());
         assert_eq!(f.items.load(Ordering::SeqCst), 1);
     }
 }
@@ -648,22 +817,9 @@ async fn missing_or_malformed_outgoing_namespace_refuses_before_record_or_rpc() 
         let f = Fixture::new(Reply::Success).await;
         let mut ctx = f.context();
         ctx.auth_token = token.into();
-        let error = with_caller_operation(
-            f.operation(),
-            f.service.put(
-                0,
-                &ctx,
-                Address::zero_context_hash(Hash::from([25; 32])),
-                Fragment {
-                    flags: 0,
-                    size_payload: 1,
-                    size_content: 1,
-                },
-                Some(Bytes::from_static(b"x")),
-            ),
-        )
-        .await
-        .unwrap_err();
+        let error = with_caller_operation(f.operation(), f.journaled_mutation(&ctx, 25))
+            .await
+            .unwrap_err();
         assert!(!error.is_outcome_unknown());
         assert!(f.journal.records.lock().is_empty());
         assert!(f.seen.lock().is_empty());
@@ -674,9 +830,8 @@ async fn missing_or_malformed_outgoing_namespace_refuses_before_record_or_rpc() 
 #[tokio::test]
 async fn journal_names_the_exact_outgoing_credential_namespace_without_bearer_bytes() {
     let f = Fixture::new(Reply::Success).await;
-    with_caller_operation(f.operation(), f.put(26))
-        .await
-        .unwrap();
+    let ctx = f.context();
+    let _ = with_caller_operation(f.operation(), f.journaled_mutation(&ctx, 26)).await;
     let intents = f.journal.intents.lock();
     assert_eq!(intents.len(), 1);
     assert_eq!(intents[0].verified_issuer, "https://fixture.invalid/issuer");
@@ -691,53 +846,32 @@ async fn parent_rejects_principal_rotation_but_allows_same_principal_refresh() {
     const OTHER: &str = "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2ZpeHR1cmUuaW52YWxpZC9pc3N1ZXIiLCJzdWIiOiJvdGhlci11c2VyIiwibmFtZSI6ImZpeHR1cmUtdXNlciIsImV4cCI6NDEwMjQ0NDgwMCwiYXVkIjoiZml4dHVyZSJ9.eA";
     const REFRESHED: &str = "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJodHRwczovL2ZpeHR1cmUuaW52YWxpZC9pc3N1ZXIiLCJzdWIiOiJmaXh0dXJlLXVzZXIiLCJuYW1lIjoicmVuYW1lZC11c2VyIiwiZXhwIjo0MTAyNDQ0OTAwLCJhdWQiOiJmaXh0dXJlIn0.eA";
     let f = Fixture::new(Reply::Success).await;
+    // The fixture loses every MutableStore answer, so each accepted call is an unknown outcome;
+    // only whether the call was admitted and journaled is under test.
     with_caller_operation(f.operation(), async {
-        f.put(27).await.unwrap();
         let mut ctx = f.context();
+        let first = f.journaled_mutation(&ctx, 27).await.unwrap_err();
+        assert!(first.is_outcome_unknown(), "{first:?}");
         ctx.auth_token = OTHER.into();
-        let result = f
-            .service
-            .put(
-                0,
-                &ctx,
-                Address::zero_context_hash(Hash::from([28; 32])),
-                Fragment {
-                    flags: 0,
-                    size_payload: 1,
-                    size_content: 1,
-                },
-                Some(Bytes::from_static(b"x")),
-            )
-            .await;
+        let rotated = f.journaled_mutation(&ctx, 28).await.unwrap_err();
         assert!(
-            result.is_err(),
-            "changing principal under one parent must refuse before dispatch"
+            !rotated.is_outcome_unknown(),
+            "changing principal under one parent must refuse before dispatch: {rotated:?}"
         );
         assert_eq!(f.items.load(Ordering::SeqCst), 1);
         assert_eq!(f.journal.records.lock().len(), 1);
         ctx.auth_token = REFRESHED.into();
-        f.service
-            .put(
-                0,
-                &ctx,
-                Address::zero_context_hash(Hash::from([29; 32])),
-                Fragment {
-                    flags: 0,
-                    size_payload: 1,
-                    size_content: 1,
-                },
-                Some(Bytes::from_static(b"x")),
-            )
-            .await
-            .unwrap();
+        let refreshed = f.journaled_mutation(&ctx, 29).await.unwrap_err();
+        assert!(refreshed.is_outcome_unknown(), "{refreshed:?}");
     })
     .await;
     assert_eq!(f.items.load(Ordering::SeqCst), 2);
     assert_eq!(f.journal.records.lock().len(), 2);
 }
 
+/// A Put abandoned after the server read it leaves nothing behind: no record to settle.
 #[tokio::test]
-async fn cancelling_after_server_reads_item_keeps_attempt_unresolved() {
+async fn cancelling_a_put_after_server_reads_item_leaves_no_journal_state() {
     let f = Fixture::new(Reply::Hold).await;
     let mut put = Box::pin(with_caller_operation(f.operation(), f.put(6)));
     tokio::select! {
@@ -748,7 +882,8 @@ async fn cancelling_after_server_reads_item_keeps_attempt_unresolved() {
     }
     assert_eq!(f.items.load(Ordering::SeqCst), 1);
     drop(put);
-    assert_eq!(f.journal.unresolved().await.unwrap().len(), 1);
+    assert!(f.journal.records.lock().is_empty());
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -777,7 +912,7 @@ async fn reconnect_retains_only_the_current_callers_declaration() {
     assert!(seen[1].capability.is_none());
     assert_eq!(seen[2].capability.as_deref(), Some("outcome_unknown_v1"));
     assert_ne!(seen[0].attempt, seen[2].attempt);
-    assert!(seen[2].journaled_before_body);
+    assert!(f.journal.records.lock().is_empty());
 }
 
 #[tokio::test]
@@ -876,23 +1011,27 @@ async fn resolved_put_and_mutable_unaries_journal_before_loss_without_replay() {
 }
 
 /// A managed single-message Put whose answer never comes is bounded by the idle duration and
-/// reads as an unknown outcome; the journal keeps the attempt unresolved. Pre-change the put
-/// waits forever (the fixture's own 5 s bound then fails the test).
+/// reads as a retryable lost answer (not an unknown outcome); nothing is journaled. Pre-change
+/// the put waits forever (the fixture's own 5 s bound then fails the test).
 #[tokio::test]
-async fn silent_managed_put_is_bounded_unknown_and_stays_unresolved() {
+async fn silent_managed_put_is_bounded_and_reads_as_a_retryable_lost_answer() {
     let f = Fixture::with_idle(Reply::Hold, Some(Duration::from_secs(1))).await;
     let started = std::time::Instant::now();
     let error = with_caller_operation(f.operation(), f.put(40))
         .await
         .unwrap_err();
-    assert!(error.is_outcome_unknown(), "{error:?}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(!error.is_disconnected(), "{error:?}");
+    assert!(error.to_string().contains("lost its answer"), "{error}");
     assert!(
         started.elapsed() >= Duration::from_millis(900),
         "must wait out the idle bound, took {:?}",
         started.elapsed()
     );
     assert_eq!(f.items.load(Ordering::SeqCst), 1);
-    assert_eq!(f.journal.unresolved().await.unwrap().len(), 1);
+    assert_eq!(f.seen.lock().len(), 1, "no resend");
+    assert!(f.journal.records.lock().is_empty());
+    assert!(f.journal.unresolved().await.unwrap().is_empty());
 }
 
 /// Time spent queued behind other uploads is not idleness: 8 concurrent managed Puts against a
@@ -1014,17 +1153,9 @@ async fn managed_put_with_no_stream_slot_is_not_applied_and_disconnected() {
     assert!(!error.is_outcome_unknown(), "{error:?}");
     assert!(started.elapsed() < Duration::from_secs(4));
     assert!(f.journal.unresolved().await.unwrap().is_empty());
-    let records = f.journal.records.lock().clone();
-    assert_eq!(records.len(), 1);
-    let record = f
-        .journal
-        .lookup(&records[0].attempt_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.state,
-        lore_transport::attempt_store::AttemptState::Resolved(AttemptResolution::NotApplied)
+    assert!(
+        f.journal.records.lock().is_empty(),
+        "an unsent Put has no journal child to settle"
     );
     assert_eq!(
         f.items.load(Ordering::SeqCst),
@@ -1087,19 +1218,7 @@ async fn abandoned_put_round(tag: u8) {
     .expect("a slot that never comes must not hang the put")
     .unwrap_err();
     assert!(error.is_disconnected(), "round {tag}: {error:?}");
-    let records = f.journal.records.lock().clone();
-    assert_eq!(records.len(), 1, "round {tag}");
-    let record = f
-        .journal
-        .lookup(&records[0].attempt_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        record.state,
-        lore_transport::attempt_store::AttemptState::Resolved(AttemptResolution::NotApplied),
-        "round {tag}"
-    );
+    assert!(f.journal.records.lock().is_empty(), "round {tag}");
     // Free the slot: the server ends the stalled open.
     f.release.notify_one();
     let _ = held.await;

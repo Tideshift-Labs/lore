@@ -70,6 +70,238 @@ async fn managed_child(store: &RepositoryAttemptStore, method: &str) -> (Uuid, A
     (parent, record)
 }
 
+/// One parent holding one unresolved child per method, as an older build left them.
+async fn managed_children(
+    store: &RepositoryAttemptStore,
+    methods: &[&str],
+) -> (Uuid, Vec<AttemptRecord>) {
+    let parent = Uuid::now_v7();
+    store
+        .begin_parent(ManagedParent {
+            version: 1,
+            id: parent.to_string(),
+            root: "fixture".into(),
+            operation: "push".into(),
+            normalized_intent: "fixture".into(),
+            namespace: None,
+            complete: false,
+            parent_uncertainty_code: None,
+            body_completed: false,
+        })
+        .await
+        .unwrap();
+    let mut records = Vec::new();
+    for method in methods {
+        let record = child(method);
+        store
+            .record_managed(
+                &record,
+                &ManagedAttemptIntent {
+                    version: 1,
+                    parent_id: parent,
+                    repository: record.repository,
+                    rpc: (*method).into(),
+                    canonical_request: vec![8, 1],
+                    endpoint: "grpcs://original.invalid/".into(),
+                    verified_issuer: "original-issuer".into(),
+                    authenticated_subject: "original-subject".into(),
+                    caller_capabilities: "outcome_unknown_v1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        records.push(record);
+    }
+    store.complete_parent_body(parent).await.unwrap();
+    (parent, records)
+}
+
+/// A journal written the way an older build did: a fragment Put child left unresolved after a
+/// lost answer. It still blocks the fence until the operator reconciles; reconcile settles it
+/// `NotApplied` WITHOUT reading a receipt (none can exist for a Put), completes the parent, and
+/// admission then succeeds.
+#[tokio::test]
+async fn an_older_builds_unresolved_put_child_is_settled_not_applied_without_a_receipt_read() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(".lore")).unwrap();
+    let (parent, records) = {
+        let guard = RepositoryMutationGuard::acquire(directory.path())
+            .await
+            .unwrap();
+        let store = guard.store();
+        let parent = Uuid::now_v7();
+        guard
+            .begin(parent, "push".into(), "branch".into())
+            .await
+            .unwrap();
+        let record = child("StorageService.Put");
+        store
+            .record_managed(
+                &record,
+                &ManagedAttemptIntent {
+                    version: 1,
+                    parent_id: parent,
+                    repository: record.repository,
+                    rpc: "StorageService.Put".into(),
+                    canonical_request: vec![8, 1],
+                    endpoint: "grpcs://original.invalid/".into(),
+                    verified_issuer: "original-issuer".into(),
+                    authenticated_subject: "original-subject".into(),
+                    caller_capabilities: "outcome_unknown_v1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        store.complete_parent_body(parent).await.unwrap();
+        (parent, vec![record])
+    };
+    let put = &records[0];
+
+    // The old journal still loads, and still closes the fence.
+    assert!(
+        RepositoryMutationGuard::acquire(directory.path())
+            .await
+            .is_err()
+    );
+    let guard = RepositoryMutationGuard::recover(directory.path())
+        .await
+        .unwrap();
+    let store = guard.store();
+    assert_eq!(store.managed_parents().await.unwrap().len(), 1);
+    assert_eq!(store.admission_parents().await.unwrap().len(), 1);
+    assert!(
+        status_lines(&guard)
+            .await
+            .unwrap()
+            .iter()
+            .any(|line| line.contains(&put.attempt_id.to_string())
+                && line.contains("StorageService.Put"))
+    );
+
+    let calls = AtomicUsize::new(0);
+    reconcile_stores(&guard, |_, _| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { panic!("a legacy fragment Put has no receipt and must never be looked up") }
+    })
+    .await
+    .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(store.unresolved().await.unwrap().is_empty());
+    let settled = store.lookup(&put.attempt_id).await.unwrap().unwrap();
+    assert_eq!(
+        settled.state,
+        AttemptState::Resolved(lore_transport::AttemptResolution::NotApplied)
+    );
+    let parents = store.managed_parents().await.unwrap();
+    assert_eq!(parents[0].id, parent.to_string());
+    assert!(parents[0].complete);
+    drop(store);
+    drop(guard);
+    RepositoryMutationGuard::acquire(directory.path())
+        .await
+        .expect("reconcile must reopen the fence");
+}
+
+/// Mixed parent: the Put settles locally, the `BranchPush` still goes through the receipt lookup
+/// (exactly once, for its own attempt), and the parent completes only when both are settled.
+#[tokio::test]
+async fn a_legacy_put_beside_a_branch_push_settles_the_put_and_still_reads_the_push_receipt() {
+    for (receipt_state, parent_completes) in [
+        (
+            DomainReceiptState::Committed {
+                outcome: DomainReceiptOutcome::Applied,
+                from_future_marker: false,
+            },
+            true,
+        ),
+        (DomainReceiptState::NotFound, false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let guard = RepositoryMutationGuard::recover(directory.path())
+            .await
+            .unwrap();
+        let store = guard.store();
+        let (_, records) = managed_children(
+            &store,
+            &[
+                "StorageService.Put",
+                "RevisionService.BranchPush",
+                "StorageService.Put",
+            ],
+        )
+        .await;
+        let push = records[1].attempt_id;
+        let looked_up = parking_lot::Mutex::new(Vec::new());
+        let result = reconcile_stores(&guard, |_, attempt| {
+            looked_up.lock().push(attempt);
+            let state = receipt_state.clone();
+            async move {
+                Ok(DomainAttemptReceipt {
+                    method: "branch.push".into(),
+                    state,
+                })
+            }
+        })
+        .await;
+        assert_eq!(
+            *looked_up.lock(),
+            vec![push],
+            "only the push is looked up, and only once"
+        );
+        let unresolved = store.unresolved().await.unwrap();
+        for put in [&records[0], &records[2]] {
+            let settled = store.lookup(&put.attempt_id).await.unwrap().unwrap();
+            assert_eq!(
+                settled.state,
+                AttemptState::Resolved(lore_transport::AttemptResolution::NotApplied)
+            );
+        }
+        if parent_completes {
+            result.unwrap();
+            assert!(unresolved.is_empty());
+        } else {
+            assert!(result.is_err());
+            assert_eq!(unresolved.len(), 1);
+            assert_eq!(unresolved[0].attempt_id, push);
+        }
+        assert_eq!(
+            store.managed_parents().await.unwrap()[0].complete,
+            parent_completes
+        );
+    }
+}
+
+/// Only the fragment Put left by an older build is settled blind. Every other storage child has
+/// no receipt rail and stays blocked, and it is never looked up.
+#[tokio::test]
+async fn other_storage_children_stay_blocked_beside_a_settled_legacy_put() {
+    for method in [
+        "StorageService.PutResolved",
+        "StorageService.Copy",
+        "StorageService.Verify",
+        "StorageService.MutableStore",
+        "StorageService.MutableCompareAndSwap",
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let guard = RepositoryMutationGuard::recover(directory.path())
+            .await
+            .unwrap();
+        let store = guard.store();
+        let (_, records) = managed_children(&store, &["StorageService.Put", method]).await;
+        let calls = AtomicUsize::new(0);
+        let error = reconcile_stores(&guard, |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { panic!("a storage child without a receipt rail must never dispatch") }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{method}");
+        assert!(error.to_string().contains(method), "{method}: {error}");
+        assert_eq!(store.unresolved().await.unwrap(), vec![records[1].clone()]);
+        assert!(!store.managed_parents().await.unwrap()[0].complete);
+    }
+}
+
 #[tokio::test]
 async fn branch_create_reconciliation_requires_exact_receipt_method_and_original_namespace() {
     for method in ["branch.create", "branch_create", "branch.push"] {

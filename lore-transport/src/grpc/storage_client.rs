@@ -1118,6 +1118,47 @@ fn decisive_item_error(error: ProtocolError) -> ProtocolError {
     }
 }
 
+/// The caller-facing result of a managed fragment Put, which has no journal child.
+///
+/// Positive proof the message never left is `Disconnected`, so the reconnect layer may send it
+/// again, exactly as before. A lost answer is a plain, retryable failure of this push rather than
+/// [`ProtocolError::OutcomeUnknown`]: no receipt can ever settle a Put, so an unknown one would
+/// hold the repository fence with nothing able to clear it. It is not resent here, because Put
+/// stays `MutableNoReplay` (a second copy could revive what an obliterate retired in between);
+/// the next push queries the remote and uploads whatever is missing.
+#[lore_macro::test_pub]
+fn unjournaled_put_result(
+    result: Result<(), ProtocolError>,
+    attempt: &AttemptId,
+) -> Result<(), ProtocolError> {
+    match result {
+        Err(error) if crate::error::is_request_not_sent(&error) => {
+            let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
+            lore_error_set::ErrorSet::push_trace(
+                &mut disconnected,
+                lore_error_set::Location::with_context(
+                    file!(),
+                    line!(),
+                    column!(),
+                    std::sync::Arc::from(format!("{}: {error}", GrpcRpc::StoragePut.wire_name())),
+                ),
+            );
+            Err(disconnected)
+        }
+        Err(error)
+            if error.is_outcome_unknown()
+                || error.is_disconnected()
+                || crate::error::answer_lost_code(&error).is_some() =>
+        {
+            Err(ProtocolError::internal(format!(
+                "{} attempt {attempt} lost its answer. Pushing again is safe: the next push uploads any missing data: {error}",
+                GrpcRpc::StoragePut.wire_name()
+            )))
+        }
+        result => result,
+    }
+}
+
 impl StorageService {
     /// The connection this service sends on, for the crate's own tests. An accessor rather
     /// than `test_pub` on the struct, which would also publish its private stream caches.
@@ -1278,16 +1319,20 @@ impl StorageService {
             payload,
         };
 
-        if crate::caller_operation::current_caller_operation().is_some() {
-            let mut canonical = request.clone();
-            canonical.payload = canonical.payload.map(|_| Bytes::new());
+        if let Some(context) = crate::caller_operation::current_caller_operation() {
+            if ctx.partition != context.repository() {
+                return Err(ProtocolError::internal(
+                    "managed operation repository mismatch",
+                ));
+            }
+            // A fragment Put writes no journal child (WP-120 decision reversal, 2026-10-22).
+            // Fragments are content-addressed and the server ignores the Put's attempt id, so
+            // a durable record buys no recovery, and an unknown one used to block the fence for
+            // good. The attempt id is still minted and sent, for logs and wire correlation only.
+            let attempt = AttemptId::new();
             let (body, claim) = managed_body(request);
-            return crate::caller_operation::dispatch(
-                ctx.partition,
-                GrpcRpc::StoragePut,
-                canonical.encode_to_vec(),
-                self.connection.remote_url.to_string(),
-                ctx.auth_token.clone(),
+            let result = crate::outcome::with_dispatch_attempt(
+                attempt,
                 bounded_managed(
                     GrpcRpc::StoragePut,
                     self.stream_idle,
@@ -1315,6 +1360,7 @@ impl StorageService {
                 ),
             )
             .await;
+            return unjournaled_put_result(result, &attempt);
         }
 
         self.put_streams

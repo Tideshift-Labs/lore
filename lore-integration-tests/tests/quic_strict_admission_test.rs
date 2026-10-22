@@ -186,6 +186,8 @@ mod quic_strict_admission_tests {
     #[derive(Default)]
     struct ManagedJournal {
         inner: VolatileAttemptStore,
+        /// Every record of either kind, so a test can prove an RPC wrote nothing.
+        records: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait]
@@ -195,9 +197,13 @@ mod quic_strict_admission_tests {
             record: &AttemptRecord,
             _intent: &ManagedAttemptIntent,
         ) -> Result<(), ProtocolError> {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.record(record).await
         }
         async fn record(&self, record: &AttemptRecord) -> Result<(), ProtocolError> {
+            self.records
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.record(record).await
         }
         async fn lookup(&self, id: &AttemptId) -> Result<Option<AttemptRecord>, ProtocolError> {
@@ -433,11 +439,11 @@ mod quic_strict_admission_tests {
         connection.session(partition, "wp120-strict-quic").await
     }
 
-    fn managed(partition: RepositoryId) -> CallerOperationContext {
-        CallerOperationContext::new(
-            uuid::Uuid::now_v7(),
-            partition,
-            Arc::new(ManagedJournal::default()),
+    fn managed(partition: RepositoryId) -> (CallerOperationContext, Arc<ManagedJournal>) {
+        let journal = Arc::new(ManagedJournal::default());
+        (
+            CallerOperationContext::new(uuid::Uuid::now_v7(), partition, journal.clone()),
+            journal,
         )
     }
 
@@ -492,15 +498,23 @@ mod quic_strict_admission_tests {
                 assert!(!error.is_outcome_unknown(), "{error:?}");
                 assert!(!stored(&immutable, partition, address).await);
 
-                // 3. A managed gRPC Put is admitted and stored.
+                // 3. A managed gRPC Put is admitted and stored, and (a fragment Put being
+                //    unjournaled) records nothing in the caller's attempt journal.
                 let (fragment, address, payload) = fragment::generate_random();
+                let (operation, journal) = managed(partition);
                 with_caller_operation(
-                    managed(partition),
+                    operation,
                     grpc.put(address, fragment, Some(payload.clone())),
                 )
                 .await
                 .map_err(|error| format!("a managed gRPC Put must be admitted: {error:?}"))?;
                 assert!(stored(&immutable, partition, address).await);
+                assert_eq!(
+                    journal.records.load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "a managed fragment Put must write no journal child"
+                );
+                assert!(journal.unresolved().await?.is_empty());
 
                 // 4. A QUIC Get of the gRPC-seeded fragment returns its bytes.
                 let (read_fragment, read_payload) = quic.get(&address).await?;

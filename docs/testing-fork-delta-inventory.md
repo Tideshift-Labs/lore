@@ -85,6 +85,20 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   a strict real boot needs a fragment provider + domain enforcement. Gates: `cargo test -p
   lore-server --test unit -j 4 -- grpc::caller_capabilities` `cargo test -p lore-integration-tests
   --features integration_tests --test integration -j 4 -- quic_strict_admission`
+- **Managed fragment Put is unjournaled [CLIENT]**: `StorageService::put` inside a caller operation
+  mints and sends an attempt id + capability header but writes no journal child;
+  `unjournaled_put_result` maps request-not-sent to `Disconnected` and any lost answer to a plain
+  `Internal` ("lost its answer ... can be retried"), never `OutcomeUnknown`. Tests:
+  `lore-transport/tests/unit/grpc/storage_client/adoption_tests.rs` (tonic fixture; `Reply::Loss`
+  etc.; generic journal properties ride `Fixture::journaled_mutation` = MutableStore, since the
+  fixture loses every non-Put answer); `lore-revision/tests/put_fence.rs` (real
+  `RepositoryAttemptStore` + fence vs a lost Put answer; needs lore-transport `test-util` for
+  `GRPCConnection::for_test`); old-journal compat in `lore-revision/tests/repository_fence.rs` and
+  `lore-client/tests/unit/commands/operation.rs` (`reconcile_stores` settles a legacy `StorageService.Put`
+  child `NotApplied` with no lookup; other storage children stay blocked). A test that needs the
+  wire attempt id of an unjournaled Put reads it from the error text. Gates: `cargo test -j 4 -p
+  lore-transport --test unit -- storage_client` `cargo test -j 4 -p lore-revision --test put_fence
+  --test repository_fence` `cargo test -j 4 -p lore-client --test unit -- operation`
 - **CR-033 charge-admission deadline horizon guard [SERVER]**: See [Appendix](testing-fork-delta-inventory-appendix.md#cr-033-charge-admission-deadline-horizon-guard-server). Gates: `cargo test -p lore-server --test unit -- charge_bound`
 - **CR-038 cell schema forward upgrade and spool metadata true-up [SERVER]**: migration 0028 trues
   up a released spool row's metadata charge to its actual retained size (was a flat 16,384-byte

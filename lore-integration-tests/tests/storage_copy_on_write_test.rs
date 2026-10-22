@@ -336,29 +336,44 @@ mod storage_copy_on_write_tests {
                     )
                     .await?;
                     let journal = Arc::new(ManagedJournal::default());
+                    // A fragment Put writes no journal child, so the namespace a managed write
+                    // binds is read off the still-journaled Copy that follows the upload.
                     lore_transport::with_caller_operation(
                         lore_transport::CallerOperationContext::new(
                             uuid::Uuid::now_v7(),
                             partition,
                             journal.clone(),
                         ),
-                        lore_storage::write::write_content(
-                            local,
-                            partition,
-                            Context::from([0x98; 16]),
-                            Bytes::from_static(b"real managed write namespace"),
-                            lore_storage::options::WriteOptions::default(),
-                            Some(session),
-                            lore_storage::write_tracker::WriteContext::none(),
-                            None,
-                        ),
+                        async {
+                            let written = lore_storage::write::write_content(
+                                local,
+                                partition,
+                                Context::from([0x98; 16]),
+                                Bytes::from_static(b"real managed write namespace"),
+                                lore_storage::options::WriteOptions::default(),
+                                Some(session.clone()),
+                                lore_storage::write_tracker::WriteContext::none(),
+                                None,
+                            )
+                            .await?;
+                            assert!(
+                                journal.intents.lock().unwrap().is_empty(),
+                                "a managed fragment Put must journal nothing"
+                            );
+                            session
+                                .copy(partition, written.address, Context::from([0x97; 16]))
+                                .await?;
+                            TestResult::Ok(())
+                        },
                     )
                     .await?;
                     assert_eq!(server.counted.traffic().payload_puts, 1);
+                    assert_eq!(server.counted.traffic().copies, 1);
                     assert!(journal.unresolved().await?.is_empty());
                     let intents = journal.intents.lock().unwrap();
                     assert_eq!(intents.len(), 1);
                     let actual = intents.values().next().unwrap();
+                    assert_eq!(actual.rpc, "StorageService.Copy");
                     assert_eq!(actual.endpoint, selected.endpoint);
                     assert_eq!(actual.repository, selected.repository);
                     assert_eq!(actual.verified_issuer, selected.verified_issuer);
@@ -451,15 +466,24 @@ mod storage_copy_on_write_tests {
                     })
                     .await
                     .expect("both managed parents must independently reach the wire");
+                    // A lost Put answer is a retryable internal failure, never an unknown outcome
+                    // and never a journal child; the error names the wire attempt id.
+                    let mut ids = Vec::new();
                     for result in [first, second] {
+                        let error = result.err().expect("the lost answer must fail the write");
+                        let text = error.to_string();
                         assert!(
-                            result
-                                .as_ref()
-                                .is_err_and(|error| error.is_outcome_unknown()),
-                            "error={:?}, traffic={:?}",
-                            result.err(),
+                            !error.is_outcome_unknown() && text.contains("lost its answer"),
+                            "error={error:?}, traffic={:?}",
                             server.counted.traffic()
                         );
+                        let attempt = text
+                            .split("StorageService.Put attempt ")
+                            .nth(1)
+                            .and_then(|rest| rest.split(' ').next())
+                            .unwrap_or_else(|| panic!("no attempt id in {text}"))
+                            .to_owned();
+                        ids.push(attempt);
                     }
                     assert_eq!(
                         server.counted.traffic(),
@@ -469,21 +493,17 @@ mod storage_copy_on_write_tests {
                             copies: 0
                         }
                     );
-                    let mut ids = Vec::new();
-                    for index in 0..2 {
-                        let unresolved = journals[index].unresolved().await?;
-                        assert_eq!(unresolved.len(), 1);
-                        ids.push(unresolved[0].attempt_id);
-                        let intents = journals[index].intents.lock().unwrap();
-                        assert_eq!(intents.len(), 1);
-                        assert_eq!(intents.values().next().unwrap().parent_id, parents[index]);
-                        assert_eq!(
-                            intents.values().next().unwrap().endpoint,
-                            selected.endpoint,
-                            "preflight selection and actual dispatch must bind the same endpoint"
+                    for journal in &journals {
+                        assert!(journal.unresolved().await?.is_empty());
+                        assert!(
+                            journal.intents.lock().unwrap().is_empty(),
+                            "a managed fragment Put must journal nothing"
                         );
                     }
-                    assert_ne!(ids[0], ids[1]);
+                    assert_ne!(
+                        ids[0], ids[1],
+                        "each parent's Put carries its own attempt id"
+                    );
                     if let Some(tracker) = tracker {
                         tracker.await_all().await?;
                     }

@@ -190,9 +190,20 @@ fn workflow_path_detection_uses_complete_components_for_both_separators() {
     }
 }
 
+/// A generic journaled child. `Copy` stays journaled; a fragment `Put` no longer is, so it is
+/// not the vehicle for the generic journal properties below.
 fn record(parent: Uuid) -> (AttemptRecord, ManagedAttemptIntent) {
+    record_for(parent, "StorageService.Copy")
+}
+
+/// The child an older build wrote for every fragment Put in a managed operation.
+fn legacy_put_record(parent: Uuid) -> (AttemptRecord, ManagedAttemptIntent) {
+    record_for(parent, "StorageService.Put")
+}
+
+fn record_for(parent: Uuid, rpc: &str) -> (AttemptRecord, ManagedAttemptIntent) {
     let repository = RepositoryId::from([1; 16]);
-    let rpc = "StorageService.Put".to_owned();
+    let rpc = rpc.to_owned();
     (
         AttemptRecord {
             attempt_id: AttemptId::new(),
@@ -214,6 +225,102 @@ fn record(parent: Uuid) -> (AttemptRecord, ManagedAttemptIntent) {
             caller_capabilities: "outcome_unknown_v1".into(),
         },
     )
+}
+
+/// Journals written before fragment Puts stopped being journaled can hold unresolved `Put`
+/// children. They must still load and still close the fence (nothing settles them silently);
+/// only the operator's reconcile settles them.
+#[tokio::test]
+async fn an_older_builds_unresolved_put_child_still_loads_and_blocks_the_fence() {
+    let dir = worktree();
+    let parent = Uuid::now_v7();
+    let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+    let store = guard
+        .begin(parent, "push".into(), "branch".into())
+        .await
+        .unwrap();
+    let (child, intent) = legacy_put_record(parent);
+    store.record_managed(&child, &intent).await.unwrap();
+    store.complete_parent_body(parent).await.unwrap();
+    assert!(guard.finish(parent).await.is_err(), "unresolved child");
+    drop(store);
+    drop(guard);
+
+    assert!(RepositoryMutationGuard::acquire(dir.path()).await.is_err());
+    let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+    let store = recovery.store();
+    for parents in [
+        store.managed_parents().await.unwrap(),
+        store.admission_parents().await.unwrap(),
+    ] {
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].id, parent.to_string());
+        assert!(parents[0].body_completed);
+        assert!(!parents[0].complete);
+    }
+    assert_eq!(store.unresolved().await.unwrap(), vec![child.clone()]);
+    assert_eq!(
+        store.unresolved().await.unwrap()[0].operation,
+        "StorageService.Put"
+    );
+    store
+        .recovery_context(&child.attempt_id)
+        .await
+        .expect("the recorded namespace survives for the operator");
+
+    store
+        .resolve(&child.attempt_id, AttemptResolution::NotApplied)
+        .await
+        .unwrap();
+    assert!(store.unresolved().await.unwrap().is_empty());
+    store.reconcile_parent(parent).await.unwrap();
+    drop(store);
+    drop(recovery);
+    RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+}
+
+/// `finish_parent` prunes and re-validates settled history; a journal full of settled old `Put`
+/// children must neither fail that nor stop the next parent from starting.
+#[tokio::test]
+async fn settled_old_put_children_do_not_break_finish_or_the_next_parent() {
+    let dir = worktree();
+    for round in 0..3 {
+        let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+        let parent = Uuid::now_v7();
+        let store = guard
+            .begin(parent, "push".into(), "branch".into())
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            let (child, intent) = legacy_put_record(parent);
+            store.record_managed(&child, &intent).await.unwrap();
+            store
+                .resolve(&child.attempt_id, AttemptResolution::NotApplied)
+                .await
+                .unwrap();
+        }
+        let (copy, intent) = record(parent);
+        store.record_managed(&copy, &intent).await.unwrap();
+        store
+            .resolve(&copy.attempt_id, AttemptResolution::Applied)
+            .await
+            .unwrap();
+        store.complete_parent_body(parent).await.unwrap();
+        guard.finish(parent).await.unwrap();
+        assert!(
+            store
+                .managed_parents()
+                .await
+                .unwrap()
+                .iter()
+                .all(|p| p.complete),
+            "round {round}"
+        );
+        assert!(store.unresolved().await.unwrap().is_empty());
+        drop(store);
+        drop(guard);
+    }
+    RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
 }
 
 #[tokio::test]
