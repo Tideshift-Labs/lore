@@ -334,14 +334,33 @@ async fn put_wave(
 }
 
 /// A front that answers every request trailers-only with the admission marker but keeps the
-/// request body open and keeps reading it, never resetting the stream.
-async fn body_holding_front() -> (String, Arc<AtomicUsize>) {
-    draining_front(false).await
+/// request body open and keeps reading it, never resetting the stream. It sends the refusal only
+/// once it has read `refuse_after` request messages on the stream, so a test can make every
+/// request of a wave meet the same stream.
+async fn body_holding_front(refuse_after: usize) -> (String, Arc<AtomicUsize>) {
+    draining_front(false, refuse_after).await
+}
+
+/// How many complete length-prefixed gRPC messages `buffer` holds; `buffer` keeps a partial one.
+fn take_grpc_messages(buffer: &mut Vec<u8>) -> usize {
+    let mut messages = 0;
+    loop {
+        let Some(header) = buffer.get(..5) else {
+            return messages;
+        };
+        let len = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if buffer.len() < 5 + len {
+            return messages;
+        }
+        buffer.drain(..5 + len);
+        messages += 1;
+    }
 }
 
 /// `silent`: send response headers without ending the stream, then never answer: an opened,
-/// silent stream. Otherwise the trailers-only admission refusal.
-async fn draining_front(silent: bool) -> (String, Arc<AtomicUsize>) {
+/// silent stream. Otherwise the trailers-only admission refusal, after `refuse_after` request
+/// messages (zero: at once).
+async fn draining_front(silent: bool, refuse_after: usize) -> (String, Arc<AtomicUsize>) {
     let opens = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -360,22 +379,34 @@ async fn draining_front(silent: bool) -> (String, Arc<AtomicUsize>) {
                 };
                 while let Some(Ok((request, mut respond))) = conn.accept().await {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    let mut response = http::Response::builder()
-                        .status(200)
-                        .header("content-type", "application/grpc");
-                    if !silent {
-                        response = response
-                            .header("grpc-status", "9")
-                            .header("grpc-message", "unsupported-client")
-                            .header("lore-client-admission-v1", "unsupported-client");
-                    }
-                    let response = response.body(()).unwrap();
-                    if respond.send_response(response, !silent).is_err() {
-                        continue;
-                    }
                     let mut body = request.into_body();
-                    #[allow(clippy::disallowed_methods)] // Test-local request drain.
+                    // The stream is handled off the accept loop, which must keep polling the
+                    // connection for the body to arrive.
+                    #[allow(clippy::disallowed_methods)] // Test-local stream handler.
                     tokio::spawn(async move {
+                        let mut pending = Vec::new();
+                        let mut read = 0;
+                        while read < refuse_after {
+                            let Some(Ok(chunk)) = body.data().await else {
+                                return;
+                            };
+                            let _ = body.flow_control().release_capacity(chunk.len());
+                            pending.extend_from_slice(&chunk);
+                            read += take_grpc_messages(&mut pending);
+                        }
+                        let mut response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc");
+                        if !silent {
+                            response = response
+                                .header("grpc-status", "9")
+                                .header("grpc-message", "unsupported-client")
+                                .header("lore-client-admission-v1", "unsupported-client");
+                        }
+                        let response = response.body(()).unwrap();
+                        if respond.send_response(response, !silent).is_err() {
+                            return;
+                        }
                         let _held = respond;
                         while let Some(Ok(chunk)) = body.data().await {
                             let _ = body.flow_control().release_capacity(chunk.len());
@@ -392,14 +423,61 @@ async fn draining_front(silent: bool) -> (String, Arc<AtomicUsize>) {
 /// A front that holds the request body open after a trailers-only refusal used to hang every
 /// later Put on the session: the request generator never ended, and queued requests were never
 /// failed. Pre-change, the second wave hangs and the per-put timeout fires.
+///
+/// Deterministic by construction. Each wave starts with no cached stream, and the front refuses
+/// only after it has read every request of the wave, so all of them meet one stream and the front
+/// sees exactly one open per wave. A lone put after each wave meets the refused, closed stream:
+/// it must get the refusal, open nothing and clear the cache. Before, the front refused at once,
+/// a request that looked up the cache after a refused handle was discarded opened a fresh stream,
+/// and under CPU load a wave sometimes cost two opens (2 of 40 runs).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn body_holding_front_refusal_never_hangs_a_later_wave() {
     const WAVES: u8 = 4;
-    let (url, opens) = body_holding_front().await;
+    const WAVE_SIZE: u8 = 25;
+    let (url, opens) = body_holding_front(usize::from(WAVE_SIZE)).await;
+    let service = service_at(&url, Duration::from_secs(30)).await;
+    let ctx = context();
+    let refused = |err: &ProtocolError, wave: u8| {
+        assert!(is_unsupported_client(err), "wave {wave}: {err:?}");
+        assert!(!err.is_outcome_unknown(), "wave {wave}: {err:?}");
+        assert!(!err.is_disconnected(), "wave {wave}: {err:?}");
+    };
+    for wave in 0..WAVES {
+        for result in put_wave(&service, &ctx, WAVE_SIZE, wave, Duration::from_secs(10)).await {
+            refused(&result.expect_err("a refused put cannot succeed"), wave);
+        }
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            usize::from(wave) + 1,
+            "wave {wave}: every put of a wave meets one stream"
+        );
+        let late = tokio::time::timeout(
+            Duration::from_secs(10),
+            put_one(service.clone(), ctx.clone(), WAVE_SIZE, wave),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the put after wave {wave} hung"));
+        refused(&late.expect_err("a refused put cannot succeed"), wave);
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            usize::from(wave) + 1,
+            "wave {wave}: a put on the refused stream opens nothing"
+        );
+    }
+}
+
+/// The same front refusing at once, so the refusal lands while a wave is still sending: queued
+/// requests must fail with the refusal and no wave may hang. How many streams a wave opens here
+/// depends on scheduling, so only the deterministic bound is asserted: a put opens at most one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immediate_refusal_behind_a_body_holding_front_never_hangs_a_wave() {
+    const WAVES: u8 = 4;
+    const WAVE_SIZE: u8 = 25;
+    let (url, opens) = body_holding_front(0).await;
     let service = service_at(&url, Duration::from_secs(30)).await;
     let ctx = context();
     for wave in 0..WAVES {
-        for result in put_wave(&service, &ctx, 25, wave, Duration::from_secs(10)).await {
+        for result in put_wave(&service, &ctx, WAVE_SIZE, wave, Duration::from_secs(10)).await {
             let err = result.expect_err("a refused put cannot succeed");
             assert!(is_unsupported_client(&err), "wave {wave}: {err:?}");
             assert!(!err.is_outcome_unknown(), "wave {wave}: {err:?}");
@@ -408,8 +486,8 @@ async fn body_holding_front_refusal_never_hangs_a_later_wave() {
     }
     let seen = opens.load(Ordering::SeqCst);
     assert!(
-        (1..=usize::from(WAVES)).contains(&seen),
-        "the front must see at most one open per wave, saw {seen} for {WAVES} waves"
+        (1..=usize::from(WAVES) * usize::from(WAVE_SIZE)).contains(&seen),
+        "saw {seen} opens"
     );
 }
 
@@ -578,7 +656,7 @@ async fn marker_status_on_an_opened_stream_is_not_a_refusal() {
 /// (positive non-dispatch proof; `GRPCStorage` reconnects on it), never a refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn silent_front_never_hangs_and_dispatched_puts_are_unknown() {
-    let (url, _opens) = draining_front(true).await;
+    let (url, _opens) = draining_front(true, 0).await;
     let service = service_at(&url, Duration::from_secs(1)).await;
     let ctx = context();
     for wave in 0..3u8 {
