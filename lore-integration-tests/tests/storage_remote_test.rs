@@ -1742,6 +1742,186 @@ mod storage_remote_tests {
             .await
     }
 
+    /// Builds a served state whose tree names a delta block, then caches it from a client.
+    ///
+    /// `slow_down_delta` answers the first remote get of the delta block with `SlowDown`;
+    /// `store_delta` false leaves the delta block off the remote. Returns the cache result and
+    /// whether the delta block then reads back with no remote.
+    async fn cache_state_with_delta_block(
+        slow_down_delta: usize,
+        store_delta: bool,
+    ) -> Result<(Result<(), String>, bool), Box<dyn std::error::Error>> {
+        use lore_base::error::NoRemote;
+        use lore_base::types::Address;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::filter::Filter;
+        use lore_revision::instance::InstanceId;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::node::Node;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::repository::RepositoryContext;
+        use lore_revision::repository::RepositoryContextCreationArgs;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let repository_id = RepositoryId::from([0xd3u8; 16]);
+        let context = |immutable_store, mutable_store, remote| {
+            Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+                paths: None,
+                immutable_store,
+                mutable_store,
+                id: repository_id,
+                instance_id: InstanceId::default(),
+                remote,
+                filter: Arc::new(Filter::default()),
+                filesystem_provider: None,
+            }))
+        };
+
+        let (backend_immutable, backend_mutable) = make_backends().await;
+        let server_repository = context(
+            backend_immutable.clone(),
+            backend_mutable.clone(),
+            Err(lore_transport::ProtocolError::from(NoRemote)),
+        );
+        let write_token =
+            RepositoryWriteToken::acquire(std::path::Path::new("delta-block-cache-test")).await;
+        let state = State::new();
+        let node = Node {
+            name_hash: hash_string("held"),
+            ..Default::default()
+        };
+        state
+            .node_add(server_repository.clone(), ROOT_NODE, node, "held")
+            .await?;
+
+        let delta_payload = bytes::Bytes::from_static(b"delta block cached through SlowDown");
+        let delta_address = Address::zero_context_hash(lore_storage::hash_slice(&delta_payload));
+        if store_delta {
+            backend_immutable
+                .clone()
+                .put(
+                    repository_id,
+                    delta_address,
+                    lore_base::types::Fragment {
+                        flags: 0,
+                        size_payload: delta_payload.len() as u32,
+                        size_content: delta_payload.len() as u64,
+                    },
+                    Some(delta_payload.clone()),
+                    true,
+                )
+                .await?;
+        }
+        state.set_delta_block(delta_address.hash, 1)?;
+        let revision = state.serialize(server_repository, &write_token).await?;
+
+        // Strip the cache priority flag, as a remote may serve them, so only cache_fragments
+        // can keep the records for the offline read below.
+        for hash in [revision, state.tree_hash()] {
+            let address = Address::zero_context_hash(hash);
+            let (mut fragment, payload) = backend_immutable
+                .clone()
+                .get(repository_id, address)
+                .await?
+                .into_payload()?;
+            fragment.flags &= !FragmentFlags::PayloadLocalCachePriority;
+            backend_immutable
+                .clone()
+                .put(repository_id, address, fragment, Some(payload), true)
+                .await?;
+        }
+
+        let served: Arc<dyn lore_storage::ImmutableStore> = Arc::new(SlowDownOnce {
+            inner: backend_immutable,
+            target: delta_address,
+            remaining: std::sync::atomic::AtomicUsize::new(slow_down_delta),
+        });
+        let server = start_test_server_with(served, backend_mutable).await;
+
+        let (client_immutable, client_mutable) =
+            lore_revision::repository::create_client_memory_stores().await?;
+        let remote = lore_transport::connection::connect(
+            server.url.as_str(),
+            "delta-block-cache-test",
+            repository_id,
+            1,
+            "",
+            "",
+        )
+        .await?;
+        let client_repository =
+            context(client_immutable.clone(), client_mutable.clone(), Ok(remote));
+        client_repository.set_disable_cache(true);
+        let cached = State::deserialize(client_repository.clone(), revision)
+            .await?
+            .cache_fragments(client_repository)
+            .await
+            .map_err(|e| e.to_string());
+
+        let offline_repository = context(
+            client_immutable,
+            client_mutable,
+            Err(lore_transport::ProtocolError::from(NoRemote)),
+        );
+        let offline_state = State::deserialize(offline_repository.clone(), revision).await?;
+        let delta_offline = offline_state
+            .delta_block(offline_repository.clone())
+            .await
+            .is_ok_and(|block| block == delta_payload);
+        // With every record local, no remote is no failure: an offline sync must not fail on it.
+        let offline_cached = offline_state
+            .cache_fragments(offline_repository)
+            .await
+            .is_ok();
+        assert_eq!(
+            offline_cached, delta_offline,
+            "cache_fragments without a remote must pass exactly when the records are local"
+        );
+        drop(server);
+        Ok((cached, delta_offline))
+    }
+
+    /// A `SlowDown` on the delta block must not drop it from the cache: an offline commit after
+    /// a sync reads that block, and would fail with "Address not found".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_fragment_cache_retries_slow_down_on_delta_block() -> TestResult {
+        let execution = setup_execution("storage-remote-delta-block-slowdown".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (cached, delta_offline) = cache_state_with_delta_block(1, true)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                assert!(cached.is_ok(), "cache_fragments failed: {cached:?}");
+                assert!(
+                    delta_offline,
+                    "the delta block must read back offline after one SlowDown"
+                );
+                Ok(())
+            })
+            .await
+    }
+
+    /// A delta block the cache cannot fetch is an error of `cache_fragments`, not silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_fragment_cache_reports_unfetchable_delta_block() -> TestResult {
+        let execution = setup_execution("storage-remote-delta-block-missing".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (cached, delta_offline) = cache_state_with_delta_block(0, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                assert!(
+                    cached.is_err(),
+                    "cache_fragments must report the missing delta block"
+                );
+                assert!(!delta_offline);
+                Ok(())
+            })
+            .await
+    }
+
     /// `local_cache=1` on a put item tags the resulting fragment with
     /// `PayloadLocalCachePriority`. A subsequent local query of the address shows the flag
     /// is preserved so future remote reads of this content cache regardless of the reader's

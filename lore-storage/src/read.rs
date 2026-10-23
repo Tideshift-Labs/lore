@@ -159,7 +159,7 @@ impl Drop for RemoteFetchGuard {
 /// `Disconnected` is deliberately not retried here: on both transports it means the
 /// transport already exhausted its own reconnect-and-reissue and gave up, so the remote
 /// is down rather than the session being stale.
-async fn remote_get_retry(
+pub async fn remote_get_retry(
     session: &StorageSession,
     address: Address,
     priority: bool,

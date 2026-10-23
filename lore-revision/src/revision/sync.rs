@@ -8,7 +8,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use lore_base::error::OutcomeUnknown;
-use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -44,6 +43,7 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node::Node;
 use crate::progress::DiscoveryStats;
 use crate::repository;
@@ -901,30 +901,33 @@ pub(crate) async fn sync(
         }
     }
 
-    let cache_repository = repository.clone();
-    let cache_state = state_target.clone();
-    let cache_task = Some(lore_spawn!(async move {
-        // Ignore errors during caching
-        let _ = cache_state.cache_fragments(cache_repository).await;
-    }));
+    // An offline commit reads the target state's records, the delta block among them, from
+    // the local store. They are cached before realize touches the workspace: with the remote
+    // answering, a fragment that still fails after one more pass fails the sync while the
+    // workspace and anchor are as they were, rather than leave a workspace whose next commit
+    // fails with "Address not found". Each pass backs off on SlowDown for up to about a
+    // minute, and fetches only what the local store lacks. Without a remote that answered,
+    // or in a dry run, caching stays best effort.
+    if let Err(err) = Box::pin(state_target.cache_fragments(repository.clone())).await {
+        if remote_authorized && !execution_context().globals().dry_run() {
+            lore_warn!("Retrying the cache of the target state's fragments: {err}");
+            Box::pin(state_target.cache_fragments(repository.clone()))
+                .await
+                .forward::<SyncError>("Failed to cache the target state's fragments")?;
+        } else {
+            lore_debug!("Caching the target state's fragments failed: {err}");
+        }
+    }
 
     let state_synced = state_target.clone();
-    let result = sync_realize(
+    let modified_times = sync_realize(
         repository_current.clone(),
         repository.clone(),
         state_current,
         state_target,
         options.clone(),
     )
-    .await;
-
-    // Make sure caching has finished
-    if let Some(task) = cache_task {
-        let _ = task.await;
-    }
-
-    // Safe to handle error when cache task has finished
-    let modified_times = result?;
+    .await?;
 
     if !layers.is_empty() {
         Box::pin(sync_layers(

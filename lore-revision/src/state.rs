@@ -4192,8 +4192,11 @@ impl State {
         address.push(Address::zero_context_hash(tree.hash_delta));
         address.push(Address::zero_context_hash(tree.hash_file_metadata));
 
-        // Disregard any errors during caching
-        let _ = immutable::cache(repository.clone(), address, true).await;
+        // An offline commit reads these, so a fragment that failed to cache is an error. The
+        // ones that did cache are kept, and a repeat call fetches only what is missing.
+        immutable::cache(repository.clone(), address, true)
+            .await
+            .forward::<StateError>("Failed to cache state fragments")?;
 
         /* Avoid caching all the blocks, generally it's better to fetch these on demand
            as it parallelizes better with other i/o
