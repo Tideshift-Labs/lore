@@ -84,6 +84,50 @@ fn item_status_error(
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
 
+/// How many managed fragment Puts one connection keeps in flight, unless
+/// `LORE_GRPC_MANAGED_PUT_SLOTS` says otherwise. Read once per service.
+///
+/// A managed Put opens its own stream, so without this bound a push opened one stream per
+/// fragment, up to [`INFLIGHT_COMMAND_LIMIT`], on one connection, and the server ran as many
+/// Puts at once. HTTP/2 interleaves the open streams' frames, so the more are open, the longer
+/// every one of them waits for its answer against [`STREAM_IDLE_TIMEOUT_SECS`]. The unmanaged
+/// path sends its Puts one after another on one stream per session; this bound keeps the managed
+/// path's open streams and unanswered payload small in the same way. It is per connection, so
+/// `--max-connections` scales it. See also [`finish_managed_stream`].
+const MANAGED_PUT_SLOTS: u32 = 128;
+
+/// A managed Put costs one slot plus one per this many payload bytes, so a connection holds at
+/// most a few MiB of unanswered Put payload: at 128 slots, 25 full-size 256 KiB fragments.
+const MANAGED_PUT_SLOT_BYTES: usize = 64 * 1024;
+
+fn managed_put_slots() -> u32 {
+    let Ok(value) = std::env::var("LORE_GRPC_MANAGED_PUT_SLOTS") else {
+        return MANAGED_PUT_SLOTS;
+    };
+    match value.parse::<u32>() {
+        Ok(slots) if slots > 0 => clamp_managed_put_slots(slots),
+        _ => {
+            lore_warn!(
+                "LORE_GRPC_MANAGED_PUT_SLOTS={value} is not a positive integer; using {MANAGED_PUT_SLOTS}"
+            );
+            MANAGED_PUT_SLOTS
+        }
+    }
+}
+
+/// At least one slot, and never more than a semaphore can hold.
+fn clamp_managed_put_slots(slots: u32) -> u32 {
+    let max = u32::try_from(Semaphore::MAX_PERMITS).unwrap_or(u32::MAX);
+    slots.clamp(1, max)
+}
+
+/// The slots one managed Put holds, never more than the whole budget so a large one still runs.
+#[lore_macro::test_pub]
+fn managed_put_cost(payload_len: usize, slots: u32) -> u32 {
+    let cost = 1 + payload_len / MANAGED_PUT_SLOT_BYTES;
+    u32::try_from(cost).unwrap_or(u32::MAX).min(slots)
+}
+
 /// Bound on stream-level reissues before handing off to connection-level reconnect.
 ///
 /// Reissuing here only covers a stream dying on an otherwise healthy channel, which needs no
@@ -902,6 +946,9 @@ pub struct StorageService {
     put_resolved_streams:
         StreamCache<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>>,
     get_put_limiter: Semaphore,
+    /// See [`MANAGED_PUT_SLOTS`].
+    managed_put_limiter: Semaphore,
+    managed_put_slots: u32,
     /// See [`STREAM_IDLE_TIMEOUT_SECS`]. Also bounds a managed single-message mutation.
     stream_idle: Duration,
     managed_progress: ManagedProgress,
@@ -952,6 +999,39 @@ fn stream_lost(rpc: GrpcRpc) -> ProtocolError {
         rpc.wire_name(),
         &crate::outcome::current_dispatch_attempt().unwrap_or_else(AttemptId::new),
     )
+}
+
+/// Why a managed fragment Put got no answer, kept so the push failure names its cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct PutAnswerLost(String);
+
+/// A managed Put has no journal child, so its lost answer is never [`stream_lost`]'s unknown
+/// outcome: [`unjournaled_put_result`] makes it a plain push failure that carries this cause.
+fn put_answer_lost(cause: impl Into<String>) -> ProtocolError {
+    ProtocolError::internal_with_context(PutAnswerLost(cause.into()), "managed Put answer lost")
+}
+
+fn is_put_answer_lost(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<PutAnswerLost>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+/// What a managed call that went silent after its message was taken returns.
+fn silence_lost(rpc: GrpcRpc, idle: Duration) -> ProtocolError {
+    if rpc == GrpcRpc::StoragePut {
+        put_answer_lost(format!(
+            "no answer and no progress on this connection for {idle:?}"
+        ))
+    } else {
+        stream_lost(rpc)
+    }
 }
 
 const CLAIM_PENDING: u8 = 0;
@@ -1079,7 +1159,7 @@ async fn bounded_managed<T>(
                         rpc.wire_name(),
                         idle
                     );
-                    return Err(stream_lost(rpc));
+                    return Err(silence_lost(rpc, idle));
                 }
                 if !claim.abandon() {
                     // The transport took the message as the bound ran out: it may be on its way.
@@ -1106,7 +1186,46 @@ fn managed_stream_status(status: tonic::Status, rpc: GrpcRpc) -> ProtocolError {
     if crate::error::is_unsupported_client_status(&status) {
         ProtocolError::from(status)
     } else {
+        // The unknown outcome carries no status, so this log line is where its cause survives.
+        lore_warn!(
+            "{} stream failed before its answer; its outcome is unknown: {status}",
+            rpc.wire_name()
+        );
         stream_lost(rpc)
+    }
+}
+
+/// [`managed_stream_status`] for the unjournaled Put: the same split, with the server's status
+/// kept in the error.
+fn managed_put_stream_status(status: tonic::Status) -> ProtocolError {
+    if crate::error::is_unsupported_client_status(&status) {
+        ProtocolError::from(status)
+    } else {
+        put_answer_lost(format!("the stream failed before its answer: {status}"))
+    }
+}
+
+/// Reads a managed call's response stream to its trailers once its one answer is in.
+///
+/// Dropping the stream unread resets it with `RST_STREAM(CANCEL)`. h2 remembers only 50 reset
+/// streams, for one second, so when many calls end together the server's trailers arrive for
+/// streams this client has already forgotten. Each one costs a library-initiated reset, h2
+/// never forgets that count for the life of the connection, and at 1024 of them hyper's client
+/// sends `GOAWAY(ENHANCE_YOUR_CALM, "too_many_internal_resets")`, which fails every call still
+/// open on the connection. The answer is already decided here, so what the trailers say is not
+/// read, and a server that never ends the stream costs at most [`CLOSED_STREAM_GRACE`]. The
+/// answer counts as progress first, and the wait is at most half of `idle`, so it can never run
+/// the call into [`bounded_managed`]'s silence bound and turn a received answer into a lost one.
+async fn finish_managed_stream<T>(
+    responses: &mut tonic::Streaming<T>,
+    progress: &ManagedProgress,
+    idle: Duration,
+) {
+    progress.mark();
+    match tokio::time::timeout(CLOSED_STREAM_GRACE.min(idle / 2), responses.trailers()).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(status)) => lore_debug!("managed stream ended with {status} after its answer"),
+        Err(_) => lore_debug!("managed stream did not end after its answer"),
     }
 }
 
@@ -1148,6 +1267,7 @@ fn unjournaled_put_result(
         Err(error)
             if error.is_outcome_unknown()
                 || error.is_disconnected()
+                || is_put_answer_lost(&error)
                 || crate::error::answer_lost_code(&error).is_some() =>
         {
             Err(ProtocolError::internal(format!(
@@ -1168,6 +1288,7 @@ impl StorageService {
     }
 
     pub fn new(connection: Arc<super::GRPCConnection>) -> Self {
+        let managed_put_slots = managed_put_slots();
         Self {
             connection,
             get_streams: StreamCache::new(),
@@ -1177,6 +1298,8 @@ impl StorageService {
             get_resolved_streams: StreamCache::new(),
             put_resolved_streams: StreamCache::new(),
             get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            managed_put_limiter: Semaphore::new(managed_put_slots as usize),
+            managed_put_slots,
             stream_idle: stream_idle_timeout(),
             managed_progress: ManagedProgress::new(),
         }
@@ -1186,6 +1309,15 @@ impl StorageService {
     #[cfg(feature = "test-util")]
     pub fn with_stream_idle_timeout(mut self, idle: Duration) -> Self {
         self.stream_idle = idle;
+        self
+    }
+
+    /// The same service with a different managed Put budget, for tests that count streams.
+    #[cfg(feature = "test-util")]
+    pub fn with_managed_put_slots(mut self, slots: u32) -> Self {
+        let slots = clamp_managed_put_slots(slots);
+        self.managed_put_limiter = Semaphore::new(slots as usize);
+        self.managed_put_slots = slots;
         self
     }
 
@@ -1330,6 +1462,15 @@ impl StorageService {
             // a durable record buys no recovery, and an unknown one used to block the fence for
             // good. The attempt id is still minted and sent, for logs and wire correlation only.
             let attempt = AttemptId::new();
+            let cost = managed_put_cost(
+                request.payload.as_ref().map_or(0, Bytes::len),
+                self.managed_put_slots,
+            );
+            let _slots = self
+                .managed_put_limiter
+                .acquire_many(cost)
+                .await
+                .internal("managed Put permit acquire")?;
             let (body, claim) = managed_body(request);
             let result = crate::outcome::with_dispatch_attempt(
                 attempt,
@@ -1350,11 +1491,20 @@ impl StorageService {
                         let response = responses
                             .message()
                             .await
-                            .map_err(|status| managed_stream_status(status, GrpcRpc::StoragePut))?
-                            .ok_or_else(|| stream_lost(GrpcRpc::StoragePut))?;
+                            .map_err(managed_put_stream_status)?
+                            .ok_or_else(|| put_answer_lost("the stream ended without an answer"))?;
                         if response.key() != Some(address) {
-                            return Err(stream_lost(GrpcRpc::StoragePut));
+                            return Err(put_answer_lost(format!(
+                                "the answer named {:?}, not {address}",
+                                response.key()
+                            )));
                         }
+                        finish_managed_stream(
+                            &mut responses,
+                            &self.managed_progress,
+                            self.stream_idle,
+                        )
+                        .await;
                         response.into_result().map_err(decisive_item_error)
                     }),
                 ),
@@ -1517,6 +1667,12 @@ impl StorageService {
                         if response.key() != Some(source_address) {
                             return Err(stream_lost(GrpcRpc::StorageCopy));
                         }
+                        finish_managed_stream(
+                            &mut responses,
+                            &self.managed_progress,
+                            self.stream_idle,
+                        )
+                        .await;
                         response.into_result().map_err(decisive_item_error)
                     }),
                 ),
@@ -1815,6 +1971,12 @@ impl StorageService {
                         if response.request_id != request_id {
                             return Err(stream_lost(GrpcRpc::StoragePutResolved));
                         }
+                        finish_managed_stream(
+                            &mut responses,
+                            &self.managed_progress,
+                            self.stream_idle,
+                        )
+                        .await;
                         match item_status_error(response.status.as_ref()) {
                             Some(error) => Err(decisive_item_error(error)),
                             None => Ok(()),

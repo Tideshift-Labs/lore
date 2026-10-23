@@ -124,6 +124,16 @@ enum Reply {
     Serialized(Duration),
     /// Answer after this pause; the server admits one HTTP/2 stream at a time.
     OneStream(Duration),
+    /// Count the Put streams open at once (from handler entry to the answer being sent), holding
+    /// each for this pause before it answers.
+    Gauge(Duration),
+    /// Fail the response stream with a stream-fatal status that names its cause.
+    Fatal,
+    /// End the response stream cleanly without sending any message.
+    Ended,
+    /// Answer at once, then end the response stream only after this pause, so the trailers reach
+    /// the client late.
+    LateTrailers(Duration),
     ItemCancelled,
     ItemAborted,
     ItemUnknown(u32, &'static str, &'static str),
@@ -144,6 +154,9 @@ struct FixtureServer {
     gate: Arc<tokio::sync::Mutex<()>>,
     /// Ends the stalled first open (see `Reply::StallOpen`), freeing the client's slot.
     release: Arc<tokio::sync::Notify>,
+    /// Put streams open now, and the most that were ever open at once (see `Reply::Gauge`).
+    open: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
 }
 
 impl FixtureServer {
@@ -209,6 +222,11 @@ impl Service for FixtureServer {
         let journal = self.journal.clone();
         let reply = self.reply;
         let gate = self.gate.clone();
+        let open = self.open.clone();
+        if matches!(reply, Reply::Gauge(_)) {
+            let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+        }
         Ok(Response::new(Box::pin(async_stream::stream! {
             while let Some(Ok(item)) = requests.next().await {
                 if managed {
@@ -232,6 +250,18 @@ impl Service for FixtureServer {
                     Reply::OneStream(pause) => {
                         tokio::time::sleep(pause).await;
                         yield Ok(storage_v1::PutResponse { address: item.address, status: None });
+                    }
+                    Reply::Gauge(pause) => {
+                        tokio::time::sleep(pause).await;
+                        open.fetch_sub(1, Ordering::SeqCst);
+                        yield Ok(storage_v1::PutResponse { address: item.address, status: None });
+                    }
+                    Reply::Fatal => { yield Err(Status::internal("disk exploded")); return; }
+                    Reply::Ended => { return; }
+                    Reply::LateTrailers(pause) => {
+                        yield Ok(storage_v1::PutResponse { address: item.address, status: None });
+                        tokio::time::sleep(pause).await;
+                        return;
                     }
                     Reply::Paced(pause) => {
                         tokio::time::sleep(pause).await;
@@ -340,6 +370,7 @@ struct Fixture {
     seen: Arc<parking_lot::Mutex<Vec<Seen>>>,
     items: Arc<AtomicUsize>,
     release: Arc<tokio::sync::Notify>,
+    peak: Arc<AtomicUsize>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -354,6 +385,14 @@ impl Fixture {
         Self::with_idle(reply, None).await
     }
     async fn with_idle(reply: Reply, idle: Option<Duration>) -> Self {
+        Self::build(reply, idle, None).await
+    }
+    /// A service whose managed Put budget is `slots`.
+    async fn with_slots(reply: Reply, slots: u32) -> Self {
+        Self::build(reply, None, Some(slots)).await
+    }
+    async fn build(reply: Reply, idle: Option<Duration>, slots: Option<u32>) -> Self {
+        let peak = Arc::new(AtomicUsize::new(0));
         let journal = Arc::new(Journal::default());
         let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let items = Arc::new(AtomicUsize::new(0));
@@ -367,6 +406,8 @@ impl Fixture {
             reply,
             gate: Arc::default(),
             release: release.clone(),
+            open: Arc::default(),
+            peak: peak.clone(),
         };
         let server = lore_base::lore_spawn!(async move {
             tonic::transport::Server::builder()
@@ -393,12 +434,17 @@ impl Fixture {
             Some(idle) => service.with_stream_idle_timeout(idle),
             None => service,
         };
+        let service = match slots {
+            Some(slots) => service.with_managed_put_slots(slots),
+            None => service,
+        };
         Self {
             service,
             journal,
             seen,
             items,
             release,
+            peak,
             server,
         }
     }
@@ -434,6 +480,29 @@ impl Fixture {
         )
         .await
         .expect("bounded put")
+    }
+    /// A managed Put of `len` payload bytes, for the slot weighting.
+    async fn put_sized(&self, tag: u8, len: usize) -> Result<(), ProtocolError> {
+        let size = u32::try_from(len).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            with_caller_operation(
+                self.operation(),
+                self.service.put(
+                    0,
+                    &self.context(),
+                    Address::zero_context_hash(Hash::from([tag; 32])),
+                    Fragment {
+                        flags: 0,
+                        size_payload: size,
+                        size_content: u64::from(size),
+                    },
+                    Some(Bytes::from(vec![0u8; len])),
+                ),
+            ),
+        )
+        .await
+        .expect("bounded sized put")
     }
     /// A still-journaled managed mutation, for the generic journal properties a Put no longer
     /// carries. The fixture server loses its answer, so the call is always an unknown outcome.
@@ -1248,4 +1317,151 @@ async fn abandoned_put_round(tag: u8) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_abandoned_managed_put_is_never_sent_when_the_slot_frees() {
     futures::future::join_all((0..10u8).map(abandoned_put_round)).await;
+}
+
+/// The managed Put budget bounds the streams open at once: 40 concurrent tiny Puts against a
+/// budget of 4 never have more than 4 open, and every one of them succeeds.
+#[tokio::test]
+async fn managed_puts_in_flight_never_exceed_the_slot_budget() {
+    let f = Fixture::with_slots(Reply::Gauge(Duration::from_millis(30)), 4).await;
+    let results = futures::future::join_all(
+        (0..40u8).map(|tag| with_caller_operation(f.operation(), f.put(100 + tag))),
+    )
+    .await;
+    for result in results {
+        result.expect("a Put waiting for a slot must still succeed");
+    }
+    let peak = f.peak.load(Ordering::SeqCst);
+    assert!(peak <= 4, "peak concurrent Put streams was {peak}");
+    assert!(
+        peak >= 2,
+        "the fixture never overlapped Puts ({peak}); the bound is untested"
+    );
+    assert_eq!(f.items.load(Ordering::SeqCst), 40);
+    assert!(f.journal.records.lock().is_empty());
+}
+
+/// A Put costs one slot plus one per 64 KiB: with a budget of 4, a 3 * 64 KiB payload costs 4,
+/// so those Puts run one at a time.
+#[tokio::test]
+async fn managed_put_cost_weights_payload_bytes_against_the_budget() {
+    let f = Fixture::with_slots(Reply::Gauge(Duration::from_millis(30)), 4).await;
+    let results =
+        futures::future::join_all((0..6u8).map(|tag| f.put_sized(110 + tag, 3 * 65536))).await;
+    for result in results {
+        result.expect("a whole-budget Put must complete");
+    }
+    assert_eq!(f.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(f.items.load(Ordering::SeqCst), 6);
+}
+
+/// A payload costing more than the whole budget is capped at the budget, so it still runs.
+#[tokio::test]
+async fn managed_put_larger_than_the_whole_budget_still_completes() {
+    let f = Fixture::with_slots(Reply::Gauge(Duration::from_millis(10)), 4).await;
+    f.put_sized(120, 10 * 65536)
+        .await
+        .expect("a Put over the whole budget must be capped, not starved");
+    assert_eq!(f.peak.load(Ordering::SeqCst), 1);
+    assert_eq!(f.items.load(Ordering::SeqCst), 1);
+}
+
+/// A stream-fatal status on the response stream is a lost answer that keeps the server's text,
+/// and is still neither an unknown outcome nor a disconnect.
+#[tokio::test]
+async fn managed_put_stream_failure_keeps_its_cause_in_the_error() {
+    let f = Fixture::new(Reply::Fatal).await;
+    let error = with_caller_operation(f.operation(), f.put(130))
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("lost its answer"), "{text}");
+    assert!(text.contains("disk exploded"), "{text}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(!error.is_disconnected(), "{error:?}");
+    assert_eq!(f.seen.lock().len(), 1, "no resend");
+    assert!(f.journal.records.lock().is_empty());
+}
+
+/// A response stream that ends without a message says so.
+#[tokio::test]
+async fn managed_put_stream_ending_without_an_answer_says_so() {
+    let f = Fixture::new(Reply::Ended).await;
+    let error = with_caller_operation(f.operation(), f.put(131))
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("lost its answer"), "{text}");
+    assert!(text.contains("ended without an answer"), "{text}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(!error.is_disconnected(), "{error:?}");
+    assert_eq!(f.seen.lock().len(), 1, "no resend");
+}
+
+/// The wait for a stream's trailers must never outlast the silence bound: a server that answers
+/// at once but ends the stream after the idle limit still has its answer kept, not turned into a
+/// lost one.
+#[tokio::test]
+async fn managed_put_answer_is_kept_when_trailers_outlast_the_idle_bound() {
+    let f = Fixture::with_idle(
+        Reply::LateTrailers(Duration::from_millis(1500)),
+        Some(Duration::from_millis(300)),
+    )
+    .await;
+    with_caller_operation(f.operation(), f.put(140))
+        .await
+        .expect("an answer received before the idle bound must be kept");
+    assert_eq!(f.items.load(Ordering::SeqCst), 1);
+    assert_eq!(f.seen.lock().len(), 1, "no resend");
+}
+
+#[test]
+fn managed_put_cost_edge_cases() {
+    assert_eq!(managed_put_cost(0, 128), 1);
+    assert_eq!(managed_put_cost(65535, 128), 1);
+    assert_eq!(managed_put_cost(65536, 128), 2);
+    assert_eq!(managed_put_cost(3 * 65536, 128), 4);
+    assert_eq!(managed_put_cost(usize::MAX, 128), 128);
+    assert_eq!(managed_put_cost(10 * 65536, 4), 4, "capped at the budget");
+    assert_eq!(managed_put_cost(0, 1), 1);
+}
+
+/// A managed Put used to drop its response stream right after the answer, so h2 reset every
+/// stream (`RST_STREAM(CANCEL)`) before the server's trailers arrived. Under concurrency the
+/// trailers hit forgotten streams, each counted as an internal reset, and past the h2 limit of
+/// 1024 the client sent `GOAWAY` for the whole connection (`too_many_internal_resets`).
+///
+/// The load is tuned to discriminate: with the Put's stream finish removed it fails on that
+/// GOAWAY, and with it every Put completes. The slot budget (512, well above the 50 streams h2
+/// remembers) lets enough streams end within a second to outrun that memory; a much larger
+/// budget (`100_000`) or a larger burst instead closes the connection for unrelated reasons.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_concurrent_managed_puts_do_not_trip_the_h2_reset_limit() {
+    const PUTS: usize = 10_000;
+    let f = Fixture::with_slots(Reply::LateTrailers(Duration::from_millis(30)), 512).await;
+    let results = futures::future::join_all((0..PUTS).map(|n| {
+        let tag = u8::try_from(n % 256).unwrap();
+        f.put_sized(tag, 1)
+    }))
+    .await;
+    let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    // Attempt ids differ per Put; keep only the text after them so causes dedupe.
+    let mut causes: Vec<String> = failures
+        .iter()
+        .map(|error| {
+            let text = error.to_string();
+            match text.split_once("lost its answer") {
+                Some((_, cause)) => cause.to_owned(),
+                None => text,
+            }
+        })
+        .collect();
+    causes.sort();
+    causes.dedup();
+    assert!(
+        failures.is_empty(),
+        "{} of {PUTS} managed Puts failed; distinct causes: {causes:#?}",
+        failures.len(),
+    );
+    assert_eq!(f.items.load(Ordering::SeqCst), PUTS);
 }
