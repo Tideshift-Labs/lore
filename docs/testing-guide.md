@@ -26,6 +26,13 @@ embedded engine is client-relevant.
 - The fork-only crates (lore-postgres, lore-object-dispatch, lore-fragment-provider) still keep
   crate-local `#[cfg(test)]` modules. Run `cargo test -p <crate> --lib`.
 - Integration tests live under each crate's `tests/` and in `lore-integration-tests`.
+- **Python smoke server logs** (`scripts/test`, `launch_lore_server`): a server's `server.log` lives
+  in its root and pytest deletes the root with the test, so a failed push showed only the client side.
+  Set `LORE_TEST_SERVER_LOG_DIR=<dir>` to keep logs as `server-<pid>-<seq>-<test>.log`. A failed
+  test phase writes the bytes its servers logged during it to `FAILED-<pid>-<seq>-<test>-<phase>.log`,
+  and the report's "Lore server logs" section names that file. Passed logs are deleted, failed ones
+  gzipped at session end. `LORE_TEST_SERVER_LOG_KEEP=all` keeps everything. Unset = no change
+  (`f8ce5ad7`; `test_server_logs.py`).
 - Infrastructure-gated Postgres/S3 tests are `#[ignore]`; run them with `-- --ignored` and the
   documented environment variables. An unset environment must never report an infra test as passed.
 - **Always run `cargo` with the working directory inside `lore/`.** `.cargo/config.toml` is resolved
