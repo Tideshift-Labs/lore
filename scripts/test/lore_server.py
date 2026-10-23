@@ -16,6 +16,7 @@ from time import sleep
 
 import pytest
 
+import server_logs
 from cleanup_util import remove_tree, remove_tree_contents
 from error_types import ServerException
 
@@ -430,7 +431,7 @@ def generate_server_config(
 
 
 def launch_lore_server(server_root, server_env, executable_path):
-    server_log_path = server_root / "server.log"
+    server_log_path = server_logs.server_log_path(server_root)
     server_log_fd = server_log_path.open("w", buffering=1, encoding="utf-8")
 
     server_name = f"Local Lore Server Quic:{server_env['LORE__SERVER__QUIC__PORT']}  GRPC: {server_env['LORE__SERVER__GRPC__PORT']}"
@@ -458,6 +459,7 @@ def launch_lore_server(server_root, server_env, executable_path):
         cwd=server_root,
         **platform_kwargs,
     )
+    server_logs.track(server_log_path, server_proc)
 
     quic_port = server_env["LORE__SERVER__QUIC__PORT"]
     grpc_port = server_env["LORE__SERVER__GRPC__PORT"]

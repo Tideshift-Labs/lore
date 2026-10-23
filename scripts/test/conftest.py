@@ -18,6 +18,7 @@ from time import monotonic, sleep
 
 import pytest
 
+import server_logs
 from cleanup_util import remove_tree
 from lore import Lore, lore_test_env
 from lore_server import (
@@ -946,6 +947,7 @@ def pytest_configure(config):
     hook fires on the controller process."""
     _sandbox_machine_settings(config)
     config.pluginmanager.register(_SessionCleanup(), "lore_session_cleanup")
+    config.pluginmanager.register(server_logs, "lore_server_logs")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"
     )
