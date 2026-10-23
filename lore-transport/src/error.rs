@@ -438,7 +438,6 @@ impl From<tonic::Status> for ProtocolError {
                 Some(error) => ProtocolError::from(error),
                 None => ProtocolError::internal_with_context(value, "remote rejected the request"),
             },
-            tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
             tonic::Code::OutOfRange => ProtocolError::from(Oversized {
                 context: value.message().to_string(),
             }),
@@ -499,9 +498,26 @@ impl From<tonic::Status> for ProtocolError {
             // and request-direction decoder errors (`"Error encoding: …"`,
             // `"Missing request message."`, the `", while sending request"` renderings) are
             // decisive because the handler provably never ran on that message.
-            tonic::Code::Internal if std::error::Error::source(&value).is_some() => {
+            //
+            // `ResourceExhausted` is split on the same discriminator, for a sharper reason:
+            // `SlowDown` is the one verdict callers retry. A server's in-band back-pressure is
+            // sourceless; it is decisive (nothing was stored) and stays `SlowDown`. `code_from_h2`
+            // maps an h2 `ENHANCE_YOUR_CALM` reset or GOAWAY to this code too, with the h2 or
+            // hyper error as the source. That is the connection failing the call, often after
+            // the request was sent. The client's own `too_many_internal_resets` GOAWAY takes this
+            // shape, and read as `SlowDown` it let `store_raw_remote_retry`, `remote_put_retry`
+            // and `crate::grpc::handle_error` resend a dispatched `MutableNoReplay` request.
+            //
+            // Known residual, in the safe direction: a peer's `GOAWAY(ENHANCE_YOUR_CALM)` gives a
+            // stream above its `last_stream_id`, which the peer never processed, the same h2
+            // error as one below it, so that stream is read as a lost answer too. For a managed
+            // mutation that is a false unknown outcome, never a resend.
+            tonic::Code::Internal | tonic::Code::ResourceExhausted
+                if std::error::Error::source(&value).is_some() =>
+            {
                 answer_lost(&value)
             }
+            tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
             _ => ProtocolError::internal(value.to_string()),
         }
     }

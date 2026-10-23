@@ -37,6 +37,40 @@ fn unmapped_status_falls_back_to_internal() {
     assert_eq!(err.ffi_code(), -1);
 }
 
+// --- ResourceExhausted from an h2 ENHANCE_YOUR_CALM failure (the sourceless control is
+// `ordinary_resource_exhausted_backpressure_maps_to_slow_down_and_does_not_mark`) ---
+
+/// `tonic` derives `ResourceExhausted` from an h2 error whose reason is `ENHANCE_YOUR_CALM`
+/// (the client's own `too_many_internal_resets` GOAWAY, or a peer's reset) and attaches that
+/// error as the source. It is a lost answer, never `SlowDown`, which callers retry.
+#[test]
+fn enhance_your_calm_resource_exhausted_is_a_lost_answer() {
+    let status =
+        tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::ENHANCE_YOUR_CALM)));
+    assert_eq!(
+        status.code(),
+        tonic::Code::ResourceExhausted,
+        "sanity: tonic maps ENHANCE_YOUR_CALM to ResourceExhausted"
+    );
+    assert!(
+        std::error::Error::source(&status).is_some(),
+        "sanity: tonic attaches the h2 error as the source"
+    );
+    let err = ProtocolError::from(status);
+    assert!(!err.is_slow_down(), "{err:?}");
+    assert_eq!(answer_lost_code(&err), Some(tonic::Code::ResourceExhausted));
+
+    // A relaying peer re-emits the code with the answer-lost header, and it re-marks.
+    let relayed: tonic::Status = err.into();
+    assert_eq!(relayed.code(), tonic::Code::ResourceExhausted);
+    let reconverted = ProtocolError::from(relayed);
+    assert!(!reconverted.is_slow_down(), "{reconverted:?}");
+    assert_eq!(
+        answer_lost_code(&reconverted),
+        Some(tonic::Code::ResourceExhausted)
+    );
+}
+
 // --- Cancelled/DeadlineExceeded/sourced-Internal answer-lost split (the fix under test) ---
 //
 // Neither code is ever raised by a lock handler as a refusal

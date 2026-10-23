@@ -1279,12 +1279,21 @@ pub(crate) fn address_not_found_details(status: &Status) -> Option<AddressNotFou
 /// stretching it. The status returned is the one the server actually sent,
 /// whichever bound ran out — a caller cannot tell the two apart, and does not
 /// need to.
+///
+/// The retry keys off the mapped verdict, not the raw code. A `ResourceExhausted` that the
+/// mapping reads as a lost answer (an h2 `ENHANCE_YOUR_CALM` reset or GOAWAY, a marked relay, a
+/// response too big to decompress) is not back-pressure, and relooping it here would resend the
+/// request beneath the replay class.
 async fn handle_error(retry: &mut RetryBudget, status: Status) -> Result<(), ProtocolError> {
     match status.code() {
         tonic::Code::ResourceExhausted => {
             let hint = retry_delay_hint(&status);
+            let error = ProtocolError::from(status);
+            if !matches!(error, ProtocolError::SlowDown(_)) {
+                return Err(error);
+            }
             if !retry.wait(hint).await {
-                return Err(ProtocolError::from(status));
+                return Err(error);
             }
         }
         _ => return Err(ProtocolError::from(status)),
@@ -1647,7 +1656,7 @@ impl Admin for GRPCAdmin {
     async fn server_info(&self) -> Result<ServerInfo, ProtocolError> {
         with_reconnect(
             &self.connection,
-            || async { self.client.read().await.server_info().await },
+            || async { reconnectable_read(self.client.read().await.server_info().await) },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await
@@ -1836,7 +1845,17 @@ where
         return Err(ProtocolError::internal("recovery dispatch scope mismatch"));
     }
     match grpc_replay_class(rpc) {
-        ReplayClass::ReadRetryable => with_reconnect(connection, op, rebuild).await,
+        ReplayClass::ReadRetryable => {
+            with_reconnect(
+                connection,
+                || {
+                    let read = op();
+                    async move { reconnectable_read(read.await) }
+                },
+                rebuild,
+            )
+            .await
+        }
         ReplayClass::MutableNoReplay => {
             if crate::caller_operation::current_caller_operation().is_some()
                 && !matches!(
@@ -1881,6 +1900,25 @@ where
                 result => result,
             }
         }
+    }
+}
+
+/// A read whose call failed with a lost-answer `ResourceExhausted` is reissued on a rebuilt
+/// channel.
+///
+/// That shape is mostly an h2 `ENHANCE_YOUR_CALM` GOAWAY, which kills the connection. It used to
+/// read as `SlowDown` and [`handle_error`] retried it in place, for reads and mutations alike. It
+/// is now a lost answer, so a mutation is never resent; a read may be, and `Disconnected` is the
+/// one error [`with_reconnect`] reconnects on.
+fn reconnectable_read<T>(result: Result<T, ProtocolError>) -> Result<T, ProtocolError> {
+    match result {
+        Err(error)
+            if crate::error::answer_lost_code(&error) == Some(tonic::Code::ResourceExhausted) =>
+        {
+            lore_debug!("read lost its answer to the connection, reconnecting: {error}");
+            Err(ProtocolError::from(lore_base::error::Disconnected))
+        }
+        result => result,
     }
 }
 

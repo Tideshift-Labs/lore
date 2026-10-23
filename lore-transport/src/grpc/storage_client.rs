@@ -62,13 +62,11 @@ use crate::replay::ReplayClass;
 /// mean when `tonic` raises them. An in-band item status means the opposite: the server
 /// answered, per item, and named this code itself.
 ///
-/// The mislabel is inert today and only by accident of wiring — every verb reaching here goes
-/// through [`super::GRPCStorage::with_reconnect_dispatch_aware`], which branches on
-/// `Disconnected` alone, and [`StreamCache::request`] filters on `is_disconnected` alone, so a
-/// marked item status is returned to the caller exactly as it was before the marker existed.
-/// Moving any stream verb onto `with_reconnect_classified` would arm it into a false unknown
-/// outcome. There is a standing test pinning the inertness; the real fix, if a verb ever moves,
-/// is to map the item's code here without going through the transport classifier.
+/// So the lost-answer mark is taken off here, in [`in_band_error`]. [`StreamCache::request`]
+/// reads a lost answer as no verdict at all (a dispatched mutation becomes an unknown outcome,
+/// a read is reissued), and an item status kept marked would be reissued or reported unknown
+/// although the server decided it. The server's explicit unknown-outcome marker is kept: that
+/// is the server saying it does not know.
 #[lore_macro::test_pub]
 fn item_status_error(
     status: Option<&lore_proto::lore::model::v1::ItemStatus>,
@@ -78,7 +76,17 @@ fn item_status_error(
     if code == tonic::Code::Ok && !status.has_outcome_unknown() {
         return None;
     }
-    Some(ProtocolError::from(tonic::Status::from(status)))
+    Some(in_band_error(status))
+}
+
+/// One in-band item status as the server's verdict on that item. See [`item_status_error`].
+fn in_band_error(status: &lore_proto::lore::model::v1::ItemStatus) -> ProtocolError {
+    let error = ProtocolError::from(tonic::Status::from(status));
+    if crate::error::answer_lost_code(&error).is_some() {
+        ProtocolError::internal(error.to_string())
+    } else {
+        error
+    }
 }
 
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
@@ -424,7 +432,7 @@ impl StreamResponse for storage_v1::GetResponse {
 
     fn into_result(self) -> Result<Self::Success, ProtocolError> {
         if let Some(status) = self.status.as_ref().filter(|status| !status.is_ok()) {
-            return Err(ProtocolError::from(tonic::Status::from(status)));
+            return Err(in_band_error(status));
         }
         let fragment = self
             .fragment
@@ -442,7 +450,7 @@ impl StreamResponse for storage_v1::PutResponse {
 
     fn into_result(self) -> Result<Self::Success, ProtocolError> {
         match self.status.as_ref().filter(|status| !status.is_ok()) {
-            Some(status) => Err(ProtocolError::from(tonic::Status::from(status))),
+            Some(status) => Err(in_band_error(status)),
             None => Ok(()),
         }
     }
@@ -457,7 +465,7 @@ impl StreamResponse for storage_v1::CopyResponse {
 
     fn into_result(self) -> Result<Self::Success, ProtocolError> {
         match self.status.as_ref().filter(|status| !status.is_ok()) {
-            Some(status) => Err(ProtocolError::from(tonic::Status::from(status))),
+            Some(status) => Err(in_band_error(status)),
             None => Ok(()),
         }
     }
@@ -876,8 +884,17 @@ impl<K: Clone, S> StreamCache<K, S> {
                 handle.life.settle().await;
                 None
             };
-            let server_verdict =
-                answer.filter(|answer| !matches!(answer, Err(err) if err.is_disconnected()));
+            // A lost answer is no verdict either, whatever its code: an h2 `ENHANCE_YOUR_CALM`
+            // GOAWAY or reset (which once read as the server's `SlowDown`), a `Cancelled` or
+            // `DeadlineExceeded` call, a sourced `Internal`. It reaches here only as a stream's
+            // own failure (a failed open, or a resolved stream's terminal status), because an
+            // in-band item status has its mark taken off in `in_band_error`. So a dispatched
+            // mutation below is an unknown outcome, and a read is reissued within
+            // `MAX_STREAM_REISSUES`, where before both came back as a plain error.
+            let server_verdict = answer.filter(|answer| {
+                !matches!(answer, Err(err)
+                    if err.is_disconnected() || crate::error::answer_lost_code(err).is_some())
+            });
             if let Some(result) = server_verdict {
                 return result;
             }

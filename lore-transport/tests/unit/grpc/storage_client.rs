@@ -466,14 +466,10 @@ async fn a_failure_status_wins_over_a_populated_payload() {
 /// An in-band `ItemStatus` of `Cancelled` on a stream-backed verb must not become
 /// `OutcomeUnknown`, and must not be mistaken for a stream death.
 ///
-/// A standing inertness guard, not a regression pin against the `error.rs` fix under test
-/// elsewhere in this crate: `item_status_error`'s doc comment already establishes that this
-/// path is inert to the `Cancelled | DeadlineExceeded` marker by construction, because
-/// `StreamCache::request`'s `server_verdict` filter (below) and
-/// `super::GRPCStorage::with_reconnect_dispatch_aware` both branch on `Disconnected` alone.
-/// This test would still pass with that marker arm removed from `error.rs` -- it is not what
-/// discriminates the fix, it is what proves the fix's split does not leak into a path that
-/// never asked for it.
+/// `StreamCache::request`'s `server_verdict` filter reads a lost answer as no verdict, so an
+/// in-band item status must reach it without the lost-answer mark that `ProtocolError::from`
+/// puts on a `Cancelled`. `in_band_error` takes the mark off, and this test is what fails if it
+/// stops doing so: the item is then read as a stream death and reissued.
 ///
 /// `get_against_stream_killing_server` always forces one kill on the FIRST accepted stream
 /// before a server double ever reads a request (`StreamKillingServer::get`'s `if attempt == 0
