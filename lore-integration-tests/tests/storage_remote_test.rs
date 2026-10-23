@@ -7672,8 +7672,14 @@ mod storage_remote_tests {
         /// Remote queries that named the delta block.
         queries: usize,
         /// Whether the delta block read back from the clone's own store with the server gone.
-        /// `None` when the clone failed, so there is no clone to read.
+        /// `None` when the clone left no repository to read.
         delta_offline: Option<bool>,
+        /// The clone's current anchor, read offline. `None` when it left no repository to read.
+        anchor: Option<lore_base::types::Hash>,
+        /// Whether the clone wrote the committed file into its workspace.
+        workspace_file: bool,
+        /// The revision pushed and cloned.
+        revision: lore_base::types::Hash,
     }
 
     /// Pushes a real commit to an in-process server, faults that revision's delta block, and
@@ -7862,7 +7868,9 @@ mod storage_remote_tests {
         // Read offline, so a delta block that is not in the clone's own store cannot be fetched
         // from the server.
         drop(server);
-        let delta_offline = if status == 0 {
+        let workspace_file = clone_path.join("held.txt").exists();
+        // A failed clone is read too: what it leaves on disk is part of its contract.
+        let (delta_offline, anchor) = if clone_path.join(".lore").exists() {
             let execution =
                 std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_server(
                     LoreGlobalArgs {
@@ -7872,22 +7880,26 @@ mod storage_remote_tests {
                     lore_revision::relay::EventDispatcher::no_dispatch(),
                     "storage-remote-clone-delta-offline".to_string(),
                 ));
-            Some(
-                LORE_CONTEXT
-                    .scope(execution, async {
-                        let clone_repository = lore_revision::repository::load_and_connect(
-                            &clone_path,
-                            RepositoryAccess::ReadOnly,
-                        )
-                        .await?;
-                        let state =
-                            State::deserialize(clone_repository.clone(), revision_hash).await?;
-                        Ok::<_, Box<dyn Error>>(state.delta_block(clone_repository).await.is_ok())
-                    })
-                    .await?,
-            )
+            let (delta_offline, anchor) = LORE_CONTEXT
+                .scope(execution, async {
+                    let clone_repository = lore_revision::repository::load_and_connect(
+                        &clone_path,
+                        RepositoryAccess::ReadOnly,
+                    )
+                    .await?;
+                    let anchor =
+                        lore_revision::instance::load_current_anchor_boxed(&clone_repository)
+                            .await
+                            .ok()
+                            .map(|(revision, _)| revision);
+                    let state = State::deserialize(clone_repository.clone(), revision_hash).await?;
+                    let delta_offline = state.delta_block(clone_repository).await.is_ok();
+                    Ok::<_, Box<dyn Error>>((delta_offline, anchor))
+                })
+                .await?;
+            (Some(delta_offline), anchor)
         } else {
-            None
+            (None, None)
         };
 
         Ok(CloneOutcome {
@@ -7896,13 +7908,21 @@ mod storage_remote_tests {
             gets: fault.gets.load(std::sync::atomic::Ordering::SeqCst),
             queries: fault.queries.load(std::sync::atomic::Ordering::SeqCst),
             delta_offline,
+            anchor,
+            workspace_file,
+            revision: revision_hash,
         })
     }
 
     /// Clone caches the target state's records. A delta block that answers `SlowDown` for more
     /// gets than one `remote_get_retry` pass allows fails the first caching pass; clone's second
     /// pass must fetch it, or the clone's next offline commit fails with "Address not found".
+    ///
+    /// Ignored by default: the fault has to outlast a full `remote_get_retry` pass (60 attempts,
+    /// up to 1 s apart), about a minute. `clone_fails_when_delta_block_unfetchable` is the
+    /// default gate for the same fix.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "about 1 min: SlowDown must outlast a full retry pass; run with --ignored"]
     async fn clone_caches_delta_block_after_slow_down_outlasts_first_pass() -> TestResult {
         // One pass makes the first get, then one per retry the store policy allows (60 by default).
         let first_pass_gets = lore_storage::STORE_RETRY_ATTEMPTS
@@ -7952,6 +7972,15 @@ mod storage_remote_tests {
             "the failure must name the cache failure, got: {}",
             outcome.errors
         );
+        // A failed cache leaves the clone as a failed file walk does: workspace kept, anchor at
+        // the cloned revision, the missing record still missing.
+        assert!(outcome.workspace_file, "the clone's workspace must be kept");
+        assert_eq!(
+            outcome.anchor,
+            Some(outcome.revision),
+            "the clone's anchor must name the cloned revision"
+        );
+        assert_eq!(outcome.delta_offline, Some(false));
         Ok(())
     }
 }
