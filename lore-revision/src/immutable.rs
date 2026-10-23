@@ -703,7 +703,7 @@ pub async fn cache(
 }
 
 /// Whether the local store holds every non-zero address in `address`.
-async fn stored_local(repository: &RepositoryContext, address: &[Address]) -> bool {
+pub(crate) async fn stored_local(repository: &RepositoryContext, address: &[Address]) -> bool {
     let address: Vec<Address> = address
         .iter()
         .copied()

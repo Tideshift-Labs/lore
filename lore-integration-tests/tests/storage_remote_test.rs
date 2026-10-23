@@ -7680,16 +7680,20 @@ mod storage_remote_tests {
         workspace_file: bool,
         /// The revision pushed and cloned.
         revision: lore_base::types::Hash,
+        /// The status of the sync run after the clone, when one was asked for.
+        sync_status: Option<i32>,
     }
 
     /// Pushes a real commit to an in-process server, faults that revision's delta block, and
     /// clones it through `lore::repository::clone`.
     ///
     /// `slow_downs` is how many gets of the delta block answer `SlowDown`; `obliterate` removes
-    /// the block from the server for good.
+    /// the block from the server. `sync_after` then puts the block back on the server and
+    /// runs `lore::revision::sync` in the clone before the offline read.
     async fn clone_with_delta_block_fault(
         slow_downs: usize,
         obliterate: bool,
+        sync_after: bool,
     ) -> Result<CloneOutcome, Box<dyn Error>> {
         use lore::branch;
         use lore::file;
@@ -7824,6 +7828,11 @@ mod storage_remote_tests {
             "the pushed commit must name a delta block"
         );
         let delta_address = Address::zero_context_hash(tree.hash_delta);
+        let delta_record = backend_immutable
+            .clone()
+            .get(repository_id, delta_address)
+            .await?
+            .into_payload()?;
         if obliterate {
             backend_immutable
                 .clone()
@@ -7864,6 +7873,25 @@ mod storage_remote_tests {
         )
         .await;
         let errors = sink.lock().unwrap().join(" | ");
+
+        // The sync runs at the revision the clone's anchor names, as a user's retry would.
+        let sync_status = if sync_after {
+            let (fragment, payload) = delta_record;
+            backend_immutable
+                .clone()
+                .put(repository_id, delta_address, fragment, Some(payload), true)
+                .await?;
+            Some(
+                revision::sync(
+                    globals(&clone_path),
+                    revision::LoreRevisionSyncArgs::default(),
+                    None,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
 
         // Read offline, so a delta block that is not in the clone's own store cannot be fetched
         // from the server.
@@ -7911,6 +7939,7 @@ mod storage_remote_tests {
             anchor,
             workspace_file,
             revision: revision_hash,
+            sync_status,
         })
     }
 
@@ -7932,7 +7961,7 @@ mod storage_remote_tests {
             + 1;
         let slow_downs = first_pass_gets + 9;
 
-        let outcome = clone_with_delta_block_fault(slow_downs, false).await?;
+        let outcome = clone_with_delta_block_fault(slow_downs, false, false).await?;
         assert!(
             outcome.gets > first_pass_gets,
             "the fault must outlast one retry pass, but the delta block saw {} gets",
@@ -7955,7 +7984,7 @@ mod storage_remote_tests {
     /// rather than leaving a clone whose next offline commit fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn clone_fails_when_delta_block_unfetchable() -> TestResult {
-        let outcome = clone_with_delta_block_fault(0, true).await?;
+        let outcome = clone_with_delta_block_fault(0, true, false).await?;
         assert!(
             outcome.gets + outcome.queries > 0,
             "the clone must have asked the server for the delta block"
@@ -7981,6 +8010,22 @@ mod storage_remote_tests {
             "the clone's anchor must name the cloned revision"
         );
         assert_eq!(outcome.delta_offline, Some(false));
+        Ok(())
+    }
+
+    /// A sync at the revision a failed clone left as its anchor must cache the record the clone
+    /// could not, rather than return early as though the workspace were complete.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_after_failed_clone_caches_missing_delta_block() -> TestResult {
+        let outcome = clone_with_delta_block_fault(0, true, true).await?;
+        assert_ne!(outcome.status, 0, "the clone must fail: {}", outcome.errors);
+        assert_eq!(outcome.anchor, Some(outcome.revision));
+        assert_eq!(outcome.sync_status, Some(0), "the sync must succeed");
+        assert_eq!(
+            outcome.delta_offline,
+            Some(true),
+            "after the sync the delta block must read back from the clone's own store"
+        );
         Ok(())
     }
 }

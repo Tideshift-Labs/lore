@@ -4169,28 +4169,22 @@ impl State {
         Ok(tree)
     }
 
+    /// Whether the local store holds every record [`State::cache_fragments`] caches. Local
+    /// lookups only once the tree is loaded; the subfragments of a fragmented record are not
+    /// checked.
+    pub async fn fragments_stored_local(&self, repository: Arc<RepositoryContext>) -> bool {
+        let Ok(tree) = self.tree(repository.clone()).await else {
+            return false;
+        };
+        immutable::stored_local(&repository, &self.fragment_addresses(&tree)).await
+    }
+
     pub async fn cache_fragments(
         &self,
         repository: Arc<RepositoryContext>,
     ) -> Result<(), StateError> {
         let tree = self.tree(repository.clone()).await?;
-
-        let mut address = Vec::with_capacity(7);
-
-        // A remote can return the state and tree records without the local cache priority
-        // flag, so a read does not keep them. Cache them to keep the state readable offline.
-        address.push(Address::zero_context_hash(self.revision()));
-        address.push(Address::zero_context_hash(tree.hash_node));
-
-        {
-            let data = self.data.read();
-            address.push(Address::zero_context_hash(data.hash_tree));
-            address.push(Address::zero_context_hash(data.hash_metadata));
-            address.push(Address::zero_context_hash(data.hash_link));
-        }
-
-        address.push(Address::zero_context_hash(tree.hash_delta));
-        address.push(Address::zero_context_hash(tree.hash_file_metadata));
+        let address = self.fragment_addresses(&tree);
 
         // An offline commit reads these, so a fragment that failed to cache is an error. The
         // ones that did cache are kept, and a repeat call fetches only what is missing.
@@ -4223,6 +4217,28 @@ impl State {
         */
 
         Ok(())
+    }
+
+    /// The records [`State::cache_fragments`] caches: the state, its tree, node list,
+    /// metadata, link, delta block and file metadata.
+    fn fragment_addresses(&self, tree: &Tree) -> Vec<Address> {
+        let mut address = Vec::with_capacity(7);
+
+        // A remote can return the state and tree records without the local cache priority
+        // flag, so a read does not keep them. Cache them to keep the state readable offline.
+        address.push(Address::zero_context_hash(self.revision()));
+        address.push(Address::zero_context_hash(tree.hash_node));
+
+        {
+            let data = self.data.read();
+            address.push(Address::zero_context_hash(data.hash_tree));
+            address.push(Address::zero_context_hash(data.hash_metadata));
+            address.push(Address::zero_context_hash(data.hash_link));
+        }
+
+        address.push(Address::zero_context_hash(tree.hash_delta));
+        address.push(Address::zero_context_hash(tree.hash_file_metadata));
+        address
     }
 
     pub async fn revision_metadata(

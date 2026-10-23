@@ -425,6 +425,32 @@ async fn revision_advances_branch_latest(
     )
 }
 
+/// Caches the target state's records ([`State::cache_fragments`]) for an offline commit,
+/// the delta block among them.
+///
+/// With the remote answering, a fragment that still fails after one more pass fails the
+/// sync, rather than leave a workspace whose next commit fails with "Address not found".
+/// Each pass backs off on `SlowDown` for up to about a minute, and fetches only what the
+/// local store lacks. Without a remote that answered, or in a dry run, caching stays best
+/// effort.
+async fn cache_target_fragments(
+    repository: Arc<RepositoryContext>,
+    state_target: &State,
+    remote_authorized: bool,
+) -> Result<(), SyncError> {
+    if let Err(err) = Box::pin(state_target.cache_fragments(repository.clone())).await {
+        if remote_authorized && !execution_context().globals().dry_run() {
+            lore_warn!("Retrying the cache of the target state's fragments: {err}");
+            Box::pin(state_target.cache_fragments(repository))
+                .await
+                .forward::<SyncError>("Failed to cache the target state's fragments")?;
+        } else {
+            lore_debug!("Caching the target state's fragments failed: {err}");
+        }
+    }
+    Ok(())
+}
+
 /// Carries the working tree to the revision, and the view, a sync resolves.
 ///
 /// `repository` is the context the instance holds, and answers for what the working tree stands
@@ -814,7 +840,18 @@ pub(crate) async fn sync(
             )
             .await
             .forward::<SyncError>("Failed to store revision as current branch latest")?;
-            branch::store_last_sync(repository, anchor_branch, revision).await;
+            branch::store_last_sync(repository.clone(), anchor_branch, revision).await;
+        }
+        // The workspace is at the target, but its records may not be local: a clone whose
+        // cache failed writes the anchor all the same. Local lookups settle the common case.
+        // Unlike the main path, a failure here comes after the branch latest above is stored;
+        // that latest is the one a repeat sync stores too.
+        if !execution_context().globals().dry_run()
+            && !state_target
+                .fragments_stored_local(repository.clone())
+                .await
+        {
+            cache_target_fragments(repository, &state_target, remote_authorized).await?;
         }
         return Ok(());
     }
@@ -901,23 +938,9 @@ pub(crate) async fn sync(
         }
     }
 
-    // An offline commit reads the target state's records, the delta block among them, from
-    // the local store. They are cached before realize touches the workspace: with the remote
-    // answering, a fragment that still fails after one more pass fails the sync while the
-    // workspace and anchor are as they were, rather than leave a workspace whose next commit
-    // fails with "Address not found". Each pass backs off on SlowDown for up to about a
-    // minute, and fetches only what the local store lacks. Without a remote that answered,
-    // or in a dry run, caching stays best effort.
-    if let Err(err) = Box::pin(state_target.cache_fragments(repository.clone())).await {
-        if remote_authorized && !execution_context().globals().dry_run() {
-            lore_warn!("Retrying the cache of the target state's fragments: {err}");
-            Box::pin(state_target.cache_fragments(repository.clone()))
-                .await
-                .forward::<SyncError>("Failed to cache the target state's fragments")?;
-        } else {
-            lore_debug!("Caching the target state's fragments failed: {err}");
-        }
-    }
+    // Cached before realize touches the workspace, so a failure leaves the workspace and
+    // anchor as they were.
+    cache_target_fragments(repository.clone(), &state_target, remote_authorized).await?;
 
     let state_synced = state_target.clone();
     let modified_times = sync_realize(
