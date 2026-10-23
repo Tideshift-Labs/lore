@@ -29,10 +29,30 @@ pub fn is_workflow_path(path: &str) -> bool {
 
 tokio::task_local! { static ACTIVE_WORKTREE: PathBuf; }
 
+/// Whether a store blocks write admission after it settles what needs no server answer.
+/// The caller holds the exclusive admission lock, so no open parent has a live body.
+async fn blocks_admission(store: &RepositoryAttemptStore) -> Result<bool, ProtocolError> {
+    async fn blocked(store: &RepositoryAttemptStore) -> Result<bool, ProtocolError> {
+        Ok(store
+            .admission_parents()
+            .await?
+            .iter()
+            .any(|parent| !parent.complete)
+            || !store.unresolved().await?.is_empty())
+    }
+    if !blocked(store).await? {
+        return Ok(false);
+    }
+    if !store.settle_receiptless().await? {
+        return Ok(true);
+    }
+    blocked(store).await
+}
+
 /// Owns exclusion until all nested calls and durable settlement have ended.
 pub struct RepositoryMutationGuard {
     root: PathBuf,
-    _lock: Option<FSLock>,
+    lock: Option<FSLock>,
     store: Arc<RepositoryAttemptStore>,
     legacy_stores: Vec<(&'static str, Arc<RepositoryAttemptStore>)>,
 }
@@ -79,28 +99,14 @@ impl RepositoryMutationGuard {
                 })
             })
             .collect();
-        if !nested
-            && !recovery
-            && (store
-                .admission_parents()
-                .await?
-                .iter()
-                .any(|parent| !parent.complete)
-                || !store.unresolved().await?.is_empty())
-        {
+        if !nested && !recovery && blocks_admission(&store).await? {
             return Err(ProtocolError::internal(
                 "repository has an unresolved workflow; inspect operation status",
             ));
         }
         if !nested && !recovery {
             for (_, legacy) in &legacy_stores {
-                if legacy
-                    .admission_parents()
-                    .await?
-                    .iter()
-                    .any(|parent| !parent.complete)
-                    || !legacy.unresolved().await?.is_empty()
-                {
+                if blocks_admission(legacy).await? {
                     return Err(ProtocolError::internal(
                         "repository has unresolved legacy attempts; inspect operation status",
                     ));
@@ -109,10 +115,27 @@ impl RepositoryMutationGuard {
         }
         Ok(Self {
             root,
-            _lock: lock,
+            lock,
             store,
             legacy_stores,
         })
+    }
+
+    /// Settles what needs no server answer in every admission store (see
+    /// `RepositoryAttemptStore::settle_receiptless`). Refused inside a nested fence: it holds no
+    /// lock, and the open parent there is the running caller's own.
+    pub async fn settle_receiptless(&self) -> Result<(), ProtocolError> {
+        if self.lock.is_none() {
+            return Err(ProtocolError::internal(
+                "cannot settle blockers inside a running managed workflow",
+            ));
+        }
+        for (source, store) in self.recovery_stores() {
+            store.settle_receiptless().await.map_err(|error| {
+                ProtocolError::internal(format!("{source}: cannot settle blockers: {error}"))
+            })?;
+        }
+        Ok(())
     }
 
     pub fn store(&self) -> Arc<RepositoryAttemptStore> {

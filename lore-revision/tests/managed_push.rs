@@ -271,13 +271,18 @@ async fn observer_failure_preserves_durable_blocker_at_every_hook() {
             !parents[0].complete,
             "hook {failed_hook} lost its durable blocker"
         );
+        let had_child = !guard.store().unresolved().await.unwrap().is_empty();
         drop(runner);
         drop(guard);
-        assert!(
-            RepositoryMutationGuard::acquire(directory.path())
-                .await
-                .is_err()
-        );
+        let admitted = RepositoryMutationGuard::acquire(directory.path()).await;
+        if failed_hook == 0 {
+            // Hook 0 fails before the stage dispatches: the parent is childless, so the next
+            // acquire closes it instead of blocking.
+            assert!(!had_child);
+            assert!(admitted.is_ok(), "a childless crashed parent is closed");
+        } else {
+            assert!(admitted.is_err(), "hook {failed_hook}");
+        }
     }
 }
 

@@ -273,6 +273,87 @@ impl RepositoryAttemptStore {
         self.finish_loaded_parent(&guard, &mut document, parent, &children)
     }
 
+    /// Settles what needs no server answer, so a crash does not block the next write.
+    ///
+    /// A fragment Put child from an older build settles `NotApplied` without a read (WP-120
+    /// decision reversal, 2026-10-22). An open parent then closes when it has no uncertainty
+    /// code, no root orphan intent, and no child other than settled Puts. Every irreversible
+    /// step records its child before any effect, so such a parent moved no branch and no lock,
+    /// and its Puts are content-addressed: there is nothing to reconcile. A parent with any
+    /// other child, settled or not, is left for its receipts and body evidence. Call this only
+    /// under the exclusive admission lock, where an open parent cannot belong to a live body.
+    /// Returns whether anything changed.
+    /// Production callers go through `RepositoryMutationGuard::settle_receiptless`, which
+    /// refuses a nested fence.
+    #[lore_macro::test_pub]
+    pub(crate) async fn settle_receiptless(&self) -> Result<bool, ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let mut document = self.load_for_write(&guard)?;
+        Self::validate_parents(&document)?;
+        let mut changed = false;
+        for pending in self.children(&document, true)? {
+            if !pending.attempt.state.is_unresolved()
+                || !lore_transport::caller_operation::is_legacy_fragment_put(
+                    &pending.attempt.operation,
+                )
+            {
+                continue;
+            }
+            let mut existing = self.load_child(&guard, &document, &pending.attempt.attempt_id)?;
+            if let Some(mut child) = existing.child.take() {
+                child.attempt.state =
+                    StoredState::from(&AttemptState::Resolved(AttemptResolution::NotApplied));
+                self.write_child(&document, &child, existing)?;
+                changed = true;
+            }
+        }
+        if document.parents.iter().all(|parent| parent.complete) {
+            return Ok(changed);
+        }
+        // Parents that keep a claim on a server answer: an orphan intent, or any child that is
+        // not a settled fragment Put.
+        let mut retained = document
+            .managed
+            .iter()
+            .map(|intent| intent.parent.clone())
+            .collect::<std::collections::HashSet<_>>();
+        retained.extend(
+            self.children(&document, false)?
+                .into_iter()
+                .filter(|child| {
+                    child.attempt.state.is_unresolved()
+                        || !lore_transport::caller_operation::is_legacy_fragment_put(
+                            &child.attempt.operation,
+                        )
+                })
+                .filter_map(|child| child.managed.map(|intent| intent.parent)),
+        );
+        let mut closed = false;
+        for parent in document.parents.iter_mut().filter(|parent| {
+            !parent.complete
+                && parent.parent_uncertainty_code.is_none()
+                && !retained.contains(&parent.id)
+        }) {
+            // No body is running, so none can still complete; the parent derives its state
+            // from children, and none of them is owed an answer. `body_completed` here means
+            // execution finished, not that every step ran: a desktop interrupted-workflow
+            // closure reads it to close the app record of a stage that dispatched nothing.
+            crate::lore_info!(
+                "Closing managed parent {} ({}): no child needs a server answer",
+                parent.id,
+                parent.operation
+            );
+            parent.body_completed = true;
+            parent.complete = true;
+            closed = true;
+        }
+        if closed {
+            self.store(&guard, &document)?;
+        }
+        Ok(changed || closed)
+    }
+
     pub async fn record_workflow_child(
         &self,
         parent: Uuid,

@@ -1002,13 +1002,10 @@ async fn push_managed_local(
         Err(error) => return reject_undelegatable(globals, callback, error.to_string()).await,
     };
     globals.repository_path = repository_path.display().to_string().into();
-    let guard =
-        match lore_revision::repository_fence::RepositoryMutationGuard::acquire(&repository_path)
-            .await
-        {
-            Ok(guard) => Arc::new(guard),
-            Err(error) => return reject_undelegatable(globals, callback, error.to_string()).await,
-        };
+    let guard = match crate::recovery::admit(&repository_path).await {
+        Ok(guard) => Arc::new(guard),
+        Err(error) => return reject_undelegatable(globals, callback, error.to_string()).await,
+    };
     let runner = Arc::new(lore_revision::managed_push::ManagedPushRunner::new(
         guard.clone(),
         observer,

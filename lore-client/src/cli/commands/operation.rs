@@ -101,115 +101,7 @@ where
     F: Fn(Arc<RepositoryAttemptStore>, AttemptId) -> Fut,
     Fut: Future<Output = Result<DomainAttemptReceipt, ProtocolError>>,
 {
-    let mut blockers = Vec::new();
-    for (source, store) in fence.recovery_stores() {
-        for child in store.unresolved().await.map_err(|error| {
-            ProtocolError::internal(format!("{source}: cannot read blockers: {error}"))
-        })? {
-            if lore_transport::caller_operation::is_legacy_fragment_put(&child.operation) {
-                store
-                    .resolve(
-                        &child.attempt_id,
-                        lore_transport::AttemptResolution::NotApplied,
-                    )
-                    .await?;
-                continue;
-            }
-            // Other storage mutations have no attributable receipt rail. Never infer their
-            // result from content.
-            if !matches!(
-                child.operation.as_str(),
-                "RevisionService.BranchPush"
-                    | "RevisionService.BranchCreate"
-                    | "LockService.Lock"
-                    | "LockService.Unlock"
-                    | "LockService.ForceUnlock"
-            ) {
-                blockers.push(format!(
-                    "{source}: {} {} has no supported receipt reader; remains blocked",
-                    child.attempt_id, child.operation
-                ));
-                continue;
-            }
-            if let Err(error) = store.recovery_context(&child.attempt_id).await {
-                blockers.push(format!(
-                    "{source}: {} cannot recover its recorded namespace: {error}; remains blocked",
-                    child.attempt_id
-                ));
-                continue;
-            }
-            let receipt = match lookup(store.clone(), child.attempt_id).await {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    blockers.push(format!(
-                        "{source}: {} receipt unavailable: {error}; remains blocked",
-                        child.attempt_id
-                    ));
-                    continue;
-                }
-            };
-            // State before method: a lookup that found no receipt carries no method at all, and
-            // checking the method first reported that absence as a method mismatch (Gate 0
-            // campaign c13, 2026-10-13).
-            let lore_transport::DomainReceiptState::Committed { outcome, .. } = receipt.state
-            else {
-                blockers.push(format!(
-                    "{source}: {} receipt is nondecisive ({}); remains blocked",
-                    child.attempt_id,
-                    receipt_state_label(&receipt.state)
-                ));
-                continue;
-            };
-            if !lore_transport::caller_operation::recovery_receipt_method_matches(
-                &child.operation,
-                &receipt.method,
-            ) {
-                blockers.push(format!(
-                    "{source}: {} receipt method mismatch; remains blocked",
-                    child.attempt_id
-                ));
-                continue;
-            }
-            let resolution = match outcome {
-                lore_transport::DomainReceiptOutcome::Applied => {
-                    lore_transport::AttemptResolution::Applied
-                }
-                lore_transport::DomainReceiptOutcome::NotApplied { .. } => {
-                    lore_transport::AttemptResolution::NotApplied
-                }
-            };
-            store.resolve(&child.attempt_id, resolution).await?;
-        }
-        for parent in store
-            .managed_parents()
-            .await?
-            .iter()
-            .filter(|parent| !parent.complete)
-        {
-            let id = Uuid::parse_str(&parent.id)
-                .map_err(|_err| lore_transport::ProtocolError::internal("invalid parent UUID"))?;
-            if let Err(error) = store.reconcile_parent(id).await {
-                blockers.push(format!("{source}: {} remains blocked: {error}", parent.id));
-            }
-        }
-    }
-    if blockers.is_empty() {
-        Ok(())
-    } else {
-        Err(ProtocolError::internal(blockers.join("\n")))
-    }
-}
-
-/// The name an operator reads for a receipt state that cannot settle an attempt.
-fn receipt_state_label(state: &lore_transport::DomainReceiptState) -> &'static str {
-    match state {
-        lore_transport::DomainReceiptState::Prepared { .. } => "prepared, not committed",
-        lore_transport::DomainReceiptState::Committed { .. } => "committed",
-        lore_transport::DomainReceiptState::Mismatch => "identity mismatch",
-        lore_transport::DomainReceiptState::Expired => "expired",
-        lore_transport::DomainReceiptState::ExpiredOrUnknown => "expired or unknown",
-        lore_transport::DomainReceiptState::NotFound => "no receipt found",
-    }
+    lore::recovery::reconcile(fence, lookup).await
 }
 
 /// Explicit CLI adoption for the supported push and lock families.
@@ -224,8 +116,7 @@ where
     Fut: Future<Output = i32>,
 {
     let result = async {
-        let fence =
-            RepositoryMutationGuard::acquire(Path::new(globals.repository_path.as_str())).await?;
+        let fence = lore::recovery::admit(Path::new(globals.repository_path.as_str())).await?;
         let parent = Uuid::now_v7();
         let store = fence.begin(parent, operation.to_owned(), intent).await?;
         let status = fence
@@ -235,8 +126,9 @@ where
                 command(store.clone()),
             ))
             .await;
-        // A crash before this proof, or an unnameable resource, cannot be cleared by
-        // receipts for named children alone.
+        // A crash before this proof leaves the parent open. The next admission closes it only
+        // when no child needs a server answer (none, or settled fragment Puts); otherwise
+        // receipts alone cannot clear it. An unnameable resource always stays open.
         if status == UnnameableResource::FFI_CODE {
             if let Err(error) = store.mark_parent_uncertain(parent, status).await {
                 crate::eprintln!("{error}");

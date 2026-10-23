@@ -117,11 +117,12 @@ async fn managed_children(
 }
 
 /// A journal written the way an older build did: a fragment Put child left unresolved after a
-/// lost answer. It still blocks the fence until the operator reconciles; reconcile settles it
-/// `NotApplied` WITHOUT reading a receipt (none can exist for a Put), completes the parent, and
-/// admission then succeeds.
+/// lost answer. The journal still loads (`recover` lists the Put unresolved). A plain acquire then
+/// settles the Put `NotApplied` WITHOUT reading a receipt (none can exist for a Put) and closes the
+/// parent, so a new parent can begin.
 #[tokio::test]
-async fn an_older_builds_unresolved_put_child_is_settled_not_applied_without_a_receipt_read() {
+async fn an_older_builds_lone_put_child_still_loads_then_acquire_settles_it_without_a_receipt_read()
+{
     let directory = tempfile::tempdir().unwrap();
     std::fs::create_dir(directory.path().join(".lore")).unwrap();
     let (parent, records) = {
@@ -157,12 +158,7 @@ async fn an_older_builds_unresolved_put_child_is_settled_not_applied_without_a_r
     };
     let put = &records[0];
 
-    // The old journal still loads, and still closes the fence.
-    assert!(
-        RepositoryMutationGuard::acquire(directory.path())
-            .await
-            .is_err()
-    );
+    // The old journal still loads: `recover` reads it before any acquire, Put still listed.
     let guard = RepositoryMutationGuard::recover(directory.path())
         .await
         .unwrap();
@@ -177,15 +173,14 @@ async fn an_older_builds_unresolved_put_child_is_settled_not_applied_without_a_r
             .any(|line| line.contains(&put.attempt_id.to_string())
                 && line.contains("StorageService.Put"))
     );
+    drop(store);
+    drop(guard);
 
-    let calls = AtomicUsize::new(0);
-    reconcile_stores(&guard, |_, _| {
-        calls.fetch_add(1, Ordering::SeqCst);
-        async { panic!("a legacy fragment Put has no receipt and must never be looked up") }
-    })
-    .await
-    .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // A plain acquire settles the lone Put NotApplied (no receipt read) and closes its parent.
+    let guard = RepositoryMutationGuard::acquire(directory.path())
+        .await
+        .expect("a parent holding only a legacy Put must not block admission");
+    let store = guard.store();
     assert!(store.unresolved().await.unwrap().is_empty());
     let settled = store.lookup(&put.attempt_id).await.unwrap().unwrap();
     assert_eq!(
@@ -195,11 +190,24 @@ async fn an_older_builds_unresolved_put_child_is_settled_not_applied_without_a_r
     let parents = store.managed_parents().await.unwrap();
     assert_eq!(parents[0].id, parent.to_string());
     assert!(parents[0].complete);
+    guard
+        .begin(Uuid::now_v7(), "push".into(), "branch".into())
+        .await
+        .unwrap();
     drop(store);
     drop(guard);
-    RepositoryMutationGuard::acquire(directory.path())
+
+    // Reconcile has nothing left to look up.
+    let guard = RepositoryMutationGuard::recover(directory.path())
         .await
-        .expect("reconcile must reopen the fence");
+        .unwrap();
+    let calls = AtomicUsize::new(0);
+    let _ = reconcile_stores(&guard, |_, _| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async { panic!("a legacy fragment Put has no receipt and must never be looked up") }
+    })
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
 
 /// Mixed parent: the Put settles locally, the `BranchPush` still goes through the receipt lookup

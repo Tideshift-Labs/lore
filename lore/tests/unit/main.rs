@@ -14,6 +14,7 @@ mod call_delegation;
 mod file;
 mod lock;
 mod log;
+mod recovery;
 mod remote;
 mod repository;
 mod revision;
