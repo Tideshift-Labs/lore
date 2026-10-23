@@ -7489,4 +7489,469 @@ mod storage_remote_tests {
             })
             .await
     }
+
+    /// A served store that faults one address: answers `SlowDown` to its first `slow_downs`
+    /// gets, and counts every get and query that names it so a test can tell the fault was hit.
+    ///
+    /// The target is set after the test has pushed, so only the clone under test meets the fault.
+    struct FaultOnAddress {
+        inner: Arc<dyn lore_storage::ImmutableStore>,
+        target: Mutex<Option<lore_base::types::Address>>,
+        slow_downs: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
+        queries: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FaultOnAddress {
+        fn names_target(&self, address: &lore_base::types::Address) -> bool {
+            *self.target.lock().unwrap() == Some(*address)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl lore_storage::ImmutableStore for FaultOnAddress {
+        // Answered from the wrapped store, as `SlowDownOnce` does: a decorator that let these
+        // default would misdescribe whatever it wraps.
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn isolates_partitions(&self) -> bool {
+            self.inner.isolates_partitions()
+        }
+
+        fn read_scope(&self) -> lore_storage::StoreMatch {
+            self.inner.read_scope()
+        }
+
+        fn query_scope(&self) -> lore_storage::StoreMatch {
+            self.inner.query_scope()
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+        ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
+            if self.names_target(&address) {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self
+                    .slow_downs
+                    .try_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+                {
+                    return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
+                }
+            }
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            addresses: &[lore_base::types::Address],
+            results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), lore_storage::StoreError> {
+            if addresses.iter().any(|address| self.names_target(address)) {
+                self.queries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+        ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            fragment: lore_base::types::Fragment,
+            payload: Option<bytes::Bytes>,
+            force: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            stats: Arc<lore_storage::StoreObliterateStats>,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: lore_base::types::Partition,
+            source_address: lore_base::types::Address,
+            destination_partition: lore_base::types::Partition,
+            destination_context: lore_base::types::Context,
+            behavior: CopyBehavior,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    behavior,
+                )
+                .await
+        }
+    }
+
+    /// What a clone of a pushed revision did against a server that faults its delta block.
+    struct CloneOutcome {
+        status: i32,
+        /// Every error message the clone reported, joined.
+        errors: String,
+        /// Remote gets that named the delta block.
+        gets: usize,
+        /// Remote queries that named the delta block.
+        queries: usize,
+        /// Whether the delta block read back from the clone's own store with the server gone.
+        /// `None` when the clone failed, so there is no clone to read.
+        delta_offline: Option<bool>,
+    }
+
+    /// Pushes a real commit to an in-process server, faults that revision's delta block, and
+    /// clones it through `lore::repository::clone`.
+    ///
+    /// `slow_downs` is how many gets of the delta block answer `SlowDown`; `obliterate` removes
+    /// the block from the server for good.
+    async fn clone_with_delta_block_fault(
+        slow_downs: usize,
+        obliterate: bool,
+    ) -> Result<CloneOutcome, Box<dyn Error>> {
+        use lore::branch;
+        use lore::file;
+        use lore::repository;
+        use lore::revision;
+        use lore_base::error::NoRemote;
+        use lore_base::test_util::TempDir;
+        use lore_base::types::Address;
+        use lore_revision::filter::Filter;
+        use lore_revision::instance::InstanceId;
+        use lore_revision::interface::LoreArray;
+        use lore_revision::repository::LoreSharedStoreMode;
+        use lore_revision::repository::RepositoryAccess;
+        use lore_revision::repository::RepositoryContext;
+        use lore_revision::repository::RepositoryContextCreationArgs;
+        use lore_revision::state::State;
+
+        let (backend_immutable, backend_mutable) = make_backends().await;
+        let fault = Arc::new(FaultOnAddress {
+            inner: backend_immutable.clone(),
+            target: Mutex::new(None),
+            slow_downs: std::sync::atomic::AtomicUsize::new(slow_downs),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+            queries: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let served: Arc<dyn lore_storage::ImmutableStore> = fault.clone();
+        let server = start_test_server_with(served, backend_mutable.clone()).await;
+
+        let temp = TempDir::new("lore-clone-delta-");
+        let source_path = temp.join("source");
+        let clone_path = temp.join("clone");
+        std::fs::create_dir_all(&source_path)?;
+        let globals = |path: &std::path::Path| LoreGlobalArgs {
+            repository_path: path.into(),
+            identity: "test-user".into(),
+            ..Default::default()
+        };
+        let url = format!("{}/clone-delta-block", server.url);
+
+        let status = repository::create(
+            globals(&source_path),
+            repository::LoreRepositoryCreateArgs {
+                repository_url: url.as_str().into(),
+                description: LoreString::default(),
+                id: LoreString::default(),
+                use_shared_store: LoreSharedStoreMode::Disabled,
+                shared_store_path: LoreString::default(),
+                vfs: Default::default(),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 0,
+            "repository create against the test server failed"
+        );
+
+        std::fs::write(
+            source_path.join("held.txt"),
+            "a file whose commit has a delta",
+        )?;
+        let status = file::stage(
+            globals(&source_path),
+            file::LoreFileStageArgs {
+                paths: LoreArray::from_vec(vec![LoreString::from(".")]),
+                case_change: 0,
+                scan: 1,
+            },
+            None,
+        )
+        .await;
+        assert_eq!(status, 0, "stage failed");
+
+        let committed: Arc<
+            Mutex<Option<(lore_base::types::Hash, lore_revision::lore::RepositoryId)>>,
+        > = Arc::default();
+        let committed_for_callback = committed.clone();
+        let status = revision::commit(
+            globals(&source_path),
+            revision::LoreRevisionCommitArgs {
+                message: "Initial commit".into(),
+                link: Default::default(),
+                link_paths: Default::default(),
+                layer: Default::default(),
+                layer_paths: Default::default(),
+                link_messages: Default::default(),
+                layer_messages: Default::default(),
+            },
+            Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::RevisionCommitRevision(data) = event {
+                    *committed_for_callback.lock().unwrap() =
+                        Some((data.revision, data.repository));
+                }
+            })),
+        )
+        .await;
+        assert_eq!(status, 0, "commit failed");
+        let (revision_hash, repository_id) = committed
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or("commit reported no revision")?;
+
+        let status = branch::push(
+            globals(&source_path),
+            branch::LoreBranchPushArgs {
+                branch: LoreString::default(),
+                fast_forward_merge: 0,
+            },
+            None,
+        )
+        .await;
+        assert_eq!(status, 0, "push to the test server failed");
+
+        // Read the delta block's address from the server's own copy of the pushed state.
+        let server_repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+            paths: None,
+            immutable_store: backend_immutable.clone(),
+            mutable_store: backend_mutable,
+            id: repository_id,
+            instance_id: InstanceId::default(),
+            remote: Err(lore_transport::ProtocolError::from(NoRemote)),
+            filter: Arc::new(Filter::default()),
+            filesystem_provider: None,
+        }));
+        let tree = State::deserialize(server_repository.clone(), revision_hash)
+            .await?
+            .tree(server_repository)
+            .await?;
+        assert!(
+            !tree.hash_delta.is_zero(),
+            "the pushed commit must name a delta block"
+        );
+        let delta_address = Address::zero_context_hash(tree.hash_delta);
+        if obliterate {
+            backend_immutable
+                .clone()
+                .obliterate(
+                    repository_id,
+                    delta_address,
+                    Arc::new(lore_storage::StoreObliterateStats::default()),
+                )
+                .await?;
+        }
+        *fault.target.lock().unwrap() = Some(delta_address);
+
+        let (sink, callback) = {
+            let errors: Arc<Mutex<Vec<String>>> = Arc::default();
+            let errors_for_callback = errors.clone();
+            let callback: LoreEventCallback =
+                Some(Box::new(move |event: &LoreEvent| match event {
+                    LoreEvent::Error(data) => errors_for_callback
+                        .lock()
+                        .unwrap()
+                        .push(data.error_inner.to_string()),
+                    LoreEvent::Complete(data) => errors_for_callback
+                        .lock()
+                        .unwrap()
+                        .push(data.error.message.to_string()),
+                    _ => {}
+                }));
+            (errors, callback)
+        };
+        let status = repository::clone(
+            globals(&clone_path),
+            repository::LoreRepositoryCloneArgs {
+                repository_url: url.as_str().into(),
+                use_shared_store: LoreSharedStoreMode::Disabled,
+                ..Default::default()
+            },
+            callback,
+        )
+        .await;
+        let errors = sink.lock().unwrap().join(" | ");
+
+        // Read offline, so a delta block that is not in the clone's own store cannot be fetched
+        // from the server.
+        drop(server);
+        let delta_offline = if status == 0 {
+            let execution =
+                std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_server(
+                    LoreGlobalArgs {
+                        offline: 1,
+                        ..Default::default()
+                    },
+                    lore_revision::relay::EventDispatcher::no_dispatch(),
+                    "storage-remote-clone-delta-offline".to_string(),
+                ));
+            Some(
+                LORE_CONTEXT
+                    .scope(execution, async {
+                        let clone_repository = lore_revision::repository::load_and_connect(
+                            &clone_path,
+                            RepositoryAccess::ReadOnly,
+                        )
+                        .await?;
+                        let state =
+                            State::deserialize(clone_repository.clone(), revision_hash).await?;
+                        Ok::<_, Box<dyn Error>>(state.delta_block(clone_repository).await.is_ok())
+                    })
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        Ok(CloneOutcome {
+            status,
+            errors,
+            gets: fault.gets.load(std::sync::atomic::Ordering::SeqCst),
+            queries: fault.queries.load(std::sync::atomic::Ordering::SeqCst),
+            delta_offline,
+        })
+    }
+
+    /// Clone caches the target state's records. A delta block that answers `SlowDown` for more
+    /// gets than one `remote_get_retry` pass allows fails the first caching pass; clone's second
+    /// pass must fetch it, or the clone's next offline commit fails with "Address not found".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_caches_delta_block_after_slow_down_outlasts_first_pass() -> TestResult {
+        // One pass makes the first get, then one per retry the store policy allows (60 by default).
+        let first_pass_gets = lore_storage::STORE_RETRY_ATTEMPTS
+            .get()
+            .copied()
+            .unwrap_or(60)
+            + 1;
+        let slow_downs = first_pass_gets + 9;
+
+        let outcome = clone_with_delta_block_fault(slow_downs, false).await?;
+        assert!(
+            outcome.gets > first_pass_gets,
+            "the fault must outlast one retry pass, but the delta block saw {} gets",
+            outcome.gets
+        );
+        assert_eq!(
+            outcome.status, 0,
+            "clone must succeed on its retry pass: {}",
+            outcome.errors
+        );
+        assert_eq!(
+            outcome.delta_offline,
+            Some(true),
+            "the delta block must read back from the clone's own store with no remote"
+        );
+        Ok(())
+    }
+
+    /// A delta block the remote does not have fails the clone, naming the cache failure,
+    /// rather than leaving a clone whose next offline commit fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_fails_when_delta_block_unfetchable() -> TestResult {
+        let outcome = clone_with_delta_block_fault(0, true).await?;
+        assert!(
+            outcome.gets + outcome.queries > 0,
+            "the clone must have asked the server for the delta block"
+        );
+        assert_ne!(
+            outcome.status, 0,
+            "clone must fail: {:?}",
+            outcome.delta_offline
+        );
+        assert!(
+            outcome
+                .errors
+                .contains("Failed to cache the cloned state's fragments"),
+            "the failure must name the cache failure, got: {}",
+            outcome.errors
+        );
+        Ok(())
+    }
 }

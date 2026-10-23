@@ -1349,7 +1349,7 @@ async fn clone_materialize(
         let cache_repository = repository.clone();
         let cache_state = state.clone();
         cache_task = Some(lore_spawn!(async move {
-            let _ = cache_state.cache_fragments(cache_repository).await;
+            cache_state.cache_fragments(cache_repository).await
         }));
 
         clone_result = clone_in_path(ctx).await;
@@ -1360,8 +1360,28 @@ async fn clone_materialize(
     })
     .send();
 
+    // An offline commit reads the cloned state's records, the delta block among them, from
+    // the local store. A fragment the cache task failed to fetch gets one more pass, and a
+    // second failure fails the clone, rather than leave a clone whose next commit fails with
+    // "Address not found". Only those records are cached, not file content. Each pass backs
+    // off on SlowDown, and fetches only what the local store lacks. In a dry run, or when
+    // the clone failed anyway, caching stays best effort.
     if let Some(task) = cache_task {
-        let _ = task.await;
+        let cached = task.await.unwrap_or_else(|err| {
+            Err(state::StateError::internal(format!(
+                "Cache task failed: {err}"
+            )))
+        });
+        if let Err(err) = cached {
+            if clone_result.is_ok() && !execution_context().globals().dry_run() {
+                lore_warn!("Retrying the cache of the cloned state's fragments: {err}");
+                clone_result = Box::pin(state.cache_fragments(repository.clone()))
+                    .await
+                    .forward::<CloneError>("Failed to cache the cloned state's fragments");
+            } else {
+                lore_debug!("Caching the cloned state's fragments failed: {err}");
+            }
+        }
     }
 
     crate::instance::store_current_anchor_branch(&repository, branch_id)

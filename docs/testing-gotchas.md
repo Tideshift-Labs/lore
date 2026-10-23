@@ -119,6 +119,18 @@ Durable, recurring testing lessons grouped by topic.
   catch-all bucket. A `tokio_postgres::Error` is unconstructible in a unit test; test the pure
   `code`/`message` functions and pin the shared message literal by source scan. A test-only
   `match` over a cause enum trips clippy `match_same_arms` if two arms share a body: merge them.
+- **Real clone against an in-process server** (`storage_remote_test.rs`,
+  `clone_with_delta_block_fault`): `lore::repository::create` with `<server.url>/<name>`, stage,
+  commit (a plain commit names a non-zero `tree.hash_delta`), `branch::push`, then wrap the served
+  store with a fault set AFTER the push. Run it as `--test integration <name>` (one binary, not
+  `--test storage_remote_test`). `server.shutdown().await` after a clone panics (the clone's pooled
+  connection keeps the listener up): `drop(server)` and read the clone with an `offline: 1`
+  `ExecutionContext` + `load_and_connect(path, ReadOnly)` instead. A full `remote_get_retry` pass
+  on SlowDown is 61 gets and ~55 s wall (50 ms to 1 s backoff, 60 attempts), so a "outlasts one
+  pass" test costs about a minute. Save a fix hunk for revert with `cmd /c "git diff -- f > p"`:
+  PowerShell `Set-Content` adds CRLF and `git apply -R` then fails. A file restored with
+  `Copy-Item` keeps its old mtime, so cargo reuses the build of the reverted source: set
+  `LastWriteTime` to now after any restore, or a "red" result may be a stale binary.
 
 ## Postgres & Database Testing
 
