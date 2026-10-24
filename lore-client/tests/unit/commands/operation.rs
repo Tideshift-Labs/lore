@@ -57,7 +57,9 @@ async fn managed_child(store: &RepositoryAttemptStore, method: &str) -> (Uuid, A
                 parent_id: parent,
                 repository: record.repository,
                 rpc: method.into(),
-                canonical_request: vec![8, 1],
+                // An empty request decodes as a lock request naming no resources, so an applied
+                // lock receipt has no ownership to recover here.
+                canonical_request: Vec::new(),
                 endpoint: "grpcs://original.invalid/".into(),
                 verified_issuer: "original-issuer".into(),
                 authenticated_subject: "original-subject".into(),
@@ -246,6 +248,7 @@ async fn a_legacy_put_beside_a_branch_push_settles_the_put_and_still_reads_the_p
             async move {
                 Ok(DomainAttemptReceipt {
                     method: "branch.push".into(),
+                    acquired_locks: Vec::new(),
                     state,
                 })
             }
@@ -334,6 +337,7 @@ async fn branch_create_reconciliation_requires_exact_receipt_method_and_original
                 );
                 Ok(DomainAttemptReceipt {
                     method: method.into(),
+                    acquired_locks: Vec::new(),
                     state: DomainReceiptState::Committed {
                         outcome: DomainReceiptOutcome::Applied,
                         from_future_marker: false,
@@ -437,6 +441,7 @@ async fn exact_legacy_force_unlock_receipt_settles_original_child_and_parent() {
                 );
                 Ok(DomainAttemptReceipt {
                     method: "lock.force_release".into(),
+                    acquired_locks: Vec::new(),
                     state: DomainReceiptState::Committed {
                         outcome,
                         from_future_marker: false,
@@ -491,6 +496,7 @@ async fn wrong_method_or_nonattributive_force_unlock_receipt_keeps_parent_blocke
                 async move {
                     Ok(DomainAttemptReceipt {
                         method: method.into(),
+                        acquired_locks: Vec::new(),
                         state,
                     })
                 }
@@ -552,6 +558,7 @@ async fn a_receipt_that_is_not_committed_reports_its_state_not_a_method_mismatch
             async move {
                 Ok(DomainAttemptReceipt {
                     method: String::new(),
+                    acquired_locks: Vec::new(),
                     state,
                 })
             }
@@ -587,6 +594,7 @@ async fn a_committed_receipt_with_the_wrong_method_still_reports_a_method_mismat
     let error = reconcile_stores(&guard, |_, _| async {
         Ok(DomainAttemptReceipt {
             method: "lock.release".into(),
+            acquired_locks: Vec::new(),
             state: DomainReceiptState::Committed {
                 outcome: DomainReceiptOutcome::Applied,
                 from_future_marker: false,

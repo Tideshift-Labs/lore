@@ -135,6 +135,7 @@ async fn a_nondecisive_branch_push_receipt_still_refuses_and_names_the_child() {
             Ok(DomainAttemptReceipt {
                 method: String::new(),
                 state: DomainReceiptState::NotFound,
+                acquired_locks: Vec::new(),
             })
         }
     })
@@ -169,6 +170,7 @@ async fn a_committed_applied_branch_push_receipt_settles_the_child_and_admits() 
                     outcome: DomainReceiptOutcome::Applied,
                     from_future_marker: false,
                 },
+                acquired_locks: Vec::new(),
             })
         }
     })

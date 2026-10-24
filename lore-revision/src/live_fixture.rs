@@ -204,7 +204,17 @@ pub enum RpcOutcome {
     /// its repository-operation verifier is down and it never filed a receipt (Gate 0 campaign
     /// c13). The [`NotPreparedProof`] picks which attempt id the proof names.
     RefuseNotPrepared(NotPreparedProof),
+    /// Apply a lock verb, file a committed `Applied` receipt for its attempt, then lose the answer.
+    ///
+    /// The shape a real fenced cell produces when the mutation commits and the response does not
+    /// arrive: the client sees what [`Self::LoseTheAnswer`] gives it, and a later receipt read
+    /// returns what the server recorded, including the granted ownership tokens for an acquire.
+    /// Revision RPCs treat it as [`Self::LoseTheAnswer`]; this fixture files no revision receipts.
+    ApplyThenLoseTheAnswer,
 }
+
+/// The subject [`MANAGED_FIXTURE_TOKEN`] names, which a real cell records as a lock's owner.
+pub const MANAGED_FIXTURE_SUBJECT: &str = "fixture-user";
 
 /// Which attempt id a [`RpcOutcome::RefuseNotPrepared`] proof names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,6 +393,8 @@ struct ServerState {
     revision_policy: Mutex<RevisionPolicy>,
     /// Monotonic counter feeding minted ownership tokens, so two granted rows never share one.
     minted: Mutex<u64>,
+    /// Where [`RpcOutcome::ApplyThenLoseTheAnswer`] files the receipt the lost answer leaves.
+    receipts: Arc<receipt::ReceiptProbe>,
 }
 
 /// A running in-process lock server, plus everything a test needs to interrogate it.
@@ -432,6 +444,7 @@ impl LockServer {
             revision_calls: Mutex::new(Vec::new()),
             revision_policy: Mutex::new(revision),
             minted: Mutex::new(0),
+            receipts: receipts.clone(),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -645,6 +658,31 @@ impl StubLockService {
             .collect()
     }
 
+    /// File the committed `Applied` receipt an [`RpcOutcome::ApplyThenLoseTheAnswer`] leaves, under
+    /// the repository and attempt the request carried.
+    fn file_receipt<T>(
+        &self,
+        request: &Request<T>,
+        method: &str,
+        locks: Vec<lore_proto::lock::Lock>,
+    ) {
+        let repository = request
+            .metadata()
+            .get_bin("urc-repository-id-bin")
+            .and_then(|value| value.to_bytes().ok())
+            .map(|bytes| bytes.to_vec())
+            .unwrap_or_default();
+        let attempt = request
+            .metadata()
+            .get(ATTEMPT_ID_METADATA_KEY)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            .expect("an applied fixture mutation carries its attempt id");
+        self.state
+            .receipts
+            .commit(repository, attempt, method.to_owned(), locks);
+    }
+
     fn outcome(&self, rpc: LockRpc) -> RpcOutcome {
         let policy = self.state.policy.lock();
         match rpc {
@@ -674,6 +712,11 @@ impl LockService for StubLockService {
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::RefuseNotPrepared(proof) => {
                 Err(not_prepared_refusal(request.metadata(), proof))
+            }
+            RpcOutcome::ApplyThenLoseTheAnswer => {
+                let locks = self.grant(resources, MANAGED_FIXTURE_SUBJECT);
+                self.file_receipt(&request, "lock.acquire", locks);
+                Err(lost_answer())
             }
             RpcOutcome::Grant => Ok(Response::new(LockResponse {
                 locks: self.grant(resources, "fixture-owner"),
@@ -722,6 +765,10 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::Unlock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::ApplyThenLoseTheAnswer => {
+                self.file_receipt(&request, "lock.release", Vec::new());
+                Err(lost_answer())
+            }
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::RefuseNotPrepared(proof) => {
                 Err(not_prepared_refusal(request.metadata(), proof))
@@ -750,6 +797,11 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::AdminLock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::ApplyThenLoseTheAnswer => {
+                let locks = self.grant(resources, &owner);
+                self.file_receipt(&request, "lock.admin_acquire", locks);
+                Err(lost_answer())
+            }
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::RefuseNotPrepared(proof) => {
                 Err(not_prepared_refusal(request.metadata(), proof))
@@ -770,6 +822,10 @@ impl LockService for StubLockService {
         match self.outcome(LockRpc::ForceUnlock) {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
             RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::ApplyThenLoseTheAnswer => {
+                self.file_receipt(&request, "lock.force_release", Vec::new());
+                Err(lost_answer())
+            }
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::RefuseNotPrepared(proof) => {
                 Err(not_prepared_refusal(request.metadata(), proof))
@@ -815,7 +871,7 @@ impl RevisionService for StubRevisionService {
         let policy = self.state.revision_policy.lock().clone();
         match policy.branch_create {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
-            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswer | RpcOutcome::ApplyThenLoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::RefuseNotPrepared(proof) => {
                 Err(not_prepared_refusal(request.metadata(), proof))
@@ -898,7 +954,7 @@ impl RevisionService for StubRevisionService {
         let outcome = self.state.revision_policy.lock().branch_push;
         match outcome {
             RpcOutcome::Refuse(refusal) => Err(refusal.status()),
-            RpcOutcome::LoseTheAnswer => Err(lost_answer()),
+            RpcOutcome::LoseTheAnswer | RpcOutcome::ApplyThenLoseTheAnswer => Err(lost_answer()),
             RpcOutcome::LoseTheAnswerCancelled => Err(lost_answer_cancelled()),
             RpcOutcome::RefuseNotPrepared(proof) => {
                 Err(not_prepared_refusal(request.metadata(), proof))

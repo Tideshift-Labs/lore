@@ -88,6 +88,50 @@ pub fn recovery_receipt_method_matches(recorded_rpc: &str, receipt_method: &str)
     )
 }
 
+/// The lock resources a managed lock child named, with the ownership token each presented, read
+/// back from the canonical request it journalled before dispatch. Recovery uses this to bind a
+/// receipt to what the attempt asked for; it never resends the request.
+pub fn recorded_lock_resources(
+    recorded_rpc: &str,
+    canonical_request: &[u8],
+) -> Result<Vec<crate::attempt_store::FencedLockResource>, ProtocolError> {
+    use prost::Message;
+    let invalid = |error: prost::DecodeError| {
+        ProtocolError::internal(format!(
+            "recorded {recorded_rpc} request does not decode: {error}"
+        ))
+    };
+    let resources = if recorded_rpc == GrpcRpc::LockLock.wire_name() {
+        lore_proto::lock::LockRequest::decode(canonical_request)
+            .map_err(invalid)?
+            .resources
+    } else if recorded_rpc == GrpcRpc::LockUnlock.wire_name() {
+        lore_proto::lock::UnlockRequest::decode(canonical_request)
+            .map_err(invalid)?
+            .resources
+    } else if recorded_rpc == GrpcRpc::LockForceUnlock.wire_name() {
+        lore_proto::lock::ForceUnlockRequest::decode(canonical_request)
+            .map_err(invalid)?
+            .resources
+    } else {
+        return Err(ProtocolError::internal(format!(
+            "{recorded_rpc} is not a recoverable lock request"
+        )));
+    };
+    resources
+        .into_iter()
+        .map(|resource| {
+            let token = crate::attempt_store::OwnershipToken::from_wire(
+                resource.expected_ownership_token.as_ref(),
+            )?;
+            Ok(crate::attempt_store::FencedLockResource::with_token(
+                resource.into(),
+                token,
+            ))
+        })
+        .collect()
+}
+
 /// Whether a recorded child is a fragment Put from a build that still journaled them.
 ///
 /// Fragment Puts write no child since 2026-10-22. Old journals may still hold unresolved ones,

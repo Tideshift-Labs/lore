@@ -144,9 +144,17 @@ async fn attempt_receipt_get_impl(
         response.prepared_at_unix_millis,
         response.hard_expires_at_unix_millis,
     )?;
+    // A malformed token fails the read rather than being dropped: a settled acquire whose token
+    // was discarded is a lock its owner cannot release.
+    let acquired_locks = response
+        .acquired_locks
+        .into_iter()
+        .map(super::lock_client::wire_to_acquired_lock)
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(DomainAttemptReceipt {
         state,
         method: response.method,
+        acquired_locks,
     })
 }
 

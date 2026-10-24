@@ -173,7 +173,8 @@ impl DomainReceiptState {
 /// to the operation whose full intent I can restate", which a client that lost a response cannot
 /// ask; this answers "what happened to the attempt I named before I dispatched it", which is the
 /// only thing such a client still holds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `PartialEq` without `Eq`, because the granted locks it carries are not `Eq`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct DomainAttemptReceipt {
     /// What the server knows about the attempt. Read exactly as [`DomainReceipt::state`] is.
     pub state: DomainReceiptState,
@@ -183,6 +184,12 @@ pub struct DomainAttemptReceipt {
     /// worth the trouble: a client reconciling several unresolved attempts at once has no other
     /// way to notice that it asked about one and was answered about another.
     pub method: String,
+    /// The locks an `Applied` acquire granted, each with the ownership token it was issued.
+    ///
+    /// The server fills this only for its authenticated owner and only for a committed `Applied`
+    /// acquire. A reconciler that settles such an attempt must keep these tokens exactly as a live
+    /// acquire keeps them, or the lock it holds can be released only by an administrator.
+    pub acquired_locks: Vec<crate::attempt_store::AcquiredLock>,
 }
 
 /// A receipt lookup's answer, with the witness the server echoed back.

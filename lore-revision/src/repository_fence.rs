@@ -138,6 +138,11 @@ impl RepositoryMutationGuard {
         Ok(())
     }
 
+    /// The canonical worktree root this guard admits.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn store(&self) -> Arc<RepositoryAttemptStore> {
         self.store.clone()
     }

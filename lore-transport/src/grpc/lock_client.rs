@@ -50,7 +50,9 @@ fn fenced_resource_to_wire(resource: &FencedLockResource) -> lore_proto::lock::R
 ///
 /// A malformed token width fails the whole acquire rather than being dropped: the alternative is
 /// reporting a lock acquired that nothing can later release.
-fn wire_to_acquired_lock(lock: lore_proto::lock::Lock) -> Result<AcquiredLock, ProtocolError> {
+pub(crate) fn wire_to_acquired_lock(
+    lock: lore_proto::lock::Lock,
+) -> Result<AcquiredLock, ProtocolError> {
     let ownership_token = OwnershipToken::from_wire(lock.ownership_token.as_ref())?;
     Ok(AcquiredLock {
         lock: LockData::from(lock),

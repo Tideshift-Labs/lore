@@ -128,7 +128,7 @@ where
             // State before method: a lookup that found no receipt carries no method at all, and
             // checking the method first reported that absence as a method mismatch (Gate 0
             // campaign c13, 2026-10-13).
-            let lore_transport::DomainReceiptState::Committed { outcome, .. } = receipt.state
+            let lore_transport::DomainReceiptState::Committed { outcome, .. } = &receipt.state
             else {
                 blockers.push(format!(
                     "{source}: {} receipt is nondecisive ({}); remains blocked",
@@ -155,6 +155,23 @@ where
                     lore_transport::AttemptResolution::NotApplied
                 }
             };
+            // Before the child settles: an applied acquire keeps its tokens and an applied release
+            // clears them, exactly as the live verb would have. A failure keeps the child blocked.
+            if let Err(error) = lore_revision::lock::recovered::settle_recovered_ownership(
+                fence.root(),
+                &store,
+                &child.attempt_id,
+                &child.operation,
+                &receipt,
+            )
+            .await
+            {
+                blockers.push(format!(
+                    "{source}: {} lock ownership not recovered: {error}; remains blocked",
+                    child.attempt_id
+                ));
+                continue;
+            }
             store.resolve(&child.attempt_id, resolution).await?;
         }
         for parent in store

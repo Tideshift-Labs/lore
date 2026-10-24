@@ -664,6 +664,73 @@ impl RepositoryAttemptStore {
         Ok(())
     }
 
+    /// The managed intent journalled for one attempt, on its child or as a legacy root orphan.
+    fn managed_intent(
+        &self,
+        document: &StoredDocument,
+        attempt: &AttemptId,
+    ) -> Result<Option<StoredManagedIntent>, ProtocolError> {
+        let id = attempt.to_string();
+        Ok(self
+            .child(document, &id)?
+            .and_then(|(child, _)| child.managed)
+            .or_else(|| {
+                document
+                    .managed
+                    .iter()
+                    .find(|child| child.attempt == id)
+                    .cloned()
+            }))
+    }
+
+    /// Forget each ownership row whose stored token is the one named, in one guarded write.
+    ///
+    /// For a recovered release: the journalled request names the token it presented, so a row
+    /// re-acquired since then holds a different token and is kept.
+    pub async fn clear_ownership_matching(
+        &self,
+        released: &[(Context, Hash, OwnershipToken)],
+    ) -> Result<(), ProtocolError> {
+        if released.is_empty() {
+            return Ok(());
+        }
+        let released = released
+            .iter()
+            .map(|(branch, resource, token)| {
+                (
+                    branch.to_string(),
+                    resource.to_string(),
+                    hex::encode(token.as_bytes()),
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        self.update(|document| {
+            document.ownership.retain(|held| {
+                !released.contains(&(
+                    held.branch.clone(),
+                    held.resource.clone(),
+                    held.token.clone(),
+                ))
+            });
+        })
+        .await
+    }
+
+    /// The RPC and canonical request a managed child journalled before dispatch. Read only to
+    /// bind a recovered receipt to what the attempt asked for; never resent.
+    pub async fn managed_request(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<(String, Vec<u8>), ProtocolError> {
+        let _local = self.write_guard.lock().await;
+        let guard = self.guard().await?;
+        let document = self.load(&guard)?;
+        let managed = self
+            .managed_intent(&document, attempt)?
+            .ok_or_else(|| ProtocolError::internal("attempt has no managed request"))?;
+        Ok((managed.rpc, managed.canonical_request))
+    }
+
     pub async fn recovery_context(
         &self,
         attempt: &AttemptId,
@@ -672,15 +739,7 @@ impl RepositoryAttemptStore {
         let guard = self.guard().await?;
         let document = self.load(&guard)?;
         let managed = self
-            .child(&document, &attempt.to_string())?
-            .and_then(|(child, _)| child.managed)
-            .or_else(|| {
-                document
-                    .managed
-                    .iter()
-                    .find(|child| child.attempt == attempt.to_string())
-                    .cloned()
-            })
+            .managed_intent(&document, attempt)?
             .ok_or_else(|| ProtocolError::internal("attempt has no managed namespace"))?;
         let namespace = document
             .parents

@@ -1,6 +1,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 //! Test-only receipt authority. JWT signature verification belongs to live auth tests.
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use lore_base::types::RepositoryId;
@@ -18,13 +19,30 @@ use uuid::Uuid;
 pub struct ReceiptProbe {
     expected: Mutex<Option<(RepositoryId, Uuid)>>,
     calls: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
+    /// Receipts a lock mutation committed before its answer was lost, keyed by attempt:
+    /// repository bytes, receipt method, and the granted locks with their tokens.
+    committed: Mutex<HashMap<Uuid, CommittedReceipt>>,
 }
+
+type CommittedReceipt = (Vec<u8>, String, Vec<lore_proto::lock::Lock>);
 impl ReceiptProbe {
     pub fn allow(&self, repository: RepositoryId, attempt: Uuid) {
         *self.expected.lock() = Some((repository, attempt));
     }
     pub fn calls(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         self.calls.lock().clone()
+    }
+    /// File a committed `Applied` receipt for one attempt in one repository.
+    pub fn commit(
+        &self,
+        repository: Vec<u8>,
+        attempt: Uuid,
+        method: String,
+        locks: Vec<lore_proto::lock::Lock>,
+    ) {
+        self.committed
+            .lock()
+            .insert(attempt, (repository, method, locks));
     }
 }
 #[lore_macro::test_pub]
@@ -69,6 +87,23 @@ impl DomainOperationService for ReceiptService {
             .calls
             .lock()
             .push((repository.to_vec(), attempt.to_vec()));
+        let committed = Uuid::from_slice(&attempt)
+            .ok()
+            .and_then(|attempt| self.0.committed.lock().get(&attempt).cloned());
+        if let Some((filed_under, method, acquired_locks)) = committed {
+            if filed_under != repository.as_ref() {
+                return Err(Status::permission_denied(
+                    "wrong receipt namespace or attempt",
+                ));
+            }
+            return Ok(Response::new(DomainOperationAttemptReceiptGetResponse {
+                status: DomainOperationReceiptStatus::Committed as i32,
+                outcome: DomainOperationOutcome::Applied as i32,
+                method,
+                acquired_locks,
+                ..Default::default()
+            }));
+        }
         let expected = *self.0.expected.lock();
         let Some((expected_repo, expected_attempt)) = expected else {
             return Err(Status::permission_denied(

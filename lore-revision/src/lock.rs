@@ -14,6 +14,7 @@ use crate::lore::Hash;
 use crate::lore::RepositoryId;
 
 pub mod file;
+pub mod recovered;
 pub mod util;
 
 #[error_set]
