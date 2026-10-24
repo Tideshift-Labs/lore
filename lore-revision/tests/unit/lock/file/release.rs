@@ -151,6 +151,7 @@ fn release_options(fixture: &LiveRepository) -> ReleaseOptions {
         branch: String::new(),
         owner: String::new(),
         owner_id: String::new(),
+        all_owners: false,
     }
 }
 

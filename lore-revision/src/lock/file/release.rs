@@ -39,6 +39,7 @@ use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::repository::RepositoryContext;
 use crate::state;
 use crate::util::path::RelativePath;
@@ -49,6 +50,12 @@ pub struct ReleaseOptions {
     pub branch: String,
     pub owner: String,
     pub owner_id: String,
+    /// Break every owner's locks on the branch, not only the caller's.
+    ///
+    /// Only meaningful with `--force` and no paths, and only with no owner named. Without it, the
+    /// no-paths `--force` release clears the caller's own locks and nobody else's. This is the
+    /// explicit opt-in for an administrator who means to break other people's locks.
+    pub all_owners: bool,
 }
 
 #[error_set]
@@ -179,6 +186,15 @@ pub async fn release(
         resolved.id
     };
 
+    let force = execution_context().globals().force();
+    let owner_named = !options.owner_id.is_empty() || !options.owner.is_empty();
+    if options.all_owners && (!force || !options.paths.is_empty() || owner_named) {
+        return Err(InvalidArguments {
+            reason: "--all-owners needs --force, and takes no paths and no --owner".to_owned(),
+        }
+        .into());
+    }
+
     let owner = if !options.owner_id.is_empty() {
         Some(options.owner_id)
     } else if !options.owner.is_empty() {
@@ -196,7 +212,6 @@ pub async fn release(
     // shape that can escalate to an administrative takeover: `ForceUnlock` names the owner it
     // believes it is releasing, and there is nowhere else on this path to learn one.
     let mut queried_owners = HashMap::<lock::LockResource, String>::new();
-    let force = execution_context().globals().force();
     if !options.paths.is_empty() {
         // When --force flag IS enabled we attempt to release a lock on all paths passed
         // When --force flag ISN'T enabled we attempt to release a lock considering the following
@@ -248,6 +263,31 @@ pub async fn release(
         // If there are no paths and --force flag IS enabled we attempt to release all locks for
         // i) the current branch or the branch passed in by the --branch option
         // ii) the current user or the user passed in by the --owner option
+        // iii) every owner, only when --all-owners asks for it
+        //
+        // Fork change: the query used to send no owner when --owner was not given, so it returned
+        // every owner's locks on the branch, despite (ii). For an elevated caller that was a
+        // silent takeover of the whole branch: the legacy store's `Unlock` waives the ownership
+        // check for an owner or admin, and on a fenced cell the refused rows escalate to
+        // `ForceUnlock` per owner below. The no-owner default is now the caller, and breaking
+        // other people's locks takes the explicit `all_owners` opt-in.
+        let caller = if owner.is_none() && !options.all_owners {
+            let caller = execution_context().user_id().await;
+            if caller.is_empty() {
+                // Without a known caller the query would match every owner, which is the
+                // takeover this default exists to prevent.
+                return Err(InvalidArguments {
+                    reason: "Cannot tell which locks are yours: no identity is known. Pass \
+                             --owner, or --all-owners to break every owner's locks"
+                        .to_owned(),
+                }
+                .into());
+            }
+            Some(caller)
+        } else {
+            None
+        };
+        let query_owner = owner.as_deref().or(caller.as_deref());
 
         let response = remote
             .lock(repository.id)
@@ -255,15 +295,49 @@ pub async fn release(
             .forward_with::<ReleaseError, _>(|| {
                 format!("Failed to connect to remote {}", remote.remote_url())
             })?
-            .query(Some(branch), owner.as_deref(), None)
+            .query(Some(branch), query_owner, None)
             .await
             .forward::<ReleaseError>("Failed to query the locks")?;
 
         for lock in response.iter() {
+            // The query already filtered on the owner. This is a second check, so a server that
+            // ignores the filter cannot turn a release of one owner's locks into a takeover of
+            // another owner's.
+            if let Some(expected) = query_owner
+                && lock.owner != expected
+            {
+                lore_debug!(
+                    "Skipping a queried lock held by another owner: {}",
+                    lock.resource.description
+                );
+                continue;
+            }
             let relative_path = &lock.resource.description;
             let resource = assemble_resource_for_path(relative_path.as_str(), branch);
             queried_owners.insert(resource.clone(), lock.owner.clone());
             resources.insert(resource);
+        }
+
+        // Breaking other people's locks must say whose locks it breaks, before it does, and in a
+        // dry run too. Both explicit targets list them: --all-owners, and a named --owner.
+        if options.all_owners || owner.is_some() {
+            let mut named = queried_owners
+                .iter()
+                .map(|(resource, owner)| (resource.description.as_str(), owner.as_str()))
+                .collect::<Vec<_>>();
+            named.sort();
+            let whose = if options.all_owners {
+                "any owner"
+            } else {
+                "the named owner"
+            };
+            lore_warn!(
+                "Breaking {} lock(s) held by {whose} on this branch",
+                named.len()
+            );
+            for (path, owner) in named {
+                lore_warn!("{path} held by {owner}");
+            }
         }
     }
 
@@ -589,7 +663,9 @@ async fn unlock_batches(
 ///
 /// * **no owner is known.** Only the `--force`-with-no-paths shape rebuilds its set from a
 ///   `Query`, which is where an owner comes from. A release naming explicit paths has none, and
-///   the server's own refusal already names the remedy in that case.
+///   the server's own refusal already names the remedy in that case. That query names the caller
+///   as the owner unless `--owner` or `--all-owners` was given, so by default the only owner this
+///   can name is the caller, and the server admits a caller's force release of its own locks.
 /// * **the escalation itself fails.** A caller with no administrative permission, or a cell with
 ///   no fenced routing, gets the `Unlock` refusal back — on a fenced cell that message is the
 ///   actionable one, and on an unfenced cell `ForceUnlock`'s own refusal would be a red herring.
@@ -603,7 +679,7 @@ async fn force_release(
     attempts: Option<&Arc<dyn AttemptStore>>,
 ) -> Result<(), ReleaseError> {
     // Grouped by owner because one `ForceUnlock` names exactly one. A rebuilt set spans several
-    // when `--owner` was not given and the branch holds other people's locks.
+    // only under `--all-owners`, when the branch holds other people's locks.
     let mut by_owner: HashMap<&str, Vec<LockResource>> = HashMap::new();
     for resource in resources {
         let Some(owner) = owners.get(&resource.resource) else {

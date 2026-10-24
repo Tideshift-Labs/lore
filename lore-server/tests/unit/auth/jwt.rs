@@ -1114,6 +1114,25 @@ mod jwt_verifier {
             assert_eq!(verified.identity(), "the u");
         }
 
+        /// The client's caller id and the server's lock owner are the same string by default.
+        ///
+        /// `lore lock release --force` with no paths queries the locks owned by the caller, and
+        /// names the caller by the client's identity: the `sub` the credential store decodes.
+        /// The server records a lock's owner as `identity()`. If the two read different claims,
+        /// that release would match none of the caller's own locks.
+        #[tokio::test]
+        async fn the_clients_identity_is_the_owner_the_server_records() {
+            let token = encoded_token();
+            let verified = verifier_with_identity_claim(DEFAULT_IDENTITY_CLAIM)
+                .verify_token(&token)
+                .await
+                .expect("verifies");
+            assert_eq!(
+                lore_credential::jwt::identity_from_token(&token),
+                verified.identity()
+            );
+        }
+
         #[tokio::test]
         async fn a_configured_claim_is_recorded_beside_the_subject() {
             let verified = verifier_with_identity_claim("preferred_username")

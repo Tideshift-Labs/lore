@@ -483,6 +483,7 @@ pub async fn acquire(
                 branch: options.branch,
                 owner: String::default(),
                 owner_id: String::default(),
+                all_owners: false,
             };
 
             // The same store the successful batches just wrote their tokens into, so the rollback

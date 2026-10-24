@@ -43,6 +43,10 @@ use lore_transport::error::ProtocolError;
 use lore_transport::outcome::AttemptId;
 use lore_transport::outcome::GrpcRpc;
 
+/// The repository identity the escalation tests run as. A no-paths `--force` release clears the
+/// caller's own locks, so the rows these tests escalate are owned by this identity.
+const CALLER: &str = "fixture-user";
+
 fn no_callback() -> LoreEventCallback {
     lore_revision::event::convert_event_callback(LoreEventCallbackConfig {
         user_context: 0,
@@ -747,7 +751,12 @@ fn the_force_release_escalation_is_journalled() {
         ..LockPolicy::default()
     }));
     let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
-        LiveRepository::create(&server.remote_url()).await
+        LiveRepository::create_with_files_and_identity(
+            &server.remote_url(),
+            &["locked.file"],
+            CALLER,
+        )
+        .await
     }));
 
     // The escalation needs a known owner, which only a `Query` response provides -- naming the
@@ -756,10 +765,7 @@ fn the_force_release_escalation_is_journalled() {
         mint_ownership_tokens: false,
         unlock: RpcOutcome::Refuse(Refusal::PermissionDenied),
         force_unlock: RpcOutcome::Grant,
-        query_result: vec![(
-            fixture.committed_files[0].clone(),
-            "someone-else".to_owned(),
-        )],
+        query_result: vec![(fixture.committed_files[0].clone(), CALLER.to_owned())],
         ..LockPolicy::default()
     });
 
@@ -842,7 +848,12 @@ fn a_lost_answer_on_the_unlock_is_not_escalated_to_a_force_release() {
         ..LockPolicy::default()
     }));
     let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
-        LiveRepository::create(&server.remote_url()).await
+        LiveRepository::create_with_files_and_identity(
+            &server.remote_url(),
+            &["locked.file"],
+            CALLER,
+        )
+        .await
     }));
 
     // The escalation needs a known owner, which only a `Query` response provides -- naming the
@@ -852,10 +863,7 @@ fn a_lost_answer_on_the_unlock_is_not_escalated_to_a_force_release() {
         mint_ownership_tokens: false,
         unlock: RpcOutcome::LoseTheAnswer,
         force_unlock: RpcOutcome::Grant,
-        query_result: vec![(
-            fixture.committed_files[0].clone(),
-            "someone-else".to_owned(),
-        )],
+        query_result: vec![(fixture.committed_files[0].clone(), CALLER.to_owned())],
         ..LockPolicy::default()
     });
 
@@ -1066,7 +1074,12 @@ fn an_unlock_answered_with_cancelled_is_not_escalated_to_a_force_release() {
         ..LockPolicy::default()
     }));
     let fixture = runtime.block_on(LORE_CONTEXT.scope(fixture_execution_context(), async {
-        LiveRepository::create(&server.remote_url()).await
+        LiveRepository::create_with_files_and_identity(
+            &server.remote_url(),
+            &["locked.file"],
+            CALLER,
+        )
+        .await
     }));
 
     // The escalation needs a known owner, which only a `Query` response provides -- naming the
@@ -1076,10 +1089,7 @@ fn an_unlock_answered_with_cancelled_is_not_escalated_to_a_force_release() {
         mint_ownership_tokens: false,
         unlock: RpcOutcome::LoseTheAnswerCancelled,
         force_unlock: RpcOutcome::Grant,
-        query_result: vec![(
-            fixture.committed_files[0].clone(),
-            "someone-else".to_owned(),
-        )],
+        query_result: vec![(fixture.committed_files[0].clone(), CALLER.to_owned())],
         ..LockPolicy::default()
     });
 

@@ -306,6 +306,10 @@ pub struct LoreLockFileReleaseArgs {
 
 /// Releases file locks on the specified paths for a given branch and owner.
 ///
+/// With `--force` and no paths, releases every lock on the branch held by `owner`/`owner_id`, or
+/// by the caller when neither is given. To release every owner's locks, use
+/// [`file_release_all_owners_with_attempt_store`].
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -355,7 +359,33 @@ pub async fn file_release_with_attempt_store(
         )
         .await;
     }
-    file_release_journalled(globals, args, callback, Some(attempts)).await
+    file_release_journalled(globals, args, callback, Some(attempts), false).await
+}
+
+/// Release every owner's locks on the branch: `--force`, no paths, `--all-owners`.
+///
+/// Fork addition. [`file_release_with_attempt_store`] with `--force` and no paths clears only the
+/// caller's own locks. Breaking other people's locks is a separate, explicit entry point so no
+/// caller reaches it by leaving a field empty, and it lists each owner and path before it acts.
+/// It is not on the C ABI or the service wire, so [`LoreLockFileReleaseArgs`] keeps its layout.
+/// The server still decides: without the `owner` permission, other owners' rows are refused.
+pub async fn file_release_all_owners_with_attempt_store(
+    globals: LoreGlobalArgs,
+    args: LoreLockFileReleaseArgs,
+    callback: LoreEventCallback,
+    attempts: Arc<dyn AttemptStore>,
+) -> i32 {
+    if service_in_use().await {
+        return reject_undelegatable(
+            globals,
+            callback,
+            "file_release_all_owners_with_attempt_store cannot delegate to a service: the attempt \
+             store is in-process. Turn service relaying off (LORE_USE_SERVICE=0, or [service] use_automatically = false)."
+                .to_owned(),
+        )
+        .await;
+    }
+    file_release_journalled(globals, args, callback, Some(attempts), true).await
 }
 
 fn file_release_local(
@@ -363,7 +393,7 @@ fn file_release_local(
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
 ) -> impl Future<Output = i32> {
-    file_release_journalled(globals, args, callback, None)
+    file_release_journalled(globals, args, callback, None, false)
 }
 
 fn file_release_journalled(
@@ -371,6 +401,7 @@ fn file_release_journalled(
     args: LoreLockFileReleaseArgs,
     callback: LoreEventCallback,
     attempts: Option<Arc<dyn AttemptStore>>,
+    all_owners: bool,
 ) -> impl Future<Output = i32> {
     crate::call::repository_call_mutation_read(
         globals,
@@ -383,6 +414,7 @@ fn file_release_journalled(
                 branch: args.branch.to_string(),
                 owner: args.owner.to_string(),
                 owner_id: args.owner_id.to_string(),
+                all_owners,
             };
 
             let ownership = repository_attempt_store(&repository);

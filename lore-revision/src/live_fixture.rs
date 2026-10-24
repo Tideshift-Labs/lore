@@ -122,7 +122,8 @@ pub struct LockCall {
     pub authorization_matches_fixture: bool,
     /// The `description` of every resource in the request, in wire order.
     pub descriptions: Vec<String>,
-    /// The owner named by an `AdminLock` or `ForceUnlock`, empty otherwise.
+    /// The owner named by an `AdminLock`, `ForceUnlock` or `Query`, empty otherwise (a `Query` with
+    /// no owner filter records an empty owner).
     pub owner: String,
     /// Whether every resource in the request carried an ownership token.
     pub all_resources_carried_a_token: bool,
@@ -307,6 +308,12 @@ pub struct LockPolicy {
     /// the release path — it rebuilds the resource from the description itself — so the rest of
     /// the row is left at its default.
     pub query_result: Vec<(String, String)>,
+    /// Answer `Query` with every row in `query_result` even when the request names an owner.
+    ///
+    /// The default is `false`: the stub filters rows by the requested owner, like the real
+    /// server. Set it to model a server that ignores the filter, which is what the client's own
+    /// second check on each row's owner defends against.
+    pub query_ignores_owner: bool,
 }
 
 /// How much of an `Unlock` request a successful answer confirms.
@@ -331,6 +338,7 @@ impl Default for LockPolicy {
             mint_ownership_tokens: true,
             unlock_echo: UnlockEcho::All,
             query_result: Vec::new(),
+            query_ignores_owner: false,
         }
     }
 }
@@ -734,11 +742,26 @@ impl LockService for StubLockService {
         &self,
         request: Request<QueryRequest>,
     ) -> Result<Response<QueryResponse>, Status> {
-        self.record(LockRpc::Query, &request, &[], "");
-        let rows = self.state.policy.lock().query_result.clone();
+        let requested_owner = request.get_ref().owner.clone();
+        self.record(
+            LockRpc::Query,
+            &request,
+            &[],
+            requested_owner.as_deref().unwrap_or(""),
+        );
+        let (rows, ignores_owner) = {
+            let policy = self.state.policy.lock();
+            (policy.query_result.clone(), policy.query_ignores_owner)
+        };
         Ok(Response::new(QueryResponse {
             result: rows
                 .into_iter()
+                .filter(|(_, owner)| {
+                    ignores_owner
+                        || requested_owner
+                            .as_deref()
+                            .is_none_or(|wanted| wanted == owner)
+                })
                 .map(|(description, owner)| lore_proto::lock::Lock {
                     resource: Some(lore_proto::lock::Resource {
                         description,
@@ -1078,6 +1101,18 @@ impl LiveRepository {
     /// A managed fixture selects a named principal before opening its connection.
     pub async fn create_managed(remote_url: &str) -> Self {
         Self::create_with_identity(remote_url, &["locked.file"], Some("fixture-user")).await
+    }
+
+    /// As [`Self::create_with_files`], with the repository config naming `identity` as the caller.
+    ///
+    /// The execution context's user id, which a verb reads as "the caller", is taken from that
+    /// config identity, so this is how a test chooses who is calling.
+    pub async fn create_with_files_and_identity(
+        remote_url: &str,
+        names: &[&str],
+        identity: &str,
+    ) -> Self {
+        Self::create_with_identity(remote_url, names, Some(identity)).await
     }
 
     async fn create_with_identity(

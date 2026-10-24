@@ -330,8 +330,8 @@ pub trait AttemptStore: Send + Sync {
     ///
     /// Defaulted to a loop over [`Self::ownership_for`], so an implementation with no cheaper
     /// bulk read needs nothing here. An implementation whose single read touches a disk should
-    /// override it: `lore lock release --force` rebuilds its set from a `Query` over the whole
-    /// branch, and asking one resource at a time turns one read into thousands.
+    /// override it: `lore lock release --force` rebuilds its set from a `Query` over a branch,
+    /// and asking one resource at a time turns one read into thousands.
     async fn ownership_for_batch(
         &self,
         resources: &[(Context, Hash)],

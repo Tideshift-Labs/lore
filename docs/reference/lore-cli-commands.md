@@ -2648,6 +2648,8 @@ Query the lock status given a branch, owner or path
 
 Release lock on file(s)
 
+With --force and no paths, releases every lock on the branch that you hold, or that --owner holds. Other people's locks are released only when --owner or --all-owners names them.
+
 **Usage:** `lore lock release [OPTIONS] [paths]...`
 
 ###### **Arguments:**
@@ -2658,6 +2660,7 @@ Release lock on file(s)
 
 * `--branch <branch>` — Branch where lock was acquired
 * `--owner <owner>` — Owner of the lock
+* `--all-owners` — With --force and no paths, break every owner's locks on the branch, listing each one. Needs the repository's owner permission to break other people's locks
 
 
 

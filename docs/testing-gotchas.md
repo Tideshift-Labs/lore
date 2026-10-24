@@ -21,6 +21,18 @@ Durable, recurring testing lessons grouped by topic.
   restored file to a new mtime or run `cargo clean -p <crate>`, and confirm a `Compiling <crate>`
   line before trusting results.
 
+## Live lock fixture (`lore-revision/src/live_fixture.rs`)
+
+- **`Log` events never reach a test callback** (`lore_warn!` text, e.g. the force-release listing):
+  `lore::log::initialize()` is what routes `lore_log_dispatch` into the execution context. Call it
+  in the test's capture helper (idempotent). Without it the captured log list is silently empty.
+- **Who is "the caller"**: `execution_context().user_id()` comes from the repository config
+  `identity`. `LiveRepository::create` sets none (empty caller); use
+  `create_with_files_and_identity(url, names, "fixture-user")` to choose one.
+- **The stub `Query` filters by requested owner and records it in `LockCall.owner`**; set
+  `LockPolicy.query_ignores_owner` to model a server that ignores the filter. Tests of
+  no-paths `--force` release: `lore/tests/release_owner_scope.rs`.
+
 ## Deterministic async tests
 
 - **Time pausing**: `#[tokio::test(start_paused = true)]` doesn't work well with cross-thread I/O (`lore_io::IoDriver`) or tasks spawned on the global `lore_base::runtime::runtime()`. Use unpaused clocks with real margins for these.

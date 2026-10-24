@@ -48,6 +48,10 @@ pub enum LockFileCommands {
     Query(FileLockQueryArgs),
 
     /// Release lock on file(s)
+    ///
+    /// With --force and no paths, releases every lock on the branch that you hold, or that
+    /// --owner holds. Other people's locks are released only when --owner or --all-owners
+    /// names them.
     Release(FileLockReleaseArgs),
 }
 
@@ -94,8 +98,12 @@ pub struct FileLockReleaseArgs {
     #[clap(long, value_name = "branch")]
     branch: Option<String>,
     /// Owner of the lock
-    #[clap(long, value_name = "owner")]
+    #[clap(long, value_name = "owner", conflicts_with = "all_owners")]
     owner: Option<String>,
+    /// With --force and no paths, break every owner's locks on the branch, listing each one.
+    /// Needs the repository's owner permission to break other people's locks
+    #[clap(long, conflicts_with = "paths")]
+    all_owners: bool,
 }
 
 fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u8 {
@@ -291,6 +299,22 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
         }) as EventCallbackFn)
             .with_defaults(),
     ));
+
+    if args.all_owners {
+        return runtime().block_on(crate::commands::operation::managed(
+            &globals.clone(),
+            "lock-release",
+            format!("{release_args:?} all_owners"),
+            |store| {
+                lock::file_release_all_owners_with_attempt_store(
+                    globals,
+                    release_args,
+                    callback,
+                    store,
+                )
+            },
+        )) as u8;
+    }
 
     return runtime().block_on(crate::commands::operation::managed(
         &globals.clone(),
