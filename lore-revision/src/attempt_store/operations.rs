@@ -275,12 +275,13 @@ impl RepositoryAttemptStore {
 
     /// Settles what needs no server answer, so a crash does not block the next write.
     ///
-    /// A fragment Put child from an older build settles `NotApplied` without a read (WP-120
-    /// decision reversal, 2026-10-22). An open parent then closes when it has no uncertainty
-    /// code, no root orphan intent, and no child other than settled Puts. Every irreversible
-    /// step records its child before any effect, so such a parent moved no branch and no lock,
-    /// and its Puts are content-addressed: there is nothing to reconcile. A parent with any
-    /// other child, settled or not, is left for its receipts and body evidence. Call this only
+    /// A fragment Put, Copy or `PutResolved` child from an older build settles `NotApplied`
+    /// without a read (WP-120 decision reversals, 2026-10-22 and 2026-10-23). An open parent
+    /// then closes when it has no uncertainty code, no root orphan intent, and no child other
+    /// than those settled writes. Every irreversible step records its child before any effect,
+    /// so such a parent moved no branch and no lock; its Puts and Copies are content-addressed
+    /// and a `PutResolved` key is last-writer-wins: there is nothing to reconcile. A parent with
+    /// any other child, settled or not, is left for its receipts and body evidence. Call this only
     /// under the exclusive admission lock, where an open parent cannot belong to a live body.
     /// Returns whether anything changed.
     /// Production callers go through `RepositoryMutationGuard::settle_receiptless`, which
@@ -294,7 +295,7 @@ impl RepositoryAttemptStore {
         let mut changed = false;
         for pending in self.children(&document, true)? {
             if !pending.attempt.state.is_unresolved()
-                || !lore_transport::caller_operation::is_legacy_fragment_put(
+                || !lore_transport::caller_operation::is_legacy_unjournaled_write(
                     &pending.attempt.operation,
                 )
             {
@@ -312,7 +313,7 @@ impl RepositoryAttemptStore {
             return Ok(changed);
         }
         // Parents that keep a claim on a server answer: an orphan intent, or any child that is
-        // not a settled fragment Put.
+        // not a settled Put, Copy or PutResolved.
         let mut retained = document
             .managed
             .iter()
@@ -323,7 +324,7 @@ impl RepositoryAttemptStore {
                 .into_iter()
                 .filter(|child| {
                     child.attempt.state.is_unresolved()
-                        || !lore_transport::caller_operation::is_legacy_fragment_put(
+                        || !lore_transport::caller_operation::is_legacy_unjournaled_write(
                             &child.attempt.operation,
                         )
                 })

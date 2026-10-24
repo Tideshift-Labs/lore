@@ -206,16 +206,24 @@ fn workflow_path_detection_uses_complete_components_for_both_separators() {
     }
 }
 
-/// A generic journaled child. `Copy` stays journaled; a fragment `Put` no longer is, so it is
-/// not the vehicle for the generic journal properties below.
+/// A generic journaled child. `MutableStore` stays journaled; a fragment `Put`, `Copy` and
+/// `PutResolved` no longer are, so none of them is the vehicle for the generic journal properties
+/// below.
 fn record(parent: Uuid) -> (AttemptRecord, ManagedAttemptIntent) {
-    record_for(parent, "StorageService.Copy")
+    record_for(parent, "StorageService.MutableStore")
 }
 
 /// The child an older build wrote for every fragment Put in a managed operation.
 fn legacy_put_record(parent: Uuid) -> (AttemptRecord, ManagedAttemptIntent) {
     record_for(parent, "StorageService.Put")
 }
+
+/// Every storage write an older build journaled and this one no longer does.
+const LEGACY_UNJOURNALED: [&str; 3] = [
+    "StorageService.Put",
+    "StorageService.Copy",
+    "StorageService.PutResolved",
+];
 
 fn record_for(parent: Uuid, rpc: &str) -> (AttemptRecord, ManagedAttemptIntent) {
     let repository = RepositoryId::from([1; 16]);
@@ -400,6 +408,212 @@ async fn put_beside_a_settled_non_put_child_with_no_body_proof_still_blocks() {
     let parents = recovery.store().managed_parents().await.unwrap();
     assert!(!parents[0].complete);
     assert!(!parents[0].body_completed);
+}
+
+/// Copy and `PutResolved` stopped being journaled after Put did. An older build's unresolved child
+/// of any of the three settles `NotApplied` at the next acquire with no receipt read, and a parent
+/// whose only children are such settled writes closes.
+#[tokio::test]
+async fn an_older_builds_lone_unjournaled_write_child_is_settled_and_closed_by_acquire() {
+    for rpc in LEGACY_UNJOURNALED {
+        for body_completed in [false, true] {
+            let dir = worktree();
+            let parent = Uuid::now_v7();
+            let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+            let store = guard
+                .begin(parent, "push".into(), "branch".into())
+                .await
+                .unwrap();
+            let (child, intent) = record_for(parent, rpc);
+            store.record_managed(&child, &intent).await.unwrap();
+            if body_completed {
+                store.complete_parent_body(parent).await.unwrap();
+            }
+            drop(store);
+            drop(guard);
+
+            // `recover` settles nothing, so the old journal still lists the child.
+            let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+            assert_eq!(
+                recovery.store().unresolved().await.unwrap(),
+                vec![child.clone()],
+                "{rpc} body_completed={body_completed}"
+            );
+            drop(recovery);
+
+            let guard = RepositoryMutationGuard::acquire(dir.path())
+                .await
+                .unwrap_or_else(|error| panic!("{rpc} body_completed={body_completed}: {error}"));
+            let store = guard.store();
+            assert!(store.unresolved().await.unwrap().is_empty(), "{rpc}");
+            assert_eq!(
+                store
+                    .lookup(&child.attempt_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                AttemptState::Resolved(AttemptResolution::NotApplied),
+                "{rpc} body_completed={body_completed}"
+            );
+            let parents = store.managed_parents().await.unwrap();
+            assert!(
+                parents[0].complete && parents[0].body_completed,
+                "{rpc} body_completed={body_completed}"
+            );
+            guard
+                .begin(Uuid::now_v7(), "push".into(), "branch".into())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// One parent holding an unresolved child of each legacy write closes together.
+#[tokio::test]
+async fn a_parent_of_mixed_legacy_put_copy_and_put_resolved_children_closes() {
+    let dir = worktree();
+    let parent = Uuid::now_v7();
+    let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+    let store = guard
+        .begin(parent, "push".into(), "branch".into())
+        .await
+        .unwrap();
+    let mut children = Vec::new();
+    for rpc in LEGACY_UNJOURNALED {
+        let (child, intent) = record_for(parent, rpc);
+        store.record_managed(&child, &intent).await.unwrap();
+        children.push(child);
+    }
+    drop(store);
+    drop(guard);
+
+    let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+    for child in &children {
+        assert_eq!(
+            guard
+                .store()
+                .lookup(&child.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Resolved(AttemptResolution::NotApplied),
+            "{}",
+            child.operation
+        );
+    }
+    assert!(guard.store().managed_parents().await.unwrap()[0].complete);
+}
+
+/// A legacy Copy or `PutResolved` beside an unresolved `BranchPush`: the write settles but the
+/// parent still waits on the push receipt, so acquire refuses.
+#[tokio::test]
+async fn legacy_copy_or_put_resolved_beside_an_unresolved_branch_push_settles_but_still_blocks() {
+    for rpc in ["StorageService.Copy", "StorageService.PutResolved"] {
+        let dir = worktree();
+        let parent = Uuid::now_v7();
+        let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+        let store = guard
+            .begin(parent, "push".into(), "branch".into())
+            .await
+            .unwrap();
+        let (write, write_intent) = record_for(parent, rpc);
+        store.record_managed(&write, &write_intent).await.unwrap();
+        let (push, push_intent) = record_for(parent, "RevisionService.BranchPush");
+        store.record_managed(&push, &push_intent).await.unwrap();
+        store.complete_parent_body(parent).await.unwrap();
+        drop(store);
+        drop(guard);
+
+        assert!(
+            RepositoryMutationGuard::acquire(dir.path()).await.is_err(),
+            "{rpc}"
+        );
+        let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+        let store = recovery.store();
+        assert_eq!(store.unresolved().await.unwrap(), vec![push], "{rpc}");
+        assert_eq!(
+            store
+                .lookup(&write.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Resolved(AttemptResolution::NotApplied),
+            "{rpc}"
+        );
+        assert!(!store.managed_parents().await.unwrap()[0].complete, "{rpc}");
+    }
+}
+
+/// A legacy Copy or `PutResolved` plus a settled non-write child with the body unfinished is a
+/// partial composite: the settled child is evidence something may have happened.
+#[tokio::test]
+async fn legacy_copy_or_put_resolved_beside_a_settled_other_child_with_no_body_proof_still_blocks()
+{
+    for rpc in ["StorageService.Copy", "StorageService.PutResolved"] {
+        let dir = worktree();
+        let parent = Uuid::now_v7();
+        let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+        let store = guard
+            .begin(parent, "push".into(), "branch".into())
+            .await
+            .unwrap();
+        let (write, write_intent) = record_for(parent, rpc);
+        store.record_managed(&write, &write_intent).await.unwrap();
+        let (other, other_intent) = record(parent);
+        store.record_managed(&other, &other_intent).await.unwrap();
+        store
+            .resolve(&other.attempt_id, AttemptResolution::Applied)
+            .await
+            .unwrap();
+        drop(store);
+        drop(guard);
+
+        assert!(
+            RepositoryMutationGuard::acquire(dir.path()).await.is_err(),
+            "{rpc}"
+        );
+        let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+        let parents = recovery.store().managed_parents().await.unwrap();
+        assert!(!parents[0].complete, "{rpc}");
+        assert!(!parents[0].body_completed, "{rpc}");
+    }
+}
+
+/// A journaled child that merely resembles a legacy write is not one: it keeps its claim.
+#[tokio::test]
+async fn a_near_miss_rpc_name_is_not_settled_as_a_legacy_write() {
+    for rpc in [
+        "StorageService.Copy2",
+        "StorageService.PutResolve",
+        "StorageService.Verify",
+    ] {
+        let dir = worktree();
+        let parent = Uuid::now_v7();
+        let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+        let store = guard
+            .begin(parent, "push".into(), "branch".into())
+            .await
+            .unwrap();
+        let (child, intent) = record_for(parent, rpc);
+        store.record_managed(&child, &intent).await.unwrap();
+        store.complete_parent_body(parent).await.unwrap();
+        drop(store);
+        drop(guard);
+
+        assert!(
+            RepositoryMutationGuard::acquire(dir.path()).await.is_err(),
+            "{rpc}"
+        );
+        let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+        assert_eq!(
+            recovery.store().unresolved().await.unwrap(),
+            vec![child],
+            "{rpc}"
+        );
+    }
 }
 
 /// `finish_parent` prunes and re-validates settled history; a journal full of settled old `Put`

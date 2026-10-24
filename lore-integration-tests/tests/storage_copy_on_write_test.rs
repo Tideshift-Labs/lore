@@ -147,13 +147,13 @@ mod storage_copy_on_write_tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_copy_never_falls_back_to_put_and_reaches_the_public_result() -> TestResult {
+    async fn a_lost_copy_answer_never_falls_back_to_put_and_fails_the_public_result() -> TestResult
+    {
         unknown_copy_public_result(false).await
     }
 
     #[tokio::test]
-    async fn an_unknown_copy_dominates_invalid_and_successful_items_in_the_public_batch()
-    -> TestResult {
+    async fn a_lost_copy_answer_fails_only_its_item_in_a_mixed_public_batch() -> TestResult {
         unknown_copy_public_result(true).await
     }
 
@@ -246,10 +246,13 @@ mod storage_copy_on_write_tests {
                 let unresolved_snapshot = journal.unresolved().await.unwrap();
                 assert_eq!(server.counted.traffic().copies, 1,
                     "fixture must reach Copy before testing response-loss propagation; status={status}, events={event_snapshot:?}, unresolved={unresolved_snapshot:?}, completions={completion_snapshot:?}");
-                assert_eq!(
-                    status,
-                    lore_revision::interface::LoreError::OutcomeUnknown as i32,
-                    "traffic={:?}, events={:?}, unresolved={:?}, intents={:?}, completions={:?}",
+                // A managed Copy writes no journal child, so its lost answer is a plain failed
+                // write rather than an unknown outcome: the push fails, retryably, and holds no
+                // fence.
+                let outcome_unknown = lore_revision::interface::LoreError::OutcomeUnknown as i32;
+                assert!(
+                    status != 0 && status != outcome_unknown,
+                    "status={status}, traffic={:?}, events={:?}, unresolved={:?}, intents={:?}, completions={:?}",
                     server.counted.traffic(),
                     event_snapshot,
                     unresolved_snapshot,
@@ -258,18 +261,37 @@ mod storage_copy_on_write_tests {
                 );
                 let mut observed = events.lock().unwrap().clone();
                 observed.sort_by_key(|(id, _)| *id);
-                // Per-item events carry the error's own FFI code since upstream a3a90fd0.
-                let mut expected = vec![(
-                    1,
-                    lore_revision::interface::LoreError::OutcomeUnknown as i32,
-                )];
-                if mixed_batch {
-                    expected.extend([
-                        (2, lore_revision::interface::LoreError::InvalidArguments as i32),
-                        (3, 0),
-                    ]);
+                let lost = observed
+                    .iter()
+                    .find(|(id, _)| *id == 1)
+                    .map(|(_, code)| *code)
+                    .expect("item 1 reports its own failure");
+                // NotConnected (FFI code 29): the transport's lost-answer error reaches the
+                // storage layer as a plain connectivity failure, never as OutcomeUnknown.
+                let not_connected = 29;
+                assert_eq!(
+                    lost, not_connected,
+                    "the lost Copy answer must fail item 1 as a plain failure: {observed:?}"
+                );
+                if !mixed_batch {
+                    assert_eq!(status, not_connected);
                 }
-                assert_eq!(observed, expected);
+                if mixed_batch {
+                    assert_eq!(
+                        observed,
+                        vec![
+                            (1, lost),
+                            (
+                                2,
+                                lore_revision::interface::LoreError::InvalidArguments as i32
+                            ),
+                            (3, 0),
+                        ]
+                    );
+                } else {
+                    assert_eq!(observed, vec![(1, lost)]);
+                }
+                // The Copy may have applied, so no payload Put follows it.
                 assert_eq!(
                     server.counted.traffic(),
                     Traffic {
@@ -278,17 +300,22 @@ mod storage_copy_on_write_tests {
                         copies: 1
                     }
                 );
-                let unresolved = journal.unresolved().await?;
-                assert_eq!(unresolved.len(), 1);
+                assert!(journal.unresolved().await?.is_empty());
+                assert!(
+                    journal.intents.lock().unwrap().is_empty(),
+                    "a managed Copy must journal nothing"
+                );
                 let detail: serde_json::Value = {
                     let completed = completions.lock().unwrap();
                     assert_eq!(completed.len(), 1);
                     serde_json::from_str(&completed[0]).unwrap()
                 };
-                assert_eq!(detail["status"], 248);
-                assert_eq!(detail["error"]["errorCode"], 248);
-                assert_eq!(detail["error"]["attemptId"], unresolved[0].attempt_id.to_string());
-                assert_eq!(detail["error"]["operation"], "StorageService.Copy");
+                assert_ne!(detail["status"], outcome_unknown);
+                assert!(
+                    detail["error"]["attemptId"].is_null()
+                        || detail["error"]["attemptId"] == "",
+                    "no journaled attempt to name: {detail}"
+                );
                 close_handle(handle_id).await;
                 Ok(())
             })
@@ -336,8 +363,9 @@ mod storage_copy_on_write_tests {
                     )
                     .await?;
                     let journal = Arc::new(ManagedJournal::default());
-                    // A fragment Put writes no journal child, so the namespace a managed write
-                    // binds is read off the still-journaled Copy that follows the upload.
+                    // A fragment Put, Copy and PutResolved write no journal child, so the namespace
+                    // a managed write binds is read off the still-journaled mutable store that
+                    // follows the upload and the copy.
                     lore_transport::with_caller_operation(
                         lore_transport::CallerOperationContext::new(
                             uuid::Uuid::now_v7(),
@@ -363,6 +391,17 @@ mod storage_copy_on_write_tests {
                             session
                                 .copy(partition, written.address, Context::from([0x97; 16]))
                                 .await?;
+                            assert!(
+                                journal.intents.lock().unwrap().is_empty(),
+                                "a managed Copy must journal nothing"
+                            );
+                            session
+                                .mutable_store(
+                                    lore_base::types::Hash::from([0x96; 32]),
+                                    lore_base::types::Hash::from([0x95; 32]),
+                                    lore_base::types::KeyType::Untyped,
+                                )
+                                .await?;
                             TestResult::Ok(())
                         },
                     )
@@ -373,7 +412,7 @@ mod storage_copy_on_write_tests {
                     let intents = journal.intents.lock().unwrap();
                     assert_eq!(intents.len(), 1);
                     let actual = intents.values().next().unwrap();
-                    assert_eq!(actual.rpc, "StorageService.Copy");
+                    assert_eq!(actual.rpc, "StorageService.MutableStore");
                     assert_eq!(actual.endpoint, selected.endpoint);
                     assert_eq!(actual.repository, selected.repository);
                     assert_eq!(actual.verified_issuer, selected.verified_issuer);
@@ -513,6 +552,186 @@ mod storage_copy_on_write_tests {
             .await
     }
 
+    /// Whether any link of `error`'s chain is a `ProtocolError` carrying the unjournaled
+    /// lost-answer mark.
+    fn chain_has_unjournaled_answer_lost(error: &(dyn Error + 'static)) -> bool {
+        let mut current = Some(error);
+        while let Some(link) = current {
+            if link
+                .downcast_ref::<lore_transport::ProtocolError>()
+                .is_some_and(lore_transport::is_unjournaled_answer_lost)
+            {
+                return true;
+            }
+            current = link.source();
+        }
+        // PushError keeps the cause inside its own traced payload, not as a source() link, so
+        // the typed mark is read off the rendering of that payload.
+        format!("{error:?}").contains("UnjournaledAnswerLost {")
+    }
+
+    /// A real `push_fragments` with one copyable fragment (the peer holds the hash under another
+    /// context, the local store holds the payload) against the counting server, as a managed
+    /// operation. Returns the push result, the journal, and the peer's traffic.
+    async fn push_one_copyable_fragment(
+        server: &TestServer,
+    ) -> (
+        Result<(), lore_revision::branch::push::PushError>,
+        Arc<ManagedJournal>,
+    ) {
+        let handle_id = open_handle_with_token(server, FIXTURE_TOKEN).await;
+        let payload = b"copyable: the peer holds this hash under another context".to_vec();
+        let partition = Partition::from(*uuid::Uuid::now_v7().as_bytes());
+        let first = put_with_token(
+            handle_id,
+            partition,
+            Context::from([0x82; 16]),
+            &payload,
+            1,
+            0,
+            FIXTURE_TOKEN,
+        )
+        .await;
+        close_handle(handle_id).await;
+        server.counted.reset();
+
+        let address = Address {
+            hash: first.hash,
+            context: Context::from([0x83; 16]),
+        };
+        let immutable = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            ImmutableStoreCreateOptions::none(),
+            false,
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .unwrap();
+        let mutable = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable.clone(),
+        )
+        .await
+        .unwrap();
+        let mut context =
+            lore_revision::repository::RepositoryContext::new_null_context(immutable, mutable);
+        context.id = partition;
+        let repository = Arc::new(context);
+        let size = u32::try_from(payload.len()).unwrap();
+        repository
+            .immutable_store()
+            .put(
+                repository.id,
+                address,
+                Fragment {
+                    flags: 0,
+                    size_payload: size,
+                    size_content: u64::from(size),
+                },
+                Some(Bytes::from(payload)),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let connection = lore_transport::connect(
+            &server.url,
+            "fixture-user",
+            repository.id,
+            4,
+            "",
+            FIXTURE_TOKEN,
+        )
+        .await
+        .unwrap();
+        let session = connection
+            .session(repository.id, "push-copyable")
+            .await
+            .unwrap();
+        let queried = lore_revision::branch::push::PushQueryResult {
+            absent: Vec::new(),
+            copyable: vec![address],
+            present: Vec::new(),
+        };
+        let progress = Arc::new(lore_revision::branch::push::PushProgress::new(Arc::new(
+            lore_revision::branch::push::PushStats::new(false),
+        )));
+        let journal = Arc::new(ManagedJournal::default());
+        let result = lore_transport::with_caller_operation(
+            lore_transport::CallerOperationContext::new(
+                uuid::Uuid::now_v7(),
+                repository.id,
+                journal.clone(),
+            ),
+            lore_revision::branch::push::push_fragments(repository, session, queried, progress),
+        )
+        .await;
+        (result, journal)
+    }
+
+    /// A lost managed Copy answer fails the push, and the push does not fall back to a Put for
+    /// that address: the Copy may have applied, and an upload would be a second mutation.
+    #[tokio::test]
+    async fn a_push_whose_copy_answer_is_lost_fails_and_sends_no_fallback_put() -> TestResult {
+        LORE_CONTEXT
+            .scope(setup_execution("push-copy-lost".into()), async move {
+                let server = start_server().await;
+                // The Copy applies on the peer and its answer is lost.
+                server
+                    .counted
+                    .lose_copy_response
+                    .store(true, Ordering::SeqCst);
+                let (result, journal) = push_one_copyable_fragment(&server).await;
+                let error = result.expect_err("a lost Copy answer must fail the push");
+                assert!(!error.is_outcome_unknown(), "{error:?}");
+                assert!(
+                    error.to_string().contains("lost its answer")
+                        || format!("{error:?}").contains("lost its answer"),
+                    "{error:?}"
+                );
+                assert!(
+                    chain_has_unjournaled_answer_lost(&error),
+                    "the error chain must carry the lost-answer mark: {error:?}"
+                );
+                assert_eq!(
+                    server.counted.traffic(),
+                    Traffic {
+                        payload_puts: 0,
+                        empty_puts: 0,
+                        copies: 1
+                    },
+                    "one Copy, and no fallback Put"
+                );
+                assert!(journal.unresolved().await?.is_empty());
+                assert!(journal.intents.lock().unwrap().is_empty());
+                Ok(())
+            })
+            .await
+    }
+
+    /// A decisive Copy refusal still falls back to uploading the payload.
+    #[tokio::test]
+    async fn a_push_whose_copy_is_refused_still_falls_back_to_a_put() -> TestResult {
+        LORE_CONTEXT
+            .scope(setup_execution("push-copy-refused".into()), async move {
+                let server = start_refusing_server().await;
+                let (result, journal) = push_one_copyable_fragment(&server).await;
+                result.expect("a decisive refusal falls back to an upload");
+                assert_eq!(
+                    server.counted.traffic(),
+                    Traffic {
+                        payload_puts: 1,
+                        empty_puts: 0,
+                        copies: 1
+                    }
+                );
+                assert!(journal.unresolved().await?.is_empty());
+                assert!(journal.intents.lock().unwrap().is_empty());
+                Ok(())
+            })
+            .await
+    }
     /// What the peer was asked to do, so a test can say a payload never crossed the wire.
     #[derive(Debug, Default, PartialEq, Eq)]
     struct Traffic {

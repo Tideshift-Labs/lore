@@ -1,19 +1,23 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_transport::caller_operation::canonical_endpoint;
-use lore_transport::caller_operation::is_legacy_fragment_put;
+use lore_transport::caller_operation::is_legacy_unjournaled_write;
 use lore_transport::caller_operation::recovery_dial_url;
 use lore_transport::caller_operation::recovery_receipt_method_matches;
 
-/// Only the fragment Put an older build journaled is legacy; every other storage child stays
-/// journaled and so must not be mistaken for it.
+/// Only the fragment Put, Copy and `PutResolved` an older build journaled are legacy; every other
+/// child stays journaled and so must not be mistaken for them.
 #[test]
-fn only_the_exact_fragment_put_is_a_legacy_unjournaled_child() {
-    assert!(is_legacy_fragment_put("StorageService.Put"));
+fn only_the_exact_put_copy_and_put_resolved_are_legacy_unjournaled_children() {
+    for legacy in [
+        "StorageService.Put",
+        "StorageService.Copy",
+        "StorageService.PutResolved",
+    ] {
+        assert!(is_legacy_unjournaled_write(legacy), "{legacy:?}");
+    }
     for other in [
         "",
-        "StorageService.PutResolved",
-        "StorageService.Copy",
         "StorageService.Verify",
         "StorageService.MutableStore",
         "StorageService.MutableCompareAndSwap",
@@ -21,10 +25,18 @@ fn only_the_exact_fragment_put_is_a_legacy_unjournaled_child() {
         "RevisionService.BranchCreate",
         "LockService.Lock",
         "StorageService.Put ",
+        "StorageService.Copy ",
+        "StorageService.PutResolved ",
+        "StorageService.PutResolve",
+        "StorageService.Copy2",
         "storageservice.put",
+        "storageservice.copy",
+        "StorageService.putresolved",
         "Put",
+        "Copy",
+        "PutResolved",
     ] {
-        assert!(!is_legacy_fragment_put(other), "{other:?}");
+        assert!(!is_legacy_unjournaled_write(other), "{other:?}");
     }
 }
 

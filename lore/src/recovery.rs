@@ -85,7 +85,7 @@ where
     F: Fn(Arc<RepositoryAttemptStore>, AttemptId) -> Fut,
     Fut: Future<Output = Result<DomainAttemptReceipt, ProtocolError>>,
 {
-    // Legacy fragment Puts and childless parents need no server answer.
+    // Legacy Put, Copy and PutResolved children and childless parents need no server answer.
     fence.settle_receiptless().await?;
     let mut blockers = Vec::new();
     for (source, store) in fence.recovery_stores() {

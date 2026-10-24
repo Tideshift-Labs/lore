@@ -9,38 +9,46 @@ use lore_revision::attempt_store::StoredDocument;
 use lore_revision::attempt_store::StoredManagedIntent;
 use uuid::Uuid;
 
+/// An orphan intent (no child record) keeps its parent open whichever legacy write it names: the
+/// parent holds a claim on a server answer that no child can settle.
 #[tokio::test]
 async fn a_root_orphan_intent_keeps_its_parent_open() {
-    let dir = tempfile::tempdir().unwrap();
-    let parent_id = Uuid::from_u128(100);
-    let document = StoredDocument {
-        parents: vec![ManagedParent {
-            version: 1,
-            id: parent_id.to_string(),
-            root: "fixture".into(),
-            operation: "push".into(),
-            normalized_intent: "fixture".into(),
-            namespace: None,
-            complete: false,
-            parent_uncertainty_code: None,
-            body_completed: false,
-        }],
-        managed: vec![StoredManagedIntent {
-            attempt: Uuid::from_u128(1).to_string(),
-            parent: parent_id.to_string(),
-            rpc: "StorageService.Put".into(),
-            canonical_request: vec![8, 1],
-        }],
-        ..StoredDocument::default()
-    };
-    let mut bytes = vec![1];
-    bytes.extend(serde_json::to_vec(&document).unwrap());
-    std::fs::write(dir.path().join("attempts"), bytes).unwrap();
+    for rpc in [
+        "StorageService.Put",
+        "StorageService.Copy",
+        "StorageService.PutResolved",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_id = Uuid::from_u128(100);
+        let document = StoredDocument {
+            parents: vec![ManagedParent {
+                version: 1,
+                id: parent_id.to_string(),
+                root: "fixture".into(),
+                operation: "push".into(),
+                normalized_intent: "fixture".into(),
+                namespace: None,
+                complete: false,
+                parent_uncertainty_code: None,
+                body_completed: false,
+            }],
+            managed: vec![StoredManagedIntent {
+                attempt: Uuid::from_u128(1).to_string(),
+                parent: parent_id.to_string(),
+                rpc: rpc.into(),
+                canonical_request: vec![8, 1],
+            }],
+            ..StoredDocument::default()
+        };
+        let mut bytes = vec![1];
+        bytes.extend(serde_json::to_vec(&document).unwrap());
+        std::fs::write(dir.path().join("attempts"), bytes).unwrap();
 
-    let store = RepositoryAttemptStore::in_directory(dir.path());
-    assert!(!store.settle_receiptless().await.unwrap());
-    let parents = store.managed_parents().await.unwrap();
-    assert_eq!(parents.len(), 1);
-    assert!(!parents[0].complete);
-    assert!(!parents[0].body_completed);
+        let store = RepositoryAttemptStore::in_directory(dir.path());
+        assert!(!store.settle_receiptless().await.unwrap(), "{rpc}");
+        let parents = store.managed_parents().await.unwrap();
+        assert_eq!(parents.len(), 1, "{rpc}");
+        assert!(!parents[0].complete, "{rpc}");
+        assert!(!parents[0].body_completed, "{rpc}");
+    }
 }

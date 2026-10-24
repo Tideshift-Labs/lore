@@ -282,13 +282,162 @@ async fn a_legacy_put_beside_a_branch_push_settles_the_put_and_still_reads_the_p
     }
 }
 
-/// Only the fragment Put left by an older build is settled blind. Every other storage child has
-/// no receipt rail and stays blocked, and it is never looked up.
+/// An older build's unresolved Copy or `PutResolved` child (journaled before 2026-10-23) settles
+/// `NotApplied` at the next acquire with no receipt read, exactly as a fragment Put does, and its
+/// parent closes.
+#[tokio::test]
+async fn an_older_builds_lone_copy_or_put_resolved_child_settles_without_a_receipt_read() {
+    for method in ["StorageService.Copy", "StorageService.PutResolved"] {
+        let directory = tempfile::tempdir().unwrap();
+        let guard = RepositoryMutationGuard::recover(directory.path())
+            .await
+            .unwrap();
+        let store = guard.store();
+        let (parent, records) = managed_children(&store, &[method]).await;
+        // `recover` settles nothing, so the status shows the child.
+        assert!(
+            status_lines(&guard)
+                .await
+                .unwrap()
+                .iter()
+                .any(|line| line.contains(&records[0].attempt_id.to_string())
+                    && line.contains(method)),
+            "{method}"
+        );
+        drop(store);
+        drop(guard);
+
+        let guard = RepositoryMutationGuard::acquire(directory.path())
+            .await
+            .unwrap_or_else(|error| panic!("{method} must not block admission: {error}"));
+        let store = guard.store();
+        assert!(store.unresolved().await.unwrap().is_empty(), "{method}");
+        assert_eq!(
+            store
+                .lookup(&records[0].attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Resolved(lore_transport::AttemptResolution::NotApplied),
+            "{method}"
+        );
+        let parents = store.managed_parents().await.unwrap();
+        assert_eq!(parents[0].id, parent.to_string());
+        assert!(parents[0].complete, "{method}");
+        drop(store);
+        drop(guard);
+
+        let guard = RepositoryMutationGuard::recover(directory.path())
+            .await
+            .unwrap();
+        let calls = AtomicUsize::new(0);
+        let _ = reconcile_stores(&guard, |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                panic!("a legacy Copy or PutResolved has no receipt and must never be looked up")
+            }
+        })
+        .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{method}");
+    }
+}
+
+/// Reconcile on a blocked journal settles every legacy write blind and reads the receipt only for
+/// the `BranchPush` beside them.
+#[tokio::test]
+async fn legacy_copy_and_put_resolved_beside_a_branch_push_never_reach_the_receipt_lookup() {
+    let directory = tempfile::tempdir().unwrap();
+    let guard = RepositoryMutationGuard::recover(directory.path())
+        .await
+        .unwrap();
+    let store = guard.store();
+    let (_, records) = managed_children(
+        &store,
+        &[
+            "StorageService.Copy",
+            "RevisionService.BranchPush",
+            "StorageService.PutResolved",
+            "StorageService.Put",
+        ],
+    )
+    .await;
+    let push = records[1].attempt_id;
+    let looked_up = parking_lot::Mutex::new(Vec::new());
+    let result = reconcile_stores(&guard, |_, attempt| {
+        looked_up.lock().push(attempt);
+        async move {
+            Ok(DomainAttemptReceipt {
+                method: "branch.push".into(),
+                state: DomainReceiptState::Committed {
+                    outcome: DomainReceiptOutcome::Applied,
+                    from_future_marker: false,
+                },
+                acquired_locks: Vec::new(),
+            })
+        }
+    })
+    .await;
+    result.unwrap();
+    assert_eq!(*looked_up.lock(), vec![push], "only the push is looked up");
+    for write in [&records[0], &records[2], &records[3]] {
+        assert_eq!(
+            store
+                .lookup(&write.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Resolved(lore_transport::AttemptResolution::NotApplied),
+            "{}",
+            write.operation
+        );
+    }
+    assert!(store.unresolved().await.unwrap().is_empty());
+    assert!(store.managed_parents().await.unwrap()[0].complete);
+}
+
+/// A legacy Copy beside an unresolved `BranchPush` that no receipt decides stays blocked: the
+/// write settles, the parent does not close.
+#[tokio::test]
+async fn a_legacy_copy_beside_an_undecided_branch_push_settles_the_copy_and_stays_blocked() {
+    let directory = tempfile::tempdir().unwrap();
+    let guard = RepositoryMutationGuard::recover(directory.path())
+        .await
+        .unwrap();
+    let store = guard.store();
+    let (_, records) = managed_children(
+        &store,
+        &["StorageService.Copy", "RevisionService.BranchPush"],
+    )
+    .await;
+    let result = reconcile_stores(&guard, |_, _| async {
+        Ok(DomainAttemptReceipt {
+            method: String::new(),
+            state: DomainReceiptState::NotFound,
+            acquired_locks: Vec::new(),
+        })
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(
+        store
+            .lookup(&records[0].attempt_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        AttemptState::Resolved(lore_transport::AttemptResolution::NotApplied)
+    );
+    assert_eq!(store.unresolved().await.unwrap(), vec![records[1].clone()]);
+    assert!(!store.managed_parents().await.unwrap()[0].complete);
+}
+
+/// Only the fragment Put, Copy and `PutResolved` left by an older build are settled blind. Every
+/// other storage child has no receipt rail and stays blocked, and it is never looked up.
 #[tokio::test]
 async fn other_storage_children_stay_blocked_beside_a_settled_legacy_put() {
     for method in [
-        "StorageService.PutResolved",
-        "StorageService.Copy",
         "StorageService.Verify",
         "StorageService.MutableStore",
         "StorageService.MutableCompareAndSwap",

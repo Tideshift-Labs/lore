@@ -32,6 +32,7 @@ use lore_transport::caller_operation::with_caller_operation;
 use lore_transport::error::ProtocolError;
 use lore_transport::grpc::storage_client::*;
 use lore_transport::outcome::AttemptId;
+use lore_transport::outcome::GrpcRpc;
 use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::Response;
@@ -302,12 +303,23 @@ impl Service for FixtureServer {
         request: Request<Streaming<storage_v1::PutResolvedRequest>>,
     ) -> Result<Response<Self::PutResolvedStream>, Status> {
         self.observe(&request);
+        if matches!(self.reply, Reply::Refusal) {
+            return Err(refusal());
+        }
         let mut requests = request.into_inner();
         let items = self.items.clone();
+        let reply = self.reply;
         Ok(Response::new(Box::pin(async_stream::stream! {
-            if requests.next().await.is_some() {
+            if let Some(Ok(item)) = requests.next().await {
                 items.fetch_add(1, Ordering::SeqCst);
-                yield Err(Status::unavailable("resolved put response lost"));
+                match reply {
+                    Reply::Success => yield Ok(storage_v1::PutResolvedResponse { request_id: item.request_id, status: None }),
+                    Reply::ItemCancelled => yield Ok(storage_v1::PutResolvedResponse { request_id: item.request_id, status: Some(model_v1::ItemStatus { code: 1, message: "decisive per-item cancellation".into(), ..Default::default() }) }),
+                    // An answer for some other request is a lost answer, not this one's.
+                    Reply::ItemUnknown(..) => yield Ok(storage_v1::PutResolvedResponse { request_id: item.request_id.wrapping_add(1), status: None }),
+                    Reply::Ended => {}
+                    _ => yield Err(Status::unavailable("resolved put response lost")),
+                }
             }
         })))
     }
@@ -317,12 +329,28 @@ impl Service for FixtureServer {
         request: Request<Streaming<storage_v1::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
         self.observe(&request);
+        if matches!(self.reply, Reply::Refusal) {
+            return Err(refusal());
+        }
         let mut requests = request.into_inner();
         let items = self.items.clone();
+        let reply = self.reply;
         Ok(Response::new(Box::pin(async_stream::stream! {
-            if requests.next().await.is_some() {
+            if let Some(Ok(item)) = requests.next().await {
                 items.fetch_add(1, Ordering::SeqCst);
-                yield Err(Status::unavailable("copy response lost"));
+                let answer = |address: Option<model_v1::Address>, status: Option<model_v1::ItemStatus>| storage_v1::CopyResponse {
+                    source_repository_id: item.source_repository_id.clone(),
+                    source_address: address,
+                    status,
+                };
+                match reply {
+                    Reply::Success => yield Ok(answer(item.source_address.clone(), None)),
+                    Reply::ItemCancelled => yield Ok(answer(item.source_address.clone(), Some(model_v1::ItemStatus { code: 1, message: "decisive per-item cancellation".into(), ..Default::default() }))),
+                    // An answer naming another address is a lost answer, not this one's.
+                    Reply::ItemUnknown(..) => yield Ok(answer(Some(Address::zero_context_hash(Hash::from([0xEE; 32])).into()), None)),
+                    Reply::Ended => {}
+                    _ => yield Err(Status::unavailable("copy response lost")),
+                }
             }
         })))
     }
@@ -480,6 +508,43 @@ impl Fixture {
         )
         .await
         .expect("bounded put")
+    }
+    /// A Copy of one source address into the fixture's own repository.
+    async fn copy(&self, tag: u8) -> Result<(), ProtocolError> {
+        let ctx = self.context();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.service.copy(
+                0,
+                &ctx,
+                ctx.partition,
+                Address::zero_context_hash(Hash::from([tag; 32])),
+                Context::from([0x12; 16]),
+            ),
+        )
+        .await
+        .expect("bounded copy")
+    }
+    /// A `PutResolved` of one key.
+    async fn put_resolved(&self, tag: u8) -> Result<(), ProtocolError> {
+        let ctx = self.context();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            self.service.put_resolved(
+                0,
+                &ctx,
+                &Hash::from([tag; 32]),
+                Address::zero_context_hash(Hash::from([tag.wrapping_add(1); 32])),
+                Fragment {
+                    flags: 0,
+                    size_payload: 1,
+                    size_content: 1,
+                },
+                Some(Bytes::from_static(b"x")),
+            ),
+        )
+        .await
+        .expect("bounded put_resolved")
     }
     /// A managed Put of `len` payload bytes, for the slot weighting.
     async fn put_sized(&self, tag: u8, len: usize) -> Result<(), ProtocolError> {
@@ -790,46 +855,84 @@ async fn an_unmarked_in_band_aborted_response_is_decisive() {
     assert!(f.journal.unresolved().await.unwrap().is_empty());
 }
 
-/// The mapping of a managed Put's wire result: every way of losing the answer becomes the same
-/// retryable internal error, and decisive refusals pass through untouched.
+/// The mapping of a managed Put, Copy or `PutResolved` wire result: every way of losing the answer
+/// becomes the same retryable internal error that names its RPC and carries the lost-answer mark,
+/// and decisive refusals pass through untouched and unmarked.
 #[test]
-fn unjournaled_put_result_maps_lost_answers_and_passes_decisive_errors_through() {
-    let attempt = AttemptId::new();
-    assert!(unjournaled_put_result(Ok(()), &attempt).is_ok());
-    let lost = [
-        lore_transport::outcome::outcome_unknown("StorageService.Put", &attempt),
-        ProtocolError::from(lore_base::error::Disconnected),
-        ProtocolError::from(Status::cancelled("answer lost")),
-        ProtocolError::from(Status::deadline_exceeded("answer lost")),
-    ];
-    for error in lost {
-        let shown = format!("{error:?}");
-        let mapped = unjournaled_put_result(Err(error), &attempt).unwrap_err();
+fn unjournaled_result_maps_lost_answers_and_passes_decisive_errors_through() {
+    for rpc in [
+        GrpcRpc::StoragePut,
+        GrpcRpc::StorageCopy,
+        GrpcRpc::StoragePutResolved,
+    ] {
+        let attempt = AttemptId::new();
+        assert!(unjournaled_result(rpc, Ok(()), &attempt).is_ok());
+        let lost = [
+            lore_transport::outcome::outcome_unknown(rpc.wire_name(), &attempt),
+            ProtocolError::from(lore_base::error::Disconnected),
+            ProtocolError::from(Status::cancelled("answer lost")),
+            ProtocolError::from(Status::deadline_exceeded("answer lost")),
+        ];
+        for error in lost {
+            let shown = format!("{error:?}");
+            let mapped = unjournaled_result(rpc, Err(error), &attempt).unwrap_err();
+            assert!(
+                matches!(mapped, ProtocolError::Internal(_)),
+                "{rpc:?}: {shown} -> {mapped:?}"
+            );
+            assert!(
+                !mapped.is_outcome_unknown(),
+                "{rpc:?}: {shown} -> {mapped:?}"
+            );
+            assert!(!mapped.is_disconnected(), "{rpc:?}: {shown} -> {mapped:?}");
+            assert!(
+                lore_transport::is_unjournaled_answer_lost(&mapped),
+                "{rpc:?}: {shown} -> {mapped:?}"
+            );
+            let text = mapped.to_string();
+            assert!(text.contains(rpc.wire_name()), "{text}");
+            assert!(
+                text.contains(&format!("attempt {attempt} lost its answer")),
+                "{text}"
+            );
+            assert!(text.contains("Pushing again is safe"), "{text}");
+        }
+        let refused =
+            unjournaled_result(rpc, Err(ProtocolError::from(refusal())), &attempt).unwrap_err();
         assert!(
-            matches!(mapped, ProtocolError::Internal(_)),
-            "{shown} -> {mapped:?}"
+            lore_transport::error::is_unsupported_client(&refused),
+            "{rpc:?}: {refused:?}"
         );
-        assert!(!mapped.is_outcome_unknown(), "{shown} -> {mapped:?}");
-        assert!(!mapped.is_disconnected(), "{shown} -> {mapped:?}");
-        let text = mapped.to_string();
-        assert!(text.contains(&attempt.to_string()), "{text}");
-        assert!(text.contains("Pushing again is safe"), "{text}");
+        assert!(!lore_transport::is_unjournaled_answer_lost(&refused));
+        let denied = unjournaled_result(
+            rpc,
+            Err(ProtocolError::from(Status::permission_denied("no"))),
+            &attempt,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(denied, ProtocolError::NotAuthorized(_)),
+            "{rpc:?}: {denied:?}"
+        );
+        assert!(!lore_transport::is_unjournaled_answer_lost(&denied));
     }
-    let refused =
-        unjournaled_put_result(Err(ProtocolError::from(refusal())), &attempt).unwrap_err();
-    assert!(
-        lore_transport::error::is_unsupported_client(&refused),
-        "{refused:?}"
-    );
-    let denied = unjournaled_put_result(
-        Err(ProtocolError::from(Status::permission_denied("no"))),
-        &attempt,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(denied, ProtocolError::NotAuthorized(_)),
-        "{denied:?}"
-    );
+}
+
+/// The lost-answer predicate is false for the errors a caller must keep treating as before.
+#[test]
+fn is_unjournaled_answer_lost_is_false_for_other_errors() {
+    let attempt = AttemptId::new();
+    for error in [
+        lore_transport::outcome::outcome_unknown("StorageService.MutableStore", &attempt),
+        ProtocolError::from(lore_base::error::Disconnected),
+        ProtocolError::internal("lost its answer. Pushing again is safe"),
+        ProtocolError::from(Status::permission_denied("no")),
+    ] {
+        assert!(
+            !lore_transport::is_unjournaled_answer_lost(&error),
+            "{error:?}"
+        );
+    }
 }
 
 #[test]
@@ -1002,48 +1105,210 @@ async fn healing_verify_response_loss_is_unknown_and_read_verify_records_nothing
     assert_eq!(f.items.load(Ordering::SeqCst), 2);
 }
 
-#[tokio::test]
-async fn copy_response_loss_is_unknown_and_is_not_resent() {
-    let f = Fixture::new(Reply::Loss).await;
-    let ctx = f.context();
-    let error = with_caller_operation(
-        f.operation(),
-        f.service.copy(
-            0,
-            &ctx,
-            ctx.partition,
-            Address::zero_context_hash(Hash::from([11; 32])),
-            Context::from([12; 16]),
-        ),
-    )
-    .await
-    .unwrap_err();
-    assert!(error.is_outcome_unknown(), "{error:?}");
-    assert_eq!(f.items.load(Ordering::SeqCst), 1);
-    assert_eq!(f.seen.lock().len(), 1);
-    assert_eq!(f.journal.unresolved().await.unwrap().len(), 1);
+/// The managed storage writes that write no journal child.
+#[derive(Clone, Copy, Debug)]
+enum Unjournaled {
+    Copy,
+    PutResolved,
 }
 
+impl Unjournaled {
+    const ALL: [Self; 2] = [Self::Copy, Self::PutResolved];
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Copy => "StorageService.Copy",
+            Self::PutResolved => "StorageService.PutResolved",
+        }
+    }
+    async fn call(self, f: &Fixture, tag: u8) -> Result<(), ProtocolError> {
+        match self {
+            Self::Copy => f.copy(tag).await,
+            Self::PutResolved => f.put_resolved(tag).await,
+        }
+    }
+}
+
+/// A managed Copy and `PutResolved` write no journal child, exactly as a fragment Put does: on
+/// success they still declare the capability and send a fresh attempt id each call, but nothing
+/// is recorded and the id is never in the journal.
 #[tokio::test]
-async fn resolved_put_and_mutable_unaries_journal_before_loss_without_replay() {
-    for operation in [
-        "StorageService.PutResolved",
-        "StorageService.MutableStore",
-        "StorageService.MutableCompareAndSwap",
-    ] {
+async fn managed_copy_and_put_resolved_record_nothing_but_still_declare_and_mint_an_attempt_id() {
+    for write in Unjournaled::ALL {
+        let f = Fixture::new(Reply::Success).await;
+        with_caller_operation(f.operation(), async {
+            write.call(&f, 41).await.unwrap();
+            write.call(&f, 41).await.unwrap();
+        })
+        .await;
+        assert!(f.journal.records.lock().is_empty(), "{write:?}");
+        assert!(f.journal.intents.lock().is_empty(), "{write:?}");
+        assert!(
+            f.journal.unresolved().await.unwrap().is_empty(),
+            "{write:?}"
+        );
+        let seen = f.seen.lock();
+        assert_eq!(seen.len(), 2, "{write:?}");
+        for observation in seen.iter() {
+            assert_eq!(
+                observation.capability.as_deref(),
+                Some("outcome_unknown_v1"),
+                "{write:?}"
+            );
+            assert!(observation.attempt.is_some(), "{write:?}");
+            assert!(!observation.journaled_before_body, "{write:?}");
+        }
+        assert_ne!(
+            seen[0].attempt, seen[1].attempt,
+            "{write:?}: fresh id per call"
+        );
+        assert_eq!(f.items.load(Ordering::SeqCst), 2, "{write:?}");
+    }
+}
+
+/// A lost answer is a plain retryable failure of the push, marked as an unjournaled lost answer:
+/// not an unknown outcome (which would hold the fence), not `Disconnected` (which the reconnect
+/// layer would resend). The one message is sent exactly once and nothing is journaled.
+#[tokio::test]
+async fn managed_copy_and_put_resolved_response_loss_is_a_retryable_internal_error_without_journal()
+{
+    for write in Unjournaled::ALL {
         let f = Fixture::new(Reply::Loss).await;
-        let ctx = f.context();
-        let key = Hash::from([31; 32]);
-        let value = Hash::from([32; 32]);
+        let error = with_caller_operation(f.operation(), write.call(&f, 11))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ProtocolError::Internal(_)),
+            "{write:?}: {error:?}"
+        );
+        assert!(!error.is_outcome_unknown(), "{write:?}: {error:?}");
+        assert!(!error.is_disconnected(), "{write:?}: {error:?}");
+        assert!(
+            lore_transport::is_unjournaled_answer_lost(&error),
+            "{write:?}: {error:?}"
+        );
+        let text = error.to_string();
+        assert!(text.contains(write.wire_name()), "{write:?}: {text}");
+        assert!(text.contains("lost its answer"), "{write:?}: {text}");
+        assert!(text.contains("Pushing again is safe"), "{write:?}: {text}");
+        assert_eq!(f.items.load(Ordering::SeqCst), 1, "{write:?}");
+        {
+            let seen = f.seen.lock();
+            assert_eq!(seen.len(), 1, "{write:?}: exactly one wire request");
+            assert_eq!(
+                seen[0].capability.as_deref(),
+                Some("outcome_unknown_v1"),
+                "{write:?}"
+            );
+            assert!(seen[0].attempt.is_some(), "{write:?}");
+            assert!(!seen[0].journaled_before_body, "{write:?}");
+        }
+        assert!(f.journal.records.lock().is_empty(), "{write:?}");
+        assert!(f.journal.intents.lock().is_empty(), "{write:?}");
+        assert!(
+            f.journal.unresolved().await.unwrap().is_empty(),
+            "{write:?}"
+        );
+    }
+}
+
+/// Every other way the answer goes missing is the same lost answer: a stream that ends silent,
+/// and an answer that names another address or request.
+#[tokio::test]
+async fn managed_copy_and_put_resolved_ended_or_mismatched_answer_is_a_lost_answer() {
+    for write in Unjournaled::ALL {
+        for reply in [Reply::Ended, Reply::ItemUnknown(0, "", "")] {
+            let f = Fixture::new(reply).await;
+            let error = with_caller_operation(f.operation(), write.call(&f, 12))
+                .await
+                .unwrap_err();
+            assert!(
+                lore_transport::is_unjournaled_answer_lost(&error),
+                "{write:?}: {error:?}"
+            );
+            assert!(!error.is_outcome_unknown(), "{write:?}: {error:?}");
+            assert!(!error.is_disconnected(), "{write:?}: {error:?}");
+            assert_eq!(f.seen.lock().len(), 1, "{write:?}: no resend");
+            assert!(f.journal.records.lock().is_empty(), "{write:?}");
+        }
+    }
+}
+
+/// A decisive refusal stays decisive: it is not the lost-answer mapping, and nothing is journaled.
+#[tokio::test]
+async fn managed_copy_and_put_resolved_decisive_refusals_are_not_lost_answers() {
+    for write in Unjournaled::ALL {
+        let f = Fixture::new(Reply::Refusal).await;
+        let error = with_caller_operation(f.operation(), write.call(&f, 13))
+            .await
+            .unwrap_err();
+        assert!(
+            lore_transport::error::is_unsupported_client(&error),
+            "{write:?}: {error:?}"
+        );
+        assert!(
+            !lore_transport::is_unjournaled_answer_lost(&error),
+            "{write:?}"
+        );
+        assert!(!error.is_outcome_unknown(), "{write:?}");
+        assert_eq!(f.items.load(Ordering::SeqCst), 0, "{write:?}");
+        assert!(f.journal.records.lock().is_empty(), "{write:?}");
+
+        let f = Fixture::new(Reply::ItemCancelled).await;
+        let error = with_caller_operation(f.operation(), write.call(&f, 14))
+            .await
+            .unwrap_err();
+        assert!(
+            !lore_transport::is_unjournaled_answer_lost(&error),
+            "{write:?}: {error:?}"
+        );
+        assert!(!error.is_outcome_unknown(), "{write:?}: {error:?}");
+        assert_eq!(f.items.load(Ordering::SeqCst), 1, "{write:?}");
+        assert!(f.journal.records.lock().is_empty(), "{write:?}");
+    }
+}
+
+/// Neither write depends on the journal working: it never touches the store.
+#[tokio::test]
+async fn managed_copy_and_put_resolved_do_not_depend_on_the_journal_working() {
+    for write in Unjournaled::ALL {
+        let f = Fixture::new(Reply::Success).await;
+        f.journal.fail_record.store(true, Ordering::SeqCst);
+        f.journal.fail_settle.store(true, Ordering::SeqCst);
+        with_caller_operation(f.operation(), write.call(&f, 15))
+            .await
+            .unwrap();
+        assert_eq!(f.items.load(Ordering::SeqCst), 1, "{write:?}");
+    }
+}
+
+/// A managed Copy or `PutResolved` whose session partition differs from the operation's repository
+/// is refused before anything is sent.
+#[tokio::test]
+async fn managed_copy_and_put_resolved_for_another_repository_are_refused_before_the_wire() {
+    for write in Unjournaled::ALL {
+        let f = Fixture::new(Reply::Success).await;
+        let mut ctx = f.context();
+        ctx.partition = Partition::from(Context::from([0x22; 16]));
         let error = with_caller_operation(f.operation(), async {
-            match operation {
-                "StorageService.PutResolved" => {
+            match write {
+                Unjournaled::Copy => {
+                    f.service
+                        .copy(
+                            0,
+                            &ctx,
+                            ctx.partition,
+                            Address::zero_context_hash(Hash::from([72; 32])),
+                            Context::from([0x12; 16]),
+                        )
+                        .await
+                }
+                Unjournaled::PutResolved => {
                     f.service
                         .put_resolved(
                             0,
                             &ctx,
-                            &key,
-                            Address::zero_context_hash(value),
+                            &Hash::from([73; 32]),
+                            Address::zero_context_hash(Hash::from([74; 32])),
                             Fragment {
                                 flags: 0,
                                 size_payload: 1,
@@ -1053,6 +1318,32 @@ async fn resolved_put_and_mutable_unaries_journal_before_loss_without_replay() {
                         )
                         .await
                 }
+            }
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("repository mismatch"),
+            "{write:?}: {error:?}"
+        );
+        assert!(f.seen.lock().is_empty(), "{write:?}: no wire request");
+        assert_eq!(f.items.load(Ordering::SeqCst), 0, "{write:?}");
+        assert!(f.journal.records.lock().is_empty(), "{write:?}");
+    }
+}
+
+#[tokio::test]
+async fn mutable_unaries_journal_before_loss_without_replay() {
+    for operation in [
+        "StorageService.MutableStore",
+        "StorageService.MutableCompareAndSwap",
+    ] {
+        let f = Fixture::new(Reply::Loss).await;
+        let ctx = f.context();
+        let key = Hash::from([31; 32]);
+        let value = Hash::from([32; 32]);
+        let error = with_caller_operation(f.operation(), async {
+            match operation {
                 "StorageService.MutableStore" => {
                     f.service
                         .mutable_store(&ctx, key, value, KeyType::Resolve)

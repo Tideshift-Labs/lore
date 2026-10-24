@@ -62,6 +62,8 @@ uuid = { workspace = true }
 jsonwebtoken = { workspace = true }
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+# test-util exposes branch::push::push_fragments to storage_copy_on_write_test.rs.
+lore-revision = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
 # `UserAgentFilter` for the hand-built `StorageServiceV4` in quic_session_rebind_test.rs.
 lore-telemetry = { workspace = true }

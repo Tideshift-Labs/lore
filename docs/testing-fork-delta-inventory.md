@@ -85,10 +85,13 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   a strict real boot needs a fragment provider + domain enforcement. Gates: `cargo test -p
   lore-server --test unit -j 4 -- grpc::caller_capabilities` `cargo test -p lore-integration-tests
   --features integration_tests --test integration -j 4 -- quic_strict_admission`
-- **Managed fragment Put is unjournaled [CLIENT]**: `StorageService::put` inside a caller operation
-  mints and sends an attempt id + capability header but writes no journal child;
-  `unjournaled_put_result` maps request-not-sent to `Disconnected` and any lost answer to a plain
-  `Internal` ("lost its answer ... can be retried"), never `OutcomeUnknown`. Tests:
+- **Managed fragment Put, Copy and PutResolved are unjournaled [CLIENT]**: `StorageService::put`,
+  `copy` and `put_resolved` inside a caller operation mint and send an attempt id + capability
+  header but write no journal child (Copy/PutResolved since 2026-10-23); `unjournaled_result` maps
+  request-not-sent to `Disconnected` and any lost answer to an `Internal` carrying
+  `UnjournaledAnswerLost` ("lost its answer. Pushing again is safe"), never `OutcomeUnknown`.
+  Push's Copy-then-Put fallback refuses to upload after such a lost Copy answer
+  (`copy_failure_allows_upload`). Tests:
   `lore-transport/tests/unit/grpc/storage_client/adoption_tests.rs` (tonic fixture; `Reply::Loss`
   etc.; generic journal properties ride `Fixture::journaled_mutation` = MutableStore, since the
   fixture loses every non-Put answer); `lore-revision/tests/put_fence.rs` (real

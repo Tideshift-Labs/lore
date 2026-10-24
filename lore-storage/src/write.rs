@@ -1084,9 +1084,13 @@ async fn copy_association(
         return Ok(false);
     }
 
+    // The `_outcome` form (WP-120): the plain one collapses a lost QUIC answer into
+    // `Disconnected`, which would read below as a refusal and send the fallback upload.
+    let attempt = AttemptId::new();
     match session
-        .copy(source.partition, source.address, address.context)
+        .copy_outcome(source.partition, source.address, address.context)
         .await
+        .and_then(|outcome| resolve(outcome, "lore-storage/0.4 Copy", &attempt))
     {
         Ok(()) => {
             REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);

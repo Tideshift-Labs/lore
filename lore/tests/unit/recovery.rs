@@ -121,6 +121,110 @@ async fn a_lone_old_put_child_is_settled_by_a_plain_acquire_with_no_lookup() {
         .unwrap();
 }
 
+/// Copy and `PutResolved` stopped being journaled after Put did: an older build's unresolved child
+/// of either is settled by a plain acquire with no lookup, exactly as a Put is.
+#[tokio::test]
+async fn a_lone_old_copy_or_put_resolved_child_is_settled_by_a_plain_acquire_with_no_lookup() {
+    for rpc in ["StorageService.Copy", "StorageService.PutResolved"] {
+        let dir = worktree();
+        let (parent, child) = crash_with_child(dir.path(), rpc).await;
+        {
+            let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+            assert_eq!(
+                recovery.store().unresolved().await.unwrap(),
+                vec![child.clone()],
+                "{rpc}"
+            );
+        }
+
+        let calls = AtomicUsize::new(0);
+        let guard = admit_with(dir.path(), |_, _| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async {
+                panic!("a legacy Copy or PutResolved has no receipt and must never be looked up")
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "{rpc}");
+        let store = guard.store();
+        assert!(store.unresolved().await.unwrap().is_empty(), "{rpc}");
+        assert_eq!(
+            store
+                .lookup(&child.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Resolved(AttemptResolution::NotApplied),
+            "{rpc}"
+        );
+        let parents = store.managed_parents().await.unwrap();
+        assert_eq!(parents[0].id, parent.to_string());
+        assert!(parents[0].complete, "{rpc}");
+        guard
+            .begin(Uuid::now_v7(), "push".into(), "branch".into())
+            .await
+            .unwrap();
+    }
+}
+
+/// A legacy Copy or `PutResolved` beside an unresolved `BranchPush` settles, but the parent stays
+/// blocked on the push, and only the push is ever looked up.
+#[tokio::test]
+async fn a_legacy_copy_or_put_resolved_beside_a_branch_push_looks_up_only_the_push() {
+    for rpc in ["StorageService.Copy", "StorageService.PutResolved"] {
+        let dir = worktree();
+        let parent = Uuid::now_v7();
+        let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+        let store = guard
+            .begin(parent, "push".into(), "branch".into())
+            .await
+            .unwrap();
+        let (write, write_intent) = record(parent, rpc);
+        store.record_managed(&write, &write_intent).await.unwrap();
+        let (push, push_intent) = record(parent, "RevisionService.BranchPush");
+        store.record_managed(&push, &push_intent).await.unwrap();
+        store.complete_parent_body(parent).await.unwrap();
+        drop(store);
+        drop(guard);
+
+        let looked_up = parking_lot::Mutex::new(Vec::new());
+        let error = admit_with(dir.path(), |_, attempt| {
+            looked_up.lock().push(attempt);
+            async {
+                Ok(DomainAttemptReceipt {
+                    method: String::new(),
+                    state: DomainReceiptState::NotFound,
+                    acquired_locks: Vec::new(),
+                })
+            }
+        })
+        .await
+        .err()
+        .expect("an undecided push receipt keeps admission refused");
+        assert_eq!(*looked_up.lock(), vec![push.attempt_id], "{rpc}");
+        assert!(
+            error.to_string().contains(&push.attempt_id.to_string()),
+            "{rpc}"
+        );
+
+        let recovery = RepositoryMutationGuard::recover(dir.path()).await.unwrap();
+        let store = recovery.store();
+        assert_eq!(store.unresolved().await.unwrap(), vec![push], "{rpc}");
+        assert_eq!(
+            store
+                .lookup(&write.attempt_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            AttemptState::Resolved(AttemptResolution::NotApplied),
+            "{rpc}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_nondecisive_branch_push_receipt_still_refuses_and_names_the_child() {
     let dir = worktree();

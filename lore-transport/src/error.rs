@@ -351,6 +351,31 @@ pub(crate) fn is_request_not_sent(error: &ProtocolError) -> bool {
     false
 }
 
+/// Typed mark of a managed storage write that wrote no journal child and lost its answer:
+/// fragment `Put`, `Copy` or `PutResolved` (WP-120 decision reversals, 2026-10-22 and
+/// 2026-10-23). It rides inside `ProtocolError::Internal`, so the push fails as an ordinary,
+/// retryable failure rather than an unknown outcome.
+///
+/// The write may have applied. A caller must never answer it with a second mutation that does
+/// the same work, such as a fallback upload after a `Copy`: that is a resend under another name.
+#[derive(Debug, Clone, Error)]
+#[error("{message}")]
+pub(crate) struct UnjournaledAnswerLost {
+    pub(crate) message: String,
+}
+
+/// Whether `error` is an unjournaled managed write's lost answer. See [`UnjournaledAnswerLost`].
+pub fn is_unjournaled_answer_lost(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<UnjournaledAnswerLost>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {

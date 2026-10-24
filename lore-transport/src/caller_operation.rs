@@ -132,14 +132,22 @@ pub fn recorded_lock_resources(
         .collect()
 }
 
-/// Whether a recorded child is a fragment Put from a build that still journaled them.
+/// Whether a recorded child is a storage write from a build that still journaled it: a fragment
+/// `Put`, a `Copy` or a `PutResolved`.
 ///
-/// Fragment Puts write no child since 2026-10-22. Old journals may still hold unresolved ones,
-/// and no receipt can settle them. A Put is content-addressed and the server ignores its attempt
-/// id, so recovery settles such a child as not applied without a read: nothing is owed, and the
-/// next push uploads whatever the remote lacks.
-pub fn is_legacy_fragment_put(recorded_rpc: &str) -> bool {
-    recorded_rpc == GrpcRpc::StoragePut.wire_name()
+/// Fragment Puts write no child since 2026-10-22, and `Copy` and `PutResolved` since 2026-10-23
+/// (WP-120 decision reversals). Old journals may still hold unresolved ones, and no receipt can
+/// settle them. Put and Copy are content-addressed, the `PutResolved` key is last-writer-wins, and
+/// the server ignores their attempt ids, so recovery settles such a child as not applied without
+/// a read: nothing is owed, and the next push uploads whatever the remote lacks.
+pub fn is_legacy_unjournaled_write(recorded_rpc: &str) -> bool {
+    [
+        GrpcRpc::StoragePut,
+        GrpcRpc::StorageCopy,
+        GrpcRpc::StoragePutResolved,
+    ]
+    .iter()
+    .any(|rpc| recorded_rpc == rpc.wire_name())
 }
 
 /// Read the exact repository credential selection without declaring or dispatching a mutation.

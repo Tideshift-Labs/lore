@@ -413,6 +413,7 @@ impl PushStats {
 /// those facts are recorded in one place whichever event reports them.
 /// `fragment_count` and `bytes_queued` are this revision's alone: the fragments it
 /// has to register, and the payload bytes it has loaded to send.
+#[lore_macro::test_pub]
 pub(crate) struct PushProgress {
     fragment_count: AtomicUsize,
     bytes_queued: AtomicU64,
@@ -423,6 +424,7 @@ pub(crate) struct PushProgress {
 
 impl PushProgress {
     /// Start a revision's progress from where the push-wide counters stand now.
+    #[lore_macro::test_pub]
     pub(crate) fn new(stats: Arc<PushStats>) -> Self {
         Self {
             fragment_count: AtomicUsize::new(0),
@@ -1770,6 +1772,11 @@ async fn mark_durable(repository: &Arc<RepositoryContext>, address: Address, fra
 /// The source names no context because the query did not say which one the peer matched under —
 /// only that the partition holds the hash — and that is exactly what a zero source context asks
 /// for. A refusal costs the round trip and leaves the payload to be uploaded as before.
+///
+/// A lost answer is not a refusal: the Copy may have applied, and the fallback upload would be a
+/// second mutation for the same address, a resend under another name that an obliterate in
+/// between makes unsafe (`MutableNoReplay`). An unknown outcome and an unjournaled managed
+/// Copy's lost answer both fail the push instead; see [`copy_failure_allows_upload`].
 async fn duplicate_association(
     repository: &Arc<RepositoryContext>,
     storage: &Arc<StorageSession>,
@@ -1779,15 +1786,20 @@ async fn duplicate_association(
     if !storage.can_copy_from(repository.id).await {
         return Ok(false);
     }
+    // The `_outcome` form (WP-120): the plain one collapses a lost QUIC answer into
+    // `Disconnected`, which would read here as a refusal and send the fallback upload. The id
+    // only names the attempt in an unknown outcome's message; it is never sent or journaled.
+    let attempt = lore_transport::AttemptId::new();
     if let Err(err) = storage
-        .copy(
+        .copy_outcome(
             repository.id,
             Address::zero_context_hash(address.hash),
             address.context,
         )
         .await
+        .and_then(|outcome| lore_transport::resolve(outcome, "lore-storage/0.4 Copy", &attempt))
     {
-        if err.is_outcome_unknown() {
+        if !copy_failure_allows_upload(&err) {
             return Err(err);
         }
         lore_debug!("Copy of {address} refused ({err:?}), uploading instead");
@@ -1797,6 +1809,14 @@ async fn duplicate_association(
     stats.copied();
     mark_stored_durable(repository, address).await;
     Ok(true)
+}
+
+/// Whether a failed Copy leaves its payload free to upload instead: only a decisive refusal does.
+/// An unknown outcome, or the lost answer of a managed Copy that writes no journal child, may
+/// have applied, so uploading would resend it.
+#[lore_macro::test_pub]
+fn copy_failure_allows_upload(err: &ProtocolError) -> bool {
+    !(err.is_outcome_unknown() || lore_transport::is_unjournaled_answer_lost(err))
 }
 
 /// Mark the local entry for `address` durable, looking up the fragment it needs to write back.
@@ -1858,6 +1878,7 @@ fn prefer_unknown(first: Option<PushError>, next: Option<PushError>) -> Option<P
 
 /// Register every fragment the peer is missing, transferring a payload only where it has no
 /// association to duplicate. Addresses the peer already holds are marked durable alongside.
+#[lore_macro::test_pub]
 pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,

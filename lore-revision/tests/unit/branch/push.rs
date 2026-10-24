@@ -226,3 +226,56 @@ mod mark {
         );
     }
 }
+
+/// A failed Copy falls back to uploading the payload only when the refusal is decisive. A Copy
+/// that may have applied (an unknown outcome, or the lost answer of an unjournaled managed Copy)
+/// must fail the push: an upload would be a second mutation for the same address.
+mod copy_fallback {
+    use lore_base::error::AddressNotFound;
+    use lore_base::error::Disconnected;
+    use lore_transport::outcome::AttemptId;
+    use lore_transport::outcome::GrpcRpc;
+    use lore_transport::outcome::outcome_unknown;
+
+    use super::*;
+
+    #[test]
+    fn a_decisive_refusal_allows_the_upload_fallback() {
+        for error in [
+            ProtocolError::from(AddressNotFound { address: [7u8; 48] }),
+            ProtocolError::from(tonic::Status::permission_denied("no")),
+            ProtocolError::from(tonic::Status::not_found("no source")),
+            ProtocolError::internal("the source fragment is missing"),
+            // Disconnected after `resolve` is proof the Copy was never dispatched, so it is not a
+            // lost answer and the upload may follow.
+            ProtocolError::from(Disconnected),
+        ] {
+            assert!(copy_failure_allows_upload(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_outcome_forbids_the_upload_fallback() {
+        let error = outcome_unknown(GrpcRpc::StorageCopy.wire_name(), &AttemptId::new());
+        assert!(error.is_outcome_unknown());
+        assert!(!copy_failure_allows_upload(&error), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_lost_unjournaled_copy_answer_forbids_the_upload_fallback() {
+        // Produce the real lost-answer error through the transport's own mapping.
+        let attempt = AttemptId::new();
+        let lost = lore_transport::grpc::storage_client::unjournaled_result(
+            GrpcRpc::StorageCopy,
+            Err(ProtocolError::from(tonic::Status::cancelled("answer lost"))),
+            &attempt,
+        )
+        .expect_err("a lost answer is an error");
+        assert!(
+            lore_transport::is_unjournaled_answer_lost(&lost),
+            "{lost:?}"
+        );
+        assert!(!lost.is_outcome_unknown(), "{lost:?}");
+        assert!(!copy_failure_allows_upload(&lost), "{lost:?}");
+    }
+}

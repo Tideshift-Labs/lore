@@ -1018,21 +1018,32 @@ fn stream_lost(rpc: GrpcRpc) -> ProtocolError {
     )
 }
 
-/// Why a managed fragment Put got no answer, kept so the push failure names its cause.
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct PutAnswerLost(String);
-
-/// A managed Put has no journal child, so its lost answer is never [`stream_lost`]'s unknown
-/// outcome: [`unjournaled_put_result`] makes it a plain push failure that carries this cause.
-fn put_answer_lost(cause: impl Into<String>) -> ProtocolError {
-    ProtocolError::internal_with_context(PutAnswerLost(cause.into()), "managed Put answer lost")
+/// The managed storage writes that write no journal child: fragment `Put` (2026-10-22), and
+/// `Copy` and `PutResolved` (2026-10-23). None has a server receipt reader, so an unknown child
+/// of any of them used to hold the repository fence for good (WP-120 decision reversals).
+fn is_unjournaled(rpc: GrpcRpc) -> bool {
+    matches!(
+        rpc,
+        GrpcRpc::StoragePut | GrpcRpc::StorageCopy | GrpcRpc::StoragePutResolved
+    )
 }
 
-fn is_put_answer_lost(error: &ProtocolError) -> bool {
+/// Why an unjournaled managed write got no answer, kept so the push failure names its cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct UnjournaledCause(String);
+
+/// An unjournaled managed write has no journal child, so its lost answer is never
+/// [`stream_lost`]'s unknown outcome: [`unjournaled_result`] makes it a plain push failure that
+/// carries this cause.
+fn answer_lost(cause: impl Into<String>) -> ProtocolError {
+    ProtocolError::internal_with_context(UnjournaledCause(cause.into()), "managed answer lost")
+}
+
+fn is_answer_lost(error: &ProtocolError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
-        if source.downcast_ref::<PutAnswerLost>().is_some() {
+        if source.downcast_ref::<UnjournaledCause>().is_some() {
             return true;
         }
         current = source.source();
@@ -1042,8 +1053,8 @@ fn is_put_answer_lost(error: &ProtocolError) -> bool {
 
 /// What a managed call that went silent after its message was taken returns.
 fn silence_lost(rpc: GrpcRpc, idle: Duration) -> ProtocolError {
-    if rpc == GrpcRpc::StoragePut {
-        put_answer_lost(format!(
+    if is_unjournaled(rpc) {
+        answer_lost(format!(
             "no answer and no progress on this connection for {idle:?}"
         ))
     } else {
@@ -1199,26 +1210,18 @@ async fn bounded_managed<T>(
     }
 }
 
-fn managed_stream_status(status: tonic::Status, rpc: GrpcRpc) -> ProtocolError {
+/// A managed write's stream failure before its answer: an unsupported-client refusal stays
+/// decisive, anything else is a lost answer that keeps the server's status in the error.
+///
+/// Deliberately the safe side: a stream-level status cannot say whether the one message was
+/// applied before the stream failed, so even a decisive-looking code (such as a handler's
+/// `invalid_argument`) fails the push rather than letting push fall back from a Copy to a Put.
+/// The cost is one failed push, never a second mutation.
+fn unjournaled_stream_status(status: tonic::Status) -> ProtocolError {
     if crate::error::is_unsupported_client_status(&status) {
         ProtocolError::from(status)
     } else {
-        // The unknown outcome carries no status, so this log line is where its cause survives.
-        lore_warn!(
-            "{} stream failed before its answer; its outcome is unknown: {status}",
-            rpc.wire_name()
-        );
-        stream_lost(rpc)
-    }
-}
-
-/// [`managed_stream_status`] for the unjournaled Put: the same split, with the server's status
-/// kept in the error.
-fn managed_put_stream_status(status: tonic::Status) -> ProtocolError {
-    if crate::error::is_unsupported_client_status(&status) {
-        ProtocolError::from(status)
-    } else {
-        put_answer_lost(format!("the stream failed before its answer: {status}"))
+        answer_lost(format!("the stream failed before its answer: {status}"))
     }
 }
 
@@ -1254,19 +1257,24 @@ fn decisive_item_error(error: ProtocolError) -> ProtocolError {
     }
 }
 
-/// The caller-facing result of a managed fragment Put, which has no journal child.
+/// The caller-facing result of a managed `Put`, `Copy` or `PutResolved`, which has no journal
+/// child.
 ///
 /// Positive proof the message never left is `Disconnected`, so the reconnect layer may send it
 /// again, exactly as before. A lost answer is a plain, retryable failure of this push rather than
-/// [`ProtocolError::OutcomeUnknown`]: no receipt can ever settle a Put, so an unknown one would
-/// hold the repository fence with nothing able to clear it. It is not resent here, because Put
-/// stays `MutableNoReplay` (a second copy could revive what an obliterate retired in between);
-/// the next push queries the remote and uploads whatever is missing.
+/// [`ProtocolError::OutcomeUnknown`]: no receipt can ever settle one of these writes, so an
+/// unknown one would hold the repository fence with nothing able to clear it. It carries
+/// [`crate::error::UnjournaledAnswerLost`], so a caller can tell it from a decisive refusal. It
+/// is not resent here, because all three stay `MutableNoReplay` (a second copy could revive what
+/// an obliterate retired in between); the next push queries the remote and uploads whatever is
+/// missing.
 #[lore_macro::test_pub]
-fn unjournaled_put_result(
+fn unjournaled_result(
+    rpc: GrpcRpc,
     result: Result<(), ProtocolError>,
     attempt: &AttemptId,
 ) -> Result<(), ProtocolError> {
+    debug_assert!(is_unjournaled(rpc), "{} is journaled", rpc.wire_name());
     match result {
         Err(error) if crate::error::is_request_not_sent(&error) => {
             let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
@@ -1276,7 +1284,7 @@ fn unjournaled_put_result(
                     file!(),
                     line!(),
                     column!(),
-                    std::sync::Arc::from(format!("{}: {error}", GrpcRpc::StoragePut.wire_name())),
+                    std::sync::Arc::from(format!("{}: {error}", rpc.wire_name())),
                 ),
             );
             Err(disconnected)
@@ -1284,13 +1292,18 @@ fn unjournaled_put_result(
         Err(error)
             if error.is_outcome_unknown()
                 || error.is_disconnected()
-                || is_put_answer_lost(&error)
+                || is_answer_lost(&error)
                 || crate::error::answer_lost_code(&error).is_some() =>
         {
-            Err(ProtocolError::internal(format!(
-                "{} attempt {attempt} lost its answer. Pushing again is safe: the next push uploads any missing data: {error}",
-                GrpcRpc::StoragePut.wire_name()
-            )))
+            Err(ProtocolError::internal_with_context(
+                crate::error::UnjournaledAnswerLost {
+                    message: format!(
+                        "{} attempt {attempt} lost its answer. Pushing again is safe: the next push uploads any missing data: {error}",
+                        rpc.wire_name()
+                    ),
+                },
+                "unjournaled managed write lost its answer",
+            ))
         }
         result => result,
     }
@@ -1508,10 +1521,10 @@ impl StorageService {
                         let response = responses
                             .message()
                             .await
-                            .map_err(managed_put_stream_status)?
-                            .ok_or_else(|| put_answer_lost("the stream ended without an answer"))?;
+                            .map_err(unjournaled_stream_status)?
+                            .ok_or_else(|| answer_lost("the stream ended without an answer"))?;
                         if response.key() != Some(address) {
-                            return Err(put_answer_lost(format!(
+                            return Err(answer_lost(format!(
                                 "the answer named {:?}, not {address}",
                                 response.key()
                             )));
@@ -1527,7 +1540,7 @@ impl StorageService {
                 ),
             )
             .await;
-            return unjournaled_put_result(result, &attempt);
+            return unjournaled_result(GrpcRpc::StoragePut, result, &attempt);
         }
 
         self.put_streams
@@ -1653,15 +1666,20 @@ impl StorageService {
             target_context: Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&target_context)),
         };
 
-        if crate::caller_operation::current_caller_operation().is_some() {
-            let canonical = request.encode_to_vec();
+        if let Some(context) = crate::caller_operation::current_caller_operation() {
+            if ctx.partition != context.repository() {
+                return Err(ProtocolError::internal(
+                    "managed operation repository mismatch",
+                ));
+            }
+            // A Copy writes no journal child (WP-120 decision reversal, 2026-10-23), for the
+            // reasons a fragment Put does not: no receipt reader exists, the association it
+            // duplicates is content-addressed, and an unknown child used to block the fence for
+            // good. The attempt id is still minted and sent, for logs and wire correlation only.
+            let attempt = AttemptId::new();
             let (body, claim) = managed_body(request);
-            return crate::caller_operation::dispatch(
-                ctx.partition,
-                GrpcRpc::StorageCopy,
-                canonical,
-                self.connection.remote_url.to_string(),
-                ctx.auth_token.clone(),
+            let result = crate::outcome::with_dispatch_attempt(
+                attempt,
                 bounded_managed(
                     GrpcRpc::StorageCopy,
                     self.stream_idle,
@@ -1679,10 +1697,13 @@ impl StorageService {
                         let response = responses
                             .message()
                             .await
-                            .map_err(|status| managed_stream_status(status, GrpcRpc::StorageCopy))?
-                            .ok_or_else(|| stream_lost(GrpcRpc::StorageCopy))?;
+                            .map_err(unjournaled_stream_status)?
+                            .ok_or_else(|| answer_lost("the stream ended without an answer"))?;
                         if response.key() != Some(source_address) {
-                            return Err(stream_lost(GrpcRpc::StorageCopy));
+                            return Err(answer_lost(format!(
+                                "the answer named {:?}, not {source_address}",
+                                response.key()
+                            )));
                         }
                         finish_managed_stream(
                             &mut responses,
@@ -1695,6 +1716,7 @@ impl StorageService {
                 ),
             )
             .await;
+            return unjournaled_result(GrpcRpc::StorageCopy, result, &attempt);
         }
 
         self.copy_streams
@@ -1948,22 +1970,25 @@ impl StorageService {
             payload: payload.unwrap_or_default(),
         };
 
-        if crate::caller_operation::current_caller_operation().is_some() {
+        if let Some(context) = crate::caller_operation::current_caller_operation() {
+            if ctx.partition != context.repository() {
+                return Err(ProtocolError::internal(
+                    "managed operation repository mismatch",
+                ));
+            }
             let _permit = self
                 .get_put_limiter
                 .acquire()
                 .await
                 .internal("permit acquire")?;
-            let mut canonical = request.clone();
-            canonical.payload = Bytes::new();
-            canonical.request_id = 0;
+            // A PutResolved writes no journal child (WP-120 decision reversal, 2026-10-23): no
+            // receipt reader exists, its fragment is content-addressed and its key is
+            // last-writer-wins, and an unknown child used to block the fence for good. The
+            // attempt id is still minted and sent, for logs and wire correlation only.
+            let attempt = AttemptId::new();
             let (body, claim) = managed_body(request);
-            return crate::caller_operation::dispatch(
-                ctx.partition,
-                GrpcRpc::StoragePutResolved,
-                canonical.encode_to_vec(),
-                self.connection.remote_url.to_string(),
-                ctx.auth_token.clone(),
+            let result = crate::outcome::with_dispatch_attempt(
+                attempt,
                 bounded_managed(
                     GrpcRpc::StoragePutResolved,
                     self.stream_idle,
@@ -1981,12 +2006,13 @@ impl StorageService {
                         let response = responses
                             .message()
                             .await
-                            .map_err(|status| {
-                                managed_stream_status(status, GrpcRpc::StoragePutResolved)
-                            })?
-                            .ok_or_else(|| stream_lost(GrpcRpc::StoragePutResolved))?;
+                            .map_err(unjournaled_stream_status)?
+                            .ok_or_else(|| answer_lost("the stream ended without an answer"))?;
                         if response.request_id != request_id {
-                            return Err(stream_lost(GrpcRpc::StoragePutResolved));
+                            return Err(answer_lost(format!(
+                                "the answer named request {}, not {request_id}",
+                                response.request_id
+                            )));
                         }
                         finish_managed_stream(
                             &mut responses,
@@ -2002,6 +2028,7 @@ impl StorageService {
                 ),
             )
             .await;
+            return unjournaled_result(GrpcRpc::StoragePutResolved, result, &attempt);
         }
 
         let _permit = self

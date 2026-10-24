@@ -2595,6 +2595,76 @@ mod quic_session_rebind_tests {
             .await
     }
 
+    /// An unmanaged push whose QUIC Copy loses its answer fails with an unknown outcome and sends
+    /// no fallback Put: the Copy may have applied, and an upload would resend it. The wire log
+    /// ends at the Copy, so nothing (no Put, no rebind) followed it.
+    #[tokio::test]
+    async fn b12_push_with_a_severed_copy_answer_is_unknown_and_sends_no_fallback_put() -> TestResult
+    {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (scenario, notify_processed, server) =
+                    severed_response_scenario(Command::Copy).await;
+                let SeveredScenario { session, log, .. } = scenario;
+
+                // The peer holds the content under one context; the local store holds it under
+                // another, so the push asks the peer to copy rather than upload.
+                let (fragment, peer_address, payload) = random_fragment();
+                session
+                    .put(peer_address, fragment, Some(payload.clone()))
+                    .await
+                    .expect("seed put for the copy source");
+                let copyable = lore_base::types::Address {
+                    hash: peer_address.hash,
+                    context: lore_base::types::Context::from(rand::random::<[u8; 16]>()),
+                };
+                let (local, local_mutable) = fresh_stores().await;
+                let mut context = lore_revision::repository::RepositoryContext::new_null_context(
+                    local,
+                    local_mutable,
+                );
+                context.id = session.partition().await?;
+                let repository = Arc::new(context);
+                repository
+                    .immutable_store()
+                    .put(repository.id, copyable, fragment, Some(payload), false)
+                    .await
+                    .expect("local payload");
+
+                let queried = lore_revision::branch::push::PushQueryResult {
+                    absent: Vec::new(),
+                    copyable: vec![copyable],
+                    present: Vec::new(),
+                };
+                let progress = Arc::new(lore_revision::branch::push::PushProgress::new(Arc::new(
+                    lore_revision::branch::push::PushStats::new(false),
+                )));
+                let (result, ()) = tokio::join!(
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        lore_revision::branch::push::push_fragments(
+                            repository, session, queried, progress,
+                        ),
+                    ),
+                    async {
+                        // Sever the connection once the peer has applied the Copy, before its
+                        // answer can reach the client.
+                        await_severed(&notify_processed, Command::Copy).await;
+                        server.close().await;
+                    }
+                );
+                let result = result.expect(
+                    "push did not return: a fallback Put after the cut waits on a reconnect that never comes
+                     (the plain-Copy mutant lands here); a correct push fails at once with an unknown outcome",
+                );
+                let error = result.expect_err("a severed Copy answer must fail the push");
+                assert!(error.is_outcome_unknown(), "{error:?}");
+                assert_no_bytes_after_severed_command(&log.lock().unwrap(), Command::Copy as u8);
+                Ok(())
+            })
+            .await
+    }
     /// A real server error answer is never replay authority. The path-less in-memory immutable
     /// store makes `Verify` return the storage service's generic failure after the request has
     /// reached the server. Move the connection generation while that answer is held in flight,
