@@ -1873,7 +1873,7 @@ async fn receipt_get_sends_the_same_wire_constants_the_maintenance_rail_reads() 
 // -------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn attempt_receipt_acquire_result_is_only_exposed_for_exact_applied_acquire() {
+async fn attempt_receipt_acquire_result_is_only_exposed_for_exact_applied_acquire_or_renew() {
     use lore_postgres::domain::locks::FencedLock;
     use lore_postgres::domain::locks::VerifiedLockOwner;
     let lock = FencedLock {
@@ -1893,6 +1893,9 @@ async fn attempt_receipt_acquire_result_is_only_exposed_for_exact_applied_acquir
     };
     for (method, applied, marker, expected) in [
         ("lock.acquire", true, false, 1),
+        // A renewal mints new tokens; a lost renewal answer is recovered from this receipt.
+        ("lock.renew", true, false, 1),
+        ("lock.renew", false, false, 0),
         ("lock.admin_acquire", true, false, 1),
         ("lock.release", true, false, 0),
         ("branch.push", true, false, 0),

@@ -817,7 +817,7 @@ impl DomainOperationService for LoreDomainOperationV1Service {
                 response.reason = reason;
                 if matches!(
                     response.method.as_str(),
-                    "lock.acquire" | "lock.admin_acquire"
+                    "lock.acquire" | "lock.renew" | "lock.admin_acquire"
                 ) && response.outcome == DomainOperationOutcome::Applied as i32
                     && !from_future_marker
                 {

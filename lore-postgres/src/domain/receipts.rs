@@ -1334,9 +1334,11 @@ pub async fn attempt_receipt_get(
     // Dropped when the delegated read found nothing after all. The two statements run in one
     // transaction so this is close to unreachable, but "close to" is not the same as a promise,
     // and the contract says a caller learns a method only for a receipt that exists.
+    // A renewal mints a fresh token for every row, so its result is returned exactly as an
+    // acquire's is: without it, a renewal whose answer was lost leaves only stale tokens.
     let acquired_locks = if matches!(
         binding.method.as_str(),
-        "lock.acquire" | "lock.admin_acquire"
+        "lock.acquire" | "lock.renew" | "lock.admin_acquire"
     ) && matches!(
         &lookup,
         ReceiptLookup::Committed {
@@ -1361,13 +1363,13 @@ pub async fn attempt_receipt_get(
                 if locks.iter().any(|lock| {
                     lock.owner.verified_issuer != verified_issuer
                         || lock.owner.authenticated_subject.is_empty()
-                        || (binding.method == "lock.acquire"
+                        || (matches!(binding.method.as_str(), "lock.acquire" | "lock.renew")
                             && lock.owner.authenticated_subject != authenticated_subject)
                         || lock.branch_id.len() != 16
                         || lock.ownership_token.is_none_or(|token| token == [0; 32])
                 }) {
                     return Err(DomainError::Internal(
-                        "stored acquire result has invalid ownership".to_owned(),
+                        "stored acquire or renewal result has invalid ownership".to_owned(),
                     ));
                 }
                 locks

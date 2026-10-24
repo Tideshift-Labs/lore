@@ -86,8 +86,9 @@ pub async fn settle_recovered_ownership(
         .map(|resource| (resource.resource.branch, resource.resource.hash))
         .collect::<HashSet<(BranchId, Hash)>>();
 
-    // A renewal mints new tokens, but the server returns no locks on a renewal receipt, so they
-    // cannot be recovered here. The tokens this client holds are now stale.
+    // A renewal mints new tokens. A current server returns them on the receipt, and they replace
+    // the held ones below. A server from before that returns none, so they cannot be recovered
+    // here, and the tokens this client holds are now stale.
     if receipt.method == "lock.renew" && receipt.acquired_locks.is_empty() {
         crate::lore_warn!(
             "Lock renewal {attempt} settled applied without its new ownership tokens; the held \

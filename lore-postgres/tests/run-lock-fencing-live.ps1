@@ -62,6 +62,7 @@ $inventory = @(
         ExactPrefixes = @()
         Cases         = @(
             'receipt_recovery_cases::acquire_attempt_recovers_original_tokens_after_release_without_exposing_them_to_other_principals',
+            'receipt_recovery_cases::renew_attempt_recovers_the_new_tokens_only_for_its_owner_and_the_old_tokens_stop_working',
             'receipt_recovery_cases::acquire_attempt_missing_historical_result_is_empty_but_malformed_result_refuses',
             'receipt_recovery_cases::attempt_recovery_never_combines_unique_prepared_snapshot_with_later_duplicate_and_tokens',
             'receipt_recovery_cases::branch_publication_and_refusal_serialize_both_orders_without_overwriting_applied',

@@ -714,8 +714,14 @@ impl LockService for StubLockService {
                 Err(not_prepared_refusal(request.metadata(), proof))
             }
             RpcOutcome::ApplyThenLoseTheAnswer => {
+                // A real cell files a request whose resources all carry tokens as a renewal.
+                let renew = !resources.is_empty()
+                    && resources
+                        .iter()
+                        .all(|resource| !resource.expected_ownership_token.is_empty());
                 let locks = self.grant(resources, MANAGED_FIXTURE_SUBJECT);
-                self.file_receipt(&request, "lock.acquire", locks);
+                let method = if renew { "lock.renew" } else { "lock.acquire" };
+                self.file_receipt(&request, method, locks);
                 Err(lost_answer())
             }
             RpcOutcome::Grant => Ok(Response::new(LockResponse {

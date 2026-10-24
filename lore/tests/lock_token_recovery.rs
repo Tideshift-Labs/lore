@@ -294,6 +294,81 @@ fn a_reconciled_lost_release_keeps_a_newer_token_for_the_same_row() {
     assert_eq!(kept.token, newer.token);
 }
 
+/// Lowercase hex, as the ownership store writes tokens.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The token in the only ownership row, as the store keeps it (hex).
+fn only_token(root: &Path) -> String {
+    let document = std::fs::read(root.join(".lore").join("attempts")).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&document[1..]).unwrap();
+    let rows = json["ownership"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "one ownership row");
+    rows[0]["token"].as_str().unwrap().to_owned()
+}
+
+/// A renewal mints new tokens. When its answer is lost, recovery replaces the held tokens with
+/// the ones the receipt returns, and the release presents the new one. A server that returns no
+/// tokens for a renewal still settles the renewal, keeping the held token.
+#[test]
+fn a_reconciled_lost_renewal_replaces_the_held_token_and_tolerates_an_old_server() {
+    for old_server in [false, true] {
+        let runtime = lore::runtime();
+        let live = live(&runtime, LockPolicy::default());
+        assert_eq!(runtime.block_on(acquire(&live.fixture)), 0);
+        let held = only_token(&live.fixture.path);
+
+        live.server.set_policy(LockPolicy {
+            lock: RpcOutcome::ApplyThenLoseTheAnswer,
+            ..LockPolicy::default()
+        });
+        assert_eq!(
+            runtime.block_on(acquire(&live.fixture)),
+            OutcomeUnknown::FFI_CODE,
+            "the renewal's answer is lost"
+        );
+        assert_eq!(
+            only_token(&live.fixture.path),
+            held,
+            "no answer, no new token"
+        );
+
+        runtime
+            .block_on(async {
+                let fence = RepositoryMutationGuard::recover(&live.fixture.path)
+                    .await
+                    .expect("recovery opens the fence");
+                lore::recovery::reconcile(&fence, |store, attempt| async move {
+                    let mut receipt = lore::recovery::receipt_get(&store, &attempt).await?;
+                    assert_eq!(receipt.method, "lock.renew");
+                    if old_server {
+                        receipt.acquired_locks.clear();
+                    }
+                    Ok(receipt)
+                })
+                .await
+            })
+            .expect("the applied renewal settles");
+        let kept = only_token(&live.fixture.path);
+        if old_server {
+            assert_eq!(kept, held, "an old server returns no new token");
+        } else {
+            assert_ne!(kept, held, "the renewal's new token replaces the held one");
+            // The fixture mints counter tokens: 1 for the acquire, 2 for the renewal it filed.
+            let minted = [&2u64.to_be_bytes()[..], &[0u8; 24]].concat();
+            assert_eq!(
+                kept,
+                hex(&minted),
+                "the stored token is the one the receipt returned"
+            );
+            live.server.set_policy(LockPolicy::default());
+            assert_eq!(runtime.block_on(release(&live.fixture)), 0);
+            assert_released_with_token(&live);
+        }
+    }
+}
+
 /// How a test alters the real receipt before recovery reads it.
 type Tamper = fn(&mut lore_transport::DomainAttemptReceipt);
 

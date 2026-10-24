@@ -130,6 +130,164 @@ async fn acquire_attempt_recovers_original_tokens_after_release_without_exposing
     }
 }
 
+/// A renewal mints a new token for every row. When its answer is lost, the receipt is the only
+/// place the new token exists, so it must return it to the renewing owner exactly as an acquire's
+/// does; the old token no longer releases the row.
+#[tokio::test]
+#[ignore = "requires isolated PostgreSQL; LORE_TEST_PG_URL"]
+async fn renew_attempt_recovers_the_new_tokens_only_for_its_owner_and_the_old_tokens_stop_working()
+{
+    let url = pg_url().expect("PostgreSQL required");
+    let store = store(&url).await;
+    let (repo, branch) = create_repository(&store).await;
+    let (operation, input, _) = prepared_acquire(&store, &repo, &branch).await;
+    let acquired = store
+        .lock_coordinator()
+        .acquire_or_renew(&operation, &input)
+        .await
+        .unwrap();
+    let old = acquired.locks[0].ownership_token.unwrap();
+    let hash: [u8; 32] = input.resources[0]
+        .resource_hash
+        .as_slice()
+        .try_into()
+        .unwrap();
+
+    let renew = acquire_input(
+        &repo,
+        &branch,
+        input.owner.clone(),
+        vec![resource(hash, Some(old))],
+        None,
+    );
+    let renew_binding = acquire_or_renew_binding(&renew).unwrap();
+    assert_eq!(renew_binding.method, "lock.renew");
+    let key = ReceiptKey {
+        verified_issuer: input.owner.verified_issuer.clone(),
+        authenticated_subject: input.owner.authenticated_subject.clone(),
+        tenant_scope_key: lock_tenant_scope_key(&repo, &branch).unwrap(),
+        operation_id: Uuid::now_v7(),
+    };
+    let attempt = Uuid::now_v7();
+    let PrepareResult::Prepared { token, .. } = store
+        .domain_operation_prepare(&key, &renew_binding, None, Some(attempt))
+        .await
+        .unwrap()
+    else {
+        panic!("a renewal must prepare")
+    };
+    let renew_operation = GovernedOperation {
+        key,
+        binding: renew_binding,
+        prepare_token: token,
+    };
+    // The answer below is the one a lost response never delivers; only the receipt remains.
+    let renewed = store
+        .lock_coordinator()
+        .acquire_or_renew(&renew_operation, &renew)
+        .await
+        .unwrap();
+    assert_eq!(renewed.outcome, DomainOutcome::Applied);
+    let new = renewed.locks[0].ownership_token.unwrap();
+    assert_ne!(new, old, "a renewal mints a new token");
+
+    let receipt = store
+        .domain_operation_attempt_receipt_get(
+            &input.owner.verified_issuer,
+            &input.owner.authenticated_subject,
+            &attempt,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        receipt.lookup,
+        ReceiptLookup::Committed {
+            outcome: DomainOutcome::Applied,
+            ..
+        }
+    ));
+    assert_eq!(receipt.method.as_deref(), Some("lock.renew"));
+    assert_eq!(receipt.acquired_locks.len(), 1);
+    assert_eq!(receipt.acquired_locks[0].ownership_token, Some(new));
+    assert_eq!(receipt.acquired_locks[0].resource_hash, hash.to_vec());
+    for (issuer, subject) in [
+        ("foreign", input.owner.authenticated_subject.as_str()),
+        (input.owner.verified_issuer.as_str(), "foreign"),
+    ] {
+        let foreign = store
+            .domain_operation_attempt_receipt_get(issuer, subject, &attempt)
+            .await
+            .unwrap();
+        assert!(matches!(foreign.lookup, ReceiptLookup::NotFound));
+        assert!(foreign.acquired_locks.is_empty());
+    }
+
+    // A client that kept the old token could not release the row with it.
+    for (presented, releases) in [(old, false), (new, true)] {
+        let release = ReleaseInput {
+            repository_id: repo.to_vec(),
+            branch_id: branch.to_vec(),
+            owner: input.owner.clone(),
+            resources: vec![resource(hash, Some(presented))],
+            outbox_cell_id: None,
+        };
+        let release_operation = prepare_bound_operation(
+            &store,
+            &input.owner,
+            &repo,
+            &branch,
+            release_binding(&release).unwrap(),
+        )
+        .await;
+        let released = store
+            .lock_coordinator()
+            .release(&release_operation, &release)
+            .await
+            .unwrap();
+        if releases {
+            assert_eq!(released.outcome, DomainOutcome::Applied);
+        } else {
+            assert_rejection(&released, LockRejection::AuthorityMismatch);
+        }
+    }
+
+    // A stored renewal result naming another owner is refused, exactly as an acquire's is.
+    let client = client(&url).await;
+    let operation_id = renew_operation.key.operation_id.as_bytes().to_vec();
+    let mut wrong_owner: Vec<u8> = client
+        .query_one(
+            "SELECT public_result FROM lore_domain_operation_receipts WHERE operation_id=$1",
+            &[&operation_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let owner_bytes = input.owner.authenticated_subject.as_bytes();
+    let owner_offset = wrong_owner
+        .windows(owner_bytes.len())
+        .position(|window| window == owner_bytes)
+        .unwrap();
+    wrong_owner[owner_offset] ^= 1;
+    client
+        .execute(
+            "UPDATE lore_domain_operation_receipts SET public_result=$1 WHERE operation_id=$2",
+            &[&wrong_owner, &operation_id],
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .domain_operation_attempt_receipt_get(
+                &input.owner.verified_issuer,
+                &input.owner.authenticated_subject,
+                &attempt,
+            )
+            .await
+            .is_err(),
+        "a renewal result naming another owner must not be returned"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires isolated PostgreSQL; LORE_TEST_PG_URL"]
 async fn acquire_attempt_missing_historical_result_is_empty_but_malformed_result_refuses() {
