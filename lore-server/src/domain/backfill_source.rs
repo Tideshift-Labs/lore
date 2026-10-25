@@ -98,11 +98,11 @@ type KeyIdentity = (Vec<u8>, i16, Vec<u8>);
 /// Why one repository's facts could not be read.
 ///
 /// `missing` is the whole reason this type exists rather than a bare
-/// [`DomainError`]. A repository found only by its metadata row is skipped as
-/// delete residue when its blob is genuinely gone, and that skip must not
-/// swallow a transient object-store failure — a `SlowDown` treated as "deleted"
-/// silently drops a live repository from the projection, which is the exact
-/// silent-partial-backfill this module exists to prevent.
+/// [`DomainError`]. A repository found only by its metadata row whose blob is
+/// genuinely gone refuses with a lost-data message that names the partition;
+/// any other failed read refuses with the read's own error. Both refuse: the
+/// earlier skip of the absent case dropped a repository from the projection,
+/// which is the exact silent-partial-backfill this module exists to prevent.
 struct FactsFailure {
     /// The read failed because nothing is there, not because the read failed.
     missing: bool,
@@ -130,10 +130,10 @@ enum Discovery {
     /// it would enforce over a repository that has no domain row.
     NameMap,
     /// It has a `RepositoryMetadata` row in its own partition but no name-map
-    /// row pointing at it. Either a repository whose name row was lost, which
-    /// must still be projected, or delete residue whose metadata blob is already
-    /// gone, which must not stop the cutover. Reading the metadata is what tells
-    /// the two apart.
+    /// row pointing at it: a repository whose name row was lost, or a delete
+    /// that crashed after removing the name row. Both still have a readable
+    /// metadata blob and are projected. One whose blob is absent is lost data
+    /// and refuses the cutover; one whose read failed refuses too.
     MetadataRow,
 }
 
@@ -400,9 +400,10 @@ impl DomainBackfillSource for CellBackfillSource {
     async fn list_repositories(&self) -> Result<Vec<RepositoryFacts>, DomainError> {
         let mut facts = Vec::new();
         for (repository_id, discovery) in self.repository_ids().await? {
-            // Reason: the `NameMap` and `MetadataRow` (non-`missing`) arms both refuse, but for
-            // unrelated reasons worth keeping as separately commented arms rather than merging
-            // into one pattern clippy can't attach a single rationale to.
+            // Reason: all three `Err` arms refuse, but for unrelated reasons (an unreadable
+            // name-mapped repository, an absent metadata blob that is lost data, a failed
+            // read of a metadata-row repository). Each keeps its own comment rather than
+            // merging into one pattern clippy can't attach a single rationale to.
             #[allow(clippy::match_same_arms)]
             match (self.repository_facts(repository_id).await, discovery) {
                 (Ok(one), _) => facts.push(one),
@@ -410,18 +411,26 @@ impl DomainBackfillSource for CellBackfillSource {
                 // serves. Failing to read it stops the cutover rather than
                 // projecting the cell without it.
                 (Err(failure), Discovery::NameMap) => return Err(failure.error),
-                // Found only by its metadata row, and the metadata is genuinely
-                // ABSENT: a crashed delete's leftover pointer. Reported and
-                // skipped; the leftover rows are then classified as residue by
-                // the verification, which is what residue is for.
+                // Found only by its metadata row, and the metadata is ABSENT.
+                //
+                // This was once skipped as a crashed delete's leftover pointer.
+                // No writer produces that shape: create stores the blob before
+                // the row, and delete removes the rows and never the blob, so a
+                // crashed delete leaves a readable blob and the repository is
+                // projected. Every real instance is lost data — a write-behind
+                // blob that was never promoted, an obliterated blob, a wrong
+                // bucket — and skipping it dropped the repository, its branches
+                // and its locks from the projection behind a warning. Refuse.
                 (Err(failure), Discovery::MetadataRow) if failure.missing => {
-                    crate::domain::operator::step(&format!(
-                        "WARNING: partition {} holds a repository metadata row that no name \
-                         resolves to and whose metadata is absent ({}); treating it as delete \
-                         residue and not projecting it",
+                    return Err(DomainError::NotReady(format!(
+                        "partition {} holds a repository metadata row that no name resolves to, \
+                         and the metadata blob it points at is missing from the legacy store \
+                         ({}). No create or delete path leaves that shape, so this is lost data, \
+                         not delete residue. Restore the blob (check the configured bucket) \
+                         before running cutover again",
                         hex::encode(repository_id.data()),
                         failure.error
-                    ));
+                    )));
                 }
                 // Found only by its metadata row, and the read FAILED rather
                 // than answering "absent". A transient object-store failure

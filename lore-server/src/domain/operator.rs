@@ -83,6 +83,7 @@ use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::backfill::DomainBackfill;
 use lore_postgres::domain::backfill::ResidueClass;
 use lore_postgres::domain::backfill::VerificationReport;
+use lore_postgres::domain::errors::DomainError;
 use lore_postgres::domain::locks::BackfillIssuerMap;
 use lore_postgres::domain::locks::BackfillReport;
 use lore_postgres::domain::locks::LockFencingReadiness;
@@ -206,6 +207,10 @@ pub enum DomainCommand {
     /// `--legacy-lock-issuer`, and discarding them needs
     /// `--force-release-legacy-locks`, which releases the lock rather than
     /// preserving it.
+    ///
+    /// Also refuses, while the domain backfill has not finished, when any
+    /// fragment lifecycle head exists: the supported order is cutover first,
+    /// then `initialize-fragments`.
     Cutover {
         /// Report what each step would do and change no row.
         ///
@@ -404,6 +409,79 @@ fn framed(hasher: &mut blake3::Hasher, component: &[u8]) {
     hasher.update(component);
 }
 
+/// Why `cutover` refused before it changed any lifecycle state.
+///
+/// Typed so a caller can tell a refusal from a database failure without
+/// matching on message text. `run` returns it inside its `anyhow::Error`; a
+/// caller recovers it with `downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CutoverRefusal {
+    /// The cell holds fragment lifecycle heads but its domain backfill has not
+    /// finished.
+    ///
+    /// `cutover` opens the immutable store on the legacy route, which reads
+    /// only the legacy fragment tables. A coordinated-route write never writes
+    /// them, so every coordinated-route blob reads as absent to the backfill,
+    /// whatever its lifecycle state or object key. The supported order is
+    /// domain cutover on empty stores first, then `initialize-fragments`, so a
+    /// cell in this shape is outside the design and no recovery is offered.
+    #[error(
+        "this cell has {heads} fragment lifecycle head(s) (first: {}) but no completed domain \
+         cutover. Cutover reads repository and branch metadata through the legacy fragment \
+         route only, and that route cannot see blobs written through the coordinated fragment \
+         route. The supported order is domain cutover first, then initialize-fragments. Do not \
+         force this cutover; ask the cell's operator owner how this cell reached this state. \
+         Cutover refused before any lifecycle state changed: enforcement and fenced routing \
+         are exactly as they were",
+        first.join(", ")
+    )]
+    FragmentLifecyclePresent {
+        /// How many `lore_fragment_lifecycle` heads exist, in any state.
+        heads: i64,
+        /// Up to five of their hashes, hex, ascending.
+        first: Vec<String>,
+    },
+}
+
+/// A domain backfill step failed.
+///
+/// `run` returns it inside its `anyhow::Error`, so a caller recovers the
+/// typed [`DomainError`] with `downcast_ref` and [`BackfillFailure::cause`].
+///
+/// The message is built here rather than from `cause`'s own text, because
+/// `DomainError::NotReady` prints "domain enforcement requested before
+/// cutover", which is not what a backfill refusal means. The cause is kept as
+/// data, not as an error source, so the CLI does not print that text either.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error("{stage}: {}", backfill_detail(.cause))]
+pub struct BackfillFailure {
+    stage: &'static str,
+    cause: DomainError,
+}
+
+impl BackfillFailure {
+    /// Which backfill step failed, as printed before the detail.
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    /// The typed failure the backfill returned.
+    pub fn cause(&self) -> &DomainError {
+        &self.cause
+    }
+}
+
+fn backfill_detail(cause: &DomainError) -> String {
+    match cause {
+        DomainError::NotReady(detail) => detail.clone(),
+        other => other.to_string(),
+    }
+}
+
+fn typed_backfill_error(stage: &'static str, cause: DomainError) -> anyhow::Error {
+    BackfillFailure { stage, cause }.into()
+}
+
 /// What one `cutover` invocation was asked to do.
 struct CutoverOptions {
     dry_run: bool,
@@ -585,6 +663,14 @@ impl DomainOperatorContext {
         json: bool,
     ) -> Result<()> {
         let before = self.status().await?;
+        // Before the dry-run report, so a dry run predicts this refusal rather
+        // than reporting a plan the real run would refuse. Only while the
+        // domain backfill still has to run: it is the one step that reads
+        // metadata blobs. A cell already at cutover skips it, and on such a
+        // cell lifecycle heads are ordinary live fragment traffic.
+        if !before.ready_for_enforcement() {
+            self.refuse_fragment_lifecycle_present().await?;
+        }
         if options.dry_run {
             print_report(
                 &dry_run_plan(&before, &options),
@@ -671,15 +757,14 @@ impl DomainOperatorContext {
                 let projected = backfill
                     .run()
                     .await
-                    .map_err(|error| anyhow!("Domain backfill failed: {error}"))?;
+                    .map_err(|error| typed_backfill_error("Domain backfill failed", error))?;
                 step(&format!(
                     "domain backfill pass complete: {projected} repository(ies) projected"
                 ));
             }
-            let report = backfill
-                .verify()
-                .await
-                .map_err(|error| anyhow!("Domain backfill verification failed: {error}"))?;
+            let report = backfill.verify().await.map_err(|error| {
+                typed_backfill_error("Domain backfill verification failed", error)
+            })?;
             log_verification(&report);
             backfill
                 .complete(&report)
@@ -802,6 +887,59 @@ impl DomainOperatorContext {
             step("fenced lock routing armed (leases off)");
         }
         Ok(report)
+    }
+
+    /// Refuse while any fragment lifecycle head exists, in any state.
+    ///
+    /// Every head names a coordinated-route blob, and the legacy route this
+    /// command reads through cannot see one. Checking only `Staged` heads
+    /// missed promoted and repaired blobs, which the legacy route cannot read
+    /// either. A cell with no SCHEMA-118 lifecycle table has never written
+    /// through the coordinated route.
+    async fn refuse_fragment_lifecycle_present(&self) -> Result<()> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|error| anyhow!("Failed to check out an operator connection: {error}"))?;
+        let present: bool = client
+            .query_one(
+                "SELECT to_regclass('lore_fragment_lifecycle') IS NOT NULL AS present",
+                &[],
+            )
+            .await
+            .map_err(|error| anyhow!("Failed to probe the fragment lifecycle relation: {error}"))?
+            .try_get("present")
+            .map_err(|error| anyhow!("Failed to decode the fragment lifecycle probe: {error}"))?;
+        if !present {
+            return Ok(());
+        }
+        // One statement, so the count and the sample come from one snapshot.
+        // The window count is computed before the LIMIT, so it is the full
+        // total even though at most five rows return.
+        let rows = client
+            .query(
+                "SELECT hash, count(*) OVER ()::bigint AS heads \
+                   FROM lore_fragment_lifecycle ORDER BY hash LIMIT 5",
+                &[],
+            )
+            .await
+            .map_err(|error| anyhow!("Failed to read fragment lifecycle heads: {error}"))?;
+        let Some(head_row) = rows.first() else {
+            return Ok(());
+        };
+        let heads: i64 = head_row.try_get("heads").map_err(|error| {
+            anyhow!("Failed to decode the fragment lifecycle head count: {error}")
+        })?;
+        let first = rows
+            .iter()
+            .map(|row| {
+                row.try_get::<_, Vec<u8>>("hash")
+                    .map(hex::encode)
+                    .map_err(|error| anyhow!("Failed to decode a fragment lifecycle hash: {error}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Err(CutoverRefusal::FragmentLifecyclePresent { heads, first }.into())
     }
 
     /// Refuse, or release, legacy lock rows no reviewed issuer covers.

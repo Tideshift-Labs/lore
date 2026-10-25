@@ -405,9 +405,12 @@ mod live {
     use std::sync::Arc;
 
     use lore_base::types::KeyType;
+    use lore_base::types::RepositoryId;
     use lore_postgres::domain::DomainSchemaState;
     use lore_postgres::domain::PostgresDomainStore;
     use lore_postgres::domain::backfill::DomainBackfillSource;
+    use lore_postgres::domain::errors::DomainError;
+    use lore_postgres::domain::fragments::FragmentLifecycleState;
     use lore_postgres::domain::locks::LockFencingReadiness;
     use lore_postgres::domain::schema as domain_schema;
     use lore_postgres::pool::TlsConfig;
@@ -416,6 +419,10 @@ mod live {
     use lore_postgres::store::immutable_store::PostgresImmutableStore;
     use lore_postgres::store::lock_store::PostgresLockStore;
     use lore_postgres::store::mutable_store::PostgresMutableStore;
+    use lore_revision::repository;
+    use lore_revision::repository::RepositoryContext;
+    use lore_server::domain::operator::BackfillFailure;
+    use lore_server::domain::operator::CutoverRefusal;
     use lore_storage::Hash;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
@@ -1019,5 +1026,424 @@ mod live {
             !final_state.enforcement_enabled,
             "enforcement must stay off when the lock backfill fails, since it now runs last"
         );
+    }
+
+    // ── 13. any fragment lifecycle head refuses a cutover not yet done ───
+    //
+    // `cutover` opens the immutable store on the legacy route, which reads
+    // only the legacy fragment tables. A coordinated-route write never writes
+    // them, so every coordinated-route blob — Staged, or Remote at any key —
+    // reads as absent to the backfill. The supported order is domain cutover
+    // first, then `initialize-fragments`, so a cell holding any lifecycle head
+    // before its backfill finishes is outside that design. The command must
+    // refuse, before it changes any lifecycle state and on `--dry-run` too,
+    // whatever state the head is in, and the refusal must be typed.
+    //
+    // The control is the same cell with the head deleted: an installed but
+    // empty lifecycle table must cut over, so the refusal is shown to be
+    // caused by the head and not by the table.
+
+    /// Install SCHEMA-118 through the coordinator's own bootstrap, then insert
+    /// one lifecycle head in `state`.
+    async fn seed_lifecycle_head(
+        store: &PostgresDomainStore,
+        db_url: &str,
+        state: i16,
+    ) -> Result<(), String> {
+        store
+            .fragment_coordinator()
+            .bootstrap()
+            .await
+            .map_err(|error| format!("fragment schema bootstrap: {error}"))?;
+        pg_client(db_url)
+            .await
+            .execute(
+                "INSERT INTO lore_fragment_lifecycle \
+                 (hash, current_epoch, state, manifest_id, last_fence) \
+                 VALUES ($1, 1, $2, $3, 1)",
+                &[&vec![0x5au8; 32], &state, &vec![0x5bu8; 32]],
+            )
+            .await
+            .map_err(|error| format!("insert the lifecycle head: {error}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_refuses_a_cell_holding_a_staged_fragment_head() {
+        let case = "cutover_refuses_a_cell_holding_a_staged_fragment_head";
+        Box::pin(assert_lifecycle_head_refuses_cutover(
+            case,
+            FragmentLifecycleState::Staged,
+        ))
+        .await;
+    }
+
+    /// A `Remote` head is the case a Staged-only check missed: a promoted or
+    /// repaired blob is still a coordinated-route blob the legacy backfill
+    /// cannot read.
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_refuses_a_cell_holding_a_remote_fragment_head() {
+        let case = "cutover_refuses_a_cell_holding_a_remote_fragment_head";
+        Box::pin(assert_lifecycle_head_refuses_cutover(
+            case,
+            FragmentLifecycleState::Remote,
+        ))
+        .await;
+    }
+
+    async fn assert_lifecycle_head_refuses_cutover(case: &str, state: FragmentLifecycleState) {
+        let Some((admin_url, s3)) = live_env(case) else {
+            return;
+        };
+        let (db_name, db_url) = create_throwaway_database(&admin_url, "lifecycle_head").await;
+
+        let bootstrap_store = PostgresDomainStore::connect(&db_url, 2, &TlsConfig::default())
+            .await
+            .expect("bootstrap the disposable domain schema");
+        let seed_result = seed_lifecycle_head(&bootstrap_store, &db_url, state.bits()).await;
+        drop(bootstrap_store);
+
+        let settings = armed_settings(&db_url, &s3);
+        let dry_run_outcome = run(
+            &DomainCommand::Cutover {
+                dry_run: true,
+                force_release_legacy_locks: false,
+                legacy_lock_issuer: Vec::new(),
+                json: false,
+            },
+            &settings,
+        )
+        .await;
+        let refused_outcome = run(&cutover_defaults(), &settings).await;
+        let refused_state = independent_domain_state(&db_url).await;
+
+        // The control: the same cell, its lifecycle table installed but empty.
+        let empty_result = pg_client(&db_url)
+            .await
+            .execute("DELETE FROM lore_fragment_lifecycle", &[])
+            .await;
+        let control_outcome = run(&cutover_defaults(), &settings).await;
+        let control_state = independent_domain_state(&db_url).await;
+        drop_throwaway_database(&admin_url, &db_name).await;
+
+        seed_result.expect("seed one lifecycle head");
+        let expected = CutoverRefusal::FragmentLifecyclePresent {
+            heads: 1,
+            first: vec![hex::encode([0x5au8; 32])],
+        };
+        let dry_run_error = dry_run_outcome.expect_err("a --dry-run must report the refusal too");
+        assert_eq!(
+            dry_run_error.downcast_ref::<CutoverRefusal>(),
+            Some(&expected),
+            "the dry-run refusal must be typed: {dry_run_error}"
+        );
+        let error = refused_outcome.expect_err("a lifecycle head must refuse cutover");
+        assert_eq!(
+            error.downcast_ref::<CutoverRefusal>(),
+            Some(&expected),
+            "the refusal must be typed: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("1 fragment lifecycle head(s)")
+                && message.contains("initialize-fragments"),
+            "the refusal must name the count and the supported order: {message}"
+        );
+        assert!(
+            !message.contains("drain"),
+            "the refusal must not offer a drain recovery the cell cannot use: {message}"
+        );
+        assert_eq!(
+            refused_state.backfill_state,
+            domain_schema::BACKFILL_NOT_STARTED,
+            "a refusal must not start the domain backfill"
+        );
+        assert!(!refused_state.enforcement_enabled);
+
+        empty_result.expect("empty the lifecycle table");
+        control_outcome.expect("the same cell with an empty lifecycle table must cut over");
+        assert_eq!(
+            control_state.backfill_state,
+            domain_schema::BACKFILL_CUTOVER
+        );
+        assert!(control_state.enforcement_enabled);
+    }
+
+    // ── 13b. a lifecycle head refuses a backfill left RUNNING or VERIFIED ─
+    //
+    // The refusal is gated on "backfill not finished", not on "backfill not
+    // started". A cell hand-placed at RUNNING or VERIFIED (the latter as in
+    // case 11) still has to run or resume a backfill step that reads through
+    // the legacy route, so a lifecycle head must refuse there too, and the
+    // refusal must leave the seeded backfill state exactly as it was.
+
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_refuses_a_lifecycle_head_while_the_backfill_is_running() {
+        let case = "cutover_refuses_a_lifecycle_head_while_the_backfill_is_running";
+        Box::pin(assert_lifecycle_head_refuses_unfinished_backfill(
+            case,
+            domain_schema::BACKFILL_RUNNING,
+            false,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_refuses_a_lifecycle_head_while_the_backfill_is_verified() {
+        let case = "cutover_refuses_a_lifecycle_head_while_the_backfill_is_verified";
+        Box::pin(assert_lifecycle_head_refuses_unfinished_backfill(
+            case,
+            domain_schema::BACKFILL_VERIFIED,
+            true,
+        ))
+        .await;
+    }
+
+    async fn assert_lifecycle_head_refuses_unfinished_backfill(
+        case: &str,
+        backfill_state: i16,
+        residue_classified: bool,
+    ) {
+        let Some((admin_url, s3)) = live_env(case) else {
+            return;
+        };
+        let (db_name, db_url) = create_throwaway_database(&admin_url, "unfinished_head").await;
+
+        let bootstrap_store = PostgresDomainStore::connect(&db_url, 2, &TlsConfig::default())
+            .await
+            .expect("bootstrap the disposable domain schema");
+        let head_result = seed_lifecycle_head(
+            &bootstrap_store,
+            &db_url,
+            FragmentLifecycleState::Remote.bits(),
+        )
+        .await;
+        drop(bootstrap_store);
+        let state_result = pg_client(&db_url)
+            .await
+            .execute(
+                "UPDATE lore_domain_schema_state \
+                 SET backfill_state = $1, residue_classified = $2, \
+                     updated_at = clock_timestamp() \
+                 WHERE id = 1",
+                &[&backfill_state, &residue_classified],
+            )
+            .await;
+
+        let settings = armed_settings(&db_url, &s3);
+        let outcome = run(&cutover_defaults(), &settings).await;
+        let final_state = independent_domain_state(&db_url).await;
+        drop_throwaway_database(&admin_url, &db_name).await;
+
+        head_result.expect("seed one lifecycle head");
+        assert_eq!(
+            state_result.expect("hand-place the backfill state"),
+            1,
+            "the seed must move the one schema-state row, or this case tests nothing"
+        );
+        let error = outcome.expect_err("a lifecycle head must refuse an unfinished backfill");
+        assert_eq!(
+            error.downcast_ref::<CutoverRefusal>(),
+            Some(&CutoverRefusal::FragmentLifecyclePresent {
+                heads: 1,
+                first: vec![hex::encode([0x5au8; 32])],
+            }),
+            "the refusal must be typed: {error}"
+        );
+        assert_eq!(
+            final_state.backfill_state, backfill_state,
+            "a refusal must leave the seeded backfill state unchanged"
+        );
+        assert!(!final_state.enforcement_enabled);
+    }
+
+    // ── 14. a metadata-row repository with an absent blob refuses ────────
+    //
+    // A repository found only by its `RepositoryMetadata` row, whose blob the
+    // object store reports absent, used to be skipped as delete residue. No
+    // writer produces that shape: create stores the blob before the row, and
+    // delete removes the rows and never the blob. So every instance is lost
+    // data (an unpromoted or lost write-behind blob, an obliterated blob, a
+    // wrong bucket), and the skip dropped the repository from the projection
+    // with only a warning. The cutover must refuse and name the partition.
+
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_refuses_a_metadata_row_repository_whose_blob_is_absent() {
+        let Some((admin_url, s3)) =
+            live_env("cutover_refuses_a_metadata_row_repository_whose_blob_is_absent")
+        else {
+            return;
+        };
+        let (db_name, db_url) = create_throwaway_database(&admin_url, "absent_blob").await;
+
+        let object = ObjectStoreSettings {
+            bucket: s3.bucket.clone(),
+            endpoint_url: Some(s3.endpoint.clone()),
+            region: Some(s3.region.clone()),
+            force_path_style: true,
+            slow_operation_threshold_millis: u64::MAX,
+            timeout_millis: 5_000,
+            validate_bucket_on_startup: true,
+        };
+        let immutable_store =
+            PostgresImmutableStore::connect(&db_url, 2, &TlsConfig::default(), object)
+                .await
+                .expect("bootstrap the disposable immutable store");
+        let mutable_store = PostgresMutableStore::connect(&db_url, 2, &TlsConfig::default())
+            .await
+            .expect("bootstrap the disposable mutable store");
+        let immutable: Arc<dyn ImmutableStore> = Arc::new(immutable_store);
+        let mutable: Arc<dyn MutableStore> = Arc::new(mutable_store);
+
+        // The exact key `repository::metadata_hash` reads, pointing at a blob
+        // that was never written.
+        let mut repository_id = RepositoryId::default();
+        *repository_id.data_mut() = [0x6cu8; 16];
+        let base = RepositoryContext::new_null_context(immutable, mutable.clone());
+        let (key, key_type) =
+            repository::mutable_key(base.salt(), repository::METADATA, repository_id);
+        let write_result = mutable
+            .clone()
+            .store(
+                Partition::from(*repository_id.data()),
+                key,
+                Hash::from([0x6du8; 32]),
+                key_type,
+            )
+            .await;
+
+        let settings = armed_settings(&db_url, &s3);
+        let outcome = run(&cutover_defaults(), &settings).await;
+        let final_state = independent_domain_state(&db_url).await;
+        drop_throwaway_database(&admin_url, &db_name).await;
+
+        write_result.expect("write one repository metadata row with no blob behind it");
+        assert_eq!(key_type, KeyType::RepositoryMetadata);
+        let error = outcome.expect_err(
+            "a metadata-row repository whose blob is absent must refuse cutover, not be skipped",
+        );
+        // Typed, so a caller can tell this refusal from a database failure
+        // without matching on message text.
+        assert!(
+            matches!(
+                error
+                    .downcast_ref::<BackfillFailure>()
+                    .map(BackfillFailure::cause),
+                Some(DomainError::NotReady(_))
+            ),
+            "the refusal must be a recoverable DomainError::NotReady: {error:?}"
+        );
+        // The whole chain, as the CLI prints it. `NotReady`'s own prefix says
+        // "enforcement requested before cutover", which is not what happened.
+        let chain = format!("{error:?}");
+        assert!(
+            !chain.contains("requested before cutover"),
+            "the refusal must not claim enforcement was requested: {chain}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("missing from the legacy store"),
+            "the refusal must say where the blob is missing: {message}"
+        );
+        assert!(
+            message.contains(&hex::encode([0x6cu8; 16])),
+            "the refusal must name the repository partition: {message}"
+        );
+        assert!(
+            !final_state.enforcement_enabled,
+            "a refused backfill must leave enforcement off"
+        );
+        assert_ne!(
+            final_state.backfill_state,
+            domain_schema::BACKFILL_CUTOVER,
+            "a refused backfill must not reach cutover"
+        );
+    }
+
+    // ── 15. a Staged head on an already cut-over cell does not refuse ────
+    //
+    // The lifecycle-head refusal guards the domain backfill, the one step that
+    // reads metadata blobs. A cell already at cutover skips that step, and on
+    // such a cell a Staged head is ordinary live write-behind traffic. A rerun
+    // must still pass, or every restart of an armed write-behind cell's
+    // cutover would refuse.
+
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_rerun_on_a_cut_over_cell_passes_with_a_staged_fragment_head() {
+        let Some((admin_url, s3)) =
+            live_env("cutover_rerun_on_a_cut_over_cell_passes_with_a_staged_fragment_head")
+        else {
+            return;
+        };
+        let (db_name, db_url) = create_throwaway_database(&admin_url, "staged_rerun").await;
+        let settings = armed_settings(&db_url, &s3);
+
+        let first_outcome = run(&cutover_defaults(), &settings).await;
+        let seed_result = match PostgresDomainStore::connect(&db_url, 2, &TlsConfig::default())
+            .await
+        {
+            Ok(store) => {
+                seed_lifecycle_head(&store, &db_url, FragmentLifecycleState::Staged.bits()).await
+            }
+            Err(error) => Err(format!("connect the seeding store: {error}")),
+        };
+        let rerun_outcome = run(&cutover_defaults(), &settings).await;
+        let final_state = independent_domain_state(&db_url).await;
+        drop_throwaway_database(&admin_url, &db_name).await;
+
+        first_outcome.expect("the first cutover of an empty cell must succeed");
+        seed_result.expect("seed one Staged lifecycle head after cutover");
+        rerun_outcome.expect("a rerun on a cut-over cell must not refuse on a Staged head");
+        assert_eq!(final_state.backfill_state, domain_schema::BACKFILL_CUTOVER);
+        assert!(final_state.enforcement_enabled);
+    }
+
+    // ── 16. no lifecycle table at all does not refuse ────────────────────
+    //
+    // A cell that never installed SCHEMA-118 has never staged anything. The
+    // probe must read the missing relation as "nothing staged" rather than
+    // fail the query against a table that does not exist.
+
+    #[tokio::test]
+    #[ignore = "requires LORE_TEST_PG_URL + LORE_TEST_S3_ENDPOINT/LORE_TEST_S3_BUCKET"]
+    async fn cutover_passes_on_a_cell_with_no_fragment_lifecycle_table() {
+        let Some((admin_url, s3)) =
+            live_env("cutover_passes_on_a_cell_with_no_fragment_lifecycle_table")
+        else {
+            return;
+        };
+        let (db_name, db_url) = create_throwaway_database(&admin_url, "no_lifecycle").await;
+        let settings = armed_settings(&db_url, &s3);
+
+        let probe = "SELECT to_regclass('lore_fragment_lifecycle') IS NOT NULL AS present";
+        let absent_before = pg_client(&db_url).await.query_one(probe, &[]).await;
+        let outcome = run(&cutover_defaults(), &settings).await;
+        let absent_after = pg_client(&db_url).await.query_one(probe, &[]).await;
+        let final_state = independent_domain_state(&db_url).await;
+        drop_throwaway_database(&admin_url, &db_name).await;
+
+        let present: bool = absent_before
+            .expect("probe the lifecycle relation before cutover")
+            .get("present");
+        assert!(
+            !present,
+            "the fixture must start with no lifecycle table, or this case tests nothing"
+        );
+        outcome.expect("a cell with no lifecycle table must cut over");
+        let present: bool = absent_after
+            .expect("probe the lifecycle relation after cutover")
+            .get("present");
+        assert!(
+            !present,
+            "the probe ran against a missing relation, and cutover must not create it"
+        );
+        assert_eq!(final_state.backfill_state, domain_schema::BACKFILL_CUTOVER);
+        assert!(final_state.enforcement_enabled);
     }
 }
