@@ -3,70 +3,84 @@
 // SPDX-License-Identifier: MIT
 #[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod net_common {
-    /// Maximum simultaneously reserved candidates across both protocols.
+    /// Maximum candidates tried, OS-assigned and random together.
     pub(crate) const PORT_PAIR_ATTEMPTS: usize = 100;
+
+    /// The IANA dynamic range that random fallback candidates are drawn from.
+    const DYNAMIC_PORTS: std::ops::RangeInclusive<u16> = 49152..=65535;
+
+    /// Where the leading TCP socket of one candidate binds.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Candidate {
+        /// Port 0: the OS picks.
+        Assigned,
+        /// A random port from `DYNAMIC_PORTS`.
+        At(u16),
+    }
 
     /// A TCP listener and a UDP socket on the same port, both held exclusively.
     ///
     /// A `lore://` server serves gRPC on TCP and QUIC on UDP at one number, and no bind can reserve
     /// a number for the other protocol. So the port is not chosen and then bound twice — it is
-    /// taken from the OS on one protocol, matched on the other, and handed to the servers already
-    /// bound. Nothing can take either between choosing and serving, because there is no such gap.
+    /// bound on TCP, matched on UDP, and handed to the servers already bound. Nothing can take
+    /// either between choosing and serving, because there is no such gap.
     ///
     /// Neither socket sets a reuse option. Failed candidates stay reserved until this search ends,
-    /// preventing immediate reuse. Alternate the leading protocol: Windows can allocate many TCP
-    /// candidates inside a UDP-only excluded range (and vice versa).
+    /// preventing immediate reuse. The first candidate is OS-assigned. Every later one is random:
+    /// Windows excludes port ranges per protocol in blocks of 100 (Hyper-V, WSL, `WinNAT`), and
+    /// the OS hands out ports sequentially, so asking it again keeps landing in the same block.
+    /// A random loopback bind can succeed over another process's wildcard bind of the same port;
+    /// the matching bind always had that exposure, and the OS-assigned first candidate does not.
     pub(crate) fn bind_matched_pair() -> (std::net::TcpListener, std::net::UdpSocket) {
-        enum Socket {
-            Tcp(std::net::TcpListener),
-            Udp(std::net::UdpSocket),
-        }
-        let pair = reserve_matched_pair(
+        reserve_matched_pair(
             PORT_PAIR_ATTEMPTS,
-            |tcp_first| {
-                if tcp_first {
-                    std::net::TcpListener::bind("127.0.0.1:0").map(Socket::Tcp)
-                } else {
-                    std::net::UdpSocket::bind("127.0.0.1:0").map(Socket::Udp)
+            random_port,
+            |candidate| match candidate {
+                Candidate::Assigned => std::net::TcpListener::bind("127.0.0.1:0"),
+                Candidate::At(port) => {
+                    std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|error| {
+                        std::io::Error::new(error.kind(), format!("TCP port {port}: {error}"))
+                    })
                 }
             },
-            |socket| match socket {
-                Socket::Tcp(tcp) => {
-                    let port = tcp.local_addr()?.port();
-                    std::net::UdpSocket::bind(("127.0.0.1", port))
-                        .map(Socket::Udp)
-                        .map_err(|error| {
-                            std::io::Error::new(error.kind(), format!("UDP port {port}: {error}"))
-                        })
-                }
-                Socket::Udp(udp) => {
-                    let port = udp.local_addr()?.port();
-                    std::net::TcpListener::bind(("127.0.0.1", port))
-                        .map(Socket::Tcp)
-                        .map_err(|error| {
-                            std::io::Error::new(error.kind(), format!("TCP port {port}: {error}"))
-                        })
-                }
+            |tcp| {
+                let port = tcp.local_addr()?.port();
+                std::net::UdpSocket::bind(("127.0.0.1", port)).map_err(|error| {
+                    std::io::Error::new(error.kind(), format!("UDP port {port}: {error}"))
+                })
             },
         )
-        .unwrap_or_else(|error| panic!("cannot reserve matched TCP/UDP sockets: {error}"));
-        match pair {
-            (Socket::Tcp(tcp), Socket::Udp(udp)) | (Socket::Udp(udp), Socket::Tcp(tcp)) => {
-                (tcp, udp)
-            }
-            _ => unreachable!("matching always binds the other protocol"),
-        }
+        .unwrap_or_else(|error| panic!("cannot reserve matched TCP/UDP sockets: {error}"))
     }
 
+    fn random_port() -> u16 {
+        rand::random_range(DYNAMIC_PORTS)
+    }
+
+    /// Bind up to `attempts` candidates until one matches. An OS-assigned bind failure is fatal,
+    /// because the OS has no port to give. A random bind failure only costs that candidate.
     fn reserve_matched_pair<T, U>(
         attempts: usize,
-        mut bind_leading: impl FnMut(bool) -> std::io::Result<T>,
+        mut next_random: impl FnMut() -> u16,
+        mut bind_leading: impl FnMut(Candidate) -> std::io::Result<T>,
         mut bind_matching: impl FnMut(&T) -> std::io::Result<U>,
     ) -> std::io::Result<(T, U)> {
         let mut rejected = Vec::new();
         let mut last_error = None;
         for attempt in 0..attempts {
-            let leading = bind_leading(attempt % 2 == 0)?;
+            let candidate = if attempt == 0 {
+                Candidate::Assigned
+            } else {
+                Candidate::At(next_random())
+            };
+            let leading = match bind_leading(candidate) {
+                Ok(leading) => leading,
+                Err(error) if candidate == Candidate::Assigned => return Err(error),
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
             match bind_matching(&leading) {
                 Ok(matching) => return Ok((leading, matching)),
                 Err(error) => {
@@ -76,7 +90,7 @@ pub(crate) mod net_common {
             }
         }
         Err(std::io::Error::other(format!(
-            "no matching socket after {} reserved candidates; last failure: {:?}",
+            "no matching socket after {attempts} candidates ({} reserved); last failure: {:?}",
             rejected.len(),
             last_error
         )))
@@ -87,8 +101,13 @@ pub(crate) mod net_common {
         use std::cell::RefCell;
         use std::collections::BTreeSet;
         use std::io;
+        use std::ops::RangeInclusive;
         use std::rc::Rc;
 
+        use super::Candidate;
+        use super::DYNAMIC_PORTS;
+        use super::PORT_PAIR_ATTEMPTS;
+        use super::random_port;
         use super::reserve_matched_pair;
 
         #[derive(Debug)]
@@ -100,49 +119,178 @@ pub(crate) mod net_common {
             }
         }
 
-        // Model an allocator that immediately reuses the lowest released port. Dropping a rejected
-        // reservation would select port 1 forever, even though port 3 has a matching UDP socket.
-        fn lowest_free(held: &Rc<RefCell<BTreeSet<u16>>>) -> Reservation {
-            let port = (1..=u16::MAX)
-                .find(|port| !held.borrow().contains(port))
+        /// A model of the excluded blocks on the failing rig: TCP and UDP blocks together spanned
+        /// 55333-57125. Here one protocol holds the whole span.
+        const EXCLUDED: RangeInclusive<u16> = 55333..=57125;
+
+        /// Model the OS: port 0 hands out the next number of a sequential allocator that starts
+        /// inside the excluded block, a named port binds unless it is held or excluded.
+        struct Model {
+            held: Rc<RefCell<BTreeSet<u16>>>,
+            next_assigned: u16,
+            leading_excluded: bool,
+        }
+
+        impl Model {
+            fn new(leading_excluded: bool) -> Self {
+                Model {
+                    held: Rc::new(RefCell::new(BTreeSet::new())),
+                    next_assigned: *EXCLUDED.start(),
+                    leading_excluded,
+                }
+            }
+
+            fn bind(&mut self, candidate: Candidate) -> io::Result<Reservation> {
+                let port = match candidate {
+                    Candidate::Assigned => {
+                        self.next_assigned += 1;
+                        self.next_assigned
+                    }
+                    Candidate::At(port) => port,
+                };
+                // The OS never assigns a port excluded on its own protocol; a named port can be.
+                let named = matches!(candidate, Candidate::At(_));
+                if self.leading_excluded && named && EXCLUDED.contains(&port) {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                if !self.held.borrow_mut().insert(port) {
+                    return Err(io::Error::from(io::ErrorKind::AddrInUse));
+                }
+                Ok(Reservation(port, Rc::clone(&self.held)))
+            }
+        }
+
+        fn match_outside_excluded(socket: &Reservation) -> io::Result<u16> {
+            if EXCLUDED.contains(&socket.0) {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            } else {
+                Ok(socket.0)
+            }
+        }
+
+        #[test]
+        fn assigned_candidate_is_used_when_it_matches() {
+            let mut model = Model::new(false);
+            let pair = reserve_matched_pair(
+                PORT_PAIR_ATTEMPTS,
+                || panic!("no random candidate needed"),
+                |candidate| model.bind(candidate),
+                |socket| Ok(socket.0),
+            )
+            .unwrap();
+            assert_eq!(pair.1, *EXCLUDED.start() + 1);
+        }
+
+        /// The run-6 failure: every OS-assigned port sits in a block excluded on the matching
+        /// protocol. The old logic asked the OS 100 times and exhausted inside the block.
+        #[test]
+        fn random_fallback_escapes_a_sequential_excluded_block() {
+            for leading_excluded in [false, true] {
+                let mut model = Model::new(leading_excluded);
+                let held = Rc::clone(&model.held);
+                let mut candidates = Vec::new();
+                let pair = reserve_matched_pair(
+                    PORT_PAIR_ATTEMPTS,
+                    random_port,
+                    |candidate| {
+                        candidates.push(candidate);
+                        model.bind(candidate)
+                    },
+                    match_outside_excluded,
+                )
                 .unwrap();
-            assert!(held.borrow_mut().insert(port));
-            Reservation(port, Rc::clone(held))
+                assert!(DYNAMIC_PORTS.contains(&pair.1) && !EXCLUDED.contains(&pair.1));
+                assert_eq!(candidates[0], Candidate::Assigned);
+                assert!(candidates[1..].iter().all(|candidate| {
+                    matches!(candidate, Candidate::At(port) if DYNAMIC_PORTS.contains(port))
+                }));
+                assert_eq!(*held.borrow(), BTreeSet::from([pair.1]));
+                drop(pair);
+                assert!(held.borrow().is_empty());
+            }
+        }
+
+        #[test]
+        fn random_candidates_cover_the_dynamic_range() {
+            let ports: Vec<u16> = (0..10_000).map(|_| random_port()).collect();
+            assert!(ports.iter().all(|port| DYNAMIC_PORTS.contains(port)));
+            assert!(ports.iter().any(|port| *port < 50_000));
+            assert!(ports.iter().any(|port| *port > 64_000));
         }
 
         #[test]
         fn rejected_candidates_stay_reserved_until_a_pair_is_found() {
-            let held = Rc::new(RefCell::new(BTreeSet::new()));
+            let mut model = Model::new(false);
+            let held = Rc::clone(&model.held);
+            let mut randoms = [60_001, 60_002].into_iter();
             let mut visited = Vec::new();
             let pair = reserve_matched_pair(
                 3,
-                |_| Ok(lowest_free(&held)),
-                |tcp| {
-                    visited.push(tcp.0);
-                    if tcp.0 == 3 {
-                        Ok(3)
+                || randoms.next().unwrap(),
+                |candidate| model.bind(candidate),
+                |socket| {
+                    visited.push(socket.0);
+                    assert_eq!(held.borrow().len(), visited.len());
+                    if socket.0 == 60_002 {
+                        Ok(socket.0)
                     } else {
                         Err(io::Error::from(io::ErrorKind::AddrInUse))
                     }
                 },
             )
             .unwrap();
-            assert_eq!(visited, [1, 2, 3]);
-            assert_eq!(*held.borrow(), BTreeSet::from([3]));
-            assert_eq!(pair.1, 3);
+            assert_eq!(visited, [*EXCLUDED.start() + 1, 60_001, 60_002]);
+            assert_eq!(*held.borrow(), BTreeSet::from([60_002]));
+            drop(pair);
+            assert!(held.borrow().is_empty());
+        }
+
+        #[test]
+        fn random_bind_failure_costs_only_that_candidate() {
+            let mut model = Model::new(true);
+            model.next_assigned = 40_000;
+            let held = Rc::clone(&model.held);
+            // Excluded on the leading protocol, then the held assigned port, then a free one.
+            let mut randoms = [56_000, 40_001, 60_000].into_iter();
+            let mut matched = Vec::new();
+            let pair = reserve_matched_pair(
+                4,
+                || randoms.next().unwrap(),
+                |candidate| model.bind(candidate),
+                |socket| {
+                    matched.push(socket.0);
+                    if socket.0 == 40_001 {
+                        Err(io::Error::from(io::ErrorKind::AddrInUse))
+                    } else {
+                        Ok(socket.0)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(matched, [40_001, 60_000]);
+            assert_eq!(pair.1, 60_000);
+            assert_eq!(*held.borrow(), BTreeSet::from([60_000]));
             drop(pair);
             assert!(held.borrow().is_empty());
         }
 
         #[test]
         fn exhaustion_is_bounded_and_releases_every_candidate() {
-            let held = Rc::new(RefCell::new(BTreeSet::new()));
-            let mut visited = Vec::new();
+            let mut model = Model::new(false);
+            let held = Rc::clone(&model.held);
+            let mut next = 60_000;
+            let mut tries = 0;
             let error = reserve_matched_pair::<_, ()>(
                 3,
-                |_| Ok(lowest_free(&held)),
-                |tcp| {
-                    visited.push(tcp.0);
+                || {
+                    next += 1;
+                    next
+                },
+                |candidate| {
+                    tries += 1;
+                    model.bind(candidate)
+                },
+                |_| {
                     Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "UDP excluded",
@@ -150,88 +298,27 @@ pub(crate) mod net_common {
                 },
             )
             .unwrap_err();
-            assert_eq!(visited, [1, 2, 3]);
+            assert_eq!(tries, 3);
             assert!(held.borrow().is_empty());
-            assert!(error.to_string().contains("3 reserved candidates"));
+            assert!(error.to_string().contains("3 candidates (3 reserved)"));
             assert!(error.to_string().contains("UDP excluded"));
         }
 
         #[test]
-        fn tcp_failure_releases_previous_reservations() {
-            let held = Rc::new(RefCell::new(BTreeSet::new()));
-            let mut calls = 0;
-            let error = reserve_matched_pair::<_, ()>(
+        fn assigned_bind_failure_is_fatal() {
+            let mut tries = 0;
+            let error = reserve_matched_pair::<Reservation, ()>(
                 3,
+                || panic!("no random candidate after a fatal bind"),
                 |_| {
-                    calls += 1;
-                    if calls == 2 {
-                        Err(io::Error::from(io::ErrorKind::AddrNotAvailable))
-                    } else {
-                        Ok(lowest_free(&held))
-                    }
+                    tries += 1;
+                    Err(io::Error::from(io::ErrorKind::AddrNotAvailable))
                 },
-                |_| Err(io::Error::from(io::ErrorKind::AddrInUse)),
+                |_| unreachable!(),
             )
             .unwrap_err();
-            assert_eq!(calls, 2);
+            assert_eq!(tries, 1);
             assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
-            assert!(held.borrow().is_empty());
-        }
-
-        fn protocol_exclusion_model(tcp_band_excluded_on_udp: bool) {
-            let held = Rc::new(RefCell::new(BTreeSet::new()));
-            let mut leaders = Vec::new();
-            let mut tcp_number = 0;
-            let mut udp_number = 1000;
-            let pair = reserve_matched_pair(
-                super::PORT_PAIR_ATTEMPTS,
-                |tcp_first| {
-                    leaders.push(tcp_first);
-                    let number = if tcp_first {
-                        &mut tcp_number
-                    } else {
-                        &mut udp_number
-                    };
-                    *number += 1;
-                    assert!(held.borrow_mut().insert(*number));
-                    Ok(Reservation(*number, Rc::clone(&held)))
-                },
-                |socket| {
-                    // One protocol's entire candidate band is excluded on the other protocol.
-                    // The opposite allocator's first candidate also conflicts, then finds a pair.
-                    let excluded = if tcp_band_excluded_on_udp {
-                        socket.0 < 1000 || socket.0 == 1001
-                    } else {
-                        socket.0 >= 1000 || socket.0 == 1
-                    };
-                    if excluded {
-                        Err(io::Error::from(io::ErrorKind::PermissionDenied))
-                    } else {
-                        Ok(socket.0)
-                    }
-                },
-            )
-            .unwrap();
-            if tcp_band_excluded_on_udp {
-                assert_eq!(leaders, [true, false, true, false]);
-                assert_eq!(pair.1, 1002);
-            } else {
-                assert_eq!(leaders, [true, false, true]);
-                assert_eq!(pair.1, 2);
-            }
-            assert_eq!(*held.borrow(), BTreeSet::from([pair.1]));
-            drop(pair);
-            assert!(held.borrow().is_empty());
-        }
-
-        #[test]
-        fn udp_leading_escapes_a_tcp_candidate_band_excluded_on_udp() {
-            protocol_exclusion_model(true);
-        }
-
-        #[test]
-        fn tcp_leading_escapes_a_udp_candidate_band_excluded_on_tcp() {
-            protocol_exclusion_model(false);
         }
     }
 }
