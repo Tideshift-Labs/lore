@@ -175,6 +175,30 @@ impl Fixture {
         ).await.unwrap().get(0)
     }
 
+    /// Run only `drain_cleanup_release_v1` for a claimed row, as the runtime role, leaving the
+    /// row released (state 3) and uncompacted: the shape a cell upgraded from before R32 holds.
+    async fn release_without_compaction(&self, spool: Uuid) {
+        let fence: i64 = self
+            .admin
+            .query_one(
+                "SELECT cleanup_fence FROM object_store_retention.drain_spool_custody WHERE spool_id=$1",
+                &[&spool],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        self.admin
+            .batch_execute(&format!(
+                "SET SESSION AUTHORIZATION object_dispatch_retention_runtime;
+                 BEGIN ISOLATION LEVEL SERIALIZABLE;
+                 SELECT object_store_retention.drain_cleanup_release_v1('{spool}', {fence});
+                 COMMIT;
+                 RESET SESSION AUTHORIZATION;"
+            ))
+            .await
+            .unwrap();
+    }
+
     async fn reserve(&self, policy: &DrainPolicy) -> DrainDescriptor {
         let (_, allocation_revision, allocation_fence, allocation_expiry_ms) = self
             .runtime
@@ -535,22 +559,26 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
     fixture
         .wait_until(second_descriptor.hard_not_after_ms + short.maximum_ttl_ms + 100)
         .await;
+    // From R32 `release_cleanup` also deletes the row, so no released row survives it. A cell that
+    // rotates with released rows still occupying the ledger is a cell upgraded from an older
+    // schema, and its rows are the shape the release procedure alone leaves (state 3). Build
+    // that shape: claim each row, then run only the release procedure.
     let cleanup = fixture
         .runtime
         .claim_cleanup(descriptor.spool_object_id)
         .await
         .unwrap();
-    fixture.runtime.release_cleanup(&cleanup).await.unwrap();
+    fixture
+        .release_without_compaction(descriptor.spool_object_id)
+        .await;
     let second_cleanup = fixture
         .runtime
         .claim_cleanup(second_descriptor.spool_object_id)
         .await
         .unwrap();
     fixture
-        .runtime
-        .release_cleanup(&second_cleanup)
-        .await
-        .unwrap();
+        .release_without_compaction(second_descriptor.spool_object_id)
+        .await;
     let coordinator = fixture.domain.fragment_coordinator();
     // Two withdrawn stages: each head still names its withdrawn epoch and has no
     // epochs row, so the release keeps the custody row as a tombstone (a late file
@@ -649,6 +677,9 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
             .iter()
             .all(|row| row["superseded"] == true && row["marker_fence_ms"].as_i64().unwrap() > 0)
     );
+    // Replaying the first claim's cleanup: the release is already applied, so only the R32
+    // deletion runs. It gives back exactly that row and its retained bytes (not a 1024-byte
+    // marker), whether or not a rotation superseded the row, and leaves the other row alone.
     fixture.runtime.release_cleanup(&cleanup).await.unwrap();
     coordinator.commit_stage_cleanup(orphan).await.unwrap();
     let replayed: serde_json::Value = serde_json::from_str(&fixture.snapshot().await).unwrap();
@@ -658,30 +689,30 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
             "old cleanup replay cannot refund twice"
         );
     }
-    // The replay's compaction step now finds its row superseded, so the row becomes a marker at
-    // once. That gives back exactly that row's retained bytes above the 1024-byte marker, never
-    // a metadata row, and leaves the other row alone. The replay's pre-rotation claim cannot
-    // delete the marker.
     let spool_row = |snapshot: &serde_json::Value, id: Uuid| -> serde_json::Value {
         snapshot["spool"]
             .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["spool_id"] == id.to_string())
-            .cloned()
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row["spool_id"] == id.to_string())
+                    .cloned()
+            })
             .unwrap_or(serde_json::Value::Null)
     };
-    let replayed_row = spool_row(&replayed, descriptor.spool_object_id);
-    assert_eq!(replayed_row["state"], 4);
-    assert_eq!(replayed_row["metadata_bytes"], 1024);
+    assert_eq!(
+        spool_row(&replayed, descriptor.spool_object_id),
+        serde_json::Value::Null,
+        "the replayed cleanup deleted the first row"
+    );
     assert_eq!(
         spool_row(&replayed, second_descriptor.spool_object_id),
-        spool_row(&after, second_descriptor.spool_object_id)
+        spool_row(&after, second_descriptor.spool_object_id),
+        "and left the second row alone"
     );
     let freed = spool_row(&after, descriptor.spool_object_id)["metadata_bytes"]
         .as_i64()
-        .unwrap()
-        - 1024;
+        .unwrap();
+    assert!(freed >= 1024, "a released row retains at least the floor");
     let metadata = |snapshot: &serde_json::Value| -> (i64, i64) {
         let rows = snapshot["dispatch_metadata"].as_array().unwrap();
         assert_eq!(rows.len(), 1, "one drain policy row");
@@ -694,31 +725,41 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
         (number(&rows[0][0]), number(&rows[0][1]))
     };
     let (after_bytes, after_rows) = metadata(&after);
-    assert_eq!(metadata(&replayed), (after_bytes - freed, after_rows));
-    fixture.wait_until(short.expires_at_ms).await;
-    assert!(fixture.now().await < next.expires_at_ms);
+    assert_eq!(
+        metadata(&replayed),
+        (after_bytes - freed, after_rows - 1),
+        "the deletion gave back exactly one row and the row's own retained bytes"
+    );
+    fixture
+        .runtime
+        .release_cleanup(&second_cleanup)
+        .await
+        .unwrap();
+    let emptied: serde_json::Value = serde_json::from_str(&fixture.snapshot().await).unwrap();
+    assert!(
+        emptied["spool"].is_null() || emptied["spool"].as_array().is_some_and(Vec::is_empty),
+        "no custody row outlives its cleanup: {}",
+        emptied["spool"]
+    );
+    assert_eq!(
+        metadata(&emptied),
+        (0, 0),
+        "the ledger is empty once every row is deleted"
+    );
+    assert_eq!(
+        emptied["dispatch_usage"], after["dispatch_usage"],
+        "deletion does not refund live quota again"
+    );
+    // Replays of finished cleanups change nothing.
     fixture.runtime.release_cleanup(&cleanup).await.unwrap();
     fixture
         .runtime
         .release_cleanup(&second_cleanup)
         .await
         .unwrap();
-    let compacted: serde_json::Value = serde_json::from_str(&fixture.snapshot().await).unwrap();
-    assert!(
-        compacted["spool"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|row| row["state"] == 4 && row["descriptor"].is_null())
-    );
-    assert_eq!(
-        compacted["dispatch_usage"], after["dispatch_usage"],
-        "compaction does not refund live quota again"
-    );
-    fixture.runtime.release_cleanup(&cleanup).await.unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&fixture.snapshot().await).unwrap(),
-        compacted
+        emptied
     );
 }
 

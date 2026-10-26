@@ -517,10 +517,11 @@ fn synthetic_descriptor(
     }
 }
 
-/// One full reserve -> claim -> release(+no-op compact) cycle, driven through the real
-/// `DrainClient`. Compaction is a deliberate no-op here: the published policy's `expires_at_ms` is
-/// far in the future, so every released row stays in state 3 holding its charge -- exactly the
-/// "8192 released rows, zero spooled files" shape from the CR's slot-31 evidence.
+/// One full reserve -> claim -> release -> compact cycle, driven through the real `DrainClient`.
+/// From R32 `release_cleanup` also runs `drain_cleanup_compact_v3`, which deletes the custody row
+/// at once and gives its row and bytes back, so the cell holds nothing after the cycle. (Through
+/// R31 the row stayed behind as a released row holding its charge: the "8192 released rows, zero
+/// spooled files" shape from the CR's slot-31 evidence.)
 async fn reserve_and_release(
     client: &DrainClient,
     descriptor: &DrainDescriptor,
@@ -598,6 +599,89 @@ async fn legacy_metadata_full(admin: &tokio_postgres::Client, boundary: &str, ce
         .await
         .expect("read the policy counters")
         .get(0)
+}
+
+/// Claim `spool` through the runtime role and run only `drain_cleanup_release_v1`, leaving the row
+/// released (state 3) and uncompacted. That is the shape every released row had through R31, and the
+/// shape a cell upgraded to R32 still holds until its first cleanup pass. Returns the cleanup fence.
+async fn release_without_compaction(runtime: &tokio_postgres::Client, spool: Uuid) -> i64 {
+    runtime
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    let fence: i64 = runtime
+        .query_one(
+            "SELECT fence FROM object_store_retention.drain_cleanup_claim_v2($1)",
+            &[&spool],
+        )
+        .await
+        .expect("raw cleanup claim")
+        .get(0);
+    runtime.batch_execute("COMMIT").await.unwrap();
+    runtime
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    runtime
+        .query(
+            "SELECT object_store_retention.drain_cleanup_release_v1($1,$2)",
+            &[&spool, &fence],
+        )
+        .await
+        .expect("raw cleanup release");
+    runtime.batch_execute("COMMIT").await.unwrap();
+    fence
+}
+
+/// The metadata ledger of one `(boundary, cell)`, against the custody rows it must describe.
+#[derive(Debug, PartialEq, Eq)]
+struct LedgerReading {
+    metadata_rows: i64,
+    metadata_bytes: i64,
+    custody_rows: i64,
+    custody_bytes: i64,
+}
+
+async fn ledger_reading(
+    admin: &tokio_postgres::Client,
+    boundary: &str,
+    cell: &str,
+) -> LedgerReading {
+    let row = admin
+        .query_one(
+            "SELECT p.metadata_rows::bigint, p.metadata_bytes::bigint,
+                    (SELECT count(*) FROM object_store_retention.drain_spool_custody c
+                      WHERE c.boundary = p.boundary AND c.cell = p.cell)::bigint,
+                    (SELECT coalesce(sum(c.metadata_bytes), 0) FROM object_store_retention.drain_spool_custody c
+                      WHERE c.boundary = p.boundary AND c.cell = p.cell)::bigint
+             FROM object_store_retention.drain_policies p WHERE p.boundary = $1 AND p.cell = $2",
+            &[&boundary, &cell],
+        )
+        .await
+        .expect("read the ledger and the custody rows it describes");
+    LedgerReading {
+        metadata_rows: row.get(0),
+        metadata_bytes: row.get(1),
+        custody_rows: row.get(2),
+        custody_bytes: row.get(3),
+    }
+}
+
+/// The ledger invariant of f2: `metadata_rows == count(custody rows)` and
+/// `metadata_bytes == sum(custody.metadata_bytes)`, for one `(boundary, cell)`.
+async fn assert_ledger_matches_custody(
+    admin: &tokio_postgres::Client,
+    boundary: &str,
+    cell: &str,
+    when: &str,
+) -> LedgerReading {
+    let reading = ledger_reading(admin, boundary, cell).await;
+    assert_eq!(
+        (reading.metadata_rows, reading.metadata_bytes),
+        (reading.custody_rows, reading.custody_bytes),
+        "ledger invariant broken {when}: {reading:?}"
+    );
+    reading
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2146,11 +2230,6 @@ async fn live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_do
         cell: &str,
         spool: Uuid,
     ) -> (i64, i64) {
-        // Unlike every other seeded policy in this file, `expires_at_ms` here is in the PAST: this
-        // helper needs `drain_cleanup_compact_v2` to actually run (its early-return condition is
-        // `greatest(s.expires_at_unix_ms, policy.expires_at_ms) > now`; with no matching
-        // `object_dispatch_spool_objects` row, `s.expires_at_unix_ms` is NULL and `greatest` falls
-        // through to the policy's own value alone).
         admin
             .batch_execute(&format!(
                 "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
@@ -2173,18 +2252,24 @@ async fn live_backfill_leaves_other_states_untouched_and_the_guard_prevents_a_do
             .await
             .expect("compute the retained size a snapshot would have captured")
             .get(0);
-        // Compaction "races ahead": give the row's own custody charge back now, exactly like the
-        // real 0027 `drain_cleanup_compact_v1`, before any backfill APPLY step re-checks it.
+        // Compaction "races ahead": move the row to the marker shape and give back its custody
+        // charge now, exactly as the pre-R32 `drain_cleanup_compact_v1/v2` did, before any backfill
+        // APPLY step re-checks it. R32's `drain_cleanup_compact_v3` deletes the row instead, so the
+        // marker is written by hand: this case exists to prove the backfill guard against a row an
+        // OLDER compaction already moved to state 4, which is still a state a cell can hold.
         admin
             .batch_execute(&format!(
-                "SET SESSION AUTHORIZATION object_dispatch_retention_runtime;
-                 BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE;
-                 SELECT object_store_retention.drain_cleanup_compact_v2('{spool}', NULL);
-                 COMMIT;
-                 RESET SESSION AUTHORIZATION;"
+                "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+                 UPDATE object_store_retention.drain_spool_custody
+                   SET state = 4, descriptor = NULL, canonical = NULL, metadata_bytes = 1024
+                   WHERE spool_id = '{spool}';
+                 UPDATE object_store_retention.drain_policies
+                   SET metadata_bytes = (metadata_bytes::numeric - 15360)::object_store_retention.uint64
+                   WHERE boundary = '{boundary}' AND cell = '{cell}';
+                 COMMIT;"
             ))
             .await
-            .expect("real compaction on the row");
+            .expect("simulate the pre-R32 compaction on the row");
         (charged, retained)
     }
 
@@ -3253,7 +3338,9 @@ async fn live_a_cleanup_claim_lost_to_another_replica_reads_as_contended() {
         .await
         .expect("a current cell's schema marker");
 
-    // One released (state 3) row: the idle-cell shape every cleanup pass re-scans.
+    // One released (state 3) row: the shape a cell upgraded from before R32 re-scans. From R32
+    // `release_cleanup` also deletes the row, so this one is released with only the release
+    // procedure; a second row takes the whole cycle and is gone.
     let descriptor = synthetic_descriptor(
         0,
         &policy,
@@ -3265,9 +3352,23 @@ async fn live_a_cleanup_claim_lost_to_another_replica_reads_as_contended() {
         .reserve(&descriptor)
         .await
         .expect("a real reservation");
+    let finished = synthetic_descriptor(
+        2,
+        &policy,
+        &policy_digest,
+        &allocation,
+        now_ms(&fixture.client).await,
+    );
+    client
+        .reserve(&finished)
+        .await
+        .expect("a second real reservation");
     tokio::time::sleep(Duration::from_millis(policy.maximum_ttl_ms + 500)).await;
+    let (releaser, _releaser_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_runtime").await;
+    release_without_compaction(&releaser, descriptor.spool_object_id).await;
     let intent = client
-        .claim_cleanup(descriptor.spool_object_id)
+        .claim_cleanup(finished.spool_object_id)
         .await
         .expect("the first cleanup claim");
     client
@@ -3277,8 +3378,8 @@ async fn live_a_cleanup_claim_lost_to_another_replica_reads_as_contended() {
     let spool = descriptor.spool_object_id;
 
     // Controls. Uncontended, a released row is re-claimable. A row that is gone reads as
-    // Contended since 0029: another replica deleted it, so that replica did its work. A claim the
-    // function itself rejects (too early) is still Refused.
+    // Contended since 0029: another replica deleted it, so that replica did its work. That includes
+    // a row R32's release deleted. A claim the function itself rejects (too early) is still Refused.
     client
         .claim_cleanup(spool)
         .await
@@ -3287,6 +3388,11 @@ async fn live_a_cleanup_claim_lost_to_another_replica_reads_as_contended() {
         client.claim_cleanup(Uuid::now_v7()).await.err(),
         Some(DrainError::Contended),
         "a claim on a row that no longer exists must read as Contended"
+    );
+    assert_eq!(
+        client.claim_cleanup(finished.spool_object_id).await.err(),
+        Some(DrainError::Contended),
+        "a claim on a row the release just deleted must read as Contended"
     );
     let early = synthetic_descriptor(
         1,
@@ -3462,9 +3568,9 @@ impl DrainCell {
         )
     }
 
-    /// Reserve `count` rows under the published policy, wait past their cleanup window, then
-    /// claim and release each: released (state 3) rows, the idle shape of a drained cell.
-    async fn released_rows(&self, first: u32, count: u32) -> Vec<DrainDescriptor> {
+    /// Reserve `count` rows under the published policy and wait past their cleanup window, so each
+    /// is claimable. They are still reserved (state 1).
+    async fn expired_reservations(&self, first: u32, count: u32) -> Vec<DrainDescriptor> {
         let mut descriptors = Vec::new();
         for i in first..first + count {
             let descriptor = self.descriptor(i, &self.policy).await;
@@ -3475,18 +3581,119 @@ impl DrainCell {
             descriptors.push(descriptor);
         }
         tokio::time::sleep(Duration::from_millis(self.policy.maximum_ttl_ms + 500)).await;
+        descriptors
+    }
+
+    /// [`DrainCell::expired_reservations`], then claim and run only the release procedure on each:
+    /// released (state 3) rows still holding their charge. R32's `release_cleanup` would also delete
+    /// them, so this is the shape of a cell upgraded from before R32, not of an R32 cell at rest.
+    async fn released_state3_rows(&self, first: u32, count: u32) -> Vec<DrainDescriptor> {
+        let descriptors = self.expired_reservations(first, count).await;
         for descriptor in &descriptors {
-            let intent = self
-                .client
-                .claim_cleanup(descriptor.spool_object_id)
-                .await
-                .expect("claim an expired reservation");
-            self.client
-                .release_cleanup(&intent)
-                .await
-                .expect("release it");
+            release_without_compaction(&self.runtime.0, descriptor.spool_object_id).await;
         }
         descriptors
+    }
+
+    /// Rewrite one released (state 3) row into the marker the pre-R32 compaction left (state 4,
+    /// descriptor and canonical NULL, `metadata_bytes` 1024, the spool object deleted, the policy
+    /// charge reduced by what the row gave back). R32 never writes this shape; a cell upgraded from
+    /// an older schema holds it, and `drain_cleanup_compact_v3` must delete it.
+    async fn become_legacy_marker(&self, spool: Uuid) {
+        self.fixture
+            .client
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;
+                 DELETE FROM object_store_retention.object_dispatch_spool_objects
+                   WHERE spool_object_id = '{spool}';
+                 UPDATE object_store_retention.drain_policies p
+                   SET metadata_bytes = (p.metadata_bytes::numeric - (c.metadata_bytes - 1024))::object_store_retention.uint64
+                   FROM object_store_retention.drain_spool_custody c
+                   WHERE c.spool_id = '{spool}' AND p.boundary = c.boundary AND p.cell = c.cell;
+                 UPDATE object_store_retention.drain_spool_custody
+                   SET state = 4, descriptor = NULL, canonical = NULL, metadata_bytes = 1024,
+                       lease_until_ms = 0
+                   WHERE spool_id = '{spool}' AND state = 3;
+                 COMMIT;"
+            ))
+            .await
+            .expect("rewrite a released row into the pre-R32 marker shape");
+    }
+
+    /// `count` pre-R32 markers (state 4), the shape that wedged a cell at `metadata_max_rows`.
+    async fn legacy_markers(&self, first: u32, count: u32) -> Vec<DrainDescriptor> {
+        let descriptors = self.released_state3_rows(first, count).await;
+        for descriptor in &descriptors {
+            self.become_legacy_marker(descriptor.spool_object_id).await;
+        }
+        descriptors
+    }
+
+    /// Run `sql` as the policy owner in one committed transaction.
+    async fn owner_sql(&self, sql: &str) {
+        self.fixture
+            .client
+            .batch_execute(&format!(
+                "BEGIN; SET LOCAL ROLE object_dispatch_retention_owner; {sql}; COMMIT;"
+            ))
+            .await
+            .unwrap_or_else(|error| panic!("owner statement failed: {error}: {sql}"));
+    }
+
+    async fn retired_floor(&self) -> i64 {
+        self.fixture
+            .client
+            .query_one(
+                "SELECT retired_floor_ms FROM object_store_retention.drain_policies \
+                 WHERE boundary=$1 AND cell=$2",
+                &[&self.policy.boundary, &self.policy.cell],
+            )
+            .await
+            .expect("read the retired floor")
+            .get(0)
+    }
+
+    async fn assert_ledger(&self, when: &str) -> LedgerReading {
+        assert_ledger_matches_custody(
+            &self.fixture.client,
+            &self.policy.boundary,
+            &self.policy.cell,
+            when,
+        )
+        .await
+    }
+
+    /// Every custody row's `(spool_id, state, metadata_bytes)` plus the policy's two counters, to
+    /// prove a refused call changed nothing.
+    async fn custody_snapshot(&self) -> (Vec<(Uuid, i16, i64)>, (String, String)) {
+        let admin = &self.fixture.client;
+        let rows = admin
+            .query(
+                "SELECT spool_id, state, metadata_bytes FROM object_store_retention.drain_spool_custody \
+                 WHERE boundary=$1 AND cell=$2 ORDER BY spool_id",
+                &[&self.policy.boundary, &self.policy.cell],
+            )
+            .await
+            .expect("snapshot custody");
+        let rows = rows
+            .iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .collect();
+        (rows, self.metadata_counters().await)
+    }
+
+    /// The smallest attempt `UUIDv7` millisecond any custody row of this cell carries, if any.
+    async fn oldest_attempt_ms(&self) -> Option<i64> {
+        self.fixture
+            .client
+            .query_one(
+                "SELECT min(object_store_retention.drain_uuid_v7_ms_v1(attempt_id)) \
+                 FROM object_store_retention.drain_spool_custody WHERE boundary=$1 AND cell=$2",
+                &[&self.policy.boundary, &self.policy.cell],
+            )
+            .await
+            .expect("read the oldest live attempt")
+            .get(0)
     }
 
     /// One cleanup pass the way the drain worker runs it, without a spool root: lease
@@ -3613,12 +3820,12 @@ impl DrainCell {
     }
 }
 
-// Row 56: a cell at its metadata row cap rotates, its superseded rows compact and then leave after
-// a post-fence rescan, and it takes a full cap of new reservations. A superseded marker is never
-// deleted on a scan time that is not a real claim after its fence, and an old-revision descriptor
-// stays refused once its marker is gone.
+// Row 56 under R32: a cell wedged at its metadata row cap by pre-R32 markers rotates, and its
+// superseded markers are deleted by one cleanup pass. There is no post-fence rescan to wait for any
+// more: `drain_cleanup_compact_v3` deletes a marker as soon as a cleanup release reaches it, and the
+// new revision pin already refuses an old-revision descriptor once the row is gone.
 #[tokio::test]
-#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database with a real BLAKE3 provider"]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
 async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap_again() {
     const CAP: u32 = 4;
     let cell = drain_cell(
@@ -3628,7 +3835,15 @@ async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap
     )
     .await;
 
-    let old = cell.released_rows(0, CAP).await;
+    // The wedge: CAP legacy markers fill the cell.
+    let old = cell.legacy_markers(0, CAP).await;
+    assert_eq!(cell.custody_states().await, vec![(4, false); CAP as usize]);
+    assert_eq!(
+        cell.metadata_counters().await,
+        (CAP.to_string(), (1024 * CAP).to_string()),
+        "a marker holds its row and its 1024-byte charge"
+    );
+    cell.assert_ledger("with the cell wedged by markers").await;
     let refused = cell.descriptor(CAP, &cell.policy).await;
     assert_eq!(
         cell.reserve_message(&refused).await.as_deref(),
@@ -3642,14 +3857,6 @@ async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap
             .unwrap()
             .metadata_full
     );
-    assert!(
-        cell.client
-            .cleanup_candidates(&cell.policy.boundary, &cell.policy.cell, 16)
-            .await
-            .unwrap()
-            .is_empty(),
-        "released rows under a live policy are not due before the rotation"
-    );
 
     let mut next = cell.policy.clone();
     next.revision = format!("{}-v2", cell.policy.revision);
@@ -3660,51 +3867,9 @@ async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap
         .await
         .unwrap();
     assert_eq!(observed.superseded_pending, u64::from(CAP));
-    assert_eq!(cell.custody_states().await, vec![(3, true); CAP as usize]);
-
-    // First pass: superseded released rows compact at once, without the old policy's expiry.
-    assert_eq!(
-        cell.cleanup_pass(&cell.client, 16).await.len(),
-        CAP as usize
-    );
     assert_eq!(cell.custody_states().await, vec![(4, true); CAP as usize]);
-    assert_eq!(
-        cell.metadata_counters().await,
-        (CAP.to_string(), (1024 * CAP).to_string()),
-        "a marker still holds its row and its 1024-byte charge"
-    );
 
-    // A scan time that is not a post-fence claim never deletes a marker.
-    let spool = old[0].spool_object_id;
-    let (fence, last_scan): (i64, i64) = {
-        let row = cell
-            .fixture
-            .client
-            .query_one(
-                "SELECT marker_fence_ms, last_scan_ms FROM object_store_retention.drain_spool_custody \
-                 WHERE spool_id=$1",
-                &[&spool],
-            )
-            .await
-            .unwrap();
-        (row.get(0), row.get(1))
-    };
-    assert!(
-        last_scan <= fence,
-        "the compacting claim came before the marker fence"
-    );
-    let compact = "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)";
-    for scanned in [last_scan, fence, fence + 3_600_000] {
-        cell.runtime_commit(compact, &[&spool, &scanned]).await;
-    }
-    assert_eq!(
-        cell.custody_states().await.len(),
-        CAP as usize,
-        "a pre-fence claim, a claim at the fence, and a forged future scan time delete nothing"
-    );
-
-    // Second pass: each marker's own post-fence claim, then its deletion.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // One pass deletes every superseded marker: no second, post-fence pass is needed.
     assert_eq!(
         cell.cleanup_pass(&cell.client, 16).await.len(),
         CAP as usize
@@ -3715,6 +3880,7 @@ async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap
         ("0".to_string(), "0".to_string()),
         "every deleted marker gave back exactly its row and its 1024 bytes"
     );
+    cell.assert_ledger("after the markers were deleted").await;
     let observed = cell
         .client
         .observe(&cell.policy.boundary, &cell.policy.cell)
@@ -3731,6 +3897,8 @@ async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap
             .await
             .unwrap_or_else(|error| panic!("post-rotation reservation {i}: {error}"));
     }
+    cell.assert_ledger("after a full cap of new reservations")
+        .await;
 
     // The old descriptor itself is past its send window. The same identity re-timed under the old
     // revision reaches the policy fence and is refused there.
@@ -3750,44 +3918,97 @@ async fn live_rotation_reclaims_superseded_markers_and_the_cell_takes_a_full_cap
     );
 }
 
-// Row 56 accounting: deleting a marker refuses an underflow rather than clamping, like 0028.
+// Row 56 accounting under R32: deleting a row (released or a legacy marker) refuses an underflow
+// rather than clamping, like 0028, and changes nothing when it does.
 #[tokio::test]
-#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database with a real BLAKE3 provider"]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
 async fn live_superseded_marker_deletion_refuses_a_counter_underflow() {
     let cell = drain_cell(
         "LORE_TEST_CELL_SCHEMA_UPGRADE_SUPERSEDE_UNDERFLOW_PG_URL",
         "underflow",
-        4,
+        8,
     )
     .await;
-    cell.released_rows(0, 1).await;
-    let mut next = cell.policy.clone();
-    next.revision = format!("{}-v2", cell.policy.revision);
-    cell.rotate(&next).await;
-    assert_eq!(cell.cleanup_pass(&cell.client, 16).await.len(), 1);
-    cell.fixture
-        .client
-        .batch_execute(&format!(
-            "UPDATE object_store_retention.drain_policies SET metadata_rows=0 \
-             WHERE boundary='{}' AND cell='{}'",
-            cell.policy.boundary, cell.policy.cell
-        ))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    let ids = cell
-        .client
-        .cleanup_candidates(&cell.policy.boundary, &cell.policy.cell, 16)
-        .await
-        .unwrap();
-    let intent = cell.client.claim_cleanup(ids[0]).await.unwrap();
+    let (boundary, cell_id) = (cell.policy.boundary.clone(), cell.policy.cell.clone());
+    // One released row, one more released row, and one legacy marker.
+    let released = cell.released_state3_rows(0, 2).await;
+    let marker = cell.legacy_markers(2, 1).await;
+    let (first, second, third) = (
+        released[0].spool_object_id,
+        released[1].spool_object_id,
+        marker[0].spool_object_id,
+    );
+    assert_eq!(
+        cell.custody_states().await,
+        vec![(3, false), (3, false), (4, false)]
+    );
+    cell.assert_ledger("before the corruption").await;
+    // Rows underflow: the policy says it holds no rows at all.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_policies SET metadata_rows=0 \
+         WHERE boundary='{boundary}' AND cell='{cell_id}'"
+    ))
+    .await;
+    for spool in [first, third] {
+        let before = cell.custody_snapshot().await;
+        let intent = cell.client.claim_cleanup(spool).await.unwrap();
+        assert_eq!(
+            cell.client.release_cleanup(&intent).await,
+            Err(DrainError::MetadataUnderflow),
+            "a deletion that would take metadata_rows below zero must refuse, and say why, so \
+             cleanup can skip this one row instead of failing its pass"
+        );
+        assert_eq!(
+            cell.custody_snapshot().await,
+            before,
+            "a refused deletion changes no row and no counter"
+        );
+    }
+
+    // Bytes underflow: rows are fine, the byte counter is below the row's own charge.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_policies SET metadata_rows=3, metadata_bytes=1 \
+         WHERE boundary='{boundary}' AND cell='{cell_id}'"
+    ))
+    .await;
+    let before = cell.custody_snapshot().await;
+    let intent = cell.client.claim_cleanup(second).await.unwrap();
     assert_eq!(
         cell.client.release_cleanup(&intent).await,
         Err(DrainError::MetadataUnderflow),
-        "a marker deletion that would take metadata_rows below zero must refuse, and say why, so \
-         cleanup can skip this one row instead of failing its pass"
+        "a deletion that would take metadata_bytes below zero must refuse too"
     );
-    assert_eq!(cell.custody_states().await, vec![(4, true)]);
+    assert_eq!(cell.custody_snapshot().await, before);
+    // The same refusal straight from the procedure, with its message.
+    assert_eq!(
+        cell.runtime_message(
+            "SELECT object_store_retention.drain_cleanup_compact_v3($1)",
+            &[&second]
+        )
+        .await
+        .as_deref(),
+        Some("DRAIN_METADATA_UNDERFLOW")
+    );
+
+    // Control: with an honest ledger the same rows delete, so the refusal above was the guard.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_policies \
+         SET metadata_rows=3, metadata_bytes=(SELECT sum(metadata_bytes) FROM \
+            object_store_retention.drain_spool_custody WHERE boundary='{boundary}' AND cell='{cell_id}') \
+         WHERE boundary='{boundary}' AND cell='{cell_id}'"
+    ))
+    .await;
+    cell.assert_ledger("after the ledger was made honest again")
+        .await;
+    for spool in [first, second, third] {
+        let intent = cell.client.claim_cleanup(spool).await.unwrap();
+        cell.client.release_cleanup(&intent).await.unwrap();
+    }
+    assert!(cell.custody_states().await.is_empty());
+    assert_eq!(
+        cell.metadata_counters().await,
+        ("0".to_string(), "0".to_string())
+    );
 }
 
 // Row 66 residual 1: a claim lost to another session clears its own lease, so the row is due
@@ -3854,9 +4075,11 @@ async fn live_a_contended_claim_clears_its_lease_so_a_peer_retakes_the_row_at_on
     );
 }
 
-// Row 66: released rows and markers leave the scan until they are due.
+// Row 66 under R32: due times. A released row is due at greatest(cleanup_not_before, lease_until_ms)
+// (no wait for the policy generation to expire), and a marker is due at lease_until_ms (no hourly
+// sweep). The candidates call leases what it returns, and a cleanup pass deletes what it claims.
 #[tokio::test]
-#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database with a real BLAKE3 provider"]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
 async fn live_released_rows_and_markers_are_scanned_only_when_due() {
     let cell = drain_cell(
         "LORE_TEST_CELL_SCHEMA_UPGRADE_NOT_DUE_PG_URL",
@@ -3864,53 +4087,125 @@ async fn live_released_rows_and_markers_are_scanned_only_when_due() {
         16,
     )
     .await;
-    let rows = cell.released_rows(0, 2).await;
+    let rows = cell.released_state3_rows(0, 2).await;
+    let marker = cell.legacy_markers(2, 1).await;
+    let (ready, later, old_marker) = (
+        rows[0].spool_object_id,
+        rows[1].spool_object_id,
+        marker[0].spool_object_id,
+    );
     let candidates = |cell: &DrainCell| {
         let client = cell.client.clone();
         let (boundary, cell_id) = (cell.policy.boundary.clone(), cell.policy.cell.clone());
         async move {
-            client
+            let mut ids = client
                 .cleanup_candidates(&boundary, &cell_id, 16)
                 .await
-                .unwrap()
+                .unwrap();
+            ids.sort();
+            ids
         }
     };
-    assert!(
-        candidates(&cell).await.is_empty(),
-        "released rows under a live policy are not scanned"
-    );
+    let sorted = |mut ids: Vec<Uuid>| {
+        ids.sort();
+        ids
+    };
+    cell.assert_ledger("before any scan").await;
 
-    // Compaction becomes due when the row's policy generation expires.
-    let spool = rows[0].spool_object_id;
-    cell.fixture
+    // The due time column agrees with the contract, state by state.
+    let due: Vec<(i16, i64, i64, i64)> = cell
+        .fixture
         .client
-        .execute(
-            "UPDATE object_store_retention.drain_spool_custody SET policy_expiry_ms=1 WHERE spool_id=$1",
-            &[&spool],
+        .query(
+            "SELECT state, due_ms, greatest(cleanup_not_before, lease_until_ms), lease_until_ms \
+             FROM object_store_retention.drain_spool_custody WHERE boundary=$1 AND cell=$2 \
+             ORDER BY state",
+            &[&cell.policy.boundary, &cell.policy.cell],
         )
         .await
-        .unwrap();
-    assert_eq!(cell.cleanup_pass(&cell.client, 16).await, vec![spool]);
-    assert_eq!(cell.custody_states().await, vec![(3, false), (4, false)]);
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    for (state, due_ms, rows_due, lease) in due {
+        match state {
+            3 => assert_eq!(
+                due_ms, rows_due,
+                "a released row is due at greatest(cleanup_not_before, lease_until_ms), with no \
+                 wait for the policy generation to expire"
+            ),
+            4 => assert_eq!(
+                due_ms, lease,
+                "a marker is due at lease_until_ms, not on an hourly sweep"
+            ),
+            other => panic!("unexpected state {other}"),
+        }
+    }
 
-    // A marker that is not superseded is swept once an hour, not on every pass.
-    assert!(
-        candidates(&cell).await.is_empty(),
-        "a fresh marker is not due"
-    );
-    cell.fixture
-        .client
-        .execute(
-            "UPDATE object_store_retention.drain_spool_custody \
-             SET last_scan_ms=last_scan_ms-3600001, lease_until_ms=0 WHERE spool_id=$1",
-            &[&spool],
-        )
-        .await
-        .unwrap();
+    // One released row is not due yet (its cleanup window is still ahead); the other row and the
+    // marker are due. A marker whose lease is in the future is not due either.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_spool_custody \
+         SET cleanup_not_before = (extract(epoch FROM clock_timestamp())*1000)::bigint + 3600000 \
+         WHERE spool_id = '{later}'"
+    ))
+    .await;
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_spool_custody \
+         SET lease_until_ms = (extract(epoch FROM clock_timestamp())*1000)::bigint + 3600000 \
+         WHERE spool_id = '{old_marker}'"
+    ))
+    .await;
     assert_eq!(
         candidates(&cell).await,
-        vec![spool],
-        "the hourly late-blob sweep picks the marker up"
+        vec![ready],
+        "only the released row whose window passed and whose lease is clear is scanned"
+    );
+    assert!(
+        candidates(&cell).await.is_empty(),
+        "the scan leased what it returned, so it is not returned again at once"
+    );
+
+    // Clear the marker's lease: it is due at once, with no hour to wait, and a fresh last scan.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_spool_custody SET lease_until_ms = 0 \
+         WHERE spool_id = '{old_marker}'"
+    ))
+    .await;
+    assert_eq!(
+        candidates(&cell).await,
+        vec![old_marker],
+        "a marker with no lease is due at once"
+    );
+
+    // A cleanup pass over the leased rows' cleared leases deletes exactly what is due.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_spool_custody SET lease_until_ms = 0 \
+         WHERE spool_id IN ('{ready}', '{old_marker}')"
+    ))
+    .await;
+    assert_eq!(
+        sorted(cell.cleanup_pass(&cell.client, 16).await),
+        sorted(vec![ready, old_marker])
+    );
+    assert_eq!(
+        cell.custody_states().await,
+        vec![(3, false)],
+        "only the row whose window is still ahead is left"
+    );
+    cell.assert_ledger("after the due rows were deleted").await;
+
+    // Its window passing makes it due, and the pass deletes it too.
+    cell.owner_sql(&format!(
+        "UPDATE object_store_retention.drain_spool_custody SET cleanup_not_before = 0, \
+         lease_until_ms = 0 WHERE spool_id = '{later}'"
+    ))
+    .await;
+    assert_eq!(cell.cleanup_pass(&cell.client, 16).await, vec![later]);
+    assert!(cell.custody_states().await.is_empty());
+    assert_eq!(
+        cell.metadata_counters().await,
+        ("0".to_string(), "0".to_string())
     );
 }
 
@@ -4152,13 +4447,39 @@ async fn live_r28_cell_is_refused_then_upgrades_with_its_rows_not_superseded() {
     let client = drain_client(&base_url, identity).await;
     let observed = client.observe("r28-boundary", "r28-cell").await.unwrap();
     assert_eq!(observed.superseded_pending, 0);
-    assert!(
+    // Under R32 a released row is due at greatest(cleanup_not_before, lease_until_ms): no wait for
+    // the policy generation to expire. Its window has passed, so the first scan returns it, and
+    // claim + release + compact_v3 delete it, giving back exactly its row and bytes.
+    let before = assert_ledger_matches_custody(
+        &fixture.client,
+        "r28-boundary",
+        "r28-cell",
+        "after the R28 upgrade",
+    )
+    .await;
+    assert_eq!(before.metadata_rows, 1);
+    assert_eq!(
         client
             .cleanup_candidates("r28-boundary", "r28-cell", 16)
             .await
-            .unwrap()
-            .is_empty(),
-        "an upgraded released row under a live policy is not due"
+            .unwrap(),
+        vec![spool],
+        "an upgraded released row is due once its cleanup window has passed"
+    );
+    let intent = client.claim_cleanup(spool).await.expect("claim it");
+    client.release_cleanup(&intent).await.expect("delete it");
+    let after = assert_ledger_matches_custody(
+        &fixture.client,
+        "r28-boundary",
+        "r28-cell",
+        "after the online deletion",
+    )
+    .await;
+    assert_eq!(
+        (after.metadata_rows, after.metadata_bytes),
+        (0, 0),
+        "the deletion gave back exactly the row and its {} bytes",
+        before.metadata_bytes
     );
 }
 
@@ -4736,7 +5057,8 @@ async fn mark_ready_through_runtime(
                 &"0",
                 &descriptor.body_size.to_string(),
                 &&digest[..],
-                &"durable/r31-fixture-handle",
+                // Unique per attempt: the handle index is unique across live ready rows.
+                &format!("durable/r31-fixture-handle-{}", descriptor.attempt_id),
                 &256_i32,
                 &256_i32,
                 &4096_i32,
@@ -4872,7 +5194,8 @@ async fn live_r30_cell_with_live_rows_upgrades_to_r31_and_backfills_them() {
         report.disposition,
         CellUpgradeDisposition::Upgraded(CellSchemaRevision::R30)
     );
-    assert_eq!(report.attestation.schema_revision, CellSchemaRevision::R31);
+    // The upgrade walks every step to the current state: R30 -> R31 -> R32.
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
 
     let fixture = admin_at(base_url.clone()).await;
     // The four database hashing functions are gone, and the v2 ready check replaces v1.
@@ -5084,19 +5407,13 @@ async fn live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by
         "this case must run without a BLAKE3 provider"
     );
 
-    // Reserve, wait past the short window, claim, release.
+    // Reserve, wait past the short window, claim, release. Only the release procedure runs: the
+    // receipt lives on the released row, and R32's `release_cleanup` would go on to delete it.
     let descriptor = cell.descriptor(0, &cell.policy).await;
     cell.client.reserve(&descriptor).await.expect("reservation");
     tokio::time::sleep(Duration::from_millis(cell.policy.maximum_ttl_ms + 500)).await;
-    let intent = cell
-        .client
-        .claim_cleanup(descriptor.spool_object_id)
-        .await
-        .expect("claim an expired reservation");
-    cell.client
-        .release_cleanup(&intent)
-        .await
-        .expect("release it");
+    let released_fence =
+        release_without_compaction(&cell.runtime.0, descriptor.spool_object_id).await;
 
     let row = admin
         .query_one(
@@ -5145,10 +5462,11 @@ async fn live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by
         )
         .await
         .expect("tamper the stored release receipt");
-    cell.client
-        .release_cleanup(&intent)
-        .await
-        .expect("R31 does not detect a tampered release receipt");
+    cell.runtime_commit(
+        "SELECT object_store_retention.drain_cleanup_release_v1($1,$2)",
+        &[&descriptor.spool_object_id, &released_fence],
+    )
+    .await;
     admin
         .execute(
             "UPDATE object_store_retention.drain_spool_custody SET release_receipt = $1
@@ -5333,4 +5651,1404 @@ async fn live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row(
         .await
         .expect("restore the ready row");
     accepted.expect("accepted cut: check_ready_v2 binds only (spool_revision, ready_at)");
+}
+
+// -------------------------------------------------------------------------------------------
+// WP-115 f2 (migration 0032, R32): the spool custody ledger stops growing.
+//
+// `drain_policies.metadata_rows` used to count lifetime reservations: a released row stayed as a
+// marker until an offline rotation superseded it, so a cell wedged at `metadata_max_rows`.
+// R32 deletes a released row or marker with `drain_cleanup_compact_v3`, and a retired floor
+// (`drain_policies.retired_floor_ms`, advanced by `drain_retired_floor_advance_v1`) bounds which
+// attempts a first-seen reservation may still carry. The invariant every case here leans on:
+// `metadata_rows == count(custody rows)` and `metadata_bytes == sum(custody.metadata_bytes)` for a
+// `(boundary, cell)`, and no custody row's attempt UUIDv7 time is below its cell's floor.
+// -------------------------------------------------------------------------------------------
+
+/// A UUID with the given `version` nibble, the given byte 8 (its variant bits first), and `ms` as
+/// its first 48 bits. `uuid_v7_at` is the well-formed case.
+fn uuid_with(version: u8, byte8: u8, ms: i64, salt: u8) -> Uuid {
+    let mut bytes = [0_u8; 16];
+    let ms = u64::try_from(ms).expect("a non-negative timestamp");
+    bytes[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+    bytes[6] = (version << 4) | (salt & 0x0f);
+    bytes[7] = salt;
+    bytes[8] = byte8;
+    for byte in &mut bytes[9..] {
+        *byte = salt;
+    }
+    Uuid::from_bytes(bytes)
+}
+
+fn uuid_v7_at(ms: i64, salt: u8) -> Uuid {
+    uuid_with(7, 0x80 | (salt & 0x3f), ms, salt)
+}
+
+/// `(sqlstate, message)` of a database refusal.
+type DbFailure = (String, String);
+
+/// One statement in its own SERIALIZABLE transaction, committed or rolled back, reporting the
+/// database's own refusal (SQLSTATE and message) rather than a mapped client error.
+async fn serializable_statement(
+    client: &tokio_postgres::Client,
+    sql: &str,
+    values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+) -> Result<Vec<tokio_postgres::Row>, DbFailure> {
+    let fail = |error: tokio_postgres::Error| -> DbFailure {
+        error.as_db_error().map_or_else(
+            || ("no-sqlstate".to_string(), error.to_string()),
+            |db| (db.code().code().to_string(), db.message().to_string()),
+        )
+    };
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .map_err(fail)?;
+    match client.query(sql, values).await {
+        Ok(rows) => match client.batch_execute("COMMIT").await {
+            Ok(()) => Ok(rows),
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(fail(error))
+            }
+        },
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(fail(error))
+        }
+    }
+}
+
+/// The cleanup pass the way the drain worker runs it, without a spool root: lease candidates, claim
+/// each, release (with R32's deletion). Returns the rows it processed.
+async fn run_cleanup_pass(
+    client: &DrainClient,
+    boundary: &str,
+    cell: &str,
+    batch: u16,
+) -> Vec<Uuid> {
+    let ids = client
+        .cleanup_candidates(boundary, cell, batch)
+        .await
+        .expect("lease cleanup candidates");
+    for id in &ids {
+        match client.claim_cleanup(*id).await {
+            Ok(intent) => client
+                .release_cleanup(&intent)
+                .await
+                .expect("release a leased row"),
+            Err(DrainError::Contended) => {}
+            Err(error) => panic!("claim a leased row: {error}"),
+        }
+    }
+    ids
+}
+
+/// A synthetic descriptor stamped with the database clock now.
+async fn descriptor_at_now(
+    i: u32,
+    policy: &DrainPolicy,
+    allocation: &BudgetFixture,
+    admin: &tokio_postgres::Client,
+) -> DrainDescriptor {
+    synthetic_descriptor(
+        i,
+        policy,
+        &policy.digest().unwrap(),
+        allocation,
+        now_ms(admin).await,
+    )
+}
+/// `good`'s canonical bytes with its logical and attempt ids replaced by `bad`'s, so a descriptor
+/// the Rust encoder refuses (an id that is not version 7) can still reach the database.
+fn forged_canonical(good: &DrainDescriptor, bad: &DrainDescriptor) -> Vec<u8> {
+    let mut bytes = good.canonical_bytes().expect("a well-formed descriptor");
+    for (from, to) in [
+        (good.logical_request_id, bad.logical_request_id),
+        (good.attempt_id, bad.attempt_id),
+    ] {
+        let at = bytes
+            .windows(16)
+            .position(|window| window == from.as_bytes())
+            .expect("the id is in the canonical bytes");
+        bytes[at..at + 16].copy_from_slice(to.as_bytes());
+    }
+    bytes
+}
+
+const COMPACT_V3: &str = "SELECT object_store_retention.drain_cleanup_compact_v3($1)";
+
+impl DrainCell {
+    /// A descriptor whose attempt id is a `UUIDv7` stamped `attempt_ms` (the logical id is fresh).
+    async fn descriptor_with_attempt_ms(
+        &self,
+        i: u32,
+        attempt_ms: i64,
+        salt: u8,
+    ) -> DrainDescriptor {
+        let mut descriptor = self.descriptor(i, &self.policy).await;
+        descriptor.attempt_id = uuid_v7_at(attempt_ms, salt);
+        descriptor
+    }
+
+    /// Reserve `descriptor` on `session` (a plain runtime session) in one SERIALIZABLE transaction.
+    async fn reserve_on(
+        &self,
+        session: &tokio_postgres::Client,
+        descriptor: &DrainDescriptor,
+    ) -> Result<(), DbFailure> {
+        let canonical = descriptor.canonical_bytes().unwrap();
+        self.reserve_with_canonical(session, descriptor, canonical)
+            .await
+    }
+
+    /// [`DrainCell::reserve_on`] with caller-built canonical bytes. The Rust encoder refuses an id
+    /// that is not version 7, so a descriptor the database must refuse needs its bytes forged.
+    async fn reserve_with_canonical(
+        &self,
+        session: &tokio_postgres::Client,
+        descriptor: &DrainDescriptor,
+        canonical: Vec<u8>,
+    ) -> Result<(), DbFailure> {
+        let json = serde_json::to_string(descriptor).unwrap();
+        let digest = *blake3::hash(&canonical).as_bytes();
+        serializable_statement(
+            session,
+            "SELECT object_store_retention.drain_reserve_v1($1::text::jsonb,$2,$3)",
+            &[&json, &canonical, &&digest[..]],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `drain_retired_floor_advance_v1` on `session`, in one SERIALIZABLE transaction.
+    async fn advance_on(&self, session: &tokio_postgres::Client) -> Result<i64, DbFailure> {
+        serializable_statement(
+            session,
+            "SELECT object_store_retention.drain_retired_floor_advance_v1($1,$2)",
+            &[&self.policy.boundary, &self.policy.cell],
+        )
+        .await
+        .map(|rows| rows[0].get(0))
+    }
+
+    async fn set_floor(&self, floor_ms: i64) {
+        self.owner_sql(&format!(
+            "UPDATE object_store_retention.drain_policies SET retired_floor_ms = {floor_ms} \
+             WHERE boundary='{}' AND cell='{}'",
+            self.policy.boundary, self.policy.cell
+        ))
+        .await;
+    }
+
+    /// Forget every custody row and spool object of this cell and zero its ledger, leaving the
+    /// quota usage alone. Only a fixture reset between race iterations.
+    async fn wipe_custody(&self, floor_ms: i64) {
+        self.owner_sql(&format!(
+            "DELETE FROM object_store_retention.drain_spool_custody \
+               WHERE boundary='{b}' AND cell='{c}'; \
+             DELETE FROM object_store_retention.object_dispatch_spool_objects \
+               WHERE provider_boundary_id='{b}' AND authenticated_cell_id='{c}'; \
+             UPDATE object_store_retention.drain_policies \
+               SET metadata_rows=0, metadata_bytes=0, retired_floor_ms={floor_ms} \
+               WHERE boundary='{b}' AND cell='{c}'",
+            b = self.policy.boundary,
+            c = self.policy.cell
+        ))
+        .await;
+    }
+
+    /// Custody rows whose attempt `UUIDv7` time is below the cell's retired floor. Must always be 0.
+    async fn rows_below_the_floor(&self) -> i64 {
+        self.fixture
+            .client
+            .query_one(
+                "SELECT count(*) FROM object_store_retention.drain_spool_custody c \
+                 JOIN object_store_retention.drain_policies p ON p.boundary=c.boundary AND p.cell=c.cell \
+                 WHERE c.boundary=$1 AND c.cell=$2 \
+                   AND object_store_retention.drain_uuid_v7_ms_v1(c.attempt_id) < p.retired_floor_ms",
+                &[&self.policy.boundary, &self.policy.cell],
+            )
+            .await
+            .expect("count custody rows below the floor")
+            .get(0)
+    }
+
+    async fn custody_rows_for_attempt(&self, attempt: Uuid) -> i64 {
+        self.fixture
+            .client
+            .query_one(
+                "SELECT count(*) FROM object_store_retention.drain_spool_custody WHERE attempt_id=$1",
+                &[&attempt],
+            )
+            .await
+            .expect("count custody rows")
+            .get(0)
+    }
+
+    async fn spool_object_rows(&self) -> i64 {
+        self.fixture
+            .client
+            .query_one(
+                "SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects \
+                 WHERE provider_boundary_id=$1 AND authenticated_cell_id=$2",
+                &[&self.policy.boundary, &self.policy.cell],
+            )
+            .await
+            .expect("count spool objects")
+            .get(0)
+    }
+}
+
+// Guardrail (item 1): a cell whose cap is four rows completes sixty-four full cycles, sixteen times
+// the cap, with no DRAIN_METADATA_CAPACITY. Each cycle is reserve -> ready -> claim -> release ->
+// compact_v3, driven through the real `DrainClient` and the real ready procedure. The ledger holds
+// the invariant after every single cycle, and `metadata_rows` never exceeds the cap.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_a_four_row_cell_completes_sixty_four_full_cycles_without_ever_filling() {
+    const CAP: u32 = 4;
+    const BATCHES: u32 = 16;
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_LONGRUN_PG_URL",
+        "r32longrun",
+        u64::from(CAP),
+    )
+    .await;
+    let (boundary, cell_id) = (cell.policy.boundary.clone(), cell.policy.cell.clone());
+    let mut highest_rows = 0_i64;
+    let mut cycles = 0_u32;
+
+    for batch in 0..BATCHES {
+        // Fill the cell to its cap: reserve and mark ready.
+        let mut live = Vec::new();
+        for slot in 0..CAP {
+            let descriptor = cell.descriptor(batch * CAP + slot, &cell.policy).await;
+            cell.client
+                .reserve(&descriptor)
+                .await
+                .unwrap_or_else(|error| panic!("batch {batch} slot {slot} reserve: {error}"));
+            let (code, _, _) = mark_ready_through_runtime(&cell.runtime.0, &descriptor).await;
+            assert_eq!(code, "APPLIED", "batch {batch} slot {slot} ready");
+            let reading = cell.assert_ledger("while filling a batch").await;
+            highest_rows = highest_rows.max(reading.metadata_rows);
+            assert!(reading.metadata_rows <= i64::from(CAP));
+            live.push(descriptor);
+        }
+        if batch == 0 || batch == BATCHES - 1 {
+            // The cap is real: a fifth live reservation is refused by name.
+            let fifth = cell.descriptor(1000 + batch, &cell.policy).await;
+            assert_eq!(
+                cell.reserve_message(&fifth).await.as_deref(),
+                Some("DRAIN_METADATA_CAPACITY"),
+                "batch {batch}: the cap holds while the cell is full"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(cell.policy.maximum_ttl_ms + 500)).await;
+        // Drain it: each cycle ends in a deletion that gives its row back at once.
+        for descriptor in &live {
+            let intent = cell
+                .client
+                .claim_cleanup(descriptor.spool_object_id)
+                .await
+                .expect("claim an expired reservation");
+            cell.client
+                .release_cleanup(&intent)
+                .await
+                .expect("release and delete it");
+            cycles += 1;
+            let reading = cell.assert_ledger("after a full cycle").await;
+            assert!(reading.metadata_rows <= i64::from(CAP));
+        }
+        let emptied = cell.assert_ledger("after a batch").await;
+        assert_eq!(
+            (emptied.metadata_rows, emptied.metadata_bytes),
+            (0, 0),
+            "batch {batch}: every cycle gave back its row and its bytes"
+        );
+        assert_eq!(cell.spool_object_rows().await, 0);
+    }
+
+    assert_eq!(cycles, CAP * BATCHES);
+    assert_eq!(highest_rows, i64::from(CAP), "the cell did fill to its cap");
+    assert!(
+        cycles > 10 * CAP,
+        "the cap was crossed many times over by lifetime reservations"
+    );
+    let observed = cell.client.observe(&boundary, &cell_id).await.unwrap();
+    assert_eq!(
+        observed.charged_files,
+        u64::from(CAP * BATCHES),
+        "every cycle was a real, charged reservation"
+    );
+    assert!(!observed.metadata_full);
+    assert_eq!(observed.superseded_pending, 0);
+    assert!(cell.custody_states().await.is_empty());
+}
+
+// Item 2, deterministic halves. The advance and a first-seen reserve both write the policy row, so
+// they serialize. The reserve commits first -> the advance cannot also commit a floor above the
+// reserved attempt (it fails to serialize). The advance commits first -> a reserve that began
+// before it cannot commit (it fails to serialize), and a fresh reserve is refused as retired.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_retired_floor_advance_and_a_first_seen_reserve_serialize_on_the_policy_row() {
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_RACE_PG_URL",
+        "r32race",
+        64,
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let (reserver, _reserver_task) =
+        connect_as(&cell.fixture.base_url, "object_dispatch_retention_runtime").await;
+    let (advancer, _advancer_task) =
+        connect_as(&cell.fixture.base_url, "object_dispatch_retention_runtime").await;
+    let old_floor = now_ms(admin).await - 3_600_000;
+    cell.set_floor(old_floor).await;
+    assert_eq!(cell.retired_floor().await, old_floor);
+
+    // --- The reserve commits first. ---
+    let attempt_ms = old_floor + 5;
+    let first = cell.descriptor_with_attempt_ms(0, attempt_ms, 1).await;
+    reserver
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    let json = serde_json::to_string(&first).unwrap();
+    let canonical = first.canonical_bytes().unwrap();
+    let digest = *blake3::hash(&canonical).as_bytes();
+    reserver
+        .query(
+            "SELECT object_store_retention.drain_reserve_v1($1::text::jsonb,$2,$3)",
+            &[&json, &canonical, &&digest[..]],
+        )
+        .await
+        .expect("the first-seen reserve, uncommitted");
+    let (advance, commit) = tokio::join!(cell.advance_on(&advancer), async {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        reserver.batch_execute("COMMIT").await
+    });
+    commit.expect("the reserve commits");
+    let (code, _) = advance.expect_err(
+        "an advance that could not see the reserved row must not commit a floor above it",
+    );
+    assert_eq!(
+        code, "40001",
+        "the advance loses as a serialization failure"
+    );
+    assert_eq!(
+        cell.retired_floor().await,
+        old_floor,
+        "the lost advance left the floor where it was"
+    );
+    assert_eq!(cell.custody_rows_for_attempt(first.attempt_id).await, 1);
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+    // The advance, retried once the reserve is visible, stops at the reserved attempt.
+    let stopped = cell
+        .advance_on(&advancer)
+        .await
+        .expect("the retried advance");
+    assert_eq!(
+        stopped, attempt_ms,
+        "the floor stops at the oldest live attempt"
+    );
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+    cell.assert_ledger("after the reserve-first order").await;
+
+    // --- The advance commits first. ---
+    cell.wipe_custody(old_floor).await;
+    let second_ms = old_floor + 10;
+    let second = cell.descriptor_with_attempt_ms(1, second_ms, 2).await;
+    // The reserve's snapshot is taken before the advance commits.
+    reserver
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    reserver
+        .query(
+            "SELECT object_store_retention.cell_schema_revision_v1()",
+            &[],
+        )
+        .await
+        .expect("take the reserve's snapshot");
+    let raised = cell
+        .advance_on(&advancer)
+        .await
+        .expect("the advance commits first");
+    assert!(
+        raised > second_ms,
+        "with no live row the floor rises to now minus 15 minutes, past the attempt ({raised})"
+    );
+    let json = serde_json::to_string(&second).unwrap();
+    let canonical = second.canonical_bytes().unwrap();
+    let digest = *blake3::hash(&canonical).as_bytes();
+    let stale = reserver
+        .query(
+            "SELECT object_store_retention.drain_reserve_v1($1::text::jsonb,$2,$3)",
+            &[&json, &canonical, &&digest[..]],
+        )
+        .await
+        .expect_err("a reserve that began before the advance committed must not commit");
+    assert_eq!(
+        stale.code().map(tokio_postgres::error::SqlState::code),
+        Some("40001"),
+        "{stale}"
+    );
+    let _ = reserver.batch_execute("ROLLBACK").await;
+    assert_eq!(cell.custody_rows_for_attempt(second.attempt_id).await, 0);
+    // A fresh transaction sees the new floor and refuses the attempt by name.
+    let third = cell.descriptor_with_attempt_ms(2, second_ms, 3).await;
+    assert_eq!(
+        cell.reserve_on(&reserver, &third).await,
+        Err(("55000".to_string(), "DRAIN_ATTEMPT_RETIRED".to_string())),
+        "a first-seen attempt below the floor is retired"
+    );
+    assert_eq!(cell.custody_rows_for_attempt(third.attempt_id).await, 0);
+    assert_eq!(cell.retired_floor().await, raised);
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+    cell.assert_ledger("after the advance-first order").await;
+}
+
+// Item 2, stress half: many races of a first-seen reserve whose attempt sits just above the old
+// floor against an advance that would otherwise raise the floor past it. Any interleaving is fine
+// as long as the invariant holds: either the reserve committed and the floor stayed at or below
+// its attempt, or the reserve was refused (retired, or it lost to serialization) and left no row.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_no_race_between_the_floor_advance_and_a_reserve_leaves_a_row_below_the_floor() {
+    const ITERATIONS: u32 = 24;
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_STRESS_PG_URL",
+        "r32stress",
+        64,
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let (reserver, _reserver_task) =
+        connect_as(&cell.fixture.base_url, "object_dispatch_retention_runtime").await;
+    let (advancer, _advancer_task) =
+        connect_as(&cell.fixture.base_url, "object_dispatch_retention_runtime").await;
+    let old_floor = now_ms(admin).await - 3_600_000;
+    let mut outcomes = [0_u32; 4];
+    for iteration in 0..ITERATIONS {
+        cell.wipe_custody(old_floor).await;
+        let attempt_ms = old_floor + 5;
+        let descriptor = cell
+            .descriptor_with_attempt_ms(iteration, attempt_ms, u8::try_from(iteration).unwrap())
+            .await;
+        let barrier = tokio::sync::Barrier::new(2);
+        let stagger = Duration::from_micros(u64::from(iteration % 6) * 700);
+        let (reserved, advanced) = tokio::join!(
+            async {
+                barrier.wait().await;
+                cell.reserve_on(&reserver, &descriptor).await
+            },
+            async {
+                barrier.wait().await;
+                tokio::time::sleep(stagger).await;
+                cell.advance_on(&advancer).await
+            }
+        );
+        let floor = cell.retired_floor().await;
+        let rows = cell.custody_rows_for_attempt(descriptor.attempt_id).await;
+        match &reserved {
+            Ok(()) => {
+                assert_eq!(
+                    rows, 1,
+                    "iteration {iteration}: a committed reserve left its row"
+                );
+                assert!(
+                    floor <= attempt_ms,
+                    "iteration {iteration}: the floor ({floor}) passed a live attempt ({attempt_ms})"
+                );
+                outcomes[0] += 1;
+            }
+            Err((code, message)) if code == "55000" => {
+                assert_eq!(message, "DRAIN_ATTEMPT_RETIRED", "iteration {iteration}");
+                assert_eq!(
+                    rows, 0,
+                    "iteration {iteration}: a refused reserve left a row"
+                );
+                assert!(
+                    floor > attempt_ms,
+                    "iteration {iteration}: retired, but the floor ({floor}) is not past the attempt"
+                );
+                outcomes[1] += 1;
+            }
+            Err((code, _)) if code == "40001" || code == "40P01" => {
+                assert_eq!(
+                    rows, 0,
+                    "iteration {iteration}: a failed reserve left a row"
+                );
+                outcomes[2] += 1;
+            }
+            Err(other) => panic!("iteration {iteration}: unexpected reserve failure {other:?}"),
+        }
+        match &advanced {
+            Ok(returned) => {
+                assert_eq!(
+                    *returned, floor,
+                    "iteration {iteration}: the advance returns the floor it left"
+                );
+                if reserved.is_ok() {
+                    assert!(
+                        *returned <= attempt_ms,
+                        "iteration {iteration}: both committed, so the advance saw the row"
+                    );
+                }
+            }
+            Err((code, _)) if code == "40001" || code == "40P01" => outcomes[3] += 1,
+            Err(other) => panic!("iteration {iteration}: unexpected advance failure {other:?}"),
+        }
+        assert_eq!(
+            cell.rows_below_the_floor().await,
+            0,
+            "iteration {iteration}: a custody row sits below the floor"
+        );
+        cell.assert_ledger("after a race iteration").await;
+    }
+    // Scheduling decides how the races split (reserve first, advance first, or a serialization
+    // failure), so the split is reported, not asserted: every per-iteration check above already holds
+    // for each outcome. (A sum of the outcome counters equals the iteration count by construction.)
+    eprintln!(
+        "floor race outcomes [reserve committed, retired, serialization failure, advance failed]: {outcomes:?}"
+    );
+}
+
+// Item 2, bounds: the advance never lowers the floor, caps it at now minus 15 minutes, and stops at
+// the oldest live custody row.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_retired_floor_never_lowers_is_capped_at_fifteen_minutes_and_stops_at_the_oldest_row()
+ {
+    const WINDOW_MS: i64 = 900_000;
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_BOUNDS_PG_URL",
+        "r32bounds",
+        16,
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let (boundary, cell_id) = (cell.policy.boundary.clone(), cell.policy.cell.clone());
+
+    // An empty cell: the floor rises to now minus 15 minutes, and the row records it.
+    assert_eq!(
+        cell.retired_floor().await,
+        0,
+        "a cell starts with a zero floor"
+    );
+    let before = now_ms(admin).await;
+    let first = cell
+        .client
+        .advance_retired_floor(&boundary, &cell_id)
+        .await
+        .expect("advance an empty cell");
+    let after = now_ms(admin).await;
+    assert!(
+        (before - WINDOW_MS..=after - WINDOW_MS).contains(&first),
+        "the floor is now minus 15 minutes: {first} not in [{}, {}]",
+        before - WINDOW_MS,
+        after - WINDOW_MS
+    );
+    assert_eq!(cell.retired_floor().await, first);
+
+    // Never lowers: a higher floor stays, is returned unchanged, and is not even rewritten.
+    let xmin = |label: &'static str| {
+        let boundary = boundary.clone();
+        let cell_id = cell_id.clone();
+        async move {
+            admin
+                .query_one(
+                    "SELECT xmin::text FROM object_store_retention.drain_policies \
+                     WHERE boundary=$1 AND cell=$2",
+                    &[&boundary, &cell_id],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label}: {error}"))
+                .get::<_, String>(0)
+        }
+    };
+    for high in [
+        now_ms(admin).await - 60_000,
+        now_ms(admin).await + 3_600_000,
+    ] {
+        cell.set_floor(high).await;
+        let row_version = xmin("before a non-growing advance").await;
+        assert_eq!(
+            cell.client
+                .advance_retired_floor(&boundary, &cell_id)
+                .await
+                .unwrap(),
+            high,
+            "an advance never lowers the floor"
+        );
+        assert_eq!(cell.retired_floor().await, high);
+        assert_eq!(
+            xmin("after a non-growing advance").await,
+            row_version,
+            "the policy row is written only when the floor grows"
+        );
+    }
+
+    // Capped at now minus 15 minutes even when every live row is newer than that.
+    cell.set_floor(0).await;
+    let fresh = cell.descriptor(0, &cell.policy).await;
+    cell.client
+        .reserve(&fresh)
+        .await
+        .expect("a current attempt");
+    let before = now_ms(admin).await;
+    let capped = cell
+        .client
+        .advance_retired_floor(&boundary, &cell_id)
+        .await
+        .unwrap();
+    let after = now_ms(admin).await;
+    assert!(
+        (before - WINDOW_MS..=after - WINDOW_MS).contains(&capped),
+        "a live row newer than the window does not hold the floor above now minus 15 minutes"
+    );
+
+    // Stops at the oldest live row, and follows it as rows are deleted.
+    cell.set_floor(0).await;
+    let now = now_ms(admin).await;
+    let (oldest_ms, middle_ms) = (now - 3_600_000, now - 1_800_000);
+    let oldest = cell.descriptor_with_attempt_ms(1, oldest_ms, 10).await;
+    let middle = cell.descriptor_with_attempt_ms(2, middle_ms, 11).await;
+    cell.client.reserve(&oldest).await.expect("an old attempt");
+    cell.client
+        .reserve(&middle)
+        .await
+        .expect("a middle attempt");
+    let pinned = cell
+        .client
+        .advance_retired_floor(&boundary, &cell_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        pinned, oldest_ms,
+        "the floor stops exactly at the oldest live attempt"
+    );
+    assert_eq!(cell.retired_floor().await, oldest_ms);
+    assert_eq!(cell.oldest_attempt_ms().await, Some(oldest_ms));
+    // An attempt AT the floor is allowed; one millisecond below is retired.
+    let at_floor = cell.descriptor_with_attempt_ms(3, oldest_ms, 12).await;
+    assert_eq!(
+        cell.reserve_message(&at_floor).await,
+        None,
+        "an attempt equal to the floor is not below it"
+    );
+    let below = cell.descriptor_with_attempt_ms(4, oldest_ms - 1, 13).await;
+    assert_eq!(
+        cell.reserve_message(&below).await.as_deref(),
+        Some("DRAIN_ATTEMPT_RETIRED")
+    );
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+
+    // Delete the current attempt and the oldest row through the real cleanup; the middle row is
+    // the oldest left, and the floor follows to it.
+    tokio::time::sleep(Duration::from_millis(cell.policy.maximum_ttl_ms + 500)).await;
+    for spool in [fresh.spool_object_id, oldest.spool_object_id] {
+        let intent = cell.client.claim_cleanup(spool).await.unwrap();
+        cell.client.release_cleanup(&intent).await.unwrap();
+    }
+    let followed = cell
+        .client
+        .advance_retired_floor(&boundary, &cell_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        followed, middle_ms,
+        "the floor moves up to the next oldest row"
+    );
+    assert!(followed > pinned);
+    // Delete the last row: the floor is capped again.
+    let intent = cell
+        .client
+        .claim_cleanup(middle.spool_object_id)
+        .await
+        .unwrap();
+    cell.client.release_cleanup(&intent).await.unwrap();
+    assert!(cell.custody_states().await.is_empty());
+    let before = now_ms(admin).await;
+    let last = cell
+        .client
+        .advance_retired_floor(&boundary, &cell_id)
+        .await
+        .unwrap();
+    let after = now_ms(admin).await;
+    assert!(last > followed);
+    assert!((before - WINDOW_MS..=after - WINDOW_MS).contains(&last));
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+    cell.assert_ledger("after the last row was deleted").await;
+}
+
+// Item 3: compact_v3 deletes a released row or a legacy marker together with its spool object, for
+// exactly the row and bytes that row was charged; state 1, state 2 and a missing row are no-ops; a
+// deleted descriptor's replay is refused as expired; a fresh reserve below the floor is retired.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_compact_v3_deletes_rows_and_markers_for_exactly_their_charge_and_a_deleted_descriptor_stays_refused()
+ {
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_DELETE_PG_URL",
+        "r32delete",
+        8,
+    )
+    .await;
+    let (boundary, cell_id) = (cell.policy.boundary.clone(), cell.policy.cell.clone());
+    let rows = cell.expired_reservations(0, 4).await;
+    let spools: Vec<Uuid> = rows.iter().map(|row| row.spool_object_id).collect();
+    let (r_reserved, r_claimed, r_released, r_marker) =
+        (spools[0], spools[1], spools[2], spools[3]);
+    // State 2: claimed, not released.
+    cell.client.claim_cleanup(r_claimed).await.expect("claim");
+    // State 3: released.
+    release_without_compaction(&cell.runtime.0, r_released).await;
+    // State 4: a pre-R32 marker.
+    release_without_compaction(&cell.runtime.0, r_marker).await;
+    cell.become_legacy_marker(r_marker).await;
+    assert_eq!(
+        cell.custody_states().await,
+        vec![(1, false), (2, false), (3, false), (4, false)]
+    );
+    assert_eq!(
+        cell.spool_object_rows().await,
+        3,
+        "the marker's spool object is gone"
+    );
+    cell.assert_ledger("with one row in each state").await;
+
+    // State 1, state 2 and a missing row: compaction is a no-op and raises nothing.
+    let before = cell.custody_snapshot().await;
+    for spool in [r_reserved, r_claimed, Uuid::now_v7()] {
+        cell.runtime_commit(COMPACT_V3, &[&spool]).await;
+    }
+    assert_eq!(
+        cell.custody_snapshot().await,
+        before,
+        "a state 1 row, a state 2 row and a missing row are untouched"
+    );
+    assert_eq!(cell.spool_object_rows().await, 3);
+
+    // State 3: deleted with its spool object, giving back exactly its row and its bytes.
+    let released_bytes: i64 = cell
+        .fixture
+        .client
+        .query_one(
+            "SELECT metadata_bytes FROM object_store_retention.drain_spool_custody WHERE spool_id=$1",
+            &[&r_released],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(released_bytes >= 1024);
+    let ledger_before = ledger_reading(&cell.fixture.client, &boundary, &cell_id).await;
+    cell.runtime_commit(COMPACT_V3, &[&r_released]).await;
+    let ledger_after = cell.assert_ledger("after deleting a released row").await;
+    assert_eq!(
+        (ledger_after.metadata_rows, ledger_after.metadata_bytes),
+        (
+            ledger_before.metadata_rows - 1,
+            ledger_before.metadata_bytes - released_bytes
+        ),
+        "a released row gives back exactly one row and its own bytes"
+    );
+    assert_eq!(
+        cell.spool_object_rows().await,
+        2,
+        "its spool object left with it"
+    );
+    assert_eq!(
+        cell.custody_states().await,
+        vec![(1, false), (2, false), (4, false)]
+    );
+
+    // State 4: a legacy marker is deleted online too, for one row and its 1024 bytes.
+    let ledger_before = ledger_after;
+    cell.runtime_commit(COMPACT_V3, &[&r_marker]).await;
+    let ledger_after = cell.assert_ledger("after deleting a legacy marker").await;
+    assert_eq!(
+        (ledger_after.metadata_rows, ledger_after.metadata_bytes),
+        (
+            ledger_before.metadata_rows - 1,
+            ledger_before.metadata_bytes - 1024
+        )
+    );
+    // A second compaction of a deleted row is a no-op.
+    cell.runtime_commit(COMPACT_V3, &[&r_marker]).await;
+    cell.runtime_commit(COMPACT_V3, &[&r_released]).await;
+    assert_eq!(cell.assert_ledger("after repeats").await, ledger_after);
+
+    // The replay of a deleted descriptor is refused: its window has passed.
+    assert_eq!(
+        cell.reserve_message(&rows[2]).await.as_deref(),
+        Some("DRAIN_EXPIRED"),
+        "a deleted descriptor cannot be admitted again (cleanup_not_before >= send_not_after)"
+    );
+    assert_eq!(
+        cell.reserve_message(&rows[3]).await.as_deref(),
+        Some("DRAIN_EXPIRED")
+    );
+
+    // A fresh reserve whose attempt is below the floor is retired, by name and SQLSTATE, and leaves
+    // nothing; at the floor it is admitted.
+    let floor = cell
+        .client
+        .advance_retired_floor(&boundary, &cell_id)
+        .await
+        .expect("advance the floor");
+    let session = &cell.runtime.0;
+    let retired = cell.descriptor_with_attempt_ms(10, floor - 1_000, 20).await;
+    assert_eq!(
+        cell.reserve_on(session, &retired).await,
+        Err(("55000".to_string(), "DRAIN_ATTEMPT_RETIRED".to_string()))
+    );
+    assert_eq!(cell.custody_rows_for_attempt(retired.attempt_id).await, 0);
+    let ledger_unchanged = cell.assert_ledger("after a retired refusal").await;
+    assert_eq!(ledger_unchanged.metadata_rows, ledger_after.metadata_rows);
+    let at_floor = cell.descriptor_with_attempt_ms(11, floor, 21).await;
+    assert_eq!(cell.reserve_on(session, &at_floor).await, Ok(()));
+    assert_eq!(cell.custody_rows_for_attempt(at_floor.attempt_id).await, 1);
+    cell.assert_ledger("after admitting an attempt at the floor")
+        .await;
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+}
+
+// Item 4: the version and variant of both ids are checked, and `drain_uuid_v7_ms_v1` decodes the
+// 48-bit timestamp exactly.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_non_v7_ids_are_refused_and_the_v7_timestamp_function_decodes_exactly() {
+    let cell = drain_cell(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UUIDV7_PG_URL",
+        "r32uuid",
+        16,
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let decode = |id: Option<Uuid>| async move {
+        admin
+            .query_one(
+                "SELECT object_store_retention.drain_uuid_v7_ms_v1($1)",
+                &[&id],
+            )
+            .await
+            .expect("decode")
+            .get::<_, Option<i64>>(0)
+    };
+
+    // Version 7 with variant 10 decodes to its timestamp.
+    for (ms, byte8) in [
+        (1_700_000_000_123_i64, 0x80_u8),
+        (1_700_000_000_123, 0xa5),
+        (1_700_000_000_123, 0xbf),
+        (0, 0x80),
+        (1, 0x80),
+        (0xffff_ffff_ffff, 0x80),
+    ] {
+        let id = uuid_with(7, byte8, ms, 0x5c);
+        assert_eq!(decode(Some(id)).await, Some(ms), "{id}");
+    }
+    assert_eq!(
+        decode(Some(uuid_v7_at(1_700_000_000_123, 3))).await,
+        Some(1_700_000_000_123)
+    );
+    // Any other version, any other variant, and NULL decode to NULL.
+    for version in [0_u8, 1, 3, 4, 5, 6, 8, 0xf] {
+        let id = uuid_with(version, 0x80, 1_700_000_000_123, 0x5c);
+        assert_eq!(decode(Some(id)).await, None, "version {version}: {id}");
+    }
+    assert_eq!(decode(Some(Uuid::new_v4())).await, None, "a random v4");
+    for byte8 in [0x00_u8, 0x3f, 0x7f, 0xc0, 0xc5, 0xdf, 0xe0, 0xff] {
+        let id = uuid_with(7, byte8, 1_700_000_000_123, 0x5c);
+        assert_eq!(
+            decode(Some(id)).await,
+            None,
+            "variant byte {byte8:#04x}: {id}"
+        );
+    }
+    assert_eq!(decode(None).await, None);
+
+    // The function is IMMUTABLE and owner-only: the runtime and maintenance roles cannot call it.
+    let catalog = admin
+        .query_one(
+            "SELECT p.provolatile::text, p.prorettype::regtype::text,
+                    has_function_privilege('object_dispatch_retention_runtime', p.oid, 'EXECUTE'),
+                    has_function_privilege('object_dispatch_retention_maintenance', p.oid, 'EXECUTE'),
+                    EXISTS (SELECT 1 FROM aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+                             WHERE a.grantee = 0 AND a.privilege_type = 'EXECUTE')
+             FROM pg_catalog.pg_proc p
+             WHERE p.pronamespace='object_store_retention'::regnamespace
+               AND p.proname='drain_uuid_v7_ms_v1'",
+            &[],
+        )
+        .await
+        .expect("the function exists exactly once");
+    assert_eq!(catalog.get::<_, String>(0), "i", "IMMUTABLE");
+    assert_eq!(catalog.get::<_, String>(1), "bigint");
+    assert!(!catalog.get::<_, bool>(2), "runtime must not execute it");
+    assert!(
+        !catalog.get::<_, bool>(3),
+        "maintenance must not execute it"
+    );
+    assert!(!catalog.get::<_, bool>(4), "PUBLIC must not execute it");
+    let denied = cell
+        .runtime_message(
+            "SELECT object_store_retention.drain_uuid_v7_ms_v1($1)",
+            &[&Uuid::now_v7()],
+        )
+        .await
+        .expect("the runtime role is refused");
+    assert!(denied.contains("permission denied"), "{denied}");
+
+    // The reservation refuses a non-v7 logical or attempt id by name and SQLSTATE 22023, and
+    // admits the same descriptor with well-formed ids.
+    let session = &cell.runtime.0;
+    let now = now_ms(admin).await;
+    // `drain_reserve_v1` checks the canonical bytes first, and `drain_descriptor_bytes_v1` refuses
+    // any id that is not version 7 with variant 10 as `INVALID_UUIDV7` (22023, migration 0013's
+    // decoder). That is the only `UUIDv7` refusal, and it precedes the replay lookup.
+    let refused = ("22023".to_string(), "INVALID_UUIDV7".to_string());
+    let mut cases: Vec<(&str, DrainDescriptor, Vec<u8>)> = Vec::new();
+    for (label, logical, attempt) in [
+        ("logical v4", Some(Uuid::new_v4()), None),
+        ("attempt v4", None, Some(Uuid::new_v4())),
+        ("logical version 8", Some(uuid_with(8, 0x80, now, 1)), None),
+        ("attempt version 6", None, Some(uuid_with(6, 0x80, now, 2))),
+        (
+            "logical bad variant",
+            Some(uuid_with(7, 0xc0, now, 3)),
+            None,
+        ),
+        (
+            "attempt bad variant",
+            None,
+            Some(uuid_with(7, 0xc0, now, 4)),
+        ),
+        (
+            "attempt NCS variant",
+            None,
+            Some(uuid_with(7, 0x00, now, 5)),
+        ),
+    ] {
+        let good = cell.descriptor(0, &cell.policy).await;
+        let mut descriptor = good.clone();
+        if let Some(logical) = logical {
+            descriptor.logical_request_id = logical;
+        }
+        if let Some(attempt) = attempt {
+            descriptor.attempt_id = attempt;
+        }
+        let canonical = forged_canonical(&good, &descriptor);
+        cases.push((label, descriptor, canonical));
+    }
+    for (label, descriptor, canonical) in &cases {
+        // The Rust encoder checks the version only: a non-v7 version never reaches the database
+        // through it, while a v7 id with the wrong variant does, and the database refuses it.
+        let version_wrong = [descriptor.logical_request_id, descriptor.attempt_id]
+            .iter()
+            .any(|id| id.get_version_num() != 7);
+        assert_eq!(
+            descriptor.canonical_bytes().is_err(),
+            version_wrong,
+            "{label}: the Rust encoder refuses exactly the wrong versions"
+        );
+        assert_eq!(
+            cell.reserve_with_canonical(session, descriptor, canonical.clone())
+                .await,
+            Err(refused.clone()),
+            "{label}"
+        );
+    }
+    assert!(
+        cell.custody_states().await.is_empty(),
+        "no refused reservation left a row"
+    );
+    cell.assert_ledger("after the non-v7 refusals").await;
+    let well_formed = cell.descriptor(1, &cell.policy).await;
+    assert_eq!(cell.reserve_on(session, &well_formed).await, Ok(()));
+    cell.assert_ledger("after the well-formed control").await;
+
+    // The check comes before the replay lookup. A pre-R32 custody row can carry non-v7 ids (the
+    // old cell never checked them); its descriptor's replay is refused for its ids, not looked up.
+    let good = cell.descriptor(2, &cell.policy).await;
+    let mut legacy = good.clone();
+    legacy.logical_request_id = Uuid::new_v4();
+    legacy.attempt_id = Uuid::new_v4();
+    let json = serde_json::to_string(&legacy).unwrap();
+    let canonical = forged_canonical(&good, &legacy);
+    let digest = blake3::hash(&canonical).as_bytes().to_vec();
+    admin
+        .batch_execute("BEGIN; SET LOCAL ROLE object_dispatch_retention_owner;")
+        .await
+        .unwrap();
+    admin
+        .execute(
+            "INSERT INTO object_store_retention.drain_spool_custody \
+               (spool_id, boundary, cell, service, logical_id, attempt_id, descriptor, canonical, \
+                digest, cleanup_not_before, metadata_bytes) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7::text::jsonb,$8,$9,$10,16384)",
+            &[
+                &legacy.spool_object_id,
+                &cell.policy.boundary,
+                &cell.policy.cell,
+                &cell.policy.service,
+                &legacy.logical_request_id,
+                &legacy.attempt_id,
+                &json,
+                &canonical,
+                &digest,
+                &i64::try_from(legacy.hard_not_after_ms).unwrap(),
+            ],
+        )
+        .await
+        .expect("seed a pre-R32 custody row with non-v7 ids");
+    admin
+        .batch_execute(&format!(
+            "UPDATE object_store_retention.drain_policies \
+               SET metadata_rows = metadata_rows + 1, metadata_bytes = metadata_bytes + 16384 \
+               WHERE boundary='{}' AND cell='{}'; COMMIT;",
+            cell.policy.boundary, cell.policy.cell
+        ))
+        .await
+        .unwrap();
+    cell.assert_ledger("after seeding the legacy row").await;
+    assert_eq!(
+        cell.reserve_with_canonical(session, &legacy, canonical.clone())
+            .await,
+        Err(refused),
+        "the id check precedes the replay lookup, so a legacy row's replay is refused for its ids"
+    );
+    // A legacy row with no UUIDv7 time never holds the floor down, and never breaks the advance.
+    let floor = cell
+        .client
+        .advance_retired_floor(&cell.policy.boundary, &cell.policy.cell)
+        .await
+        .expect("an advance over a legacy non-v7 row");
+    assert!(floor > 0);
+    assert_eq!(cell.rows_below_the_floor().await, 0);
+}
+
+// Item 5: migration 0032's up path. An R31 cell holding a reserved row (state 1), released rows
+// (state 3) and markers (state 4), superseded and not, is refused by the R32 revision check, upgrades
+// R31 -> R32 with every custody row unchanged and the ledger invariant holding, attests R32, and
+// then deletes its released rows and legacy markers online.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrades_unchanged_and_cleans_online()
+ {
+    let fixture = admin("LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UP_PG_URL").await;
+    let (migrator, _migrator_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_migrator").await;
+    install_cell_schema_at(&migrator, CellSchemaRevision::R31)
+        .await
+        .expect("install a real R31 cell");
+    assert_eq!(
+        attest_cell_schema(&migrator).await,
+        Err(CellSchemaError::UpgradeRequired(CellSchemaRevision::R31))
+    );
+    let (identity, system_identifier, database_oid) = database_identity(&fixture.client).await;
+    fixture
+        .client
+        .batch_execute(
+            "CREATE OR REPLACE FUNCTION public.stage_policy_rotate_v1(p jsonb, digest bytea,
+               expected_revision text, expected_digest bytea) RETURNS void
+             LANGUAGE plpgsql AS $$ BEGIN END $$;",
+        )
+        .await
+        .expect("stub the paired stage-policy rotation");
+    let now = now_ms(&fixture.client).await;
+    let (boundary, cell_id) = ("r32up-boundary", "r32up-cell");
+    let allocation = publish_budget(
+        &fixture.client,
+        boundary,
+        cell_id,
+        &system_identifier,
+        database_oid,
+        now,
+    )
+    .await;
+    let policy = drain_policy(
+        boundary,
+        cell_id,
+        "r32up-service",
+        "r32up-policy-v1",
+        u64::try_from(now + 3_600_000).unwrap(),
+        16_384 * 16,
+        16,
+    );
+    publish_drain_policy(&fixture.client, &policy).await;
+    let client = DrainClient::new(Arc::new(
+        DispatchRuntimePool::new(runtime_pool_config(&fixture.base_url, identity))
+            .expect("runtime pool"),
+    ));
+    assert_eq!(
+        client.verify_schema_revision().await,
+        Err(DrainError::SchemaUpgradeRequired),
+        "an R32 binary must refuse an R31 cell and name the upgrade"
+    );
+    let (runtime, runtime_task) =
+        connect_as(&fixture.base_url, "object_dispatch_retention_runtime").await;
+    let ttl = Duration::from_millis(policy.maximum_ttl_ms + 500);
+    // Generation 1: two rows, released, then a rotation supersedes them; one is compacted to a
+    // superseded marker by the R31 procedures themselves.
+    let s1 = descriptor_at_now(0, &policy, &allocation, &fixture.client).await;
+    let s2 = descriptor_at_now(1, &policy, &allocation, &fixture.client).await;
+    client.reserve(&s1).await.expect("R31 reservation");
+    client.reserve(&s2).await.expect("R31 reservation");
+    tokio::time::sleep(ttl).await;
+    release_without_compaction(&runtime, s1.spool_object_id).await;
+    release_without_compaction(&runtime, s2.spool_object_id).await;
+    let mut next = policy.clone();
+    next.revision = "r32up-policy-v2".to_string();
+    next.expires_at_ms = u64::try_from(now_ms(&fixture.client).await + 3_600_000).unwrap();
+    fixture
+        .client
+        .batch_execute("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance; BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    fixture
+        .client
+        .query_one(
+            "SELECT object_store_retention.drain_policy_rotate_v1($1::text::jsonb,$2,$3,$4,$5)",
+            &[
+                &serde_json::to_string(&next).unwrap(),
+                &next.canonical_bytes().unwrap(),
+                &&next.digest().unwrap()[..],
+                &policy.revision,
+                &&policy.digest().unwrap()[..],
+            ],
+        )
+        .await
+        .expect("offline policy rotation on the R31 cell");
+    fixture
+        .client
+        .batch_execute("COMMIT; RESET SESSION AUTHORIZATION")
+        .await
+        .unwrap();
+    runtime
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    runtime
+        .query(
+            "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)",
+            &[&s1.spool_object_id, &Option::<i64>::None],
+        )
+        .await
+        .expect("R31 compaction of a superseded released row");
+    runtime.batch_execute("COMMIT").await.unwrap();
+
+    // Generation 2 under the new revision: a released row and a marker that no rotation superseded,
+    // and a live reservation.
+    let n1 = descriptor_at_now(2, &next, &allocation, &fixture.client).await;
+    let n2 = descriptor_at_now(3, &next, &allocation, &fixture.client).await;
+    client.reserve(&n1).await.expect("R31 reservation");
+    client.reserve(&n2).await.expect("R31 reservation");
+    tokio::time::sleep(ttl).await;
+    release_without_compaction(&runtime, n1.spool_object_id).await;
+    release_without_compaction(&runtime, n2.spool_object_id).await;
+    fixture
+        .client
+        .execute(
+            "UPDATE object_store_retention.drain_spool_custody SET policy_expiry_ms=1 WHERE spool_id=$1",
+            &[&n1.spool_object_id],
+        )
+        .await
+        .unwrap();
+    runtime
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .unwrap();
+    runtime
+        .query(
+            "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)",
+            &[&n1.spool_object_id, &Option::<i64>::None],
+        )
+        .await
+        .expect("R31 compaction of an expired released row");
+    runtime.batch_execute("COMMIT").await.unwrap();
+    let live = descriptor_at_now(4, &next, &allocation, &fixture.client).await;
+    client.reserve(&live).await.expect("R31 reservation");
+
+    // Five rows: superseded marker, superseded released, plain marker, plain released, reserved.
+    let states: Vec<(i16, bool)> = fixture
+        .client
+        .query(
+            "SELECT state, superseded FROM object_store_retention.drain_spool_custody \
+             WHERE boundary=$1 AND cell=$2 ORDER BY state, superseded",
+            &[&boundary, &cell_id],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        states,
+        vec![(1, false), (3, false), (3, true), (4, false), (4, true)]
+    );
+    // `retired_floor_ms` does not exist yet, and the pre-upgrade ledger already holds.
+    assert_ledger_matches_custody(&fixture.client, boundary, cell_id, "on the R31 cell").await;
+
+    // Every column of every custody row except the generated due time, and the policy rows.
+    async fn custody_projection(admin: &tokio_postgres::Client) -> Vec<String> {
+        admin
+            .query(
+                "SELECT (to_jsonb(c) - 'due_ms')::text FROM object_store_retention.drain_spool_custody c \
+                 ORDER BY spool_id",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+    async fn policy_projection(admin: &tokio_postgres::Client) -> Vec<String> {
+        admin
+            .query(
+                "SELECT (to_jsonb(p) - 'retired_floor_ms')::text FROM object_store_retention.drain_policies p \
+                 ORDER BY boundary, cell",
+                &[],
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+    let custody_before = custody_projection(&fixture.client).await;
+    let policy_before = policy_projection(&fixture.client).await;
+    let spool_objects_before: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(custody_before.len(), 5);
+
+    drop(runtime);
+    drop(runtime_task);
+    drop(client);
+    let base_url = fixture.base_url.clone();
+    drop(fixture);
+    wait_until_exclusive(&migrator).await;
+    let report = upgrade_cell_schema(&migrator)
+        .await
+        .expect("upgrade R31 to R32");
+    assert_eq!(
+        report.disposition,
+        CellUpgradeDisposition::Upgraded(CellSchemaRevision::R31)
+    );
+    assert_eq!(report.attestation.schema_revision, CellSchemaRevision::R32);
+    assert_eq!(report.attestation.schema_revision, CELL_SCHEMA_CURRENT);
+
+    let fixture = admin_at(base_url.clone()).await;
+    let marker: i32 = fixture
+        .client
+        .query_one(
+            "SELECT object_store_retention.cell_schema_revision_v1()",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(marker, 32);
+    assert_eq!(
+        custody_projection(&fixture.client).await,
+        custody_before,
+        "every custody row is unchanged by the upgrade"
+    );
+    assert_eq!(
+        policy_projection(&fixture.client).await,
+        policy_before,
+        "the policy row is unchanged except for the new column"
+    );
+    let floor: i64 = fixture
+        .client
+        .query_one(
+            "SELECT retired_floor_ms FROM object_store_retention.drain_policies WHERE boundary=$1",
+            &[&boundary],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(floor, 0, "the floor starts at zero");
+    let spool_objects_after: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(spool_objects_after, spool_objects_before);
+    assert_ledger_matches_custody(&fixture.client, boundary, cell_id, "after the upgrade").await;
+    // The generated due time follows the R32 contract for each state.
+    for row in fixture
+        .client
+        .query(
+            "SELECT state, due_ms, cleanup_not_before, lease_until_ms \
+             FROM object_store_retention.drain_spool_custody",
+            &[],
+        )
+        .await
+        .unwrap()
+    {
+        let (state, due, not_before, lease): (i16, i64, i64, i64) =
+            (row.get(0), row.get(1), row.get(2), row.get(3));
+        let expected = if state == 4 {
+            lease
+        } else {
+            not_before.max(lease)
+        };
+        assert_eq!(due, expected, "state {state} due time after the upgrade");
+    }
+
+    // The upgraded cell is accepted by the R32 client, and cleans itself online: the released rows
+    // and both kinds of marker are deleted, and the reserved row once its window passes.
+    let client = drain_client(&base_url, identity).await;
+    tokio::time::sleep(ttl).await;
+    let mut deleted = 0;
+    for _ in 0..4 {
+        deleted += run_cleanup_pass(&client, boundary, cell_id, 16).await.len();
+        let remaining: i64 = fixture
+            .client
+            .query_one(
+                "SELECT count(*) FROM object_store_retention.drain_spool_custody",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_ledger_matches_custody(&fixture.client, boundary, cell_id, "during online cleanup")
+            .await;
+        if remaining == 0 {
+            break;
+        }
+    }
+    assert!(deleted >= 5, "all five rows were processed ({deleted})");
+    let end =
+        assert_ledger_matches_custody(&fixture.client, boundary, cell_id, "after cleanup").await;
+    assert_eq!((end.metadata_rows, end.metadata_bytes), (0, 0));
+    let leftovers: i64 = fixture
+        .client
+        .query_one(
+            "SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(leftovers, 0, "the spool objects left with their rows");
+    let observed = client.observe(boundary, cell_id).await.unwrap();
+    assert!(!observed.metadata_full);
+    assert_eq!((observed.spool_bytes, observed.spool_files), (0, 0));
 }

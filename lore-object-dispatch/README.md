@@ -14,10 +14,15 @@ There is no separate dispatcher process, no in-cell mTLS service, and no survivi
 ### Out-of-Band Cell Schema Install (WP-114 CD-1)
 Migrations are never auto-installed by runtime. They are installed out of band through the concrete `cell-schema-install` binary.
 - **TLS:** The installer's transport follows the same rule as the dispatch pool (`dispatch_pool::cell_tls_connector`). When `LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM` (PEM text) is set, the URL must say `sslmode=require`. The server is verified against exactly that bundle (chain and host name, libpq `verify-full` semantics). When it is unset, the URL must say `sslmode=disable`. `prefer` or a missing `sslmode` exits 2.
-- **Install set:** migrations `0002`, `0003`, then `0007` through `0031` (`0004`-`0006` stay deferred); the embedded identity is cell schema R31 (R30 plus forward step `0031`). Existing R30 cells reach R31 through `cell-schema-install upgrade`.
+- **Install set:** migrations `0002`, `0003`, then `0007` through `0032` (`0004`-`0006` stay deferred); the embedded identity is cell schema R32 (R31 plus forward step `0032`, CR-041). Existing older cells reach R32 through `cell-schema-install upgrade`, which requires `LORE_OBJECT_DISPATCH_CELL_UPGRADE_BACKUP_REF` because R31 -> R32 is one-way.
 - **No database BLAKE3:** the cell Postgres provides no `public.blake3` and needs no plpython3u. Rust callers compute and check BLAKE3 digests and hash columns; the database does not verify them. The participant key check uses the built-in `sha256()`.
 
 For a detailed catalogue of embedded migrations (including BLAKE3 hashes and detailed bytes sizes), see [README-migrations.md](./README-migrations.md).
+
+### Retired-floor walk and quarantine (CR-041)
+From R32 a released spool custody row is deleted. `LinuxSpoolWriter::reclaim_step` walks the boundary's PUT tree and moves any body whose `UUIDv7` attempt is older than the cell's retired floor into `<spool root>/quarantine/`. It never unlinks one. Two deployment requirements follow:
+- **Local POSIX filesystem.** The move uses `RENAME_NOREPLACE`. NFS and some FUSE filesystems refuse it. `probe_quarantine_rename` checks it when write-behind starts, and write-behind refuses to start without it.
+- **One cell per spool root.** The path names the provider boundary token, not the cell. Two cells sharing a root and a boundary would see each other's bodies, and one cell's floor would quarantine the other's live bodies. Give each cell its own root.
 
 ### Shared Spool Verifier
 `LinuxSpoolVerifier` is a source-dark, read-only observer for derived shared-spool paths on Linux. It opens artifacts descriptor-relative (using `openat2`), requires beneath-root, no-symlink, and no-cross-mount resolution, and hashes complete candidates via BLAKE3-256 to verify file identity.

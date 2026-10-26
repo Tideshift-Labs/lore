@@ -389,6 +389,8 @@ fn the_cleanup_skipped_counter_adds_each_causes_growth_by_label() {
             stage_capacity: 3,
             stage_key_taken: 1,
             tombstone_sweep_failed: 0,
+            spool_retire_failed: 0,
+            spool_retire_contended: 0,
         },
     );
     // A cause that has not grown adds nothing and has no data point yet.
@@ -403,6 +405,8 @@ fn the_cleanup_skipped_counter_adds_each_causes_growth_by_label() {
         stage_capacity: 4,
         stage_key_taken: 1,
         tombstone_sweep_failed: 2,
+        spool_retire_failed: 5,
+        spool_retire_contended: 4,
     };
     record_cleanup_skips(&counter, &mut counted, later);
     // The same snapshot again adds nothing.
@@ -413,6 +417,8 @@ fn the_cleanup_skipped_counter_adds_each_causes_growth_by_label() {
             ("stage_capacity".to_owned(), 4),
             ("stage_key_taken".to_owned(), 1),
             ("tombstone_sweep_failed".to_owned(), 2),
+            ("spool_retire_failed".to_owned(), 5),
+            ("spool_retire_contended".to_owned(), 4),
         ])
     );
     assert_eq!(counted, later);

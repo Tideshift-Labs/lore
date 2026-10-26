@@ -521,3 +521,26 @@ connection) proving the SQLSTATE the coordinator's own `pg()` wrapper is expecte
 - **Appending to an `eol=lf` file with `Add-Content` writes CRLF** -> rewrite with
   `[IO.File]::WriteAllText` and an LF-normalised string, then `git ls-files --eol <path>`.
 - **`lore-integration-tests --features integration_tests` has 51 pre-existing failures without LocalStack/Dynamo** (`aws_store_test` 30, `locks_test` 14, `dynamodb_test` 7). They are infra-gated, not regressions; filter them out (`-- storage_copy_on_write quic_strict_admission`) rather than reading the red as yours.
+
+## R32 (migration 0032, WP-115 f2) fixture gotchas
+
+- **From R32 `DrainClient::release_cleanup` deletes the row** (release then `drain_cleanup_compact_v3`), so a case that reads a
+  released row, a receipt, or a marker afterwards finds nothing. Use `release_without_compaction`
+  (raw `drain_cleanup_claim_v2` + `drain_cleanup_release_v1`, state 3) and `DrainCell::become_legacy_marker` (the pre-R32 state-4
+  shape) in `cell_schema_forward_upgrade_live.rs`. A cell at its row cap can only be built from those shapes now.
+- **Assert the ledger, not just the call**: `assert_ledger_matches_custody` (rows == count, bytes == sum, per boundary/cell) after
+  every cycle; add `rows_below_the_floor` (custody `drain_uuid_v7_ms_v1(attempt_id)` < `retired_floor_ms`) for floor cases.
+- **Reserve needs UUIDv7 ids and a chosen timestamp**: `uuid_v7_at(ms, salt)`; `Uuid::new_v4()` or md5-derived ids are refused
+  `INVALID_UUIDV7` (22023, from the canonical-bytes encoder, the only `UUIDv7` refusal; Rust's `canonical_bytes` also refuses non-version-7, so forge canonical bytes to reach SQL), and legacy md5-seeded custody rows decode to NULL (never hold the floor).
+- **Race the floor with two plain runtime sessions**, not the pool: `serializable_statement` returns `(sqlstate, message)`;
+  accept 40001/40P01 and `55000 DRAIN_ATTEMPT_RETIRED`, assert no row below the floor. Reset between iterations with
+  `wipe_custody` (owner role), and take the "advance first" order by opening the reserve's snapshot with a cheap read first.
+- **A subcommand gated on an env var is testable without a database**: closed port + exit code 2 (refused before connecting) vs 1
+  (reached the connection attempt), as `cell_schema_install_tls.rs` does for `LORE_OBJECT_DISPATCH_CELL_UPGRADE_BACKUP_REF`.
+- **Runner inventories pin test names**: `paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_usage` keeps its
+  name (Gate 0 receipts key on it) though it no longer holds compact markers. New live cases join
+  `run-cell-schema-forward-upgrade-live.ps1`'s `$tests` (one database each), `run-local-authority-live.ps1`'s known list, and
+  `run-write-behind-linux.ps1`'s `$libUnixOnlyLive` / `spool_writer` floor.
+- **The 64-cycle guardrail costs ~16 x 3.5 s**: a cycle cannot be claimed before `maximum_ttl_ms` passes, so the cap-4 case runs
+  16 batches of 4. The provider-level Linux run of more fragments than `metadata_max_rows` (1000 in the fixture) is not feasible
+  in the same way; the SQL tier carries the proof.

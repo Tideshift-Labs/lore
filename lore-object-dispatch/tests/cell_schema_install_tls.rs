@@ -181,6 +181,76 @@ fn a_missing_or_unparsable_url_is_refused_without_echoing_it() {
     assert_never_echoed(&output, &[PASSWORD, "notaport"]);
 }
 
+const BACKUP_REF_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_UPGRADE_BACKUP_REF";
+
+fn run_action(action: &str, backup_ref: Option<&str>) -> Output {
+    let port = closed_port();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cell-schema-install"));
+    command.env_clear();
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", root);
+    }
+    command.arg(action).env(URL_ENV, url(port, Some("disable")));
+    if let Some(value) = backup_ref {
+        command.env(BACKUP_REF_ENV, value);
+    }
+    command.output().expect("spawn cell-schema-install")
+}
+
+#[test]
+fn upgrade_without_a_backup_ref_is_refused_before_connecting() {
+    // WP-115 f2: the R32 step deletes spool custody rows, so the operator must name the pre-upgrade
+    // volume copy. Exit 2 with the closed port proves the refusal came before any connection.
+    for backup_ref in [None, Some("")] {
+        let output = run_action("upgrade", backup_ref);
+        assert_eq!(output.status.code(), Some(2), "backup ref {backup_ref:?}");
+        assert!(
+            !stderr(&output).contains(CONNECT_FAILURE),
+            "backup ref {backup_ref:?} reached a connection attempt: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(BACKUP_REF_ENV),
+            "the refusal must name the variable: {}",
+            stderr(&output)
+        );
+        assert_never_echoed(&output, &[PASSWORD, "127.0.0.1"]);
+    }
+}
+
+#[test]
+fn upgrade_with_a_backup_ref_reaches_a_connection_attempt() {
+    // The positive control for the refusal above: the same command with the variable set is not
+    // refused up front, it tries (and, on the closed port, fails) to connect.
+    let output = run_action("upgrade", Some("volume-copy-2026-10-26"));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains(CONNECT_FAILURE),
+        "{}",
+        stderr(&output)
+    );
+    assert_never_echoed(&output, &[PASSWORD, "127.0.0.1"]);
+}
+
+#[test]
+fn the_backup_ref_is_required_by_upgrade_only() {
+    // attest, install and measure keep working with no backup ref: they reach a connection attempt.
+    for action in ["attest", "install", "measure"] {
+        let output = run_action(action, None);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{action}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(CONNECT_FAILURE),
+            "{action} must not need a backup ref: {}",
+            stderr(&output)
+        );
+    }
+}
+
 #[test]
 fn explicit_plaintext_is_accepted_and_reaches_a_connection_attempt() {
     let port = closed_port();

@@ -117,6 +117,22 @@ fn spool_io(context: &'static str) -> impl FnOnce(SpoolWriteError) -> FragmentPr
     }
 }
 
+/// Map a blocking spool task that never returned onto the seam's closed error, logging whether it
+/// panicked or was cancelled: neither is a spool I/O failure, and the error cannot say which.
+fn spool_join(
+    context: &'static str,
+) -> impl FnOnce(tokio::task::JoinError) -> FragmentProviderError {
+    move |error| {
+        let how = if error.is_panic() {
+            "panicked"
+        } else {
+            "was cancelled"
+        };
+        lore_base::lore_warn!("{context} {how}: {error}");
+        FragmentProviderError::DrainSpoolIo
+    }
+}
+
 fn log_spool_failure(context: &'static str, error: SpoolWriteError) {
     match error.os_error() {
         Some(os) => lore_base::lore_warn!("{context}: {error}: {os}"),
@@ -309,6 +325,30 @@ pub struct FragmentDrainMaintenanceHandle {
     observation_io: tokio::sync::Mutex<SpoolObservationState>,
     /// Rows skipped because giving back their metadata charge would underflow (row 56).
     underflow_skips: std::sync::atomic::AtomicU64,
+    /// Spool bodies the retired-floor walk moved to quarantine (WP-115 f2).
+    quarantined_files: std::sync::atomic::AtomicU64,
+}
+
+/// Entries one retired-floor walk step visits. The PUT tree holds at most one body per live
+/// custody row plus residue, so a few steps cover a full cell.
+const RETIRE_WALK_ENTRIES: u32 = 4096;
+
+/// What one [`FragmentDrainMaintenanceHandle::retire_pass`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SpoolRetireOutcome {
+    /// The cell's retired floor after this pass, in database unix ms.
+    pub floor_ms: i64,
+    /// Whether this pass completed a walk of the boundary's PUT tree.
+    pub walk_completed: bool,
+    pub quarantined_files: u64,
+    pub quarantined_bytes: u64,
+    /// Entries kept because they do not re-derive as a spool path.
+    pub retained_unknown: u64,
+    /// Entries the walk could not stat, open or move this pass; a later traversal retries them.
+    pub skipped_entries: u64,
+    /// The floor advance lost a race with a reservation on the policy row. Nothing committed and
+    /// no walk ran; the next pass retries. This is routine on a busy cell, not a failure.
+    pub floor_contended: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -453,6 +493,71 @@ impl FragmentDrainMaintenanceHandle {
         }
     }
 
+    pub fn quarantined_files(&self) -> u64 {
+        self.quarantined_files
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Raise the cell's retired floor, then walk one bounded step of the spool's PUT tree and move
+    /// every body older than the floor into quarantine (migration 0032, CR-041).
+    ///
+    /// Custody rows are deleted once released, so nothing else will ever touch a body a stale
+    /// writer places after its row is gone, or one whose row a database restore lost. The floor
+    /// proves such a body has no row and never will. It is moved, never unlinked.
+    pub async fn retire_pass(&self) -> Result<SpoolRetireOutcome, FragmentProviderError> {
+        let floor_ms = match self
+            .client
+            .advance_retired_floor(&self.boundary, &self.cell)
+            .await
+        {
+            Ok(floor_ms) => floor_ms,
+            Err(DrainError::Contended) => {
+                return Ok(SpoolRetireOutcome {
+                    floor_contended: true,
+                    ..SpoolRetireOutcome::default()
+                });
+            }
+            Err(error) => return Err(FragmentProviderError::DrainAuthority(error)),
+        };
+        let layout = self.layout.clone();
+        let writer = self.writer.clone();
+        let boundary = self.boundary.clone();
+        let step = lore_base::lore_spawn_blocking!(move || writer.reclaim_step(
+            &layout,
+            &boundary,
+            floor_ms,
+            RETIRE_WALK_ENTRIES
+        ))
+        .await
+        .map_err(spool_join("drain spool retired-floor walk step"))?
+        .map_err(spool_io("drain spool retired-floor walk failed"))?;
+        if step.quarantined_files > 0 {
+            self.quarantined_files
+                .fetch_add(step.quarantined_files, std::sync::atomic::Ordering::Relaxed);
+            lore_base::lore_warn!(
+                "drain spool moved {} body file(s), {} bytes, below the retired floor into quarantine",
+                step.quarantined_files,
+                step.quarantined_bytes
+            );
+        }
+        if step.skipped_entries > 0 {
+            lore_base::lore_warn!(
+                "drain spool retired-floor walk skipped {} entr(ies) it could not stat, open or move; \
+                 a later walk retries them",
+                step.skipped_entries
+            );
+        }
+        Ok(SpoolRetireOutcome {
+            floor_ms,
+            walk_completed: step.completed,
+            quarantined_files: step.quarantined_files,
+            quarantined_bytes: step.quarantined_bytes,
+            retained_unknown: step.retained_unknown,
+            skipped_entries: step.skipped_entries,
+            floor_contended: false,
+        })
+    }
+
     pub async fn cleanup_pass(&self, batch: u32) -> Result<u32, FragmentProviderError> {
         let batch = u16::try_from(batch)
             .map_err(|_error| FragmentProviderError::DrainAuthority(DrainError::Invalid))?;
@@ -585,9 +690,18 @@ impl FragmentProviderEntry {
                 FRAGMENT_PROVIDER_INGRESS_CAP_BYTES
             ))
             .await
-            .map_err(|_error| FragmentProviderError::DrainSpoolIo)?
+            .map_err(spool_join("drain spool writer open"))?
             .map_err(spool_io("drain spool writer open failed"))?,
         );
+        // The retired-floor walk quarantines with RENAME_NOREPLACE. On a filesystem without it
+        // (NFS, some FUSE) every retire pass would skip every body, so refuse to start instead.
+        let probe = writer.clone();
+        lore_base::lore_spawn_blocking!(move || probe.probe_quarantine_rename())
+            .await
+            .map_err(spool_join("drain spool RENAME_NOREPLACE probe"))?
+            .map_err(spool_io(
+                "drain spool root refused RENAME_NOREPLACE; it must be a local POSIX filesystem",
+            ))?;
         let maintenance = FragmentDrainMaintenanceHandle {
             client,
             layout,
@@ -598,6 +712,7 @@ impl FragmentProviderEntry {
             io: tokio::sync::Mutex::new(None),
             observation_io: tokio::sync::Mutex::new(SpoolObservationState::default()),
             underflow_skips: std::sync::atomic::AtomicU64::new(0),
+            quarantined_files: std::sync::atomic::AtomicU64::new(0),
         };
         let mut capability = self
             .drain_capability(root)
@@ -734,7 +849,7 @@ pub(super) async fn assert_cleanup_recovers_after_worker_panic(
             .await
             .expect("next real SQL/filesystem cleanup pass must not repoll a completed panic"),
         0,
-        "an already compact tombstone does not report fresh cleanup progress"
+        "a cell with no due custody row reports no fresh cleanup progress"
     );
     assert!(maintenance.io.lock().await.is_none());
 }

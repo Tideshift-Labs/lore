@@ -490,6 +490,14 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by_rust',
         'live_r31_drain_reserve_replay_is_pinned_to_the_descriptor_digest',
         'live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row',
+        # Same file, migration 0032 (WP-115 f2): the retired floor and the deleting compaction.
+        'live_r32_a_four_row_cell_completes_sixty_four_full_cycles_without_ever_filling',
+        'live_r32_retired_floor_advance_and_a_first_seen_reserve_serialize_on_the_policy_row',
+        'live_r32_no_race_between_the_floor_advance_and_a_reserve_leaves_a_row_below_the_floor',
+        'live_r32_retired_floor_never_lowers_is_capped_at_fifteen_minutes_and_stops_at_the_oldest_row',
+        'live_r32_compact_v3_deletes_rows_and_markers_for_exactly_their_charge_and_a_deleted_descriptor_stays_refused',
+        'live_r32_non_v7_ids_are_refused_and_the_v7_timestamp_function_decodes_exactly',
+        'live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrades_unchanged_and_cleans_online',
         # CR-034 budget pin refresh -- run-budget-pin-refresh-live.ps1
         'live_postgres_head_read_function_is_the_only_door_and_is_least_privilege',
         'live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the_new_fence',

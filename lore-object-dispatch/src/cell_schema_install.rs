@@ -293,9 +293,11 @@ pub enum CellSchemaRevision {
     /// `R29` plus forward step 0030: running spool charge counters (WP-115 row 78).
     R30,
     /// `R30` plus forward step 0031: BLAKE3 leaves `PostgreSQL` (WP-115 readiness blocker 6).
-    /// Database-built records are preimages only, and no procedure hashes with BLAKE3. The
-    /// current state.
+    /// Database-built records are preimages only, and no procedure hashes with BLAKE3.
     R31,
+    /// `R31` plus forward step 0032: released spool custody rows are deleted online and a retired
+    /// floor replaces the marker (WP-115 f2, CR-041). The current state.
+    R32,
 }
 
 impl CellSchemaRevision {
@@ -310,6 +312,7 @@ impl CellSchemaRevision {
             Self::R29 => "R29",
             Self::R30 => "R30",
             Self::R31 => "R31",
+            Self::R32 => "R32",
         }
     }
 
@@ -324,12 +327,13 @@ impl CellSchemaRevision {
             Self::R29 => 29,
             Self::R30 => 30,
             Self::R31 => 31,
+            Self::R32 => 32,
         }
     }
 }
 
 /// The state a fully installed or fully upgraded cell must attest as.
-pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R31;
+pub const CELL_SCHEMA_CURRENT: CellSchemaRevision = CellSchemaRevision::R32;
 
 /// One forward step between two adjacent known states.
 ///
@@ -409,7 +413,7 @@ END $prelude$;";
 /// The forward steps, in order, each from one known state to the next (CR-038 D2 as amended by
 /// the 2026-09-23 addendum). `upgrade` chains them until the cell reaches [`CELL_SCHEMA_CURRENT`].
 /// A cell at a state outside [`CELL_SCHEMA_STATES`] is still refused, never walked forward.
-pub const CELL_FORWARD_STEPS: [CellForwardStep; 6] = [
+pub const CELL_FORWARD_STEPS: [CellForwardStep; 7] = [
     CellForwardStep {
         from: CellSchemaRevision::R25,
         to: CellSchemaRevision::R26,
@@ -467,6 +471,17 @@ pub const CELL_FORWARD_STEPS: [CellForwardStep; 6] = [
         ),
         unwrap_frozen_transaction: false,
         prelude_sql: R30_TO_R31_PRELUDE_SQL,
+    },
+    CellForwardStep {
+        from: CellSchemaRevision::R31,
+        to: CellSchemaRevision::R32,
+        migration: cell_migration!(
+            32,
+            "0032_object_store_dispatch_drain_retired_floor.sql",
+            "9f4328a606e946fa9949993a8deffd3634e716297caf4ddf35f56cb30f155b0a"
+        ),
+        unwrap_frozen_transaction: false,
+        prelude_sql: DRAIN_TABLES_LOCK_SQL,
     },
 ];
 
@@ -1394,6 +1409,32 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R31: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R31: [u8; 32] =
     hex32("f27b8611d1c89cd0741202615f0e3719411554e8fcc84ba43962d5f4615d7a0d");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R32`], `PostgreSQL` 16.
+///
+/// Forward step 0032 adds `drain_policies.retired_floor_ms` and its `CHECK`, re-creates the custody
+/// row's generated `due_ms` and its index, adds the attempt-time index, replaces
+/// `drain_reserve_v1`, creates `drain_uuid_v7_ms_v1`, `drain_retired_floor_advance_v1` and
+/// `drain_cleanup_compact_v3`, and drops `drain_cleanup_compact_v2`. Measured 2026-10-26 on
+/// `postgres:16` (160015) from a fresh install.
+pub const CELL_CATALOG_SECTION_BLAKE3_R32: [[u8; 32]; 12] = [
+    hex32("f468de7d148f5335b52a10c4298d609be546801754da1d991ff0ac7e7c0da0ca"),
+    hex32("3d562552f6e80e971f6dabb8cd52767d9f7e305bf0b1bbce0981932a4922cf19"),
+    hex32("4f4947287ab9a5e3fc4f9d187e67920272f674a5f86289923799bdf209d0c50d"),
+    hex32("7db5c45ad1c62687c2154f4d9b5eefd42f82d8df8f6847efa70c078bf72ddbad"),
+    hex32("2823797fa06d1bde0af401ba18c0b48d5e5c8e9ff191d676872c649cbe6e3ae9"),
+    hex32("dc1a82b516bbc4da26221f3805cb2137f53fbaca582d5648d0ffcf6784551d72"),
+    hex32("b1d398c31b847b9e6a68a0ef1a681a5b1fb027d89fb66ba04b95a994b3523da9"),
+    hex32("d41a19bb5ec651fd0b77c2e5f69eb352ec81e19b5cb1737503e26dbdd792fcc3"),
+    hex32("e6aa8d2368660f4a61aca9eaf744acfb4f0d33169e1a9843891b6790f8766c59"),
+    hex32("971ec53fc27466c873c783701757e1434c20b383d23f081d918a2d6e4c797971"),
+    hex32("1dc93be73ec145b886d59f53d48f0b5e30edb4bbf33a2933451036cce626fc7f"),
+    hex32("444e1ca598f3a2dbe3601fdb803e2479f21b3b22fe4713d50f9a0e47fd7b73b2"),
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R32`] cell, `PostgreSQL` 16.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R32: [u8; 32] =
+    hex32("b64129e3d8259fbfad8d33369c1535436162ade916326d8b15ea3282bccdb061");
+
 /// Pinned per-section digests of state [`CellSchemaRevision::R25`], `PostgreSQL` 16 (CR-038 addendum).
 ///
 /// Measured 2026-09-23 on `postgres:16` from a fresh 0002-0025 install. The same twelve digests
@@ -1480,6 +1521,11 @@ pub const CELL_SCHEMA_STATES: CellSchemaStatePins = [
         CellSchemaRevision::R31,
         CELL_CATALOG_SECTION_BLAKE3_R31,
         CELL_CATALOG_MANIFEST_BLAKE3_R31,
+    ),
+    (
+        CellSchemaRevision::R32,
+        CELL_CATALOG_SECTION_BLAKE3_R32,
+        CELL_CATALOG_MANIFEST_BLAKE3_R32,
     ),
 ];
 
@@ -1646,8 +1692,31 @@ pub const CELL_CATALOG_SECTION_BLAKE3_R31_PG18: [[u8; 32]; 12] = [
 pub const CELL_CATALOG_MANIFEST_BLAKE3_R31_PG18: [u8; 32] =
     hex32("e5b283d671f3fcc9a8f16a743088068e01feaeafb01ad9ac5563b8395e6a6097");
 
+/// Pinned per-section digests of state [`CellSchemaRevision::R32`], `PostgreSQL` 18.
+///
+/// Measured 2026-10-26 on `postgres:18` (180006) from a fresh install. Against the `PostgreSQL` 16
+/// R32 pin, `constraints`, `functions` and `relation_acls` differ, as in every state.
+pub const CELL_CATALOG_SECTION_BLAKE3_R32_PG18: [[u8; 32]; 12] = [
+    CELL_CATALOG_SECTION_BLAKE3_R32[0],
+    CELL_CATALOG_SECTION_BLAKE3_R32[1],
+    CELL_CATALOG_SECTION_BLAKE3_R32[2],
+    hex32("12b1cc525e974040ba379ed1eb9a3e0b8f6b8dde75a6b4bf221bdf0f40106942"),
+    CELL_CATALOG_SECTION_BLAKE3_R32[4],
+    CELL_CATALOG_SECTION_BLAKE3_R32[5],
+    hex32("4cc0e8c810582fcfc13c1fc277c2a0ce7b88a0c8617873f3cd524a6300e16501"),
+    CELL_CATALOG_SECTION_BLAKE3_R32[7],
+    hex32("13d78472d189234ecf23b827b9290e4b4574b198188551d3ed43472a4418694a"),
+    CELL_CATALOG_SECTION_BLAKE3_R32[9],
+    CELL_CATALOG_SECTION_BLAKE3_R32[10],
+    CELL_CATALOG_SECTION_BLAKE3_R32[11],
+];
+
+/// Pinned BLAKE3-256 of the complete manifest of an [`CellSchemaRevision::R32`] cell, `PostgreSQL` 18.
+pub const CELL_CATALOG_MANIFEST_BLAKE3_R32_PG18: [u8; 32] =
+    hex32("b487435e08d09c66e41d48fcb0afd61cdb6d6235ca25c68615a4896ae8aa0fb4");
+
 /// One major's closed list of known states: each state with its section pins and manifest pin.
-pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 7];
+pub type CellSchemaStatePins = [(CellSchemaRevision, [[u8; 32]; 12], [u8; 32]); 8];
 
 /// Every known `PostgreSQL` 18 state with its pins, oldest first.
 pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
@@ -1685,6 +1754,11 @@ pub const CELL_SCHEMA_STATES_PG18: CellSchemaStatePins = [
         CellSchemaRevision::R31,
         CELL_CATALOG_SECTION_BLAKE3_R31_PG18,
         CELL_CATALOG_MANIFEST_BLAKE3_R31_PG18,
+    ),
+    (
+        CellSchemaRevision::R32,
+        CELL_CATALOG_SECTION_BLAKE3_R32_PG18,
+        CELL_CATALOG_MANIFEST_BLAKE3_R32_PG18,
     ),
 ];
 
@@ -2309,7 +2383,7 @@ pub async fn release_cell_schema_lock(client: &Client) -> Result<(), CellSchemaE
 }
 
 /// Move a cell at any known older state to [`CELL_SCHEMA_CURRENT`] (CR-038 and its 2026-09-23
-/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28 -> R29 -> R30 -> R31.
+/// addendum), one attested step at a time: R25 -> R26 -> R27 -> R28 -> R29 -> R30 -> R31 -> R32.
 ///
 /// Offline only: every replica must be stopped. The session guard checks ONCE before each step's
 /// `BEGIN`: it refuses if any other session is connected to the cell database. A session that
@@ -3344,6 +3418,7 @@ mod revision_marker_tests {
             (Some(28), CellSchemaRevision::R28),
             (Some(29), CellSchemaRevision::R29),
             (Some(30), CellSchemaRevision::R30),
+            (Some(32), CellSchemaRevision::R32),
         ] {
             assert_eq!(assert_revision_marker_matches(marker, revision), Ok(()));
         }
@@ -3359,6 +3434,8 @@ mod revision_marker_tests {
             (None, CellSchemaRevision::R30),
             (Some(29), CellSchemaRevision::R30),
             (Some(30), CellSchemaRevision::R29),
+            (Some(31), CellSchemaRevision::R32),
+            (Some(32), CellSchemaRevision::R31),
         ] {
             assert_eq!(
                 assert_revision_marker_matches(marker, revision),

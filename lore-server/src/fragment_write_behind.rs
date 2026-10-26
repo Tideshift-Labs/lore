@@ -750,6 +750,16 @@ fn record_cleanup_skips(counter: &Counter<u64>, previous: &mut CleanupSkips, now
             previous.tombstone_sweep_failed,
             now.tombstone_sweep_failed,
         ),
+        (
+            "spool_retire_failed",
+            previous.spool_retire_failed,
+            now.spool_retire_failed,
+        ),
+        (
+            "spool_retire_contended",
+            previous.spool_retire_contended,
+            now.spool_retire_contended,
+        ),
     ] {
         let grown = after.saturating_sub(before);
         if grown > 0 {

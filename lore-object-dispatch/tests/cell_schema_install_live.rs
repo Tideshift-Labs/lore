@@ -1134,7 +1134,8 @@ async fn live_postgres_cell_schema_measure_catalog_manifest() {
     let cell = connect("LORE_TEST_CELL_SCHEMA_MEASURE_PG_URL").await;
     // Optional: measure an older known state, e.g. on a newly supported server major.
     let target = match std::env::var("LORE_TEST_CELL_SCHEMA_MEASURE_TARGET").as_deref() {
-        Err(_) | Ok("R31") => CellSchemaRevision::R31,
+        Err(_) | Ok("R32") => CellSchemaRevision::R32,
+        Ok("R31") => CellSchemaRevision::R31,
         Ok("R30") => CellSchemaRevision::R30,
         Ok("R29") => CellSchemaRevision::R29,
         Ok("R28") => CellSchemaRevision::R28,

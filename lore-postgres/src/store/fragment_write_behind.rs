@@ -666,6 +666,8 @@ struct CleanupState {
     scanner: Arc<std::sync::Mutex<StageFileScanner>>,
     scan: Option<tokio::task::JoinHandle<Result<Vec<StageFileCandidate>, StoreError>>>,
     purge: Option<tokio::task::JoinHandle<Result<StageCleanupIntent, StoreError>>>,
+    /// When the spool's retired-floor step last succeeded (WP-115 f2).
+    retired: Option<Instant>,
 }
 
 /// Actual completed work, independent of the duration of a whole batch.
@@ -1065,6 +1067,10 @@ pub struct FragmentWriteBehindHandle {
     cleanup_skips: CleanupSkipCounters,
 }
 
+/// The least time between two successful spool retired-floor steps (WP-115 f2). The floor itself
+/// trails the clock by 15 minutes, so this delay only adds to that.
+const SPOOL_RETIRE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Cleanup steps a pass skipped and continued past, cumulative since boot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CleanupSkips {
@@ -1076,6 +1082,10 @@ pub struct CleanupSkips {
     /// Tombstone sweep batches that failed; the pass went on to the scan and
     /// the spool cleanup.
     pub tombstone_sweep_failed: u64,
+    /// Spool retired-floor steps that failed (WP-115 f2); the next pass retries.
+    pub spool_retire_failed: u64,
+    /// Spool retired-floor advances that lost a race with a reservation; not failures.
+    pub spool_retire_contended: u64,
 }
 
 #[derive(Default)]
@@ -1083,6 +1093,8 @@ struct CleanupSkipCounters {
     stage_capacity: std::sync::atomic::AtomicU64,
     stage_key_taken: std::sync::atomic::AtomicU64,
     tombstone_sweep_failed: std::sync::atomic::AtomicU64,
+    spool_retire_failed: std::sync::atomic::AtomicU64,
+    spool_retire_contended: std::sync::atomic::AtomicU64,
 }
 
 impl CleanupSkipCounters {
@@ -1103,6 +1115,8 @@ impl CleanupSkipCounters {
             stage_capacity: read(&self.stage_capacity),
             stage_key_taken: read(&self.stage_key_taken),
             tombstone_sweep_failed: read(&self.tombstone_sweep_failed),
+            spool_retire_failed: read(&self.spool_retire_failed),
+            spool_retire_contended: read(&self.spool_retire_contended),
         }
     }
 }
@@ -1173,6 +1187,7 @@ impl PostgresImmutableStore {
                 scanner,
                 scan: None,
                 purge: None,
+                retired: None,
             }),
             inventory: Mutex::new(PhysicalInventory::default()),
             activity: std::sync::Mutex::new(WriteBehindActivity::default()),
@@ -2151,6 +2166,30 @@ impl FragmentWriteBehindHandle {
                 .map_err(provider_store_err)?;
             cleaned += removed;
             self.record_cleanup_activity(removed > 0);
+        }
+        // The spool deletes released custody rows, so only the retired floor finds a body a stale
+        // writer placed after its row was gone. Each successful step writes the policy row every
+        // reservation writes, so it runs at most once per interval; a failure retries next pass.
+        if state
+            .retired
+            .is_none_or(|at| at.elapsed() >= SPOOL_RETIRE_INTERVAL)
+        {
+            match self.maintenance.retire_pass().await {
+                // A lost race with a reservation on the policy row: routine, retried next pass,
+                // and counted apart so the failure alert does not see it.
+                Ok(outcome) if outcome.floor_contended => {
+                    self.cleanup_skips
+                        .spool_retire_contended
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!("spool retired-floor advance lost a race; retrying next pass");
+                }
+                Ok(_) => state.retired = Some(Instant::now()),
+                Err(error) => CleanupSkipCounters::note(
+                    &self.cleanup_skips.spool_retire_failed,
+                    "spool_retire_failed",
+                    &error.to_string(),
+                ),
+            }
         }
         Ok(cleaned)
     }

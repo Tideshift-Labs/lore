@@ -1101,7 +1101,7 @@ fn strip_sql_line_comments(source: &str) -> String {
 fn forward_steps_carry_no_transaction_control_or_concurrent_index_build() {
     assert_eq!(
         CELL_FORWARD_STEPS.len(),
-        6,
+        7,
         "a new forward step must extend this sweep, not bypass it"
     );
     for step in CELL_FORWARD_STEPS {
@@ -1233,12 +1233,117 @@ fn forward_steps_are_registered_from_r27_and_reach_the_current_state() {
             (CellSchemaRevision::R28, CellSchemaRevision::R29),
             (CellSchemaRevision::R29, CellSchemaRevision::R30),
             (CellSchemaRevision::R30, CellSchemaRevision::R31),
+            (CellSchemaRevision::R31, CellSchemaRevision::R32),
         ]
     );
     assert_eq!(
-        CELL_FORWARD_STEPS[5].to,
+        CELL_FORWARD_STEPS[6].to,
         lore_object_dispatch::cell_schema_install::CELL_SCHEMA_CURRENT
     );
+}
+
+#[test]
+fn the_r32_step_adds_the_retired_floor_and_replaces_compact_v2_with_v3() {
+    // WP-115 f2: the spool custody ledger stops growing. Offline half of the proof; the live tier
+    // (`cell_schema_forward_upgrade_live.rs`) runs the procedures.
+    let step = CELL_FORWARD_STEPS
+        .iter()
+        .find(|step| step.to == CellSchemaRevision::R32)
+        .expect("a step into R32");
+    assert_eq!(step.from, CellSchemaRevision::R31);
+    assert_eq!(step.migration.number, 32);
+    assert_eq!(
+        step.migration.file_name,
+        "0032_object_store_dispatch_drain_retired_floor.sql"
+    );
+    assert!(
+        !step.unwrap_frozen_transaction,
+        "0032 is a forward-only body without its own transaction control"
+    );
+    // The prelude takes the owner role and locks all four drain tables NOWAIT, like 0028-0030.
+    let prelude = step.prelude_sql;
+    assert!(prelude.contains("SET LOCAL ROLE object_dispatch_retention_owner"));
+    assert!(prelude.contains("NOWAIT"));
+    for table in [
+        "object_dispatch_spool_objects",
+        "drain_spool_custody",
+        "object_dispatch_quota_usage",
+        "drain_policies",
+    ] {
+        assert!(
+            prelude.contains(table),
+            "the R32 prelude must lock {table} (the 4-table drain lock)"
+        );
+    }
+
+    let code = strip_sql_line_comments(step.migration.sql);
+    let flattened = code.split_whitespace().collect::<Vec<_>>().join(" ");
+    for needle in [
+        "drain_uuid_v7_ms_v1",
+        "retired_floor_ms",
+        "DRAIN_ATTEMPT_RETIRED",
+        "drain_retired_floor_advance_v1",
+        "drain_cleanup_compact_v3",
+    ] {
+        assert!(flattened.contains(needle), "0032 must define {needle}");
+    }
+    // The UUIDv7 refusal is 0013's INVALID_UUIDV7, raised by the descriptor encoder before any
+    // lookup; 0032 adds no second, unreachable one.
+    assert!(!flattened.contains("DRAIN_ATTEMPT_NOT_UUIDV7"));
+    assert!(
+        flattened.contains("DROP FUNCTION object_store_retention.drain_cleanup_compact_v2"),
+        "compact_v2 is replaced, not kept beside compact_v3"
+    );
+    assert!(
+        flattened.contains("SELECT 32"),
+        "0032 moves cell_schema_revision_v1() to 32"
+    );
+    assert!(
+        flattened.contains("bigint NOT NULL DEFAULT 0")
+            || flattened.contains("BIGINT NOT NULL DEFAULT 0"),
+        "retired_floor_ms is bigint NOT NULL DEFAULT 0"
+    );
+    assert!(
+        flattened.contains("DELETE FROM object_store_retention.drain_spool_custody"),
+        "compact_v3 deletes the custody row instead of keeping a marker"
+    );
+    assert!(
+        flattened.contains("DRAIN_METADATA_UNDERFLOW"),
+        "compact_v3 refuses a counter underflow like 0028"
+    );
+}
+
+#[test]
+fn the_retired_floor_window_in_0032_is_the_rust_constant() {
+    // The window is written twice, as a literal in 0032 and as a constant the provider's tests tie
+    // to the send timeout. They must stay one number.
+    let step = CELL_FORWARD_STEPS
+        .iter()
+        .find(|step| step.to == CellSchemaRevision::R32)
+        .expect("a step into R32");
+    let code = strip_sql_line_comments(step.migration.sql);
+    assert!(
+        code.contains("-900000"),
+        "0032 subtracts the 15 minute window as the literal -900000"
+    );
+    let subtracted: Vec<i64> = code
+        .match_indices("-900000")
+        .map(|(at, _)| {
+            code[at + 1..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .expect("digits follow the minus sign")
+        })
+        .collect();
+    assert!(!subtracted.is_empty());
+    for window in subtracted {
+        assert_eq!(
+            window,
+            lore_object_dispatch::drain_spool::RETIRED_FLOOR_WINDOW_MS
+        );
+    }
 }
 
 #[test]

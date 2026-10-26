@@ -1059,8 +1059,16 @@ fn reservation_and_maintenance_handles_expose_only_their_approved_operations() {
         ("FragmentDrainReservation", vec!["budget_pin", "write_body"]),
         (
             "FragmentDrainMaintenanceHandle",
-            // `underflow_skips` is a read-only counter (row 56), not an operation.
-            vec!["cleanup_pass", "observe", "underflow_skips"],
+            // `underflow_skips` and `quarantined_files` are read-only counters, not operations.
+            // `retire_pass` (WP-115 f2) advances the retired floor and quarantines below-floor
+            // spool files; it moves files and never unlinks them.
+            vec![
+                "cleanup_pass",
+                "observe",
+                "quarantined_files",
+                "retire_pass",
+                "underflow_skips",
+            ],
         ),
     ] {
         let prefix = format!("impl {name} {{");

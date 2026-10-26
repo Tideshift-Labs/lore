@@ -17,9 +17,15 @@
 //! $env:LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM = Get-Content -Raw ca-certificate.crt
 //! cell-schema-install install    # install the CR-033 D5 set, then attest
 //! cell-schema-install attest     # attest only; never writes schema
-//! cell-schema-install upgrade    # CR-038: move an attested R25/R26/R27 cell to current, offline
+//! cell-schema-install upgrade    # CR-038: move an attested older cell to current, offline
 //! cell-schema-install measure    # print the live catalog manifest digests
 //! ```
+//!
+//! `upgrade` also requires `LORE_OBJECT_DISPATCH_CELL_UPGRADE_BACKUP_REF`, naming the stopped-volume
+//! copy of the cell database taken before the upgrade, and refuses before connecting without it.
+//! The R31 -> R32 step deletes released spool custody rows and an older loreserver refuses an R32
+//! cell, so that copy is the only rollback (CR-041). The installer cannot check the copy; it prints
+//! the reference so the run's log records it.
 //!
 //! `upgrade` requires every replica stopped. It checks once, before its transaction, that no other
 //! session is connected to the cell database; a later connection is refused only if it holds a cell
@@ -71,6 +77,9 @@ const MIGRATOR_URL_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL";
 /// Environment variable carrying the PEM root CA bundle for a TLS cell database.
 const MIGRATOR_CA_PEM_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM";
 
+/// Environment variable naming the pre-upgrade volume copy that `upgrade` requires (CR-041).
+const UPGRADE_BACKUP_REF_ENV: &str = "LORE_OBJECT_DISPATCH_CELL_UPGRADE_BACKUP_REF";
+
 const USAGE: &str = "usage: cell-schema-install <install|attest|upgrade|measure>\n\
      the cell database URL is read from LORE_OBJECT_DISPATCH_CELL_MIGRATOR_URL\n\
      for TLS, set LORE_OBJECT_DISPATCH_CELL_MIGRATOR_CA_PEM and sslmode=require\n\
@@ -104,6 +113,23 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    if action == Action::Upgrade {
+        match std::env::var(UPGRADE_BACKUP_REF_ENV) {
+            Ok(reference) if !reference.trim().is_empty() => {
+                println!("upgrade: pre-upgrade volume copy: {reference}");
+            }
+            _ => {
+                eprintln!(
+                    "upgrade refused: set {UPGRADE_BACKUP_REF_ENV} to the stopped-volume copy of the \
+                     cell database taken before this upgrade. The R31 -> R32 step deletes released \
+                     spool custody rows and an older Lore binary refuses an R32 cell, so that copy \
+                     is the only rollback."
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     let Ok(url) = std::env::var(MIGRATOR_URL_ENV) else {
         eprintln!("{MIGRATOR_URL_ENV} is not set");

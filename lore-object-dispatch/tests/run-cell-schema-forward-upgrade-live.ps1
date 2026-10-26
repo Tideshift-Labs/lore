@@ -134,7 +134,15 @@ $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_PARTICIPANT_PG_URL'; Name = 'live_r30_cell_with_an_enrolled_participant_is_refused_and_stays_r30'; Database = 'r31_participant' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_RECEIPT_PG_URL'; Name = 'live_r31_release_receipt_is_a_preimage_and_the_policy_pin_is_checked_by_rust'; Database = 'r31_receipt' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_REPLAY_PG_URL'; Name = 'live_r31_drain_reserve_replay_is_pinned_to_the_descriptor_digest'; Database = 'r31_replay' },
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_CUT_PG_URL'; Name = 'live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row'; Database = 'r31_cut' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R31_CUT_PG_URL'; Name = 'live_r31_accepted_cut_check_ready_v2_does_not_see_a_tampered_ready_row'; Database = 'r31_cut' },
+    # Migration 0032 (WP-115 f2): the spool custody ledger stops growing; the retired floor.
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_LONGRUN_PG_URL'; Name = 'live_r32_a_four_row_cell_completes_sixty_four_full_cycles_without_ever_filling'; Database = 'r32_longrun' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_RACE_PG_URL'; Name = 'live_r32_retired_floor_advance_and_a_first_seen_reserve_serialize_on_the_policy_row'; Database = 'r32_floor_race' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_STRESS_PG_URL'; Name = 'live_r32_no_race_between_the_floor_advance_and_a_reserve_leaves_a_row_below_the_floor'; Database = 'r32_floor_stress' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_BOUNDS_PG_URL'; Name = 'live_r32_retired_floor_never_lowers_is_capped_at_fifteen_minutes_and_stops_at_the_oldest_row'; Database = 'r32_floor_bounds' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_DELETE_PG_URL'; Name = 'live_r32_compact_v3_deletes_rows_and_markers_for_exactly_their_charge_and_a_deleted_descriptor_stays_refused'; Database = 'r32_delete' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UUIDV7_PG_URL'; Name = 'live_r32_non_v7_ids_are_refused_and_the_v7_timestamp_function_decodes_exactly'; Database = 'r32_uuidv7' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UP_PG_URL'; Name = 'live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrades_unchanged_and_cleans_online'; Database = 'r32_up' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

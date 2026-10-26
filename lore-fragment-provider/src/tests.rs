@@ -2754,6 +2754,37 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
     );
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
     admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {ATTEMPT_TIMESTAMP_MS}::bigint';")).await.unwrap();
+    // CR-041: a spool filesystem without RENAME_NOREPLACE (NFS answers EINVAL) refuses write-behind
+    // at startup. Every other activation check passes here, so the probe is what refuses.
+    // Linux errno values: EINVAL, ENOSYS, EXDEV.
+    for errno in [22, 38, 18] {
+        lore_object_dispatch::spool_writer::probe_fault::fail_probe_under(&root, errno);
+        let refused = entry
+            .drain_handles(
+                root.clone(),
+                FragmentDrainPolicyPin {
+                    cell_id: policy.cell.clone(),
+                    revision: policy.revision.clone(),
+                    digest: policy_digest,
+                },
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+            )
+            .await;
+        lore_object_dispatch::spool_writer::probe_fault::clear(&root);
+        assert!(
+            matches!(refused, Err(FragmentProviderError::DrainSpoolIo)),
+            "errno {errno}: an unsupported RENAME_NOREPLACE refuses write-behind at startup"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root.join("quarantine"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "the refused probe cleaned up: {leftovers:?}"
+        );
+    }
     let (capability, maintenance) = entry
         .drain_handles(
             root.clone(),
@@ -2998,92 +3029,19 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         before,
         "expired token must not charge"
     );
-    // Full metadata remains until both the reservation and its policy expire.
-    // Keep the actual writer paused across that complete compaction horizon.
+    // R32 (WP-115 f2): the custody row leaves with its release, even while the policy is still
+    // live, and gives back exactly its row and bytes. Keep the actual writer paused across that
+    // whole deletion.
     admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", policy.expires_at_ms + 1)).await.unwrap();
-    let client = DrainClient::new(pool);
-    let intent = client.claim_cleanup(input.spool_object_id).await.unwrap();
-    intent.unlink(&layout).unwrap();
-    client.release_cleanup(&intent).await.unwrap();
-    client.release_cleanup(&intent).await.unwrap();
-    let full_rows: i64 = admin.query_one("SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects WHERE spool_object_id=$1", &[&input.spool_object_id]).await.unwrap().get(0);
-    assert_eq!(
-        full_rows, 0,
-        "full spool metadata is pruned while the writer remains held"
-    );
-    assert!(
-        maintenance.observe().await.is_err(),
-        "expired maintenance policy fails closed"
-    );
-    let sample = client.observe(BOUNDARY_ID, &policy.cell).await.unwrap();
-    assert_eq!(sample.spool_bytes, 0);
-    assert!(!paths.final_path().exists());
-    resume_writer.send(()).unwrap();
-    late_writer
-        .await
-        .unwrap()
-        .expect("actual late physical completion after authority cleanup and compaction");
-    let late = client.observe(BOUNDARY_ID, &policy.cell).await.unwrap();
-    assert_eq!(late.spool_bytes, 0);
-    assert!(paths.final_path().is_file());
-    assert_eq!(
-        std::fs::metadata(paths.final_path()).unwrap().len(),
-        body.len() as u64
-    );
-    // Migration 0029: a marker that no rotation superseded is swept for late bodies once an hour,
-    // not on every pass.
-    assert_eq!(
-        maintenance.cleanup_pass(64).await.unwrap(),
-        0,
-        "a fresh marker is not due"
-    );
-    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", policy.expires_at_ms + 1 + 3_600_001)).await.unwrap();
-    assert!(paths.final_path().is_file());
-    assert_eq!(
-        maintenance.cleanup_pass(64).await.unwrap(),
-        1,
-        "late physical body was removed"
-    );
-    let purged = client.observe(BOUNDARY_ID, &policy.cell).await.unwrap();
-    assert_eq!(purged.spool_bytes, 0);
-    assert!(!paths.final_path().exists());
-    assert_eq!(
-        maintenance.cleanup_pass(64).await.unwrap(),
-        0,
-        "replaying the tombstone is not fresh cleanup progress"
-    );
-    crate::drain::assert_cleanup_recovers_after_worker_panic(&maintenance).await;
-
-    // Migration 0029 (WP-115 row 56): an offline rotation supersedes the marker. A late body a
-    // stale writer places after the marker's fence is unlinked by the marker's own post-fence
-    // rescan, and only then is the marker deleted with its row and its 1024 bytes.
-    let rotated_at = policy.expires_at_ms + 3_600_010;
-    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {rotated_at}::bigint';
-        CREATE FUNCTION public.stage_policy_rotate_v1(p jsonb, digest bytea, expected_revision text, expected_digest bytea)
-        RETURNS void LANGUAGE plpgsql AS $$ BEGIN END $$;")).await.unwrap();
-    let next = DrainPolicy {
-        revision: "drain-test-policy-v2".into(),
-        expires_at_ms: rotated_at + 3_600_000,
-        ..policy.clone()
-    };
-    let rotate = format!(
-        "SELECT object_store_retention.drain_policy_rotate_v1({}::jsonb,decode('{}','hex'),decode('{}','hex'),{},decode('{}','hex'))",
-        quoted(&serde_json::to_string(&next).unwrap()),
-        hex::encode(next.canonical_bytes().unwrap()),
-        hex::encode(next.digest().unwrap()),
-        quoted(&policy.revision),
-        hex::encode(policy_digest)
-    );
-    admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_maintenance;BEGIN ISOLATION LEVEL SERIALIZABLE;{rotate};COMMIT;RESET SESSION AUTHORIZATION;")).await.unwrap();
-    async fn marker(admin: &Client, spool: Uuid) -> Option<(bool, i64)> {
+    async fn custody_row_exists(admin: &Client, spool: Uuid) -> bool {
         admin
             .query_opt(
-                "SELECT superseded, marker_fence_ms FROM object_store_retention.drain_spool_custody WHERE spool_id=$1",
+                "SELECT 1 FROM object_store_retention.drain_spool_custody WHERE spool_id=$1",
                 &[&spool],
             )
             .await
             .unwrap()
-            .map(|row| (row.get::<_, bool>(0), row.get::<_, i64>(1)))
+            .is_some()
     }
     async fn counters(admin: &Client, cell: &str) -> (i64, i64) {
         let row = admin
@@ -3096,31 +3054,132 @@ async fn attempt_drain_forces_the_drain_traffic_class_and_sends_the_bound_bodys_
         (row.get::<_, i64>(0), row.get::<_, i64>(1))
     }
     let spool = input.spool_object_id;
-    let fence = i64::try_from(rotated_at).unwrap();
-    assert_eq!(marker(&admin, spool).await, Some((true, fence)));
-    let before = counters(&admin, &policy.cell).await;
-    // A scan time at the fence is not a post-fence rescan and deletes nothing.
-    admin.batch_execute(&format!("SET SESSION AUTHORIZATION object_dispatch_retention_runtime;BEGIN ISOLATION LEVEL SERIALIZABLE;SELECT object_store_retention.drain_cleanup_compact_v2('{}'::uuid,{fence});COMMIT;RESET SESSION AUTHORIZATION;", input.spool_object_id)).await.unwrap();
-    assert_eq!(marker(&admin, spool).await, Some((true, fence)));
-    // The stale writer's late body lands after the fence.
-    std::fs::create_dir_all(paths.final_path().parent().unwrap()).unwrap();
-    std::fs::write(paths.final_path(), &body).unwrap();
-    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", rotated_at + 5)).await.unwrap();
+    assert!(custody_row_exists(&admin, spool).await);
+    let row_bytes: i64 = admin
+        .query_one(
+            "SELECT metadata_bytes FROM object_store_retention.drain_spool_custody WHERE spool_id=$1",
+            &[&spool],
+        )
+        .await
+        .unwrap()
+        .get(0);
     assert_eq!(
-        maintenance.cleanup_pass(64).await.unwrap(),
-        1,
-        "the superseded marker's post-fence rescan unlinked the late body"
+        counters(&admin, &policy.cell).await,
+        (1, row_bytes),
+        "the ledger holds exactly the one reservation before cleanup"
     );
-    assert!(!paths.final_path().exists());
+    let client = DrainClient::new(pool);
+    let intent = client.claim_cleanup(input.spool_object_id).await.unwrap();
+    intent.unlink(&layout).unwrap();
+    client.release_cleanup(&intent).await.unwrap();
+    client.release_cleanup(&intent).await.unwrap();
+    let full_rows: i64 = admin.query_one("SELECT count(*) FROM object_store_retention.object_dispatch_spool_objects WHERE spool_object_id=$1", &[&input.spool_object_id]).await.unwrap().get(0);
     assert_eq!(
-        marker(&admin, spool).await,
-        None,
-        "the marker is deleted after its own post-fence unlink"
+        full_rows, 0,
+        "full spool metadata is pruned while the writer remains held"
+    );
+    assert!(
+        !custody_row_exists(&admin, spool).await,
+        "release deletes the custody row; no marker is left behind"
     );
     assert_eq!(
         counters(&admin, &policy.cell).await,
-        (before.0 - 1, before.1 - 1024),
-        "deletion gives back exactly the marker's row and 1024 bytes"
+        (0, 0),
+        "the deletion gave back exactly the row and the bytes it was charged"
+    );
+    assert!(
+        maintenance.observe().await.is_err(),
+        "expired maintenance policy fails closed"
+    );
+    let sample = client.observe(BOUNDARY_ID, &policy.cell).await.unwrap();
+    assert_eq!(sample.spool_bytes, 0);
+    assert!(!paths.final_path().exists());
+    resume_writer.send(()).unwrap();
+    late_writer
+        .await
+        .unwrap()
+        .expect("actual late physical completion after authority cleanup and deletion");
+    let late = client.observe(BOUNDARY_ID, &policy.cell).await.unwrap();
+    assert_eq!(late.spool_bytes, 0);
+    assert!(paths.final_path().is_file());
+    assert_eq!(
+        std::fs::metadata(paths.final_path()).unwrap().len(),
+        body.len() as u64
+    );
+    // No custody row remains, so the cleanup sweep has nothing to rescan. The late body is
+    // reachable only through the retired-floor sweep.
+    assert_eq!(
+        maintenance.cleanup_pass(64).await.unwrap(),
+        0,
+        "a deleted row leaves nothing for cleanup to rescan"
+    );
+    crate::drain::assert_cleanup_recovers_after_worker_panic(&maintenance).await;
+    assert!(paths.final_path().is_file());
+    assert_eq!(maintenance.quarantined_files(), 0);
+
+    // Control: the floor is capped at now minus 15 minutes, so at 800 s after the attempt the late
+    // body (a 1.7e12 ms attempt) is not yet below the floor and stays in place.
+    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", ATTEMPT_TIMESTAMP_MS + 800_000)).await.unwrap();
+    for _ in 0..4 {
+        maintenance
+            .retire_pass()
+            .await
+            .expect("retire pass below the window");
+    }
+    assert!(
+        paths.final_path().is_file(),
+        "a body newer than the floor is never moved"
+    );
+    assert_eq!(maintenance.quarantined_files(), 0);
+
+    // Once the attempt is older than the 15 minute window, the sweep moves the late body into
+    // `<root>/quarantine`, byte for byte, and unlinks nothing.
+    admin.batch_execute(&format!("CREATE OR REPLACE FUNCTION object_store_retention.clock_unix_ms_v1() RETURNS bigint LANGUAGE sql STABLE SECURITY DEFINER SET search_path=pg_catalog AS 'SELECT {}::bigint';", ATTEMPT_TIMESTAMP_MS + 3_600_000)).await.unwrap();
+    for _ in 0..8 {
+        maintenance
+            .retire_pass()
+            .await
+            .expect("retire pass past the window");
+        if !paths.final_path().exists() {
+            break;
+        }
+    }
+    assert!(
+        !paths.final_path().exists(),
+        "the late body below the floor left its spool path"
+    );
+    let quarantined = root
+        .join("quarantine")
+        .join(format!("{REQUEST_ID}.{ATTEMPT_ID}.blob"));
+    assert_eq!(
+        std::fs::read(&quarantined).unwrap(),
+        body,
+        "the late body is quarantined intact, not deleted"
+    );
+    assert_eq!(maintenance.quarantined_files(), 1);
+    // The custody row stays deleted, and the sweep does not resurrect any ledger charge.
+    assert_eq!(counters(&admin, &policy.cell).await, (0, 0));
+
+    // A retire pass dropped mid-flight (cancelled at its first await) leaves the handle usable: the
+    // next pass succeeds, advances the floor, and the walk completes.
+    for _ in 0..3 {
+        let cancelled = tokio::time::timeout(Duration::ZERO, maintenance.retire_pass()).await;
+        assert!(
+            cancelled.is_err() || cancelled.is_ok_and(|outcome| outcome.is_ok()),
+            "a cancelled pass is dropped; a pass that finished first finished cleanly"
+        );
+    }
+    let recovered = maintenance
+        .retire_pass()
+        .await
+        .expect("the pass after a cancelled one succeeds");
+    assert!(
+        recovered.floor_ms > 0,
+        "the recovered pass returns the advanced floor"
+    );
+    assert_eq!(
+        recovered.skipped_entries, 0,
+        "nothing was skipped on an intact root"
     );
     std::fs::remove_dir_all(&root).unwrap();
 }
@@ -3389,6 +3448,18 @@ async fn drain_handles_refuses_a_cell_schema_revision_this_build_does_not_know()
 /// cell's only put permit through the direct path leaves a otherwise-valid
 /// drain nowhere to go but the admission queue, where it times out. A
 /// drain with its own semaphore would have admitted immediately instead.
+/// WP-115 f2: the retired floor trails the database clock by a window. A body placed by a writer
+/// that was admitted just before the floor passed its attempt must have finished or timed out by
+/// then, so the window must cover several send timeouts.
+#[test]
+fn the_retired_floor_window_covers_three_send_timeouts() {
+    let send_max = i64::try_from(FRAGMENT_PROVIDER_SEND_TIMEOUT_MAX_MILLIS).unwrap();
+    assert!(
+        lore_object_dispatch::drain_spool::RETIRED_FLOOR_WINDOW_MS >= 3 * send_max,
+        "window {} < 3 x send timeout max {send_max}",
+        lore_object_dispatch::drain_spool::RETIRED_FLOOR_WINDOW_MS
+    );
+}
 #[tokio::test]
 async fn attempt_drain_shares_the_one_in_flight_put_permit_with_the_direct_fallback() {
     let (entry, _authority, _port) = drain_entry(ChargeScript::Grant, narrow_put_bound());

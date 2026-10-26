@@ -82,9 +82,9 @@ impl std::fmt::Debug for DrainDescriptor {
     }
 }
 
-/// The cell schema revision this build ships (CR-038). Migration 0031's
+/// The cell schema revision this build ships (CR-038). Migration 0032's
 /// `cell_schema_revision_v1()` returns it; write-behind refuses to start on any other value.
-pub const CELL_SCHEMA_REVISION: i32 = 31;
+pub const CELL_SCHEMA_REVISION: i32 = 32;
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DrainError {
@@ -174,6 +174,10 @@ pub enum DrainFailureCause {
     RefusedOther,
     /// `DRAIN_METADATA_UNDERFLOW`. `MetadataUnderflow`.
     MetadataUnderflow,
+    /// SQLSTATE 55000 raised as `DRAIN_ATTEMPT_RETIRED` (migration 0032): a first-seen attempt older
+    /// than the cell's retired floor, which a replica whose clock lags the database produces.
+    /// `Refused`.
+    RefusedAttemptRetired,
     /// The statement failed with no SQLSTATE, so its outcome is unknown. `Unavailable`.
     StatementUnknown,
     /// `COMMIT` lost a race and rolled back. `Contended`.
@@ -183,7 +187,7 @@ pub enum DrainFailureCause {
 }
 
 impl DrainFailureCause {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::PoolAcquire,
         Self::Session,
         Self::OperationTimeout,
@@ -194,6 +198,7 @@ impl DrainFailureCause {
         Self::RefusedStatementTimeout,
         Self::RefusedOther,
         Self::MetadataUnderflow,
+        Self::RefusedAttemptRetired,
         Self::StatementUnknown,
         Self::CommitContended,
         Self::CommitUnknown,
@@ -211,6 +216,7 @@ impl DrainFailureCause {
             Self::RefusedStatementTimeout => "refused_statement_timeout",
             Self::RefusedOther => "refused_other",
             Self::MetadataUnderflow => "metadata_underflow",
+            Self::RefusedAttemptRetired => "refused_attempt_retired",
             Self::StatementUnknown => "unavailable_statement",
             Self::CommitContended => "commit_contended",
             Self::CommitUnknown => "commit_unknown",
@@ -227,6 +233,9 @@ pub fn statement_failure_cause(
 ) -> DrainFailureCause {
     if message == Some("DRAIN_METADATA_UNDERFLOW") {
         return DrainFailureCause::MetadataUnderflow;
+    }
+    if message == Some("DRAIN_ATTEMPT_RETIRED") {
+        return DrainFailureCause::RefusedAttemptRetired;
     }
     match code {
         None => DrainFailureCause::StatementUnknown,
@@ -256,7 +265,7 @@ pub fn commit_failure_cause(code: Option<&SqlState>) -> DrainFailureCause {
 /// A closed label for the authority procedure a drain statement calls. Matched against this
 /// crate's own static SQL, so the label set is the arms below.
 pub fn drain_procedure_label(sql: &str) -> &'static str {
-    const PROCEDURES: [(&str, &str); 14] = [
+    const PROCEDURES: [(&str, &str); 15] = [
         ("drain_reserve_v1", "reserve"),
         ("drain_policy_read_v1", "policy_read"),
         ("drain_check_ready_v2", "check_ready"),
@@ -265,7 +274,8 @@ pub fn drain_procedure_label(sql: &str) -> &'static str {
         ("drain_cleanup_claim_v2", "cleanup_claim"),
         ("drain_cleanup_unlease_v1", "cleanup_unlease"),
         ("drain_cleanup_release_v1", "cleanup_release"),
-        ("drain_cleanup_compact_v2", "cleanup_compact"),
+        ("drain_cleanup_compact_v3", "cleanup_compact"),
+        ("drain_retired_floor_advance_v1", "retired_floor_advance"),
         ("drain_policy_publish_v1", "policy_publish"),
         ("drain_policy_verify_v1", "policy_verify"),
         ("drain_policy_rotate_v1", "policy_rotate"),
@@ -868,6 +878,7 @@ mod tests {
     const PUT_CAPACITY: &str = "DISPATCH_RESERVE_PUT_CAPACITY_EXHAUSTED";
     const METADATA_CAPACITY: &str = "DRAIN_METADATA_CAPACITY";
     const UNDERFLOW: &str = "DRAIN_METADATA_UNDERFLOW";
+    const RETIRED: &str = "DRAIN_ATTEMPT_RETIRED";
 
     /// The `DrainError` each cause documents on its own doc comment.
     fn documented_error(cause: DrainFailureCause) -> DrainError {
@@ -883,13 +894,14 @@ mod tests {
             | C::RefusedMetadataCapacity
             | C::RefusedCapacityOther
             | C::RefusedStatementTimeout
+            | C::RefusedAttemptRetired
             | C::RefusedOther => DrainError::Refused,
             C::MetadataUnderflow => DrainError::MetadataUnderflow,
         }
     }
 
     #[test]
-    fn drain_failure_cause_labels_are_thirteen_distinct_exact_literals() {
+    fn drain_failure_cause_labels_are_fourteen_distinct_exact_literals() {
         let expected = [
             "unavailable_pool",
             "unavailable_session",
@@ -901,17 +913,18 @@ mod tests {
             "refused_statement_timeout",
             "refused_other",
             "metadata_underflow",
+            "refused_attempt_retired",
             "unavailable_statement",
             "commit_contended",
             "commit_unknown",
         ];
-        assert_eq!(DrainFailureCause::ALL.len(), 13);
+        assert_eq!(DrainFailureCause::ALL.len(), 14);
         let labels: Vec<&str> = DrainFailureCause::ALL.iter().map(|c| c.label()).collect();
         assert_eq!(labels, expected, "ALL order and labels are pinned");
         let mut unique = labels.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(unique.len(), 13, "labels must be distinct");
+        assert_eq!(unique.len(), 14, "labels must be distinct");
         // ALL covers every variant exactly once: no duplicates by value.
         for (i, a) in DrainFailureCause::ALL.iter().enumerate() {
             for b in &DrainFailureCause::ALL[i + 1..] {
@@ -931,7 +944,8 @@ mod tests {
         let capacity = SqlState::INSUFFICIENT_RESOURCES;
         let cancel = SqlState::QUERY_CANCELED;
         let raise = SqlState::RAISE_EXCEPTION;
-        let table: [(Option<&SqlState>, Option<&str>, DrainFailureCause); 16] = [
+        let not_in_state = SqlState::OBJECT_NOT_IN_PREREQUISITE_STATE;
+        let table: [(Option<&SqlState>, Option<&str>, DrainFailureCause); 19] = [
             // The underflow message wins over every code, including none and contention.
             (None, Some(UNDERFLOW), C::MetadataUnderflow),
             (Some(&raise), Some(UNDERFLOW), C::MetadataUnderflow),
@@ -970,6 +984,15 @@ mod tests {
                 C::RefusedStatementTimeout,
             ),
             (Some(&raise), Some(PUT_CAPACITY), C::RefusedOther),
+            // 0032's retired-attempt refusal is 55000 plus its exact message; any other 55000
+            // message is an ordinary refusal.
+            (Some(&not_in_state), Some(RETIRED), C::RefusedAttemptRetired),
+            (
+                Some(&not_in_state),
+                Some("DRAIN_ATTEMPT_RETIRED2"),
+                C::RefusedOther,
+            ),
+            (Some(&not_in_state), None, C::RefusedOther),
         ];
         for (code, message, expected) in table {
             assert_eq!(
@@ -1086,6 +1109,56 @@ mod tests {
         }
     }
 
+    /// The drain client no longer calls the compaction procedure migration 0032 dropped, and it does
+    /// call the replacement. Scanned over the SQL call sites (`"SELECT ...` literals), not the label
+    /// table, which may keep naming a retired procedure.
+    #[test]
+    fn the_drain_client_calls_compact_v3_and_not_the_dropped_compact_v2() {
+        let mut calls = Vec::new();
+        for source in [
+            include_str!("drain_policy.rs"),
+            include_str!("drain_spool.rs"),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for line in production.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") || !trimmed.contains("\"SELECT ") {
+                    continue;
+                }
+                calls.push(trimmed.to_string());
+            }
+        }
+        assert!(
+            calls
+                .iter()
+                .any(|sql| sql.contains("drain_cleanup_compact_v3($1)")),
+            "release_cleanup must call compact_v3 with the spool id only"
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|sql| !sql.contains("drain_cleanup_compact_v2")),
+            "migration 0032 dropped drain_cleanup_compact_v2"
+        );
+    }
+
+    /// This build's revision is the one migration 0032 installs, and the Rust enum agrees.
+    #[test]
+    fn the_client_revision_is_the_one_migration_0032_installs() {
+        assert_eq!(CELL_SCHEMA_REVISION, 32);
+        let migration =
+            include_str!("../migrations/0032_object_store_dispatch_drain_retired_floor.sql");
+        let flattened: String = migration
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flattened.contains("SELECT 32"),
+            "0032 must return 32 from cell_schema_revision_v1"
+        );
+    }
+
     #[test]
     fn drain_procedure_label_names_each_documented_procedure() {
         let table = [
@@ -1122,8 +1195,12 @@ mod tests {
                 "cleanup_release",
             ),
             (
-                "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)",
+                "SELECT object_store_retention.drain_cleanup_compact_v3($1)",
                 "cleanup_compact",
+            ),
+            (
+                "SELECT object_store_retention.drain_retired_floor_advance_v1($1,$2)",
+                "retired_floor_advance",
             ),
             (
                 "SELECT object_store_retention.drain_policy_publish_v1($1::text::jsonb,$2,$3)",

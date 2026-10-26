@@ -14,12 +14,16 @@ use crate::spool_writer::LinuxSpoolWriter;
 use crate::spool_writer::MAX_SPOOL_BODY_BYTES;
 use crate::spool_writer::SpoolWriteError;
 
+/// How far the retired floor trails the database clock (migration 0032's `900000`). It must cover
+/// the time from minting a write claim's `UUIDv7` attempt id in a replica to reserving it, at most
+/// the provider send timeout, plus clock skew between replicas and the database and an NTP step
+/// allowance (CR-041). A replica whose clock lags by more than the rest of this window has its
+/// reservations refused; the floor itself stays sound at any skew.
+pub const RETIRED_FLOOR_WINDOW_MS: i64 = 900_000;
+
 pub struct DrainCleanupIntent {
     spool: Uuid,
     fence: i64,
-    /// Database time of this intent's own claim. Compaction deletes a superseded marker only when
-    /// this claim, which precedes this intent's unlink, came after the marker's fence.
-    scanned_ms: i64,
     key: SpoolObjectKey,
 }
 
@@ -91,7 +95,6 @@ impl DrainClient {
         Ok(DrainCleanupIntent {
             spool,
             fence: r.try_get(3).map_err(|_error| DrainError::Invalid)?,
-            scanned_ms: r.try_get(4).map_err(|_error| DrainError::Invalid)?,
             key: SpoolObjectKey {
                 provider_boundary_id: r.try_get(0).map_err(|_error| DrainError::Invalid)?,
                 logical_request_id: r
@@ -138,17 +141,38 @@ impl DrainClient {
             &[&intent.spool, &intent.fence],
         )
         .await?;
-        // The release above has committed. A compaction lost to another replica is redone on the
-        // row's next re-scan, so it must not read as a release that committed nothing.
+        // The release above has committed. Compaction deletes the released row (migration 0032);
+        // one lost to another replica is redone on the row's next re-scan, so it must not read as
+        // a release that committed nothing.
         match self
             .query(
-                "SELECT object_store_retention.drain_cleanup_compact_v2($1,$2)",
-                &[&intent.spool, &intent.scanned_ms],
+                "SELECT object_store_retention.drain_cleanup_compact_v3($1)",
+                &[&intent.spool],
             )
             .await
         {
             Ok(_) | Err(DrainError::Contended) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Raise the cell's retired floor and return it (migration 0032). No custody row of the cell
+    /// is older than the floor and no first-seen reservation below it is accepted, so a spool body
+    /// whose `UUIDv7` attempt is older than the returned value has no row and never will.
+    pub async fn advance_retired_floor(
+        &self,
+        boundary: &str,
+        cell: &str,
+    ) -> Result<i64, DrainError> {
+        let rows = self
+            .query(
+                "SELECT object_store_retention.drain_retired_floor_advance_v1($1,$2)",
+                &[&boundary, &cell],
+            )
+            .await?;
+        rows.first()
+            .ok_or(DrainError::Invalid)?
+            .try_get(0)
+            .map_err(|_error| DrainError::Invalid)
     }
 }

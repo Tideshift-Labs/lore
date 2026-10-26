@@ -8,7 +8,8 @@
 //! Each platform drops cases and gains others: off Linux, `linux_live`'s whole
 //! module is compiled out and only `open_returns_unsupported_platform_off_linux`
 //! (below, top level) exists; on Linux the reverse holds and that case never
-//! compiles. **Here the counts happen to differ (1 off Linux, 12 on it), so a
+//! compiles. (WP-115 f2 added `reclaim_step_is_closed_off_linux_like_the_other_stubs` beside it,
+//! and five Linux-only reclaim cases.) **Here the counts differ (2 off Linux, many more on it), so a
 //! count IS discriminating for this file today** — but only by accident of the
 //! ratio. The general trap, and the reason the rule is "diff names, not counts",
 //! is a `cfg(unix)`/`cfg(not(unix))` PAIR: one case each way leaves the total
@@ -51,6 +52,23 @@ fn open_returns_unsupported_platform_off_linux() {
     assert!(writer_open_result.is_err());
 }
 
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn reclaim_step_is_closed_off_linux_like_the_other_stubs() {
+    // The stub is a unit struct, so it can be named without `open` (which is also closed).
+    let layout = SpoolLayout::new(if cfg!(windows) {
+        PathBuf::from(r"Z:\must-not-be-opened\spool-writer-secret")
+    } else {
+        PathBuf::from("/must-not-be-opened/spool-writer-secret")
+    })
+    .expect("absolute test root");
+    assert_eq!(
+        LinuxSpoolWriter
+            .reclaim_step(&layout, "boundary", 1_700_000_000_000, 64)
+            .expect_err("non-Linux must be closed"),
+        SpoolWriteError::UnsupportedPlatform
+    );
+}
 #[cfg(target_os = "linux")]
 mod linux_live {
     use std::fs;
@@ -542,5 +560,452 @@ mod linux_live {
                 .unwrap_or_else(|| panic!("{} must have a parent under the root", level.display()))
                 .to_path_buf();
         }
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // WP-115 f2: `reclaim_step` quarantines spool files below the retired floor.
+    //
+    // A body written for an attempt whose custody row no longer exists (a database restored to
+    // before it, or a late writer after the row was deleted) has no row left to unlink it. The
+    // retired floor says no custody row can have an attempt UUIDv7 older than the floor, so any
+    // file below it is residue. It is MOVED to `<root>/quarantine`, never unlinked.
+    // ---------------------------------------------------------------------------------------
+
+    const FLOOR_MS: u64 = 1_700_000_000_000 + 1_000;
+
+    /// A `UUIDv7` (version 7, variant 10) whose embedded unix-ms timestamp is `ms`.
+    fn v7_with_ms(ms: u64, salt: u8) -> String {
+        let mut bytes = [0_u8; 16];
+        bytes[..6].copy_from_slice(&ms.to_be_bytes()[2..]);
+        bytes[6] = 0x70;
+        bytes[7] = salt;
+        bytes[8] = 0x80;
+        bytes[9] = salt;
+        uuid::Uuid::from_bytes(bytes).to_string()
+    }
+
+    fn key_for(boundary: &str, attempt_id: &str) -> SpoolObjectKey {
+        SpoolObjectKey {
+            provider_boundary_id: boundary.into(),
+            logical_request_id: LOGICAL_ID.into(),
+            attempt_id: attempt_id.into(),
+            kind: SpoolObjectKind::Put,
+        }
+    }
+
+    /// Every regular file under `root`, by path.
+    fn all_files(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(directory: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(directory).expect("read directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else {
+                    let bytes = fs::read(&path).expect("read file");
+                    out.insert(path, bytes);
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        walk(root, &mut files);
+        files
+    }
+
+    fn sorted_contents(files: &std::collections::BTreeMap<PathBuf, Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut contents: Vec<Vec<u8>> = files.values().cloned().collect();
+        contents.sort();
+        contents
+    }
+
+    /// Run bounded steps until the traversal completes. Returns
+    /// `(calls, quarantined_files, quarantined_bytes, retained_unknown)`.
+    fn reclaim_all(
+        writer: &LinuxSpoolWriter,
+        layout: &SpoolLayout,
+        floor_ms: i64,
+        entries: u32,
+    ) -> (u32, u64, u64, u64) {
+        let (mut calls, mut files, mut bytes, mut unknown) = (0, 0, 0, 0);
+        loop {
+            let step = writer
+                .reclaim_step(layout, BOUNDARY, floor_ms, entries)
+                .expect("a bounded reclaim step");
+            calls += 1;
+            files += step.quarantined_files;
+            bytes += step.quarantined_bytes;
+            unknown += step.retained_unknown;
+            if step.completed {
+                return (calls, files, bytes, unknown);
+            }
+            assert!(calls < 500, "the reclaim traversal must complete");
+        }
+    }
+
+    /// A completed physical walk of the root, `(bytes, files)`.
+    fn physical_walk(writer: &LinuxSpoolWriter) -> (u64, u64) {
+        for _ in 0..64 {
+            if let Some(inventory) = writer.physical_usage(4096).expect("physical walk") {
+                return inventory;
+            }
+        }
+        panic!("the physical walk must complete");
+    }
+
+    fn floor() -> i64 {
+        i64::try_from(FLOOR_MS).expect("floor fits i64")
+    }
+
+    #[test]
+    fn reclaim_moves_exactly_the_below_floor_parseable_files_into_quarantine_and_unlinks_nothing() {
+        let root = test_root("reclaim-below-floor");
+        let layout = SpoolLayout::new(root.0.clone()).expect("layout");
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).expect("open writer");
+
+        // A: a below-floor blob. B: a below-floor `.part`. C: exactly at the floor. D: above it.
+        let a = v7_with_ms(FLOOR_MS - 10_000, 0xa1);
+        let b = v7_with_ms(FLOOR_MS - 5_000, 0xb2);
+        let c = v7_with_ms(FLOOR_MS, 0xc3);
+        let d = v7_with_ms(FLOOR_MS + 10_000, 0xd4);
+        let body_a = b"a-blob-for-an-attempt-whose-row-was-deleted";
+        let body_b = b"a-part-file-left-by-a-writer-that-died";
+        writer
+            .write_put_body(&layout, &key_for(BOUNDARY, &a), body_a)
+            .expect("place A");
+        let paths_b = layout
+            .derive_paths(&key_for(BOUNDARY, &b))
+            .expect("derive B");
+        fs::create_dir_all(paths_b.part_path().parent().expect("B parent")).expect("B dirs");
+        fs::write(paths_b.part_path(), body_b).expect("plant B");
+        writer
+            .write_put_body(&layout, &key_for(BOUNDARY, &c), b"at-the-floor")
+            .expect("place C");
+        let paths_d = layout
+            .derive_paths(&key_for(BOUNDARY, &d))
+            .expect("derive D");
+        writer
+            .write_put_body(&layout, &key_for(BOUNDARY, &d), b"above-the-floor")
+            .expect("place D");
+        // E: a name that is not an attempt UUID, inside a real request directory.
+        let unparseable = paths_d
+            .final_path()
+            .parent()
+            .expect("D parent")
+            .join("not-an-attempt.blob");
+        fs::write(&unparseable, b"unknown-name").expect("plant E");
+        // F: another boundary's file, below the floor. It is not this boundary's to move.
+        let other = v7_with_ms(FLOOR_MS - 20_000, 0xf5);
+        let other_key = key_for("some-other-boundary", &other);
+        let other_paths = layout.derive_paths(&other_key).expect("derive F");
+        writer
+            .write_put_body(&layout, &other_key, b"another-boundarys-body")
+            .expect("place F");
+
+        let before = all_files(&root.0);
+        let (walk_bytes_before, walk_files_before) = physical_walk(&writer);
+
+        // Control: a floor of zero selects nothing, so the floor is what drives the move.
+        let (_, files, bytes, _) = reclaim_all(&writer, &layout, 0, 3);
+        assert_eq!((files, bytes), (0, 0), "a zero floor moves nothing");
+        assert_eq!(all_files(&root.0), before);
+
+        let (calls, files, bytes, unknown) = reclaim_all(&writer, &layout, floor(), 3);
+        assert!(
+            calls > 1,
+            "a three entry budget needs several calls, so the cursor is kept across them ({calls})"
+        );
+        assert_eq!(files, 2, "exactly A and B are below the floor");
+        assert_eq!(bytes, (body_a.len() + body_b.len()) as u64);
+        assert_eq!(
+            unknown, 1,
+            "only the unparseable name is retained as unknown"
+        );
+
+        let paths_a = layout
+            .derive_paths(&key_for(BOUNDARY, &a))
+            .expect("derive A");
+        assert!(!paths_a.final_path().exists(), "A left its spool path");
+        assert!(!paths_b.part_path().exists(), "B left its spool path");
+        let quarantine = root.0.join("quarantine");
+        assert_eq!(
+            fs::read(quarantine.join(format!("{LOGICAL_ID}.{a}.blob"))).expect("A quarantined"),
+            body_a,
+            "A is byte equal in quarantine"
+        );
+        assert_eq!(
+            fs::read(quarantine.join(format!("{LOGICAL_ID}.{b}.part"))).expect("B quarantined"),
+            body_b,
+            "B keeps its .part suffix and is byte equal in quarantine"
+        );
+        assert_eq!(fs::read_dir(&quarantine).expect("quarantine").count(), 2);
+        let paths_c = layout
+            .derive_paths(&key_for(BOUNDARY, &c))
+            .expect("derive C");
+        for kept in [
+            paths_c.final_path(),
+            paths_d.final_path(),
+            unparseable.as_path(),
+            other_paths.final_path(),
+        ] {
+            assert!(kept.is_file(), "{} must stay in place", kept.display());
+        }
+
+        // Nothing was unlinked: the same bytes exist, only their paths moved.
+        let after = all_files(&root.0);
+        assert_eq!(
+            sorted_contents(&after),
+            sorted_contents(&before),
+            "a reclaim moves files, it never deletes or rewrites them"
+        );
+
+        // The next physical walk does not count the quarantine directory.
+        let (walk_bytes_after, walk_files_after) = physical_walk(&writer);
+        assert_eq!(walk_files_after, walk_files_before - 2);
+        assert_eq!(
+            walk_bytes_after,
+            walk_bytes_before - (body_a.len() + body_b.len()) as u64
+        );
+
+        // A second traversal finds nothing new, and still retains the unknown name.
+        let (_, files, _, unknown) = reclaim_all(&writer, &layout, floor(), 64);
+        assert_eq!((files, unknown), (0, 1));
+
+        // A late writer after the traversal: its below-floor body is found by the next one.
+        let late = v7_with_ms(FLOOR_MS - 1, 0xe6);
+        writer
+            .write_put_body(&layout, &key_for(BOUNDARY, &late), b"a-late-writers-body")
+            .expect("place the late body");
+        let (_, files, bytes, _) = reclaim_all(&writer, &layout, floor(), 64);
+        assert_eq!((files, bytes), (1, b"a-late-writers-body".len() as u64));
+        assert!(
+            quarantine
+                .join(format!("{LOGICAL_ID}.{late}.blob"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn a_path_that_does_not_rederive_exactly_is_kept_even_below_the_floor() {
+        let root = test_root("reclaim-rederive");
+        let layout = SpoolLayout::new(root.0.clone()).expect("layout");
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).expect("open writer");
+
+        // Control: a correctly placed below-floor file does move, so the walk really runs.
+        let placed = v7_with_ms(FLOOR_MS - 7_000, 0x11);
+        writer
+            .write_put_body(&layout, &key_for(BOUNDARY, &placed), b"placed")
+            .expect("place the control");
+
+        // The same shape one fan-out directory over: it parses, but the path is not the derived one.
+        let misplaced = v7_with_ms(FLOOR_MS - 8_000, 0x22);
+        let derived = layout
+            .derive_paths(&key_for(BOUNDARY, &misplaced))
+            .expect("derive");
+        let request_dir = derived.final_path().parent().expect("request directory");
+        let fanout_dir = request_dir.parent().expect("fan-out directory");
+        let put_dir = fanout_dir.parent().expect("put directory");
+        let fanout_name = fanout_dir.file_name().expect("fan-out name");
+        let other_fanout = if fanout_name == "00" { "01" } else { "00" };
+        let wrong_dir = put_dir
+            .join(other_fanout)
+            .join(request_dir.file_name().expect("request name"));
+        fs::create_dir_all(&wrong_dir).expect("wrong dirs");
+        let wrong = wrong_dir.join(format!("{misplaced}.blob"));
+        fs::write(&wrong, b"misplaced").expect("plant");
+
+        let (_, files, _, _) = reclaim_all(&writer, &layout, floor(), 64);
+        assert_eq!(files, 1, "only the correctly derived path is moved");
+        assert!(wrong.is_file(), "a path that does not re-derive is kept");
+        assert!(
+            root.0
+                .join("quarantine")
+                .join(format!("{LOGICAL_ID}.{placed}.blob"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn reclaim_on_a_root_with_no_spool_layout_yet_completes_with_nothing_to_do() {
+        let root = test_root("reclaim-empty");
+        let layout = SpoolLayout::new(root.0.clone()).expect("layout");
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).expect("open writer");
+        let (_, files, bytes, unknown) = reclaim_all(&writer, &layout, floor(), 8);
+        assert_eq!((files, bytes, unknown), (0, 0, 0));
+        assert!(
+            !root.0.join("quarantine").exists(),
+            "an empty reclaim creates no quarantine directory"
+        );
+    }
+
+    #[test]
+    fn the_physical_walk_skips_only_the_root_level_quarantine_directory() {
+        let root = test_root("walk-quarantine");
+        fs::create_dir(root.0.join("quarantine")).unwrap();
+        fs::write(root.0.join("quarantine").join("moved"), b"12345").unwrap();
+        fs::create_dir_all(root.0.join("elsewhere").join("quarantine")).unwrap();
+        fs::write(
+            root.0.join("elsewhere").join("quarantine").join("nested"),
+            b"ab",
+        )
+        .unwrap();
+        let layout = SpoolLayout::new(root.0.clone()).unwrap();
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).unwrap();
+        assert_eq!(
+            physical_walk(&writer),
+            (2, 1),
+            "the root-level quarantine is skipped; a nested directory of that name is not"
+        );
+    }
+
+    #[test]
+    fn two_writers_reclaiming_the_same_files_both_succeed_and_each_file_is_quarantined_once() {
+        const FILES: u8 = 24;
+        for round in 0..4 {
+            let root = test_root(&format!("reclaim-race-{round}"));
+            let layout = SpoolLayout::new(root.0.clone()).expect("layout");
+            let seed = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).expect("seed writer");
+            let mut expected = Vec::new();
+            for index in 0..FILES {
+                let attempt = v7_with_ms(FLOOR_MS - 1_000 - u64::from(index), index);
+                let body = format!("race-body-{index}").into_bytes();
+                seed.write_put_body(&layout, &key_for(BOUNDARY, &attempt), &body)
+                    .expect("place");
+                expected.push((attempt, body));
+            }
+            let barrier = std::sync::Barrier::new(2);
+            let outcomes: Vec<(u32, u64, u64, u64)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES)
+                                .expect("open a competing writer");
+                            barrier.wait();
+                            reclaim_all(&writer, &layout, floor(), 5)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().expect("a reclaim thread must not panic"))
+                    .collect()
+            });
+            let moved: u64 = outcomes.iter().map(|outcome| outcome.1).sum();
+            assert!(
+                moved >= u64::from(FILES),
+                "round {round}: every file is moved by one writer or the other ({moved})"
+            );
+            let quarantine = root.0.join("quarantine");
+            assert_eq!(
+                fs::read_dir(&quarantine).expect("quarantine").count(),
+                usize::from(FILES),
+                "round {round}: each file ends up quarantined exactly once"
+            );
+            for (attempt, body) in &expected {
+                assert_eq!(
+                    &fs::read(quarantine.join(format!("{LOGICAL_ID}.{attempt}.blob")))
+                        .expect("quarantined body"),
+                    body,
+                    "round {round}: bytes survive a raced move"
+                );
+                assert!(
+                    !layout
+                        .derive_paths(&key_for(BOUNDARY, attempt))
+                        .expect("derive")
+                        .final_path()
+                        .exists()
+                );
+            }
+        }
+    }
+
+    /// WP-115 f2 round 3: a per-entry failure no longer aborts the walk. A fan-out directory the
+    /// walk cannot open is skipped and counted, and the files elsewhere are still quarantined.
+    ///
+    /// `chmod 000` does not stop root, and the Linux tier's container runs as root. Then this case
+    /// reports NOT RUN on stderr and returns, because Rust has no skip; read the log for it.
+    #[test]
+    fn an_unreadable_fanout_directory_is_skipped_and_counted_and_the_rest_is_still_quarantined() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("reclaim-unreadable");
+        let layout = SpoolLayout::new(root.0.clone()).expect("layout");
+        let writer = LinuxSpoolWriter::open(&layout, MAX_SPOOL_BODY_BYTES).expect("open writer");
+        let first_key = key_for(BOUNDARY, &v7_with_ms(FLOOR_MS - 10_000, 0x31));
+        writer
+            .write_put_body(&layout, &first_key, b"readable-below-the-floor")
+            .expect("place the readable file");
+        let first_paths = layout.derive_paths(&first_key).expect("derive");
+        let first_fanout = first_paths
+            .final_path()
+            .parent()
+            .and_then(Path::parent)
+            .expect("fan-out directory")
+            .to_path_buf();
+
+        // A second request whose fan-out directory differs from the first's.
+        let (victim_key, victim_paths) = (0_u8..=255)
+            .find_map(|salt| {
+                let logical = v7_with_ms(FLOOR_MS - 20_000, salt);
+                let key = SpoolObjectKey {
+                    provider_boundary_id: BOUNDARY.into(),
+                    logical_request_id: logical,
+                    attempt_id: v7_with_ms(FLOOR_MS - 9_000, salt),
+                    kind: SpoolObjectKind::Put,
+                };
+                let paths = layout.derive_paths(&key).expect("derive");
+                let fanout = paths
+                    .final_path()
+                    .parent()
+                    .and_then(Path::parent)?
+                    .to_path_buf();
+                (fanout != first_fanout).then_some((key, paths))
+            })
+            .expect("a request in another fan-out directory");
+        writer
+            .write_put_body(&layout, &victim_key, b"behind-an-unreadable-directory")
+            .expect("place the victim file");
+        let victim_fanout = victim_paths
+            .final_path()
+            .parent()
+            .and_then(Path::parent)
+            .expect("victim fan-out")
+            .to_path_buf();
+
+        fs::set_permissions(&victim_fanout, fs::Permissions::from_mode(0o000)).expect("chmod");
+        if fs::read_dir(&victim_fanout).is_ok() {
+            fs::set_permissions(&victim_fanout, fs::Permissions::from_mode(0o700)).expect("chmod");
+            eprintln!(
+                "NOT RUN: an_unreadable_fanout_directory_is_skipped_and_counted: chmod 000 does \
+                 not stop this user (root)"
+            );
+            return;
+        }
+        let (mut skipped, mut moved) = (0_u64, 0_u64);
+        let mut finished = false;
+        for _ in 0..50 {
+            let step = writer
+                .reclaim_step(&layout, BOUNDARY, floor(), 16)
+                .expect("an unreadable entry does not fail the step");
+            skipped += step.skipped_entries;
+            moved += step.quarantined_files;
+            if step.completed {
+                finished = true;
+                break;
+            }
+        }
+        fs::set_permissions(&victim_fanout, fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(finished, "the walk completes past the unreadable directory");
+        assert_eq!(
+            skipped, 1,
+            "the unreadable directory is skipped and counted once"
+        );
+        assert_eq!(
+            moved, 1,
+            "the readable below-floor file is still quarantined"
+        );
+        assert!(!first_paths.final_path().exists());
+        assert!(
+            victim_paths.final_path().is_file(),
+            "the file behind the unreadable directory is untouched"
+        );
     }
 }

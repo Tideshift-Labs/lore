@@ -172,7 +172,11 @@ $windowsLibEnumerated = 190
 # pin is a FLOOR on the enumerated count plus "every enumerated case ran, and none was ignored",
 # which survives a sibling lane renaming or adding a case without going stale the same day.
 $offlineInventory = @(
-    [pscustomobject]@{ Package = 'lore-object-dispatch'; Kind = 'test'; Target = 'spool_writer'; MinimumCases = 11 },
+    [pscustomobject]@{ Package = 'lore-object-dispatch'; Kind = 'test'; Target = 'spool_writer'; MinimumCases = 19 },
+    # The in-crate Linux unit tests (purge_tests, reclaim_fault_tests) live in the lib, behind cfg(test)
+    # seams that an integration target cannot reach. 76 cases enumerate on Windows; Linux adds the
+    # in-crate spool_writer modules, so 84 is a floor the Windows count alone cannot meet.
+    [pscustomobject]@{ Package = 'lore-object-dispatch'; Kind = 'lib'; Target = 'object_dispatch_lib'; MinimumCases = 84 },
     [pscustomobject]@{ Package = 'lore-object-dispatch'; Kind = 'test'; Target = 'drain_policy'; MinimumCases = 5 },
     [pscustomobject]@{ Package = 'lore-fragment-provider'; Kind = 'test'; Target = 'seam_source_pins'; MinimumCases = 18 },
     [pscustomobject]@{
@@ -242,6 +246,9 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_pass_tests::cleanup_pass_sweeps_a_redundant_legacy_tombstone',
     'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_pass_tests::cleanup_pass_counts_a_full_stage_skip_and_reclaims_the_file_once_room_frees',
     'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_pass_tests::a_failing_tombstone_sweep_does_not_stop_the_stage_scan',
+    'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_pass_tests::cleanup_pass_advances_the_retired_floor_and_counts_no_skip',
+    'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_pass_tests::a_failing_retire_step_is_counted_and_does_not_fail_the_pass',
+    'store::immutable_store::fragment_write_behind::adapter_tests::cleanup_pass_tests::a_contended_floor_advance_is_counted_apart_and_retried_on_the_next_pass',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_precondition_adopts_actual_alternate_compression_manifest',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_remote_readback_keeps_staged_source_and_late_effect_barrier',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority',
@@ -624,11 +631,9 @@ try {
 
     # ---- offline targets -----------------------------------------------------------------
     foreach ($target in $offlineInventory) {
-        Write-Host "Running $($target.Package) --test $($target.Target) ..."
-        $run = Invoke-InContainer -Command @(
-            'cargo', 'test', '-p', $target.Package, '--test', $target.Target,
-            '--', '--test-threads=1'
-        )
+        Write-Host "Running $($target.Package) $($target.Kind) $($target.Target) ..."
+        $offlineSelector = if ($target.Kind -eq 'lib') { @('--lib') } else { @('--test', $target.Target) }
+        $run = Invoke-InContainer -Command (@('cargo', 'test', '-p', $target.Package) + $offlineSelector + @('--', '--test-threads=1'))
         # Echo cargo's output verbatim (here and at every test-run site below) so `test result:`
         # lines reach stdout; the Gate 0 receipt producers parse them.
         Write-Host $run.Output
@@ -640,6 +645,27 @@ try {
             -Note "floor $($target.MinimumCases)"
         if ($status -ne 'PASS') { Write-Warning "  FAIL`n$($run.Output)" } else { Write-Host "  PASS ($($counts.Passed)/$($target.Enumerated))" }
     }
+
+    # `chmod 000` does not stop root, and this container runs as root, so the unreadable-directory
+    # case reports NOT RUN in the pass above. Run that one case again, from the binary the pass
+    # above built, as uid/gid 65534 (CR-041 round 4). It must pass AND not print NOT RUN.
+    $unreadableCase = 'linux_live::an_unreadable_fanout_directory_is_skipped_and_counted_and_the_rest_is_still_quarantined'
+    Write-Host "Running $unreadableCase as uid 65534 ..."
+    $unprivileged = Invoke-InContainer -Command @(
+        'sh', '-c',
+        ('bin=$(cargo test -p lore-object-dispatch --test spool_writer --no-run --message-format=json 2>/dev/null ' +
+            '| grep -o ''"executable":"[^"]*spool_writer[^"]*"'' | head -1 | cut -d''"'' -f4) && ' +
+            'test -n "$bin" && setpriv --reuid=65534 --regid=65534 --clear-groups "$bin" --exact ' +
+            $unreadableCase + ' --nocapture')
+    )
+    Write-Host $unprivileged.Output
+    $unprivilegedCounts = Read-TestCounts -Output $unprivileged.Output
+    $unprivilegedStatus = if ($unprivileged.ExitCode -eq 0 -and $unprivilegedCounts.Passed -eq 1 -and
+        $unprivilegedCounts.Failed -eq 0 -and $unprivileged.Output -notmatch 'NOT RUN') { 'PASS' } else { 'FAIL' }
+    Add-Result -Target 'spool_writer' -Case "$unreadableCase (uid 65534)" -Status $unprivilegedStatus `
+        -Enumerated 1 -Ran $unprivilegedCounts.Ran -Passed $unprivilegedCounts.Passed -Failed $unprivilegedCounts.Failed `
+        -Note 'chmod 000 is only meaningful as non-root'
+    if ($unprivilegedStatus -ne 'PASS') { Write-Warning "  FAIL`n$($unprivileged.Output)" } else { Write-Host '  PASS (non-root)' }
 
     # The lib target's non-ignored cases, which is where durability_tests lives.
     Write-Host 'Running lore-postgres --lib ...'

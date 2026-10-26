@@ -270,3 +270,199 @@ async fn a_failing_tombstone_sweep_does_not_stop_the_stage_scan() {
     assert_eq!(custody_rows(&fixture, &hash, epoch).await, 0);
     assert_ledger_matches_custody(&fixture).await;
 }
+
+/// The drain policy's retired floor, straight from the cell database.
+async fn retired_floor(fixture: &Fixture) -> i64 {
+    fixture
+        .admin
+        .query_one(
+            "SELECT retired_floor_ms FROM object_store_retention.drain_policies WHERE cell='adapter-cell'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+async fn database_now_ms(fixture: &Fixture) -> i64 {
+    fixture
+        .admin
+        .query_one(
+            "SELECT floor(extract(epoch FROM clock_timestamp())*1000)::bigint",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Every pass advances the retired floor once (WP-115 f2): the floor is the spool's only way to
+/// notice a body whose custody row is gone, and nothing but this pass drives it.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn cleanup_pass_advances_the_retired_floor_and_counts_no_skip() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture
+        .admin
+        .execute(
+            "UPDATE object_store_retention.drain_policies SET retired_floor_ms=0 WHERE cell='adapter-cell'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let before = database_now_ms(&fixture).await;
+
+    fixture.handle.cleanup_pass(8).await.unwrap();
+
+    let floor = retired_floor(&fixture).await;
+    let after = database_now_ms(&fixture).await;
+    assert!(
+        (before - 900_000..=after - 900_000).contains(&floor),
+        "one pass raised the floor to now minus 15 minutes: {floor} not in [{}, {}]",
+        before - 900_000,
+        after - 900_000
+    );
+    assert_eq!(
+        fixture.handle.cleanup_skips().spool_retire_failed,
+        0,
+        "a clean advance counts no retire failure"
+    );
+    assert_eq!(
+        fixture.handle.cleanup_skips(),
+        CleanupSkips::default(),
+        "and no other skip either"
+    );
+    assert_ledger_matches_custody(&fixture).await;
+}
+
+/// The retire step fails (the floor update is refused by the database). The pass still returns
+/// `Ok`, counts one `spool_retire_failed` per pass, and keeps doing its other work; once the fault
+/// is removed the next pass advances the floor.
+///
+/// Fault: a BEFORE UPDATE trigger that refuses only a change to `retired_floor_ms`, so the rest of
+/// the pass's writes to the policy row are not affected.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn a_failing_retire_step_is_counted_and_does_not_fail_the_pass() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture
+        .admin
+        .batch_execute(
+            "UPDATE object_store_retention.drain_policies SET retired_floor_ms=0 WHERE cell='adapter-cell'; \
+             CREATE FUNCTION refuse_floor_advance() RETURNS trigger LANGUAGE plpgsql AS $$ \
+             BEGIN IF NEW.retired_floor_ms IS DISTINCT FROM OLD.retired_floor_ms THEN \
+               RAISE EXCEPTION 'TEST_REFUSE_FLOOR_ADVANCE'; END IF; RETURN NEW; END $$; \
+             CREATE TRIGGER refuse_floor_advance BEFORE UPDATE ON object_store_retention.drain_policies \
+               FOR EACH ROW EXECUTE FUNCTION refuse_floor_advance();",
+        )
+        .await
+        .unwrap();
+    let orphan_hash = [0xd3; 32];
+    let orphan = plant_orphan_file(&fixture, orphan_hash, 9002);
+
+    for pass in 1..=3_u64 {
+        fixture
+            .handle
+            .cleanup_pass(8)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("pass {pass} must not fail on a retire failure: {error:?}")
+            });
+        assert_eq!(
+            fixture.handle.cleanup_skips().spool_retire_failed,
+            pass,
+            "the retire step runs once per pass and each failure is counted"
+        );
+    }
+    assert_eq!(
+        retired_floor(&fixture).await,
+        0,
+        "the refused advance left the floor"
+    );
+    // The rest of the pass still ran: the scan reclaims the late stage file past the failure.
+    pass_until(&fixture, "the scan runs past a failing retire step", |_| {
+        !orphan.exists()
+    })
+    .await;
+    assert!(fixture.handle.cleanup_skips().spool_retire_failed >= 3);
+    assert_ledger_matches_custody(&fixture).await;
+
+    fixture
+        .admin
+        .batch_execute(
+            "DROP TRIGGER refuse_floor_advance ON object_store_retention.drain_policies; \
+             DROP FUNCTION refuse_floor_advance();",
+        )
+        .await
+        .unwrap();
+    let failures = fixture.handle.cleanup_skips().spool_retire_failed;
+    fixture.handle.cleanup_pass(8).await.unwrap();
+    assert!(
+        retired_floor(&fixture).await > 0,
+        "the retire step recovers"
+    );
+    assert_eq!(
+        fixture.handle.cleanup_skips().spool_retire_failed,
+        failures,
+        "a successful retire step counts nothing"
+    );
+}
+
+/// A contended advance is not a failure (WP-115 f2 round 4): the pass returns `Ok`, counts
+/// `spool_retire_contended`, leaves `spool_retire_failed` alone, and does not start the retire
+/// interval, so the very next pass tries again.
+///
+/// Contention: another session holds the policy row lock, so the advance's floor update waits out
+/// the dispatch pool's lock timeout and reports a lock failure.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn a_contended_floor_advance_is_counted_apart_and_retried_on_the_next_pass() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture
+        .admin
+        .execute(
+            "UPDATE object_store_retention.drain_policies SET retired_floor_ms=0 WHERE cell='adapter-cell'",
+            &[],
+        )
+        .await
+        .unwrap();
+    fixture
+        .admin
+        .batch_execute(
+            "BEGIN; SELECT 1 FROM object_store_retention.drain_policies WHERE cell='adapter-cell' FOR UPDATE;",
+        )
+        .await
+        .unwrap();
+
+    for pass in 1..=2_u64 {
+        fixture
+            .handle
+            .cleanup_pass(8)
+            .await
+            .unwrap_or_else(|error| panic!("pass {pass} must not fail on contention: {error:?}"));
+        let skips = fixture.handle.cleanup_skips();
+        assert_eq!(
+            skips.spool_retire_contended, pass,
+            "each contended pass counts once, so no retire interval was started: {skips:?}"
+        );
+        assert_eq!(
+            skips.spool_retire_failed, 0,
+            "contention is not a failure: {skips:?}"
+        );
+    }
+    assert_eq!(
+        retired_floor(&fixture).await,
+        0,
+        "the locked row kept the floor"
+    );
+
+    fixture.admin.batch_execute("ROLLBACK").await.unwrap();
+    fixture.handle.cleanup_pass(8).await.unwrap();
+    assert!(
+        retired_floor(&fixture).await > 0,
+        "the next pass after the lock cleared advances the floor"
+    );
+    let skips = fixture.handle.cleanup_skips();
+    assert_eq!(skips.spool_retire_contended, 2, "{skips:?}");
+    assert_eq!(skips.spool_retire_failed, 0, "{skips:?}");
+}
