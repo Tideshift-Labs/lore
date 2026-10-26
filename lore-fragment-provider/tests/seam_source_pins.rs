@@ -1061,12 +1061,14 @@ fn reservation_and_maintenance_handles_expose_only_their_approved_operations() {
             "FragmentDrainMaintenanceHandle",
             // `underflow_skips` and `quarantined_files` are read-only counters, not operations.
             // `retire_pass` (WP-115 f2) advances the retired floor and quarantines below-floor
-            // spool files; it moves files and never unlinks them.
+            // spool files; it moves files and never unlinks them. `retired_floor_age` reads the
+            // last floor that pass returned and touches no database state.
             vec![
                 "cleanup_pass",
                 "observe",
                 "quarantined_files",
                 "retire_pass",
+                "retired_floor_age",
                 "underflow_skips",
             ],
         ),

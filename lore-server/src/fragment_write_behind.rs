@@ -53,6 +53,9 @@ struct Instruments {
     stage_tombstones_kept: Gauge<u64>,
     /// Cleanup steps skipped, by `cause`.
     cleanup_skipped: Counter<u64>,
+    /// Seconds the spool retired floor trails this replica's clock (WP-115 f2). Recorded every
+    /// tick from memory, so it keeps growing while the floor is stuck or the database fails.
+    spool_retired_floor_age: Gauge<u64>,
     /// Each `observe()` step's duration, by `step` and `outcome`.
     observe_step_ms: Histogram<f64>,
 }
@@ -77,6 +80,9 @@ fn instruments() -> &'static Instruments {
                 .build(),
             cleanup_skipped: meter
                 .u64_counter(provider.scope_name("cleanup_skipped"))
+                .build(),
+            spool_retired_floor_age: meter
+                .u64_gauge(provider.scope_name("spool_retired_floor_age_seconds"))
                 .build(),
             observe_step_ms: provider.latency_histogram_ms("observe_step"),
         }
@@ -1022,6 +1028,9 @@ pub(crate) fn configure_fragment_write_behind(
                 &mut counted_skips,
                 handle.cleanup_skips(),
             );
+            instruments()
+                .spool_retired_floor_age
+                .record(handle.spool_retired_floor_age().as_secs(), &[]);
             if let Ok(Ok(observation)) = result {
                 instruments().pending.record(observation.pending_files, &[]);
                 instruments()

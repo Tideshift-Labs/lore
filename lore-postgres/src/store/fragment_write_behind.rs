@@ -666,7 +666,7 @@ struct CleanupState {
     scanner: Arc<std::sync::Mutex<StageFileScanner>>,
     scan: Option<tokio::task::JoinHandle<Result<Vec<StageFileCandidate>, StoreError>>>,
     purge: Option<tokio::task::JoinHandle<Result<StageCleanupIntent, StoreError>>>,
-    /// When the spool's retired-floor step last succeeded (WP-115 f2).
+    /// When the spool's retired-floor step last succeeded or lost a race (WP-115 f2).
     retired: Option<Instant>,
 }
 
@@ -1209,6 +1209,19 @@ impl FragmentWriteBehindHandle {
     /// Cleanup steps skipped since boot, by cause.
     pub fn cleanup_skips(&self) -> CleanupSkips {
         self.cleanup_skips.snapshot()
+    }
+
+    /// How far the cell's spool retired floor trails this replica's clock, from the last floor
+    /// the cleanup pass advanced to (WP-115 f2). In memory only; it reads no database state.
+    pub fn spool_retired_floor_age(&self) -> Duration {
+        self.maintenance.retired_floor_age()
+    }
+
+    /// Let the next cleanup pass run the retired-floor step at once, as if
+    /// [`SPOOL_RETIRE_INTERVAL`] had passed.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) async fn expire_spool_retire_interval(&self) {
+        self.cleanup.lock().await.retired = None;
     }
 
     pub fn activity(&self) -> WriteBehindActivity {
@@ -2168,20 +2181,25 @@ impl FragmentWriteBehindHandle {
             self.record_cleanup_activity(removed > 0);
         }
         // The spool deletes released custody rows, so only the retired floor finds a body a stale
-        // writer placed after its row was gone. Each successful step writes the policy row every
-        // reservation writes, so it runs at most once per interval; a failure retries next pass.
+        // writer placed after its row was gone. Each step writes the policy row every reservation
+        // writes, so it runs at most once per interval; a failure retries next pass.
         if state
             .retired
             .is_none_or(|at| at.elapsed() >= SPOOL_RETIRE_INTERVAL)
         {
             match self.maintenance.retire_pass().await {
-                // A lost race with a reservation on the policy row: routine, retried next pass,
-                // and counted apart so the failure alert does not see it.
+                // A lost race with a reservation on the policy row: routine, and counted apart so
+                // the failure alert does not see it. It waits the interval too: a lock timeout
+                // retried every pass would wait on the hottest row while holding cleanup. A floor
+                // that stays stuck shows as the retired-floor age.
                 Ok(outcome) if outcome.floor_contended => {
+                    state.retired = Some(Instant::now());
                     self.cleanup_skips
                         .spool_retire_contended
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    tracing::debug!("spool retired-floor advance lost a race; retrying next pass");
+                    tracing::debug!(
+                        "spool retired-floor advance lost a race; retrying after the interval"
+                    );
                 }
                 Ok(_) => state.retired = Some(Instant::now()),
                 Err(error) => CleanupSkipCounters::note(

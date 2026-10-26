@@ -144,84 +144,70 @@ fn commit_error(code: Option<&SqlState>) -> DrainError {
     }
 }
 
-/// Why one drain authority call failed, finer than [`DrainError`].
-///
-/// Observation only. [`DrainError`] stays the contract every caller matches on; this closed set is
-/// recorded on `lore.object_dispatch.drain_authority_failures{procedure, cause}` at the one place
-/// the SQLSTATE, the raised message and the failing step are still known
-/// ([`DrainClient::query_at`]). Every label is a static string from this enum, never SQL text,
-/// a message, or an identifier.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DrainFailureCause {
+/// Declares [`DrainFailureCause`], its [`DrainFailureCause::ALL`] and its
+/// [`DrainFailureCause::label`] from one list, so a variant cannot be declared without its label
+/// and its place in `ALL`.
+macro_rules! drain_failure_causes {
+    ($($(#[$doc:meta])* $variant:ident => $label:literal,)+) => {
+        /// Why one drain authority call failed, finer than [`DrainError`].
+        ///
+        /// Observation only. [`DrainError`] stays the contract every caller matches on; this closed
+        /// set is recorded on `lore.object_dispatch.drain_authority_failures{procedure, cause}` at
+        /// the one place the SQLSTATE, the raised message and the failing step are still known
+        /// ([`DrainClient::query_at`]). Every label is a static string from this enum, never SQL
+        /// text, a message, or an identifier.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum DrainFailureCause {
+            $($(#[$doc])* $variant,)+
+        }
+
+        impl DrainFailureCause {
+            /// Every variant once, in declaration order. Built by the same macro as the enum, so
+            /// it is complete by construction.
+            pub const ALL: [Self; [$(DrainFailureCause::$variant),+].len()] =
+                [$(Self::$variant),+];
+
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $label,)+
+                }
+            }
+        }
+    };
+}
+
+drain_failure_causes! {
     /// The dispatch pool gave no connection. Reaches the caller as `Unavailable`.
-    PoolAcquire,
+    PoolAcquire => "unavailable_pool",
     /// The leased session failed before the statement: client, `BEGIN`, or the timeout preamble.
     /// Reaches the caller as `Unavailable`.
-    Session,
+    Session => "unavailable_session",
     /// The whole bounded operation outlived the pool's operation timeout. `Unavailable`.
-    OperationTimeout,
+    OperationTimeout => "unavailable_timeout",
     /// The statement lost a race (40001, 55P03, 40P01). `Contended`.
-    Contended,
+    Contended => "contended",
     /// SQLSTATE 53000 raised as `DISPATCH_RESERVE_PUT_CAPACITY_EXHAUSTED` (migration 0013). `Refused`.
-    RefusedPutCapacity,
+    RefusedPutCapacity => "refused_put_capacity",
     /// SQLSTATE 53000 raised as `DRAIN_METADATA_CAPACITY` (migrations 0026/0030). `Refused`.
-    RefusedMetadataCapacity,
+    RefusedMetadataCapacity => "refused_metadata_capacity",
     /// SQLSTATE 53000 under any other message. `Refused`.
-    RefusedCapacityOther,
+    RefusedCapacityOther => "refused_capacity_other",
     /// SQLSTATE 57014: the `SET LOCAL statement_timeout` fired. `Refused`.
-    RefusedStatementTimeout,
+    RefusedStatementTimeout => "refused_statement_timeout",
     /// Any other SQLSTATE, a raised authority refusal included. `Refused`.
-    RefusedOther,
+    RefusedOther => "refused_other",
     /// `DRAIN_METADATA_UNDERFLOW`. `MetadataUnderflow`.
-    MetadataUnderflow,
+    MetadataUnderflow => "metadata_underflow",
     /// SQLSTATE 55000 raised as `DRAIN_ATTEMPT_RETIRED` (migration 0032): a first-seen attempt older
     /// than the cell's retired floor, which a replica whose clock lags the database produces.
     /// `Refused`.
-    RefusedAttemptRetired,
+    RefusedAttemptRetired => "refused_attempt_retired",
     /// The statement failed with no SQLSTATE, so its outcome is unknown. `Unavailable`.
-    StatementUnknown,
+    StatementUnknown => "unavailable_statement",
     /// `COMMIT` lost a race and rolled back. `Contended`.
-    CommitContended,
+    CommitContended => "commit_contended",
     /// `COMMIT` failed otherwise and may have committed. `Unavailable`.
-    CommitUnknown,
-}
-
-impl DrainFailureCause {
-    pub const ALL: [Self; 14] = [
-        Self::PoolAcquire,
-        Self::Session,
-        Self::OperationTimeout,
-        Self::Contended,
-        Self::RefusedPutCapacity,
-        Self::RefusedMetadataCapacity,
-        Self::RefusedCapacityOther,
-        Self::RefusedStatementTimeout,
-        Self::RefusedOther,
-        Self::MetadataUnderflow,
-        Self::RefusedAttemptRetired,
-        Self::StatementUnknown,
-        Self::CommitContended,
-        Self::CommitUnknown,
-    ];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::PoolAcquire => "unavailable_pool",
-            Self::Session => "unavailable_session",
-            Self::OperationTimeout => "unavailable_timeout",
-            Self::Contended => "contended",
-            Self::RefusedPutCapacity => "refused_put_capacity",
-            Self::RefusedMetadataCapacity => "refused_metadata_capacity",
-            Self::RefusedCapacityOther => "refused_capacity_other",
-            Self::RefusedStatementTimeout => "refused_statement_timeout",
-            Self::RefusedOther => "refused_other",
-            Self::MetadataUnderflow => "metadata_underflow",
-            Self::RefusedAttemptRetired => "refused_attempt_retired",
-            Self::StatementUnknown => "unavailable_statement",
-            Self::CommitContended => "commit_contended",
-            Self::CommitUnknown => "commit_unknown",
-        }
-    }
+    CommitUnknown => "commit_unknown",
 }
 
 /// The cause of a failed statement, from its SQLSTATE and raised message. Mirrors

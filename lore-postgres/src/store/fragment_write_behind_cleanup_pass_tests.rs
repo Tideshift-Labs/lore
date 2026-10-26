@@ -409,14 +409,16 @@ async fn a_failing_retire_step_is_counted_and_does_not_fail_the_pass() {
 }
 
 /// A contended advance is not a failure (WP-115 f2 round 4): the pass returns `Ok`, counts
-/// `spool_retire_contended`, leaves `spool_retire_failed` alone, and does not start the retire
-/// interval, so the very next pass tries again.
+/// `spool_retire_contended`, and leaves `spool_retire_failed` alone. It starts the retire interval
+/// like a successful step, so the next pass does not retry and does not wait on the locked row
+/// again; once the interval has passed the pass retries. A FAILED step still retries every pass
+/// (`a_failing_retire_step_is_counted_and_does_not_fail_the_pass`).
 ///
 /// Contention: another session holds the policy row lock, so the advance's floor update waits out
 /// the dispatch pool's lock timeout and reports a lock failure.
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
-async fn a_contended_floor_advance_is_counted_apart_and_retried_on_the_next_pass() {
+async fn a_contended_floor_advance_is_counted_apart_and_waits_the_retire_interval() {
     let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
     fixture
         .admin
@@ -434,35 +436,212 @@ async fn a_contended_floor_advance_is_counted_apart_and_retried_on_the_next_pass
         .await
         .unwrap();
 
-    for pass in 1..=2_u64 {
-        fixture
-            .handle
-            .cleanup_pass(8)
-            .await
-            .unwrap_or_else(|error| panic!("pass {pass} must not fail on contention: {error:?}"));
-        let skips = fixture.handle.cleanup_skips();
-        assert_eq!(
-            skips.spool_retire_contended, pass,
-            "each contended pass counts once, so no retire interval was started: {skips:?}"
-        );
-        assert_eq!(
-            skips.spool_retire_failed, 0,
-            "contention is not a failure: {skips:?}"
-        );
-    }
+    let started = std::time::Instant::now();
+    fixture
+        .handle
+        .cleanup_pass(8)
+        .await
+        .unwrap_or_else(|error| panic!("pass 1 must not fail on contention: {error:?}"));
+    let first = started.elapsed();
+    let skips = fixture.handle.cleanup_skips();
+    assert_eq!(skips.spool_retire_contended, 1, "{skips:?}");
+    assert_eq!(
+        skips.spool_retire_failed, 0,
+        "contention is not a failure: {skips:?}"
+    );
+
+    // Inside the interval the retire step is not tried, so it neither counts nor waits on the lock.
+    let started = std::time::Instant::now();
+    fixture
+        .handle
+        .cleanup_pass(8)
+        .await
+        .unwrap_or_else(|error| panic!("pass 2 must not fail on contention: {error:?}"));
+    let second = started.elapsed();
+    let skips = fixture.handle.cleanup_skips();
+    assert_eq!(
+        skips.spool_retire_contended, 1,
+        "an immediate pass does not retry: {skips:?}"
+    );
+    assert_eq!(skips.spool_retire_failed, 0, "{skips:?}");
+    assert!(
+        second * 2 < first,
+        "pass 2 must not wait on the locked row (pass 1 {first:?}, pass 2 {second:?})"
+    );
     assert_eq!(
         retired_floor(&fixture).await,
         0,
         "the locked row kept the floor"
     );
 
+    // Once the interval passes the step runs again and loses the race again.
+    fixture.handle.expire_spool_retire_interval().await;
+    fixture
+        .handle
+        .cleanup_pass(8)
+        .await
+        .unwrap_or_else(|error| panic!("pass 3 must not fail on contention: {error:?}"));
+    let skips = fixture.handle.cleanup_skips();
+    assert_eq!(
+        skips.spool_retire_contended, 2,
+        "an expired interval retries: {skips:?}"
+    );
+    assert_eq!(skips.spool_retire_failed, 0, "{skips:?}");
+
     fixture.admin.batch_execute("ROLLBACK").await.unwrap();
+    fixture.handle.expire_spool_retire_interval().await;
     fixture.handle.cleanup_pass(8).await.unwrap();
     assert!(
         retired_floor(&fixture).await > 0,
-        "the next pass after the lock cleared advances the floor"
+        "the next pass after the lock cleared and the interval passed advances the floor"
     );
     let skips = fixture.handle.cleanup_skips();
     assert_eq!(skips.spool_retire_contended, 2, "{skips:?}");
     assert_eq!(skips.spool_retire_failed, 0, "{skips:?}");
+}
+
+/// The retired-floor age (WP-115 f2) reads in-memory state only. Before any advance it is the
+/// handle's age plus the 15 minute window the floor always trails by. After an advance it is the
+/// distance from the last floor to the clock. A later contended pass cannot reset or lower it: the
+/// age keeps counting from the last good floor.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn the_retired_floor_age_counts_from_the_last_good_floor_through_a_contended_pass() {
+    const WINDOW: Duration = Duration::from_secs(900);
+    const SLACK: Duration = Duration::from_secs(30);
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture
+        .admin
+        .execute(
+            "UPDATE object_store_retention.drain_policies SET retired_floor_ms=0 WHERE cell='adapter-cell'",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    let unseen = fixture.handle.spool_retired_floor_age();
+    assert!(
+        (WINDOW..WINDOW + SLACK).contains(&unseen),
+        "before any advance the age is the window plus the handle's age: {unseen:?}"
+    );
+
+    let before = database_now_ms(&fixture).await;
+    fixture.handle.cleanup_pass(8).await.unwrap();
+    let after = database_now_ms(&fixture).await;
+    let floor = retired_floor(&fixture).await;
+    assert!(floor > 0, "the pass advanced the floor");
+    let advanced = fixture.handle.spool_retired_floor_age();
+    // The floor is (database now - 15 min) at the advance; the age is read afterwards, so it lies
+    // between the window and the window plus the time the pass and the clock reads took.
+    let elapsed = Duration::from_millis(u64::try_from(after - before).unwrap_or(0));
+    assert!(
+        advanced >= WINDOW - SLACK && advanced <= WINDOW + elapsed + SLACK,
+        "after an advance the age is about the window: {advanced:?} (db clock moved {elapsed:?})"
+    );
+
+    // A contended pass leaves the floor alone, so the age must keep growing from it.
+    fixture
+        .admin
+        .batch_execute(
+            "BEGIN; SELECT 1 FROM object_store_retention.drain_policies WHERE cell='adapter-cell' FOR UPDATE;",
+        )
+        .await
+        .unwrap();
+    fixture.handle.expire_spool_retire_interval().await;
+    fixture.handle.cleanup_pass(8).await.unwrap();
+    let skips = fixture.handle.cleanup_skips();
+    assert_eq!(skips.spool_retire_contended, 1, "{skips:?}");
+    let contended = fixture.handle.spool_retired_floor_age();
+    assert!(
+        contended >= advanced,
+        "a contended pass does not reset or lower the age: {advanced:?} then {contended:?}"
+    );
+    assert!(
+        contended <= WINDOW + elapsed + SLACK + Duration::from_secs(20),
+        "and it is still computed from the last good floor: {contended:?}"
+    );
+    assert_eq!(
+        retired_floor(&fixture).await,
+        floor,
+        "the locked row kept the floor"
+    );
+    fixture.admin.batch_execute("ROLLBACK").await.unwrap();
+}
+
+/// A live custody row pins the retired floor (WP-115 f2): the advance raises the floor to the
+/// oldest custody row's attempt time, not to `now - 15 min`, so the floor age is the row's age and
+/// a spool row left open for hours reads past the 1 hour alert threshold. The advance is not a
+/// failure and not contended.
+///
+/// The row is planted by an admin INSERT shaped like the forward-upgrade suite's seed rows. It is
+/// deleted before the end. The stage ledger the assertions check is a different table, so the
+/// planted row does not disturb `assert_ledger_matches_custody`.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn a_live_custody_row_pins_the_retired_floor_to_its_attempt_time() {
+    const ROW_AGE_MS: i64 = 7_200_000;
+    const SLACK: Duration = Duration::from_secs(60);
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    let attempt_ms = database_now_ms(&fixture).await - ROW_AGE_MS;
+    // A UUIDv7: 48 bits of unix ms, version 7, variant 10xx.
+    let hex = format!("{attempt_ms:012x}");
+    let attempt = format!("{}-{}-7abc-8def-0123456789ab", &hex[..8], &hex[8..]);
+    fixture
+        .admin
+        .execute(
+            "UPDATE object_store_retention.drain_policies SET retired_floor_ms=$1 WHERE cell='adapter-cell'",
+            &[&(attempt_ms - 3_600_000)],
+        )
+        .await
+        .unwrap();
+    let planted = fixture
+        .admin
+        .execute(
+            "INSERT INTO object_store_retention.drain_spool_custody \
+             (spool_id, boundary, cell, service, logical_id, attempt_id, descriptor, canonical, \
+              digest, cleanup_not_before, state, cleanup_fence, metadata_bytes) \
+             SELECT gen_random_uuid(), p.boundary, p.cell, 'pinned-service', gen_random_uuid(), \
+                    $1::text::uuid, \
+                    jsonb_build_object('policy_revision', p.revision, 'policy_digest', encode(p.digest,'hex')), \
+                    decode('aa','hex'), decode(repeat('11',32),'hex'), 4102444800000, 1, 0, 16384 \
+             FROM object_store_retention.drain_policies p WHERE p.cell='adapter-cell'",
+            &[&attempt],
+        )
+        .await
+        .unwrap();
+    assert_eq!(planted, 1, "the custody row was planted");
+
+    fixture.handle.cleanup_pass(8).await.unwrap();
+
+    let floor = retired_floor(&fixture).await;
+    let now = database_now_ms(&fixture).await;
+    assert_eq!(
+        floor,
+        attempt_ms,
+        "the floor stops at the oldest custody row's attempt time (now minus 15 minutes would be {})",
+        now - 900_000
+    );
+    let skips = fixture.handle.cleanup_skips();
+    assert_eq!(skips.spool_retire_failed, 0, "{skips:?}");
+    assert_eq!(skips.spool_retire_contended, 0, "{skips:?}");
+    let age = fixture.handle.spool_retired_floor_age();
+    let expected = Duration::from_millis(u64::try_from(ROW_AGE_MS).unwrap_or(0));
+    assert!(
+        age >= expected.saturating_sub(SLACK) && age <= expected + SLACK,
+        "the age is about the row's age ({expected:?}): {age:?}"
+    );
+    assert!(
+        age > Duration::from_secs(3600),
+        "well above the 1 hour alert threshold: {age:?}"
+    );
+
+    fixture
+        .admin
+        .execute(
+            "DELETE FROM object_store_retention.drain_spool_custody WHERE service='pinned-service'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_ledger_matches_custody(&fixture).await;
 }

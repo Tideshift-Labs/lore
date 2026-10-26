@@ -1670,3 +1670,31 @@ fn capacity_unavailable_millis_is_none_with_no_run_and_grows_with_one() {
         "the reported age should reflect the recorded start of the run, got {reported}ms"
     );
 }
+
+/// The retired-floor age is read from memory, so it must be recorded on EVERY observer tick. If it
+/// moved inside the good-observation branch it would freeze exactly when the database fails and
+/// the floor cannot advance, which is when the alert needs it to grow. Source pin: the `OTel` gauge
+/// cannot be read back in a unit test (process-global meter provider).
+#[test]
+fn the_retired_floor_age_gauge_is_recorded_outside_the_good_observation_branch() {
+    const SOURCE: &str = include_str!("../../src/fragment_write_behind.rs");
+    let record = SOURCE
+        .find("handle.spool_retired_floor_age().as_secs()")
+        .expect("the observer records the retired-floor age");
+    assert_eq!(
+        SOURCE.matches("handle.spool_retired_floor_age()").count(),
+        1,
+        "exactly one recording site"
+    );
+    let skips = SOURCE
+        .find("handle.cleanup_skips(),\n            );")
+        .expect("the per-tick cleanup skip recording is present");
+    let good_branch = SOURCE
+        .find("if let Ok(Ok(observation)) = result {")
+        .expect("the good-observation branch is present");
+    assert!(
+        skips < record && record < good_branch,
+        "the age gauge is recorded every tick, after the skip counters and before the \
+         good-observation branch (skips {skips}, record {record}, branch {good_branch})"
+    );
+}

@@ -327,7 +327,15 @@ pub struct FragmentDrainMaintenanceHandle {
     underflow_skips: std::sync::atomic::AtomicU64,
     /// Spool bodies the retired-floor walk moved to quarantine (WP-115 f2).
     quarantined_files: std::sync::atomic::AtomicU64,
+    /// The last retired floor an advance returned, in database unix ms; [`FLOOR_UNSEEN`] until
+    /// the first one. Read by [`Self::retired_floor_age`].
+    retired_floor_ms: std::sync::atomic::AtomicI64,
+    /// When the handle was built, for the age before the first advance.
+    created: std::time::Instant,
 }
+
+/// [`FragmentDrainMaintenanceHandle::retired_floor_ms`] before any advance returned.
+const FLOOR_UNSEEN: i64 = i64::MIN;
 
 /// Entries one retired-floor walk step visits. The PUT tree holds at most one body per live
 /// custody row plus residue, so a few steps cover a full cell.
@@ -498,6 +506,32 @@ impl FragmentDrainMaintenanceHandle {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How far the cell's retired floor trails this replica's clock, from the last floor an
+    /// advance returned (WP-115 f2). It reads no database state. If the floor stops advancing,
+    /// this grows, and bodies a stale writer places later are not quarantined.
+    ///
+    /// Before the first advance returns, it is the time since the handle was built plus the window
+    /// the floor always trails by, so a replica whose every advance fails still shows a growing age.
+    /// So a replica that restarts every 45 minutes or sooner never reads an hour this way.
+    pub fn retired_floor_age(&self) -> Duration {
+        let floor_ms = self
+            .retired_floor_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if floor_ms == FLOOR_UNSEEN {
+            let window = Duration::from_millis(
+                lore_object_dispatch::drain_spool::RETIRED_FLOOR_WINDOW_MS.unsigned_abs(),
+            );
+            return self.created.elapsed().saturating_add(window);
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                i64::try_from(since.as_millis()).unwrap_or(i64::MAX)
+            });
+        // A floor ahead of this clock (skew) reads as zero, never as a negative age.
+        Duration::from_millis(u64::try_from(now_ms.saturating_sub(floor_ms)).unwrap_or(0))
+    }
+
     /// Raise the cell's retired floor, then walk one bounded step of the spool's PUT tree and move
     /// every body older than the floor into quarantine (migration 0032, CR-041).
     ///
@@ -519,6 +553,9 @@ impl FragmentDrainMaintenanceHandle {
             }
             Err(error) => return Err(FragmentProviderError::DrainAuthority(error)),
         };
+        // The floor never lowers, so keep the highest one seen.
+        self.retired_floor_ms
+            .fetch_max(floor_ms, std::sync::atomic::Ordering::Relaxed);
         let layout = self.layout.clone();
         let writer = self.writer.clone();
         let boundary = self.boundary.clone();
@@ -713,6 +750,8 @@ impl FragmentProviderEntry {
             observation_io: tokio::sync::Mutex::new(SpoolObservationState::default()),
             underflow_skips: std::sync::atomic::AtomicU64::new(0),
             quarantined_files: std::sync::atomic::AtomicU64::new(0),
+            retired_floor_ms: std::sync::atomic::AtomicI64::new(FLOOR_UNSEEN),
+            created: std::time::Instant::now(),
         };
         let mut capability = self
             .drain_capability(root)
