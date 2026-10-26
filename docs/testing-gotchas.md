@@ -174,6 +174,14 @@ Durable, recurring testing lessons grouped by topic.
   state list and asserting it loses the partial index. `pg_prepared_statements.custom_plans` /
   `generic_plans` (PG14+) observes which plan ran, with an `auto` session as the control. Worked
   example: `lore-postgres/tests/statement_cache_live.rs`.
+- **Stage-custody ledger tests: assert the ledger against the rows, and build both tombstone kinds
+  on purpose.** Symptom: a counter test passes while a metadata row leaks or is refunded twice.
+  Do: call `tests/common/stage_invariant.rs::assert_stage_ledger_matches_custody(url)` (usage
+  `metadata_rows/bytes`, `live_*` vs the custody table, read straight from SQL) after every stage
+  case. A tombstone that must stay needs the head still at the epoch with no epochs row (`begin_stage`,
+  `withdraw_stage`, cleanup). A deletable one needs a PURGED staged epoch (stage, `commit_staged`,
+  promote, cleanup). A guardrail needs a tiny `max_metadata_rows`
+  (`stage_policy::initialize_with_limits`). Reference: `lore-postgres/tests/fragment_stage_tombstones.rs`.
 - **A pool test that holds every slot and then checks out once more hangs forever.** The default
   `deadpool` pool has no wait timeout, so the test sits at 0 CPU, not failing. Drop the held guards
   first. Kill a hung live test by its test-binary name only; `Stop-Process` on every `cargo` also

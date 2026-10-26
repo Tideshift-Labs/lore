@@ -20,6 +20,8 @@ use crate::domain::fragments::FragmentDrainCandidate;
 use crate::domain::fragments::FragmentDrainCandidateBatch;
 use crate::domain::fragments::FragmentStageObserver;
 use crate::domain::fragments::StageCleanupIntent;
+use crate::domain::fragments::coordinator::is_stage_capacity_exhausted;
+use crate::domain::fragments::coordinator::is_stage_custody_key_taken;
 use crate::domain::fragments::states::FragmentLifecycleState;
 use crate::store::write_behind::CapacityVerdict;
 use crate::store::write_behind::cleanup::StageFileCandidate;
@@ -424,14 +426,15 @@ mod source_tests {
                 purged.metadata_bytes,
                 purged.metadata_rows
             ),
-            (0, 0, 256, 1)
+            (0, 0, 0, 0),
+            "an orphan has no head and no epoch row, so its release deletes the custody row"
         );
         std::fs::write(&temporary, b"late residue").unwrap();
         let retry = coordinator
             .begin_stage_cleanup(&hash, 9000)
             .await
             .unwrap()
-            .expect("compact tombstone retains cleanup authority");
+            .expect("the orphan branch re-authorizes a late residue file with a fresh charge");
         stage.purge_placement(retry.target()).unwrap();
         coordinator.commit_stage_cleanup(&retry).await.unwrap();
         coordinator.commit_stage_cleanup(&retry).await.unwrap();
@@ -443,7 +446,8 @@ mod source_tests {
                 replay.metadata_bytes,
                 replay.metadata_rows
             ),
-            (0, 0, 256, 1)
+            (0, 0, 0, 0),
+            "the fresh charge is given back by the release and a replay changes nothing"
         );
         assert!(!temporary.exists());
         std::fs::remove_dir_all(root).unwrap();
@@ -657,6 +661,8 @@ mod source_tests {
 
 struct CleanupState {
     cursor: Option<(Vec<u8>, i64)>,
+    /// Where the tombstone sweep resumes (WP-115 f1).
+    tombstone_cursor: Option<(Vec<u8>, i64)>,
     scanner: Arc<std::sync::Mutex<StageFileScanner>>,
     scan: Option<tokio::task::JoinHandle<Result<Vec<StageFileCandidate>, StoreError>>>,
     purge: Option<tokio::task::JoinHandle<Result<StageCleanupIntent, StoreError>>>,
@@ -773,6 +779,8 @@ pub struct WriteBehindObservation {
     pub spool_files: u64,
     pub oldest_pending_age: Option<Duration>,
     pub cleanup_backlog: u64,
+    /// Released stage custody rows still kept as cleanup authority.
+    pub stage_tombstones_kept: u64,
     pub roots_usable: bool,
     pub capacity_available: bool,
     /// Why `capacity_available` holds or fails. Observability only; the
@@ -1054,6 +1062,49 @@ pub struct FragmentWriteBehindHandle {
     inventory: Mutex<PhysicalInventory>,
     activity: std::sync::Mutex<WriteBehindActivity>,
     observe_trace: std::sync::Mutex<ObserveTrace>,
+    cleanup_skips: CleanupSkipCounters,
+}
+
+/// Cleanup steps a pass skipped and continued past, cumulative since boot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CleanupSkips {
+    /// Late stage files left for a later pass: reclaiming one needs a fresh
+    /// charge and the stage ledger was full.
+    pub stage_capacity: u64,
+    /// Late stage files another replica reserved first; it owns the cleanup.
+    pub stage_key_taken: u64,
+    /// Tombstone sweep batches that failed; the pass went on to the scan and
+    /// the spool cleanup.
+    pub tombstone_sweep_failed: u64,
+}
+
+#[derive(Default)]
+struct CleanupSkipCounters {
+    stage_capacity: std::sync::atomic::AtomicU64,
+    stage_key_taken: std::sync::atomic::AtomicU64,
+    tombstone_sweep_failed: std::sync::atomic::AtomicU64,
+}
+
+impl CleanupSkipCounters {
+    /// Count one skip. Log the first and then each power of two, so a
+    /// persistent cause stays visible without one line per pass.
+    fn note(counter: &std::sync::atomic::AtomicU64, cause: &'static str, detail: &str) {
+        let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if count.is_power_of_two() {
+            tracing::warn!(cause, count, detail, "write-behind cleanup skipped a step");
+        }
+    }
+
+    fn snapshot(&self) -> CleanupSkips {
+        let read = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        CleanupSkips {
+            stage_capacity: read(&self.stage_capacity),
+            stage_key_taken: read(&self.stage_key_taken),
+            tombstone_sweep_failed: read(&self.tombstone_sweep_failed),
+        }
+    }
 }
 
 impl PostgresImmutableStore {
@@ -1118,6 +1169,7 @@ impl PostgresImmutableStore {
             drain_concurrency: std::sync::atomic::AtomicUsize::new(drain_concurrency),
             cleanup: Mutex::new(CleanupState {
                 cursor: None,
+                tombstone_cursor: None,
                 scanner,
                 scan: None,
                 purge: None,
@@ -1125,6 +1177,7 @@ impl PostgresImmutableStore {
             inventory: Mutex::new(PhysicalInventory::default()),
             activity: std::sync::Mutex::new(WriteBehindActivity::default()),
             observe_trace: std::sync::Mutex::new(ObserveTrace::default()),
+            cleanup_skips: CleanupSkipCounters::default(),
         }))
     }
 }
@@ -1138,6 +1191,11 @@ struct VerifiedStagedBody {
 }
 
 impl FragmentWriteBehindHandle {
+    /// Cleanup steps skipped since boot, by cause.
+    pub fn cleanup_skips(&self) -> CleanupSkips {
+        self.cleanup_skips.snapshot()
+    }
+
     pub fn activity(&self) -> WriteBehindActivity {
         *self
             .activity
@@ -1362,6 +1420,7 @@ impl FragmentWriteBehindHandle {
                 .and_then(|t| SystemTime::now().duration_since(t).ok()),
             cleanup_backlog: positive(observation.cleanup_backlog)?
                 .saturating_add(spool.cleanup_backlog),
+            stage_tombstones_kept: positive(observation.kept_tombstones)?,
             roots_usable: self.stage.snapshot().root_available && spool.roots_usable,
             capacity_available,
             capacity,
@@ -2000,6 +2059,29 @@ impl FragmentWriteBehindHandle {
                 self.record_cleanup_activity(true);
             }
         }
+        // Database-only: deleting a redundant tombstone moves no file, so it is
+        // not counted as cleanup activity. A failed batch must not stop the
+        // scan and spool cleanup below; it is counted and logged, and the
+        // cursor stays so the next pass retries it. A database outage still
+        // fails the steps around it.
+        match self
+            .coordinator
+            .compact_stage_tombstones(
+                state
+                    .tombstone_cursor
+                    .as_ref()
+                    .map(|(h, e)| (h.as_slice(), *e)),
+                batch,
+            )
+            .await
+        {
+            Ok(sweep) => state.tombstone_cursor = sweep.last,
+            Err(error) => CleanupSkipCounters::note(
+                &self.cleanup_skips.tombstone_sweep_failed,
+                "tombstone_sweep_failed",
+                &error.to_string(),
+            ),
+        }
         if state.scan.is_none() {
             let scanner = state.scanner.clone();
             let stage = self.stage.clone();
@@ -2026,12 +2108,34 @@ impl FragmentWriteBehindHandle {
             Err(_) => return Err(StoreError::from(SlowDown)),
         };
         for file in files {
-            if let Some(intent) = self
+            // Reclaiming a late file charges the ledger first. When the stage
+            // is full, skip it until a release frees room rather than end the
+            // pass before the spool cleanup below. A file another replica
+            // reserved first is that replica's to clean.
+            let intent = match self
                 .coordinator
                 .begin_stage_cleanup(&file.hash, file.epoch)
                 .await
-                .map_err(domain_store_err)?
             {
+                Err(error) if is_stage_capacity_exhausted(&error) => {
+                    CleanupSkipCounters::note(
+                        &self.cleanup_skips.stage_capacity,
+                        "stage_capacity",
+                        &error.to_string(),
+                    );
+                    continue;
+                }
+                Err(error) if is_stage_custody_key_taken(&error) => {
+                    CleanupSkipCounters::note(
+                        &self.cleanup_skips.stage_key_taken,
+                        "stage_key_taken",
+                        &error.to_string(),
+                    );
+                    continue;
+                }
+                result => result.map_err(domain_store_err)?,
+            };
+            if let Some(intent) = intent {
                 self.purge_stage(&mut state, intent, Some(file)).await?;
                 cleaned += 1;
                 self.record_cleanup_activity(true);

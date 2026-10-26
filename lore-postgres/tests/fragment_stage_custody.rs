@@ -1,6 +1,8 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 
+#[path = "common/stage_invariant.rs"]
+mod stage_invariant;
 #[path = "common/stage_policy.rs"]
 mod stage_policy;
 
@@ -58,6 +60,7 @@ async fn race_capacity(bytes: i64, files: i64) {
         "the refused reservation charged nothing"
     );
     assert_eq!((usage.metadata_bytes, usage.metadata_rows), (1024, 1));
+    stage_invariant::assert_stage_ledger_matches_custody(&url).await;
 }
 
 #[tokio::test]
@@ -147,6 +150,7 @@ async fn already_readable_replay_does_not_reserve_capacity_twice() {
         (128, 1),
         "a replay charges nothing, so the counters do not move"
     );
+    stage_invariant::assert_stage_ledger_matches_custody(&url).await;
 }
 
 /// Row 78: the charge counters add exactly what each reservation adds to the
@@ -192,6 +196,14 @@ async fn stage_charge_counters_only_grow() {
         (192, 2),
         "a release never lowers the counters"
     );
+    // The withdrawn epoch is still the head's epoch and has no epochs row, so a
+    // late file for it has no other cleanup authority: its row stays as a tombstone.
+    assert_eq!(
+        (released.metadata_bytes, released.metadata_rows),
+        (1024 + 256, 2)
+    );
+    assert_eq!(released.kept_tombstones, 1);
+    stage_invariant::assert_stage_ledger_matches_custody(&url).await;
 }
 
 #[tokio::test]

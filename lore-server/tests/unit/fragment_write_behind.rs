@@ -123,6 +123,7 @@ fn per_item_activity_keeps_a_long_batch_healthy_but_cannot_hide_a_blocked_operat
                 spool_files: 1,
                 oldest_pending_age: None,
                 cleanup_backlog: 4,
+                stage_tombstones_kept: 0,
                 roots_usable: true,
                 capacity_available: true,
                 capacity: CapacityEvidence::default(),
@@ -199,6 +200,7 @@ fn stale_observation_dead_worker_and_blocked_backlog_each_disable_admission() {
         spool_files: 1,
         oldest_pending_age: None,
         cleanup_backlog: 0,
+        stage_tombstones_kept: 0,
         roots_usable: true,
         capacity_available: true,
         capacity: CapacityEvidence::default(),
@@ -330,6 +332,90 @@ fn the_cleanup_not_progressing_gauge_follows_the_degraded_field() {
     // Only that name sets it: another degraded condition leaves it at 0.
     record_cleanup_not_progressing(&gauge, &["some_other_condition"]);
     assert_eq!(value(), 0);
+}
+
+/// Each cleanup skip cause adds its growth under its own `cause` label, so the
+/// counter's total equals the handle's cumulative count (WP-115 f1).
+#[test]
+fn the_cleanup_skipped_counter_adds_each_causes_growth_by_label() {
+    use std::collections::BTreeMap;
+
+    use lore_postgres::store::fragment_write_behind::CleanupSkips;
+    use opentelemetry::metrics::MeterProvider as _;
+    use opentelemetry_sdk::metrics::InMemoryMetricExporter;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::AggregatedMetrics;
+    use opentelemetry_sdk::metrics::data::MetricData;
+
+    let exporter = InMemoryMetricExporter::default();
+    let provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    let counter = provider
+        .meter("test")
+        .u64_counter("cleanup_skipped")
+        .build();
+    let values = || -> BTreeMap<String, u64> {
+        provider.force_flush().expect("flush the test meter");
+        let metrics = exporter.get_finished_metrics().expect("read metrics");
+        let resource = metrics.last().expect("one export per flush");
+        let metric = resource
+            .scope_metrics()
+            .flat_map(|scope| scope.metrics())
+            .next()
+            .expect("the counter was recorded");
+        match metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => sum
+                .data_points()
+                .map(|point| {
+                    let cause = point
+                        .attributes()
+                        .find(|kv| kv.key.as_str() == "cause")
+                        .expect("a cause label")
+                        .value
+                        .to_string();
+                    (cause, point.value())
+                })
+                .collect(),
+            data => panic!("expected a u64 sum, got {data:?}"),
+        }
+    };
+
+    let mut counted = CleanupSkips::default();
+    record_cleanup_skips(
+        &counter,
+        &mut counted,
+        CleanupSkips {
+            stage_capacity: 3,
+            stage_key_taken: 1,
+            tombstone_sweep_failed: 0,
+        },
+    );
+    // A cause that has not grown adds nothing and has no data point yet.
+    assert_eq!(
+        values(),
+        BTreeMap::from([
+            ("stage_capacity".to_owned(), 3),
+            ("stage_key_taken".to_owned(), 1),
+        ])
+    );
+    let later = CleanupSkips {
+        stage_capacity: 4,
+        stage_key_taken: 1,
+        tombstone_sweep_failed: 2,
+    };
+    record_cleanup_skips(&counter, &mut counted, later);
+    // The same snapshot again adds nothing.
+    record_cleanup_skips(&counter, &mut counted, later);
+    assert_eq!(
+        values(),
+        BTreeMap::from([
+            ("stage_capacity".to_owned(), 4),
+            ("stage_key_taken".to_owned(), 1),
+            ("tombstone_sweep_failed".to_owned(), 2),
+        ])
+    );
+    assert_eq!(counted, later);
 }
 
 #[test]
@@ -663,6 +749,7 @@ fn healthy_observation() -> WriteBehindObservation {
         spool_files: 0,
         oldest_pending_age: None,
         cleanup_backlog: 0,
+        stage_tombstones_kept: 0,
         roots_usable: true,
         capacity_available: true,
         capacity: CapacityEvidence::default(),

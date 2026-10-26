@@ -1153,6 +1153,9 @@ mod staged_read_tests;
 #[path = "fragment_write_behind_withdraw_tests.rs"]
 mod withdraw_tests;
 
+#[path = "fragment_write_behind_cleanup_pass_tests.rs"]
+mod cleanup_pass_tests;
+
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
 async fn adapter_malformed_compressed_readback_is_bounded_and_preserves_staged_authority() {

@@ -24,6 +24,8 @@ mod delete_observations;
 #[path = "common/drain_candidate.rs"]
 mod drain_candidate;
 
+#[path = "common/stage_invariant.rs"]
+mod stage_invariant;
 #[path = "common/stage_policy.rs"]
 mod stage_policy;
 
@@ -7816,8 +7818,10 @@ async fn acquire_staged_leases_admits_a_quarantined_staged_member() {
             after.metadata_bytes,
             after.metadata_rows
         ),
-        (0, 0, 256, 1)
+        (0, 0, 0, 0),
+        "the staged epoch is PURGED by the cleanup, so its custody row is redundant and deleted"
     );
+    stage_invariant::assert_stage_ledger_matches_custody(&url).await;
 }
 
 /// P1-A: the exact independent-review sequence -- stage, promote, obliterate.

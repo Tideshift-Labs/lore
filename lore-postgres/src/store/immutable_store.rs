@@ -3516,6 +3516,10 @@ impl ImmutableStore for PostgresImmutableStore {
 }
 
 #[cfg(test)]
+#[path = "fragment_stage_obliterate_tests.rs"]
+mod stage_obliterate_tests;
+
+#[cfg(test)]
 mod tests {
     use std::time::Duration;
 

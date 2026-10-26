@@ -13,6 +13,7 @@ use anyhow::Result;
 use anyhow::bail;
 use lore_base::lore_spawn;
 use lore_postgres::store::fragment_write_behind::CapacityEvidence;
+use lore_postgres::store::fragment_write_behind::CleanupSkips;
 use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
 use lore_postgres::store::fragment_write_behind::MAX_DRAIN_CONCURRENCY;
 use lore_postgres::store::fragment_write_behind::ObserveStep;
@@ -47,6 +48,11 @@ struct Instruments {
     cleanup_not_progressing: Gauge<u64>,
     pending: Gauge<u64>,
     usage: Gauge<u64>,
+    /// Released stage custody rows kept as the only cleanup authority for
+    /// their epoch (WP-115 f1). Each still holds a metadata row.
+    stage_tombstones_kept: Gauge<u64>,
+    /// Cleanup steps skipped, by `cause`.
+    cleanup_skipped: Counter<u64>,
     /// Each `observe()` step's duration, by `step` and `outcome`.
     observe_step_ms: Histogram<f64>,
 }
@@ -66,6 +72,12 @@ fn instruments() -> &'static Instruments {
                 .u64_gauge(provider.scope_name("pending_files"))
                 .build(),
             usage: meter.u64_gauge(provider.scope_name("usage_bytes")).build(),
+            stage_tombstones_kept: meter
+                .u64_gauge(provider.scope_name("stage_tombstones_kept"))
+                .build(),
+            cleanup_skipped: meter
+                .u64_counter(provider.scope_name("cleanup_skipped"))
+                .build(),
             observe_step_ms: provider.latency_histogram_ms("observe_step"),
         }
     })
@@ -718,6 +730,35 @@ fn record_cleanup_not_progressing(gauge: &Gauge<u64>, degraded: &[&'static str])
     );
 }
 
+/// Add each cleanup skip cause's growth since `previous` to `counter`, labelled
+/// `cause`, and remember `now`. The handle's counts only grow.
+#[lore_macro::test_pub]
+fn record_cleanup_skips(counter: &Counter<u64>, previous: &mut CleanupSkips, now: CleanupSkips) {
+    for (cause, before, after) in [
+        (
+            "stage_capacity",
+            previous.stage_capacity,
+            now.stage_capacity,
+        ),
+        (
+            "stage_key_taken",
+            previous.stage_key_taken,
+            now.stage_key_taken,
+        ),
+        (
+            "tombstone_sweep_failed",
+            previous.tombstone_sweep_failed,
+            now.tombstone_sweep_failed,
+        ),
+    ] {
+        let grown = after.saturating_sub(before);
+        if grown > 0 {
+            counter.add(grown, &[KeyValue::new("cause", cause)]);
+        }
+    }
+    *previous = now;
+}
+
 /// Merge completed per-item activity without extending any timestamp merely
 /// because the observer ran. A wedged next operation still ages out naturally.
 #[lore_macro::test_pub]
@@ -938,6 +979,7 @@ pub(crate) fn configure_fragment_write_behind(
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut limiter = WarnLimiter::default();
         let mut previous_attempt: Option<Instant> = None;
+        let mut counted_skips = CleanupSkips::default();
         loop {
             tokio::select! { biased;
                 _ = observer_shutdown.wait_for(|value| *value) => break,
@@ -963,6 +1005,13 @@ pub(crate) fn configure_fragment_write_behind(
                 &mut limiter,
             );
             previous_attempt = Some(attempt);
+            // Every tick, not only after a good observation: skips are most
+            // likely while the database is failing.
+            record_cleanup_skips(
+                &instruments().cleanup_skipped,
+                &mut counted_skips,
+                handle.cleanup_skips(),
+            );
             if let Ok(Ok(observation)) = result {
                 instruments().pending.record(observation.pending_files, &[]);
                 instruments()
@@ -971,6 +1020,9 @@ pub(crate) fn configure_fragment_write_behind(
                 instruments()
                     .usage
                     .record(observation.spool_bytes, &[KeyValue::new("root", "spool")]);
+                instruments()
+                    .stage_tombstones_kept
+                    .record(observation.stage_tombstones_kept, &[]);
                 // Explicit block, matching the worker loops: the guard is released at the
                 // brace rather than at a statement temporary, so `snapshot()` below cannot
                 // be folded into the same expression and self-deadlock this std `Mutex`.

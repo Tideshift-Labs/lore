@@ -552,24 +552,43 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
         .await
         .unwrap();
     let coordinator = fixture.domain.fragment_coordinator();
-    let orphan = coordinator
-        .begin_stage_cleanup(&[0x42; 32], 71)
-        .await
-        .unwrap()
-        .unwrap();
-    coordinator.commit_stage_cleanup(&orphan).await.unwrap();
-    let second_orphan = coordinator
-        .begin_stage_cleanup(&[0x43; 32], 72)
-        .await
-        .unwrap()
-        .unwrap();
-    coordinator
-        .commit_stage_cleanup(&second_orphan)
-        .await
-        .unwrap();
+    // Two withdrawn stages: each head still names its withdrawn epoch and has no
+    // epochs row, so the release keeps the custody row as a tombstone (a late file
+    // would have no other cleanup authority). An orphan reclaim is not used here
+    // because its release deletes the row, which would leave nothing to hold the
+    // rotation below the occupied row count.
+    let mut withdrawn_cleanups = Vec::new();
+    for hash in [[0x42u8; 32], [0x43u8; 32]] {
+        let BeginOutcome::Admitted(stage) = coordinator
+            .begin_stage(
+                &hash,
+                StageReservationInput {
+                    size_payload: 8,
+                    original_flags: 0,
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("a fresh hash admits a stage begin")
+        };
+        assert!(coordinator.withdraw_stage(&stage).await.unwrap());
+        let cleanup = coordinator
+            .begin_stage_cleanup(&hash, stage.epoch)
+            .await
+            .unwrap()
+            .expect("a withdrawn reservation is cleaned");
+        coordinator.commit_stage_cleanup(&cleanup).await.unwrap();
+        withdrawn_cleanups.push(cleanup);
+    }
+    let orphan = &withdrawn_cleanups[0];
     let before: serde_json::Value = serde_json::from_str(&fixture.snapshot().await).unwrap();
     assert_eq!(before["spool"].as_array().unwrap().len(), 2);
     assert_eq!(before["stage_custody"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        before["stage_usage"][0]["metadata_rows"], 2,
+        "both kept tombstones are counted, so a maximum of 1 cannot hold them"
+    );
     for stage in [false, true] {
         let mut too_small = next.clone();
         if stage {
@@ -631,7 +650,7 @@ async fn paired_rotation_refuses_live_spool_then_preserves_compact_markers_and_u
             .all(|row| row["superseded"] == true && row["marker_fence_ms"].as_i64().unwrap() > 0)
     );
     fixture.runtime.release_cleanup(&cleanup).await.unwrap();
-    coordinator.commit_stage_cleanup(&orphan).await.unwrap();
+    coordinator.commit_stage_cleanup(orphan).await.unwrap();
     let replayed: serde_json::Value = serde_json::from_str(&fixture.snapshot().await).unwrap();
     for name in ["stage_usage", "stage_custody", "dispatch_usage"] {
         assert_eq!(

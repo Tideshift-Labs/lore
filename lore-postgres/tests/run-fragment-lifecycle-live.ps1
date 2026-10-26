@@ -76,6 +76,30 @@ $inventory = @(
             'stage_policy_identity_must_match_the_published_cell_revision_and_digest'
         )
     }
+    # Stage custody tombstone lifetime: a redundant release deletes the custody row and gives
+    # its metadata row back, a guarding tombstone is kept, and the sweep and the rollback SQL
+    # reconcile the pre-fix shape. NOT Unix-gated (pure coordinator and SQL).
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
+        Target        = 'fragment_stage_tombstones'
+        Exact         = $true
+        ExactPrefixes = @()
+        Cases         = @(
+            'cleaned_predecessors_do_not_consume_the_metadata_row_budget',
+            'orphan_reclaims_cycle_past_max_metadata_rows',
+            'late_residue_of_a_purged_epoch_is_reauthorized_with_a_balanced_fresh_charge',
+            'expired_preparation_keeps_its_tombstone_and_late_residue_reuses_it',
+            'only_a_purged_epoch_is_reauthorized_when_its_custody_row_is_missing',
+            'two_replicas_racing_one_residue_key_reserve_once_and_refund_once',
+            'the_loser_of_a_concurrent_headless_reserve_is_told_the_key_is_taken',
+            'a_loser_whose_winner_already_deleted_its_row_is_still_told_the_key_is_taken',
+            'two_replicas_racing_one_headless_orphan_make_one_charge',
+            'sweep_compacts_legacy_tombstones_keeps_guarding_ones_and_walks_to_the_end',
+            'concurrent_sweeps_delete_each_legacy_tombstone_once',
+            'rebuild_sql_restores_one_tombstone_per_purged_staged_epoch_exactly_once'
+        )
+    }
     [pscustomobject]@{
         Package       = 'lore-postgres'
         Kind          = 'test'
@@ -306,11 +330,16 @@ $inventory = @(
             # scope still forbids an unowned sibling case on a Unix host; off Unix the
             # prefix simply matches nothing in the catalog.
             'store::immutable_store::tests::first_put_staged_',
+            'store::immutable_store::stage_obliterate_tests::',
             'store::immutable_store::fragment_write_behind::source_tests::',
             'store::immutable_store::fragment_write_behind::adapter_tests::'
         )
         Cases         = @(
             'store::immutable_store::tests::exact_purge_proofs_are_required_before_payload_tombstone',
+            # A staged obliterate deletes its redundant custody row and stays strict about a
+            # missing one. In the library because a purge proof can only be built in-crate.
+            'store::immutable_store::stage_obliterate_tests::staged_obliterate_deletes_the_redundant_custody_row_and_balances_the_ledger',
+            'store::immutable_store::stage_obliterate_tests::staged_obliterate_refuses_a_missing_current_epoch_custody_row_and_changes_nothing',
             'store::immutable_store::tests::first_put_staged_call_returns_exact_readable_witness_without_retry',
             'store::immutable_store::fragment_write_behind::adapter_tests::adapter_valid_bytes_with_conflicting_content_flags_cannot_replace_staged_authority',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_corrupt_staged_source_creates_neither_claim_nor_provider_request',

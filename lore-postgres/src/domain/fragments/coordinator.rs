@@ -72,10 +72,13 @@ use std::time::SystemTime;
 pub(crate) use creation::bind_branch_creation_metadata;
 pub(crate) use creation::bind_creation_metadata;
 use deadpool_postgres::Transaction;
+pub use stage_custody::STAGE_TOMBSTONE_REBUILD_SQL;
 pub use stage_custody::StageCleanupIntent;
 pub use stage_custody::StageObservation;
 pub use stage_custody::StageReservationInput;
+pub use stage_custody::StageTombstoneSweep;
 pub use stage_custody::is_stage_capacity_exhausted;
+pub use stage_custody::is_stage_custody_key_taken;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::coordinator::CommittedVersions;

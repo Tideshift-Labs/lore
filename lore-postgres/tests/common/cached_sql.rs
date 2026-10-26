@@ -182,7 +182,7 @@ pub const PINS: &[Pin] = &[
         name: "stage_custody_reserve",
         needles: &[
             "INSERT INTO lore_fragment_stage_custody (hash,epoch,operation_fence,original_flags,size_payload,prepare_deadline,state,metadata_bytes) SELECT $1,$2,$3,$4,$5,",
-            "FROM lore_fragment_stage_policy WHERE singleton AND expires_at > clock_timestamp()",
+            "FROM lore_fragment_stage_policy WHERE singleton AND expires_at > clock_timestamp() ON CONFLICT (hash,epoch) DO NOTHING",
         ],
         forbidden: &[],
         indexes: &[],
