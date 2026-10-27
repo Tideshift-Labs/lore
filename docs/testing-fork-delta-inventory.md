@@ -256,7 +256,7 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   domain::outbox::event_plane::tests` `cargo test -p lore-server --test unit event_relay::plane`;
   live: `pwsh -File lore-postgres/tests/run-event-plane-live.ps1`,
   `PASS=7 FAIL=0 NOT RUN=0 EXPECTED=7` at last run. Durable-mode regression reconfirmed unaffected:
-  `run-outbox-initialization-live.ps1` 10/10, `run-outbox-producers-live.ps1` 29/29,
+  `run-outbox-initialization-live.ps1` 13/13, `run-outbox-producers-live.ps1` 29/29,
   `run-domain-enforcement-live.ps1` 11/11. **Known gap**: no live test drives a real governed
   mutation through `DomainContext`/`Governed*` end to end under `live_only` to prove zero outbox
   rows append across all producer kinds (it would need `p12_live.rs`'s receipt/digest/admission
