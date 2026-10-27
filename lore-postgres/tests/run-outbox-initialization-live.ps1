@@ -35,6 +35,7 @@ $target = 'domain_outbox_initialization'
 $cases = @(
  'fresh_event_initialization_accepts_published_stage_policy_and_exact_zero_usage',
  'fresh_event_initialization_refuses_used_or_missing_stage_usage',
+ 'fresh_event_initialization_refuses_a_cell_that_released_stage_custody',
  'fresh_event_initialization_refuses_retained_stage_custody',
  'fresh_event_initialization_is_atomic_repeatable_and_not_receiver_readiness',
  'fresh_event_initialization_refuses_unarmed_retained_or_populated_state',

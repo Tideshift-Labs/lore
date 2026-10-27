@@ -167,9 +167,12 @@ async fn fresh_event_initialization_refuses_used_or_missing_stage_usage() {
     );
 }
 
+/// A real orphan stage cleanup: release deletes its redundant custody row and
+/// gives back live and metadata usage, but the lifetime charge counters stay.
+/// Those counters refuse the cell.
 #[tokio::test]
 #[ignore = "owned empty PostgreSQL fixture required"]
-async fn fresh_event_initialization_refuses_retained_stage_custody() {
+async fn fresh_event_initialization_refuses_a_cell_that_released_stage_custody() {
     let (pool, direct) = armed().await;
     publish_stage_policy(&direct).await;
     let url = std::env::var("LORE_TEST_PG_URL").unwrap();
@@ -186,14 +189,67 @@ async fn fresh_event_initialization_refuses_retained_stage_custody() {
     let before = event_state(&direct).await;
     let error = initialize_empty(&pool, &input(0)).await.unwrap_err();
     assert!(matches!(error, DomainError::NotReady(_)), "{error:?}");
+    assert!(error.to_string().contains("stage counters"), "{error:?}");
+    assert_eq!(event_state(&direct).await, before);
+    let usage = direct
+        .query_one(
+            "SELECT (SELECT count(*) FROM lore_fragment_stage_custody), \
+                    live_bytes + live_files + metadata_bytes + metadata_rows, charged_files \
+               FROM lore_fragment_stage_usage",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        usage.get::<_, i64>(0),
+        0,
+        "release deleted the redundant row"
+    );
+    assert_eq!(
+        usage.get::<_, i64>(1),
+        0,
+        "release gave back live and metadata usage"
+    );
+    assert_eq!(usage.get::<_, i64>(2), 1, "the lifetime charge stays");
+}
+
+/// A retained custody row with clean counters. Only the custody table can
+/// refuse this cell, so this pins that check on its own.
+#[tokio::test]
+#[ignore = "owned empty PostgreSQL fixture required"]
+async fn fresh_event_initialization_refuses_retained_stage_custody() {
+    let (pool, direct) = armed().await;
+    publish_stage_policy(&direct).await;
+    // Deliberate administrative corruption only inside this owned disposable database:
+    // a released tombstone without its ledger charge. The counters stay at zero on
+    // purpose, so the stage counter check cannot refuse in place of the custody check.
+    direct
+        .batch_execute(
+            "INSERT INTO lore_fragment_stage_custody \
+             (hash,epoch,operation_fence,original_flags,size_payload,prepare_deadline,state,metadata_bytes,purged_at) \
+             VALUES (decode(repeat('42',32),'hex'),71,1,NULL,0,now(),3,256,now())",
+        )
+        .await
+        .unwrap();
+    let before = event_state(&direct).await;
+    let error = initialize_empty(&pool, &input(0)).await.unwrap_err();
+    assert!(matches!(error, DomainError::NotReady(_)), "{error:?}");
     assert!(
-        error.to_string().contains("lore_fragment_stage_custody"),
+        error
+            .to_string()
+            .contains("populated table lore_fragment_stage_custody"),
         "{error:?}"
     );
     assert_eq!(event_state(&direct).await, before);
     assert_eq!(
         direct
-            .query_one("SELECT count(*) FROM lore_fragment_stage_custody", &[])
+            .query_one(
+                "SELECT (SELECT count(*) FROM lore_fragment_stage_custody) \
+                        + live_bytes + live_files + charged_bytes + charged_files \
+                        + metadata_bytes + metadata_rows \
+                   FROM lore_fragment_stage_usage",
+                &[]
+            )
             .await
             .unwrap()
             .get::<_, i64>(0),
