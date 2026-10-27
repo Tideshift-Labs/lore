@@ -239,7 +239,20 @@ pub struct CallerOperationContext {
     repository: RepositoryId,
     attempts: Arc<dyn AttemptStore>,
     binding: Arc<parking_lot::Mutex<Option<CallerRecoveryContext>>>,
-    latest_attempt: Arc<parking_lot::Mutex<Option<AttemptId>>>,
+    parent: Arc<ParentState>,
+}
+
+/// State every clone of one context shares.
+///
+/// FORK-LOCAL (Tideshift, WP-124): the declared sessions share the attempt's allocation rather
+/// than adding a field, because this context is carried in futures sized against clippy's
+/// `large_futures` bound, and one more pointer crossed it.
+#[derive(Default)]
+struct ParentState {
+    latest_attempt: parking_lot::Mutex<Option<AttemptId>>,
+    /// The declared storage sessions this parent opened, stopped when the last clone of the
+    /// context drops, which is when the scope has ended.
+    declared: crate::session::DeclaredBindings,
 }
 
 impl CallerOperationContext {
@@ -249,8 +262,18 @@ impl CallerOperationContext {
             repository,
             attempts,
             binding: Arc::new(parking_lot::Mutex::new(None)),
-            latest_attempt: Arc::new(parking_lot::Mutex::new(None)),
+            parent: Arc::default(),
         }
+    }
+
+    pub(crate) fn declared_bindings(&self) -> &crate::session::DeclaredBindings {
+        &self.parent.declared
+    }
+
+    /// How many declared storage sessions this parent holds. A diagnostic: a test asserts the
+    /// scope owns what it opened.
+    pub fn declared_session_count(&self) -> usize {
+        self.parent.declared.len()
     }
 
     pub fn parent_id(&self) -> Uuid {
@@ -266,7 +289,7 @@ impl CallerOperationContext {
         OUTCOME_UNKNOWN_CAPABILITY_V1
     }
     pub fn latest_attempt(&self) -> Option<AttemptId> {
-        *self.latest_attempt.lock()
+        *self.parent.latest_attempt.lock()
     }
 }
 
@@ -407,7 +430,7 @@ pub(crate) async fn record(
             },
         )
         .await?;
-    *context.latest_attempt.lock() = Some(attempt);
+    *context.parent.latest_attempt.lock() = Some(attempt);
     Ok(())
 }
 

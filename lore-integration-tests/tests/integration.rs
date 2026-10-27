@@ -9,6 +9,7 @@ mod grpc_mutation_dispatch_loss_test;
 mod hashicorp;
 mod locks_test;
 mod presign_test;
+mod quic_declared_session_test;
 mod quic_session_rebind_test;
 mod quic_strict_admission_test;
 mod quic_strict_live_cell_probe_test;

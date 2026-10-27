@@ -988,3 +988,50 @@ fn a_refused_before_prepare_error_converts_back_to_an_unmarked_unavailable() {
         ProtocolError::Disconnected(_)
     ));
 }
+
+// --- WP-124 slice 2a: the typed refusal of a declared QUIC session ------------------------------
+
+/// The marker is found by walking the source chain, wherever the error layering put it, and only
+/// then. A neighbouring refusal (status 200 `unsupported-client` on a Put) is not it.
+#[test]
+fn a_quic_declaration_refusal_is_found_through_the_source_chain() {
+    for status in [1, 200] {
+        let refused = ProtocolError::internal_with_context(
+            QuicDeclarationRefused { status },
+            "declared storage session refused",
+        );
+        assert!(is_quic_declaration_refused(&refused), "status {status}");
+    }
+}
+
+#[test]
+fn a_quic_declaration_refusal_survives_one_more_layer_of_context() {
+    let inner = ProtocolError::internal_with_context(
+        QuicDeclarationRefused { status: 1 },
+        "declared storage session refused",
+    );
+    let outer = ProtocolError::internal_with_context(inner, "opening the managed session");
+    assert!(is_quic_declaration_refused(&outer));
+}
+
+#[test]
+fn other_errors_are_not_a_quic_declaration_refusal() {
+    assert!(!is_quic_declaration_refused(&ProtocolError::internal(
+        "this transport cannot declare a session"
+    )));
+    assert!(!is_quic_declaration_refused(&ProtocolError::internal(
+        "storage server refused the caller declaration (status 1)"
+    )));
+    assert!(!is_quic_declaration_refused(&ProtocolError::from(
+        tonic::Status::unavailable("server unreachable")
+    )));
+}
+
+#[test]
+fn a_quic_declaration_refusal_names_its_status() {
+    let refused = QuicDeclarationRefused { status: 200 };
+    assert_eq!(
+        refused.to_string(),
+        "storage server refused the caller declaration (status 200)"
+    );
+}

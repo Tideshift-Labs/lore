@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
@@ -16,6 +17,7 @@ use lore_base::types::*;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
+use uuid::Uuid;
 
 use crate::connection::Connection;
 use crate::error::ProtocolError;
@@ -63,6 +65,10 @@ struct SessionBinding {
     /// The correlation id the session was started under, so authorizing a further partition on this
     /// connection is attributed to the same command.
     correlation_id: Arc<str>,
+    /// FORK-LOCAL (Tideshift, WP-124): the managed parent and capability list this session
+    /// declares, or `None` for an undeclared session. Fixed at construction, so a rebind of a
+    /// declared session declares again and a rebind of an undeclared one never does.
+    declared: Option<(Uuid, &'static str)>,
 }
 
 /// A session id and the connection generation it is valid on.
@@ -115,10 +121,18 @@ impl SessionBinding {
         // A fresh `session_start` re-runs the token exchange and the server's authorization
         // check for this partition. Nothing from the old session's permission snapshot carries
         // over, which is the point: the replacement connection decides for itself.
-        let id = self
-            .storage
-            .session_start(self.partition, &self.correlation_id)
-            .await?;
+        let id = match self.declared {
+            Some((_, capabilities)) => {
+                self.storage
+                    .session_start_declared(self.partition, &self.correlation_id, capabilities)
+                    .await?
+            }
+            None => {
+                self.storage
+                    .session_start(self.partition, &self.correlation_id)
+                    .await?
+            }
+        };
         *self.session.lock() = BoundSession {
             id,
             generation: Some(current),
@@ -154,6 +168,101 @@ impl SessionBinding {
     /// costs a session slot.
     fn unbind(&self) {
         self.session.lock().generation = None;
+    }
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): the declared sessions one managed parent has opened, keyed by
+/// the storage connection and partition they were opened for.
+///
+/// Owned by the [`crate::CallerOperationContext`], never by a connection or a pool. The context
+/// lives exactly as long as the managed scope, on every path (CLI, push stage, desktop call), so
+/// when its last clone drops the declared sessions are stopped. A connection or a pool can
+/// outlive many scopes; declared sessions held there would leak across workflows and pile up
+/// toward the server's session limit.
+#[derive(Default)]
+pub(crate) struct DeclaredBindings {
+    bindings: Mutex<HashMap<(usize, Partition), Arc<SessionBinding>>>,
+}
+
+/// The key of the declared binding twinned with `undeclared`.
+///
+/// The storage is keyed by address. That is sound because the entry holds a strong reference to
+/// the same storage, so the address cannot be reused while the entry exists.
+fn declared_key(undeclared: &SessionBinding) -> (usize, Partition) {
+    (
+        Arc::as_ptr(&undeclared.storage).cast::<()>() as usize,
+        undeclared.partition,
+    )
+}
+
+impl DeclaredBindings {
+    /// The declared binding for `undeclared`'s connection and partition, created unbound on
+    /// first use. Synchronous, so concurrent first calls share one entry; the first
+    /// [`SessionBinding::resolve`] on it opens the session, under its rebind guard.
+    fn get_or_insert(
+        &self,
+        undeclared: &SessionBinding,
+        parent_id: Uuid,
+        capabilities: &'static str,
+    ) -> Arc<SessionBinding> {
+        let mut bindings = self.bindings.lock();
+        bindings
+            .entry(declared_key(undeclared))
+            .or_insert_with(|| {
+                Arc::new(SessionBinding {
+                    storage: undeclared.storage.clone(),
+                    session: Mutex::new(BoundSession {
+                        id: 0,
+                        generation: None,
+                    }),
+                    rebind: TokioMutex::new(()),
+                    partition: undeclared.partition,
+                    correlation_id: undeclared.correlation_id.clone(),
+                    declared: Some((parent_id, capabilities)),
+                })
+            })
+            .clone()
+    }
+
+    /// Forget the declared binding for `undeclared`'s connection and partition. Its session is
+    /// stopped once the last attempt holding it returns.
+    fn remove(&self, undeclared: &SessionBinding) {
+        let removed = self.bindings.lock().remove(&declared_key(undeclared));
+        drop(removed);
+    }
+
+    /// How many declared bindings this parent holds.
+    pub(crate) fn len(&self) -> usize {
+        self.bindings.lock().len()
+    }
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): a declared session is stopped when its binding's last
+/// reference drops.
+///
+/// The last reference, not the map entry. An attempt that selected the binding holds it until it
+/// returns, and may still resolve it after the entry was removed (an `invalidate` in scope); a
+/// stop tied to the entry would race that attempt, or miss a session it opened afterwards. Once
+/// the last reference is gone nothing can resolve the binding, so the id read here is final.
+///
+/// Declared bindings only: [`StorageSession`]'s own `Drop` already stops each undeclared session,
+/// and stopping here too would send a second stop for every one of them.
+impl Drop for SessionBinding {
+    fn drop(&mut self) {
+        if self.declared.is_none() {
+            return;
+        }
+        let storage = self.storage.clone();
+        let bound = self.bound();
+        // Same rule as `StorageSession::drop`: `drop` only decides to try, and the generation is
+        // compared inside the task, immediately before the stop goes out.
+        if let Some(generation) = bound.generation {
+            lore_base::lore_spawn_net!(async move {
+                if storage.connection_generation() == generation {
+                    let _ = storage.session_stop(bound.id).await;
+                }
+            });
+        }
     }
 }
 
@@ -222,6 +331,7 @@ impl StorageSession {
                     rebind: TokioMutex::new(()),
                     partition,
                     correlation_id,
+                    declared: None,
                 }),
                 connection,
             }),
@@ -275,6 +385,7 @@ impl StorageSession {
         match &self.inner {
             SessionInner::Resolved(r) => {
                 r.binding.unbind();
+                Self::release_declared(&r.binding);
                 r.connection.invalidate_all_sessions();
             }
             SessionInner::Pending { resolved, .. } => {
@@ -286,21 +397,11 @@ impl StorageSession {
                     && let SessionInner::Resolved(r) = &inner.inner
                 {
                     r.binding.unbind();
+                    Self::release_declared(&r.binding);
                     r.connection.invalidate_all_sessions();
                 }
                 *guard = None;
             }
-        }
-    }
-
-    /// Mark the resolved session gone so the next operation starts a replacement.
-    ///
-    /// Narrower than [`invalidate`](Self::invalidate): the connection's pool cache is left
-    /// alone, because a replaced connection invalidates one session's id, not the caller's
-    /// pinned pools.
-    async fn unbind(&self) {
-        if let Ok(binding) = self.binding().await {
-            binding.unbind();
         }
     }
 
@@ -321,8 +422,12 @@ impl StorageSession {
     /// ambiguous write into an ordinary error and this retry into a second `Put`.
     ///
     /// At most [`ATTEMPT_BUDGET`] dispatches of the operation itself, one rebind between them.
+    ///
+    /// `write` says whether the operation mutates; it only decides what a managed caller on a
+    /// foreign partition gets (see [`binding`](Self::binding)).
     async fn attempt<T, Fut>(
         &self,
+        write: bool,
         operation: impl Fn(Arc<dyn Storage>, u32) -> Fut,
     ) -> Result<T, ProtocolError>
     where
@@ -332,8 +437,9 @@ impl StorageSession {
         loop {
             attempts_left -= 1;
             // Resolves the session, and starts a replacement first if the connection has moved
-            // on since this one was issued.
-            let binding = self.binding().await?;
+            // on since this one was issued. Chosen per call: the caller's managed scope can
+            // differ from one operation on this session to the next.
+            let binding = self.binding(write).await?;
             let (session_id, sent_on) = binding.resolve().await?;
             let storage = binding.storage.clone();
 
@@ -369,7 +475,10 @@ impl StorageSession {
                 return Err(error);
             }
 
-            self.unbind().await;
+            // Unbind the binding this attempt used, not whatever `binding` would pick now: with
+            // per-call selection a second lookup could name a different session. The next pass
+            // selects again, so a declared binding retries on a declared session.
+            binding.unbind();
         }
     }
 
@@ -430,9 +539,53 @@ impl StorageSession {
         }
     }
 
-    /// The resolved session binding, driving the pending resolver on first call.
-    async fn binding(&self) -> Result<Arc<SessionBinding>, ProtocolError> {
-        self.with_resolved(|r| r.binding.clone()).await
+    /// The binding this call runs on, driving the pending resolver on first call.
+    ///
+    /// FORK-LOCAL (Tideshift, WP-124): chosen per call from the caller's managed scope, read here
+    /// in the caller's own task. No scope gets the undeclared binding, always. A scope on a
+    /// transport that declares per session gets the declared binding its
+    /// [`crate::CallerOperationContext`] owns for this connection and partition, so a binding
+    /// declared for one parent is never used by another, and never outside a scope. A scope on
+    /// another partition than its repository reads on the undeclared binding and is refused a
+    /// write locally, as the gRPC managed path refuses one.
+    async fn binding(&self, write: bool) -> Result<Arc<SessionBinding>, ProtocolError> {
+        let undeclared = self.with_resolved(|r| r.binding.clone()).await?;
+        let Some(context) = crate::caller_operation::current_caller_operation() else {
+            return Ok(undeclared);
+        };
+        if !undeclared.storage.declares_per_session() {
+            return Ok(undeclared);
+        }
+        if undeclared.partition != context.repository() {
+            if write {
+                return Err(ProtocolError::internal(
+                    "managed operation repository mismatch",
+                ));
+            }
+            return Ok(undeclared);
+        }
+        Ok(context.declared_bindings().get_or_insert(
+            &undeclared,
+            context.parent_id(),
+            context.capabilities(),
+        ))
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124): release the declared binding the current scope owns for
+    /// `undeclared`'s connection and partition, if it has one.
+    ///
+    /// Removed rather than unbound. Unbinding would forget the id while the server still holds
+    /// the session, and nothing would stop it before the connection closed. Without the entry,
+    /// the binding's last reference drop sends the generation-checked stop, and the next call in
+    /// scope declares a fresh session.
+    ///
+    /// Reads the scope of the task that calls `invalidate`. A task that never re-entered the
+    /// scope releases nothing; the scope's declared binding then keeps its id until a rebind
+    /// replaces it or the scope ends.
+    fn release_declared(undeclared: &SessionBinding) {
+        if let Some(context) = crate::caller_operation::current_caller_operation() {
+            context.declared_bindings().remove(undeclared);
+        }
     }
 
     /// The partition this session is scoped to, driving the pending resolver on first call.
@@ -470,15 +623,17 @@ impl StorageSession {
     }
 
     pub async fn get(&self, address: &Address) -> Result<(Fragment, Bytes), ProtocolError> {
-        self.attempt(|storage, session_id| async move { storage.get(session_id, address).await })
-            .await
+        self.attempt(false, |storage, session_id| async move {
+            storage.get(session_id, address).await
+        })
+        .await
     }
 
     pub async fn get_priority(
         &self,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(false, |storage, session_id| async move {
             storage.get_priority(session_id, address).await
         })
         .await
@@ -505,7 +660,7 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        self.attempt(|storage, session_id| {
+        self.attempt(true, |storage, session_id| {
             let payload = payload.clone();
             async move {
                 storage
@@ -517,8 +672,10 @@ impl StorageSession {
     }
 
     pub async fn query(&self, address: &[Address]) -> Result<Bytes, ProtocolError> {
-        self.attempt(|storage, session_id| async move { storage.query(session_id, address).await })
-            .await
+        self.attempt(false, |storage, session_id| async move {
+            storage.query(session_id, address).await
+        })
+        .await
     }
 
     pub async fn verify(
@@ -535,7 +692,7 @@ impl StorageSession {
         address: &Address,
         heal: bool,
     ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(heal, |storage, session_id| async move {
             storage.verify_outcome(session_id, address, heal).await
         })
         .await
@@ -560,7 +717,7 @@ impl StorageSession {
         source_address: Address,
         target_context: Context,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(true, |storage, session_id| async move {
             storage
                 .copy_outcome(session_id, source_partition, source_address, target_context)
                 .await
@@ -573,14 +730,14 @@ impl StorageSession {
     /// Use this when the caller needs metadata without paying the payload transfer cost — e.g.
     /// the storage API's `query` op for remote-hit metadata lookups.
     pub async fn get_metadata(&self, address: &Address) -> Result<Fragment, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(false, |storage, session_id| async move {
             storage.get_metadata(session_id, address).await
         })
         .await
     }
 
     pub async fn mutable_load(&self, key: &Hash, key_type: KeyType) -> Result<Hash, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(false, |storage, session_id| async move {
             storage.mutable_load(session_id, key, key_type).await
         })
         .await
@@ -595,7 +752,7 @@ impl StorageSession {
         context: &Context,
         flags: u32,
     ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(false, |storage, session_id| async move {
             storage.get_resolved(session_id, key, context, flags).await
         })
         .await
@@ -628,7 +785,7 @@ impl StorageSession {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        self.attempt(|storage, session_id| {
+        self.attempt(true, |storage, session_id| {
             let payload = payload.clone();
             async move {
                 storage
@@ -656,7 +813,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(true, |storage, session_id| async move {
             storage
                 .mutable_store_outcome(session_id, key, value, key_type)
                 .await
@@ -689,7 +846,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<Hash>, ProtocolError> {
-        self.attempt(|storage, session_id| async move {
+        self.attempt(true, |storage, session_id| async move {
             storage
                 .mutable_compare_and_swap_outcome(session_id, key, expected, value, key_type)
                 .await

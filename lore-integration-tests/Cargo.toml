@@ -64,7 +64,9 @@ ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 # test-util exposes branch::push::push_fragments to storage_copy_on_write_test.rs.
 lore-revision = { workspace = true, features = ["test-util"] }
-lore-server = { workspace = true }
+# test-util makes `StorageServiceV4`'s fields public, so quic_declared_session_test.rs can read the
+# server's own `SessionMap` rather than infer live sessions from the wire.
+lore-server = { workspace = true, features = ["test-util"] }
 # `UserAgentFilter` for the hand-built `StorageServiceV4` in quic_session_rebind_test.rs.
 lore-telemetry = { workspace = true }
 lore-transport = { workspace = true, features = ["test_seams"] }

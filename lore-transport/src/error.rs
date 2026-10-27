@@ -31,6 +31,52 @@ pub fn is_unsupported_client(error: &ProtocolError) -> bool {
     false
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): a storage server refused to open a declared session.
+///
+/// A slice-1 server answers status 200 for a capability list it will not accept; a stock server
+/// answers status 1 (`InvalidCommand`) because it has no action byte 2. Both are final. A managed
+/// caller must never answer this by opening an undeclared session instead: that session's writes
+/// would carry no declaration, which is the downgrade the contract forbids.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("storage server refused the caller declaration (status {status})")]
+pub struct QuicDeclarationRefused {
+    pub status: u32,
+}
+
+pub fn is_quic_declaration_refused(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<QuicDeclarationRefused>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): the status a storage server answered an `Authorize` with.
+///
+/// Carried inside `ProtocolError::Internal` so the declared session start can tell the server's
+/// refusal of action 2 apart from any other failure, without parsing a message. Renders as the
+/// message the untyped error always had, so an undeclared start reads exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{message}")]
+pub(crate) struct AuthorizeAnswered {
+    pub(crate) status: u32,
+    pub(crate) message: String,
+}
+
+pub(crate) fn authorize_answered_status(error: &ProtocolError) -> Option<u32> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if let Some(answered) = source.downcast_ref::<AuthorizeAnswered>() {
+            return Some(answered.status);
+        }
+        current = source.source();
+    }
+    None
+}
+
 pub fn is_unsupported_client_status(status: &tonic::Status) -> bool {
     let mut values = status.metadata().get_all("lore-client-admission-v1").iter();
     status.code() == tonic::Code::FailedPrecondition

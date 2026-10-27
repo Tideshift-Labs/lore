@@ -415,6 +415,95 @@ impl StorageClient {
     }
 }
 
+/// The `AuthorizeStart` payload: `action(1) | partition(16) | corr_len(1) | corr(N) |
+/// token_len(2, u16 LE) | token(M)`, then, for action 2 only, `caps_len(2, u16 LE) | caps(K)`.
+///
+/// FORK-LOCAL (Tideshift, WP-124): one builder for both actions, so the declared payload cannot
+/// drift from the undeclared one. `capabilities` is `None` for action 0, byte-identical to before.
+#[lore_macro::test_pub]
+fn authorize_start_payload(
+    partition: Partition,
+    correlation_id: &str,
+    token: &str,
+    capabilities: Option<&str>,
+) -> Result<Bytes, ProtocolError> {
+    let token_bytes = token.as_bytes();
+    let corr_bytes = correlation_id.as_bytes();
+    let caps_len = match capabilities {
+        Some(caps) => 2 + caps.len(),
+        None => 0,
+    };
+    let mut payload =
+        BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len() + caps_len);
+    payload.put_u8(if capabilities.is_some() { 2 } else { 0 }); // action = start (declared)
+    payload.extend_from_slice(partition.as_bytes());
+    payload.put_u8(corr_bytes.len() as u8);
+    payload.extend_from_slice(corr_bytes);
+    payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
+    payload.extend_from_slice(token_bytes);
+    if let Some(caps) = capabilities {
+        let len = u16::try_from(caps.len())
+            .map_err(|_err| ProtocolError::internal("caller capability list is too long"))?;
+        payload.extend_from_slice(&len.to_le_bytes());
+        payload.extend_from_slice(caps.as_bytes());
+    }
+    Ok(payload.freeze())
+}
+
+impl StorageClient {
+    /// Start a session with `AuthorizeStart` action 0, or action 2 when `capabilities` is set.
+    async fn authorize_start(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        capabilities: Option<&'static str>,
+    ) -> Result<u32, ProtocolError> {
+        // Sampled before the request goes out, never after. If the connection is replaced while
+        // this call is in flight, the id the server returns belongs to a connection that is
+        // already gone, and recording the older generation is what makes the send path refuse it
+        // and the session layer rebind. Sampling after the answer would record the generation the
+        // id was never issued on, which is the defect this whole path exists to prevent.
+        let generation = self.quic.connection_generation();
+
+        // Fetch auth token via token exchange (cached if already exchanged).
+        // The credentials are read here, not at construction: the server checks
+        // storage authorization at each session start, so a session opened later
+        // must present whatever the newest call supplied.
+        let token = if !self.auth_url.is_empty() {
+            let (identity_token, access_token) = self.credentials.tokens();
+            let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
+                &self.auth_url,
+                &self.recipient_domain,
+                &self.identity,
+                partition,
+                &identity_token,
+                &access_token,
+            )
+            .await;
+            authorization_token
+        } else {
+            String::new()
+        };
+
+        let payload = authorize_start_payload(partition, correlation_id, &token, capabilities)?;
+
+        let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
+            [Bytes::default(), payload.clone()]
+        })
+        .await?;
+
+        let Ok(session_id) = <[u8; 4]>::try_from(&response[..]) else {
+            return Err(ProtocolError::internal(format!(
+                "session_start: expected 4-byte response, got {} bytes",
+                response.len()
+            )));
+        };
+        let session_id = u32::from_le_bytes(session_id);
+        self.quic.register_session(session_id, generation);
+        Ok(session_id)
+    }
+}
+
 impl ServiceClient for StorageClient {
     type RequestType = Command;
     type ErrorType = ProtocolError;
@@ -478,6 +567,20 @@ impl ServiceClient for StorageClient {
                         storage_service::command_name(&failed_request)
                     ),
                 }),
+                // FORK-LOCAL (Tideshift, WP-124): an answered `Authorize` keeps its status, so a
+                // declared session start can tell a refusal of action 2 from any other failure.
+                QuicClientError::ServerError(status)
+                    if matches!(failed_request, Command::Authorize) =>
+                {
+                    let name = storage_service::command_name(&failed_request);
+                    ProtocolError::internal_with_context(
+                        crate::error::AuthorizeAnswered {
+                            status,
+                            message: format!("{name}: Failed sending command: {client_error}"),
+                        },
+                        "storage server answered the authorize request with an error",
+                    )
+                }
                 _ => {
                     let name = storage_service::command_name(&failed_request);
                     ProtocolError::internal(format!(
@@ -523,62 +626,36 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        // Sampled before the request goes out, never after. If the connection is replaced while
-        // this call is in flight, the id the server returns belongs to a connection that is
-        // already gone, and recording the older generation is what makes the send path refuse it
-        // and the session layer rebind. Sampling after the answer would record the generation the
-        // id was never issued on, which is the defect this whole path exists to prevent.
-        let generation = self.quic.connection_generation();
+        self.authorize_start(partition, correlation_id, None).await
+    }
 
-        // Fetch auth token via token exchange (cached if already exchanged).
-        // The credentials are read here, not at construction: the server checks
-        // storage authorization at each session start, so a session opened later
-        // must present whatever the newest call supplied.
-        let token = if !self.auth_url.is_empty() {
-            let (identity_token, access_token) = self.credentials.tokens();
-            let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-                &self.auth_url,
-                &self.recipient_domain,
-                &self.identity,
-                partition,
-                &identity_token,
-                &access_token,
+    /// FORK-LOCAL (Tideshift, WP-124): open a session with `AuthorizeStart` action 2, which
+    /// carries `capabilities` so a strict server admits this session's writes.
+    ///
+    /// A refusal is final and typed [`crate::error::QuicDeclarationRefused`]: status 200 from a
+    /// server that will not take the list, status 1 from a stock server that has no action 2.
+    /// Nothing here falls back to action 0.
+    async fn session_start_declared(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        capabilities: &'static str,
+    ) -> Result<u32, ProtocolError> {
+        self.authorize_start(partition, correlation_id, Some(capabilities))
+            .await
+            .map_err(
+                |error| match crate::error::authorize_answered_status(&error) {
+                    Some(status @ (1 | 200)) => ProtocolError::internal_with_context(
+                        crate::error::QuicDeclarationRefused { status },
+                        "declared storage session refused",
+                    ),
+                    _ => error,
+                },
             )
-            .await;
-            authorization_token
-        } else {
-            String::new()
-        };
-        let token_bytes = token.as_bytes();
+    }
 
-        // Build Authorize start payload:
-        // action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
-        let corr_bytes = correlation_id.as_bytes();
-        let mut payload =
-            BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
-        payload.put_u8(0); // action = start
-        payload.extend_from_slice(partition.as_bytes());
-        payload.put_u8(corr_bytes.len() as u8);
-        payload.extend_from_slice(corr_bytes);
-        payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
-        payload.extend_from_slice(token_bytes);
-        let payload = payload.freeze();
-
-        let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
-            [Bytes::default(), payload.clone()]
-        })
-        .await?;
-
-        if response.len() != 4 {
-            return Err(ProtocolError::internal(format!(
-                "session_start: expected 4-byte response, got {} bytes",
-                response.len()
-            )));
-        }
-
-        let session_id = u32::from_le_bytes(response[..4].try_into().unwrap());
-        self.quic.register_session(session_id, generation);
-        Ok(session_id)
+    fn declares_per_session(&self) -> bool {
+        true
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {

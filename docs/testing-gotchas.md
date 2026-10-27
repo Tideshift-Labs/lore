@@ -143,6 +143,17 @@ Durable, recurring testing lessons grouped by topic.
   PowerShell `Set-Content` adds CRLF and `git apply -R` then fails. A file restored with
   `Copy-Item` keeps its old mtime, so cargo reuses the build of the reverted source: set
   `LastWriteTime` to now after any restore, or a "red" result may be a stale binary.
+- **Live QUIC server-side probes** (`quic_declared_session_test.rs`): symptom, a client-side count
+  stands in for what the server holds. Cause, `StorageServiceV4.session_map` is private. Do: add
+  `features = ["test-util"]` to `lore-server` in `lore-integration-tests` dev-deps, wrap the service
+  in a `QuicService` that records `(cmd, session_id, Authorize action byte)` in `parse_request_bytes`
+  and pushes `inner.session_map.clone()` per accepted connection, then read `map.entries.len()` and
+  `map.get(id)`. A stock-server stand-in is a `MessageParseError::ParseFailure` for Authorize action 2
+  (answered status 1); `MessageHandleError::UnsupportedClient` is status 200. `connection.session()`
+  starts the undeclared session eagerly, so snapshot the wire before asserting "no action 0". To
+  observe a drop-time `session_stop`, `drop(session)` and `connection.release_session(..)` (the pool
+  pins it). `#[tokio::test]` is current-thread: do not `block_in_place` inside a fixture.
+  `async_yields_async` clippy fires on `lore_spawn!` as an async block's tail: `.await` it inside.
 
 ## Postgres & Database Testing
 

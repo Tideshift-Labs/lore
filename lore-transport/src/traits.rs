@@ -140,6 +140,34 @@ pub trait Storage: Send + Sync {
         correlation_id: &str,
     ) -> Result<u32, ProtocolError>;
 
+    /// FORK-LOCAL (Tideshift, WP-124): start a session that declares `capabilities` for its
+    /// whole lifetime, so a strict server admits its writes.
+    ///
+    /// The default refuses: a transport that cannot carry a declaration must not silently open
+    /// an undeclared session in its place. A refusal is final; a caller never retries it as
+    /// [`Storage::session_start`].
+    async fn session_start_declared(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        capabilities: &'static str,
+    ) -> Result<u32, ProtocolError> {
+        let _ = (partition, correlation_id, capabilities);
+        Err(ProtocolError::internal(
+            "this transport cannot declare a session",
+        ))
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124): whether a managed caller needs its own declared session
+    /// on this transport.
+    ///
+    /// `false` for a transport that declares per request (gRPC), whose managed path then stays
+    /// exactly as it was: no second session, no second stream set. `true` for QUIC, where the
+    /// declaration is fixed when the session opens.
+    fn declares_per_session(&self) -> bool {
+        false
+    }
+
     /// Stop an active session, releasing server-side capacity.
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError>;
 

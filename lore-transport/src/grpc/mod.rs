@@ -2061,6 +2061,17 @@ impl Storage for GRPCStorage {
         Ok(session_id)
     }
 
+    /// FORK-LOCAL (Tideshift, WP-124): gRPC declares per request
+    /// (`inject_managed_metadata`), so a declared session needs nothing an undeclared one lacks.
+    async fn session_start_declared(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        _capabilities: &'static str,
+    ) -> Result<u32, ProtocolError> {
+        self.session_start(partition, correlation_id).await
+    }
+
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
         self.sessions.remove(&session_id);
         self.client.remove_session_streams(session_id);

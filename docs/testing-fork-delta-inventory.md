@@ -85,6 +85,14 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   a strict real boot needs a fragment provider + domain enforcement. Gates: `cargo test -p
   lore-server --test unit -j 4 -- grpc::caller_capabilities` `cargo test -p lore-integration-tests
   --features integration_tests --test integration -j 4 -- quic_strict_admission`
+- **WP-124 slice 2a declared QUIC sessions (`session_start_declared`, per-call binding in
+  `StorageSession::binding`) [CLIENT]**: payload bytes + `QuicDeclarationRefused` chain walk in
+  `lore-transport/tests/unit/quic/storage_service/client.rs` and `unit/error.rs`. Live, one file
+  `lore-integration-tests/tests/quic_declared_session_test.rs`: a `ProbeService` wraps the real strict
+  `StorageServiceV4` (recording wire + `Mode::{Stock, RefuseDeclared200, RejectUndeclared}` stand-ins)
+  and reads liveness from the server's own `SessionMap` (needs `lore-server` `test-util` as a dev-dep).
+  Reads are the managed traffic until slice 2b removes `reject_managed_quic`. Gate: `cargo test -p
+  lore-integration-tests --features integration_tests --test integration -j 4 -- quic_declared_session`
 - **Managed fragment Put, Copy and PutResolved are unjournaled [CLIENT]**: `StorageService::put`,
   `copy` and `put_resolved` inside a caller operation mint and send an attempt id + capability
   header but write no journal child (Copy/PutResolved since 2026-10-23); `unjournaled_result` maps
