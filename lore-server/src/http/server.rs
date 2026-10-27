@@ -347,10 +347,15 @@ pub async fn caller_capability_readiness(
 ) -> axum::Json<serde_json::Value> {
     use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
     let required = policy == CallerCapabilityPolicy::RequireOutcomeUnknownV1;
+    // FORK-LOCAL (Tideshift, WP-124): same order as ServerInfo.
     let features = if required {
-        vec!["outcome_unknown_v1", "requires_outcome_unknown_v1"]
+        vec![
+            "outcome_unknown_v1",
+            "quic_caller_declaration_v1",
+            "requires_outcome_unknown_v1",
+        ]
     } else {
-        vec!["outcome_unknown_v1"]
+        vec!["outcome_unknown_v1", "quic_caller_declaration_v1"]
     };
     axum::Json(serde_json::json!({
         "policy": if required { "require_outcome_unknown_v1" } else { "compatible_single_replica" },

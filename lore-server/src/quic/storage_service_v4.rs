@@ -25,6 +25,7 @@ use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::grpc::caller_capabilities::CallerCapabilityPolicy;
 use crate::grpc::caller_capabilities::admit_quic;
+use crate::grpc::caller_capabilities::parse_capability_list;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -65,6 +66,8 @@ pub enum ParsedStorageRequestV4 {
         repository: lore_revision::lore::RepositoryId,
         correlation_id: String,
         auth_token: Vec<u8>,
+        /// FORK-LOCAL (Tideshift, WP-124): `Some` for `AuthorizeStart` action 2.
+        caller_capabilities: Option<String>,
     },
     AuthorizeStop {
         session_id: u32,
@@ -198,6 +201,7 @@ impl QuicService for StorageServiceV4 {
                     repository: start.repository,
                     correlation_id: start.correlation_id,
                     auth_token: start.auth_token,
+                    caller_capabilities: start.caller_capabilities,
                 }),
                 AuthorizeAction::Stop(stop) => Ok(ParsedStorageRequestV4::AuthorizeStop {
                     session_id: stop.session_id,
@@ -231,7 +235,16 @@ impl QuicService for StorageServiceV4 {
                 repository,
                 correlation_id,
                 auth_token,
+                caller_capabilities,
             } => {
+                // FORK-LOCAL (Tideshift, WP-124): an action-2 list is checked before the
+                // token, so a malformed declaration creates no session. Compatible policy
+                // records the flag; only the required policy reads it.
+                let declared = match caller_capabilities.as_deref() {
+                    None => false,
+                    Some(list) => parse_capability_list(list)
+                        .map_err(|_invalid| MessageHandleError::UnsupportedClient)?,
+                };
                 let mut user_id = String::new();
                 let mut permissions: Vec<String> = Vec::new();
                 let mut grants = None;
@@ -279,12 +292,14 @@ impl QuicService for StorageServiceV4 {
                     permissions,
                     grants,
                     token,
+                    declared,
                 ) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
                             repository = %repository,
                             correlation_id,
+                            declared,
                             "Authorized session"
                         );
                         let response_data = vec![Bytes::copy_from_slice(&session_id.to_le_bytes())];
@@ -323,6 +338,7 @@ impl QuicService for StorageServiceV4 {
                 let permissions = session.permissions.clone();
                 let token = session.token.clone();
                 let authorized_sources = session.authorized_sources.clone();
+                let declared = session.declared;
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -342,7 +358,7 @@ impl QuicService for StorageServiceV4 {
                 // silent fall-through to "ungated".
                 use crate::quic::storage_service::ParsedStorageRequest as Req;
                 // Caller admission runs first, before write authorization (contract order).
-                admit_quic(self.caller_capability_policy, &parsed)?;
+                admit_quic(self.caller_capability_policy, &parsed, declared)?;
                 match &parsed {
                     Req::Put(_) => self.require_write(&permissions, "Put")?,
                     Req::PutResolved(_) => self.require_write(&permissions, "PutResolved")?,

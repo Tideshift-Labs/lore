@@ -457,10 +457,23 @@ async fn readiness_reports_the_frozen_policy_and_contract() {
         assert_eq!(value["contract"], "grpc-caller-capability-admission-v1");
         let features = value["features"].as_array().unwrap();
         assert!(features.contains(&serde_json::json!("outcome_unknown_v1")));
+        // WP-124: the server implements AuthorizeStart action 2, under either policy.
+        assert!(features.contains(&serde_json::json!("quic_caller_declaration_v1")));
         assert_eq!(
             features.contains(&serde_json::json!("requires_outcome_unknown_v1")),
             required
         );
+        // The exact set and order: lorehub's dev-cell readiness reads this list.
+        let expected = if required {
+            serde_json::json!([
+                "outcome_unknown_v1",
+                "quic_caller_declaration_v1",
+                "requires_outcome_unknown_v1"
+            ])
+        } else {
+            serde_json::json!(["outcome_unknown_v1", "quic_caller_declaration_v1"])
+        };
+        assert_eq!(value["features"], expected, "{label}");
         assert_eq!(
             admit(policy, "/urc.rpc.StorageService/Put", &HeaderMap::new()).is_err(),
             required

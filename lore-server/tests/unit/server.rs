@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 /// Covers where the local store ends up on disk, and whether that location
 /// survives a reboot.
@@ -801,3 +802,38 @@ mod wait_for_shutdown_tests {
 
 /// FORK-LOCAL (Tideshift): WP-120 public-QUIC caller-capability wiring.
 mod quic_caller_capability_wiring;
+
+/// WP-124: `ServerInfo` advertises `quic_caller_declaration_v1` ("this server implements
+/// `AuthorizeStart` action 2") unconditionally, right after `outcome_unknown_v1` and before the
+/// policy-gated `requires_outcome_unknown_v1`. The list is built inline in `async_main`, so the
+/// pin reads the source: comment lines are stripped, and the push must not sit inside a block.
+#[test]
+fn server_info_advertises_quic_caller_declaration_unconditionally_and_in_order() {
+    const SERVER: &str = include_str!("../../src/server.rs");
+    let code = SERVER
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let outcome = r#"features_list.push("outcome_unknown_v1".to_string());"#;
+    let declaration = r#"features_list.push("quic_caller_declaration_v1".to_string());"#;
+    let required = r#"features_list.push("requires_outcome_unknown_v1".to_string());"#;
+    for needle in [outcome, declaration, required] {
+        assert_eq!(code.matches(needle).count(), 1, "{needle}");
+    }
+    let at = |needle: &str| code.find(needle).unwrap();
+    assert!(
+        at(outcome) < at(declaration),
+        "declaration follows outcome_unknown_v1"
+    );
+    assert!(
+        at(declaration) < at(required),
+        "declaration precedes the policy-gated feature"
+    );
+    let between = &code[at(outcome) + outcome.len()..at(declaration)];
+    assert!(
+        !between.contains('{') && !between.contains("if "),
+        "the declaration push must be unconditional, found: {between:?}"
+    );
+}

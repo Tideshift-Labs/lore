@@ -732,6 +732,8 @@ async fn launch_grpc_server(
     );
 
     features_list.push("outcome_unknown_v1".to_string());
+    // FORK-LOCAL (Tideshift, WP-124): this server implements QUIC `AuthorizeStart` action 2.
+    features_list.push("quic_caller_declaration_v1".to_string());
     if grpc_settings.caller_capability_policy
         == crate::grpc::caller_capabilities::CallerCapabilityPolicy::RequireOutcomeUnknownV1
     {

@@ -554,7 +554,9 @@ impl QuicService for StorageService {
         // purpose: a new variant from an upstream merge must fail to compile here
         // rather than silently fall through to "ungated".
         // Caller admission runs first, before write authorization (contract order).
-        admit_quic(self.caller_capability_policy, &request)?;
+        // FORK-LOCAL (Tideshift, WP-124): urc/0.2 has no sessions, so it is never declared
+        // and stays read-only under the required policy.
+        admit_quic(self.caller_capability_policy, &request, false)?;
         match &request {
             ParsedStorageRequest::Put(_) => self.require_write(&context, "Put")?,
             ParsedStorageRequest::PutResolved(_) => self.require_write(&context, "PutResolved")?,

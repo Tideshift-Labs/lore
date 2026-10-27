@@ -127,6 +127,7 @@ async fn authorize_start_returns_slow_down_when_session_limit_reached() {
                     repository: repo,
                     correlation_id: format!("fill-{i}"),
                     auth_token: vec![],
+                    caller_capabilities: None,
                 },
             )
             .await;
@@ -141,6 +142,7 @@ async fn authorize_start_returns_slow_down_when_session_limit_reached() {
                 repository: repo,
                 correlation_id: "over-limit".into(),
                 auth_token: vec![],
+                caller_capabilities: None,
             },
         )
         .await
@@ -284,6 +286,7 @@ mod authorized_session {
                     repository,
                     correlation_id: "corr".to_string(),
                     auth_token: token.as_bytes().to_vec(),
+                    caller_capabilities: None,
                 },
             )
             .await?;
@@ -451,6 +454,93 @@ mod authorized_session {
         assert_eq!(source_checks.load(Ordering::Relaxed), 1);
     }
 
+    async fn start_declared(
+        service: &StorageServiceV4,
+        repository: lore_revision::lore::RepositoryId,
+        token: &str,
+        caller_capabilities: Option<&str>,
+    ) -> Result<u32, MessageHandleError> {
+        let response = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::AuthorizeStart {
+                    repository,
+                    correlation_id: "corr".to_string(),
+                    auth_token: token.as_bytes().to_vec(),
+                    caller_capabilities: caller_capabilities.map(str::to_string),
+                },
+            )
+            .await?;
+        Ok(u32::from_le_bytes(response[0][..4].try_into().unwrap()))
+    }
+
+    /// WP-124: an invalid list is refused BEFORE the token is verified. A garbage token with a
+    /// bad list answers `UnsupportedClient` (200); the same garbage token with a good list
+    /// reaches verification and answers `AuthorizationFailure`, which is the positive control
+    /// that the token check still runs for a valid declaration.
+    #[tokio::test]
+    async fn an_invalid_capability_list_is_refused_before_the_token_is_verified() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+
+        let err = start_declared(&service, repository, "not-a-jwt", Some("z,a"))
+            .await
+            .expect_err("an unsorted list must be refused");
+        assert!(
+            matches!(err, MessageHandleError::UnsupportedClient),
+            "{err:?}"
+        );
+        let info = service.transform_protocol_error(&err);
+        assert_eq!(info.response_error_code, 200);
+        assert!(service.session_map.entries.is_empty());
+
+        // An empty token with a bad list is still UnsupportedClient, not MissingToken.
+        let err = start_declared(&service, repository, "", Some("A"))
+            .await
+            .expect_err("an uppercase list must be refused");
+        assert!(
+            matches!(err, MessageHandleError::UnsupportedClient),
+            "{err:?}"
+        );
+
+        // Positive control: a valid list gets as far as the token.
+        let err = start_declared(
+            &service,
+            repository,
+            "not-a-jwt",
+            Some("outcome_unknown_v1"),
+        )
+        .await
+        .expect_err("a garbage token must be refused");
+        assert!(
+            matches!(err, MessageHandleError::AuthorizationFailure(_)),
+            "{err:?}"
+        );
+        let err = start_declared(&service, repository, "", Some("outcome_unknown_v1"))
+            .await
+            .expect_err("an empty token must be refused");
+        assert!(matches!(err, MessageHandleError::MissingToken), "{err:?}");
+        assert!(service.session_map.entries.is_empty());
+    }
+
+    /// A declared, verified session keeps its token-derived permissions and grants alongside
+    /// the flag.
+    #[tokio::test]
+    async fn a_declared_session_keeps_its_verified_permissions() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let token = signed_token(&[&format!("urc-{repository}")], &["read", "write"]);
+
+        let session_id = start_declared(&service, repository, &token, Some("outcome_unknown_v1"))
+            .await
+            .unwrap();
+
+        let session = service.session_map.get(session_id).unwrap();
+        assert!(session.declared);
+        assert!(session.permissions.iter().any(|p| p == "write"));
+        assert_eq!(session.token.as_ref().unwrap().raw, token);
+        assert_eq!(session.user_id, "test-user");
+    }
     #[tokio::test]
     async fn ungranted_session_start_is_refused() {
         let service = authenticated_service().await;
@@ -562,7 +652,15 @@ mod require_write_dispatch_gate {
         let repo = random::<lore_revision::lore::RepositoryId>();
         let (session_id, _) = service
             .session_map
-            .start(repo, "corr".into(), "user".into(), permissions, None, None)
+            .start(
+                repo,
+                "corr".into(),
+                "user".into(),
+                permissions,
+                None,
+                None,
+                false,
+            )
             .expect("seed session");
         session_id
     }
@@ -647,5 +745,235 @@ mod require_write_dispatch_gate {
             )
             .await
             .expect("auth off must bypass the gate");
+    }
+}
+
+/// WP-124 slice 1: the declaration carried by `AuthorizeStart` action 2 is validated once, at
+/// session open, and recorded on the session.
+mod caller_declaration {
+    use std::sync::atomic::Ordering;
+
+    use lore_server::grpc::caller_capabilities::CallerCapabilityPolicy;
+
+    use super::*;
+
+    async fn service(policy: CallerCapabilityPolicy) -> StorageServiceV4 {
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("Failed to create stores");
+        make_service(immutable_store, mutable_store).with_caller_capability_policy(policy)
+    }
+
+    async fn start(
+        service: &StorageServiceV4,
+        caller_capabilities: Option<&str>,
+    ) -> Result<u32, MessageHandleError> {
+        let response = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                ParsedStorageRequestV4::AuthorizeStart {
+                    repository: random::<lore_revision::lore::RepositoryId>(),
+                    correlation_id: "corr".to_string(),
+                    auth_token: vec![],
+                    caller_capabilities: caller_capabilities.map(str::to_string),
+                },
+            )
+            .await?;
+        Ok(u32::from_le_bytes(response[0][..4].try_into().unwrap()))
+    }
+
+    const POLICIES: [CallerCapabilityPolicy; 2] = [
+        CallerCapabilityPolicy::CompatibleSingleReplica,
+        CallerCapabilityPolicy::RequireOutcomeUnknownV1,
+    ];
+
+    #[tokio::test]
+    async fn the_declared_flag_is_recorded_on_the_session() {
+        for policy in POLICIES {
+            let service = service(policy).await;
+            for (caps, expected) in [
+                // Action 0 carries no list.
+                (None, false),
+                (Some("outcome_unknown_v1"), true),
+                (Some("a,outcome_unknown_v1,z"), true),
+                // A valid list without the token is an undeclared session, not a refusal.
+                (Some("other_capability"), false),
+                (Some("a,b"), false),
+            ] {
+                let session_id = start(&service, caps)
+                    .await
+                    .unwrap_or_else(|e| panic!("{policy:?} {caps:?}: {e:?}"));
+                assert_eq!(
+                    service.session_map.get(session_id).unwrap().declared,
+                    expected,
+                    "{policy:?} {caps:?}"
+                );
+            }
+        }
+    }
+
+    /// The flag belongs to one session: a declared session beside an undeclared one in the
+    /// same map leaves each with its own answer.
+    #[tokio::test]
+    async fn the_declared_flag_is_scoped_to_its_own_session() {
+        let service = service(CallerCapabilityPolicy::RequireOutcomeUnknownV1).await;
+        let declared = start(&service, Some("outcome_unknown_v1")).await.unwrap();
+        let plain = start(&service, None).await.unwrap();
+        let again = start(&service, Some("outcome_unknown_v1")).await.unwrap();
+        assert!(service.session_map.get(declared).unwrap().declared);
+        assert!(!service.session_map.get(plain).unwrap().declared);
+        assert!(service.session_map.get(again).unwrap().declared);
+    }
+
+    fn sixteen_tokens_of(len: usize) -> String {
+        (0..16)
+            .map(|i| format!("a{i:02}{}", "x".repeat(len - 3)))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    #[tokio::test]
+    async fn an_invalid_capability_list_is_refused_with_200_and_no_session() {
+        let too_many = (0..17)
+            .map(|i| format!("a{i:02}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let invalid = [
+            String::new(),
+            "z,a".into(),
+            "a,a".into(),
+            "outcome_unknown_v1,outcome_unknown_v1".into(),
+            "a,,b".into(),
+            "a,".into(),
+            ",a".into(),
+            " a".into(),
+            "a b".into(),
+            "A".into(),
+            "Outcome_unknown_v1".into(),
+            "0a".into(),
+            "a-b".into(),
+            "caf\u{e9}".into(),
+            "a".repeat(65),
+            too_many,
+            // 16 well-formed tokens that only break the 1024-byte cap.
+            sixteen_tokens_of(64),
+        ];
+        assert!(invalid.last().unwrap().len() > 1024);
+        for policy in POLICIES {
+            let service = service(policy).await;
+            for caps in &invalid {
+                let err = start(&service, Some(caps))
+                    .await
+                    .expect_err(&format!("{policy:?}: {caps:?} must be refused"));
+                assert!(
+                    matches!(err, MessageHandleError::UnsupportedClient),
+                    "{policy:?} {caps:?}: {err:?}"
+                );
+                let info = service.transform_protocol_error(&err);
+                assert_eq!(
+                    info.response_error_code,
+                    QuicServiceError::ImplementationReserved as QuicErrorStatus
+                );
+                assert_eq!(info.response_error_code, 200);
+                assert!(!info.is_internal_error);
+            }
+            assert!(
+                service.session_map.entries.is_empty(),
+                "{policy:?}: a refused declaration created a session"
+            );
+            assert_eq!(
+                service.session_map.active_sessions.load(Ordering::Acquire),
+                0
+            );
+
+            // Positive control: the same service still opens a valid declaration afterwards.
+            let id = start(&service, Some("outcome_unknown_v1")).await.unwrap();
+            assert!(service.session_map.get(id).unwrap().declared);
+        }
+    }
+
+    /// The boundary: exactly 1024 bytes of well-formed tokens is accepted.
+    #[tokio::test]
+    async fn a_capability_list_of_exactly_1024_bytes_is_accepted() {
+        let mut tokens = (0..16)
+            .map(|i| format!("a{i:02}{}", "x".repeat(60)))
+            .collect::<Vec<_>>();
+        tokens[15].push('x');
+        let list = tokens.join(",");
+        assert_eq!(list.len(), 1024);
+        let service = service(CallerCapabilityPolicy::RequireOutcomeUnknownV1).await;
+        let id = start(&service, Some(&list)).await.unwrap();
+        assert!(!service.session_map.get(id).unwrap().declared);
+    }
+
+    /// A refused declaration does not consume an admission slot: with the map full, the answer
+    /// for a bad list is still 200 (the list is judged first), and a valid start still hits the
+    /// session limit.
+    #[tokio::test]
+    async fn a_bad_list_is_judged_before_the_session_limit() {
+        let service = service(CallerCapabilityPolicy::CompatibleSingleReplica).await;
+        for _ in 0..lore_server::protocol::storage::session::MAX_CONCURRENT_SESSIONS {
+            start(&service, None).await.unwrap();
+        }
+        let err = start(&service, Some("z,a")).await.unwrap_err();
+        assert!(
+            matches!(err, MessageHandleError::UnsupportedClient),
+            "{err:?}"
+        );
+        let err = start(&service, Some("outcome_unknown_v1"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MessageHandleError::SessionLimitReached),
+            "{err:?}"
+        );
+    }
+
+    /// The parsed request from the wire carries the list through `parse_request_bytes`.
+    #[tokio::test]
+    async fn action_two_bytes_reach_the_handler_as_a_capability_list() {
+        use zerocopy::IntoBytes;
+
+        let service = service(CallerCapabilityPolicy::RequireOutcomeUnknownV1).await;
+        let repo = random::<lore_revision::lore::RepositoryId>();
+        let caps = b"outcome_unknown_v1";
+        let mut payload = vec![lore_server::protocol::storage::authorize::ACTION_START_DECLARED];
+        payload.extend_from_slice(repo.as_bytes());
+        payload.push(4);
+        payload.extend_from_slice(b"corr");
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&(caps.len() as u16).to_le_bytes());
+        payload.extend_from_slice(caps);
+
+        let parsed = service
+            .parse_request_bytes(
+                &make_header(Command::Authorize as u8),
+                Bytes::from(payload.clone()),
+            )
+            .expect("action 2 must parse");
+        let ParsedStorageRequestV4::AuthorizeStart {
+            repository,
+            caller_capabilities,
+            ..
+        } = &parsed
+        else {
+            panic!("expected AuthorizeStart, got {parsed:?}");
+        };
+        assert_eq!(*repository, repo);
+        assert_eq!(caller_capabilities.as_deref(), Some("outcome_unknown_v1"));
+
+        let response = service
+            .run_request_handler(AttributeMap::default().into(), parsed)
+            .await
+            .unwrap();
+        let session_id = u32::from_le_bytes(response[0][..4].try_into().unwrap());
+        assert!(service.session_map.get(session_id).unwrap().declared);
+
+        // Trailing bytes are a parse failure at the service boundary too.
+        payload.push(0);
+        assert!(
+            service
+                .parse_request_bytes(&make_header(Command::Authorize as u8), Bytes::from(payload))
+                .is_err()
+        );
     }
 }

@@ -724,6 +724,7 @@ impl QuicV04 {
                 vec![],
                 None,
                 None,
+                false,
             )
             .expect("seed session");
         service

@@ -37,6 +37,7 @@ async fn start_session(service: &StorageServiceV4, repository: RepositoryId, tok
                 repository,
                 correlation_id: "corr".to_string(),
                 auth_token: token.as_bytes().to_vec(),
+                caller_capabilities: None,
             },
         )
         .await

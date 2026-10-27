@@ -288,10 +288,27 @@ pub fn declares_outcome_unknown(headers: &HeaderMap) -> Result<bool, Status> {
     let Some(value) = values.next() else {
         return Ok(false);
     };
-    if values.next().is_some() || value.as_bytes().len() > 1024 {
+    if values.next().is_some() {
         return Err(unsupported_client());
     }
     let value = value.to_str().map_err(|_err| unsupported_client())?;
+    parse_capability_list(value).map_err(|InvalidCapabilityList| unsupported_client())
+}
+
+/// The byte limit of a capability list, on every carrier.
+pub const MAX_CAPABILITY_LIST_LEN: usize = 1024;
+
+/// A capability list that breaks the declaration grammar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvalidCapabilityList;
+
+/// The declaration grammar shared by gRPC, HTTP and QUIC (`AuthorizeStart` action 2): at most
+/// [`MAX_CAPABILITY_LIST_LEN`] bytes and 16 tokens, each `[a-z][a-z0-9_]{0,63}`, strictly
+/// ascending, none empty. `Ok(true)` when the list declares the required capability.
+pub fn parse_capability_list(value: &str) -> Result<bool, InvalidCapabilityList> {
+    if value.len() > MAX_CAPABILITY_LIST_LEN {
+        return Err(InvalidCapabilityList);
+    }
     let mut previous: Option<&str> = None;
     let mut declared = false;
     for (index, token) in value.split(',').enumerate() {
@@ -305,7 +322,7 @@ pub fn declares_outcome_unknown(headers: &HeaderMap) -> Result<bool, Status> {
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'_')
             || previous.is_some_and(|prior| prior >= token)
         {
-            return Err(unsupported_client());
+            return Err(InvalidCapabilityList);
         }
         previous = Some(token);
         declared |= token == REQUIRED_CAPABILITY;
@@ -355,18 +372,33 @@ pub fn admit(
     }
 }
 
-/// QUIC storage admission. QUIC has no declaration carrier, so under the required policy
-/// public QUIC is read-only: every mutation is refused before write authorization and
-/// before any store effect. EXHAUSTIVE on purpose: a new command must be classified here.
+/// QUIC storage admission. The declaration carrier is the storage session: `declared` is the
+/// flag fixed when a `lore-storage/0.4` session opened with `AuthorizeStart` action 2 and a
+/// list containing `outcome_unknown_v1` (WP-124). Under the required policy an undeclared
+/// session is read-only: every mutation is refused before write authorization and before any
+/// store effect. A declared session's mutations pass here and still face write
+/// authorization. `urc/0.2` has no sessions and always passes `false`. EXHAUSTIVE on
+/// purpose: a new command must be classified here.
 pub fn admit_quic(
     policy: CallerCapabilityPolicy,
     request: &crate::quic::storage_service::ParsedStorageRequest,
+    declared: bool,
 ) -> Result<(), crate::protocol::storage::messages::MessageHandleError> {
     use crate::quic::storage_service::ParsedStorageRequest as Req;
     if policy == CallerCapabilityPolicy::CompatibleSingleReplica {
         return Ok(());
     }
     match request {
+        Req::Put(_)
+        | Req::PutResolved(_)
+        | Req::Copy(_)
+        | Req::MutableStoreOp(_)
+        | Req::MutableCas(_)
+            if declared =>
+        {
+            Ok(())
+        }
+        Req::Verify(verify) if verify.heal != 0 && declared => Ok(()),
         Req::Put(_)
         | Req::PutResolved(_)
         | Req::Copy(_)
@@ -452,9 +484,9 @@ pub(crate) fn validate_serving_fragment_route(
 }
 
 /// Run before storage or listeners start. Internal, forwarded and store-forwarding ingress
-/// have no admission gate, so the required policy forbids them. Public QUIC (`admit_quic`)
-/// and HTTP content PUT (`http::server::caller_capability_admission`, plus
-/// `content_upload_drain`) carry their own.
+/// have no admission gate, so the required policy forbids them. Public QUIC (`admit_quic`,
+/// declared per `lore-storage/0.4` session) and HTTP content PUT
+/// (`http::server::caller_capability_admission`, plus `content_upload_drain`) carry their own.
 pub fn validate_settings(settings: &crate::settings::Settings) -> anyhow::Result<()> {
     let server = &settings.server;
     if !server.grpc.as_ref().is_some_and(|grpc| {
@@ -470,7 +502,7 @@ pub fn validate_settings(settings: &crate::settings::Settings) -> anyhow::Result
             .is_some(),
         "required caller capability policy requires JWT authentication"
     );
-    // Public QUIC may stay on: `admit_quic` makes it read-only under this policy.
+    // Public QUIC may stay on: `admit_quic` admits writes only on a declared session.
     anyhow::ensure!(
         !server
             .quic_internal

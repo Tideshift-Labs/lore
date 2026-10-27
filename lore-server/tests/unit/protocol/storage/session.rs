@@ -24,6 +24,7 @@ fn bare_entry(repository: RepositoryId, correlation_id: &str, user_id: &str) -> 
         grants: None,
         token: None,
         authorized_sources: Arc::new(DashSet::new()),
+        declared: false,
     }
 }
 
@@ -66,6 +67,7 @@ mod entry_permits {
             grants,
             token,
             authorized_sources: Arc::new(DashSet::new()),
+            declared: false,
         }
     }
 
@@ -129,6 +131,7 @@ fn start_returns_a_nonzero_id() {
             Vec::new(),
             None,
             None,
+            false,
         )
         .unwrap();
     // A weaker claim than the name this test used to have
@@ -236,10 +239,26 @@ fn start_advances_the_session_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, _) = map
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let (id2, _) = map
-        .start(repo, "corr-2".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-2".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     assert_ne!(id1, id2);
 }
@@ -254,7 +273,15 @@ fn two_maps_never_issue_the_same_session_id() {
     let repo = random::<RepositoryId>();
 
     let (id1, _) = first
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let (id2, _) = second
         .start(
@@ -264,6 +291,7 @@ fn two_maps_never_issue_the_same_session_id() {
             Vec::new(),
             None,
             None,
+            false,
         )
         .unwrap();
 
@@ -284,10 +312,26 @@ fn start_always_allocates_new_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, _) = map
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let (id2, _) = map
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     assert_ne!(id1, id2);
 }
@@ -297,10 +341,26 @@ fn start_empty_correlation_generates_uuid() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, corr1) = map
-        .start(repo, String::new(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     let (id2, corr2) = map
-        .start(repo, String::new(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            String::new(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     assert_ne!(id1, id2);
     assert!(!corr1.is_empty());
@@ -313,7 +373,15 @@ fn stop_removes_session() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id, _) = map
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     assert!(map.get(id).is_some());
     map.stop(id).unwrap();
@@ -338,6 +406,7 @@ fn stop_already_stopped_returns_not_found() {
             Vec::new(),
             None,
             None,
+            false,
         )
         .unwrap();
     map.stop(id).unwrap();
@@ -355,11 +424,27 @@ fn start_after_stop_allocates_new_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, _) = map
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     map.stop(id1).unwrap();
     let (id2, _) = map
-        .start(repo, "corr-1".into(), String::new(), Vec::new(), None, None)
+        .start(
+            repo,
+            "corr-1".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
         .unwrap();
     assert_ne!(id1, id2);
 }
@@ -376,6 +461,7 @@ fn get_returns_entry_with_user_id() {
             vec!["read".into(), "write".into()],
             None,
             None,
+            false,
         )
         .unwrap();
     let entry = map.get(id).unwrap();
@@ -403,6 +489,7 @@ fn concurrent_session_limit() {
             Vec::new(),
             None,
             None,
+            false,
         )
         .unwrap();
     }
@@ -413,7 +500,8 @@ fn concurrent_session_limit() {
             String::new(),
             Vec::new(),
             None,
-            None
+            None,
+            false
         ),
         Err(SessionError::LimitReached)
     );
@@ -433,6 +521,7 @@ fn limit_freed_by_stop() {
                 Vec::new(),
                 None,
                 None,
+                false,
             )
             .unwrap();
         ids.push(id);
@@ -444,13 +533,22 @@ fn limit_freed_by_stop() {
             String::new(),
             Vec::new(),
             None,
-            None
+            None,
+            false
         ),
         Err(SessionError::LimitReached)
     );
     map.stop(ids[0]).unwrap();
-    map.start(repo, "freed".into(), String::new(), Vec::new(), None, None)
-        .unwrap();
+    map.start(
+        repo,
+        "freed".into(),
+        String::new(),
+        Vec::new(),
+        None,
+        None,
+        false,
+    )
+    .unwrap();
 }
 
 /// A length check followed by insert lets every caller below the limit pass at once. Seed one
@@ -477,6 +575,7 @@ fn concurrent_starts_cannot_overbook_the_session_limit() {
                         Vec::new(),
                         None,
                         None,
+                        false,
                     )
                     .is_ok()
                 })
@@ -515,6 +614,7 @@ fn allocation_failure_refunds_the_claimed_session_slot() {
         Vec::new(),
         None,
         None,
+        false,
     );
 
     assert_eq!(result, Err(SessionError::CounterExhausted));
@@ -523,4 +623,55 @@ fn allocation_failure_refunds_the_claimed_session_slot() {
         OCCUPIED,
         "failed allocation must refund the admission slot it claimed"
     );
+}
+
+/// WP-124: the declaration is fixed when the session starts, recorded per session, and does
+/// not leak between two sessions of one map.
+#[test]
+fn start_records_the_declared_flag_per_session() {
+    let map = SessionMap::default();
+    let repo = random::<RepositoryId>();
+    let (declared_id, _) = map
+        .start(
+            repo,
+            "declared".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+    let (plain_id, _) = map
+        .start(
+            repo,
+            "plain".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+    assert!(map.get(declared_id).unwrap().declared);
+    assert!(!map.get(plain_id).unwrap().declared);
+}
+
+#[test]
+fn start_from_records_the_declared_flag() {
+    let map = SessionMap::default();
+    let sequence = AtomicU32::new(900);
+    let (id, _) = map
+        .start_from(
+            &sequence,
+            random(),
+            "declared".into(),
+            String::new(),
+            Vec::new(),
+            None,
+            None,
+            true,
+        )
+        .unwrap();
+    assert!(map.get(id).unwrap().declared);
 }

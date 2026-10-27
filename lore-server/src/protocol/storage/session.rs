@@ -81,6 +81,10 @@ pub struct SessionEntry {
     /// spares a `CheckUserPermission` round trip per copy. Scoped to the
     /// session, so does not leak permissions for a shared Connection.
     pub authorized_sources: Arc<DashSet<RepositoryId>>,
+    /// FORK-LOCAL (Tideshift, WP-124): the session opened with `AuthorizeStart` action 2 and a
+    /// list declaring `outcome_unknown_v1`. Fixed at start and never changed. It scopes to this
+    /// session only, never to the connection or to sibling sessions on it.
+    pub declared: bool,
 }
 
 impl SessionEntry {
@@ -184,6 +188,10 @@ impl SessionMap {
 
     /// Start a new session. Always allocates a fresh session ID — deduplication
     /// is the client's responsibility (`StorageConnector`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one field per SessionEntry input; FORK-LOCAL (Tideshift, WP-124) added `declared`"
+    )]
     pub fn start(
         &self,
         repository: RepositoryId,
@@ -192,6 +200,7 @@ impl SessionMap {
         permissions: Vec<String>,
         grants: Option<Grants>,
         token: Option<Arc<VerifiedTokenOwned>>,
+        declared: bool,
     ) -> Result<(u32, String), SessionError> {
         self.start_from(
             &NEXT_SESSION_ID,
@@ -201,6 +210,7 @@ impl SessionMap {
             permissions,
             grants,
             token,
+            declared,
         )
     }
 
@@ -219,6 +229,7 @@ impl SessionMap {
         permissions: Vec<String>,
         grants: Option<Grants>,
         token: Option<Arc<VerifiedTokenOwned>>,
+        declared: bool,
     ) -> Result<(u32, String), SessionError> {
         self.active_sessions
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -242,6 +253,7 @@ impl SessionMap {
                 grants,
                 token,
                 authorized_sources: Arc::new(DashSet::new()),
+                declared,
             },
         ) {
             Ok(session_id) => session_id,

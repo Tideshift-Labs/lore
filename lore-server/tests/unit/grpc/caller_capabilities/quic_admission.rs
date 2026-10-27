@@ -2,11 +2,15 @@
 // SPDX-License-Identifier: MIT
 //! WP-120 strict caller admission on QUIC (`admit_quic`).
 //!
-//! QUIC has no capability declaration, so under `require_outcome_unknown_v1` public QUIC is
-//! read-only: every mutation is refused with storage status 200 (`unsupported-client`) before
-//! write authorization and before any store call. `compatible_single_replica` is unchanged.
-//! Each command is driven through both storage protocols (lore-storage/0.4 and urc/0.2) under
-//! both policies, against stores that count every call they receive.
+//! `urc/0.2` has no capability declaration, and a `lore-storage/0.4` session opened with
+//! `AuthorizeStart` action 0 declares nothing, so under `require_outcome_unknown_v1` those
+//! callers are read-only: every mutation is refused with storage status 200
+//! (`unsupported-client`) before write authorization and before any store call.
+//! `compatible_single_replica` is unchanged. WP-124: a `lore-storage/0.4` session opened with
+//! action 2 and `outcome_unknown_v1` is declared, and its mutations pass admission and then
+//! face write authorization as usual. Each command is driven through both storage protocols
+//! under both policies (and declared/undeclared on v4), against stores that count every call
+//! they receive.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -29,8 +33,11 @@ use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::grpc::caller_capabilities::ADMISSION_HEADER;
+use lore_server::grpc::caller_capabilities::CAPABILITIES_HEADER;
 use lore_server::grpc::caller_capabilities::CallerCapabilityPolicy;
 use lore_server::grpc::caller_capabilities::admit_quic;
+use lore_server::grpc::caller_capabilities::declares_outcome_unknown;
+use lore_server::grpc::caller_capabilities::parse_capability_list;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::MessageHandleError;
 use lore_server::protocol::storage::put::Put;
@@ -529,6 +536,7 @@ fn service(
                     vec!["read".into()],
                     None,
                     None,
+                    false,
                 )
                 .expect("seed session");
             Service::V4(service, session_id)
@@ -628,27 +636,39 @@ fn admit_quic_classifies_every_request_variant() {
     for cmd in MUTATIONS {
         for v4 in [true, false] {
             let request = cmd.parsed(repository, v4);
+            // Undeclared rows: the pre-WP-124 behaviour, unchanged.
             assert!(
                 matches!(
-                    admit_quic(STRICT, &request),
+                    admit_quic(STRICT, &request, false),
                     Err(MessageHandleError::UnsupportedClient)
                 ),
-                "strict must refuse {cmd:?} (v4={v4})"
+                "strict must refuse {cmd:?} (v4={v4}) when undeclared"
             );
             assert!(
-                admit_quic(COMPATIBLE, &request).is_ok(),
+                admit_quic(COMPATIBLE, &request, false).is_ok(),
                 "compatible must admit {cmd:?} (v4={v4})"
+            );
+            // Declared rows: every mutation is admitted; compatible is indifferent.
+            assert!(
+                admit_quic(STRICT, &request, true).is_ok(),
+                "strict must admit {cmd:?} (v4={v4}) when declared"
+            );
+            assert!(
+                admit_quic(COMPATIBLE, &request, true).is_ok(),
+                "compatible must admit {cmd:?} (v4={v4}) when declared"
             );
         }
     }
     for cmd in READS {
         for v4 in [true, false] {
             let request = cmd.parsed(repository, v4);
-            assert!(
-                admit_quic(STRICT, &request).is_ok(),
-                "strict must admit {cmd:?} (v4={v4})"
-            );
-            assert!(admit_quic(COMPATIBLE, &request).is_ok());
+            for declared in [false, true] {
+                assert!(
+                    admit_quic(STRICT, &request, declared).is_ok(),
+                    "strict must admit {cmd:?} (v4={v4}, declared={declared})"
+                );
+                assert!(admit_quic(COMPATIBLE, &request, declared).is_ok());
+            }
         }
     }
     // Connection setup on the legacy protocol stays admitted, or no read could ever run.
@@ -661,11 +681,18 @@ fn admit_quic_classifies_every_request_variant() {
             request,
             ParsedStorageRequest::Connect(_) | ParsedStorageRequest::Correlate(_)
         ));
-        assert!(admit_quic(STRICT, &request).is_ok(), "{request:?}");
-        assert!(admit_quic(COMPATIBLE, &request).is_ok(), "{request:?}");
+        for declared in [false, true] {
+            assert!(
+                admit_quic(STRICT, &request, declared).is_ok(),
+                "{request:?}"
+            );
+            assert!(
+                admit_quic(COMPATIBLE, &request, declared).is_ok(),
+                "{request:?}"
+            );
+        }
     }
 }
-
 #[tokio::test]
 async fn strict_refuses_every_quic_mutation_with_200_and_no_store_call() {
     for protocol in [Protocol::V4, Protocol::Legacy] {
@@ -789,7 +816,15 @@ async fn services_built_without_a_policy_stay_compatible() {
     );
     let (session_id, _) = v4
         .session_map
-        .start(repository, "corr".into(), "user".into(), vec![], None, None)
+        .start(
+            repository,
+            "corr".into(),
+            "user".into(),
+            vec![],
+            None,
+            None,
+            false,
+        )
         .expect("seed session");
     v4.run_request_handler(
         AttributeMap::default().into(),
@@ -840,4 +875,386 @@ fn unsupported_client_maps_to_the_grpc_admission_refusal() {
             .is_none(),
         "a refusal is a confirmed non-effect, never an unknown outcome"
     );
+}
+
+// ---- WP-124 slice 1: declared v4 sessions ----------------------------------------------------
+
+/// A `lore-storage/0.4` service whose seeded session is `declared` and holds `write` or only
+/// `read`. `auth` puts a verifier in place with write enforcement on (so `write` matters).
+fn declared_v4_service(
+    policy: CallerCapabilityPolicy,
+    stores: &Stores,
+    repository: RepositoryId,
+    auth: bool,
+    declared: bool,
+    write: bool,
+) -> Service {
+    let verifier = if auth {
+        verifier_present()
+    } else {
+        Arc::new(None)
+    };
+    let service = StorageServiceV4::new(
+        verifier,
+        Arc::new(AllowAllRepositoryAuthorizer),
+        stores.immutable.clone(),
+        stores.local.clone(),
+        stores.mutable.clone(),
+        auth,
+        Arc::new(UserAgentFilter::default()),
+    )
+    .with_caller_capability_policy(policy);
+    let permissions = if write {
+        vec!["read".into(), "write".into()]
+    } else {
+        vec!["read".into()]
+    };
+    let (session_id, _) = service
+        .session_map
+        .start(
+            repository,
+            "corr".into(),
+            "user".into(),
+            permissions,
+            None,
+            None,
+            declared,
+        )
+        .expect("seed session");
+    Service::V4(service, session_id)
+}
+
+/// The full table through the v4 harness: every command x policy x declared/undeclared. Only
+/// a strict policy with an undeclared session refuses a mutation, with 200 and no store call;
+/// every other cell is admitted and, where the command reaches a counted store, reaches it.
+///
+/// Mutation probe (a), dropping the declared arm of `admit_quic`, turns the strict + declared
+/// mutation rows red.
+#[tokio::test]
+async fn v4_admission_table_command_by_policy_by_declaration() {
+    for policy in [STRICT, COMPATIBLE] {
+        for declared in [false, true] {
+            for cmd in MUTATIONS.into_iter().chain(READS) {
+                let case = format!("{policy:?} declared={declared} {cmd:?}");
+                let stores = Stores::new().await;
+                let repository = random::<RepositoryId>();
+                let service =
+                    declared_v4_service(policy, &stores, repository, false, declared, false);
+                let result = service.run(cmd, repository).await;
+                let refused = policy == STRICT && !declared && MUTATIONS.contains(&cmd);
+                if refused {
+                    let error = result.expect_err(&format!("{case}: must be refused"));
+                    assert_unsupported_client_on_the_wire(&service, &error, &case);
+                    assert_eq!(
+                        stores.calls(),
+                        0,
+                        "{case}: a refused mutation touched a store"
+                    );
+                } else {
+                    assert!(
+                        !matches!(result, Err(MessageHandleError::UnsupportedClient)),
+                        "{case}: must be admitted, got {result:?}"
+                    );
+                    if cmd.reaches_counted_store(Protocol::V4) {
+                        assert!(stores.calls() > 0, "{case}: never reached the store");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Declared + strict + `write` grant: the mutation passes admission and the write gate, and the
+/// store is called exactly once.
+#[tokio::test]
+async fn strict_declared_session_with_write_reaches_the_store_once() {
+    for cmd in [Cmd::Put, Cmd::MutableStore, Cmd::MutableCas] {
+        let case = format!("{cmd:?}");
+        let stores = Stores::new().await;
+        let repository = random::<RepositoryId>();
+        let service = declared_v4_service(STRICT, &stores, repository, true, true, true);
+        let result = service.run(cmd, repository).await;
+        assert!(
+            result.is_ok(),
+            "{case}: expected the write to succeed, got {result:?}"
+        );
+        assert_eq!(stores.calls(), 1, "{case}: exactly one store call");
+    }
+    // Every other mutation also clears both gates (whatever the store then answers).
+    for cmd in MUTATIONS {
+        let case = format!("{cmd:?}");
+        let stores = Stores::new().await;
+        let repository = random::<RepositoryId>();
+        let service = declared_v4_service(STRICT, &stores, repository, true, true, true);
+        let result = service.run(cmd, repository).await;
+        assert!(
+            !matches!(
+                result,
+                Err(MessageHandleError::UnsupportedClient
+                    | MessageHandleError::AuthorizationFailure(_))
+            ),
+            "{case}: a declared session with write must clear admission and the write gate, got {result:?}"
+        );
+    }
+}
+
+/// The contract order: admission, then write authorization. A declared session without the
+/// `write` grant passes admission and is then refused by the write gate with `NotAuthorized`
+/// (2), not by admission with 200, and no store is touched.
+///
+/// Mutation probe (b), swapping `admit_quic` and `require_write`, turns
+/// `strict_admission_runs_before_the_write_permission_gate` red (undeclared, expects 200). This
+/// test pins the other half of the pair: declared must see the write gate's answer.
+#[tokio::test]
+async fn strict_declared_session_without_write_is_not_authorized_not_unsupported() {
+    for cmd in MUTATIONS {
+        let case = format!("{cmd:?}");
+        let stores = Stores::new().await;
+        let repository = random::<RepositoryId>();
+        let service = declared_v4_service(STRICT, &stores, repository, true, true, false);
+        let error = service
+            .run(cmd, repository)
+            .await
+            .expect_err(&format!("{case}: the write gate must refuse"));
+        assert!(
+            matches!(error, MessageHandleError::AuthorizationFailure(_)),
+            "{case}: expected AuthorizationFailure, got {error:?}"
+        );
+        let (code, _, _) = service.wire_code(&error);
+        assert_eq!(
+            code,
+            QuicServiceError::NotAuthorized as QuicErrorStatus,
+            "{case}"
+        );
+        assert_eq!(code, 2, "{case}");
+        assert_eq!(stores.calls(), 0, "{case}");
+    }
+}
+
+/// The undeclared counterpart of the case above, side by side on the same service shape: no
+/// `write` grant, strict, undeclared is still 200. Declaration changes the answer, nothing else.
+#[tokio::test]
+async fn strict_undeclared_session_without_write_is_still_200() {
+    for cmd in MUTATIONS {
+        let case = format!("{cmd:?}");
+        let stores = Stores::new().await;
+        let repository = random::<RepositoryId>();
+        let service = declared_v4_service(STRICT, &stores, repository, true, false, false);
+        let error = service
+            .run(cmd, repository)
+            .await
+            .expect_err(&format!("{case}: must be refused"));
+        assert_unsupported_client_on_the_wire(&service, &error, &case);
+        assert_eq!(stores.calls(), 0, "{case}");
+    }
+}
+
+/// The real path end to end: the declaration made in `AuthorizeStart` decides the session's
+/// writes. Action 2 with `outcome_unknown_v1` writes; action 0 and a valid list without the
+/// token are refused with 200; sessions of one service do not share a declaration.
+#[tokio::test]
+async fn the_authorize_start_declaration_decides_the_sessions_writes() {
+    let stores = Stores::new().await;
+    let repository = random::<RepositoryId>();
+    let service = StorageServiceV4::new(
+        Arc::new(None),
+        Arc::new(AllowAllRepositoryAuthorizer),
+        stores.immutable.clone(),
+        stores.local.clone(),
+        stores.mutable.clone(),
+        false,
+        Arc::new(UserAgentFilter::default()),
+    )
+    .with_caller_capability_policy(STRICT);
+
+    let open = |caps: Option<&'static str>| {
+        let service = &service;
+        async move {
+            let response = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository,
+                        correlation_id: "corr".into(),
+                        auth_token: vec![],
+                        caller_capabilities: caps.map(str::to_string),
+                    },
+                )
+                .await
+                .expect("the session must open");
+            u32::from_le_bytes(response[0][..4].try_into().unwrap())
+        }
+    };
+    let put = |session_id: u32| {
+        let service = &service;
+        async move {
+            service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Cmd::Put.opcode(),
+                        payload: Cmd::Put.payload(repository, true),
+                    },
+                )
+                .await
+        }
+    };
+
+    // Opened in an order that would expose a declaration leaking between sessions.
+    let plain = open(None).await;
+    let declared = open(Some("outcome_unknown_v1")).await;
+    let other_caps = open(Some("other_capability")).await;
+    let declared_with_extras = open(Some("a,outcome_unknown_v1,z")).await;
+
+    for (name, session_id) in [("action 0", plain), ("other capability", other_caps)] {
+        let error = put(session_id).await.expect_err(name);
+        assert!(
+            matches!(error, MessageHandleError::UnsupportedClient),
+            "{name}: {error:?}"
+        );
+        assert_eq!(stores.calls(), 0, "{name}");
+    }
+    for (name, session_id) in [
+        ("declared", declared),
+        ("declared with extras", declared_with_extras),
+    ] {
+        let before = stores.calls();
+        put(session_id)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(stores.calls(), before + 1, "{name}");
+    }
+    // The undeclared session is still refused after the declared ones wrote.
+    let error = put(plain).await.expect_err("still undeclared");
+    assert!(matches!(error, MessageHandleError::UnsupportedClient));
+}
+
+/// `urc/0.2` has no declaration carrier: strict writes stay 200 with zero store calls, with auth
+/// off and with a verifier and write enforcement on. Pinned in source too, because no behaviour
+/// can tell `false` from a hard-coded `true` that no legacy request could ever change.
+#[tokio::test]
+async fn legacy_urc02_writes_stay_refused_under_strict() {
+    for auth in [false, true] {
+        for cmd in MUTATIONS {
+            let case = format!("auth={auth} {cmd:?}");
+            let stores = Stores::new().await;
+            let repository = random::<RepositoryId>();
+            let service = service(Protocol::Legacy, STRICT, &stores, repository, auth);
+            let error = service
+                .run(cmd, repository)
+                .await
+                .expect_err(&format!("{case}: must be refused"));
+            assert_unsupported_client_on_the_wire(&service, &error, &case);
+            assert_eq!(stores.calls(), 0, "{case}");
+        }
+    }
+}
+
+#[test]
+fn legacy_urc02_admits_with_declared_false_only() {
+    let source: String = include_str!("../../../../src/quic/storage_service.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .split_whitespace()
+        .collect();
+    let calls: Vec<_> = source.match_indices("admit_quic(").collect();
+    assert_eq!(
+        calls.len(),
+        1,
+        "urc/0.2 has exactly one admission call site"
+    );
+    assert!(
+        source.contains("admit_quic(self.caller_capability_policy,&request,false)"),
+        "urc/0.2 has no sessions and must always admit as undeclared"
+    );
+}
+
+// ---- grammar parity: one table, two entry points ---------------------------------------------
+
+/// The header path (`declares_outcome_unknown`) and the QUIC path (`parse_capability_list`)
+/// must accept and refuse the same strings and answer the same bool.
+#[test]
+fn the_header_and_quic_paths_share_one_grammar() {
+    let sixteen_of = |len: usize| -> String {
+        (0..16)
+            .map(|i| format!("a{i:02}{}", "x".repeat(len - 3)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let seventeen = (0..17)
+        .map(|i| format!("a{i:02}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut at_cap = (0..16)
+        .map(|i| format!("a{i:02}{}", "x".repeat(60)))
+        .collect::<Vec<_>>();
+    at_cap[15].push('x');
+    let at_cap = at_cap.join(",");
+    assert_eq!(at_cap.len(), 1024);
+    let over_cap = sixteen_of(64);
+    assert_eq!(over_cap.len(), 1039);
+
+    // (value, Some(declared) when accepted, None when refused)
+    let table: Vec<(String, Option<bool>)> = vec![
+        ("outcome_unknown_v1".into(), Some(true)),
+        ("a,outcome_unknown_v1,z".into(), Some(true)),
+        ("other_capability".into(), Some(false)),
+        ("a,b".into(), Some(false)),
+        ("a".repeat(64), Some(false)),
+        (at_cap, Some(false)),
+        (
+            (0..16)
+                .map(|i| format!("a{i:02}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            Some(false),
+        ),
+        // refused
+        (String::new(), None),
+        ("z,outcome_unknown_v1".into(), None),
+        ("outcome_unknown_v1,outcome_unknown_v1".into(), None),
+        ("a,,b".into(), None),
+        ("a,".into(), None),
+        (",a".into(), None),
+        (" outcome_unknown_v1".into(), None),
+        ("outcome_unknown_v1 ".into(), None),
+        ("a".repeat(65), None),
+        (seventeen, None),
+        (over_cap, None),
+        ("Outcome_unknown_v1".into(), None),
+        ("OUTCOME_UNKNOWN_V1".into(), None),
+        ("0foo".into(), None),
+        ("_foo".into(), None),
+        ("outcome-unknown-v1".into(), None),
+        ("caf\u{e9}".into(), None),
+    ];
+    for (value, expected) in &table {
+        let quic = parse_capability_list(value);
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            CAPABILITIES_HEADER,
+            http::HeaderValue::from_str(value).expect("a visible-ASCII-or-opaque header value"),
+        );
+        let header = declares_outcome_unknown(&headers);
+        if let Some(declared) = expected {
+            assert_eq!(quic, Ok(*declared), "parse_capability_list({value:?})");
+            assert_eq!(
+                header.as_ref().ok(),
+                Some(declared),
+                "declares_outcome_unknown({value:?})"
+            );
+        } else {
+            assert!(
+                quic.is_err(),
+                "parse_capability_list({value:?}) must refuse"
+            );
+            assert!(
+                header.is_err(),
+                "declares_outcome_unknown({value:?}) must refuse"
+            );
+        }
+    }
 }
