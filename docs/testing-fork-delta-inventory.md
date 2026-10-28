@@ -93,6 +93,15 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   and reads liveness from the server's own `SessionMap` (needs `lore-server` `test-util` as a dev-dep).
   Reads are the managed traffic until slice 2b removes `reject_managed_quic`. Gate: `cargo test -p
   lore-integration-tests --features integration_tests --test integration -j 4 -- quic_declared_session`
+- **WP-124 follow-up (d) QUIC fault seam (`lore-server/src/quic/faults.rs`, `failure_generator` only) [SERVER]**:
+  unit `lore-server/tests/unit/quic/faults.rs` (each test builds its own `Registry`; the hooks use the
+  global `registry()`). Gate: `cargo test -p lore-server --features failure_generator --test unit
+  quic::faults` (22) and, DEFAULT build, `... --test unit quic::faults` (1: the Dockerfile must never
+  name `failure_generator`). Live (~60 s, the client's managed idle bound): `cargo test -p
+  lore-integration-tests --features integration_tests,quic_faults --test integration quic_fault`
+  (`quic_fault_injection_test.rs`, reuses `quic_managed_write_support::cell`; always disarm). Clippy:
+  `-p lore-integration-tests --all-targets --features integration_tests,quic_faults`. Compile-out proof:
+  a scratch `tests/*.rs` naming `lore_server::quic::faults` in a default build fails E0432.
 - **WP-124 slice 5b QUIC token-expiry re-check (storage status 201, `session_refresh_due`) [SERVER + CLIENT]**:
   server `lore-server/tests/unit/grpc/caller_capabilities/quic_admission/session_expiry.rs` (child module
   of the admission harness, reuses `Cmd`/`Stores`/`Service`; reads derive from `TOKEN_EXPIRY_GATES_READS`);

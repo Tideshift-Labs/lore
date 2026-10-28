@@ -332,6 +332,9 @@ async fn handle_conn(
     let context = Arc::new(AttributeMap::default());
     context.insert(conn_span.clone());
     context.insert(ConnectionId(connection_id));
+    // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): lets a test-build fault close this connection.
+    #[cfg(feature = "failure_generator")]
+    context.insert(crate::quic::faults::FaultConnection(connection.clone()));
 
     let _stats_guard = track_connection_stats(
         service_name,

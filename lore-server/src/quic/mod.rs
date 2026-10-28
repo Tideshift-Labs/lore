@@ -21,6 +21,9 @@ use crate::protocol::attribute_map::AttributeMap;
 use crate::quic::quinn::service_store::StreamDataHandlerBuilder;
 
 pub mod client_monitor;
+// FORK-LOCAL (Tideshift, WP-124 follow-up (d)): test builds only; see the module docs.
+#[cfg(feature = "failure_generator")]
+pub mod faults;
 pub mod quinn;
 pub mod replication_store_service;
 pub mod storage_service;

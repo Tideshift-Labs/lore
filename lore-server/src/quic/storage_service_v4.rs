@@ -361,6 +361,33 @@ impl QuicService for StorageServiceV4 {
                 // write-vs-read classification is a deliberate decision, never a
                 // silent fall-through to "ungated".
                 use crate::quic::storage_service::ParsedStorageRequest as Req;
+                // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): test builds only. A forced expiry
+                // takes the real expiry path below; an answer fault fires after the store
+                // accepted the write (see `quic::faults`).
+                #[cfg(feature = "failure_generator")]
+                let (fault_connection_id, fault_connection) =
+                    crate::quic::faults::connection_of(&context);
+                #[cfg(feature = "failure_generator")]
+                let (fault_verb, fault_address) = {
+                    use crate::quic::faults::WriteVerb;
+                    match &parsed {
+                        Req::Put(put) => (Some(WriteVerb::Put), Some(*put.address())),
+                        Req::Copy(copy) => (Some(WriteVerb::Copy), Some(copy.source_address)),
+                        Req::PutResolved(resolved) => {
+                            (Some(WriteVerb::PutResolved), Some(resolved.address))
+                        }
+                        _ => (None, None),
+                    }
+                };
+                #[cfg(feature = "failure_generator")]
+                let expired = expired
+                    || crate::quic::faults::registry().force_expired(
+                        fault_connection_id,
+                        session_id,
+                        repository,
+                        declared,
+                        fault_verb,
+                    );
                 // FORK-LOCAL (Tideshift, WP-124): the session's token is checked per command, as
                 // gRPC checks `exp` per call, so revocation lands within the token's life plus
                 // leeway. First of all the checks, and before any handler, so the refusal proves
@@ -546,6 +573,22 @@ impl QuicService for StorageServiceV4 {
                         Err(MessageHandleError::NotImplemented)
                     }
                 }?;
+
+                // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): test builds only.
+                #[cfg(feature = "failure_generator")]
+                if let Some(verb) = fault_verb {
+                    crate::quic::faults::registry()
+                        .after_write(
+                            fault_connection_id,
+                            fault_connection.as_ref().map(|handle| &handle.0),
+                            session_id,
+                            repository,
+                            declared,
+                            verb,
+                            fault_address.as_ref(),
+                        )
+                        .await;
+                }
 
                 Ok(response.data())
             }

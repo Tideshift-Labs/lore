@@ -96,6 +96,8 @@ tonic-prost = { workspace = true }
 
 [features]
 integration_tests = ["lore-server/integration_tests"]
+# WP-124 follow-up (d): builds lore-server with its QUIC fault seam, for quic_fault_injection_test.rs.
+quic_faults = ["lore-server/failure_generator"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]
 
 [lints]

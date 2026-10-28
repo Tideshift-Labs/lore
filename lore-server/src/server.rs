@@ -3431,6 +3431,19 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
+    // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): the QUIC fault-control listener. Test builds
+    // only, loopback only, and only when `LORE_QUIC_FAULT_CONTROL` names an address.
+    #[cfg(feature = "failure_generator")]
+    if !is_maintenance
+        && let Some(control) = crate::quic::faults::control_address_from_env(&settings)?
+    {
+        let shutdown_rx = _shutdown_rx.clone();
+        lore_spawn!(
+            endpoints,
+            crate::quic::faults::serve_control(control, shutdown_rx)
+        );
+    }
+
     if let Some(topology) = &topology
         && topology.supports_refresh_loop()
     {

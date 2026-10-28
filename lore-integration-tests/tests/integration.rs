@@ -11,6 +11,7 @@ mod hashicorp;
 mod locks_test;
 mod presign_test;
 mod quic_declared_session_test;
+mod quic_fault_injection_test;
 mod quic_managed_write_proof_test;
 mod quic_managed_write_support;
 mod quic_session_rebind_test;
