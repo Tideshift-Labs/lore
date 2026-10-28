@@ -7,13 +7,40 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-fn reject_managed_quic() -> Result<(), crate::ProtocolError> {
+/// FORK-LOCAL (Tideshift, WP-124): managed `MutableStore` and `MutableCas` stay on gRPC.
+///
+/// No managed caller sends either today (WP-124 Q1), and gRPC journals both through
+/// `caller_operation::dispatch`. Refusing them here, before any wire byte, is fail-closed and
+/// needs no untested journal path. A future managed caller routes them through `dispatch`.
+fn reject_managed_quic_mutable_key() -> Result<(), crate::ProtocolError> {
     if crate::current_caller_operation().is_some() {
         Err(crate::ProtocolError::internal(
-            "managed mutations require the gRPC transport",
+            "managed mutable-key writes require gRPC",
         ))
     } else {
         Ok(())
+    }
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): a managed fragment write's result. A managed `Put`, `Copy` or
+/// `PutResolved` writes no journal child, so a lost answer is a retryable push failure
+/// ([`crate::error::UnjournaledAnswerLost`]), as on gRPC, never an unknown outcome a parent
+/// would stay uncertain about. It is not resent: all three stay `MutableNoReplay`.
+fn unjournaled_outcome(
+    command: Command,
+    outcome: MutableOutcome<Bytes>,
+) -> Result<MutableOutcome<Bytes>, ProtocolError> {
+    match outcome {
+        MutableOutcome::Unknown(unknown) => Err(ProtocolError::internal_with_context(
+            crate::error::UnjournaledAnswerLost {
+                message: format!(
+                    "{} lost its answer ({unknown}). Pushing again is safe: the next push uploads any missing data",
+                    storage_service::command_name(&command)
+                ),
+            },
+            "unjournaled managed write lost its answer",
+        )),
+        applied @ MutableOutcome::Applied(_) => Ok(applied),
     }
 }
 
@@ -52,6 +79,7 @@ use super::super::client::ServiceClient;
 use super::super::client::TransportConfig;
 use super::super::client::connect;
 use super::super::client::send_high_priority_with_reconnect;
+use super::super::client::send_managed_with_reconnect_outcome;
 use super::super::client::send_normal;
 use super::super::client::send_normal_with_reconnect;
 use super::super::client::send_normal_with_reconnect_outcome;
@@ -71,6 +99,10 @@ use crate::traits::Storage;
 
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
 
+/// The QUIC storage status a strict server refuses an undeclared write with (`unsupported-client`
+/// in the caller admission contract).
+const UNSUPPORTED_CLIENT_STATUS: u32 = 200;
+
 const MAX_BYTES_BANDWIDTH_PER_SEC: u64 = (1024 * 1024 * 1024) / 8;
 
 #[allow(dead_code)]
@@ -89,6 +121,12 @@ pub struct StorageClient {
     connection_establish: Semaphore,
     command_limit: Semaphore,
     sent: AtomicUsize,
+    /// FORK-LOCAL (Tideshift, WP-124): the partition each live session was started for, so a
+    /// journaled managed command names the session's own partition, as the gRPC path does.
+    /// Written at every start, so a live id always maps to its latest session. Removed at stop
+    /// only, never on reconnect: a heal on a stale id must reach the write boundary, which
+    /// refuses it with the rebind proof, rather than be refused here where nothing rebinds.
+    session_partitions: dashmap::DashMap<u32, Partition>,
 }
 
 impl Drop for StorageClient {
@@ -132,6 +170,7 @@ impl StorageClient {
             connection_establish: Semaphore::new(1),
             counter: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
+            session_partitions: dashmap::DashMap::new(),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
         }
     }
@@ -238,6 +277,49 @@ impl StorageClient {
     // trait method go through it. Two sites would be two chances for the wire framing and the
     // replay class to drift apart.
 
+    /// Send an unjournaled fragment write: `Put`, `Copy` or `PutResolved`.
+    ///
+    /// FORK-LOCAL (Tideshift, WP-124): inside a managed scope the send is bounded by progress and
+    /// a lost answer becomes [`crate::error::UnjournaledAnswerLost`]. The session it runs on is
+    /// the declared one the scope owns (`StorageSession::binding`). Outside a scope, unchanged.
+    async fn send_fragment_write<const LEN: usize>(
+        &self,
+        command: Command,
+        session_id: u32,
+        chunks: impl Fn() -> [Bytes; LEN] + Send,
+    ) -> Result<MutableOutcome<Bytes>, ProtocolError> {
+        if crate::current_caller_operation().is_some() {
+            let outcome =
+                send_managed_with_reconnect_outcome(self, command, session_id, chunks).await?;
+            unjournaled_outcome(command, outcome)
+        } else {
+            send_normal_with_reconnect_outcome(self, command, session_id, chunks).await
+        }
+    }
+
+    /// The token a session start presents for `partition`: exchanged, and cached by the
+    /// exchange. Empty when the remote has no auth service.
+    ///
+    /// The credentials are read here, not at construction: the server checks storage
+    /// authorization at each session start, so a session opened later must present whatever the
+    /// newest call supplied.
+    async fn authorization(&self, partition: Partition) -> String {
+        if self.auth_url.is_empty() {
+            return String::new();
+        }
+        let (identity_token, access_token) = self.credentials.tokens();
+        let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
+            &self.auth_url,
+            &self.recipient_domain,
+            &self.identity,
+            partition,
+            &identity_token,
+            &access_token,
+        )
+        .await;
+        authorization_token
+    }
+
     async fn send_put(
         &self,
         session_id: u32,
@@ -245,8 +327,7 @@ impl StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        reject_managed_quic()?;
-        send_normal_with_reconnect_outcome(self, Command::Put, session_id, || {
+        self.send_fragment_write(Command::Put, session_id, || {
             [
                 Bytes::default(),
                 Bytes::from_owner(address),
@@ -268,8 +349,7 @@ impl StorageClient {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        reject_managed_quic()?;
-        send_normal_with_reconnect_outcome(self, Command::PutResolved, session_id, || {
+        self.send_fragment_write(Command::PutResolved, session_id, || {
             [
                 Bytes::default(),
                 Bytes::from_owner(*key),
@@ -289,7 +369,7 @@ impl StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        reject_managed_quic()?;
+        reject_managed_quic_mutable_key()?;
         send_normal_with_reconnect_outcome(self, Command::MutableStore, session_id, || {
             [
                 Bytes::default(),
@@ -310,7 +390,7 @@ impl StorageClient {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<Hash>, ProtocolError> {
-        reject_managed_quic()?;
+        reject_managed_quic_mutable_key()?;
         let outcome =
             send_normal_with_reconnect_outcome(self, Command::MutableCas, session_id, || {
                 [
@@ -356,8 +436,7 @@ impl StorageClient {
         source_address: Address,
         target_context: Context,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
-        reject_managed_quic()?;
-        send_normal_with_reconnect_outcome(self, Command::Copy, session_id, || {
+        self.send_fragment_write(Command::Copy, session_id, || {
             [
                 Bytes::default(),
                 Bytes::from_owner(source_partition),
@@ -376,19 +455,84 @@ impl StorageClient {
         heal: bool,
     ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
         let heal_byte = if heal { 1u8 } else { 0u8 };
-        if heal {
-            reject_managed_quic()?;
-        }
         let mut request_bytes = BytesMut::with_capacity(size_of::<Address>() + 1);
         request_bytes.extend_from_slice(address.as_bytes());
         request_bytes.put_u8(heal_byte);
         let request_bytes = request_bytes.freeze();
 
+        if heal && crate::current_caller_operation().is_some() {
+            return self
+                .send_managed_heal(session_id, address, request_bytes)
+                .await;
+        }
+
         let outcome = send_normal_with_reconnect_outcome(self, Command::Verify, session_id, || {
             [Bytes::default(), request_bytes.clone()]
         })
         .await?;
+        Self::verify_result(address, outcome)
+    }
 
+    /// FORK-LOCAL (Tideshift, WP-124): a healing `Verify` inside a managed scope, journaled
+    /// through `caller_operation::dispatch` as the gRPC path journals it, so a managed read keeps
+    /// its heal path on `lore(s)://`.
+    ///
+    /// The canonical intent is gRPC's (`VerifyRequest { address, heal }`), and the endpoint is the
+    /// gRPC endpoint of this remote, never `lore(s)://`, so the parent's namespace matches what
+    /// its gRPC dispatches record. The repository is the session's own partition, as gRPC passes
+    /// its session's, so `dispatch` refuses one that is not the scope's. A lost answer is
+    /// journaled unknown, as on gRPC; it is not one of the unjournaled writes.
+    async fn send_managed_heal(
+        &self,
+        session_id: u32,
+        address: &Address,
+        request_bytes: Bytes,
+    ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
+        use prost::Message;
+        let Some(repository) = self
+            .session_partitions
+            .get(&session_id)
+            .map(|partition| *partition)
+        else {
+            return Err(ProtocolError::internal(
+                "managed healing verify on a session this client did not start",
+            ));
+        };
+        let request = lore_proto::lore::storage::v1::VerifyRequest {
+            address: Some((*address).into()),
+            heal: true,
+        };
+        let endpoint = crate::grpc::grpc_endpoint(&self.remote_url)?.to_string();
+        let authorization = self.authorization(repository).await;
+        crate::caller_operation::dispatch(
+            repository,
+            crate::outcome::GrpcRpc::StorageVerify,
+            request.encode_to_vec(),
+            endpoint,
+            authorization,
+            async {
+                let outcome =
+                    send_managed_with_reconnect_outcome(self, Command::Verify, session_id, || {
+                        [Bytes::default(), request_bytes.clone()]
+                    })
+                    .await?;
+                match Self::verify_result(address, outcome)? {
+                    MutableOutcome::Applied(result) => Ok(result),
+                    // The journal reads a lost answer from `Disconnected`, and records the
+                    // attempt unknown.
+                    MutableOutcome::Unknown(_) => Err(ProtocolError::from(Disconnected)),
+                }
+            },
+        )
+        .await
+        .map(MutableOutcome::Applied)
+    }
+
+    /// Decode a `Verify` answer.
+    fn verify_result(
+        address: &Address,
+        outcome: MutableOutcome<Bytes>,
+    ) -> Result<MutableOutcome<VerifyResult>, ProtocolError> {
         let payload = match outcome {
             MutableOutcome::Applied(payload) => payload,
             MutableOutcome::Unknown(unknown) => return Ok(MutableOutcome::Unknown(unknown)),
@@ -466,24 +610,7 @@ impl StorageClient {
         let generation = self.quic.connection_generation();
 
         // Fetch auth token via token exchange (cached if already exchanged).
-        // The credentials are read here, not at construction: the server checks
-        // storage authorization at each session start, so a session opened later
-        // must present whatever the newest call supplied.
-        let token = if !self.auth_url.is_empty() {
-            let (identity_token, access_token) = self.credentials.tokens();
-            let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-                &self.auth_url,
-                &self.recipient_domain,
-                &self.identity,
-                partition,
-                &identity_token,
-                &access_token,
-            )
-            .await;
-            authorization_token
-        } else {
-            String::new()
-        };
+        let token = self.authorization(partition).await;
 
         let payload = authorize_start_payload(partition, correlation_id, &token, capabilities)?;
 
@@ -500,6 +627,7 @@ impl StorageClient {
         };
         let session_id = u32::from_le_bytes(session_id);
         self.quic.register_session(session_id, generation);
+        self.session_partitions.insert(session_id, partition);
         Ok(session_id)
     }
 }
@@ -581,6 +709,20 @@ impl ServiceClient for StorageClient {
                         "storage server answered the authorize request with an error",
                     )
                 }
+                // FORK-LOCAL (Tideshift, WP-124): status 200 is the strict admission refusal. It
+                // is an answered, decisive refusal (a journaled caller settles it not applied),
+                // typed so `is_unsupported_client` can tell it apart, and never an unknown outcome
+                // or a slow-down.
+                QuicClientError::ServerError(UNSUPPORTED_CLIENT_STATUS) => {
+                    let name = storage_service::command_name(&failed_request);
+                    ProtocolError::internal_with_context(
+                        crate::error::QuicUnsupportedClient {
+                            message: format!("{name}: Failed sending command: {client_error}"),
+                            refusal: crate::error::UnsupportedClientCapability,
+                        },
+                        "storage server refused the client before dispatch",
+                    )
+                }
                 _ => {
                     let name = storage_service::command_name(&failed_request);
                     ProtocolError::internal(format!(
@@ -659,6 +801,7 @@ impl Storage for StorageClient {
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
+        self.session_partitions.remove(&session_id);
         if !self.quic.has_streams().await {
             self.quic.forget_session(session_id);
             return Ok(());

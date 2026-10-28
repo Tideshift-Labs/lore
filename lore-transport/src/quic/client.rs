@@ -310,8 +310,78 @@ pub trait ServiceClient: Send + Sync {
 
 struct QuicQuinnConnection {
     connection: quinn::Connection,
-    writer: Vec<Arc<Mutex<quinn::SendStream>>>,
+    writer: Vec<Arc<StreamWriter>>,
     reader: Vec<ResponseReader>,
+}
+
+/// One stream's send half, with what a managed send needs to bound it.
+///
+/// FORK-LOCAL (Tideshift, WP-124). `connection` is the connection this stream belongs to, so a
+/// managed send that has to close a stalled connection closes the one it wrote on, never a
+/// replacement installed since. `progress` is when this stream last accepted bytes, in
+/// milliseconds since [`QuicConnection`] was created (0: never). It is per stream, not per
+/// connection: keep-alive PINGs move the connection's counters and never this one.
+///
+/// The progress counter is shared with the locked half, so the read path can record progress
+/// through the owned guard it already holds and carry nothing more in its size-bounded future.
+struct StreamWriter {
+    send: Arc<Mutex<StreamSend>>,
+    progress: Arc<AtomicU64>,
+    connection: quinn::Connection,
+}
+
+/// The locked half of a [`StreamWriter`].
+struct StreamSend {
+    stream: quinn::SendStream,
+    progress: Arc<AtomicU64>,
+}
+
+impl StreamWriter {
+    fn new(stream: quinn::SendStream, connection: quinn::Connection) -> Self {
+        let progress = Arc::new(AtomicU64::new(0));
+        Self {
+            send: Arc::new(Mutex::new(StreamSend {
+                stream,
+                progress: progress.clone(),
+            })),
+            progress,
+            connection,
+        }
+    }
+}
+
+impl StreamSend {
+    fn mark_progress(&self, created: Instant) {
+        self.progress
+            .fetch_max(elapsed_millis(created), Ordering::Relaxed);
+    }
+}
+
+fn elapsed_millis(created: Instant) -> u64 {
+    u64::try_from(created.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How long a managed write may go without progress before it gives up, unless
+/// `LORE_QUIC_MANAGED_IDLE_TIMEOUT` (seconds) says otherwise, then
+/// `LORE_GRPC_STREAM_IDLE_TIMEOUT`, so one setting bounds both transports.
+///
+/// FORK-LOCAL (Tideshift, WP-124). The same 60 s as the gRPC managed bound. QUIC has no other
+/// per-command bound: the connection idle timeout never fires on a live peer, because keep-alive
+/// runs every [`KEEP_ALIVE_MS`].
+const MANAGED_IDLE_TIMEOUT_SECS: u64 = 60;
+
+#[lore_macro::test_pub]
+fn managed_idle_timeout() -> Duration {
+    let from_env = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+    };
+    let secs = from_env("LORE_QUIC_MANAGED_IDLE_TIMEOUT")
+        .or_else(|| from_env("LORE_GRPC_STREAM_IDLE_TIMEOUT"))
+        .unwrap_or(MANAGED_IDLE_TIMEOUT_SECS);
+    Duration::from_secs(secs)
 }
 
 impl QuicQuinnConnection {
@@ -429,6 +499,9 @@ pub struct QuicConnection {
     stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
     max_chunk_size: usize,
     v4: bool,
+    /// FORK-LOCAL (Tideshift, WP-124): the managed write idle bound, in milliseconds. Read once
+    /// at construction from [`managed_idle_timeout`]; an atomic only so a test can shorten it.
+    managed_idle_ms: AtomicU64,
 }
 
 impl QuicConnection {
@@ -471,7 +544,23 @@ impl QuicConnection {
             stream_inflight: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
             max_chunk_size,
             v4,
+            managed_idle_ms: AtomicU64::new(
+                u64::try_from(managed_idle_timeout().as_millis()).unwrap_or(u64::MAX),
+            ),
         }
+    }
+
+    fn managed_idle(&self) -> Duration {
+        Duration::from_millis(self.managed_idle_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shorten the managed write idle bound. Tests only.
+    #[cfg(any(feature = "test-util", feature = "test_seams"))]
+    pub fn set_managed_idle_for_test(&self, idle: Duration) {
+        self.managed_idle_ms.store(
+            u64::try_from(idle.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
     }
 
     /// The connection generation a session id issued right now would belong to.
@@ -596,7 +685,10 @@ impl QuicConnection {
                 .open_bi()
                 .await
                 .map_err(|_err| QuicClientError::StreamOpen)?;
-            connection.writer.push(Arc::new(Mutex::new(send)));
+            let quinn = connection.connection.clone();
+            connection
+                .writer
+                .push(Arc::new(StreamWriter::new(send, quinn)));
             connection.reader.push(ResponseReader::new(
                 recv,
                 self.max_chunk_size,
@@ -771,11 +863,15 @@ pub enum ReconnectError {
 /// `unknown` is how the typed path learns that the error it is about to see is an ambiguous
 /// mutable write rather than a failure. See [`OutcomeSink`] for why it is a by-value generic
 /// rather than a richer return type or an out-parameter.
+///
+/// `MANAGED` bounds the send by progress (see [`send_bounded`]). A const generic for the reason
+/// `HIGH_PRIORITY` is one: the read path instantiates it `false` and carries nothing for it.
 pub async fn send_with_reconnect<
     ServiceClientType,
     Sink,
     const LEN: usize,
     const HIGH_PRIORITY: bool,
+    const MANAGED: bool,
 >(
     service_client: &ServiceClientType,
     request_type: ServiceClientType::RequestType,
@@ -802,7 +898,7 @@ where
         // section that takes the writer, where nothing can invalidate it before the bytes are
         // framed. Removing it here also keeps its captured epoch out of this future, which is
         // size bounded by `test_futures_size`.
-        match send_command_tracked::<HIGH_PRIORITY, true>(
+        match send_command_tracked::<HIGH_PRIORITY, true, MANAGED>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -847,6 +943,7 @@ where
         Sink,
         LEN,
         HIGH_PRIORITY,
+        MANAGED,
     >(
         service_client,
         request_type,
@@ -1038,7 +1135,13 @@ where
 /// There is no loop. The end-to-end budget is two dispatches — the caller's first and the one
 /// below — and expressing that structurally is what makes "no layer resets or nests it" a
 /// property of the code rather than of a counter someone has to reason about.
-async fn reconnect_and_retry<ServiceClientType, Sink, const LEN: usize, const HIGH_PRIORITY: bool>(
+async fn reconnect_and_retry<
+    ServiceClientType,
+    Sink,
+    const LEN: usize,
+    const HIGH_PRIORITY: bool,
+    const MANAGED: bool,
+>(
     service_client: &ServiceClientType,
     request_type: ServiceClientType::RequestType,
     session_id: u32,
@@ -1092,7 +1195,7 @@ where
                 service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
             );
         };
-        match send_command_tracked::<HIGH_PRIORITY, true>(
+        match send_command_tracked::<HIGH_PRIORITY, true, MANAGED>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -1797,7 +1900,10 @@ async fn add_stream(connection: Arc<QuicConnection>) -> Result<u32, QuicClientEr
                 }
             })
             .map_err(|_err| QuicClientError::StreamOpen)?;
-        connection_lock.writer.push(Arc::new(Mutex::new(send)));
+        let quinn = connection_lock.connection.clone();
+        connection_lock
+            .writer
+            .push(Arc::new(StreamWriter::new(send, quinn)));
         connection_lock.reader.push(ResponseReader::new(
             recv,
             connection.max_chunk_size,
@@ -1939,7 +2045,7 @@ pub fn send_normal_with_reconnect<'a, ServiceClientType, const LEN: usize>(
 where
     ServiceClientType: ServiceClient,
 {
-    send_with_reconnect::<ServiceClientType, IgnoreOutcome, LEN, false>(
+    send_with_reconnect::<ServiceClientType, IgnoreOutcome, LEN, false, false>(
         service_client,
         request_type,
         session_id,
@@ -1957,7 +2063,7 @@ pub fn send_high_priority_with_reconnect<'a, ServiceClientType, const LEN: usize
 where
     ServiceClientType: ServiceClient,
 {
-    send_with_reconnect::<ServiceClientType, IgnoreOutcome, LEN, true>(
+    send_with_reconnect::<ServiceClientType, IgnoreOutcome, LEN, true, false>(
         service_client,
         request_type,
         session_id,
@@ -1981,8 +2087,39 @@ pub async fn send_normal_with_reconnect_outcome<ServiceClientType, const LEN: us
 where
     ServiceClientType: ServiceClient,
 {
+    send_outcome::<ServiceClientType, LEN, false>(service_client, request_type, session_id, chunks)
+        .await
+}
+
+/// [`send_normal_with_reconnect_outcome`] for a managed mutable write: the send is bounded by
+/// progress in each of its three phases (see [`send_bounded`]).
+///
+/// FORK-LOCAL (Tideshift, WP-124). Only a managed `Put`, `Copy`, `PutResolved` or healing
+/// `Verify` uses this. Every other command keeps the unbounded send.
+pub async fn send_managed_with_reconnect_outcome<ServiceClientType, const LEN: usize>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    session_id: u32,
+    chunks: impl Fn() -> [Bytes; LEN] + Send,
+) -> Result<MutableOutcome<Bytes>, ServiceClientType::ErrorType>
+where
+    ServiceClientType: ServiceClient,
+{
+    send_outcome::<ServiceClientType, LEN, true>(service_client, request_type, session_id, chunks)
+        .await
+}
+
+async fn send_outcome<ServiceClientType, const LEN: usize, const MANAGED: bool>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    session_id: u32,
+    chunks: impl Fn() -> [Bytes; LEN] + Send,
+) -> Result<MutableOutcome<Bytes>, ServiceClientType::ErrorType>
+where
+    ServiceClientType: ServiceClient,
+{
     let unknown = SyncMutex::new(None);
-    match send_with_reconnect::<ServiceClientType, RecordOutcome<'_>, LEN, false>(
+    match send_with_reconnect::<ServiceClientType, RecordOutcome<'_>, LEN, false, MANAGED>(
         service_client,
         request_type,
         session_id,
@@ -2018,7 +2155,7 @@ pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command_tracked::<HIGH_PRIORITY, AWAIT_RESPONSE>(
+    send_command_tracked::<HIGH_PRIORITY, AWAIT_RESPONSE, false>(
         connection, command, session_id, v4, chunks,
     )
     .await
@@ -2031,13 +2168,21 @@ pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>
 /// written, so only the write and the response wait are dispatched. That split is what the
 /// replay contract branches on, so it is recorded here at the one place that can actually
 /// observe it rather than inferred from an error kind further up.
-async fn send_command_tracked<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
+///
+/// `MANAGED` sends the command through [`send_bounded`] once it is framed. It implies
+/// `AWAIT_RESPONSE`: a bounded send is bounded up to its answer.
+async fn send_command_tracked<
+    const HIGH_PRIORITY: bool,
+    const AWAIT_RESPONSE: bool,
+    const MANAGED: bool,
+>(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
     session_id: u32,
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, SendFailure> {
+    const { assert!(!MANAGED || AWAIT_RESPONSE) };
     {
         let stream_index = connection.counter.fetch_add(1, Ordering::Relaxed) % STREAM_COUNT;
         let stream_count = connection.stream_count.load(Ordering::Relaxed);
@@ -2067,92 +2212,105 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: b
         }
     }
 
-    let (command_id, writer, rx, _inflight) = {
-        let connection_lock = connection.connection.read().await;
-        if connection_lock.reader.is_empty() {
-            lore_debug!("No quic stream available when sending command");
-            return Err(SendFailure::not_dispatched(QuicClientError::StreamOpen));
+    let (writer, rx, _inflight) = {
+        let (command_id, writer, rx, inflight) = {
+            let connection_lock = connection.connection.read().await;
+            if connection_lock.reader.is_empty() {
+                lore_debug!("No quic stream available when sending command");
+                return Err(SendFailure::not_dispatched(QuicClientError::StreamOpen));
+            }
+
+            // The write boundary. Everything above is a caller's intent; from here the id is framed
+            // and handed to a stream, so this is the last moment at which "is this id valid on the
+            // connection I am about to write to" is still answerable — and the first at which the
+            // answer cannot go stale, because a reconnect has to take this lock in write mode to
+            // replace the connection, and cannot until the writer below has been taken.
+            //
+            // Refusing is the whole point. A session id the server issued on a connection that has
+            // since been replaced is not merely unknown to the replacement: the replacement is free
+            // to have issued the same number to a live session of its own, in which case the command
+            // would be applied under that session's repository, user and permissions (INV-EO P0-1).
+            // Nothing downstream can detect that, because the server answers it normally, so it is
+            // refused here or not at all.
+            //
+            // The guard is released at the end of this block, before the write below, and the check
+            // still holds afterwards for a reason worth stating because a refactor can destroy it:
+            // the writer taken here is an `Arc` over one of *this* generation's `SendStream`s. A
+            // reconnect replaces the vector, but this clone keeps pointing at a stream of the
+            // connection that was closed, so a write after a swap fails rather than landing on the
+            // replacement. Resolving the writer again after the guard drops — or reaching for
+            // `connection.connection` below — would reopen P0-1.
+            if session_id != 0 && !connection.session_is_current(session_id) {
+                return Err(SendFailure::not_dispatched(
+                    QuicClientError::SessionRebindRequired,
+                ));
+            }
+
+            // Select stream based on priority, computed inside lock to avoid living across await points
+            let reader_count = connection_lock.reader.len() as u32;
+            let stream_index = select_stream(
+                connection.stream_inflight.as_slice(),
+                reader_count,
+                HIGH_PRIORITY,
+            ) as usize
+                % connection_lock.reader.len();
+            let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
+
+            let (tx, rx) = oneshot::channel();
+            let command_id = connection_lock.reader[stream_index]
+                .wait_for(tx)
+                .map_err(SendFailure::not_dispatched)?;
+            let writer = connection_lock.writer[stream_index].clone();
+            (command_id, writer, rx, inflight)
+        };
+
+        {
+            // Skip any previous header in case this is a resend
+            let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
+            if total_size > connection.max_chunk_size {
+                lore_debug!(
+                    "Client '{command}' message too big - message size '{total_size}' exceeds {}",
+                    connection.max_chunk_size
+                );
+                return Err(SendFailure::not_dispatched(
+                    QuicClientError::ClientMessageTooBig,
+                ));
+            }
+            if v4 {
+                let header =
+                    CommandHeader::new_with_session(command, command_id, total_size, session_id);
+                chunks[0] = Bytes::from_owner(header.to_bytes_v4());
+            } else {
+                let header = CommandHeader::new(command, command_id, total_size);
+                chunks[0] = Bytes::from_owner(header.to_bytes());
+            }
         }
 
-        // The write boundary. Everything above is a caller's intent; from here the id is framed
-        // and handed to a stream, so this is the last moment at which "is this id valid on the
-        // connection I am about to write to" is still answerable — and the first at which the
-        // answer cannot go stale, because a reconnect has to take this lock in write mode to
-        // replace the connection, and cannot until the writer below has been taken.
-        //
-        // Refusing is the whole point. A session id the server issued on a connection that has
-        // since been replaced is not merely unknown to the replacement: the replacement is free
-        // to have issued the same number to a live session of its own, in which case the command
-        // would be applied under that session's repository, user and permissions (INV-EO P0-1).
-        // Nothing downstream can detect that, because the server answers it normally, so it is
-        // refused here or not at all.
-        //
-        // The guard is released at the end of this block, before the write below, and the check
-        // still holds afterwards for a reason worth stating because a refactor can destroy it:
-        // the writer taken here is an `Arc` over one of *this* generation's `SendStream`s. A
-        // reconnect replaces the vector, but this clone keeps pointing at a stream of the
-        // connection that was closed, so a write after a swap fails rather than landing on the
-        // replacement. Resolving the writer again after the guard drops — or reaching for
-        // `connection.connection` below — would reopen P0-1.
-        if session_id != 0 && !connection.session_is_current(session_id) {
-            return Err(SendFailure::not_dispatched(
-                QuicClientError::SessionRebindRequired,
-            ));
+        // FORK-LOCAL (Tideshift, WP-124): a managed write leaves here for the bounded send. Boxed,
+        // and inside this block, so the read path's future carries only the box's variant and none
+        // of the bounded send's timers.
+        if MANAGED {
+            return Box::pin(send_bounded(&connection, &writer, chunks, rx)).await;
         }
-
-        // Select stream based on priority, computed inside lock to avoid living across await points
-        let reader_count = connection_lock.reader.len() as u32;
-        let stream_index = select_stream(
-            connection.stream_inflight.as_slice(),
-            reader_count,
-            HIGH_PRIORITY,
-        ) as usize
-            % connection_lock.reader.len();
-        let inflight = StreamInflightGuard::new(&connection.stream_inflight[stream_index]);
-
-        let (tx, rx) = oneshot::channel();
-        let command_id = connection_lock.reader[stream_index]
-            .wait_for(tx)
-            .map_err(SendFailure::not_dispatched)?;
-        let writer = connection_lock.writer[stream_index].clone();
-        (command_id, writer, rx, inflight)
+        (writer.send.clone(), rx, inflight)
     };
 
     {
-        // Skip any previous header in case this is a resend
-        let total_size: usize = chunks.iter().skip(1).map(|buffer| buffer.len()).sum();
-        if total_size > connection.max_chunk_size {
-            lore_debug!(
-                "Client '{command}' message too big - message size '{total_size}' exceeds {}",
-                connection.max_chunk_size
-            );
-            return Err(SendFailure::not_dispatched(
-                QuicClientError::ClientMessageTooBig,
-            ));
-        }
-        if v4 {
-            let header =
-                CommandHeader::new_with_session(command, command_id, total_size, session_id);
-            chunks[0] = Bytes::from_owner(header.to_bytes_v4());
-        } else {
-            let header = CommandHeader::new(command, command_id, total_size);
-            chunks[0] = Bytes::from_owner(header.to_bytes());
-        }
-    }
-
-    {
-        let mut stream = writer.lock_owned().await;
-        // A failed `write_all_chunks` may still have flushed earlier chunks to the peer, so
-        // this counts as dispatched. Treating a partial write as harmless is the assumption
-        // that would let a mutable command be sent twice.
-        stream.write_all_chunks(chunks).await.map_err(|err| {
-            if let quinn::WriteError::ConnectionLost(_) = err {
-                SendFailure::response_lost(QuicClientError::Terminated)
-            } else {
-                lore_warn!("{}: {err}", QuicClientError::WriteChunks);
-                SendFailure::response_lost(QuicClientError::WriteChunks)
+        let mut send = writer.lock_owned().await;
+        // The loop `write_all_chunks` runs, written out so the stream records its progress for
+        // a managed send waiting on this writer (see [`send_bounded`]). Nothing else differs.
+        let mut bufs: &mut [Bytes] = chunks;
+        while !bufs.is_empty() {
+            let written = send
+                .stream
+                .write_chunks(bufs)
+                .await
+                .map_err(write_failure)?;
+            if written.bytes > 0 {
+                send.mark_progress(connection.created);
             }
-        })?;
+            bufs = &mut bufs[written.chunks..];
+        }
     }
 
     if !AWAIT_RESPONSE {
@@ -2162,7 +2320,26 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: b
     // The request is fully written by here, so the server has seen the command either way.
     // What is left is whether an answer came back, and the two ways it can fail to are not the
     // same thing to the replay contract.
-    rx.await
+    answer_result(rx.await)
+}
+
+/// A failed write. A failed write may still have flushed earlier chunks to the peer, so it counts
+/// as dispatched. Treating a partial write as harmless is the assumption that would let a mutable
+/// command be sent twice.
+fn write_failure(err: quinn::WriteError) -> SendFailure {
+    if let quinn::WriteError::ConnectionLost(_) = err {
+        SendFailure::response_lost(QuicClientError::Terminated)
+    } else {
+        lore_warn!("{}: {err}", QuicClientError::WriteChunks);
+        SendFailure::response_lost(QuicClientError::WriteChunks)
+    }
+}
+
+/// What a received answer, or a closed answer channel, means to the replay contract.
+fn answer_result(
+    answer: Result<Result<Bytes, QuicClientError>, oneshot::error::RecvError>,
+) -> Result<Bytes, SendFailure> {
+    answer
         .map_err(|err| {
             lore_warn!("{}: {err}", QuicClientError::Read);
             SendFailure::response_lost(QuicClientError::Read)
@@ -2178,6 +2355,139 @@ async fn send_command_tracked<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: b
             // Everything else was decoded from a response header the server actually sent.
             _ => SendFailure::answered(error),
         })
+}
+
+/// The application close code a managed send uses when it closes a stalled connection.
+const MANAGED_STALL_CLOSE_CODE: u32 = 1;
+
+/// FORK-LOCAL (Tideshift, WP-124): the rest of a managed write's send, bounded by progress in
+/// each of its three phases. Each phase gives up after the connection's managed idle bound with
+/// no progress, never after a fixed age, so a long upload that keeps moving is never cut.
+///
+/// 1. **Writer lock.** Progress is bytes this stream accepted from whoever holds the lock. No
+///    progress: [`QuicClientError::WriterLockTimeout`], not dispatched, and the connection stays.
+/// 2. **Write**, through `write_chunks`, which is cancel-safe ("if this does not resolve, no bytes
+///    were written"). Progress is bytes this stream accepted from this command. No progress before
+///    the first byte: the pending write is dropped and the result is
+///    [`QuicClientError::WriteTimeout`], not dispatched; the connection stays. No progress after a
+///    partial write: the connection this stream belongs to is closed, never the one installed
+///    now, and the pending write is left to fail with `ConnectionLost`, a lost answer. Cancelling
+///    it instead would leave a partial frame on a live stream, which the commands after it would
+///    be read against.
+/// 3. **Answer.** Progress is any answer on the connection. No progress:
+///    [`QuicClientError::AnswerTimeout`], a lost answer. Only the receiver is dropped. The command
+///    stays in the reader's pending map, so a late answer is logged rather than read as an
+///    unexpected command, which would end the stream.
+///
+/// The close in phase 2 is shared harm, accepted (WP-124): every session on that connection must
+/// rebind, and every command in flight on it loses its answer. It needs a full idle bound with no
+/// byte accepted after this command already wrote some, which is a broken peer.
+///
+/// A command that times out before dispatch stays registered with the reader until the stream
+/// ends; no answer can come for it, so the entry only costs its slot.
+async fn send_bounded(
+    connection: &QuicConnection,
+    writer: &StreamWriter,
+    chunks: &mut [Bytes],
+    rx: oneshot::Receiver<Result<Bytes, QuicClientError>>,
+) -> Result<Bytes, SendFailure> {
+    let idle = connection.managed_idle();
+    let created = connection.created;
+    let deadline =
+        |last: u64| tokio::time::Instant::from_std(created + Duration::from_millis(last) + idle);
+
+    // Phase 1: the writer lock.
+    let mut send = {
+        let lock = writer.send.lock();
+        tokio::pin!(lock);
+        let base = elapsed_millis(created);
+        loop {
+            let last = writer.progress.load(Ordering::Relaxed).max(base);
+            tokio::select! {
+                biased;
+                send = &mut lock => break send,
+                () = tokio::time::sleep_until(deadline(last)) => {
+                    if writer.progress.load(Ordering::Relaxed) > last {
+                        continue;
+                    }
+                    lore_warn!("managed QUIC write: no progress on its stream for {idle:?}; not sent");
+                    return Err(SendFailure::not_dispatched(QuicClientError::WriterLockTimeout));
+                }
+            }
+        }
+    };
+
+    // Phase 2: the write.
+    let mut bufs: &mut [Bytes] = chunks;
+    let mut wrote = false;
+    let mut closed = false;
+    let mut last = elapsed_millis(created);
+    while !bufs.is_empty() {
+        let written = {
+            let write = send.stream.write_chunks(bufs);
+            tokio::pin!(write);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut write => break result,
+                    () = tokio::time::sleep_until(deadline(last)), if !closed => {
+                        if !wrote {
+                            lore_warn!(
+                                "managed QUIC write: the stream took no byte for {idle:?}; not sent"
+                            );
+                            return Err(SendFailure::not_dispatched(QuicClientError::WriteTimeout));
+                        }
+                        lore_warn!(
+                            "managed QUIC write: the stream took no byte for {idle:?} after a partial write; closing its connection"
+                        );
+                        writer.connection.close(
+                            VarInt::from_u32(MANAGED_STALL_CLOSE_CODE),
+                            b"managed write made no progress",
+                        );
+                        closed = true;
+                    }
+                }
+            }
+        }
+        .map_err(|err| {
+            // `write_chunks` either takes bytes or fails, never both, so a failure before this
+            // command's first byte proves none of it left. Then it is not dispatched, and a
+            // replacement session may carry it. Once any byte was taken, a failure is the lost
+            // answer `write_failure` reports.
+            if wrote {
+                write_failure(err)
+            } else {
+                let failure = write_failure(err);
+                SendFailure::not_dispatched(failure.error)
+            }
+        })?;
+        if written.bytes > 0 {
+            wrote = true;
+            send.mark_progress(created);
+            last = elapsed_millis(created);
+        }
+        bufs = &mut bufs[written.chunks..];
+    }
+    drop(send);
+
+    // Phase 3: the answer.
+    let mut rx = rx;
+    let base = elapsed_millis(created);
+    let answer = loop {
+        let last = connection.last_recv.load(Ordering::Relaxed).max(base);
+        tokio::select! {
+            biased;
+            answer = &mut rx => break answer,
+            () = tokio::time::sleep_until(deadline(last)) => {
+                if connection.last_recv.load(Ordering::Relaxed) > last {
+                    continue;
+                }
+                lore_warn!("managed QUIC write: no answer on its connection for {idle:?}; the answer is lost");
+                return Err(SendFailure::response_lost(QuicClientError::AnswerTimeout));
+            }
+        }
+    };
+    answer_result(answer)
 }
 
 /// Send a command and return once its bytes are written, discarding the response.

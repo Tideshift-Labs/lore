@@ -1057,11 +1057,13 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
     Ok(channel)
 }
 
-pub async fn connect(
-    connection: Weak<Connection>,
-    remote_url: &str,
-    reuse: bool,
-) -> Result<Arc<GRPCConnection>, ProtocolError> {
+/// The HTTP(S) endpoint gRPC dials for `remote_url`: any `*s` scheme becomes `https`, anything
+/// else `http`, on the same host and port.
+///
+/// FORK-LOCAL (Tideshift, WP-124): factored out of [`connect`] so a managed QUIC dispatch can
+/// record the very endpoint the parent's gRPC dispatches record, without dialing.
+#[lore_macro::test_pub]
+pub(crate) fn grpc_endpoint(remote_url: &str) -> Result<Url, ProtocolError> {
     let parsed_url =
         Url::parse(remote_url).internal_with(|| format!("remote {remote_url} is invalid"))?;
 
@@ -1083,6 +1085,15 @@ pub async fn connect(
 
     let remote = Url::parse(&format!("{scheme}://{host}:{port}"))
         .internal_with(|| format!("remote {remote_url} is invalid"))?;
+    Ok(remote)
+}
+
+pub async fn connect(
+    connection: Weak<Connection>,
+    remote_url: &str,
+    reuse: bool,
+) -> Result<Arc<GRPCConnection>, ProtocolError> {
+    let remote = grpc_endpoint(remote_url)?;
 
     let map_lock = lock_connection(&remote).await;
     let connection_lock = if reuse {

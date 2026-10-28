@@ -155,6 +155,8 @@ Durable, recurring testing lessons grouped by topic.
   pins it). `#[tokio::test]` is current-thread: do not `block_in_place` inside a fixture.
   `async_yields_async` clippy fires on `lore_spawn!` as an async block's tail: `.await` it inside.
 
+- **Stalling a QUIC client write on purpose (`lore-transport/tests/unit/quic/scripted_storage_peer.rs`)**: symptom, a send-bound test cannot make `write_chunks` accept zero or partial bytes. Cause: credit comes from the peer's per-stream receive window, refreshed only after it reads `WINDOW/8` on that stream. Do: raw quinn peer with a small `stream_receive_window`, read headers always but gate payload reads; keep bytes read before the gate under `WINDOW/8`, then credit left = `WINDOW` - bytes the peer counted on that stream. Fill it exactly with a `Reply::EarlyOk` write (answered from the header) to get a zero-byte stall with a free lock. A sequential caller sits on stream 2 once all 8 streams exist (9 round trips); to queue behind a stalled writer, hold one read on each of streams 2..7, answer the stream-2 one, then start the writer. A trickle (`throttle`) gives a lock holder that keeps writing. `VolatileAttemptStore` refuses `record_managed`; wrap it in a journal that overrides it.
+
 ## Postgres & Database Testing
 
 - **250ms DDL limit**: `lore-postgres` bootstrap DDL has a 250ms limit; it can fail on a loaded host. Wait and retry rather than debugging a fresh container.

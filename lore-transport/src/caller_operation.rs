@@ -156,9 +156,15 @@ pub async fn selected_caller_namespace(
     connection: &Arc<crate::connection::Connection>,
     repository: RepositoryId,
 ) -> Result<CallerRecoveryContext, ProtocolError> {
-    if !matches!(connection.remote_url.scheme(), "grpc" | "grpcs") {
+    // FORK-LOCAL (Tideshift, WP-124): `lore(s)://` too. The binding dials gRPC on the same host
+    // and port either way and records the gRPC endpoint, so `lores://h:p` and `grpcs://h:p` bind
+    // the same namespace, and `lore(s)://` is never recorded.
+    if !matches!(
+        connection.remote_url.scheme(),
+        "grpc" | "grpcs" | "lore" | "lores"
+    ) {
         return Err(ProtocolError::internal(
-            "managed namespace binding requires gRPC",
+            "managed namespace binding requires gRPC or Lore",
         ));
     }
     let grpc = crate::grpc::connect(

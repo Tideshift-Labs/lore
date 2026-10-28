@@ -31,6 +31,18 @@ pub fn is_unsupported_client(error: &ProtocolError) -> bool {
     false
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): a QUIC storage command refused with status 200.
+///
+/// Renders as the message the untyped error always had, and carries
+/// [`UnsupportedClientCapability`] as its source, so [`is_unsupported_client`] finds it.
+#[derive(Debug, Clone, Error)]
+#[error("{message}")]
+pub(crate) struct QuicUnsupportedClient {
+    pub(crate) message: String,
+    #[source]
+    pub(crate) refusal: UnsupportedClientCapability,
+}
+
 /// FORK-LOCAL (Tideshift, WP-124): a storage server refused to open a declared session.
 ///
 /// A slice-1 server answers status 200 for a capability list it will not accept; a stock server

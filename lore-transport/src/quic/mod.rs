@@ -96,6 +96,21 @@ pub enum QuicClientError {
     /// not dispatched and the caller's session layer can resolve a replacement and try again.
     #[error("Session id does not belong to the current connection")]
     SessionRebindRequired,
+    /// FORK-LOCAL (Tideshift, WP-124): a managed write waited the whole idle bound for its
+    /// stream's writer while the holder wrote nothing. Raised before any byte of the command was
+    /// written, so it is not dispatched. Not `Terminated`/`StreamOpen`: those reconnect, and the
+    /// connection is not at fault.
+    #[error("No progress on the stream writer within the managed idle bound")]
+    WriterLockTimeout,
+    /// FORK-LOCAL (Tideshift, WP-124): the stream accepted no byte of a managed write within the
+    /// idle bound. Raised only when no byte of the command was written, so it is not dispatched
+    /// and the connection stays open.
+    #[error("The stream accepted no byte of the command within the managed idle bound")]
+    WriteTimeout,
+    /// FORK-LOCAL (Tideshift, WP-124): a managed write was sent and nothing came back on its
+    /// connection within the idle bound. The answer is lost; the command is never resent.
+    #[error("No answer on the connection within the managed idle bound")]
+    AnswerTimeout,
 }
 
 #[derive(Debug)]

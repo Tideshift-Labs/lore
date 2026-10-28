@@ -13,8 +13,8 @@
 // record what crossed the wire. Live-session state is read from the server's own `SessionMap`
 // (via `lore-server`'s `test-util` fields), not inferred from client state.
 //
-// Reads (Query) are the managed traffic: `reject_managed_quic` still refuses managed QUIC writes
-// in slice 2a, so nothing here asserts a managed write is admitted.
+// Slice 2a's cases use reads (Query) as the managed traffic. Slice 2b removed the managed-write guard,
+// and its section at the end asserts a managed Put, Copy and PutResolved are admitted.
 #[cfg(all(test, feature = "integration_tests"))]
 mod quic_declared_session_tests {
     use std::collections::HashMap;
@@ -75,6 +75,7 @@ mod quic_declared_session_tests {
     use lore_transport::VolatileAttemptStore;
     use lore_transport::current_caller_operation;
     use lore_transport::error::ProtocolError;
+    use lore_transport::error::is_unsupported_client;
     use lore_transport::is_quic_declaration_refused;
     use lore_transport::quic::QuicOpCode;
     use lore_transport::quic::command_header::CommandHeader;
@@ -1421,6 +1422,224 @@ mod quic_declared_session_tests {
                 stops[0] > held_query,
                 "the stop follows the Query: {wire:?}"
             );
+            Ok(())
+        })
+        .await
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // WP-124 slice 2b: a managed fragment write over QUIC is admitted and readable.
+    // ---------------------------------------------------------------------------------------
+
+    /// The first place a managed QUIC write reaches a strict slice-1 server. The same Put outside
+    /// a scope is the control: it is refused with status 200, final and typed, so the admission is
+    /// the declared session's and not an open door.
+    #[tokio::test]
+    async fn a_managed_put_over_quic_is_admitted_on_a_declared_session_and_readable() -> TestResult
+    {
+        in_context(async {
+            let cell = cell(Mode::Real).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await;
+            let session = connection.session(partition, "managed-put").await?;
+            let (fragment, address, payload) = fragment::generate_random();
+
+            let refused = session
+                .put(address, fragment, Some(payload.clone()))
+                .await
+                .expect_err("an undeclared Put is refused by a strict server");
+            assert!(is_unsupported_client(&refused), "{refused:?}");
+            assert!(!refused.is_outcome_unknown(), "{refused:?}");
+            assert!(!refused.is_slow_down(), "{refused:?}");
+            assert!(
+                session.get(&address).await.is_err(),
+                "a refused Put stores nothing"
+            );
+
+            let scope = managed(partition);
+            with_caller_operation(
+                scope.clone(),
+                session.put(address, fragment, Some(payload.clone())),
+            )
+            .await?;
+            assert_eq!(scope.declared_session_count(), 1);
+
+            let puts: Vec<Wire> = cell
+                .probe
+                .wire()
+                .into_iter()
+                .filter(|w| w.opcode == Command::Put as u8)
+                .collect();
+            assert_eq!(
+                puts.len(),
+                2,
+                "the refused Put and the admitted one: {puts:?}"
+            );
+            assert_eq!(cell.probe.declared_of(puts[0].session_id), Some(false));
+            assert_eq!(cell.probe.declared_of(puts[1].session_id), Some(true));
+
+            let (read_fragment, read_payload) = session.get(&address).await?;
+            assert_eq!(read_payload, payload);
+            assert_eq!(read_fragment.size_payload, fragment.size_payload);
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_managed_copy_over_quic_is_admitted_and_the_target_is_readable() -> TestResult {
+        in_context(async {
+            let cell = cell(Mode::Real).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await;
+            let session = connection.session(partition, "managed-copy").await?;
+            let scope = managed(partition);
+            let (fragment, address, payload) = fragment::generate_random();
+            with_caller_operation(
+                scope.clone(),
+                session.put(address, fragment, Some(payload.clone())),
+            )
+            .await?;
+
+            let target_context = random::<Context>();
+            let copy = session
+                .copy(partition, address, target_context)
+                .await
+                .expect_err("an undeclared Copy is refused by a strict server");
+            assert!(is_unsupported_client(&copy), "{copy:?}");
+
+            with_caller_operation(
+                scope.clone(),
+                session.copy(partition, address, target_context),
+            )
+            .await?;
+            let target = Address {
+                hash: address.hash,
+                context: target_context,
+            };
+            let (_, copied) = session.get(&target).await?;
+            assert_eq!(copied, payload);
+            let copies: Vec<Wire> = cell
+                .probe
+                .wire()
+                .into_iter()
+                .filter(|w| w.opcode == Command::Copy as u8)
+                .collect();
+            assert_eq!(copies.len(), 2, "{copies:?}");
+            assert_eq!(cell.probe.declared_of(copies[1].session_id), Some(true));
+            Ok(())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_managed_put_resolved_over_quic_is_admitted_and_resolves() -> TestResult {
+        in_context(async {
+            let cell = cell(Mode::Real).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await;
+            let session = connection
+                .session(partition, "managed-put-resolved")
+                .await?;
+            let scope = managed(partition);
+            let (fragment, address, payload) = fragment::generate_random();
+            let key = random::<Hash>();
+
+            let refused = session
+                .put_resolved_outcome(&key, address, fragment, Some(payload.clone()))
+                .await
+                .expect_err("an undeclared PutResolved is refused by a strict server");
+            assert!(is_unsupported_client(&refused), "{refused:?}");
+
+            with_caller_operation(
+                scope.clone(),
+                session.put_resolved_outcome(&key, address, fragment, Some(payload.clone())),
+            )
+            .await?;
+            let (resolved, _, read) = session.get_resolved(&key, &address.context, 0).await?;
+            assert_eq!(resolved, address.hash);
+            assert_eq!(read, payload);
+            Ok(())
+        })
+        .await
+    }
+
+    /// A managed mutable-key write over QUIC is refused on the client: nothing reaches the wire,
+    /// and the same verb outside a scope is unchanged (a strict server still answers 200 for it).
+    #[tokio::test]
+    async fn a_managed_mutable_key_write_over_quic_is_refused_before_the_wire() -> TestResult {
+        in_context(async {
+            let cell = cell(Mode::Real).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await;
+            let session = connection.session(partition, "managed-mutable").await?;
+            let scope = managed(partition);
+            read(&session, None, some_address()).await?;
+            let storage_commands = |probe: &Probe| {
+                probe
+                    .wire()
+                    .into_iter()
+                    .filter(|w| w.opcode != Command::Authorize as u8)
+                    .count()
+            };
+            let wire_before = storage_commands(&cell.probe);
+            let key = random::<Hash>();
+            let value = random::<Hash>();
+
+            let (store, cas) = with_caller_operation(scope.clone(), async {
+                (
+                    session
+                        .mutable_store_outcome(key, value, KeyType::Untyped)
+                        .await
+                        .map(|_| ()),
+                    session
+                        .mutable_compare_and_swap_outcome(key, value, value, KeyType::Untyped)
+                        .await
+                        .map(|_| ()),
+                )
+            })
+            .await;
+            for error in [store.expect_err("store"), cas.expect_err("cas")] {
+                assert!(
+                    error
+                        .to_string()
+                        .contains("managed mutable-key writes require gRPC"),
+                    "{error:?}"
+                );
+            }
+            // The declared session start (an Authorize) may precede the refusal; no storage command does.
+            assert_eq!(
+                storage_commands(&cell.probe),
+                wire_before,
+                "{:?}",
+                cell.probe.wire()
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// `selected_caller_namespace` binds a namespace for a `lore://` remote as it does for
+    /// `grpc://`. The loopback server runs no authentication, so neither binds a credential
+    /// namespace; what matters is that the scheme check is not what refuses either of them.
+    #[tokio::test]
+    async fn a_lore_remote_is_not_refused_by_the_namespace_scheme_check() -> TestResult {
+        in_context(async {
+            let cell = cell(Mode::Real).await;
+            let partition = random::<RepositoryId>();
+            for scheme in ["grpc", "lore"] {
+                let connection = connect(scheme, cell.port, partition).await;
+                let outcome =
+                    lore_transport::selected_caller_namespace(&connection, partition).await;
+                if let Err(error) = outcome {
+                    assert!(
+                        !error
+                            .to_string()
+                            .contains("managed namespace binding requires"),
+                        "{scheme}:// must pass the scheme check: {error:?}"
+                    );
+                }
+            }
             Ok(())
         })
         .await

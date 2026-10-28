@@ -177,3 +177,39 @@ fn recovery_dial_rejects_ambiguous_or_unsupported_endpoint_without_retargeting()
         );
     }
 }
+
+/// WP-124 slice 2b: a `lores://` remote and a `grpcs://` remote record the same journal
+/// namespace, and the recorded endpoint still dials through `recovery_dial_url`.
+#[test]
+fn lore_and_grpc_remotes_record_the_same_canonical_namespace() {
+    for (lore, grpc, recorded, dial) in [
+        (
+            "lores://h.example:41337",
+            "grpcs://h.example:41337",
+            "https://h.example:41337/",
+            "grpcs://h.example:41337/",
+        ),
+        (
+            "lore://h.example:41337",
+            "grpc://h.example:41337",
+            "http://h.example:41337/",
+            "grpc://h.example:41337/",
+        ),
+    ] {
+        let from_lore = canonical_endpoint(
+            lore_transport::grpc::grpc_endpoint(lore)
+                .expect("lore")
+                .as_str(),
+        )
+        .expect("canonical");
+        let from_grpc = canonical_endpoint(
+            lore_transport::grpc::grpc_endpoint(grpc)
+                .expect("grpc")
+                .as_str(),
+        )
+        .expect("canonical");
+        assert_eq!(from_lore, from_grpc);
+        assert_eq!(from_lore, recorded);
+        assert_eq!(recovery_dial_url(&from_lore).expect("dial"), dial);
+    }
+}

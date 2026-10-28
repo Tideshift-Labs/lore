@@ -3,6 +3,8 @@
 
 mod chunking;
 mod client;
+mod managed_send_bound;
 mod net_runtime;
 mod response_reader;
+mod scripted_storage_peer;
 mod storage_service;

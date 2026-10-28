@@ -229,3 +229,62 @@ fn details_of_another_length_are_not_read_as_an_address() {
     let error = ProtocolError::from(status);
     assert!(error.is_internal(), "{error:?}");
 }
+
+/// WP-124 slice 2b: `lore(s)://` and `grpc(s)://` name the same gRPC endpoint, so a managed
+/// journal never records a `lore(s)://` namespace and `recovery_dial_url` keeps working.
+#[test]
+fn lore_and_grpc_schemes_normalize_to_the_same_http_endpoint() {
+    for (lore, grpc, expected) in [
+        (
+            "lore://h.example:41337",
+            "grpc://h.example:41337",
+            "http://h.example:41337/",
+        ),
+        (
+            "lores://h.example:41337",
+            "grpcs://h.example:41337",
+            "https://h.example:41337/",
+        ),
+        (
+            "lore://127.0.0.1:8080",
+            "grpc://127.0.0.1:8080",
+            "http://127.0.0.1:8080/",
+        ),
+        (
+            "lores://[::1]:9443",
+            "grpcs://[::1]:9443",
+            "https://[::1]:9443/",
+        ),
+    ] {
+        let from_lore = grpc_endpoint(lore).expect("lore url");
+        let from_grpc = grpc_endpoint(grpc).expect("grpc url");
+        assert_eq!(from_lore, from_grpc, "{lore} vs {grpc}");
+        assert_eq!(from_lore.as_str(), expected, "{lore}");
+        assert!(
+            !from_lore.scheme().starts_with("lore"),
+            "a journal namespace never records lore(s)://: {from_lore}"
+        );
+    }
+}
+
+/// A missing port takes the same default whichever of the two schemes spelled the remote.
+#[test]
+fn lore_and_grpc_schemes_take_the_same_default_port() {
+    for (lore, grpc) in [
+        ("lore://h.example", "grpc://h.example"),
+        ("lores://h.example", "grpcs://h.example"),
+    ] {
+        assert_eq!(
+            grpc_endpoint(lore).expect("lore url"),
+            grpc_endpoint(grpc).expect("grpc url"),
+            "{lore} vs {grpc}"
+        );
+    }
+}
+
+#[test]
+fn grpc_endpoint_refuses_a_remote_it_cannot_dial() {
+    for remote in ["", "not a url", "lore://", "lores:///only-a-path"] {
+        assert!(grpc_endpoint(remote).is_err(), "must refuse {remote:?}");
+    }
+}
