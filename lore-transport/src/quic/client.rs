@@ -565,10 +565,11 @@ impl QuicConnection {
 
     /// The connection generation a session id issued right now would belong to.
     ///
-    /// Sample this *before* asking the server for a session, never after: a connection replaced
-    /// while `session_start` is in flight leaves the id recorded against the older generation,
-    /// which costs a rebind. Sampling afterwards would record a generation the id was never valid
-    /// on, which costs correctness.
+    /// Never bind a session id to a sample of this taken outside the send. Sampled after the
+    /// answer, it can name a connection the id was never valid on, which costs correctness.
+    /// Sampled before the start, it names the dead connection whenever the start's own send
+    /// reconnects, which strands a server session (WP-124). The send path reports the
+    /// generation a start was framed on; `Storage::session_start_bound` returns it.
     pub fn connection_generation(&self) -> u32 {
         self.generation.load(Ordering::Relaxed)
     }
@@ -577,8 +578,8 @@ impl QuicConnection {
     ///
     /// Crate-visible, and it has to stay that way. The registry is what the write boundary
     /// consults, so anything able to write it can mark an arbitrary id current on an arbitrary
-    /// connection and put P0-1 straight back. The invariant it depends on — the generation was
-    /// sampled *before* the `session_start` whose id this is — is held by the single caller in
+    /// connection and put P0-1 straight back. The invariant it depends on — the generation is the
+    /// one the `session_start` whose id this is was framed on — is held by the single caller in
     /// `quic/storage_service/client.rs`, and keeping the writer inside this crate is what makes
     /// that an invariant rather than a convention.
     ///
@@ -773,6 +774,12 @@ pub enum SendWithReconnectError {
 /// distinction only a mutable write asks about.
 pub trait OutcomeSink: Copy + Send {
     fn record(self, unknown: &OutcomeUnknown);
+
+    /// FORK-LOCAL (Tideshift, WP-124): the connection generation the request is being framed
+    /// on, reported at the write boundary under the connection read lock. Called once per
+    /// dispatch that passes the write-boundary check, so after a reconnect and retry the last
+    /// call names the connection the answer came from. Only a session start asks; every other sink ignores it.
+    fn framed_on(self, _generation: u32) {}
 }
 
 /// Discards the outcome. Zero-sized, and what every read path passes.
@@ -781,6 +788,20 @@ pub struct IgnoreOutcome;
 
 impl OutcomeSink for IgnoreOutcome {
     fn record(self, _unknown: &OutcomeUnknown) {}
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): records the generation a session start was framed on.
+///
+/// `Authorize` is replayable, so it never has an unknown outcome to record.
+#[derive(Clone, Copy)]
+struct RecordFramedOn<'a>(&'a SyncMutex<Option<u32>>);
+
+impl OutcomeSink for RecordFramedOn<'_> {
+    fn record(self, _unknown: &OutcomeUnknown) {}
+
+    fn framed_on(self, generation: u32) {
+        *self.0.lock() = Some(generation);
+    }
 }
 
 /// Records the outcome for a caller that asked for one.
@@ -898,12 +919,13 @@ where
         // section that takes the writer, where nothing can invalidate it before the bytes are
         // framed. Removing it here also keeps its captured epoch out of this future, which is
         // size bounded by `test_futures_size`.
-        match send_command_tracked::<HIGH_PRIORITY, true, MANAGED>(
+        match send_command_tracked::<HIGH_PRIORITY, true, MANAGED, Sink>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
             service_client.v4_protocol(),
             &mut chunks(),
+            unknown,
         )
         .await
         {
@@ -1195,12 +1217,13 @@ where
                 service_client.map_send_error(request_type, SendWithReconnectError::PermitAcquire)
             );
         };
-        match send_command_tracked::<HIGH_PRIORITY, true, MANAGED>(
+        match send_command_tracked::<HIGH_PRIORITY, true, MANAGED, Sink>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
             service_client.v4_protocol(),
             &mut chunks(),
+            unknown,
         )
         .await
         {
@@ -1797,9 +1820,9 @@ where
                     // The ids are dropped rather than left to age out. Every one of them belongs
                     // to the connection that is gone, and dropping them bounds the map to the
                     // sessions actually live on the connection in hand. A `register_session`
-                    // still in flight records the generation it sampled before its
-                    // `session_start`, so an insert landing after this clear is refused by the
-                    // generation comparison rather than resurrected by it.
+                    // still in flight records the generation its `session_start` was framed on,
+                    // so an insert landing after this clear is refused by the generation
+                    // comparison rather than resurrected by it.
                     connection.generation.fetch_add(1, Ordering::Relaxed);
                     connection.sessions.clear();
                 }
@@ -2072,6 +2095,33 @@ where
     )
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): [`send_normal_with_reconnect`], also returning the connection
+/// generation the answered request was framed on.
+///
+/// For a session start, whose id belongs to the connection that answered it. The generation is
+/// `None` only if no dispatch reached the write boundary, which an answer rules out; the caller
+/// treats it as a failure rather than guess.
+pub(crate) async fn send_normal_with_reconnect_framed<ServiceClientType, const LEN: usize>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    session_id: u32,
+    chunks: impl Fn() -> [Bytes; LEN] + Send,
+) -> Result<(Bytes, Option<u32>), ServiceClientType::ErrorType>
+where
+    ServiceClientType: ServiceClient,
+{
+    let framed = SyncMutex::new(None);
+    let payload = send_with_reconnect::<ServiceClientType, RecordFramedOn<'_>, LEN, false, false>(
+        service_client,
+        request_type,
+        session_id,
+        chunks,
+        RecordFramedOn(&framed),
+    )
+    .await?;
+    Ok((payload, framed.into_inner()))
+}
+
 /// [`send_normal_with_reconnect`], reporting a lost dispatched response as
 /// [`MutableOutcome::Unknown`] rather than as an error.
 ///
@@ -2155,8 +2205,13 @@ pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command_tracked::<HIGH_PRIORITY, AWAIT_RESPONSE, false>(
-        connection, command, session_id, v4, chunks,
+    send_command_tracked::<HIGH_PRIORITY, AWAIT_RESPONSE, false, IgnoreOutcome>(
+        connection,
+        command,
+        session_id,
+        v4,
+        chunks,
+        IgnoreOutcome,
     )
     .await
     .map_err(|failure| failure.error)
@@ -2171,16 +2226,21 @@ pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>
 ///
 /// `MANAGED` sends the command through [`send_bounded`] once it is framed. It implies
 /// `AWAIT_RESPONSE`: a bounded send is bounded up to its answer.
+///
+/// `sink` is told the generation the command is framed on ([`OutcomeSink::framed_on`]). Zero
+/// bytes for [`IgnoreOutcome`], which every read passes.
 async fn send_command_tracked<
     const HIGH_PRIORITY: bool,
     const AWAIT_RESPONSE: bool,
     const MANAGED: bool,
+    Sink: OutcomeSink,
 >(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
     session_id: u32,
     v4: bool,
     chunks: &mut [Bytes],
+    sink: Sink,
 ) -> Result<Bytes, SendFailure> {
     const { assert!(!MANAGED || AWAIT_RESPONSE) };
     {
@@ -2245,6 +2305,13 @@ async fn send_command_tracked<
                     QuicClientError::SessionRebindRequired,
                 ));
             }
+
+            // FORK-LOCAL (Tideshift, WP-124): the generation this command is framed on. Exact
+            // here and nowhere else: the generation moves only under this lock in write mode, and
+            // the writer taken below is a stream of this generation, so an answer to this send can
+            // only come from it. A session start registers its id against this value; a value
+            // sampled before the send would name the dead connection a reconnect replaced.
+            sink.framed_on(connection.connection_generation());
 
             // Select stream based on priority, computed inside lock to avoid living across await points
             let reader_count = connection_lock.reader.len() as u32;

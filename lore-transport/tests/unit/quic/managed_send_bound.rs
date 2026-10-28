@@ -205,6 +205,7 @@ async fn declared_session(peer: &Peer, client: &StorageClient) -> u32 {
         .session_start_declared(partition(), "managed", "outcome_unknown_v1")
         .await
         .expect("declared session")
+        .0
 }
 
 /// The three unjournaled fragment writes, one verb each.
@@ -1293,7 +1294,8 @@ async fn a_healing_verify_journals_under_the_sessions_partition_and_refuses_a_fo
     let other = client
         .session_start_declared(Partition::from([0x55u8; 16]), "other", "outcome_unknown_v1")
         .await
-        .expect("a declared session for another partition");
+        .expect("a declared session for another partition")
+        .0;
     let mismatch =
         with_caller_operation(scope.clone(), client.verify_outcome(other, &address, true))
             .await
@@ -1352,8 +1354,8 @@ async fn a_healing_verify_on_a_stale_session_after_a_reconnect_gets_the_rebind_p
         generation,
         "the generation moved"
     );
-    // The trigger's own id was recorded against the generation sampled before it went out, so it
-    // is stale too (it costs a rebind, by design). A start made now is current.
+    // The trigger's own id is bound to the generation its start was framed on (the replacement),
+    // so it is current. Only `stale`, issued on the dead connection, is refused below.
     let current = client
         .session_start(partition(), "after-reconnect")
         .await

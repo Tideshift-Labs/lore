@@ -81,6 +81,7 @@ pub(crate) type TestResult = Result<(), Box<dyn Error>>;
 
 pub(crate) const ACTION_START: u8 = 0;
 pub(crate) const ACTION_START_DECLARED: u8 = 2;
+pub(crate) const ACTION_STOP: u8 = 1;
 pub(crate) const WAIT: Duration = Duration::from_secs(30);
 
 // ---------------------------------------------------------------------------------------
@@ -131,6 +132,32 @@ impl Probe {
             .iter()
             .filter(|w| w.opcode == Command::Authorize as u8 && w.action == Some(action))
             .count()
+    }
+
+    /// Live sessions across every accepted connection, from the server's own `SessionMap`s.
+    pub(crate) fn live(&self) -> usize {
+        self.maps
+            .lock()
+            .expect("maps mutex")
+            .iter()
+            .map(|map| map.entries.len())
+            .sum()
+    }
+
+    /// Live DECLARED sessions across every accepted connection. An orphaned declared start shows
+    /// here as a session nothing will ever stop.
+    pub(crate) fn declared_live(&self) -> usize {
+        self.maps
+            .lock()
+            .expect("maps mutex")
+            .iter()
+            .map(|map| {
+                map.entries
+                    .iter()
+                    .filter(|entry| entry.value().declared)
+                    .count()
+            })
+            .sum()
     }
 
     /// `Some(declared)` for a live session id, `None` for one the server does not hold.
@@ -566,6 +593,37 @@ pub(crate) fn hold_first_put_answer() -> HoldFirstPutAnswer {
         // Comfortably longer than an in-process `QuinnServer::close()` takes.
         grace: Duration::from_millis(400),
         armed: Arc::new(AtomicBool::new(true)),
+    }
+}
+
+/// Close the cell's QUIC server and start a fresh one on the same port over the same stores, with
+/// no answer held. The client's connection to the old one is dead; its next command reconnects to
+/// the returned probe's server.
+pub(crate) async fn replace_server(cell: &mut Cell) -> Probe {
+    let old = cell.quic.take().expect("the cell's QUIC server");
+    old.close().await;
+    drop(old);
+    let udp = rebind_udp(cell.port).await;
+    let replacement = Probe::default();
+    cell.quic = Some(start_quic(
+        udp,
+        cell.stores.clone(),
+        replacement.clone(),
+        None,
+        None,
+    ));
+    replacement
+}
+
+/// Poll `condition` for up to ten seconds, failing with `what` if it never holds.
+pub(crate) async fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

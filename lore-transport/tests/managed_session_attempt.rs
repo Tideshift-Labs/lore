@@ -359,3 +359,118 @@ async fn a_sibling_closed_under_a_managed_write_rebinds_once_and_resends_once() 
         "the scope still owns one declared binding"
     );
 }
+
+/// Connect through the public seam, with the scripted peer as the storage endpoint.
+async fn connect_to(peer: &Peer) -> Arc<lore_transport::Connection> {
+    let addr = serve_environment(peer).await;
+    lore_transport::connect(
+        &format!("lore://{addr}"),
+        "",
+        RepositoryId::default(),
+        1,
+        "",
+        "",
+    )
+    .await
+    .expect("connect builds its storage connection to the scripted peer")
+}
+
+/// Close the connection from the peer's side and wait for it. The client sees it die with nothing
+/// in flight; the next command reconnects.
+async fn kill_the_connection(peer: &Peer) {
+    peer.close_connections();
+    peer.wait_until("the connection to close", |peer| {
+        peer.closed_connections() == 1
+    })
+    .await;
+}
+
+/// WP-124, through `SessionBinding::resolve`: the first managed write after the connection died
+/// starts exactly ONE declared session. The start's own send reconnects, so the id is bound to the
+/// replacement's generation; a binding that kept a generation sampled before the start would be
+/// refused at the write boundary and start a second declared session, orphaning the first.
+#[tokio::test]
+async fn the_first_managed_write_after_a_reconnect_starts_exactly_one_declared_session() {
+    bound_the_managed_send();
+    let peer = Arc::new(Peer::start());
+    let connection = connect_to(&peer).await;
+    let session = connection
+        .session(partition(), "managed-reconnect-one-start")
+        .await
+        .expect("a storage session");
+    kill_the_connection(&peer).await;
+    let context = CallerOperationContext::new(
+        Uuid::new_v4(),
+        RepositoryId::from([0x24u8; 16]),
+        Arc::new(VolatileAttemptStore::new()),
+    );
+
+    let (_, result) = managed_put(&context, &session, 64).await;
+
+    assert!(
+        matches!(result, Ok(MutableOutcome::Applied(()))),
+        "{result:?}"
+    );
+    assert_eq!(peer.accepted_connections(), 2, "one replacement connection");
+    assert_eq!(
+        authorize_actions(&peer, 1),
+        vec![ACTION_START_DECLARED],
+        "exactly one declared start on the replacement, and no undeclared one"
+    );
+    let puts = peer.seen_opcode(PUT);
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(puts[0].connection, 1, "the Put went to the replacement");
+
+    // The binding recorded the generation the start was framed on, so the next write in the same
+    // scope reuses the session. A binding left on the pre-start generation would pass the first
+    // write (the write boundary checks the transport's registry) and then rebind here, orphaning
+    // the session the first write rode.
+    let (_, second) = managed_put(&context, &session, 64).await;
+    assert!(
+        matches!(second, Ok(MutableOutcome::Applied(()))),
+        "{second:?}"
+    );
+    assert_eq!(
+        authorize_actions(&peer, 1),
+        vec![ACTION_START_DECLARED],
+        "the second write reused the declared session"
+    );
+    let puts = peer.seen_opcode(PUT);
+    assert_eq!(puts.len(), 2, "{puts:?}");
+    assert_eq!(
+        puts[0].session_id, puts[1].session_id,
+        "both writes rode one session"
+    );
+    assert_eq!(context.declared_session_count(), 1);
+}
+
+/// WP-124, the undeclared pool path: a pool started after the connection died makes exactly ONE
+/// undeclared start on the replacement, and its first use is not refused and rebound.
+#[tokio::test]
+async fn the_first_use_of_a_pool_started_after_a_reconnect_starts_exactly_one_session() {
+    bound_the_managed_send();
+    let peer = Arc::new(Peer::start());
+    let connection = connect_to(&peer).await;
+    connection.storage().await.expect("storage connection");
+    kill_the_connection(&peer).await;
+
+    let session = connection
+        .session(partition(), "pool-reconnect-one-start")
+        .await
+        .expect("a pool started on a dead connection reconnects");
+    let (address, fragment, payload) = put_args(64);
+    session
+        .put(address, fragment, Some(payload))
+        .await
+        .expect("the first use of the session is not refused");
+
+    assert_eq!(peer.accepted_connections(), 2, "one replacement connection");
+    assert_eq!(
+        authorize_actions(&peer, 1),
+        vec![ACTION_START],
+        "exactly one undeclared start on the replacement"
+    );
+    let puts = peer.seen_opcode(PUT);
+    assert_eq!(puts.len(), 1, "{puts:?}");
+    assert_eq!(puts[0].connection, 1);
+}

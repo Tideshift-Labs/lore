@@ -58,6 +58,10 @@ pub enum Reply {
     Hold(Vec<u8>),
     /// Read the request, then close the connection without answering: the answer is lost.
     Disconnect,
+    /// As [`Reply::Disconnect`] for the first request of this opcode, and from then on answer
+    /// success with this payload. The rule is swapped before the connection is closed, so the
+    /// retry on the replacement connection always finds the second behavior.
+    DisconnectThenOk(Vec<u8>),
     /// Answer success as soon as the header is read, before the payload. The payload is read
     /// later, when the gate allows it. This is how a test fills a stream's credit with a write
     /// that has completed.
@@ -433,6 +437,10 @@ async fn serve_stream(
         match rule {
             Some(Reply::EarlyOk | Reply::Silent) => {}
             Some(Reply::Disconnect) => connection.close(quinn::VarInt::from_u32(9), b"scripted"),
+            Some(Reply::DisconnectThenOk(body)) => {
+                shared.rules.lock().insert(header.cmd, Reply::Ok(body));
+                connection.close(quinn::VarInt::from_u32(9), b"scripted");
+            }
             Some(Reply::Ok(body)) => respond(&send, &header, &body).await,
             Some(Reply::Status(status)) => respond_status(&send, &header, status).await,
             Some(Reply::Hold(body)) => shared.held.lock().push(Held {

@@ -2079,8 +2079,12 @@ impl Storage for GRPCStorage {
         partition: Partition,
         correlation_id: &str,
         _capabilities: &'static str,
-    ) -> Result<u32, ProtocolError> {
-        self.session_start(partition, correlation_id).await
+    ) -> Result<(u32, u32), ProtocolError> {
+        // The generation is the constant this client's sessions always report. Nothing extra
+        // goes on the wire: this is exactly `session_start`.
+        self.session_start(partition, correlation_id)
+            .await
+            .map(|session_id| (session_id, GRPC_STATIC_SESSION_EPOCH))
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {

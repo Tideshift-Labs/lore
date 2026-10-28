@@ -21,6 +21,7 @@ mod managed_not_prepared_proof_tests;
 mod not_prepared_proof_wire_tests;
 mod repository_scoped_get;
 mod revision_client;
+mod session_start_declared_wire_tests;
 mod storage_client;
 
 use std::sync::atomic::AtomicUsize;

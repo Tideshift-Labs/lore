@@ -140,8 +140,29 @@ pub trait Storage: Send + Sync {
         correlation_id: &str,
     ) -> Result<u32, ProtocolError>;
 
+    /// FORK-LOCAL (Tideshift, WP-124): [`Storage::session_start`], also returning the connection
+    /// generation the id belongs to.
+    ///
+    /// A caller binding the id to a generation must use this, not a generation it read itself.
+    /// A sample taken before the call names the dead connection whenever the start reconnects,
+    /// so the first command refuses the id and a second session is started while the first is
+    /// never stopped.
+    ///
+    /// The default keeps the pre-sampled generation, which is exact for a transport whose
+    /// generation never moves. QUIC overrides it with the generation the request was framed on.
+    async fn session_start_bound(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+    ) -> Result<(u32, u32), ProtocolError> {
+        let generation = self.connection_generation();
+        let session_id = self.session_start(partition, correlation_id).await?;
+        Ok((session_id, generation))
+    }
+
     /// FORK-LOCAL (Tideshift, WP-124): start a session that declares `capabilities` for its
-    /// whole lifetime, so a strict server admits its writes.
+    /// whole lifetime, so a strict server admits its writes. Returns the id and the connection
+    /// generation it belongs to, as [`Storage::session_start_bound`] does.
     ///
     /// The default refuses: a transport that cannot carry a declaration must not silently open
     /// an undeclared session in its place. A refusal is final; a caller never retries it as
@@ -151,7 +172,7 @@ pub trait Storage: Send + Sync {
         partition: Partition,
         correlation_id: &str,
         capabilities: &'static str,
-    ) -> Result<u32, ProtocolError> {
+    ) -> Result<(u32, u32), ProtocolError> {
         let _ = (partition, correlation_id, capabilities);
         Err(ProtocolError::internal(
             "this transport cannot declare a session",

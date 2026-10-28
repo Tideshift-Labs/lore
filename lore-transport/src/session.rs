@@ -86,9 +86,13 @@ impl SessionBinding {
     /// The session id to send on the connection as it is now, starting a replacement session
     /// first if the connection has been replaced since this one was issued.
     ///
-    /// The generation is sampled before `session_start` rather than after, so a connection
-    /// replaced again mid-call records the older generation and the next caller rebinds. That
-    /// costs an extra round trip in a rare race, which is the way round this has to fail.
+    /// A replacement is bound to the generation the start itself reports
+    /// ([`Storage::session_start_bound`]), never to one sampled here. The start's own send may
+    /// reconnect, which it does whenever the connection died before this call; a sample taken
+    /// before it then names the dead connection, the write boundary refuses the new id, and a
+    /// second start strands the first session on the server (WP-124). A connection replaced
+    /// again after the start answers still leaves the id on the older generation, and the
+    /// next caller rebinds.
     ///
     /// What this guarantees is that no id is *handed out* for a generation it did not come from.
     /// It does not guarantee the id is still current when the bytes reach the socket, because
@@ -121,7 +125,7 @@ impl SessionBinding {
         // A fresh `session_start` re-runs the token exchange and the server's authorization
         // check for this partition. Nothing from the old session's permission snapshot carries
         // over, which is the point: the replacement connection decides for itself.
-        let id = match self.declared {
+        let (id, generation) = match self.declared {
             Some((_, capabilities)) => {
                 self.storage
                     .session_start_declared(self.partition, &self.correlation_id, capabilities)
@@ -129,15 +133,15 @@ impl SessionBinding {
             }
             None => {
                 self.storage
-                    .session_start(self.partition, &self.correlation_id)
+                    .session_start_bound(self.partition, &self.correlation_id)
                     .await?
             }
         };
         *self.session.lock() = BoundSession {
             id,
-            generation: Some(current),
+            generation: Some(generation),
         };
-        Ok((id, current))
+        Ok((id, generation))
     }
 
     /// The session id if it belongs to `generation`, otherwise nothing.
@@ -310,8 +314,8 @@ enum SessionInner {
 impl StorageSession {
     /// Construct an already-resolved session. Used by the connection internals
     /// after a successful `session_start` RPC.
-    /// `generation` is the connection generation `session_id` was issued on, sampled before the
-    /// `session_start` that produced it.
+    /// `generation` is the connection generation `session_id` was issued on, as
+    /// [`Storage::session_start_bound`] reported it.
     pub(crate) fn resolved(
         storage: Arc<dyn Storage>,
         connection: Arc<Connection>,
@@ -1101,11 +1105,12 @@ impl StorageConnector {
             let correlation_id = correlation_id.to_string();
             let started = started.clone();
             lore_spawn_net!(tasks, async move {
-                // Sampled before the call, so a connection replaced while `session_start` is in
-                // flight leaves the session bound to the older generation and the first use
-                // rebinds. The other order would record a generation the id was never valid on.
-                let generation = storage.connection_generation();
-                let session_id = storage.session_start(partition, &correlation_id).await?;
+                // FORK-LOCAL (Tideshift, WP-124): the generation the start reports, never a sample
+                // taken before it. A start that reconnects would otherwise bind the id to the dead
+                // connection, so the first use rebinds and the first session is never stopped.
+                let (session_id, generation) = storage
+                    .session_start_bound(partition, &correlation_id)
+                    .await?;
                 started.lock().push((storage, session_id, generation));
                 Ok::<_, ProtocolError>(())
             });

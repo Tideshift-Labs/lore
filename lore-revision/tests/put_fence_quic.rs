@@ -131,7 +131,8 @@ impl Fixture {
         let session = client
             .session_start_declared(partition(), "put-fence-quic", "outcome_unknown_v1")
             .await
-            .expect("a declared session");
+            .expect("a declared session")
+            .0;
         Self {
             peer,
             client,

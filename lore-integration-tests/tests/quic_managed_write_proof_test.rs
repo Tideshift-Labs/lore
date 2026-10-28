@@ -48,6 +48,7 @@ mod quic_managed_write_proof_tests {
 
     use crate::quic_managed_write_support::ACTION_START;
     use crate::quic_managed_write_support::ACTION_START_DECLARED;
+    use crate::quic_managed_write_support::ACTION_STOP;
     use crate::quic_managed_write_support::Cell;
     use crate::quic_managed_write_support::Probe;
     use crate::quic_managed_write_support::RESEND_SETTLE;
@@ -56,11 +57,13 @@ mod quic_managed_write_proof_tests {
     use crate::quic_managed_write_support::Wire;
     use crate::quic_managed_write_support::cell;
     use crate::quic_managed_write_support::connect;
+    use crate::quic_managed_write_support::eventually;
     use crate::quic_managed_write_support::fresh_stores;
     use crate::quic_managed_write_support::hold_first_put_answer;
     use crate::quic_managed_write_support::in_context;
     use crate::quic_managed_write_support::lose_answer_and_restart;
     use crate::quic_managed_write_support::managed;
+    use crate::quic_managed_write_support::replace_server;
     use crate::quic_managed_write_support::stored;
 
     /// After the writer's call returned, give a resend time to reach the replacement, then require
@@ -177,13 +180,10 @@ mod quic_managed_write_proof_tests {
         .await
     }
 
-    /// The Put the replacement received ran on a declared session, with one declared start or two.
-    ///
-    /// KNOWN DEFECT, recorded in WP-124: `SessionBinding::resolve` samples the connection
-    /// generation BEFORE the `session_start_declared` that reconnects (`session.rs:108-139`), so the
-    /// first managed call after a connection died records the older generation and rebinds once.
-    /// Measured: two declared starts, the first orphaned until the connection ends. Tighten the
-    /// range to exactly 1 when that is fixed.
+    /// The Put the replacement received ran on a declared session, and the replacement saw exactly
+    /// one declared start: the start's own send reconnected, the id was bound to the generation its
+    /// `Authorize` was framed on, and the Put was not refused and rebound. A second start here is
+    /// the defect that left the first declared session orphaned on the server.
     fn assert_declared_put_on(replacement: &Probe) {
         let puts: Vec<Wire> = replacement
             .wire()
@@ -195,12 +195,173 @@ mod quic_managed_write_proof_tests {
             Some(true),
             "the Put ran on a declared session the replacement holds"
         );
-        let starts = replacement.count_action(ACTION_START_DECLARED);
-        assert!(
-            (1..=2).contains(&starts),
-            "{starts} declared starts: {:?}",
+        assert_eq!(
+            replacement.count_action(ACTION_START_DECLARED),
+            1,
+            "exactly one declared start after the reconnect: {:?}",
             replacement.wire()
         );
+    }
+
+    /// After the connection died, the first managed call makes exactly one declared start
+    /// (`Authorize` action 2) on the replacement, the Put rides it, and when the managed scope ends
+    /// the server holds no declared session. The server's own `SessionMap` is the oracle: a second
+    /// start would leave a declared session nothing ever stops.
+    #[tokio::test]
+    async fn the_first_managed_call_after_a_reconnect_makes_one_declared_start_and_leaves_no_orphan()
+    -> TestResult {
+        in_context(async {
+            let mut cell = cell(None, None, None).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await?;
+            let session = connection.session(partition, "reconnect-one-start").await?;
+            let replacement = replace_server(&mut cell).await;
+
+            let (fragment, address, payload) = fragment::generate_random();
+            let (scope, journal) = managed(partition);
+            tokio::time::timeout(
+                WAIT,
+                with_caller_operation(
+                    scope.clone(),
+                    session.put(address, fragment, Some(payload.clone())),
+                ),
+            )
+            .await
+            .expect("the first managed Put after the reconnect must finish")?;
+
+            assert_eq!(scope.declared_session_count(), 1);
+            assert_eq!(journal.records.load(Ordering::SeqCst), 0);
+            let wire = replacement.wire();
+            assert_eq!(
+                replacement.count_action(ACTION_START_DECLARED),
+                1,
+                "one declared start on the replacement: {wire:?}"
+            );
+            assert_eq!(replacement.count_opcode(Command::Put), 1, "{wire:?}");
+            assert_declared_put_on(&replacement);
+            assert_eq!(
+                replacement.declared_live(),
+                1,
+                "the server holds the one declared session the Put rode"
+            );
+
+            drop(scope);
+            eventually("the declared session to be stopped", || {
+                replacement.declared_live() == 0
+            })
+            .await;
+            assert_eq!(
+                replacement.count_action(ACTION_START_DECLARED),
+                1,
+                "still one declared start: {:?}",
+                replacement.wire()
+            );
+            assert_eq!(
+                replacement.count_action(ACTION_STOP),
+                1,
+                "the one declared session is stopped once: {:?}",
+                replacement.wire()
+            );
+            let (_, read) = session.get(&address).await?;
+            assert_eq!(read, payload);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Control for the reconnect case: with no reconnect the first managed call makes exactly one
+    /// declared start, and the server holds no declared session once the scope ends.
+    #[tokio::test]
+    async fn a_managed_call_without_a_reconnect_makes_one_declared_start_and_leaves_no_orphan()
+    -> TestResult {
+        in_context(async {
+            let cell = cell(None, None, None).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await?;
+            let session = connection.session(partition, "steady-one-start").await?;
+
+            let (fragment, address, payload) = fragment::generate_random();
+            let (scope, _journal) = managed(partition);
+            with_caller_operation(scope.clone(), session.put(address, fragment, Some(payload)))
+                .await?;
+
+            assert_eq!(scope.declared_session_count(), 1);
+            assert_eq!(
+                cell.probe.count_action(ACTION_START_DECLARED),
+                1,
+                "{:?}",
+                cell.probe.wire()
+            );
+            assert_eq!(cell.probe.declared_live(), 1);
+            drop(scope);
+            eventually("the declared session to be stopped", || {
+                cell.probe.declared_live() == 0
+            })
+            .await;
+            assert_eq!(cell.probe.count_action(ACTION_STOP), 1);
+            Ok(())
+        })
+        .await
+    }
+
+    /// The undeclared pool path has the same root cause: its start reconnects, so an id bound to
+    /// the pre-start generation is refused on first use and a second session is started. After the
+    /// connection died, the pool's first use makes exactly one `Authorize` action 0 on the
+    /// replacement, rides that session, and releasing the pool stops it: nothing is left behind.
+    #[tokio::test]
+    async fn the_undeclared_pool_after_a_reconnect_makes_one_start_and_leaves_no_orphan()
+    -> TestResult {
+        in_context(async {
+            let mut cell = cell(None, None, None).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await?;
+            // The storage connection must exist before the server is replaced, or the first
+            // start would simply connect to the replacement and no reconnect would be tested.
+            connection.ensure_storage_connected().await?;
+            let replacement = replace_server(&mut cell).await;
+
+            let correlation = "pool-reconnect-one-start";
+            let session = connection.session(partition, correlation).await?;
+            let (_, address, _) = fragment::generate_random();
+            tokio::time::timeout(WAIT, session.query(&[address]))
+                .await
+                .expect("the pool's first use after the reconnect must finish")?;
+
+            let wire = replacement.wire();
+            assert_eq!(
+                replacement.count_action(ACTION_START),
+                1,
+                "one undeclared start on the replacement: {wire:?}"
+            );
+            assert_eq!(
+                replacement.count_action(ACTION_START_DECLARED),
+                0,
+                "{wire:?}"
+            );
+            let queries: Vec<Wire> = wire
+                .iter()
+                .copied()
+                .filter(|w| w.opcode == Command::Query as u8)
+                .collect();
+            assert_eq!(queries.len(), 1, "{wire:?}");
+            assert_eq!(
+                replacement.declared_of(queries[0].session_id),
+                Some(false),
+                "the query rode the one live undeclared session"
+            );
+            assert_eq!(replacement.live(), 1, "{wire:?}");
+
+            drop(session);
+            connection.release_session(partition, correlation);
+            eventually("the pool's session to be stopped", || {
+                replacement.live() == 0
+            })
+            .await;
+            assert_eq!(replacement.count_action(ACTION_START), 1);
+            assert_eq!(replacement.count_action(ACTION_STOP), 1);
+            Ok(())
+        })
+        .await
     }
 
     /// The lost answer arrives AFTER the connection was replaced under the writer.

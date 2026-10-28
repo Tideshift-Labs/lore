@@ -82,6 +82,7 @@ use super::super::client::send_high_priority_with_reconnect;
 use super::super::client::send_managed_with_reconnect_outcome;
 use super::super::client::send_normal;
 use super::super::client::send_normal_with_reconnect;
+use super::super::client::send_normal_with_reconnect_framed;
 use super::super::client::send_normal_with_reconnect_outcome;
 use super::super::storage_service;
 use super::super::storage_service::Command;
@@ -596,28 +597,36 @@ fn authorize_start_payload(
 
 impl StorageClient {
     /// Start a session with `AuthorizeStart` action 0, or action 2 when `capabilities` is set.
+    ///
+    /// Returns the id and the connection generation it was registered on.
     async fn authorize_start(
         &self,
         partition: Partition,
         correlation_id: &str,
         capabilities: Option<&'static str>,
-    ) -> Result<u32, ProtocolError> {
-        // Sampled before the request goes out, never after. If the connection is replaced while
-        // this call is in flight, the id the server returns belongs to a connection that is
-        // already gone, and recording the older generation is what makes the send path refuse it
-        // and the session layer rebind. Sampling after the answer would record the generation the
-        // id was never issued on, which is the defect this whole path exists to prevent.
-        let generation = self.quic.connection_generation();
-
+    ) -> Result<(u32, u32), ProtocolError> {
         // Fetch auth token via token exchange (cached if already exchanged).
         let token = self.authorization(partition).await;
 
         let payload = authorize_start_payload(partition, correlation_id, &token, capabilities)?;
 
-        let response = send_normal_with_reconnect(self, Command::Authorize, 0, || {
-            [Bytes::default(), payload.clone()]
-        })
-        .await?;
+        // FORK-LOCAL (Tideshift, WP-124): the id belongs to the generation the answered request
+        // was framed on, reported by the send path at its write boundary. Not one sampled before
+        // the send: when the send itself reconnects and retries, that names the dead connection,
+        // the write boundary refuses the new id, and the session layer starts a second session
+        // and strands the first. Not one sampled after the answer either: a reconnect landing
+        // between the answer and the sample would mark an id current on a connection that never
+        // issued it.
+        let (response, generation) =
+            send_normal_with_reconnect_framed(self, Command::Authorize, 0, || {
+                [Bytes::default(), payload.clone()]
+            })
+            .await?;
+        let Some(generation) = generation else {
+            return Err(ProtocolError::internal(
+                "session_start: answered without reporting the generation it was framed on",
+            ));
+        };
 
         let Ok(session_id) = <[u8; 4]>::try_from(&response[..]) else {
             return Err(ProtocolError::internal(format!(
@@ -628,7 +637,7 @@ impl StorageClient {
         let session_id = u32::from_le_bytes(session_id);
         self.quic.register_session(session_id, generation);
         self.session_partitions.insert(session_id, partition);
-        Ok(session_id)
+        Ok((session_id, generation))
     }
 }
 
@@ -768,6 +777,18 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
+        self.authorize_start(partition, correlation_id, None)
+            .await
+            .map(|(session_id, _)| session_id)
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124): the generation is the one the answered `Authorize` was
+    /// framed on, not one sampled before the call.
+    async fn session_start_bound(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+    ) -> Result<(u32, u32), ProtocolError> {
         self.authorize_start(partition, correlation_id, None).await
     }
 
@@ -782,7 +803,7 @@ impl Storage for StorageClient {
         partition: Partition,
         correlation_id: &str,
         capabilities: &'static str,
-    ) -> Result<u32, ProtocolError> {
+    ) -> Result<(u32, u32), ProtocolError> {
         self.authorize_start(partition, correlation_id, Some(capabilities))
             .await
             .map_err(

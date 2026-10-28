@@ -3085,8 +3085,11 @@ mod quic_session_rebind_tests {
         payload.extend_from_slice(&0u16.to_le_bytes()); // empty token, auth is off
         let payload = payload.freeze();
 
-        // Sampled before the request, exactly as `StorageClient::session_start` does, and for
-        // the same reason: a connection replaced mid-call must record the OLDER generation.
+        // Sampled before the request. `send_normal` never reconnects, so this is the generation
+        // the request is framed on unless the connection is replaced mid-call, and then the
+        // OLDER generation is the safe one to record. `StorageClient::session_start` instead
+        // takes the generation its send path reports at the write boundary, because its send
+        // can reconnect (WP-124).
         let generation = quic.connection_generation();
 
         let response = send_normal(
