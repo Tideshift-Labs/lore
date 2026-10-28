@@ -1562,6 +1562,11 @@ pub const STAGED_LEASE_MEMBER_SET_MISMATCH: &str = "staged_lease_member_set_mism
 /// A released lease is never resurrected.
 pub const STAGED_LEASE_ALREADY_RELEASED: &str = "staged_lease_already_released";
 
+/// Reason for a write claim whose send deadline passed before authorization.
+/// The claim is settled `NoSend` in the same transaction, so a fresh attempt
+/// may retry.
+pub const FRAGMENT_WRITE_SEND_DEADLINE_EXPIRED: &str = "fragment_write_send_deadline_expired";
+
 /// A batched durable reader lease over one hydration request's staged
 /// fragments.
 ///
@@ -2904,7 +2909,7 @@ impl PostgresFragmentCoordinator {
                 .await?;
             classify_commit(tx.commit().await, "fragment write expired refusal commit")?;
             return Err(DomainError::PreconditionRejected {
-                reason: "fragment_write_send_deadline_expired".to_owned(),
+                reason: FRAGMENT_WRITE_SEND_DEADLINE_EXPIRED.to_owned(),
                 reason_version: 1,
             });
         };

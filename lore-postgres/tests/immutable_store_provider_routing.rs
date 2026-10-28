@@ -392,6 +392,35 @@ fn direct_put_bytes_reach_only_the_admitted_provider_token() {
 }
 
 #[test]
+fn direct_put_authorization_failure_settles_no_send_then_maps_through_the_deadline_aware_error() {
+    let immutable = source("src/store/immutable_store.rs");
+    let issue = function(&immutable, "async fn issue_direct_put(");
+    let compact: String = issue.split_whitespace().collect();
+    let authorize = compact
+        .find("coordinator.authorize_write_claim(claim).await")
+        .expect("the direct PUT authorizes its claim");
+    let tail = &compact[authorize..];
+    let err_arm = &tail[tail.find("Err(error)=>").expect("authorization error arm")..];
+    let settle = err_arm
+        .find("Self::settle_direct_put(coordinator,claim,FragmentWriteSettlement::NoSend).await?;")
+        .expect("authorization failure settles NoSend");
+    let mapped = err_arm
+        .find("returnErr(authorize_direct_put_err(error));")
+        .expect("authorization failure maps through authorize_direct_put_err");
+    assert!(
+        settle < mapped,
+        "the claim settles NoSend before the mapped error returns"
+    );
+    assert!(
+        !tail[..tail
+            .find("send_budget().is_zero()")
+            .expect("zero-budget check")]
+            .contains("domain_store_err"),
+        "the authorization arm must not use the generic mapping"
+    );
+}
+
+#[test]
 fn ambiguous_conditional_put_verifies_once_by_unmetered_get_before_any_remote_or_missing_verdict() {
     let immutable = source("src/store/immutable_store.rs");
     let issue = function(&immutable, "async fn issue_direct_put(");

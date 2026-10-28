@@ -1628,7 +1628,7 @@ impl PostgresImmutableStore {
             Err(error) => {
                 Self::settle_direct_put(coordinator, claim, FragmentWriteSettlement::NoSend)
                     .await?;
-                return Err(domain_store_err(error));
+                return Err(authorize_direct_put_err(error));
             }
         };
         if authorized.send_budget().is_zero() {
@@ -2616,6 +2616,24 @@ fn domain_store_err(error: crate::domain::errors::DomainError) -> StoreError {
         StoreError::from(SlowDown)
     } else {
         StoreError::internal_with_context(error, "fragment lifecycle coordinator failed")
+    }
+}
+
+/// Map an `authorize_write_claim` failure on the direct-write fallback.
+///
+/// An expired send deadline is backpressure, like the zero send budget after it: authorization
+/// committed the claim as a confirmed `NoSend`, so no byte reached the provider and a fresh
+/// attempt takes a fresh claim and deadline. Every other failure keeps [`domain_store_err`]'s
+/// class.
+fn authorize_direct_put_err(error: crate::domain::errors::DomainError) -> StoreError {
+    match &error {
+        crate::domain::errors::DomainError::PreconditionRejected { reason, .. }
+            if reason
+                == crate::domain::fragments::coordinator::FRAGMENT_WRITE_SEND_DEADLINE_EXPIRED =>
+        {
+            StoreError::from(SlowDown)
+        }
+        _ => domain_store_err(error),
     }
 }
 
@@ -3609,6 +3627,47 @@ mod tests {
             begin_stage_err(DomainError::Transient("pool".into())).is_slow_down(),
             "a transient failure keeps its retryable class"
         );
+    }
+
+    /// Only the exact expired-send-deadline reason becomes `SlowDown` on the direct-write
+    /// fallback. Other precondition reasons, near-miss strings, and an unknown outcome keep
+    /// `domain_store_err`'s class.
+    #[test]
+    fn authorize_direct_put_maps_only_the_expired_send_deadline_to_slow_down() {
+        let rejected = |reason: &str| DomainError::PreconditionRejected {
+            reason: reason.into(),
+            reason_version: 1,
+        };
+        let expired = rejected("fragment_write_send_deadline_expired");
+        assert!(authorize_direct_put_err(expired.clone()).is_slow_down());
+        assert!(
+            !domain_store_err(expired).is_slow_down(),
+            "control: the generic mapping alone leaves it permanent"
+        );
+        for other in [
+            rejected("fragment_write_lineage_moved"),
+            rejected("fragment_write_send_deadline_expired "),
+            rejected("Fragment_write_send_deadline_expired"),
+            rejected("fragment_write_send_deadline"),
+            rejected(""),
+            DomainError::OutcomeUnknown("claim commit".into()),
+            DomainError::Internal("fragment_write_send_deadline_expired".into()),
+        ] {
+            let mapped = authorize_direct_put_err(other.clone());
+            assert!(
+                matches!(mapped, StoreError::Internal(_)),
+                "{other:?} must stay Internal, got {mapped:?}"
+            );
+        }
+        for retryable in [
+            DomainError::Contention("serialization".into()),
+            DomainError::Transient("pool".into()),
+        ] {
+            assert!(
+                authorize_direct_put_err(retryable.clone()).is_slow_down(),
+                "{retryable:?} keeps its retryable class"
+            );
+        }
     }
 
     #[cfg(unix)]
