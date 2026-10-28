@@ -16,6 +16,7 @@ mod quic_managed_write_support;
 mod quic_session_rebind_test;
 mod quic_strict_admission_test;
 mod quic_strict_live_cell_probe_test;
+mod quic_token_expiry_test;
 mod rebac_stub_policy_test;
 mod remote_store_test;
 mod replicated_store_test;

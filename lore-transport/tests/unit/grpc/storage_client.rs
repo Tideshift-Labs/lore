@@ -575,6 +575,38 @@ async fn a_storage_operation_recovers_across_a_reconnect() {
     );
 }
 
+/// WP-124 slice 5b: the proactive session refresh is a QUIC-only signal. A gRPC session presents
+/// its token per request, so no session is ever due, whatever token it holds or whether the id is
+/// registered at all.
+#[tokio::test]
+async fn grpc_sessions_are_never_due_for_a_proactive_rebind() {
+    use lore_transport::traits::Storage;
+
+    let (connection, _, _) = start_test_connection(KillMode::CleanEnd).await;
+    let storage = lore_transport::grpc::GRPCStorage {
+        connection: connection.clone(),
+        client: StorageService::new(connection.clone()),
+        auth_url: String::new(),
+        identity: String::new(),
+        credentials: Arc::new(lore_transport::connection::SuppliedCredentials::default()),
+        session_counter: std::sync::atomic::AtomicU32::new(1),
+        sessions: DashMap::new(),
+    };
+    // A session whose token is long expired (an unsigned JWT with `exp` = 1).
+    let mut expired = test_context();
+    expired.auth_token =
+        "eyJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJhIiwic3ViIjoiYiIsImV4cCI6MSwiYXVkIjpbImMiXX0.".to_string();
+    storage.sessions.insert(7, Arc::new(expired));
+    storage.sessions.insert(0, Arc::new(test_context()));
+
+    assert!(!storage.session_refresh_due(7), "an expired token on gRPC");
+    assert!(!storage.session_refresh_due(0));
+    assert!(!storage.session_refresh_due(12_345), "an unknown id");
+    assert!(
+        !storage.declares_per_session(),
+        "control: the same trait object keeps its other defaults"
+    );
+}
 /// A put response without a status is read as success, for a peer that predates the field.
 ///
 /// The status field is additive: a server that does not set it reports a per-item failure by

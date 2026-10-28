@@ -1258,3 +1258,6 @@ fn the_header_and_quic_paths_share_one_grammar() {
         }
     }
 }
+
+// WP-124 slice 5b: the token-expiry re-check, driven through the harness above.
+mod session_expiry;

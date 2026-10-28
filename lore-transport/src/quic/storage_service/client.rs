@@ -102,7 +102,11 @@ const INFLIGHT_COMMAND_LIMIT: usize = 10000;
 
 /// The QUIC storage status a strict server refuses an undeclared write with (`unsupported-client`
 /// in the caller admission contract).
-const UNSUPPORTED_CLIENT_STATUS: u32 = 200;
+const UNSUPPORTED_CLIENT_STATUS: u32 = super::super::STORAGE_UNSUPPORTED_CLIENT_STATUS;
+
+/// FORK-LOCAL (Tideshift, WP-124): the status a server answers a command on an expired session
+/// with (`session-expired`).
+const SESSION_EXPIRED_STATUS: u32 = super::super::STORAGE_SESSION_EXPIRED_STATUS;
 
 const MAX_BYTES_BANDWIDTH_PER_SEC: u64 = (1024 * 1024 * 1024) / 8;
 
@@ -128,6 +132,10 @@ pub struct StorageClient {
     /// only, never on reconnect: a heal on a stale id must reach the write boundary, which
     /// refuses it with the rebind proof, rather than be refused here where nothing rebinds.
     session_partitions: dashmap::DashMap<u32, Partition>,
+    /// FORK-LOCAL (Tideshift, WP-124): the `exp` (Unix ms) of the token each live session was
+    /// started with, when the token is a JWT. Read by [`Storage::session_refresh_due`]. Same
+    /// lifetime as `session_partitions`.
+    session_token_expiry: dashmap::DashMap<u32, u64>,
 }
 
 impl Drop for StorageClient {
@@ -172,6 +180,7 @@ impl StorageClient {
             counter: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
             session_partitions: dashmap::DashMap::new(),
+            session_token_expiry: dashmap::DashMap::new(),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
         }
     }
@@ -637,6 +646,11 @@ impl StorageClient {
         let session_id = u32::from_le_bytes(session_id);
         self.quic.register_session(session_id, generation);
         self.session_partitions.insert(session_id, partition);
+        // FORK-LOCAL (Tideshift, WP-124): an opaque token has no `exp` to read, so its session is
+        // never rebound early; the server's expired-session answer still covers it.
+        if let Some(info) = lore_credential::user_info_from_token(token) {
+            self.session_token_expiry.insert(session_id, info.expires);
+        }
         Ok((session_id, generation))
     }
 }
@@ -732,6 +746,19 @@ impl ServiceClient for StorageClient {
                         "storage server refused the client before dispatch",
                     )
                 }
+                // FORK-LOCAL (Tideshift, WP-124): the session's token expired. The server answers
+                // before any handler runs, so this is positive proof of non-dispatch, typed
+                // so the session layer can start a new session with a fresh token and send once
+                // more.
+                QuicClientError::ServerError(SESSION_EXPIRED_STATUS) => {
+                    let name = storage_service::command_name(&failed_request);
+                    ProtocolError::internal_with_context(
+                        crate::error::SessionExpired {
+                            message: format!("{name}: Failed sending command: {client_error}"),
+                        },
+                        "storage session expired before dispatch",
+                    )
+                }
                 _ => {
                     let name = storage_service::command_name(&failed_request);
                     ProtocolError::internal(format!(
@@ -821,8 +848,19 @@ impl Storage for StorageClient {
         true
     }
 
+    /// FORK-LOCAL (Tideshift, WP-124): the session token's `exp`, so the trait's
+    /// `session_refresh_due` is due once this client's clock reaches it. From then on the authz cache treats the token as expired and a new session gets a
+    /// fresh one, while the server still accepts the old session for the verifier's leeway. So a
+    /// rebind here lands inside that window, and the server's expired-session answer stays rare.
+    fn session_token_expiry(&self, session_id: u32) -> Option<u64> {
+        self.session_token_expiry
+            .get(&session_id)
+            .map(|expires_ms| *expires_ms)
+    }
+
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
         self.session_partitions.remove(&session_id);
+        self.session_token_expiry.remove(&session_id);
         if !self.quic.has_streams().await {
             self.quic.forget_session(session_id);
             return Ok(());

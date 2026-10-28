@@ -25,6 +25,7 @@ fn bare_entry(repository: RepositoryId, correlation_id: &str, user_id: &str) -> 
         token: None,
         authorized_sources: Arc::new(DashSet::new()),
         declared: false,
+        expires_at: None,
     }
 }
 
@@ -68,6 +69,7 @@ mod entry_permits {
             token,
             authorized_sources: Arc::new(DashSet::new()),
             declared: false,
+            expires_at: None,
         }
     }
 

@@ -209,6 +209,12 @@ pub fn map_message_handle_error_to_status(
             Code::PermissionDenied,
             message.unwrap_or_else(|| error.to_string()),
         ),
+        // FORK-LOCAL (Tideshift, WP-124): raised only by the QUIC storage service; gRPC checks
+        // the token per call in its interceptor and never reaches this arm.
+        MessageHandleError::SessionExpired => (
+            Code::Unauthenticated,
+            message.unwrap_or_else(|| error.to_string()),
+        ),
     };
 
     let mut status = Status::with_details(code, message, details.unwrap_or_default());

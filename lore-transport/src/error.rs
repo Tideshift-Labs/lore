@@ -434,6 +434,31 @@ pub fn is_unjournaled_answer_lost(error: &ProtocolError) -> bool {
     false
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): typed proof that a QUIC storage command was refused because its
+/// session's token expired (storage status 201, `session-expired`).
+///
+/// The server answers it before any check or handler runs, so the command was not dispatched. Unlike
+/// [`SessionRebindRequired`], the connection is fine: only the session is stale, and a new
+/// `session_start` re-runs the token exchange. Inside `ProtocolError::Internal` for the same reason
+/// as that marker.
+#[derive(Debug, Clone, Error)]
+#[error("{message}")]
+pub(crate) struct SessionExpired {
+    pub(crate) message: String,
+}
+
+/// Whether `error` carries [`SessionExpired`].
+pub fn is_session_expired(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<SessionExpired>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {

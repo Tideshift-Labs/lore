@@ -10,6 +10,7 @@ use lore_storage::MutableStore;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
+use lore_transport::quic::STORAGE_SESSION_EXPIRED_STATUS;
 use lore_transport::quic::UnknownCommand;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE_V4;
 use lore_transport::quic::command_header::CommandHeader;
@@ -43,6 +44,8 @@ use crate::protocol::storage::put::handle_put;
 use crate::protocol::storage::query::handle_query;
 use crate::protocol::storage::session::SessionError;
 use crate::protocol::storage::session::SessionMap;
+use crate::protocol::storage::session::now_unix_secs;
+use crate::protocol::storage::session::token_expiry_gates;
 use crate::protocol::storage::verify::handle_verify;
 use crate::quic::NO_CONNECTION_ID;
 use crate::quic::NO_CORRELATION_ID;
@@ -339,6 +342,7 @@ impl QuicService for StorageServiceV4 {
                 let token = session.token.clone();
                 let authorized_sources = session.authorized_sources.clone();
                 let declared = session.declared;
+                let expired = session.is_expired_at(now_unix_secs());
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -357,6 +361,14 @@ impl QuicService for StorageServiceV4 {
                 // write-vs-read classification is a deliberate decision, never a
                 // silent fall-through to "ungated".
                 use crate::quic::storage_service::ParsedStorageRequest as Req;
+                // FORK-LOCAL (Tideshift, WP-124): the session's token is checked per command, as
+                // gRPC checks `exp` per call, so revocation lands within the token's life plus
+                // leeway. First of all the checks, and before any handler, so the refusal proves
+                // the command was not dispatched and had no store effect. The entry is kept for
+                // in-flight siblings (see `SessionMap::sweep_expired`).
+                if expired && token_expiry_gates(&parsed) {
+                    return Err(MessageHandleError::SessionExpired);
+                }
                 // Caller admission runs first, before write authorization (contract order).
                 admit_quic(self.caller_capability_policy, &parsed, declared)?;
                 match &parsed {
@@ -559,10 +571,16 @@ impl QuicService for StorageServiceV4 {
         let is_appropriate_for_logging = !matches!(
             service_error,
             QuicServiceError::SlowDown | QuicServiceError::NotFound
-        );
+        ) && !matches!(error, MessageHandleError::SessionExpired);
+        // FORK-LOCAL (Tideshift, WP-124): status 201 has no `QuicServiceError` variant; it is this
+        // service's own code in the reserved range.
+        let response_error_code = match error {
+            MessageHandleError::SessionExpired => STORAGE_SESSION_EXPIRED_STATUS,
+            _ => service_error as QuicErrorStatus,
+        };
 
         ProtocolErrorInfo {
-            response_error_code: service_error as QuicErrorStatus,
+            response_error_code,
             message_handle_label: message_handle_error_to_label(error),
             is_internal_error: is_internal_error(error),
             is_appropriate_for_logging,

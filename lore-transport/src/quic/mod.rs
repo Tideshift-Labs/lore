@@ -35,6 +35,15 @@ pub type QuicErrorStatus = u32;
 
 pub const RESERVED_ERROR_CODE_START: u32 = 200;
 
+/// FORK-LOCAL (Tideshift, WP-124): `lore-storage/0.4` status for an undeclared write a strict
+/// server refuses (`unsupported-client`). Final and pre-dispatch.
+pub const STORAGE_UNSUPPORTED_CLIENT_STATUS: QuicErrorStatus = RESERVED_ERROR_CODE_START;
+
+/// FORK-LOCAL (Tideshift, WP-124): `lore-storage/0.4` status for a command on a session whose
+/// token has expired (`session-expired`). Answered before any handler runs, so it proves the
+/// command was not dispatched; the session stays refused until the client starts a new one.
+pub const STORAGE_SESSION_EXPIRED_STATUS: QuicErrorStatus = RESERVED_ERROR_CODE_START + 1;
+
 /// These are the error status that a service can return.
 /// Service-agnostic errors can occur (such as failing to read bytes) surfaced
 /// by the server scaffolding, and some errors might be raised by the service

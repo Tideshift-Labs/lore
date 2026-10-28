@@ -93,7 +93,13 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   and reads liveness from the server's own `SessionMap` (needs `lore-server` `test-util` as a dev-dep).
   Reads are the managed traffic until slice 2b removes `reject_managed_quic`. Gate: `cargo test -p
   lore-integration-tests --features integration_tests --test integration -j 4 -- quic_declared_session`
-- **Managed fragment Put, Copy and PutResolved are unjournaled [CLIENT]**: `StorageService::put`,
+- **WP-124 slice 5b QUIC token-expiry re-check (storage status 201, `session_refresh_due`) [SERVER + CLIENT]**:
+  server `lore-server/tests/unit/grpc/caller_capabilities/quic_admission/session_expiry.rs` (child module
+  of the admission harness, reuses `Cmd`/`Stores`/`Service`; reads derive from `TOKEN_EXPIRY_GATES_READS`);
+  client `lore-transport/tests/unit/quic/session_expiry.rs` (typed 201, `session_refresh_due`) and
+  `lore-transport/tests/session_expiry_attempt.rs` (rebind/resend through `StorageSession`); live
+  `lore-integration-tests/tests/quic_token_expiry_test.rs`. Gate: `cargo test -p lore-transport --test
+  session_expiry_attempt` and `... -- quic_token_expiry` (live, ~16 s).- **Managed fragment Put, Copy and PutResolved are unjournaled [CLIENT]**: `StorageService::put`,
   `copy` and `put_resolved` inside a caller operation mint and send an attempt id + capability
   header but write no journal child (Copy/PutResolved since 2026-10-23); `unjournaled_result` maps
   request-not-sent to `Disconnected` and any lost answer to an `Internal` carrying

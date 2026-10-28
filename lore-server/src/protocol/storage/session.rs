@@ -55,6 +55,63 @@ pub(crate) const MAX_CONCURRENT_SESSIONS: u32 = 10_000;
 /// `lore` CLI — is covered for the ordinary case of two live connections to one server.
 static NEXT_SESSION_ID: LazyLock<AtomicU32> = LazyLock::new(|| AtomicU32::new(rand::random()));
 
+/// FORK-LOCAL (Tideshift, WP-124): the `exp` leeway, in seconds, that the JWT verifier grants.
+///
+/// `JwtVerifier` builds its `Validation` with `Validation::new`, which keeps jsonwebtoken's default
+/// leeway. A session expires at the same instant the verifier would start refusing its token, so the
+/// two must agree; a test pins this value against `Validation::new`.
+pub const TOKEN_EXP_LEEWAY_SECS: u64 = 60;
+
+/// FORK-LOCAL (Tideshift, WP-124): how long an expired session stays in its map before a later
+/// `start` on the same map removes it.
+///
+/// An expired entry is kept, not removed at its first refused command, because sibling commands
+/// already in flight on the same id must also get the expired-session answer (which the client
+/// resends after a rebind) rather than `NotConnected` (which it does not). The client never stops
+/// a superseded id itself, so without this sweep each rebind would leave one entry behind until the
+/// connection closed, toward [`MAX_CONCURRENT_SESSIONS`].
+pub const EXPIRED_SESSION_SWEEP_GRACE_SECS: u64 = 5 * 60;
+
+/// FORK-LOCAL (Tideshift, WP-124): whether an expired session's reads are refused too, not only its
+/// writes. The one switch for the read rule, on both `lore-storage/0.4` and `urc/0.2`.
+///
+/// gRPC checks `exp` on every call, reads included, so `true` is parity: a revoked user loses read
+/// access within the token's life plus leeway. `false` keeps reads open for the connection's life.
+pub const TOKEN_EXPIRY_GATES_READS: bool = true;
+
+/// FORK-LOCAL (Tideshift, WP-124): whether a command on a session whose token has expired is
+/// refused. Every mutation is; a read is when [`TOKEN_EXPIRY_GATES_READS`] says so. `Connect` is
+/// the legacy session start, which verifies a token of its own, so it never is.
+///
+/// Exhaustive on purpose, like the write gate: a new command must be classified to compile.
+pub fn token_expiry_gates(request: &crate::quic::storage_service::ParsedStorageRequest) -> bool {
+    use crate::quic::storage_service::ParsedStorageRequest as Req;
+    match request {
+        Req::Put(_)
+        | Req::PutResolved(_)
+        | Req::Copy(_)
+        | Req::MutableStoreOp(_)
+        | Req::MutableCas(_) => true,
+        Req::Verify(verify) if verify.heal != 0 => true,
+        Req::Verify(_)
+        | Req::Get(_)
+        | Req::GetResolved(_)
+        | Req::GetMetadata(_)
+        | Req::Query(_)
+        | Req::MutableLoad(_)
+        | Req::Correlate(_) => TOKEN_EXPIRY_GATES_READS,
+        Req::Connect(_) => false,
+    }
+}
+
+/// Seconds since the Unix epoch, the unit of a JWT `exp`.
+pub fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
 pub struct SessionEntry {
     pub repository: RepositoryId,
     pub correlation_id: String,
@@ -85,9 +142,20 @@ pub struct SessionEntry {
     /// list declaring `outcome_unknown_v1`. Fixed at start and never changed. It scopes to this
     /// session only, never to the connection or to sibling sessions on it.
     pub declared: bool,
+    /// FORK-LOCAL (Tideshift, WP-124): the last second, in Unix seconds, at which the session's
+    /// token is still valid: its `exp` plus [`TOKEN_EXP_LEEWAY_SECS`], the instant the verifier
+    /// would refuse the same token on gRPC. `None` without a verified token (auth off), which
+    /// never expires.
+    pub expires_at: Option<u64>,
 }
 
 impl SessionEntry {
+    /// FORK-LOCAL (Tideshift, WP-124): whether the session's token has expired at `now` (Unix
+    /// seconds). One integer compare, the same boundary as jsonwebtoken's: `exp + leeway < now`.
+    pub fn is_expired_at(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|expires_at| expires_at < now)
+    }
+
     /// Whether the session's caller may perform `action` on the session's
     /// repository — the per-operation check for an action-gated storage
     /// command. Same contract as `RepositoryAuthorizer::permits`: answered
@@ -202,6 +270,9 @@ impl SessionMap {
         token: Option<Arc<VerifiedTokenOwned>>,
         declared: bool,
     ) -> Result<(u32, String), SessionError> {
+        // FORK-LOCAL (Tideshift, WP-124): before claiming a slot, so a slot a superseded session
+        // held is free for this one.
+        self.sweep_expired(now_unix_secs());
         self.start_from(
             &NEXT_SESSION_ID,
             repository,
@@ -242,6 +313,9 @@ impl SessionMap {
         } else {
             correlation_id
         };
+        let expires_at = token
+            .as_ref()
+            .map(|token| token.claims.expires.saturating_add(TOKEN_EXP_LEEWAY_SECS));
 
         let session_id = match self.allocate_from(
             sequence,
@@ -254,6 +328,7 @@ impl SessionMap {
                 token,
                 authorized_sources: Arc::new(DashSet::new()),
                 declared,
+                expires_at,
             },
         ) {
             Ok(session_id) => session_id,
@@ -264,6 +339,31 @@ impl SessionMap {
         };
 
         Ok((session_id, correlation_id))
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124): remove every session whose token expired more than
+    /// [`EXPIRED_SESSION_SWEEP_GRACE_SECS`] before `now` (Unix seconds), and free its slot.
+    /// Returns how many were removed.
+    ///
+    /// An expired session is kept for the grace period so in-flight siblings still read as expired
+    /// (see the constant). After it, nothing a rebinding client sends names the id: the client
+    /// rebinds before a command once its clock passes the token's `exp`, and after its first
+    /// expired answer.
+    #[lore_macro::test_pub]
+    fn sweep_expired(&self, now: u64) -> u32 {
+        let cutoff = now.saturating_sub(EXPIRED_SESSION_SWEEP_GRACE_SECS);
+        let mut removed: u32 = 0;
+        self.entries.retain(|_id, entry| {
+            let keep = !entry.is_expired_at(cutoff);
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        if removed > 0 {
+            self.active_sessions.fetch_sub(removed, Ordering::Release);
+        }
+        removed
     }
 
     /// Stop an active session.

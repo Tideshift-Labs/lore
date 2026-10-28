@@ -189,6 +189,25 @@ pub trait Storage: Send + Sync {
         false
     }
 
+    /// FORK-LOCAL (Tideshift, WP-124): whether `session_id` should be replaced before its next
+    /// command because the token it was started with has reached its `exp`.
+    ///
+    /// `false` for a transport that presents a token per request (gRPC) and for a session whose
+    /// token has no readable `exp`. QUIC overrides it: a QUIC session keeps the token it started
+    /// with, and the server refuses its commands once that token's `exp` plus leeway has passed.
+    fn session_refresh_due(&self, session_id: u32) -> bool {
+        self.session_token_expiry(session_id)
+            .is_some_and(crate::auth::exchange::is_expired)
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124): the `exp` (Unix ms) of the token `session_id` was started
+    /// with, when this transport keeps one per session and the token is a JWT. `None` otherwise,
+    /// which is never due.
+    fn session_token_expiry(&self, session_id: u32) -> Option<u64> {
+        let _ = session_id;
+        None
+    }
+
     /// Stop an active session, releasing server-side capacity.
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError>;
 

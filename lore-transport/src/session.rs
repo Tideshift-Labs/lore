@@ -80,6 +80,12 @@ struct SessionBinding {
 struct BoundSession {
     id: u32,
     generation: Option<u32>,
+    /// FORK-LOCAL (Tideshift, WP-124): the token `exp` a proactive rebind replaced this session
+    /// to get away from, if one did. A session whose own `exp` is the same one is not rebound
+    /// again: the start got the same token back (a supplied token, or one the authz cache still
+    /// serves), so another start would cost a round trip and a server session per command and
+    /// change nothing. The server's expired-session answer then decides.
+    refreshed_from: Option<u64>,
 }
 
 impl SessionBinding {
@@ -108,9 +114,14 @@ impl SessionBinding {
     /// [`StorageSession::invalidate`] can clear the binding at any moment, and a caller that
     /// re-read it would see "not bound to anything" and conclude the connection had been
     /// replaced under its command when it had not.
+    ///
+    /// FORK-LOCAL (Tideshift, WP-124): a session whose token has reached its `exp`
+    /// ([`Storage::session_refresh_due`]) is replaced the same way, before its next command. The
+    /// superseded id is not stopped: a sibling may have resolved it and still be sending on it,
+    /// and the server accepts it until `exp` plus leeway, then sweeps it.
     async fn resolve(&self) -> Result<(u32, u32), ProtocolError> {
         let current = self.storage.connection_generation();
-        if let Some(id) = self.bound_to(current) {
+        if let Some(id) = self.current_on(current) {
             return Ok((id, current));
         }
 
@@ -118,9 +129,18 @@ impl SessionBinding {
         // Re-read under the guard: whoever held it before us may already have rebound, and the
         // generation may have moved again while we waited.
         let current = self.storage.connection_generation();
-        if let Some(id) = self.bound_to(current) {
+        if let Some(id) = self.current_on(current) {
             return Ok((id, current));
         }
+
+        // FORK-LOCAL (Tideshift, WP-124): a session still bound to the current generation is
+        // being replaced only because its token is due, so remember which `exp` it was.
+        let previous = self.bound();
+        let refreshed_from = if previous.generation == Some(current) {
+            self.storage.session_token_expiry(previous.id)
+        } else {
+            None
+        };
 
         // A fresh `session_start` re-runs the token exchange and the server's authorization
         // check for this partition. Nothing from the old session's permission snapshot carries
@@ -140,14 +160,35 @@ impl SessionBinding {
         *self.session.lock() = BoundSession {
             id,
             generation: Some(generation),
+            refreshed_from,
         };
         Ok((id, generation))
     }
 
     /// The session id if it belongs to `generation`, otherwise nothing.
-    fn bound_to(&self, generation: u32) -> Option<u32> {
+    ///
+    /// FORK-LOCAL (Tideshift, WP-124): also nothing when its token is due for refresh. A token is not due again when a proactive
+    /// rebind already left that same `exp` behind (see [`BoundSession::refreshed_from`]).
+    fn current_on(&self, generation: u32) -> Option<u32> {
         let bound = *self.session.lock();
-        (bound.generation == Some(generation)).then_some(bound.id)
+        if bound.generation != Some(generation) {
+            return None;
+        }
+        let due = self.storage.session_refresh_due(bound.id)
+            && self.storage.session_token_expiry(bound.id) != bound.refreshed_from;
+        (!due).then_some(bound.id)
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124): unbind only if the binding still holds `session_id`.
+    ///
+    /// For the expired-session answer. Every command in flight on the expired id gets that answer,
+    /// so the slower ones arrive after the first has already rebound. Unbinding unconditionally
+    /// there would throw the fresh session away and start another, once per sibling.
+    fn unbind_if(&self, session_id: u32) {
+        let mut bound = self.session.lock();
+        if bound.id == session_id {
+            bound.generation = None;
+        }
     }
 
     /// The id and the generation it is bound to, whatever either reads as. For the cleanup paths,
@@ -218,6 +259,7 @@ impl DeclaredBindings {
                     session: Mutex::new(BoundSession {
                         id: 0,
                         generation: None,
+                        refreshed_from: None,
                     }),
                     rebind: TokioMutex::new(()),
                     partition: undeclared.partition,
@@ -331,6 +373,7 @@ impl StorageSession {
                     session: Mutex::new(BoundSession {
                         id: session_id,
                         generation: Some(generation),
+                        refreshed_from: None,
                     }),
                     rebind: TokioMutex::new(()),
                     partition,
@@ -427,6 +470,10 @@ impl StorageSession {
     ///
     /// At most [`ATTEMPT_BUDGET`] dispatches of the operation itself, one rebind between them.
     ///
+    /// FORK-LOCAL (Tideshift, WP-124): the server's expired-session answer
+    /// ([`crate::error::is_session_expired`]) is the second proof that allows that rebind. It is
+    /// sent before any handler runs, so it proves non-dispatch without any generation change.
+    ///
     /// `write` says whether the operation mutates; it only decides what a managed caller on a
     /// foreign partition gets (see [`binding`](Self::binding)).
     async fn attempt<T, Fut>(
@@ -469,6 +516,17 @@ impl StorageSession {
             //
             // A zero epoch is consulted for its own separate meaning: reconnection has given up,
             // so there is nothing to rebind onto and spending the last attempt is waste.
+            //
+            // FORK-LOCAL (Tideshift, WP-124): an expired-session answer is the other proof that
+            // allows one more pass. The server sends it before any handler runs, so nothing
+            // was dispatched, and the connection is fine: only this session is stale. It needs no
+            // generation change, and the next pass starts a new session with a fresh token. Only
+            // the id it named is unbound, so a sibling that arrives after the rebind keeps it.
+            if attempts_left > 0 && crate::error::is_session_expired(&error) {
+                binding.unbind_if(session_id);
+                continue;
+            }
+
             let not_dispatched = crate::error::is_session_rebind_required(&error);
             let replaced = sent_on != storage.connection_generation();
             if attempts_left == 0

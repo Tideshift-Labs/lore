@@ -110,6 +110,12 @@ pub enum MessageHandleError {
     /// [`crate::protocol::storage::mutable_store_handler::refuse_domain_key`].
     #[error("{}", lore_postgres::domain::bypass::rejection_message(*.0))]
     DomainKeyRefused(KeyType),
+    /// FORK-LOCAL (Tideshift, WP-124): the session's token expired (its `exp` plus the verifier's
+    /// leeway is past). Raised before any other check or handler, so it is a confirmed pre-dispatch
+    /// refusal: final for this session, with no store effect. A client starts a new session with
+    /// a fresh token and may send the command again.
+    #[error("session token expired")]
+    SessionExpired,
 }
 
 impl From<StoreError> for MessageHandleError {

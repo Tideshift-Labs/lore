@@ -44,6 +44,9 @@ use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::protocol::storage::messages::Response;
 use crate::protocol::storage::requests;
+use crate::protocol::storage::session::TOKEN_EXP_LEEWAY_SECS;
+use crate::protocol::storage::session::now_unix_secs;
+use crate::protocol::storage::session::token_expiry_gates;
 use crate::quic::NO_CONNECTION_ID;
 use crate::quic::NO_CORRELATION_ID;
 use crate::quic::NO_REPOSITORY_ID;
@@ -419,6 +422,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::LocalStoreUnavailable(_) => "LocalStoreUnavailable",
         MessageHandleError::UnsupportedClient => "UnsupportedClient",
         MessageHandleError::DomainKeyRefused(_) => "DomainKeyRefused",
+        MessageHandleError::SessionExpired => "SessionExpired",
     }
 }
 
@@ -444,6 +448,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::LocalStoreUnavailable(_)
         | MessageHandleError::UnsupportedClient
         | MessageHandleError::DomainKeyRefused(_)
+        | MessageHandleError::SessionExpired
         | MessageHandleError::OutcomeUnknown => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
@@ -554,6 +559,19 @@ impl QuicService for StorageService {
         // purpose: a new variant from an upstream merge must fail to compile here
         // rather than silently fall through to "ungated".
         // Caller admission runs first, before write authorization (contract order).
+        // FORK-LOCAL (Tideshift, WP-124): the connection's token is checked per command, against
+        // the same `exp` plus leeway the verifier uses, before any other check. urc/0.2 has no
+        // session to rebind, so the refusal is the ordinary `NotAuthorized`.
+        if self.jwt_verifier.is_some()
+            && token_expiry_gates(&request)
+            && context.get::<AuthorizationToken>().is_some_and(|token| {
+                token.expires.saturating_add(TOKEN_EXP_LEEWAY_SECS) < now_unix_secs()
+            })
+        {
+            return Err(MessageHandleError::AuthorizationFailure(
+                "token expired".to_string(),
+            ));
+        }
         // FORK-LOCAL (Tideshift, WP-124): urc/0.2 has no sessions, so it is never declared
         // and stays read-only under the required policy.
         admit_quic(self.caller_capability_policy, &request, false)?;

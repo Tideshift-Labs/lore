@@ -66,6 +66,18 @@ pub enum Reply {
     /// later, when the gate allows it. This is how a test fills a stream's credit with a write
     /// that has completed.
     EarlyOk,
+    /// WP-124 slice 5b: answer the first `times` requests of this opcode with error status
+    /// `status`, then answer success with `body`. The count is decided under the rules lock at
+    /// answer time, so concurrent requests share one count.
+    StatusThenOk {
+        status: u32,
+        times: usize,
+        body: Vec<u8>,
+    },
+    /// WP-124 slice 5b: read the request, keep an error `status` answer back, and send it on
+    /// [`Peer::release_held`]. Lets a test put several commands in flight on one session before
+    /// any of them is answered.
+    HoldStatus(u32),
 }
 
 /// One request header the peer has read.
@@ -95,6 +107,8 @@ struct Held {
     send: Arc<tokio::sync::Mutex<quinn::SendStream>>,
     header: CommandHeader,
     payload: Vec<u8>,
+    /// An error status to answer with instead of success (`Reply::HoldStatus`).
+    status: Option<u32>,
 }
 
 struct Shared {
@@ -286,7 +300,10 @@ impl Peer {
         };
         let count = held.len();
         for held in held {
-            respond(&held.send, &held.header, &held.payload).await;
+            match held.status {
+                Some(status) => respond_status(&held.send, &held.header, status).await,
+                None => respond(&held.send, &held.header, &held.payload).await,
+            }
         }
         count
     }
@@ -448,7 +465,32 @@ async fn serve_stream(
                 send: send.clone(),
                 header,
                 payload: body,
+                status: None,
             }),
+            Some(Reply::HoldStatus(status)) => shared.held.lock().push(Held {
+                stream,
+                send: send.clone(),
+                header,
+                payload: Vec::new(),
+                status: Some(status),
+            }),
+            Some(Reply::StatusThenOk { .. }) => {
+                let answer = {
+                    let mut rules = shared.rules.lock();
+                    match rules.get_mut(&header.cmd) {
+                        Some(Reply::StatusThenOk { status, times, .. }) if *times > 0 => {
+                            *times -= 1;
+                            Err(*status)
+                        }
+                        Some(Reply::StatusThenOk { body, .. }) => Ok(body.clone()),
+                        _ => Ok(Vec::new()),
+                    }
+                };
+                match answer {
+                    Err(status) => respond_status(&send, &header, status).await,
+                    Ok(body) => respond(&send, &header, &body).await,
+                }
+            }
             None if header.cmd == AUTHORIZE => {
                 if payload.first() == Some(&ACTION_STOP) {
                     respond(&send, &header, &[]).await;
