@@ -1050,6 +1050,19 @@ async fn stop_sessions(targets: Vec<CleanupTarget>) {
     }
 }
 
+/// The cleanup targets for sessions a pool build started, each with the generation it was issued
+/// on.
+fn cleanup_targets(started: &[(Arc<dyn Storage>, u32, u32)]) -> Vec<CleanupTarget> {
+    started
+        .iter()
+        .map(|(storage, id, generation)| CleanupTarget {
+            id: *id,
+            generation: *generation,
+            storage: Arc::downgrade(storage),
+        })
+        .collect()
+}
+
 /// Result of the synchronous `DashMap` entry check in
 /// [`StorageConnector::session_pool`].
 enum PoolOutcome {
@@ -1140,7 +1153,8 @@ impl StorageConnector {
     ///
     /// On a miss, one server-side session is started per underlying connection, in
     /// parallel. The first writer wins the key, vacant or expired entry alike; a
-    /// losing racer stops every server-side session it just started.
+    /// losing racer stops every server-side session it just started. So does a build in which any
+    /// start failed: it stops the sessions the other starts opened and returns the failure.
     pub async fn session_pool(
         &self,
         partition: Partition,
@@ -1173,14 +1187,20 @@ impl StorageConnector {
                 Ok::<_, ProtocolError>(())
             });
         }
-        lore_drain_tasks!(
+        let drained = lore_drain_tasks!(
             tasks,
             ProtocolError::internal("session_start task join failure")
-        )?;
+        );
         let Ok(started) = Arc::try_unwrap(started) else {
             unreachable!("session_start tasks dropped their Arc<Mutex<_>> clones");
         };
         let started: Vec<(Arc<dyn Storage>, u32, u32)> = started.into_inner();
+        // A pool holds one session per connection or none. When one start fails, nothing will
+        // own the sessions the others started, so stop them here before returning the failure.
+        if let Err(error) = drained {
+            stop_sessions(cleanup_targets(&started)).await;
+            return Err(error);
+        }
 
         // session_start succeeded on every connection in parallel above; the partition is now
         // in `authorized_repos` of every server-side `SessionMap` for the pool. Even on the
@@ -1206,14 +1226,7 @@ impl StorageConnector {
             })
             .collect();
         let pool = Arc::new(SessionPool::new(sessions));
-        let cleanup: Vec<CleanupTarget> = started
-            .iter()
-            .map(|(storage, id, generation)| CleanupTarget {
-                id: *id,
-                generation: *generation,
-                storage: Arc::downgrade(storage),
-            })
-            .collect();
+        let cleanup = cleanup_targets(&started);
 
         // Try to insert under the entry lock (synchronous only -- no .await).
         let outcome = {

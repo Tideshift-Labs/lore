@@ -16,4 +16,5 @@ mod grpc;
 mod outcome;
 mod quic;
 mod session;
+mod session_pool;
 mod types;
