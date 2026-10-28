@@ -1575,14 +1575,10 @@ mod quic_declared_session_tests {
             let session = connection.session(partition, "managed-mutable").await?;
             let scope = managed(partition);
             read(&session, None, some_address()).await?;
-            let storage_commands = |probe: &Probe| {
-                probe
-                    .wire()
-                    .into_iter()
-                    .filter(|w| w.opcode != Command::Authorize as u8)
-                    .count()
-            };
-            let wire_before = storage_commands(&cell.probe);
+            // Every message counts, Authorize included: the refusal comes before a declared
+            // session would be started, so the wire is untouched.
+            let wire_messages = |probe: &Probe| probe.wire().len();
+            let wire_before = wire_messages(&cell.probe);
             let key = random::<Hash>();
             let value = random::<Hash>();
 
@@ -1607,9 +1603,8 @@ mod quic_declared_session_tests {
                     "{error:?}"
                 );
             }
-            // The declared session start (an Authorize) may precede the refusal; no storage command does.
             assert_eq!(
-                storage_commands(&cell.probe),
+                wire_messages(&cell.probe),
                 wire_before,
                 "{:?}",
                 cell.probe.wire()

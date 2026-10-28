@@ -571,6 +571,30 @@ impl StorageSession {
         ))
     }
 
+    /// FORK-LOCAL (Tideshift, WP-124): refuse a managed `MutableStore` or `MutableCas` on a
+    /// transport that declares per session (QUIC), before [`attempt`](Self::attempt) selects a
+    /// binding. Here, a declared session is never started for a write that cannot be sent, so
+    /// the refusal puts no byte on the wire. A pending session still resolves its undeclared
+    /// session first, as any first use does; that is what tells the transport apart. gRPC journals
+    /// both verbs through `caller_operation::dispatch` and is not refused. The storage client
+    /// keeps the same refusal for a caller that bypasses this session.
+    ///
+    /// A foreign partition is left to [`binding`](Self::binding), which refuses that write
+    /// locally as a repository mismatch, also before any byte.
+    async fn refuse_managed_mutable_key(&self) -> Result<(), ProtocolError> {
+        let Some(context) = crate::caller_operation::current_caller_operation() else {
+            return Ok(());
+        };
+        let undeclared = self.with_resolved(|r| r.binding.clone()).await?;
+        if undeclared.storage.declares_per_session() && undeclared.partition == context.repository()
+        {
+            return Err(ProtocolError::internal(
+                "managed mutable-key writes require gRPC",
+            ));
+        }
+        Ok(())
+    }
+
     /// FORK-LOCAL (Tideshift, WP-124): release the declared binding the current scope owns for
     /// `undeclared`'s connection and partition, if it has one.
     ///
@@ -813,6 +837,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<()>, ProtocolError> {
+        self.refuse_managed_mutable_key().await?;
         self.attempt(true, |storage, session_id| async move {
             storage
                 .mutable_store_outcome(session_id, key, value, key_type)
@@ -846,6 +871,7 @@ impl StorageSession {
         value: Hash,
         key_type: KeyType,
     ) -> Result<MutableOutcome<Hash>, ProtocolError> {
+        self.refuse_managed_mutable_key().await?;
         self.attempt(true, |storage, session_id| async move {
             storage
                 .mutable_compare_and_swap_outcome(session_id, key, expected, value, key_type)
