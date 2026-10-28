@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# Copyright 2026 Tideshift Labs
 # SPDX-License-Identifier: MIT
 """Smoke tests for the authenticated path, against a declarative auth stub.
 
@@ -136,10 +137,11 @@ def auth_env(request, tmp_path_factory, lore_server_executable_path):
             mock=mock,
             # Upstream's QUIC remote: logins, clones and syncs stay on it.
             remote_url=f"lore://127.0.0.1:{shared_port}/",
-            # Fork (Tideshift): the CLI's managed push and lock verbs refuse
-            # QUIC ("managed mutations require the gRPC transport"), so the
-            # repositories that push or lock use this gRPC remote. Both
-            # schemes reach the same port, server and auth configuration.
+            # Fork (Tideshift): the repositories that push or lock use this
+            # gRPC remote, which keeps this module's write path on gRPC. Both
+            # schemes reach the same port, server and auth configuration. A
+            # managed push can also send its fragments over QUIC on a declared
+            # session (WP-124); test_push_missing_fragments runs both schemes.
             write_url=f"grpc://127.0.0.1:{shared_port}/",
             server_log=server_log_path,
         )
@@ -326,7 +328,7 @@ def provision_owner(auth_env, make_actor, label: str, user: MockUser, api_key=No
         login_interactive(actor.make_repo(), auth_env.remote_url)
     else:
         login_api_key(actor.make_repo(), auth_env.remote_url, api_key)
-    # The owner pushes, so its repository uses the gRPC remote (fork rule).
+    # The owner pushes, so its repository uses the gRPC remote (fork choice).
     repo = actor.make_repo(remote_url=auth_env.write_url, repo_id=repo_id)
     repo.repository_create(repo_id=repo_id, identity=user.user_id)
 
@@ -907,8 +909,8 @@ def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor)
 
     actor = make_actor("linker")
     login_api_key(actor.make_repo(), auth_env.remote_url, LINKER_API_KEY)
-    # FORK-LOCAL (Tideshift): both repositories push, and the fork's managed
-    # push refuses QUIC, so they use the gRPC remote (same server and port).
+    # FORK-LOCAL (Tideshift): both repositories push, so they use the gRPC
+    # remote (same server and port), as the module's other writers do.
     linked = actor.make_repo(remote_url=auth_env.write_url, repo_id=linked_id)
     linked.repository_create(repo_id=linked_id, identity=USER1.user_id)
     commit_file(linked, "inner.txt", "linked content")
@@ -977,8 +979,8 @@ def provision_member(
     so the data paths agree with the online checks.
 
     Fork (Tideshift): a member that pushes or locks (`writes`) clones over the
-    gRPC remote, since managed mutations refuse QUIC. A read-only member
-    clones over QUIC, as upstream does."""
+    gRPC remote, as the owner does. A read-only member clones over QUIC, as
+    upstream does."""
     mock = auth_env.mock
     login_token = mock.mint_token(USER2)
     authz_token = mock.mint_token(

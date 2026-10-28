@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 mod active_active_two_process_support;
 mod active_active_two_process_test;
@@ -10,6 +11,8 @@ mod hashicorp;
 mod locks_test;
 mod presign_test;
 mod quic_declared_session_test;
+mod quic_managed_write_proof_test;
+mod quic_managed_write_support;
 mod quic_session_rebind_test;
 mod quic_strict_admission_test;
 mod quic_strict_live_cell_probe_test;

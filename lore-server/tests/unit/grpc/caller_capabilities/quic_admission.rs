@@ -4,11 +4,11 @@
 //!
 //! `urc/0.2` has no capability declaration, and a `lore-storage/0.4` session opened with
 //! `AuthorizeStart` action 0 declares nothing, so under `require_outcome_unknown_v1` those
-//! callers are read-only: every mutation is refused with storage status 200
+//! undeclared callers can read but not write: every mutation is refused with storage status 200
 //! (`unsupported-client`) before write authorization and before any store call.
 //! `compatible_single_replica` is unchanged. WP-124: a `lore-storage/0.4` session opened with
 //! action 2 and `outcome_unknown_v1` is declared, and its mutations pass admission and then
-//! face write authorization as usual. Each command is driven through both storage protocols
+//! face write authorization as usual, so a managed caller writes over QUIC. Each command is driven through both storage protocols
 //! under both policies (and declared/undeclared on v4), against stores that count every call
 //! they receive.
 

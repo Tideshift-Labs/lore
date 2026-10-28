@@ -20,6 +20,13 @@ required-features = ["integration_tests"]
 # Its own target rather than a module of the suite: it installs a process-wide GC event sink
 # provider, which takes the first registration and would otherwise race the suite's own.
 # Needs no service from compose.yaml, so it is not behind `integration_tests`.
+# Its own target because it sets `SSL_CERT_FILE` (the only way to make the storage clients trust a
+# test CA) from a constructor, and that variable is process-wide. See the file header.
+[[test]]
+name = "lores_tls"
+path = "tests/quic_lores_tls_test.rs"
+required-features = ["integration_tests"]
+
 [[test]]
 name = "store_gc_trigger"
 path = "tests/store_gc_trigger_test.rs"

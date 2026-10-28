@@ -6,7 +6,9 @@
 //! `QuicPublicStreamHandler::new`, which must apply it to BOTH storage services it mounts
 //! (`urc/0.2` and `lore-storage/0.4`). A site that forgot the builder call would silently fall
 //! back to the compatible default, so these tests drive a real QUIC Put through each ALPN of a
-//! handler built by the production constructor.
+//! handler built by the production constructor. The Put is undeclared (`AuthorizeStart` action 0,
+//! or `urc/0.2`, which cannot declare), so strict refuses it. Declared sessions, which strict
+//! admits, are covered in `grpc/caller_capabilities/quic_admission.rs`.
 
 use std::sync::Arc;
 use std::sync::Weak;

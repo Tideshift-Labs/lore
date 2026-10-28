@@ -69,14 +69,21 @@ pub enum Reply {
 pub struct Seen {
     pub opcode: u8,
     pub stream: usize,
+    /// The session id in the header. Zero for a command sent outside a session.
+    pub session_id: u32,
+    /// Which accepted connection carried it, from 0 in the order the peer accepted them.
+    pub connection: usize,
 }
 
 /// One request the peer has read in full.
 #[derive(Clone, Debug)]
 pub struct Done {
     pub opcode: u8,
-    /// The first 48 payload bytes. For a `Put` this is the `Address`.
+    /// The first 48 payload bytes. For a `Put` this is the `Address`; for an `Authorize` the
+    /// first byte is the action (0 start, 1 stop, 2 declared start).
     pub head: Vec<u8>,
+    /// Which accepted connection carried it, from 0 in the order the peer accepted them.
+    pub connection: usize,
 }
 
 struct Held {
@@ -99,6 +106,8 @@ struct Shared {
     accepted: AtomicUsize,
     closed: AtomicUsize,
     stream_count: AtomicUsize,
+    /// Every connection the peer has accepted, so a test can close them from the peer's side.
+    connections: Mutex<Vec<quinn::Connection>>,
 }
 
 pub struct Peer {
@@ -154,6 +163,7 @@ impl Peer {
             accepted: AtomicUsize::new(0),
             closed: AtomicUsize::new(0),
             stream_count: AtomicUsize::new(0),
+            connections: Mutex::new(Vec::new()),
         });
         let accept = {
             let shared = shared.clone();
@@ -163,9 +173,10 @@ impl Peer {
                     let Ok(connection) = incoming.await else {
                         continue;
                     };
-                    shared.accepted.fetch_add(1, Ordering::SeqCst);
+                    let index = shared.accepted.fetch_add(1, Ordering::SeqCst);
+                    shared.connections.lock().push(connection.clone());
                     let shared = shared.clone();
-                    lore_base::lore_spawn!(serve_connection(shared, connection));
+                    lore_base::lore_spawn!(serve_connection(shared, connection, index));
                 }
             })
         };
@@ -227,6 +238,14 @@ impl Peer {
         self.shared.closed.load(Ordering::SeqCst)
     }
 
+    /// Close every connection the peer has accepted so far, from the peer's side. The client sees
+    /// its connection die with nothing in flight; a later command reconnects.
+    pub fn close_connections(&self) {
+        for connection in self.shared.connections.lock().iter() {
+            connection.close(quinn::VarInt::from_u32(7), b"scripted close");
+        }
+    }
+
     /// Stop reading payload bytes. Headers are still read.
     pub fn close_gate(&self) {
         self.shared.gate_open.store(false, Ordering::SeqCst);
@@ -280,7 +299,7 @@ impl Peer {
     }
 }
 
-async fn serve_connection(shared: Arc<Shared>, connection: quinn::Connection) {
+async fn serve_connection(shared: Arc<Shared>, connection: quinn::Connection, index: usize) {
     let mut next_stream = 0usize;
     let watcher = {
         let shared = shared.clone();
@@ -296,7 +315,14 @@ async fn serve_connection(shared: Arc<Shared>, connection: quinn::Connection) {
         next_stream += 1;
         shared.stream_count.fetch_max(next_stream, Ordering::SeqCst);
         let shared = shared.clone();
-        lore_base::lore_spawn!(serve_stream(shared, connection.clone(), stream, send, recv));
+        lore_base::lore_spawn!(serve_stream(
+            shared,
+            connection.clone(),
+            index,
+            stream,
+            send,
+            recv
+        ));
     }
     let _ = watcher.await;
 }
@@ -371,6 +397,7 @@ async fn respond_status(
 async fn serve_stream(
     shared: Arc<Shared>,
     connection: quinn::Connection,
+    connection_index: usize,
     stream: usize,
     send: quinn::SendStream,
     mut recv: quinn::RecvStream,
@@ -385,6 +412,8 @@ async fn serve_stream(
         shared.seen.lock().push(Seen {
             opcode: header.cmd,
             stream,
+            session_id: header.session_id,
+            connection: connection_index,
         });
         let rule = shared.rules.lock().get(&header.cmd).cloned();
         if matches!(rule, Some(Reply::EarlyOk)) {
@@ -396,6 +425,7 @@ async fn serve_stream(
         shared.done.lock().push(Done {
             opcode: header.cmd,
             head: payload.iter().take(48).copied().collect(),
+            connection: connection_index,
         });
         if header.cmd == CLIENT_IDENTIFY {
             continue;

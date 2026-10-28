@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# Copyright 2026 Tideshift Labs
 # SPDX-License-Identifier: MIT
 import logging
 from pathlib import Path
@@ -38,11 +39,16 @@ def missing_fragments_repo(
     autouse server on its own allocated ports so a single pytest invocation
     can exercise both normal-server tests and this missing-fragment scenario.
 
-    FORK-LOCAL (Tideshift): the fork CLI pushes only over gRPC, and only with a
-    signed credential ("managed mutations require the gRPC transport", then
-    "managed dispatch cannot bind credential namespace"). So the server gets
-    the same owned signed auth as the `managed_cli_server` fixture, and each
-    repository is granted to a logged-in fixture identity, as there."""
+    FORK-LOCAL (Tideshift): the fork CLI's managed push dispatches with a signed
+    credential (without one it fails with "managed dispatch cannot bind
+    credential namespace"). So the server gets the same owned signed auth as the
+    `managed_cli_server` fixture, and each repository is granted to a logged-in
+    fixture identity, as there.
+
+    The factory takes the remote scheme. `grpc` sends the push's fragment writes
+    over gRPC. `lore` sends them over a declared QUIC storage session (WP-124),
+    with the branch push itself still on gRPC. Both reach the same port and
+    server, so the dropped fragments surface the same way on each."""
     from managed_auth import ManagedAuth
 
     shared_port = allocate_free_port()
@@ -73,11 +79,14 @@ def missing_fragments_repo(
                 "server not built with the 'failure_generator' feature "
                 "(build loreserver with --features failure_generator)"
             )
-        remote_url = f"grpc://{host}:{ports['grpc']}/"
         token = auth.identity()
-        auth.login(lore_executable_path, global_dir_name, remote_url, token)
+        logged_in = set()
 
-        def make_repo() -> Lore:
+        def make_repo(scheme: str = "grpc") -> Lore:
+            remote_url = f"{scheme}://{host}:{ports['grpc']}/"
+            if scheme not in logged_in:
+                auth.login(lore_executable_path, global_dir_name, remote_url, token)
+                logged_in.add(scheme)
             repo_id = Lore.generate_id()
             auth.grant(token, repo_id)
             return new_lore_repo(
@@ -86,6 +95,20 @@ def missing_fragments_repo(
                 environment_vars=auth.environment(global_dir_name),
             )
 
+        def quic_storage_connections() -> int:
+            """Storage connections the server has accepted over QUIC so far.
+
+            The witness that a `lore://` push sent its fragments over QUIC: a CLI that
+            quietly fell back to gRPC would accept none. Every other call this test
+            makes (repository create, branch push) is gRPC, so before any clone or
+            sync a nonzero count can only be the push's fragment writes."""
+            text = Path(log_path).read_text(encoding="utf-8", errors="replace")
+            return sum(
+                'protocol="lore-storage/0.4"' in line and "Established" in line
+                for line in text.splitlines()
+            )
+
+        make_repo.quic_storage_connections = quic_storage_connections
         yield make_repo
     finally:
         _kill_server_by_pid(proc.pid, log_path, label="missing-fragments server")
@@ -106,8 +129,9 @@ def missing_fragments_repo(
 
 @pytest.mark.smoke
 @pytest.mark.requires_instrumented_lore
-def test_push_missing_fragments(missing_fragments_repo):
-    repo: Lore = missing_fragments_repo()
+@pytest.mark.parametrize("scheme", ["grpc", "lore"])
+def test_push_missing_fragments(missing_fragments_repo, scheme):
+    repo: Lore = missing_fragments_repo(scheme)
     # Generate some files
     text_file = "text-File.txt"
     other_file = "some_other.uasset"
@@ -138,6 +162,14 @@ def test_push_missing_fragments(missing_fragments_repo):
     # Push main branch
     output = repo.push(check=False).strip()
 
+    # Where the fragments went. Read before any clone or sync, which read over QUIC on
+    # either scheme, so only the push can have opened these connections.
+    quic = missing_fragments_repo.quic_storage_connections()
+    if scheme == "lore":
+        assert quic > 0, "a lore:// push sent no fragment over QUIC"
+    else:
+        assert quic == 0, f"a grpc:// push opened {quic} QUIC storage connections"
+
     # The peer carries the address in the status details rather than its message, so
     # what reaches the output is the address the push names alongside it. Both writes
     # above are dropped and the peer stops at the first fragment it finds missing, so
@@ -149,7 +181,7 @@ def test_push_missing_fragments(missing_fragments_repo):
     ), "Push did not report an injected fragment as missing"
 
     # Create source repository
-    repo = missing_fragments_repo()
+    repo = missing_fragments_repo(scheme)
 
     # Generate some files
     text_file = "text-File.txt"

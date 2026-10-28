@@ -335,8 +335,9 @@ fn guarded_settings() -> lore_server::settings::Settings {
     settings
 }
 
-/// Public QUIC no longer blocks the strict boot: `admit_quic` makes it read-only. The
-/// replication ingress (internal QUIC, internal gRPC) still does.
+/// Public QUIC no longer blocks the strict boot: `admit_quic` refuses an undeclared caller's
+/// mutations and admits a declared session's (WP-124), so exposing it adds no unguarded write
+/// path. The replication ingress (internal QUIC, internal gRPC) still blocks it.
 #[test]
 fn required_policy_boots_with_public_quic_enabled() {
     let mut settings = guarded_settings();

@@ -481,11 +481,59 @@ async fn managed_put(
     (result, started.elapsed())
 }
 
-/// The error is a refusal to send, not a lost answer: nothing in it claims the write may have
-/// been applied, and nothing in it is an unknown outcome.
-fn assert_not_dispatched(error: &ProtocolError, what: &str) {
+/// Which proof of "no byte left" a not-dispatched managed write must carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotSent {
+    /// Phase 1: the stream's writer lock never freed (`QuicClientError::WriterLockTimeout`).
+    WriterLockTimeout,
+    /// Phase 2 before any byte: the stream took none (`QuicClientError::WriteTimeout`).
+    WriteTimeout,
+    /// The write boundary refused a session id from a replaced connection (the rebind proof the
+    /// session layer resends on).
+    RebindRequired,
+}
+
+impl NotSent {
+    const ALL: [NotSent; 3] = [
+        NotSent::WriterLockTimeout,
+        NotSent::WriteTimeout,
+        NotSent::RebindRequired,
+    ];
+
+    /// The text only this proof renders. `SessionRebindRequired` is `pub(crate)` and cannot be
+    /// named from here, so the proof is read off the message the transport gives it.
+    fn marker(self) -> &'static str {
+        match self {
+            NotSent::WriterLockTimeout => {
+                "No progress on the stream writer within the managed idle bound"
+            }
+            NotSent::WriteTimeout => {
+                "The stream accepted no byte of the command within the managed idle bound"
+            }
+            NotSent::RebindRequired => "storage command was not dispatched",
+        }
+    }
+}
+
+/// The error is exactly the not-dispatched proof `expected`, and is neither a lost answer nor an
+/// unknown outcome. A bare "is not a lost answer" would pass for any unrelated failure.
+fn assert_not_dispatched(error: &ProtocolError, expected: NotSent, what: &str) {
+    let text = format!("{error} | {error:?}");
+    assert!(
+        text.contains(expected.marker()),
+        "{what}: expected {expected:?} ({:?}), got {text}",
+        expected.marker()
+    );
+    for other in NotSent::ALL.into_iter().filter(|other| *other != expected) {
+        assert!(
+            !text.contains(other.marker()),
+            "{what}: expected only {expected:?}, but it also reads as {other:?}: {text}"
+        );
+    }
     assert!(!is_unjournaled_answer_lost(error), "{what}: {error:?}");
     assert!(!error.is_outcome_unknown(), "{what}: {error:?}");
+    assert!(!error.is_disconnected(), "{what}: {error:?}");
+    assert!(!text.contains("lost its answer"), "{what}: {text}");
 }
 
 /// Phase 3. The write completes, the peer reads it and never answers.
@@ -558,7 +606,7 @@ async fn a_write_stalled_before_its_first_byte_is_not_dispatched_and_keeps_the_c
     let (address, fragment, payload) = put_args(64);
     let (result, elapsed) = managed_put(&client, session, address, fragment, payload.clone()).await;
     let error = result.expect_err("no credit, no progress");
-    assert_not_dispatched(&error, "zero-byte write stall");
+    assert_not_dispatched(&error, NotSent::WriteTimeout, "zero-byte write stall");
     assert!(
         elapsed >= BOUND - Duration::from_millis(100),
         "fired early: {elapsed:?}"
@@ -745,7 +793,7 @@ async fn a_managed_put_queued_behind_a_stalled_writer_is_not_dispatched() {
     let (address, fragment, payload) = put_args(64);
     let (result, elapsed) = managed_put(&client, session, address, fragment, payload).await;
     let error = result.expect_err("the lock never frees");
-    assert_not_dispatched(&error, "writer-lock wait");
+    assert_not_dispatched(&error, NotSent::WriterLockTimeout, "writer-lock wait");
     assert!(
         elapsed >= BOUND - Duration::from_millis(100),
         "fired early: {elapsed:?}"
@@ -769,33 +817,70 @@ async fn a_managed_put_queued_behind_a_stalled_writer_is_not_dispatched() {
 /// A lock holder that keeps writing is progress for its waiters, however long its upload takes.
 #[tokio::test]
 async fn a_managed_put_queued_behind_a_writer_that_keeps_writing_is_not_cut() {
+    a_waiter_behind_a_trickling_writer_is_served(false).await;
+}
+
+/// The same, with the lock holder itself a managed write. A managed writer takes the lock through
+/// `send_bounded`, which stamps the stream's progress on its own; if that stamp stopped moving, a
+/// waiter behind a long managed upload would read the stream as dead and get a false
+/// `WriterLockTimeout`, which is safe (not dispatched) but fails the push.
+#[tokio::test]
+async fn a_managed_put_queued_behind_a_managed_writer_that_keeps_writing_is_not_cut() {
+    a_waiter_behind_a_trickling_writer_is_served(true).await;
+}
+
+async fn a_waiter_behind_a_trickling_writer_is_served(managed_writer: bool) {
     let peer = Arc::new(Peer::start());
     let client = Arc::new(connect(&peer).await);
     let (session, stream) = warm_up(&peer, &client).await;
     client.quic().set_managed_idle_for_test(BOUND);
-    // Close the gate while the occupying reads are set up, then trickle: the peer reads 512
-    // bytes every 50 ms, and quinn grants more credit each 2 KiB, so the writer advances about
-    // every 200 ms for a few seconds, well past BOUND in total but never silent for BOUND.
+    // Trickle: the peer reads 2 KiB every 50 ms, and quinn grants more credit each 2 KiB, so the
+    // writer advances about every 50-200 ms for a few seconds, well past BOUND in total but
+    // never silent for BOUND.
     let writer = {
         peer.throttle(2048, Duration::from_millis(50));
-        queue_behind_a_stalled_writer(&peer, &client, session, stream, 200 * 1024, false, false)
-            .await
+        queue_behind_a_stalled_writer(
+            &peer,
+            &client,
+            session,
+            stream,
+            200 * 1024,
+            false,
+            managed_writer,
+        )
+        .await
     };
 
     let started = Instant::now();
     let (address, fragment, payload) = put_args(64);
     let (result, elapsed) = managed_put(&client, session, address, fragment, payload).await;
-    result.expect("a waiter behind a live writer is served, not timed out");
+    let served = result.unwrap_or_else(|error| {
+        panic!(
+            "a waiter behind a live {} writer was cut after {elapsed:?}, the false timeout a \
+             stalled stamp gives: {error:?}",
+            if managed_writer {
+                "managed"
+            } else {
+                "unmanaged"
+            }
+        )
+    });
+    assert!(matches!(served, MutableOutcome::Applied(())), "{served:?}");
     assert!(
         started.elapsed() > BOUND,
         "the case is only meaningful if the wait outlasted the bound: {elapsed:?}"
     );
     tokio::time::timeout(BOUND * 10, writer)
         .await
-        .expect("the stalled writer never finished")
+        .expect("the trickling writer never finished")
         .expect("writer task")
-        .expect("writer");
+        .expect("a writer that keeps being read is never cut");
     assert_eq!(peer.closed_connections(), 0);
+    assert_eq!(
+        peer.seen_opcode(PUT).len(),
+        2,
+        "the writer and the waiter each reached the peer once"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1149,6 +1234,11 @@ async fn a_sibling_that_wrote_nothing_before_a_phase_two_close_is_not_a_lost_ans
     )
     .await;
 
+    // The sibling joins well after the writer last made progress, so the writer's idle bound fires
+    // first and the sibling is still queued for the lock when the connection closes. Joining at
+    // once leaves the two timers a few milliseconds apart, and under load the sibling's own
+    // writer-lock timeout (also not dispatched, but a different proof) can win the race.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let (address, fragment, payload) = put_args(64);
     let (sibling, _) = managed_put(&client, session, address, fragment, payload).await;
     let writer_result = tokio::time::timeout(BOUND * 10, writer)
@@ -1162,7 +1252,13 @@ async fn a_sibling_that_wrote_nothing_before_a_phase_two_close_is_not_a_lost_ans
         "{writer_error:?}"
     );
     let sibling_error = sibling.expect_err("the sibling cannot be served on a closed connection");
-    assert_not_dispatched(&sibling_error, "sibling that wrote no byte");
+    // The dead connection is replaced, and the id issued on it is then refused at the write
+    // boundary: that is the proof a session layer resends on.
+    assert_not_dispatched(
+        &sibling_error,
+        NotSent::RebindRequired,
+        "sibling that wrote no byte",
+    );
     assert_eq!(
         peer.seen_opcode(PUT).len(),
         1,
@@ -1217,4 +1313,109 @@ async fn a_healing_verify_journals_under_the_sessions_partition_and_refuses_a_fo
     .await
     .expect("a healing verify on the scope's own session");
     assert_eq!(store.intents.lock().len(), 1);
+}
+
+/// A healing verify on a session id issued before a reconnect. The partition record outlives the
+/// reconnect, so the verify is not refused locally as "a session this client did not start": it
+/// is journaled under the session's own partition and reaches the write boundary, which refuses
+/// the stale id with the rebind proof. Nothing is sent, and the attempt settles not applied, so a
+/// session layer may resend it on a rebound session.
+#[tokio::test]
+async fn a_healing_verify_on_a_stale_session_after_a_reconnect_gets_the_rebind_proof() {
+    let peer = Peer::start();
+    let client = authenticated_client(&peer).await;
+    let stale = declared_session(&peer, &client).await;
+    let generation = client.quic().connection_generation();
+    peer.rule(Command::Verify as u8, Reply::Ok(vec![0, 0]));
+    let store = Arc::new(ManagedJournal::default());
+    let scope = scope_over(&store);
+    let (address, _, _) = put_args(0);
+
+    // A real reconnect: the peer closes the connection with nothing in flight, then a command
+    // that carries no session id replaces it.
+    peer.close_connections();
+    peer.wait_until("the connection to close", |peer| {
+        peer.closed_connections() == 1
+    })
+    .await;
+    client
+        .session_start(partition(), "reconnect-trigger")
+        .await
+        .expect("a session start replaces the connection");
+    assert_eq!(
+        peer.accepted_connections(),
+        2,
+        "the connection was replaced"
+    );
+    assert_ne!(
+        client.quic().connection_generation(),
+        generation,
+        "the generation moved"
+    );
+    // The trigger's own id was recorded against the generation sampled before it went out, so it
+    // is stale too (it costs a rebind, by design). A start made now is current.
+    let current = client
+        .session_start(partition(), "after-reconnect")
+        .await
+        .expect("a session on the replacement connection");
+    assert_ne!(current, stale);
+    let starts_on_replacement = peer
+        .done()
+        .iter()
+        .filter(|done| done.opcode == Command::Authorize as u8 && done.connection == 1)
+        .count();
+    assert!(
+        starts_on_replacement >= 2,
+        "both starts ran on the replacement connection: {starts_on_replacement}"
+    );
+
+    let error = with_caller_operation(scope.clone(), client.verify_outcome(stale, &address, true))
+        .await
+        .expect_err("a stale id must be refused");
+    assert_not_dispatched(&error, NotSent::RebindRequired, "stale healing verify");
+    assert!(
+        !error
+            .to_string()
+            .contains("managed healing verify on a session this client did not start"),
+        "the id is known; the write boundary refuses it, not the local partition check: {error:?}"
+    );
+    assert!(
+        peer.seen_opcode(Command::Verify as u8).is_empty(),
+        "the stale id never reached the wire"
+    );
+
+    // It was journaled first, under the session's own partition, and settled not applied.
+    let attempt = scope
+        .latest_attempt()
+        .expect("the heal was journaled before the boundary refused it");
+    let record = store
+        .lookup(&attempt)
+        .await
+        .expect("lookup")
+        .expect("a journal row");
+    assert_eq!(record.operation, "StorageService.Verify");
+    assert_eq!(
+        record.state,
+        AttemptState::Resolved(AttemptResolution::NotApplied),
+        "a command that never left is settled not applied, never left unknown"
+    );
+    assert!(store.unresolved().await.expect("unresolved").is_empty());
+    let intents = store.intents.lock().clone();
+    assert_eq!(intents.len(), 1, "{intents:?}");
+    assert_eq!(intents[0].repository, RepositoryId::from([0x24u8; 16]));
+    assert_eq!(intents[0].rpc, "StorageService.Verify");
+
+    // Positive control: the same scope heals on a session the replacement connection issued.
+    let outcome = with_caller_operation(
+        scope.clone(),
+        client.verify_outcome(current, &address, true),
+    )
+    .await
+    .expect("a healing verify on the current session");
+    assert!(matches!(outcome, MutableOutcome::Applied(_)));
+    let verifies = peer.seen_opcode(Command::Verify as u8);
+    assert_eq!(verifies.len(), 1);
+    assert_eq!(verifies[0].session_id, current, "sent on the current id");
+    assert_eq!(verifies[0].connection, 1, "on the replacement connection");
+    assert_eq!(store.intents.lock().len(), 2);
 }

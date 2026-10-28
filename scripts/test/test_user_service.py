@@ -1,4 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# Copyright 2026 Tideshift Labs
 # SPDX-License-Identifier: MIT
 """Smoke tests for a user directory advertised apart from the auth service.
 
@@ -93,8 +94,8 @@ def _launch(request, tmp_path_factory, executable, stubs, user_url):
             user_url=user_url,
             remote_url=f"lore://127.0.0.1:{shared_port}/",
             # FORK-LOCAL (Tideshift): the fork's `provision_owner` creates the
-            # owner's repository over this gRPC remote, because managed
-            # mutations refuse QUIC. Same port, server and auth configuration.
+            # owner's repository over this gRPC remote, as the other online
+            # modules' writers do. Same port, server and auth configuration.
             write_url=f"grpc://127.0.0.1:{shared_port}/",
             server_log=server_log_path,
         )

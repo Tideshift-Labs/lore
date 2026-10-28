@@ -15,8 +15,14 @@
 //   strict:     a stock (undeclared) QUIC Put is refused with storage status 200 and the
 //               fragment is absent from the server's store; a stock gRPC Put is refused (the gRPC
 //               gate is live); a managed gRPC Put is admitted; a QUIC Get of that gRPC-seeded
-//               fragment returns its bytes.
+//               fragment returns its bytes; a managed (declared-session) QUIC Put is admitted,
+//               stored and readable, while the identical undeclared QUIC Put of the same fragment
+//               was refused first, so the admission is the declaration's and not an open door.
 //   compatible: the same stock QUIC Put is stored (positive control for the refusal).
+//
+// The declared session is witnessed on the client (`CallerOperationContext::declared_session_count`
+// is 1 for the QUIC Put and 0 for the gRPC Put), not inferred from the URL. The server's own
+// session table is not read here; `quic_declared_session_test.rs` does that.
 //
 // Not covered here: the settings-to-policy read in `server.rs`'s `async_main` and the private
 // `QuicPublicStreamHandler`. A strict boot of the real binary needs the coordinated Postgres
@@ -456,7 +462,8 @@ mod quic_strict_admission_tests {
     }
 
     #[tokio::test]
-    async fn strict_cell_keeps_quic_read_only_and_admits_managed_grpc_writes() -> TestResult {
+    async fn strict_cell_refuses_undeclared_writes_and_admits_declared_managed_writes_on_both_transports()
+    -> TestResult {
         let execution = setup_execution("test".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
@@ -503,7 +510,7 @@ mod quic_strict_admission_tests {
                 let (fragment, address, payload) = fragment::generate_random();
                 let (operation, journal) = managed(partition);
                 with_caller_operation(
-                    operation,
+                    operation.clone(),
                     grpc.put(address, fragment, Some(payload.clone())),
                 )
                 .await
@@ -515,6 +522,11 @@ mod quic_strict_admission_tests {
                     "a managed fragment Put must write no journal child"
                 );
                 assert!(journal.unresolved().await?.is_empty());
+                assert_eq!(
+                    operation.declared_session_count(),
+                    0,
+                    "gRPC declares per request and starts no QUIC declared session"
+                );
 
                 // 4. A QUIC Get of the gRPC-seeded fragment returns its bytes.
                 let (read_fragment, read_payload) = quic.get(&address).await?;
@@ -522,6 +534,60 @@ mod quic_strict_admission_tests {
                 assert_eq!(
                     read_payload, payload,
                     "QUIC Get must return the seeded bytes"
+                );
+
+                // 5. The undeclared QUIC Put of a fresh fragment is refused, then the SAME fragment
+                //    Put inside a managed scope on the SAME session is admitted and stored. The
+                //    refusal first makes the admission the declaration's: nothing else changed
+                //    between the two calls.
+                let (declared_fragment, declared_address, declared_payload) =
+                    fragment::generate_random();
+                let refused = quic
+                    .put(
+                        declared_address,
+                        declared_fragment,
+                        Some(declared_payload.clone()),
+                    )
+                    .await
+                    .expect_err("strict must refuse the undeclared QUIC Put of this fragment");
+                assert!(lore_transport::error::is_unsupported_client(&refused));
+                assert!(
+                    !stored(&immutable, partition, declared_address).await,
+                    "the refused QUIC Put must store nothing"
+                );
+                let (quic_operation, quic_journal) = managed(partition);
+                with_caller_operation(
+                    quic_operation.clone(),
+                    quic.put(
+                        declared_address,
+                        declared_fragment,
+                        Some(declared_payload.clone()),
+                    ),
+                )
+                .await
+                .map_err(|error| format!("a managed QUIC Put must be admitted: {error:?}"))?;
+                assert_eq!(
+                    quic_operation.declared_session_count(),
+                    1,
+                    "the managed QUIC Put ran on one declared session"
+                );
+                assert!(
+                    stored(&immutable, partition, declared_address).await,
+                    "the admitted managed QUIC Put must reach the store"
+                );
+                assert_eq!(
+                    quic_journal
+                        .records
+                        .load(std::sync::atomic::Ordering::SeqCst),
+                    0,
+                    "a managed QUIC fragment Put writes no journal child"
+                );
+
+                // 6. It reads back over QUIC, undeclared, with the same bytes.
+                let (_, declared_read) = quic.get(&declared_address).await?;
+                assert_eq!(
+                    declared_read, declared_payload,
+                    "the managed QUIC write must read back"
                 );
                 Ok(())
             })
