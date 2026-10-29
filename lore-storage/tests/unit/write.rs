@@ -26,6 +26,7 @@ use lore_transport::StorageSession;
 use tokio_util::sync::CancellationToken;
 
 mod established_decisions;
+mod unmanaged_gate;
 
 use std::path::PathBuf;
 

@@ -15,6 +15,7 @@ pub mod session;
 pub mod tls;
 pub mod traits;
 pub mod types;
+pub mod unmanaged_write;
 pub mod util;
 
 use std::sync::OnceLock;

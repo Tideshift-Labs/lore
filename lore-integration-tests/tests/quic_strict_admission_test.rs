@@ -594,6 +594,210 @@ mod quic_strict_admission_tests {
             .await
     }
 
+    /// Counts the strict QUIC refusals the SERVER answered, from the event its stream handler
+    /// emits for each (`handler_error_label = "UnsupportedClient"`).
+    ///
+    /// The handler runs on the net runtime's threads, so the subscriber is process-global. Tests
+    /// in this binary run concurrently, so each refusal is attributed by the execution context
+    /// its task runs under: a test registers its own context and reads only its own count.
+    struct RefusalCounter;
+
+    static REFUSALS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+    fn context_key(context: &Arc<dyn std::any::Any + Send + Sync>) -> usize {
+        Arc::as_ptr(context).cast::<()>() as usize
+    }
+
+    /// Installs the process-global counting subscriber (once) and registers `execution` so its
+    /// refusals are counted. Returns the key to read them with.
+    fn count_refusals_for(
+        execution: &Arc<lore_revision::interface::ExecutionContext>,
+    ) -> Result<usize, Box<dyn Error>> {
+        static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let installed = *INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(tracing_subscriber::layer::SubscriberExt::with(
+                tracing_subscriber::registry(),
+                RefusalCounter,
+            ))
+            .is_ok()
+        });
+        if !installed {
+            return Err("another global tracing subscriber is installed; cannot count".into());
+        }
+        let context: Arc<dyn std::any::Any + Send + Sync> = execution.clone();
+        let key = context_key(&context);
+        REFUSALS
+            .lock()
+            .map_err(|_poisoned| "refusal registry poisoned")?
+            .push((key, 0));
+        Ok(key)
+    }
+
+    fn refusals_for(key: usize) -> usize {
+        REFUSALS
+            .lock()
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|(entry, _)| *entry == key)
+                    .map(|(_, count)| *count)
+            })
+            .unwrap_or(0)
+    }
+
+    struct LabelVisitor(bool);
+
+    impl tracing::field::Visit for LabelVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "handler_error_label"
+                && format!("{value:?}").contains("UnsupportedClient")
+            {
+                self.0 = true;
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "handler_error_label" && value.contains("UnsupportedClient") {
+                self.0 = true;
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = LabelVisitor(false);
+            event.record(&mut visitor);
+            if !visitor.0 {
+                return;
+            }
+            let Ok(key) = LORE_CONTEXT.try_with(context_key) else {
+                return;
+            };
+            if let Ok(mut entries) = REFUSALS.lock()
+                && let Some((_, count)) = entries.iter_mut().find(|(entry, _)| *entry == key)
+            {
+                *count += 1;
+            }
+        }
+    }
+
+    /// Stores `count` fragments the way `lore commit` does: unmanaged, each through the write
+    /// tracker, dispatched back to back without awaiting one before the next starts. Returns
+    /// their addresses.
+    async fn commit_style_store(
+        local: &Arc<dyn ImmutableStore>,
+        session: &Arc<lore_transport::session::StorageSession>,
+        partition: RepositoryId,
+        count: usize,
+    ) -> Result<Vec<lore_base::types::Address>, Box<dyn Error>> {
+        let tracker = Arc::new(lore_storage::write_tracker::WriteTracker::new());
+        let mut addresses = Vec::new();
+        for _ in 0..count {
+            let (fragment, address, payload) = fragment::generate_random();
+            lore_storage::write::store_fragment(
+                local.clone(),
+                partition,
+                address,
+                fragment,
+                payload,
+                true,
+                Some(session.clone()),
+                lore_storage::write_tracker::WriteContext::tracked(Some(tracker.clone()), None),
+                None,
+            )
+            .await?;
+            addresses.push(address);
+        }
+        tracker.await_all().await?;
+        Ok(addresses)
+    }
+
+    /// WP-124 follow-up (b), measured: how many refusals a strict QUIC cell answers for an
+    /// unmanaged commit-style store of 64 fragments dispatched concurrently through the write
+    /// tracker. Without the latch every fragment is refused; with it, only the writes already in
+    /// flight when the first refusal lands are. The count is printed so a run can be compared
+    /// across trees.
+    #[tokio::test]
+    async fn strict_cell_refusals_for_a_concurrent_commit_style_store_are_measured() -> TestResult {
+        const FRAGMENTS: usize = 64;
+        let execution = setup_execution("test".to_string());
+        let key = count_refusals_for(&execution)?;
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (tcp, udp) = bind_matched_pair();
+                let addr: SocketAddr = tcp.local_addr()?;
+                let policy = CallerCapabilityPolicy::RequireOutcomeUnknownV1;
+                let (immutable, mutable) = fresh_stores().await;
+                let _grpc = start_grpc(tcp, addr, immutable.clone(), mutable.clone(), policy).await;
+                let _quic = start_quic(udp, immutable.clone(), mutable.clone(), policy);
+                let partition = random::<RepositoryId>();
+                let (local, _local_mutable) = fresh_stores().await;
+                let quic = session("lore", addr, partition).await?;
+
+                let addresses = commit_style_store(&local, &quic, partition, FRAGMENTS).await?;
+
+                let refusals = refusals_for(key);
+                eprintln!(
+                    "MEASURED server refusals for {FRAGMENTS} concurrent fragments: {refusals}"
+                );
+                assert!(refusals >= 1, "the strict cell refused the stock writes");
+                for address in &addresses {
+                    assert!(
+                        !stored(&immutable, partition, *address).await,
+                        "a strict cell stores none of an unmanaged write"
+                    );
+                    assert!(
+                        stored(&local, partition, *address).await,
+                        "every fragment stays in the local store for push"
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The deterministic form: one fragment is stored and awaited, so the cell's refusal is
+    /// known, and then 63 more are stored. A strict cell answers exactly one refusal in total
+    /// (without the latch it answers 64).
+    #[tokio::test]
+    async fn strict_cell_answers_one_refusal_once_a_commit_style_store_has_learned_it() -> TestResult
+    {
+        const REST: usize = 63;
+        let execution = setup_execution("test".to_string());
+        let key = count_refusals_for(&execution)?;
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (tcp, udp) = bind_matched_pair();
+                let addr: SocketAddr = tcp.local_addr()?;
+                let policy = CallerCapabilityPolicy::RequireOutcomeUnknownV1;
+                let (immutable, mutable) = fresh_stores().await;
+                let _grpc = start_grpc(tcp, addr, immutable.clone(), mutable.clone(), policy).await;
+                let _quic = start_quic(udp, immutable.clone(), mutable.clone(), policy);
+                let partition = random::<RepositoryId>();
+                let (local, _local_mutable) = fresh_stores().await;
+                let quic = session("lore", addr, partition).await?;
+
+                commit_style_store(&local, &quic, partition, 1).await?;
+                let after_first = refusals_for(key);
+                let rest = commit_style_store(&local, &quic, partition, REST).await?;
+
+                let refusals = refusals_for(key);
+                eprintln!("MEASURED server refusals for 1 + {REST} staged fragments: {refusals}");
+                assert_eq!(after_first, 1, "the first write is refused once");
+                assert_eq!(refusals, 1, "the strict cell is not asked again");
+                for address in &rest {
+                    assert!(!stored(&immutable, partition, *address).await);
+                    assert!(stored(&local, partition, *address).await);
+                }
+                Ok(())
+            })
+            .await
+    }
     /// Positive control: the identical stock QUIC Put is stored when the policy is compatible.
     #[tokio::test]
     async fn compatible_cell_stores_a_stock_quic_put() -> TestResult {

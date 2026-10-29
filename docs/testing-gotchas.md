@@ -21,6 +21,24 @@ Durable, recurring testing lessons grouped by topic.
   restored file to a new mtime or run `cargo clean -p <crate>`, and confirm a `Compiling <crate>`
   line before trusting results.
 
+- **`LNK1140: limit exceeded for program database`** linking `lore-transport`'s `--test unit` on
+  Windows: the debug PDB is too big. Not a code fault. Build with `CARGO_PROFILE_DEV_DEBUG=0` and a
+  separate `CARGO_TARGET_DIR` (changing the profile env invalidates the shared target cache).
+- **`lore-storage` write tests share the process-global `STORE_IN_FLIGHT`** (`write.rs`), keyed by
+  `(partition, address)`. Two concurrent tests storing the same address make one "inherit" the
+  other's placement, so counts such as Puts reaching a fake come out low and flaky. Give each test
+  its own seed range. A real `StorageSession` over a scripted `Storage` needs no private
+  constructor: `connection::add(scheme, EnvironmentOnlyProtocol)` + `connect` +
+  `StorageConnector::new(vec![fake]).session_pool(..).pick()` (pattern: `tests/unit/write/unmanaged_gate.rs`,
+  after `lore-transport/tests/unit/session_pool.rs`). Needs `lore-transport` `test-util` as a dev-dep for
+  `VolatileAttemptStore` (managed scope).
+- **Counting server-side refusals in `lore-integration-tests`**: the QUIC stream handler runs on the
+  net runtime's threads, so a thread-local `tracing` subscriber sees none of its events. Install a
+  process-global layer once and attribute each `handler_error_label = "UnsupportedClient"` event by
+  `LORE_CONTEXT.try_with(Arc::as_ptr)` of the emitting task (tests in one binary run concurrently).
+  See `quic_strict_admission_test.rs` (`count_refusals_for`). Measured on a strict cell, 64 tracker
+  writes: 64 refusals without the unmanaged-write latch; with it, 1 when the refusal is learned first (deterministic). Dispatched all at once the count varies with scheduling (observed 19-64 for 64 fragments).
+
 ## Live lock fixture (`lore-revision/src/live_fixture.rs`)
 
 - **`Log` events never reach a test callback** (`lore_warn!` text, e.g. the force-release listing):

@@ -52,6 +52,7 @@ trace_log = []
 # The shared test temp-directory helper.
 lore-base = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true, features = ["test-util"] }
+lore-transport = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [target.'cfg(target_family = "windows")'.dependencies]

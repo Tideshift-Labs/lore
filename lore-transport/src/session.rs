@@ -24,6 +24,7 @@ use crate::error::ProtocolError;
 use crate::replay::ATTEMPT_BUDGET;
 use crate::replay::MutableOutcome;
 use crate::traits::Storage;
+use crate::unmanaged_write::UnmanagedWriteLatch;
 
 /// A live session on a `Storage` connection. Provides all storage operations
 /// scoped to a specific partition and correlation ID. Sends `session_stop`
@@ -37,6 +38,9 @@ use crate::traits::Storage;
 ///   forcing the background connect to resolve.
 pub struct StorageSession {
     inner: SessionInner,
+    /// FORK-LOCAL (Tideshift, WP-124 follow-up (b)): whether this session's server has refused
+    /// a write made outside a managed caller operation.
+    unmanaged_writes: UnmanagedWriteLatch,
 }
 
 struct ResolvedFields {
@@ -382,6 +386,7 @@ impl StorageSession {
                 }),
                 connection,
             }),
+            unmanaged_writes: UnmanagedWriteLatch::default(),
         }
     }
 
@@ -407,7 +412,14 @@ impl StorageSession {
                 resolver: Arc::new(move || resolver().boxed()),
                 resolved: Arc::new(TokioMutex::new(None)),
             },
+            unmanaged_writes: UnmanagedWriteLatch::default(),
         }
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124 follow-up (b)): the latch an unmanaged write reads
+    /// before it uploads on this session. See [`crate::unmanaged_write`].
+    pub fn unmanaged_writes(&self) -> &UnmanagedWriteLatch {
+        &self.unmanaged_writes
     }
 
     /// Whether the server-side session is established on first use rather than

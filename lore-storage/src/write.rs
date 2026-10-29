@@ -474,8 +474,22 @@ async fn remote_put_resolved_retry(
                     return Err(StorageError::from(SlowDown));
                 }
             }
-            Err(err) => return Err(crate::error::protocol_error_to_storage(err, address)),
+            Err(err) => {
+                note_unmanaged_refusal(&session, &err);
+                return Err(crate::error::protocol_error_to_storage(err, address));
+            }
         }
+    }
+}
+
+/// FORK-LOCAL (Tideshift, WP-124 follow-up (b)): an unmanaged write the server refused as an
+/// unsupported client sets the session's unmanaged-write latch, so later writes skip the upload.
+/// Only that typed refusal latches. Managed writes never touch the latch.
+fn note_unmanaged_refusal(session: &StorageSession, err: &lore_transport::ProtocolError) {
+    if lore_transport::is_unsupported_client(err)
+        && lore_transport::caller_operation::current_caller_operation().is_none()
+    {
+        session.unmanaged_writes().refuse();
     }
 }
 
@@ -513,7 +527,10 @@ async fn remote_put_retry(
                     return Err(StorageError::from(SlowDown));
                 }
             }
-            Err(err) => return Err(crate::error::protocol_error_to_storage(err, address)),
+            Err(err) => {
+                note_unmanaged_refusal(&session, &err);
+                return Err(crate::error::protocol_error_to_storage(err, address));
+            }
         }
     }
 }
@@ -1108,6 +1125,7 @@ async fn copy_association(
             if let lore_transport::ProtocolError::OutcomeUnknown(unknown) = err {
                 return Err(lore_base::error::OutcomeUnknown::clone(&unknown).into());
             }
+            note_unmanaged_refusal(session, &err);
             lore_base::lore_trace!(
                 "Copy of {} from partition {} refused ({err:?}), uploading instead",
                 address,
@@ -1184,10 +1202,20 @@ fn leader_body(
             stats.fragment_processed(&fragment);
         }
 
+        // FORK-LOCAL (Tideshift, WP-124 follow-up (b)): once the server has refused an unmanaged
+        // write on this session, a later one skips its copy and upload, so a strict server is not
+        // sent every fragment of a commit only to refuse it. A skipped write ends where a refused
+        // one does: local, not durable, pushed later. Read before each send, so a refused copy
+        // also skips the upload. Managed writes never read it.
+        let unmanaged = lore_transport::caller_operation::current_caller_operation().is_none();
+        let refused =
+            |session: &StorageSession| unmanaged && session.unmanaged_writes().is_refused();
+
         // Before the payload is prepared: succeeding means neither the load nor the compression below
         // is work this fragment has to pay for.
         if !stored_durable
             && let Some(session) = remote_session.as_ref()
+            && !refused(session)
             && let Some(source) = copy_source(&query, address)
         {
             stored_durable = copy_association(session, source, address).await?;
@@ -1258,7 +1286,10 @@ fn leader_body(
         }
 
         // Remote upload if session provided and not already durable
-        if !stored_durable && let Some(session) = remote_session.clone() {
+        if !stored_durable
+            && let Some(session) = remote_session.clone()
+            && !refused(&session)
+        {
             let result = match publish {
                 Some(key) => {
                     remote_put_resolved_retry(session, key, address, fragment, Some(buffer.share()))
