@@ -15,8 +15,9 @@
 //! `quic/mod.rs` declares this module only under `failure_generator`, and every call site sits in
 //! a `#[cfg(feature = "failure_generator")]` block. A default build has no control listener, no
 //! hook and none of these literals. A reference from unguarded code is a compile error (E0432 or
-//! E0433),
-//! never a silently inert call.
+//! E0433), never a silently inert call. The order "subscribe to the release, then claim" in
+//! `Registry::after_write` has no test: the race it closes needs a disarm between two synchronous
+//! calls, which no deterministic test can place.
 //!
 //! # Faults
 //!
