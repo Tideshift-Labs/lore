@@ -2879,6 +2879,14 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     if !is_maintenance {
         crate::domain::refuse_remote_mutable_store_writers(&settings)?;
     }
+    // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): validated before any listener starts, so a bad
+    // `LORE_QUIC_FAULT_CONTROL` stops the server cold. Spawned with the other endpoints below.
+    #[cfg(feature = "failure_generator")]
+    let quic_fault_control = if is_maintenance {
+        None
+    } else {
+        crate::quic::faults::control_address_from_env(&settings)?
+    };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
         Some(auth) => {
@@ -3434,9 +3442,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // FORK-LOCAL (Tideshift, WP-124 follow-up (d)): the QUIC fault-control listener. Test builds
     // only, loopback only, and only when `LORE_QUIC_FAULT_CONTROL` names an address.
     #[cfg(feature = "failure_generator")]
-    if !is_maintenance
-        && let Some(control) = crate::quic::faults::control_address_from_env(&settings)?
-    {
+    if let Some(control) = quic_fault_control {
         let shutdown_rx = _shutdown_rx.clone();
         lore_spawn!(
             endpoints,

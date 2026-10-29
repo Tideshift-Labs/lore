@@ -14,7 +14,8 @@
 //!
 //! `quic/mod.rs` declares this module only under `failure_generator`, and every call site sits in
 //! a `#[cfg(feature = "failure_generator")]` block. A default build has no control listener, no
-//! hook and none of these literals. A reference from unguarded code is a compile error (E0433),
+//! hook and none of these literals. A reference from unguarded code is a compile error (E0432 or
+//! E0433),
 //! never a silently inert call.
 //!
 //! # Faults
@@ -72,7 +73,7 @@ pub const CONTROL_ENV: &str = "LORE_QUIC_FAULT_CONTROL";
 /// the close as graceful.
 pub const FAULT_CLOSE_CODE: u32 = 0x51_46;
 
-/// Logged at boot by a binary that carries this module.
+/// Logged when the control listener starts.
 pub const QUIC_FAULTS_COMPILED_BANNER: &str = "WARNING: QUIC storage faults are compiled in \
      (failure_generator). LORE_QUIC_FAULT_CONTROL can withhold a managed write's answer, close its \
      connection or expire its session. This is a TEST binary and must not serve production traffic.";
@@ -132,9 +133,53 @@ pub struct Firing {
     pub store_accepted: bool,
     /// For `close-after-answer`: whether a connection handle was present and was closed.
     pub connection_closed: bool,
-    /// For `answer-loss`: whether the held answer has been released.
-    pub released: bool,
+    /// For `answer-loss`: how the hold ended. `None` while it is held, and for every other fault.
+    pub hold_end: Option<HoldEnd>,
     pub at_unix_ms: u128,
+}
+
+/// How a held `answer-loss` answer was let go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HoldEnd {
+    /// A disarm released it; the answer was then written, late.
+    Disarm,
+    /// Its connection closed first; there was no one to answer.
+    ConnectionClosed,
+    /// The command's task was dropped while holding (stream reset, server shutdown).
+    Cancelled,
+}
+
+/// Counts one held answer and records how its hold ended, on every exit, cancellation included.
+struct HoldGuard<'registry> {
+    registry: &'registry Registry,
+    arm_id: u64,
+    end: HoldEnd,
+}
+
+impl<'registry> HoldGuard<'registry> {
+    fn new(registry: &'registry Registry, arm_id: u64) -> Self {
+        registry.inner.lock().held += 1;
+        Self {
+            registry,
+            arm_id,
+            end: HoldEnd::Cancelled,
+        }
+    }
+}
+
+impl Drop for HoldGuard<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.registry.inner.lock();
+        inner.held = inner.held.saturating_sub(1);
+        if let Some(firing) = inner
+            .fired
+            .iter_mut()
+            .find(|firing| firing.arm_id == self.arm_id)
+        {
+            firing.hold_end = Some(self.end);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -226,14 +271,10 @@ impl Registry {
         Ok(armed)
     }
 
-    /// Clear an unfired arm and release every held answer. Firings stay as evidence.
+    /// Clear an unfired arm and release every held answer. Firings stay as evidence; a released
+    /// hold records [`HoldEnd::Disarm`] itself.
     pub fn disarm(&self) {
-        let mut inner = self.inner.lock();
-        inner.armed = None;
-        for firing in &mut inner.fired {
-            firing.released = true;
-        }
-        drop(inner);
+        self.inner.lock().armed = None;
         self.release.send_modify(|generation| *generation += 1);
     }
 
@@ -305,7 +346,7 @@ impl Registry {
             address: None,
             store_accepted: false,
             connection_closed: false,
-            released: false,
+            hold_end: None,
             at_unix_ms: now_ms(),
         });
         true
@@ -327,6 +368,9 @@ impl Registry {
         verb: WriteVerb,
         address: Option<&Address>,
     ) {
+        // Subscribed before the claim: a disarm landing between the claim and the wait below
+        // still moves the value this receiver has not seen, so the hold cannot miss it.
+        let mut release = self.release.subscribe();
         let claimed = self
             .claim(Fault::AnswerLoss, repository, declared, verb)
             .or_else(|| self.claim(Fault::CloseAfterAnswer, repository, declared, verb));
@@ -340,8 +384,6 @@ impl Registry {
                 b"quic fault: close-after-answer",
             );
         }
-        // Subscribed before the firing is visible, so a disarm that reads it cannot be missed.
-        let mut release = self.release.subscribe();
         self.record(Firing {
             arm_id: armed.id,
             fault: armed.fault,
@@ -352,7 +394,7 @@ impl Registry {
             address: address.map(ToString::to_string),
             store_accepted: true,
             connection_closed: close && connection.is_some(),
-            released: false,
+            hold_end: None,
             at_unix_ms: now_ms(),
         });
         if close {
@@ -361,19 +403,16 @@ impl Registry {
             }
             return;
         }
-        self.inner.lock().held += 1;
-        match connection {
-            Some(connection) => {
-                tokio::select! {
-                    _released = release.changed() => {}
-                    _closed = connection.closed() => {}
-                }
+        let mut hold = HoldGuard::new(self, armed.id);
+        hold.end = if let Some(connection) = connection {
+            tokio::select! {
+                _released = release.changed() => HoldEnd::Disarm,
+                _closed = connection.closed() => HoldEnd::ConnectionClosed,
             }
-            None => {
-                let _released = release.changed().await;
-            }
-        }
-        self.inner.lock().held -= 1;
+        } else {
+            let _released = release.changed().await;
+            HoldEnd::Disarm
+        };
     }
 }
 

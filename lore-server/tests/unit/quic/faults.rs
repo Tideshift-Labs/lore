@@ -12,18 +12,21 @@
 /// `lore-server/Dockerfile`) uses this file unchanged. A `failure_generator` mention in it would put
 /// the QUIC fault-control listener (withhold a write's answer, close a connection, expire a
 /// session) into the image a cell serves production traffic from. The Dockerfile must never name
-/// the feature, so a test image has to be built by a separate, explicit command.
+/// the feature, nor `--all-features`, which enables it without naming it, so a test image has to
+/// be built by a separate, explicit command.
 #[test]
 fn dockerfile_never_builds_the_failure_generator_feature() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Dockerfile");
     let dockerfile = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
-    assert!(
-        !dockerfile.contains("failure_generator"),
-        "{} mentions `failure_generator`: the staging build uses this file unchanged, so the QUIC \
-         fault-control listener would ship in the production cell image",
-        path.display()
-    );
+    for forbidden in ["failure_generator", "--all-features"] {
+        assert!(
+            !dockerfile.contains(forbidden),
+            "{} mentions `{forbidden}`: the staging build uses this file unchanged, so the QUIC \
+             fault-control listener would ship in the production cell image",
+            path.display()
+        );
+    }
 }
 
 #[cfg(feature = "failure_generator")]
@@ -37,6 +40,7 @@ mod compiled {
     use lore_server::quic::faults::ArmError;
     use lore_server::quic::faults::ArmRequest;
     use lore_server::quic::faults::Fault;
+    use lore_server::quic::faults::HoldEnd;
     use lore_server::quic::faults::Registry;
     use lore_server::quic::faults::WriteVerb;
     use lore_server::quic::faults::control_router;
@@ -159,7 +163,7 @@ mod compiled {
         );
         assert_eq!(firing.address, None);
         assert!(!firing.connection_closed);
-        assert!(!firing.released);
+        assert_eq!(firing.hold_end, None, "only answer-loss holds");
     }
 
     #[test]
@@ -256,7 +260,7 @@ mod compiled {
         );
         assert_eq!(firing.connection_id, Some(3));
         assert_eq!(firing.session_id, 11);
-        assert!(!firing.released);
+        assert_eq!(firing.hold_end, None, "still held");
 
         registry.disarm();
         tokio::time::timeout(Duration::from_secs(5), held.as_mut())
@@ -264,10 +268,49 @@ mod compiled {
             .expect("a disarm releases the held answer");
         let state = registry.state();
         assert_eq!(state.held, 0, "nothing is held after the release");
-        assert!(
-            state.fired[0].released,
-            "a disarm marks the firing released"
+        assert_eq!(
+            state.fired[0].hold_end,
+            Some(HoldEnd::Disarm),
+            "the released hold records the disarm"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_hold_is_counted_down_and_recorded_cancelled() {
+        let registry = Registry::default();
+        arm(&registry, Fault::AnswerLoss, None);
+        {
+            let held =
+                registry.after_write(None, None, 1, repo(REPO_HEX), true, WriteVerb::Put, None);
+            let mut held = std::pin::pin!(held);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(60), held.as_mut())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(registry.state().held, 1);
+        }
+        // The command's task was dropped mid-hold (a stream reset, a shutdown).
+        let state = registry.state();
+        assert_eq!(state.held, 0, "a cancelled hold must not stay counted");
+        assert_eq!(state.fired[0].hold_end, Some(HoldEnd::Cancelled));
+        // A later disarm does not rewrite how that hold ended.
+        registry.disarm();
+        assert_eq!(registry.state().fired[0].hold_end, Some(HoldEnd::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn disarm_does_not_mark_a_non_holding_firing() {
+        let registry = Registry::default();
+        arm(&registry, Fault::CloseAfterAnswer, None);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.after_write(None, None, 1, repo(REPO_HEX), true, WriteVerb::Put, None),
+        )
+        .await
+        .expect("close-after-answer never holds");
+        registry.disarm();
+        assert_eq!(registry.state().fired[0].hold_end, None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -281,13 +324,19 @@ mod compiled {
                 .await
                 .is_err()
         );
-        // An identical second command is answered at once.
-        registry
-            .after_write(None, None, 1, repo(REPO_HEX), true, WriteVerb::Put, None)
-            .await;
+        // An identical second command is answered at once. Bounded, so a broken one-shot fails
+        // here instead of hanging the binary.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            registry.after_write(None, None, 1, repo(REPO_HEX), true, WriteVerb::Put, None),
+        )
+        .await
+        .expect("a spent arm must not hold a second command");
         assert_eq!(registry.state().fired.len(), 1);
         registry.disarm();
-        first.await;
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("a disarm releases the first hold");
     }
 
     #[tokio::test]
@@ -300,9 +349,12 @@ mod compiled {
             (repo(REPO_HEX), true, WriteVerb::Copy),
             (repo(REPO_HEX), false, WriteVerb::Put),
         ] {
-            registry
-                .after_write(None, None, 1, repository, declared, verb, Some(&address))
-                .await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                registry.after_write(None, None, 1, repository, declared, verb, Some(&address)),
+            )
+            .await
+            .expect("a non-matching write is never held");
         }
         let state = registry.state();
         assert!(
