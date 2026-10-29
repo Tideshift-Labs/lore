@@ -131,7 +131,7 @@ struct Shared {
 pub struct Peer {
     pub port: u16,
     shared: Arc<Shared>,
-    _endpoint: quinn::Endpoint,
+    endpoint: quinn::Endpoint,
     accept: tokio::task::JoinHandle<()>,
 }
 
@@ -143,6 +143,12 @@ impl Drop for Peer {
 
 impl Peer {
     pub fn start() -> Peer {
+        Peer::start_on(0).expect("bind peer")
+    }
+
+    /// Start on a given UDP port (0 for any). Fails if the port cannot be bound, so a test can
+    /// retry while the OS releases the port of a peer that was just stopped.
+    pub fn start_on(port: u16) -> std::io::Result<Peer> {
         let cert = lore_transport::tls::generate_self_signed(vec!["localhost".to_string()])
             .expect("self-signed cert");
         let cert_der = CertificateDer::from_pem_slice(cert.cert_pem.as_bytes())
@@ -165,8 +171,8 @@ impl Peer {
             .max_concurrent_uni_streams(0_u8.into());
         config.transport_config(Arc::new(transport));
 
-        let endpoint = quinn::Endpoint::server(config, "127.0.0.1:0".parse().expect("addr"))
-            .expect("bind peer");
+        let endpoint =
+            quinn::Endpoint::server(config, format!("127.0.0.1:{port}").parse().expect("addr"))?;
         let port = endpoint.local_addr().expect("local addr").port();
         let shared = Arc::new(Shared {
             rules: Mutex::new(HashMap::new()),
@@ -198,12 +204,21 @@ impl Peer {
                 }
             })
         };
-        Peer {
+        Ok(Peer {
             port,
             shared,
-            _endpoint: endpoint,
+            endpoint,
             accept,
-        }
+        })
+    }
+
+    /// Make the peer unreachable: close every connection and the endpoint, and stop accepting.
+    /// The recorded history stays readable. A reconnecting client's handshakes now fail or time
+    /// out. Drop the `Peer` afterwards to release the port.
+    pub fn stop(&self) {
+        self.accept.abort();
+        self.endpoint
+            .close(quinn::VarInt::from_u32(8), b"scripted stop");
     }
 
     pub fn url(&self) -> String {

@@ -488,6 +488,11 @@ impl ServiceClient for ReplicationStoreClient {
             SendWithReconnectError::SessionRebindRequired => {
                 ReplicationStoreClientError::ConnectionFailed
             }
+            // FORK-LOCAL (Tideshift, WP-124): produced only inside a managed caller scope, which a
+            // server-side replication peer never runs in.
+            SendWithReconnectError::ManagedReconnectExpired => {
+                ReplicationStoreClientError::ConnectionFailed
+            }
             // Not reachable as the code stands, and mapped honestly rather than conveniently in
             // case it becomes so. The transport only produces this for a `MutableNoReplay`
             // command (a read is never classified ambiguous), and every `MutableNoReplay`

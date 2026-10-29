@@ -319,6 +319,12 @@ impl EventError for PushError {
             PushError::InvalidPath(_) | PushError::InvalidArguments(_) => {
                 LoreError::InvalidArguments
             }
+            // FORK-LOCAL (Tideshift, WP-124): a managed QUIC command that was not sent because
+            // the connection was not replaced within the managed bound. Nothing was dispatched, so
+            // it reads as a lost connection. A lost answer (`is_unjournaled_answer_lost`) may have
+            // applied and stays `Internal`. `push_with_runner` already reports it as
+            // `Disconnected` (`not_sent_reads_disconnected`); this arm covers any other path.
+            error if lore_transport::is_managed_reconnect_expired(error) => LoreError::Connection,
             _ => LoreError::Internal,
         }
     }
@@ -551,9 +557,12 @@ pub async fn push_with_runner(
         attempts.clone(),
         runner.clone(),
     )
-    .await?;
+    .await
+    .map_err(not_sent_reads_disconnected)?;
 
-    push_layers(&repository, token, &options, branch, &attempts, &runner).await?;
+    push_layers(&repository, token, &options, branch, &attempts, &runner)
+        .await
+        .map_err(not_sent_reads_disconnected)?;
     push_links(
         &repository,
         token,
@@ -564,6 +573,36 @@ pub async fn push_with_runner(
         &runner,
     )
     .await
+    .map_err(not_sent_reads_disconnected)
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): report a command that was not sent because the managed QUIC
+/// reconnect expired as `Disconnected`.
+///
+/// The marker rides inside `Internal`, whose FFI code is -1, and an embedder reads the code, not
+/// [`EventError::translated`]. `Disconnected` (code 28) is the code it already treats as offline
+/// and retryable. Only this marker is converted: a lost answer, which may have applied, keeps its
+/// own error. The original message is kept in the trace.
+///
+/// `prefer_unknown` keeps the first failure unless a later one is an unknown outcome, so an
+/// expiry that fails first can mask a sibling Put's lost answer, as a `Disconnected` sibling
+/// already can. Both are retryable push failures; an unknown outcome still wins.
+#[lore_macro::test_pub]
+fn not_sent_reads_disconnected(err: PushError) -> PushError {
+    if !lore_transport::is_managed_reconnect_expired(&err) {
+        return err;
+    }
+    let mut disconnected = PushError::from(Disconnected);
+    lore_error_set::ErrorSet::push_trace(
+        &mut disconnected,
+        lore_error_set::Location::with_context(
+            file!(),
+            line!(),
+            column!(),
+            std::sync::Arc::from(err.to_string()),
+        ),
+    );
+    disconnected
 }
 
 /// Push each layer of the repository at its current revision, to `branch`.
@@ -1814,9 +1853,15 @@ async fn duplicate_association(
 /// Whether a failed Copy leaves its payload free to upload instead: only a decisive refusal does.
 /// An unknown outcome, or the lost answer of a managed Copy that writes no journal child, may
 /// have applied, so uploading would resend it.
+///
+/// FORK-LOCAL (Tideshift, WP-124): a Copy not sent because the managed reconnect expired is safe
+/// to follow with an upload, but the upload would wait out a second bound on the same dead
+/// connection. The push fails at once instead.
 #[lore_macro::test_pub]
 fn copy_failure_allows_upload(err: &ProtocolError) -> bool {
-    !(err.is_outcome_unknown() || lore_transport::is_unjournaled_answer_lost(err))
+    !(err.is_outcome_unknown()
+        || lore_transport::is_unjournaled_answer_lost(err)
+        || lore_transport::is_managed_reconnect_expired(err))
 }
 
 /// Mark the local entry for `address` durable, looking up the fragment it needs to write back.

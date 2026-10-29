@@ -701,6 +701,14 @@ impl ServiceClient for StorageClient {
                 crate::error::SessionRebindRequired,
                 "storage command was not dispatched",
             ),
+            // FORK-LOCAL (Tideshift, WP-124): not `Disconnected` and not the rebind proof, so no
+            // reconnect layer and no session retry spends a second bound on it. Its source is
+            // `RequestNotSent`, so a journaled caller settles the attempt not applied.
+            SendWithReconnectError::ManagedReconnectExpired => {
+                crate::error::managed_reconnect_expired(storage_service::command_name(
+                    &failed_request,
+                ))
+            }
             SendWithReconnectError::OutcomeUnknown(_) => ProtocolError::from(Disconnected),
             SendWithReconnectError::ReconnectFailed => {
                 if let Some(connection) = self.connection.upgrade() {

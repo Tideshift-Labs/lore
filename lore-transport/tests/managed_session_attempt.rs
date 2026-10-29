@@ -385,6 +385,83 @@ async fn kill_the_connection(peer: &Peer) {
     .await;
 }
 
+/// WP-124: a managed command whose reconnect expires spends exactly ONE bound, even when the
+/// connection generation has moved meanwhile. The expiry is not the session-rebind proof, so
+/// `StorageSession::attempt` returns it instead of unbinding and dispatching a second time, which
+/// would spend a second bound on a server that is still unreachable.
+///
+/// The generation is moved through the `test_seams` connection seam while the reconnect loop
+/// runs, because a failed connect never swaps the connection and so never moves it. Run with
+/// `--features test_seams`.
+#[cfg(feature = "test_seams")]
+#[tokio::test]
+async fn an_expired_reconnect_spends_one_bound_and_is_not_retried_by_the_session() {
+    bound_the_managed_send();
+    let peer = Arc::new(Peer::start());
+    let connection = connect_to(&peer).await;
+    let session = connection
+        .session(partition(), "managed-reconnect-expiry")
+        .await
+        .expect("a storage session");
+    let context = CallerOperationContext::new(
+        Uuid::new_v4(),
+        RepositoryId::from([0x24u8; 16]),
+        Arc::new(VolatileAttemptStore::new()),
+    );
+    // Control: the scope's declared session is open and a write rides it.
+    let (_, first) = managed_put(&context, &session, 64).await;
+    assert!(
+        matches!(first, Ok(MutableOutcome::Applied(()))),
+        "{first:?}"
+    );
+    let puts_before = peer.seen_opcode(PUT).len();
+    let authorizes_before = peer.seen_opcode(AUTHORIZE).len();
+
+    peer.stop();
+    peer.wait_until("the connection to close", |peer| {
+        peer.closed_connections() == peer.accepted_connections()
+    })
+    .await;
+
+    let started = std::time::Instant::now();
+    let write = tokio::time::timeout(BOUND * 30, managed_put(&context, &session, 64));
+    let mover = async {
+        // Inside the reconnect loop: the loop's own deadline is a full BOUND away.
+        tokio::time::sleep(BOUND / 4).await;
+        connection
+            .advance_storage_generation_before_epoch_for_test()
+            .await
+            .expect("move the generation");
+    };
+    let (written, ()) = tokio::join!(write, mover);
+    let elapsed = started.elapsed();
+    let (_, result) = written.expect("the write never ended: the reconnect loop is unbounded");
+
+    let error = result.expect_err("an unreachable server ends the managed write");
+    assert!(
+        lore_transport::error::is_managed_reconnect_expired(&error),
+        "{error:?}"
+    );
+    assert!(
+        elapsed >= BOUND - Duration::from_millis(300),
+        "gave up early: {elapsed:?}"
+    );
+    assert!(
+        elapsed < BOUND + BOUND / 2,
+        "one bound, not two: a session retry would spend a second one: {elapsed:?}"
+    );
+    assert_eq!(
+        peer.seen_opcode(PUT).len(),
+        puts_before,
+        "no byte of the write reached the peer"
+    );
+    assert_eq!(
+        peer.seen_opcode(AUTHORIZE).len(),
+        authorizes_before,
+        "no rebind start reached the peer"
+    );
+}
+
 /// WP-124, through `SessionBinding::resolve`: the first managed write after the connection died
 /// starts exactly ONE declared session. The start's own send reconnects, so the id is bound to the
 /// replacement's generation; a binding that kept a generation sampled before the start would be

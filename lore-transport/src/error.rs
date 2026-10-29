@@ -409,6 +409,54 @@ pub(crate) fn is_request_not_sent(error: &ProtocolError) -> bool {
     false
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): typed proof that a managed QUIC command was not dispatched
+/// because the connection could not be replaced within the managed bound.
+///
+/// Built only when the command's own first send failed before dispatch. Its source is
+/// [`RequestNotSent`], so a journaled caller settles the attempt not applied. It is deliberately
+/// not [`SessionRebindRequired`]: the session layer must not spend a second bound on a retry.
+/// The connection is not given up, so a later command reconnects as usual.
+#[derive(Debug, Clone, Error)]
+#[error("storage command was not sent: the connection was not replaced within the managed bound")]
+pub(crate) struct ManagedReconnectExpired {
+    #[source]
+    pub(crate) not_sent: RequestNotSent,
+}
+
+/// The error a managed command gets when it was not sent because the reconnect did not finish
+/// within the managed bound. `command` names the storage command.
+pub(crate) fn managed_reconnect_expired(command: &str) -> ProtocolError {
+    ProtocolError::internal_with_context(
+        ManagedReconnectExpired {
+            not_sent: RequestNotSent,
+        },
+        &format!("{command}: managed reconnect expired before the command was sent"),
+    )
+}
+
+/// [`managed_reconnect_expired`] for tests in other crates, built the way the transport builds it.
+#[cfg(feature = "test-util")]
+pub fn managed_reconnect_expired_for_test(command: &str) -> ProtocolError {
+    managed_reconnect_expired(command)
+}
+
+/// Whether `error` is a managed command that was not sent because the reconnect did not finish
+/// within the managed bound. See [`ManagedReconnectExpired`]. Nothing was dispatched, so the
+/// operation may be retried.
+///
+/// Takes any error, not only a `ProtocolError`, so a layer that wraps one (a push error) can ask
+/// too: the marker rides in the source chain.
+pub fn is_managed_reconnect_expired(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<ManagedReconnectExpired>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 /// Typed mark of a managed storage write that wrote no journal child and lost its answer:
 /// fragment `Put`, `Copy` or `PutResolved` (WP-120 decision reversals, 2026-10-22 and
 /// 2026-10-23). It rides inside `ProtocolError::Internal`, so the push fails as an ordinary,

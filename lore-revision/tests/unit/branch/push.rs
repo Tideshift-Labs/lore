@@ -278,4 +278,123 @@ mod copy_fallback {
         assert!(!lost.is_outcome_unknown(), "{lost:?}");
         assert!(!copy_failure_allows_upload(&lost), "{lost:?}");
     }
+
+    /// A managed command that was not sent because the reconnect expired is not a decisive refusal
+    /// of the Copy: the connection is still down, so an upload would only spend another bound.
+    #[test]
+    fn a_managed_reconnect_expiry_forbids_the_upload_fallback() {
+        let expired = lore_transport::managed_reconnect_expired_for_test("Copy");
+        assert!(
+            lore_transport::is_managed_reconnect_expired(&expired),
+            "{expired:?}"
+        );
+        assert!(!copy_failure_allows_upload(&expired), "{expired:?}");
+    }
+}
+
+/// How the managed reconnect expiry reads once the push forwards it into its own error set.
+mod reconnect_expiry_translation {
+    use lore_transport::outcome::AttemptId;
+    use lore_transport::outcome::GrpcRpc;
+
+    use super::*;
+
+    /// Forward the way the push does: `forward` into `PushError`, then translate for the caller.
+    fn translated(error: ProtocolError) -> (PushError, LoreError) {
+        let forwarded = Err::<(), ProtocolError>(error)
+            .forward::<PushError>("pushing branch to remote")
+            .expect_err("an error was forwarded");
+        let translated = forwarded.translated();
+        (forwarded, translated)
+    }
+
+    /// The push forwards the marker either of two ways: `forward` (the read paths) or
+    /// `internal_with_context` (the Put path). Both are converted by the function the three remote
+    /// phases are mapped through.
+    #[test]
+    fn a_not_sent_expiry_reads_disconnected_whichever_way_it_was_forwarded() {
+        use lore_error_set::FfiError;
+
+        let forwarded =
+            Err::<(), ProtocolError>(lore_transport::managed_reconnect_expired_for_test("Get"))
+                .forward::<PushError>("pushing branch to remote")
+                .expect_err("an error was forwarded");
+        let wrapped = PushError::internal_with_context(
+            lore_transport::managed_reconnect_expired_for_test("Put"),
+            "putting fragment to remote",
+        );
+        for (how, error) in [("forward", forwarded), ("internal_with_context", wrapped)] {
+            assert_eq!(error.ffi_code(), -1, "{how}: starts as Internal");
+            let converted = not_sent_reads_disconnected(error);
+            assert_eq!(
+                converted.ffi_code(),
+                lore_base::error::Disconnected::FFI_CODE,
+                "{how}: {converted:?}"
+            );
+            assert_eq!(lore_base::error::Disconnected::FFI_CODE, 28);
+            assert!(converted.translated() == LoreError::Connection, "{how}");
+        }
+    }
+
+    /// A lost answer may have applied: it keeps its own error and code.
+    #[tokio::test]
+    async fn a_lost_unjournaled_answer_passes_through_not_sent_reads_disconnected() {
+        use lore_error_set::FfiError;
+
+        let attempt = AttemptId::new();
+        let lost = lore_transport::grpc::storage_client::unjournaled_result(
+            GrpcRpc::StoragePut,
+            Err(ProtocolError::from(tonic::Status::cancelled("answer lost"))),
+            &attempt,
+        )
+        .expect_err("a lost answer is an error");
+        let error = PushError::internal_with_context(lost, "putting fragment to remote");
+        let converted = not_sent_reads_disconnected(error);
+        assert_eq!(converted.ffi_code(), -1, "{converted:?}");
+        assert!(
+            converted.translated() == LoreError::Internal,
+            "{converted:?}"
+        );
+    }
+
+    /// An unknown outcome stays unknown: converting it would tell the caller nothing happened.
+    #[test]
+    fn an_unknown_outcome_passes_through_not_sent_reads_disconnected() {
+        use lore_error_set::FfiError;
+
+        let unknown = PushError::from(lore_base::error::OutcomeUnknown {
+            operation: "StorageService.Put".to_string(),
+            attempt_id: "attempt".to_string(),
+        });
+        let expected = unknown.ffi_code();
+        let converted = not_sent_reads_disconnected(unknown);
+        assert!(converted.is_outcome_unknown(), "{converted:?}");
+        assert_eq!(converted.ffi_code(), expected);
+        assert!(converted.translated() == LoreError::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_managed_reconnect_expiry_translates_to_a_connection_error() {
+        let expired = lore_transport::managed_reconnect_expired_for_test("Put");
+        let (forwarded, translated) = translated(expired);
+        assert!(translated == LoreError::Connection, "{forwarded:?}");
+    }
+
+    /// Pin: a lost answer may have applied, so it must not read as a lost connection.
+    #[tokio::test]
+    async fn a_lost_unjournaled_answer_does_not_translate_to_a_connection_error() {
+        let attempt = AttemptId::new();
+        let lost = lore_transport::grpc::storage_client::unjournaled_result(
+            GrpcRpc::StoragePut,
+            Err(ProtocolError::from(tonic::Status::cancelled("answer lost"))),
+            &attempt,
+        )
+        .expect_err("a lost answer is an error");
+        assert!(
+            lore_transport::is_unjournaled_answer_lost(&lost),
+            "{lost:?}"
+        );
+        let (forwarded, translated) = translated(lost);
+        assert!(translated == LoreError::Internal, "{forwarded:?}");
+    }
 }

@@ -758,6 +758,11 @@ pub enum SendWithReconnectError {
     /// resolve a replacement session first. See [`crate::session::StorageSession`].
     #[error("Connection replaced; session must be rebound before this command is sent again")]
     SessionRebindRequired,
+    /// FORK-LOCAL (Tideshift, WP-124): in a managed scope, the connection was not replaced within
+    /// the managed bound, and the command's first send failed before dispatch. Not retried here
+    /// or by the session layer; the connection is not given up.
+    #[error("Connection not replaced within the managed bound; the command was not sent")]
+    ManagedReconnectExpired,
     /// The request was dispatched on the connection that was then replaced, and its response
     /// was lost. The command's replay class forbids sending it again, so whether the server
     /// applied it is unknown.
@@ -1176,20 +1181,44 @@ where
     ServiceClientType: ServiceClient,
     Sink: OutcomeSink,
 {
-    if reconnect(
+    // FORK-LOCAL (Tideshift, WP-124): in a managed scope the reconnect is bounded by the managed
+    // bound, as the send phases are. Without it a dead path costs the whole backoff loop (minutes)
+    // with no error. Outside a scope the deadline is `None` and the loop is unchanged.
+    let deadline = crate::caller_operation::has_managed_caller()
+        .then(|| tokio::time::Instant::now() + service_client.quic().managed_idle());
+    match reconnect_until(
         service_client.endpoint_config(),
         service_client.alpn(),
         service_client.auth_adapter().clone(),
         service_client.transport_config(),
         service_client.quic().clone(),
         epoch,
+        deadline,
     )
     .await
-    .is_err()
     {
-        return Err(
-            service_client.map_send_error(request_type, SendWithReconnectError::ReconnectFailed)
-        );
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return Err(service_client
+                .map_send_error(request_type, SendWithReconnectError::ReconnectFailed));
+        }
+        // Only a failure before dispatch may say the command was not sent. A dispatched read
+        // whose answer was lost keeps its own error, as it would after a reconnect.
+        Err(ReconnectDeadline) => {
+            return Err(
+                if first_failure.dispatched == DispatchState::NotDispatched {
+                    service_client.map_send_error(
+                        request_type,
+                        SendWithReconnectError::ManagedReconnectExpired,
+                    )
+                } else {
+                    service_client.map_send_error(
+                        request_type,
+                        SendWithReconnectError::ClientError(first_failure.error),
+                    )
+                },
+            );
+        }
     }
 
     // The connection is now a new epoch with its own server-side session namespace. A captured
@@ -1725,19 +1754,73 @@ pub async fn reconnect<AuthErrorType>(
 where
     AuthErrorType: std::error::Error + Send + Sync,
 {
+    // Without a deadline nothing is raced, so the deadline error cannot occur.
+    reconnect_until(
+        config,
+        alpn,
+        auth_adapter,
+        transport_config,
+        connection,
+        epoch,
+        None,
+    )
+    .await
+    .unwrap_or_else(|ReconnectDeadline| Err(ReconnectError::from(Disconnected)))
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): the reconnect deadline passed before the connection was
+/// replaced.
+#[derive(Debug)]
+struct ReconnectDeadline;
+
+/// Race `future` against `deadline`, or just await it when there is none.
+///
+/// Only for awaits that are safe to drop: the guard wait, a connect attempt, and a backoff
+/// sleep. None of them has changed the shared connection yet.
+async fn before_deadline<T>(
+    deadline: Option<tokio::time::Instant>,
+    future: impl Future<Output = T>,
+) -> Result<T, ReconnectDeadline> {
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, future)
+            .await
+            .map_err(|_elapsed| ReconnectDeadline),
+        None => Ok(future.await),
+    }
+}
+
+/// [`reconnect`], giving up at `deadline` when there is one.
+///
+/// FORK-LOCAL (Tideshift, WP-124). On the deadline the connection is left as it is between two
+/// attempts: closed, with the epoch unchanged, so the next command reconnects. The epoch is not
+/// set to zero, because that would give the connection up for every caller. The section from the
+/// swap to the published epoch is never raced: dropped inside it, the streams, the stream count
+/// and the epoch would disagree.
+async fn reconnect_until<AuthErrorType>(
+    config: EndpointConfig,
+    alpn: &str,
+    auth_adapter: Arc<dyn AuthAdapter<ErrorType = AuthErrorType>>,
+    transport_config: TransportConfig,
+    connection: Arc<QuicConnection>,
+    epoch: u32,
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Result<(), ReconnectError>, ReconnectDeadline>
+where
+    AuthErrorType: std::error::Error + Send + Sync,
+{
     let remote_url = &config.remote_url;
-    let Ok(_permit) = connection.reconnect_guard.acquire().await else {
-        return Err(ReconnectError::from(Disconnected));
+    let Ok(_permit) = before_deadline(deadline, connection.reconnect_guard.acquire()).await? else {
+        return Ok(Err(ReconnectError::from(Disconnected)));
     };
 
     let epoch_current = connection.epoch.load(Ordering::Relaxed);
     if epoch_current == 0 {
         // Reconnection failed, give up
-        return Err(ReconnectError::from(Disconnected));
+        return Ok(Err(ReconnectError::from(Disconnected)));
     }
     if epoch < epoch_current {
         // Something else reconnected
-        return Ok(());
+        return Ok(Ok(()));
     }
 
     let elapsed = connection.created.elapsed().as_millis() as u64;
@@ -1768,7 +1851,7 @@ where
         lore_info!("Total reconnects to {remote_url} exhausted - not reconnecting");
         // Indicate that any pending commands entering their retry flow should give up
         connection.epoch.store(0, Ordering::Relaxed);
-        return Err(ReconnectError::from(Disconnected));
+        return Ok(Err(ReconnectError::from(Disconnected)));
     }
 
     let mut retry_count = 1;
@@ -1786,14 +1869,20 @@ where
 
         let start = Instant::now();
 
-        match connect(
-            &config,
-            auth_adapter.client_certs(),
-            alpn,
-            transport_config.clone(),
+        let attempt = before_deadline(
+            deadline,
+            connect(
+                &config,
+                auth_adapter.client_certs(),
+                alpn,
+                transport_config.clone(),
+            ),
         )
-        .await
-        {
+        .await;
+        let Ok(attempt) = attempt else {
+            return Err(give_up_at_deadline(&connection).await);
+        };
+        match attempt {
             Ok(quic_connection) => {
                 lore_debug!(
                     "QUIC reconnected to {remote_url} in {}ms",
@@ -1850,7 +1939,10 @@ where
                         | QuicClientError::SlowDown,
                     ) => {
                         lore_debug!("Reconnect authorization failed, retry");
-                        if !retry.wait().await {
+                        let Ok(more) = before_deadline(deadline, retry.wait()).await else {
+                            return Err(give_up_at_deadline(&connection).await);
+                        };
+                        if !more {
                             lore_debug!("Reconnect attempts exhausted, giving up");
                             {
                                 let connection = connection.connection.write().await;
@@ -1858,7 +1950,7 @@ where
                             }
                             // Indicate that any pending commands entering this flow should give up
                             connection.epoch.store(0, Ordering::Relaxed);
-                            return Err(ReconnectError::from(Disconnected));
+                            return Ok(Err(ReconnectError::from(Disconnected)));
                         }
                     }
                     Err(err) => {
@@ -1872,13 +1964,16 @@ where
                         connection.epoch.store(0, Ordering::Relaxed);
 
                         lore_error!("Failed to reconnect, authorization failed: {err}");
-                        return Err(ReconnectError::from(NotAuthorized));
+                        return Ok(Err(ReconnectError::from(NotAuthorized)));
                     }
                 }
             }
             Err(err) => {
                 lore_debug!("Reconnect attempt failed: {err}");
-                if !retry.wait().await {
+                let Ok(more) = before_deadline(deadline, retry.wait()).await else {
+                    return Err(give_up_at_deadline(&connection).await);
+                };
+                if !more {
                     lore_debug!("Reconnect attempts exhausted, giving up");
                     {
                         let connection = connection.connection.write().await;
@@ -1886,7 +1981,7 @@ where
                     }
                     // Indicate that any pending commands entering this flow should give up
                     connection.epoch.store(0, Ordering::Relaxed);
-                    return Err(ReconnectError::from(Disconnected));
+                    return Ok(Err(ReconnectError::from(Disconnected)));
                 }
             }
         }
@@ -1896,7 +1991,21 @@ where
 
     lore_info!("Reconnected to {}", remote_url);
 
-    Ok(())
+    Ok(Ok(()))
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): leave a reconnect at its deadline.
+///
+/// The connection in hand is closed, so the next command fails before dispatch and reconnects.
+/// It is either the lost one or a replacement whose authorization failed. The epoch is kept: a
+/// zero epoch would give the connection up for every caller, not just this one.
+async fn give_up_at_deadline(connection: &QuicConnection) -> ReconnectDeadline {
+    lore_info!("Reconnect did not finish within the managed bound, leaving it to the next command");
+    let connection = connection.connection.read().await;
+    connection
+        .connection
+        .close(0u32.into(), b"reconnect deadline");
+    ReconnectDeadline
 }
 
 /// Open an additional stream on the connection and return the index to send on.
