@@ -24,6 +24,8 @@ mod quic_fault_injection_tests {
     use lore_revision::lore::RepositoryId;
     use lore_server::quic::faults::ArmRequest;
     use lore_server::quic::faults::Fault;
+    use lore_server::quic::faults::Firing;
+    use lore_server::quic::faults::HoldEnd;
     use lore_server::quic::faults::WriteVerb;
     use lore_server::quic::faults::registry;
     use lore_transport::is_unjournaled_answer_lost;
@@ -39,6 +41,21 @@ mod quic_fault_injection_tests {
     use crate::quic_managed_write_support::managed;
     use crate::quic_managed_write_support::stored;
 
+    /// The hooks read one process-wide registry, and a disarm releases every hold in it, so the
+    /// cases that arm it run one at a time.
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The firings of partition, oldest first (the registry keeps earlier cases' firings too).
+    fn firings_of(partition: RepositoryId) -> Vec<Firing> {
+        let repository = partition.to_string();
+        registry()
+            .state()
+            .fired
+            .into_iter()
+            .filter(|firing| firing.repository == repository)
+            .collect()
+    }
+
     /// Disarms on drop, so a failed assertion never leaves the process-wide registry armed.
     struct Disarm;
 
@@ -52,6 +69,7 @@ mod quic_fault_injection_tests {
     async fn answer_loss_on_a_declared_managed_put_is_an_unjournaled_loss_with_one_store_write()
     -> TestResult {
         in_context(async {
+            let _serial = SERIAL.lock().await;
             let _disarm = Disarm;
             let cell = cell(None, None, None).await;
             let partition = random::<RepositoryId>();
@@ -99,11 +117,12 @@ mod quic_fault_injection_tests {
 
             let state = registry().state();
             assert!(state.armed.is_none(), "the claim spent the arm");
-            assert_eq!(state.fired.len(), 1);
-            assert_eq!(state.fired[0].fault, Fault::AnswerLoss);
-            assert!(state.fired[0].store_accepted);
+            let fired = firings_of(partition);
+            assert_eq!(fired.len(), 1);
+            assert_eq!(fired[0].fault, Fault::AnswerLoss);
+            assert!(fired[0].store_accepted);
             assert_eq!(
-                state.fired[0].address.as_deref(),
+                fired[0].address.as_deref(),
                 Some(address.to_string().as_str())
             );
 
@@ -113,6 +132,7 @@ mod quic_fault_injection_tests {
                 registry().state().held == 0
             })
             .await;
+            assert_eq!(firings_of(partition)[0].hold_end, Some(HoldEnd::Disarm));
 
             // The next managed Put on the same session is admitted and is not faulted.
             let (next_fragment, next_address, next_payload) = fragment::generate_random();
@@ -124,12 +144,77 @@ mod quic_fault_injection_tests {
             .await?;
             assert!(stored(&cell.stores, partition, next_address).await);
             assert_eq!(
-                registry().state().fired.len(),
+                firings_of(partition).len(),
                 1,
                 "a spent arm does not fire again"
             );
             let (_, read) = session.get(&next_address).await?;
             assert_eq!(read, next_payload);
+            Ok(())
+        })
+        .await
+    }
+
+    /// A hold ends when its connection closes, with no disarm: the client closes its QUIC
+    /// connection while the answer is held, the server's hold task ends (`held` returns to zero)
+    /// and the firing records `ConnectionClosed`. A later disarm changes nothing.
+    #[tokio::test]
+    async fn a_held_answer_ends_when_the_client_closes_its_connection_without_a_disarm()
+    -> TestResult {
+        in_context(async {
+            let _serial = SERIAL.lock().await;
+            let _disarm = Disarm;
+            let cell = cell(None, None, None).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect("lore", cell.port, partition).await?;
+            let session = connection
+                .session(partition, "fault-connection-close")
+                .await?;
+            let (fragment, address, payload) = fragment::generate_random();
+            let (scope, _journal) = managed(partition);
+
+            registry()
+                .arm(ArmRequest {
+                    fault: Fault::AnswerLoss,
+                    repository: partition.to_string(),
+                    verb: Some(WriteVerb::Put),
+                })
+                .map_err(|error| format!("arming the fault: {error:?}"))?;
+
+            let put =
+                with_caller_operation(scope.clone(), session.put(address, fragment, Some(payload)));
+            let close_when_held = async {
+                eventually("the answer to be held", || registry().state().held == 1).await;
+                // No disarm: only the client side goes away.
+                connection.close_transport().await;
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(150), async {
+                tokio::join!(put, close_when_held)
+            })
+            .await
+            .expect("closing the connection must end the Put, not hang it");
+            assert!(result.is_err(), "the answer never arrived: {result:?}");
+
+            eventually("the hold to end with its connection", || {
+                registry().state().held == 0
+            })
+            .await;
+            let fired = firings_of(partition);
+            assert_eq!(fired.len(), 1);
+            assert_eq!(fired[0].hold_end, Some(HoldEnd::ConnectionClosed));
+            assert!(fired[0].store_accepted);
+            assert!(
+                stored(&cell.stores, partition, address).await,
+                "the answer was withheld only after the real write"
+            );
+
+            // A disarm after the fact releases nothing and rewrites nothing.
+            registry().disarm();
+            assert_eq!(registry().state().held, 0);
+            assert_eq!(
+                firings_of(partition)[0].hold_end,
+                Some(HoldEnd::ConnectionClosed)
+            );
             Ok(())
         })
         .await

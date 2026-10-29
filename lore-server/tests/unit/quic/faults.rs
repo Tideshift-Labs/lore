@@ -8,10 +8,12 @@
 //! Only `dockerfile_never_builds_the_failure_generator_feature` runs in a default build. It is the
 //! guard for the module's one real risk: shipping the fault listener in an image.
 
-/// The staging cell build (`lorehub/deploy/staging/deploy-cell.ps1`, the `docker build` of
-/// `lore-server/Dockerfile`) uses this file unchanged. A `failure_generator` mention in it would put
-/// the QUIC fault-control listener (withhold a write's answer, close a connection, expire a
-/// session) into the image a cell serves production traffic from. The Dockerfile must never name
+/// The staging cell build uses this file unchanged: `lorehub/deploy/staging/deploy-cell.ps1:172`
+/// (as of 2026-10-28) runs
+/// ``docker build -f lore-server/Dockerfile -t "$repo`:$Sha" --build-arg "LORE_REVISION=$Sha" .``.
+/// A `failure_generator` mention in it would put the QUIC fault-control listener (withhold a
+/// write's answer, close a connection, expire a session) into the image a cell serves production
+/// traffic from. The Dockerfile must never name
 /// the feature, nor `--all-features`, which enables it without naming it, so a test image has to
 /// be built by a separate, explicit command.
 #[test]
