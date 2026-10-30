@@ -384,13 +384,6 @@ fn managed_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-/// FORK-LOCAL (Tideshift, WP-124): the managed bound, for a managed caller that waits on a connect
-/// it does not drive itself (a repository's background connect). Read when called, as a
-/// [`QuicConnection`] reads it when built.
-pub fn managed_wait_bound() -> Duration {
-    managed_idle_timeout()
-}
-
 impl QuicQuinnConnection {
     async fn close(&mut self) {
         let connection_id = self.connection.stable_id();
@@ -766,10 +759,12 @@ pub enum SendWithReconnectError {
     #[error("Connection replaced; session must be rebound before this command is sent again")]
     SessionRebindRequired,
     /// FORK-LOCAL (Tideshift, WP-124): in a managed scope, the connection was not replaced within
-    /// the managed bound, and the command's first send failed before dispatch. Not retried here
-    /// or by the session layer; the connection is not given up.
-    #[error("Connection not replaced within the managed bound; the command was not sent")]
-    ManagedReconnectExpired,
+    /// the managed bound. Either the command's first send failed before dispatch
+    /// (`dispatched: false`), or it is a replay-safe read whose answer was lost
+    /// (`dispatched: true`); a dispatched mutation never gets this. Not retried here or by the
+    /// session layer; the connection is not given up.
+    #[error("Connection not replaced within the managed bound")]
+    ManagedReconnectExpired { dispatched: bool },
     /// The request was dispatched on the connection that was then replaced, and its response
     /// was lost. The command's replay class forbids sending it again, so whether the server
     /// applied it is unknown.
@@ -1190,8 +1185,9 @@ where
 {
     // FORK-LOCAL (Tideshift, WP-124): in a managed scope the reconnect is bounded by the managed
     // bound, as the send phases are. Without it a dead path costs the whole backoff loop (minutes)
-    // with no error. Outside a scope the deadline is `None` and the loop is unchanged.
-    let deadline = crate::caller_operation::has_managed_caller()
+    // with no error. Outside a scope the deadline is `None` and the loop is unchanged. A managed
+    // workflow counts too: its waits before a stage, and spawned work that carried its scope.
+    let deadline = crate::caller_operation::in_managed_wait_scope()
         .then(|| tokio::time::Instant::now() + service_client.quic().managed_idle());
     match reconnect_until(
         service_client.endpoint_config(),
@@ -1209,22 +1205,21 @@ where
             return Err(service_client
                 .map_send_error(request_type, SendWithReconnectError::ReconnectFailed));
         }
-        // Only a failure before dispatch may say the command was not sent. A dispatched read
-        // whose answer was lost keeps its own error, as it would after a reconnect.
+        // Only a failure before dispatch may say the command was not sent. A dispatched
+        // replay-safe read (a session start, a Query) gets the expiry too, as a dispatched one:
+        // asking again is safe, and the caller must learn the bound fired. A dispatched mutation
+        // keeps its own error, so its lost answer is never read as not sent. That last arm is
+        // defence in depth and unpinned: `classify` ends a dispatched `MutableNoReplay` command
+        // (an unknown outcome or an answered failure) before it reaches this reconnect.
         Err(ReconnectDeadline) => {
-            return Err(
-                if first_failure.dispatched == DispatchState::NotDispatched {
-                    service_client.map_send_error(
-                        request_type,
-                        SendWithReconnectError::ManagedReconnectExpired,
-                    )
-                } else {
-                    service_client.map_send_error(
-                        request_type,
-                        SendWithReconnectError::ClientError(first_failure.error),
-                    )
-                },
-            );
+            let error = if first_failure.dispatched == DispatchState::NotDispatched {
+                SendWithReconnectError::ManagedReconnectExpired { dispatched: false }
+            } else if service_client.replay_class(request_type) == ReplayClass::ReadRetryable {
+                SendWithReconnectError::ManagedReconnectExpired { dispatched: true }
+            } else {
+                SendWithReconnectError::ClientError(first_failure.error)
+            };
+            return Err(service_client.map_send_error(request_type, error));
         }
     }
 

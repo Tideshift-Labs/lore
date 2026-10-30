@@ -1740,13 +1740,18 @@ pub(crate) async fn push_query(
             let mut batch = remain.split_off(remain.len().saturating_sub(max_batch_size));
 
             let storage = storage.clone();
-            lore_spawn!(tasks, async move {
-                batch.sort_unstable();
-                batch.dedup();
+            // FORK-LOCAL (Tideshift, WP-124): a batch that reconnects keeps the managed deadline of
+            // the push that spawned it.
+            lore_spawn!(
+                tasks,
+                lore_transport::carry_managed_wait_scope(async move {
+                    batch.sort_unstable();
+                    batch.dedup();
 
-                let result = storage.query(batch.as_slice()).await;
-                (batch, result)
-            });
+                    let result = storage.query(batch.as_slice()).await;
+                    (batch, result)
+                })
+            );
 
             while failure.is_none()
                 && tasks.len() > MAX_TASK_COUNT

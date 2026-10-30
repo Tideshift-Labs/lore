@@ -490,7 +490,7 @@ impl ServiceClient for ReplicationStoreClient {
             }
             // FORK-LOCAL (Tideshift, WP-124): produced only inside a managed caller scope, which a
             // server-side replication peer never runs in.
-            SendWithReconnectError::ManagedReconnectExpired => {
+            SendWithReconnectError::ManagedReconnectExpired { .. } => {
                 ReplicationStoreClientError::ConnectionFailed
             }
             // Not reachable as the code stands, and mapped honestly rather than conveniently in

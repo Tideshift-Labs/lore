@@ -1232,20 +1232,7 @@ impl RepositoryContext {
 
         // Slow path: await the shared future. All concurrent callers awaken together
         // when it resolves.
-        //
-        // FORK-LOCAL (Tideshift, WP-124): the connect runs in its own task (see `connect`), outside
-        // a managed caller's scope, so its QUIC reconnect has no managed deadline. A managed caller
-        // stops waiting at the managed bound instead. Dropping the wait is safe: the future is
-        // shared, so the connect goes on for other waiters and the state stays pending.
-        let result = if lore_transport::has_managed_caller() {
-            let bound = lore_transport::quic::client::managed_wait_bound();
-            match Box::pin(tokio::time::timeout(bound, fut)).await {
-                Ok(result) => result,
-                Err(_elapsed) => return Err(lore_transport::managed_connect_expired()),
-            }
-        } else {
-            fut.await
-        };
+        let result = fut.await;
 
         // Opportunistically promote to the terminal state so future calls skip the
         // shared future entirely. Racing writers are harmless — the matches! guard
@@ -2039,15 +2026,27 @@ fn connect(
     let identity = identity.as_deref().unwrap_or_default().to_string();
 
     let correlation_id = globals.correlation_id.to_string();
-    let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
-        let connection =
-            protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
-        // Pre-warm the session pool so it's ready when the command runs
-        if !repository.is_zero() {
-            let _ = connection.session_pool(repository, &correlation_id).await;
-        }
-        Ok(connection)
-    });
+    // FORK-LOCAL (Tideshift, WP-124): the connect keeps the managed deadline of the command that
+    // opened the repository, so the pre-warm's QUIC reconnect is bounded per command, as the
+    // command's own would be. Unmanaged commands are unchanged.
+    let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> =
+        lore_spawn!(lore_transport::carry_managed_wait_scope(async move {
+            let connection =
+                protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
+            // Pre-warm the session pool so it's ready when the command runs
+            if !repository.is_zero()
+                && let Err(error) = connection.session_pool(repository, &correlation_id).await
+                && lore_transport::is_managed_reconnect_expired(&error)
+            {
+                // FORK-LOCAL (Tideshift, WP-124): the QUIC path could not be replaced within the
+                // managed bound. A command that stores bytes would only reconnect and wait the
+                // bound again, so the command gets the expiry now (ffi 28, offline and retryable).
+                // Accepted cost: a managed command that needs only gRPC (a lock verb) also fails
+                // as offline here, where ignoring the pre-warm would have let it finish.
+                return Err(error);
+            }
+            Ok(connection)
+        }));
 
     // Wrap the JoinHandle in a Shared future so many awaiters can poll one spawned task.
     Ok(async move {

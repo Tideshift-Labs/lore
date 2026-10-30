@@ -5,6 +5,7 @@ mod chunking;
 mod client;
 mod managed_reconnect_bound;
 mod managed_send_bound;
+mod managed_wait_scope;
 mod net_runtime;
 mod response_reader;
 mod scripted_storage_peer;

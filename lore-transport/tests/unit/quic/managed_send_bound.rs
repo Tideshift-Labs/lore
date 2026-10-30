@@ -1421,3 +1421,183 @@ async fn a_healing_verify_on_a_stale_session_after_a_reconnect_gets_the_rebind_p
     assert_eq!(verifies[0].connection, 1, "on the replacement connection");
     assert_eq!(store.intents.lock().len(), 2);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The managed reconnect deadline and the journal settlement of a healing Verify
+// ---------------------------------------------------------------------------------------------
+
+/// Close every connection and the endpoint, and wait until the client's connection is gone.
+async fn heal_make_unreachable(peer: &Peer) {
+    peer.stop();
+    peer.wait_until("the connection to close", |peer| {
+        peer.closed_connections() == peer.accepted_connections()
+    })
+    .await;
+}
+
+/// A healing `Verify` is the only journaled QUIC command. When its first send fails BEFORE
+/// dispatch and the managed reconnect then hits the deadline, the transport raises the not-sent
+/// marker (`RequestNotSent`), and `caller_operation::dispatch_recorded_result` settles the attempt
+/// `NotApplied` and hands the caller `Disconnected` carrying the marker's text in its trace (the
+/// caller may resend under a fresh attempt). `is_request_not_sent` is crate-private, so the proof
+/// that the marker was the cause is the settlement itself plus the trace text.
+#[tokio::test]
+async fn a_heal_not_dispatched_when_the_reconnect_deadline_hits_settles_not_applied() {
+    let peer = Peer::start();
+    let client = authenticated_client(&peer).await;
+    let session = declared_session(&peer, &client).await;
+    client.quic().set_managed_idle_for_test(BOUND);
+    heal_make_unreachable(&peer).await;
+    let store = Arc::new(ManagedJournal::default());
+    let scope = scope_over(&store);
+    let (address, _, _) = put_args(0);
+
+    let started = Instant::now();
+    let error = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        with_caller_operation(
+            scope.clone(),
+            client.verify_outcome(session, &address, true),
+        ),
+    )
+    .await
+    .expect("the managed heal never ended: the reconnect loop is unbounded")
+    .expect_err("an unreachable server ends the heal");
+
+    assert!(started.elapsed() < BOUND + Duration::from_secs(8));
+    assert!(
+        error.is_disconnected(),
+        "the caller is told Disconnected: {error:?}"
+    );
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(
+        format!("{error:?}").contains("was not sent"),
+        "the trace carries the not-sent marker's text: {error:?}"
+    );
+    let attempt = scope
+        .latest_attempt()
+        .expect("the heal was journaled first");
+    let record = store
+        .lookup(&attempt)
+        .await
+        .expect("lookup")
+        .expect("a journal row");
+    assert_eq!(
+        record.state,
+        AttemptState::Resolved(AttemptResolution::NotApplied),
+        "a heal that never left is settled not applied"
+    );
+    assert!(store.unresolved().await.expect("unresolved").is_empty());
+    assert!(peer.seen_opcode(Command::Verify as u8).is_empty());
+}
+
+/// The same heal, but DISPATCHED: the peer read it and the connection then died, so the answer is
+/// lost and the reconnect hits the deadline. A write that may have applied is not "not sent": it is
+/// never the managed expiry, it settles nothing, and it stays outcome unknown and unresolved.
+#[tokio::test]
+async fn a_heal_dispatched_when_the_reconnect_deadline_hits_stays_unknown_and_unresolved() {
+    let peer = Peer::start();
+    let client = authenticated_client(&peer).await;
+    let session = declared_session(&peer, &client).await;
+    client.quic().set_managed_idle_for_test(BOUND);
+    peer.rule(Command::Verify as u8, Reply::Silent);
+    let store = Arc::new(ManagedJournal::default());
+    let scope = scope_over(&store);
+    let (address, _, _) = put_args(0);
+
+    let started = Instant::now();
+    let heal = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        with_caller_operation(
+            scope.clone(),
+            client.verify_outcome(session, &address, true),
+        ),
+    );
+    let kill = async {
+        peer.wait_until("the heal to be read", |peer| {
+            !peer.seen_opcode(Command::Verify as u8).is_empty()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        heal_make_unreachable(&peer).await;
+    };
+    let (result, ()) = tokio::join!(heal, kill);
+    let error = result
+        .expect("the managed heal never ended: the reconnect loop is unbounded")
+        .expect_err("a lost heal is an error in a scope");
+
+    assert!(started.elapsed() < BOUND + Duration::from_secs(8));
+    assert!(
+        !lore_transport::is_managed_reconnect_expired(&error),
+        "a dispatched write must not read as the managed expiry: {error:?}"
+    );
+    assert!(error.is_outcome_unknown(), "{error:?}");
+    let attempt = scope
+        .latest_attempt()
+        .expect("the heal was journaled first");
+    let record = store
+        .lookup(&attempt)
+        .await
+        .expect("lookup")
+        .expect("a journal row");
+    assert!(
+        !matches!(
+            record.state,
+            AttemptState::Resolved(AttemptResolution::NotApplied)
+        ),
+        "a dispatched heal must not settle not applied: {:?}",
+        record.state
+    );
+    assert_eq!(store.unresolved().await.expect("unresolved").len(), 1);
+    assert_eq!(
+        peer.seen_opcode(Command::Verify as u8).len(),
+        1,
+        "never resent"
+    );
+}
+
+/// The READ expiry (a dispatched `ReadRetryable` command that hit the deadline) is a marker for
+/// the bound, but it is not the not-sent proof: its text names a read that was sent, and the
+/// not-sent text is absent. Nothing journals a read, so it can never settle an attempt
+/// `NotApplied`; `is_request_not_sent` itself is crate-private, so the distinction is pinned by
+/// the two messages, which the transport builds from the two distinct marker structs.
+#[tokio::test]
+async fn the_read_expiry_is_the_bound_marker_but_carries_no_not_sent_proof() {
+    let peer = Peer::start();
+    let client = connect(&peer).await;
+    let session = declared_session(&peer, &client).await;
+    client.quic().set_managed_idle_for_test(BOUND);
+    peer.rule(Command::Get as u8, Reply::Silent);
+    let (address, _, _) = put_args(0);
+    let operation = CallerOperationContext::new(
+        Uuid::new_v4(),
+        RepositoryId::from([0x24u8; 16]),
+        Arc::new(VolatileAttemptStore::new()),
+    );
+
+    let read = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        with_caller_operation(operation, client.get(session, &address)),
+    );
+    let kill = async {
+        peer.wait_until("the read to be read", |peer| {
+            !peer.seen_opcode(Command::Get as u8).is_empty()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        heal_make_unreachable(&peer).await;
+    };
+    let (result, ()) = tokio::join!(read, kill);
+    let error = result
+        .expect("the managed read never ended")
+        .expect_err("a lost read ends in an error");
+
+    assert!(
+        lore_transport::is_managed_reconnect_expired(&error),
+        "{error:?}"
+    );
+    let text = format!("{error} | {error:?}");
+    assert!(text.contains("after the read was sent"), "{text}");
+    assert!(!text.contains("before the command was sent"), "{text}");
+    assert!(!text.contains("command was not sent"), "{text}");
+}

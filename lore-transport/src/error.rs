@@ -434,11 +434,20 @@ pub(crate) fn managed_reconnect_expired(command: &str) -> ProtocolError {
     )
 }
 
-/// FORK-LOCAL (Tideshift, WP-124): the error a managed caller gets when the repository's background
-/// connect did not finish within the managed bound. That connect runs in its own task, outside the
-/// caller's scope, so its reconnect has no deadline of its own; nothing of the caller was sent.
-pub fn managed_connect_expired() -> ProtocolError {
-    managed_reconnect_expired("connect")
+/// FORK-LOCAL (Tideshift, WP-124): the managed bound fired while a replay-safe read (a session
+/// start, a Query) waited for a reconnect after its answer was lost. The read may have reached the
+/// server, so this is no proof of non-dispatch and carries no [`RequestNotSent`]; asking again is
+/// safe by its replay class. A dispatched mutation never gets this.
+#[derive(Debug, Clone, Error)]
+#[error("storage read lost its answer: the connection was not replaced within the managed bound")]
+pub(crate) struct ManagedReconnectExpiredRead;
+
+/// The error a dispatched replay-safe read gets when the managed bound fired during its reconnect.
+pub(crate) fn managed_reconnect_expired_read(command: &str) -> ProtocolError {
+    ProtocolError::internal_with_context(
+        ManagedReconnectExpiredRead,
+        &format!("{command}: managed reconnect expired after the read was sent"),
+    )
 }
 
 /// [`managed_reconnect_expired`] for tests in other crates, built the way the transport builds it.
@@ -447,16 +456,21 @@ pub fn managed_reconnect_expired_for_test(command: &str) -> ProtocolError {
     managed_reconnect_expired(command)
 }
 
-/// Whether `error` is a managed command that was not sent because the reconnect did not finish
-/// within the managed bound. See [`ManagedReconnectExpired`]. Nothing was dispatched, so the
-/// operation may be retried.
+/// Whether the managed bound fired on `error`'s reconnect: a managed command that was not sent
+/// ([`ManagedReconnectExpired`]), or a replay-safe read whose answer was lost
+/// ([`ManagedReconnectExpiredRead`]). Either way the operation may be retried. A dispatched
+/// mutation is never either.
 ///
 /// Takes any error, not only a `ProtocolError`, so a layer that wraps one (a push error) can ask
 /// too: the marker rides in the source chain.
 pub fn is_managed_reconnect_expired(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
-        if source.downcast_ref::<ManagedReconnectExpired>().is_some() {
+        if source.downcast_ref::<ManagedReconnectExpired>().is_some()
+            || source
+                .downcast_ref::<ManagedReconnectExpiredRead>()
+                .is_some()
+        {
             return true;
         }
         current = source.source();

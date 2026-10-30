@@ -354,6 +354,46 @@ pub fn has_managed_caller() -> bool {
     current_caller_operation().is_some() || MANAGED_CALLER.try_with(|_| ()).is_ok()
 }
 
+tokio::task_local! {
+    /// FORK-LOCAL (Tideshift, WP-124): set for the whole of a managed workflow (a managed push),
+    /// including the waits before its first stage opens a caller operation.
+    static MANAGED_WORKFLOW: ();
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): run `future` as a managed workflow. Not a managed caller:
+/// [`has_managed_caller`] is unchanged, so a stage may still open its own caller operation inside.
+pub fn with_managed_workflow<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    MANAGED_WORKFLOW.scope((), future)
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): whether this task runs inside [`with_managed_workflow`].
+pub fn in_managed_workflow() -> bool {
+    MANAGED_WORKFLOW.try_with(|_| ()).is_ok()
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): whether a wait here is bounded by the managed bound: a managed
+/// caller, or a managed workflow before or between its stages.
+pub fn in_managed_wait_scope() -> bool {
+    has_managed_caller() || in_managed_workflow()
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): carry the managed wait scope into a task about to be spawned.
+///
+/// Task-locals do not cross a spawn, so a reconnect inside spawned work (a session start, a Query
+/// batch) would otherwise run with no managed deadline. Decided here, in the spawning task; inside
+/// the spawned task only the workflow marker is entered, never a caller operation, so
+/// [`has_managed_caller`] there is unchanged.
+pub fn carry_managed_wait_scope<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let managed = in_managed_wait_scope();
+    async move {
+        if managed {
+            MANAGED_WORKFLOW.scope((), future).await
+        } else {
+            future.await
+        }
+    }
+}
+
 pub fn with_caller_operation<F: Future>(
     context: CallerOperationContext,
     future: F,

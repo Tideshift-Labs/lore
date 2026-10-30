@@ -278,41 +278,59 @@ async fn after_an_expiry_the_next_command_reconnects_when_the_server_is_back() {
     );
 }
 
-/// Only a command whose first send failed BEFORE dispatch may say "not sent". A read that reached
-/// the wire, was never answered, and then lost its connection keeps its own error: reporting
-/// "not sent" for it would be a false proof of non-dispatch.
+/// Run `command` managed against a peer that reads it and never answers, kill the peer once the
+/// request was read, and return what the caller got and how long it took.
+async fn lost_after_read<T>(
+    peer: &Peer,
+    opcode: u8,
+    command: impl std::future::Future<Output = Result<T, ProtocolError>>,
+) -> (Result<T, ProtocolError>, Duration) {
+    let started = Instant::now();
+    let run = async {
+        tokio::time::timeout(
+            BOUND + Duration::from_secs(40),
+            with_caller_operation(managed_context(), command),
+        )
+        .await
+        .expect("the managed command never ended: the reconnect loop is unbounded")
+    };
+    let kill = async {
+        peer.wait_until("the request to be read", |peer| {
+            !peer.seen_opcode(opcode).is_empty()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        make_unreachable(peer).await;
+    };
+    let (result, ()) = tokio::join!(run, kill);
+    (result, started.elapsed())
+}
+
+/// A replay-safe read (`ReadRetryable`) that reached the wire, was never answered, and then lost
+/// its connection gets the managed expiry at the bound: asking again is safe, and the caller must
+/// learn the bound fired. It is NOT the not-sent proof (the read may have reached the server), and
+/// it is never resent.
 #[tokio::test]
-async fn a_dispatched_read_whose_connection_dies_keeps_its_own_error_at_the_bound() {
+async fn a_dispatched_read_whose_connection_dies_gets_the_read_expiry_at_the_bound() {
     let peer = Peer::start();
     let (client, session) = client_with_session(&peer).await;
     peer.rule(Command::Get as u8, Reply::Silent);
 
     let address = put_args().0;
-    let started = Instant::now();
-    let read = async {
-        tokio::time::timeout(
-            BOUND + Duration::from_secs(40),
-            with_caller_operation(managed_context(), client.get(session, &address)),
-        )
-        .await
-        .expect("the managed read never ended: the reconnect loop is unbounded")
-    };
-    let kill = async {
-        peer.wait_until("the Get to be read", |peer| {
-            !peer.seen_opcode(Command::Get as u8).is_empty()
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        make_unreachable(&peer).await;
-    };
-    let (result, ()) = tokio::join!(read, kill);
-    let elapsed = started.elapsed();
+    let (result, elapsed) =
+        lost_after_read(&peer, Command::Get as u8, client.get(session, &address)).await;
 
     let error = result.expect_err("a lost read ends in an error");
     assert!(
-        !is_managed_reconnect_expired(&error),
-        "a dispatched read must keep its first error, not claim it was not sent: {error:?}"
+        is_managed_reconnect_expired(&error),
+        "a dispatched read that hit the deadline reports the expiry: {error:?}"
     );
+    let text = format!("{error} | {error:?}");
+    assert!(
+        text.contains("after the read was sent") && !text.contains("before the command was sent"),
+        "it must not claim the read was not sent: {text}"
+    );
+    assert!(!error.is_outcome_unknown(), "{error:?}");
     assert!(
         elapsed < BOUND + LATE_MARGIN,
         "the reconnect still ends at the bound: {elapsed:?}"
@@ -325,6 +343,49 @@ async fn a_dispatched_read_whose_connection_dies_keeps_its_own_error_at_the_boun
     assert_ne!(client.quic().epoch.load(Ordering::Relaxed), 0);
 }
 
+/// A managed Put whose answer is lost because the peer read it and then died is a lost answer,
+/// never the managed expiry. This pins the 2b answer-bound outcome as seen from the reconnect
+/// tests: the Put is `is_unjournaled_answer_lost`, is sent once, and is not
+/// `is_managed_reconnect_expired`. It does NOT reach the reconnect deadline: the lost answer is
+/// classified before any reconnect starts (a mutation that gave dispatched mutations the expiry
+/// at the deadline is not caught here, and no harness reaches that arm).
+#[tokio::test]
+async fn a_managed_put_lost_to_a_dying_connection_is_a_lost_answer_not_the_managed_expiry() {
+    let peer = Peer::start();
+    let (client, session) = client_with_session(&peer).await;
+    peer.rule(PUT, Reply::Silent);
+
+    let (address, fragment, payload) = put_args();
+    let (result, elapsed) = lost_after_read(
+        &peer,
+        PUT,
+        client.put_outcome(session, address, fragment, Some(payload)),
+    )
+    .await;
+
+    match result {
+        Err(error) => {
+            assert!(
+                !is_managed_reconnect_expired(&error),
+                "a dispatched write must keep its own error, not the managed expiry: {error:?}"
+            );
+            assert!(
+                is_unjournaled_answer_lost(&error),
+                "a managed write's lost answer is the unjournaled loss: {error:?}"
+            );
+        }
+        Ok(MutableOutcome::Unknown(unknown)) => {
+            panic!("a managed write handed back an unknown outcome as Ok: {unknown:?}")
+        }
+        Ok(MutableOutcome::Applied(())) => panic!("a silent peer cannot have answered"),
+    }
+    assert!(
+        elapsed < BOUND + LATE_MARGIN,
+        "the reconnect still ends at the bound: {elapsed:?}"
+    );
+    assert_eq!(peer.seen_opcode(PUT).len(), 1, "the Put was never resent");
+    assert_ne!(client.quic().epoch.load(Ordering::Relaxed), 0);
+}
 /// Control: outside a managed scope the old loop still runs. The same command is still pending
 /// well past twice the bound, so the bound is the managed scope's, not a global change.
 #[tokio::test]

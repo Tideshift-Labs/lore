@@ -27,6 +27,13 @@ name = "lores_tls"
 path = "tests/quic_lores_tls_test.rs"
 required-features = ["integration_tests"]
 
+# Its own target because it needs a short `LORE_QUIC_MANAGED_IDLE_TIMEOUT` from a constructor, and
+# that variable is process-wide. See the file header.
+[[test]]
+name = "quic_managed_push_hang"
+path = "tests/quic_managed_push_hang_test.rs"
+required-features = ["integration_tests"]
+
 [[test]]
 name = "store_gc_trigger"
 path = "tests/store_gc_trigger_test.rs"

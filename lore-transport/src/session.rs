@@ -1188,16 +1188,22 @@ impl StorageConnector {
         for storage in self.connections.iter().cloned() {
             let correlation_id = correlation_id.to_string();
             let started = started.clone();
-            lore_spawn_net!(tasks, async move {
-                // FORK-LOCAL (Tideshift, WP-124): the generation the start reports, never a sample
-                // taken before it. A start that reconnects would otherwise bind the id to the dead
-                // connection, so the first use rebinds and the first session is never stopped.
-                let (session_id, generation) = storage
-                    .session_start_bound(partition, &correlation_id)
-                    .await?;
-                started.lock().push((storage, session_id, generation));
-                Ok::<_, ProtocolError>(())
-            });
+            // FORK-LOCAL (Tideshift, WP-124): a start that reconnects keeps the managed deadline of
+            // the caller that spawned it.
+            lore_spawn_net!(
+                tasks,
+                crate::caller_operation::carry_managed_wait_scope(async move {
+                    // FORK-LOCAL (Tideshift, WP-124): the generation the start reports, never a
+                    // sample taken before it. A start that reconnects would otherwise bind the id
+                    // to the dead connection, so the first use rebinds and the first session is
+                    // never stopped.
+                    let (session_id, generation) = storage
+                        .session_start_bound(partition, &correlation_id)
+                        .await?;
+                    started.lock().push((storage, session_id, generation));
+                    Ok::<_, ProtocolError>(())
+                })
+            );
         }
         let drained = lore_drain_tasks!(
             tasks,

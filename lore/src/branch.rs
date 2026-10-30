@@ -1010,15 +1010,19 @@ async fn push_managed_local(
         guard.clone(),
         observer,
     ));
+    // FORK-LOCAL (Tideshift, WP-124): the whole workflow is managed, so its waits before the first
+    // stage (the remote connect) are bounded too. Stages still open their own caller operation.
     guard
-        .run(repository_call_write(
-            globals,
-            callback,
-            args,
-            push,
-            move |repository, token, args| async move {
-                push_impl_with_runner(repository, &token, args, None, Some(runner)).await
-            },
+        .run(lore_transport::with_managed_workflow(
+            repository_call_write(
+                globals,
+                callback,
+                args,
+                push,
+                move |repository, token, args| async move {
+                    push_impl_with_runner(repository, &token, args, None, Some(runner)).await
+                },
+            ),
         ))
         .await
 }
