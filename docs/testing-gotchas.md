@@ -310,20 +310,16 @@ it's derived from another column rather than a fixed literal.
   `LOCAL_BLAKE3_PROVIDER_UNAVAILABLE`. From R31 (migration 0031) it signs nothing and needs no
   provider; only R25-R30 fixture cells (`install_cell_schema_at`) still do.
 - **`drain_cleanup_claim_v2` (0029; `_v1` before it) refuses `DRAIN_CLEANUP_TOO_EARLY` until the
-  reservation's own expiry passes.** A fixture driving reserve→claim→release back-to-back (to
-  simulate load quickly, not a realistic multi-minute TTL) must give the policy/descriptor a short
-  `maximum_ttl_ms` and then sleep past it before claiming — and that window must absorb a *cold* runtime pool's first
-  connect-and-physical-attest round trip (seconds, not milliseconds) if the very first reservation in
-  a test uses an unwarmed `DispatchRuntimePool`. Warm the pool once (any cheap call) before the timed
-  loop starts, then the per-iteration window only needs to cover normal round-trip time.
+  reservation's own expiry passes.** A back-to-back reserve→claim→release fixture needs a short
+  `maximum_ttl_ms` on the policy/descriptor and a sleep past it before claiming. The first window
+  must also absorb a cold `DispatchRuntimePool`'s connect-and-attest round trip (seconds): warm the
+  pool with any cheap call before the timed loop.
 - **Whitespace inside a plpgsql `$$...$$` body is part of `prosrc`, verbatim.** A test that restores
-  a function to its "original" definition (to undo a planted catalog drift, or to restore a
-  temporarily mutated function for a discrimination proof) must reproduce the exact source text,
-  comments included — `pg_get_functiondef` reconstructs a plpgsql body from the stored `prosrc`
-  unchanged, so any difference in indentation or a dropped comment line still reads as `CatalogDrift`
-  on the `functions` manifest section, even though the logic is identical. Prefer `include_str!` on
-  the real migration file plus a plain substring extraction over hand-retyping the body, and diff the
-  extracted text against what you intend to keep unmutated before relying on it.
+  a function to its original definition (undoing a planted catalog drift, or a mutation for a
+  discrimination proof) must reproduce the exact source text, comments included: any indentation
+  or comment difference still reads as `CatalogDrift` on the `functions` manifest section. Prefer
+  `include_str!` on the real migration file plus a substring extraction over retyping the body, and
+  diff the extracted text before relying on it.
 - **A shared fixture row (one `drain_policies` row per boundary/cell reused across several test
   cases) needs `ON CONFLICT DO NOTHING` on re-seed, and a matching top-up on any row a prior case's
   release decremented** (`object_dispatch_quota_usage`, keyed by `(provider_boundary_id, scope_kind,
