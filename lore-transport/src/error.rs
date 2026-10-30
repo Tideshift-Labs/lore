@@ -434,6 +434,13 @@ pub(crate) fn managed_reconnect_expired(command: &str) -> ProtocolError {
     )
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): the error a managed caller gets when the repository's background
+/// connect did not finish within the managed bound. That connect runs in its own task, outside the
+/// caller's scope, so its reconnect has no deadline of its own; nothing of the caller was sent.
+pub fn managed_connect_expired() -> ProtocolError {
+    managed_reconnect_expired("connect")
+}
+
 /// [`managed_reconnect_expired`] for tests in other crates, built the way the transport builds it.
 #[cfg(feature = "test-util")]
 pub fn managed_reconnect_expired_for_test(command: &str) -> ProtocolError {

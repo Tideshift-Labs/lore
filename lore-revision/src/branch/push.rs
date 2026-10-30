@@ -587,8 +587,9 @@ pub async fn push_with_runner(
 /// `prefer_unknown` keeps the first failure unless a later one is an unknown outcome, so an
 /// expiry that fails first can mask a sibling Put's lost answer, as a `Disconnected` sibling
 /// already can. Both are retryable push failures; an unknown outcome still wins.
-#[lore_macro::test_pub]
-fn not_sent_reads_disconnected(err: PushError) -> PushError {
+///
+/// Public for `lore`'s push entry, which awaits the remote before it calls [`push_with_runner`].
+pub fn not_sent_reads_disconnected(err: PushError) -> PushError {
     if !lore_transport::is_managed_reconnect_expired(&err) {
         return err;
     }

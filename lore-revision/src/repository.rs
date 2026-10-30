@@ -1232,7 +1232,20 @@ impl RepositoryContext {
 
         // Slow path: await the shared future. All concurrent callers awaken together
         // when it resolves.
-        let result = fut.await;
+        //
+        // FORK-LOCAL (Tideshift, WP-124): the connect runs in its own task (see `connect`), outside
+        // a managed caller's scope, so its QUIC reconnect has no managed deadline. A managed caller
+        // stops waiting at the managed bound instead. Dropping the wait is safe: the future is
+        // shared, so the connect goes on for other waiters and the state stays pending.
+        let result = if lore_transport::has_managed_caller() {
+            let bound = lore_transport::quic::client::managed_wait_bound();
+            match Box::pin(tokio::time::timeout(bound, fut)).await {
+                Ok(result) => result,
+                Err(_elapsed) => return Err(lore_transport::managed_connect_expired()),
+            }
+        } else {
+            fut.await
+        };
 
         // Opportunistically promote to the terminal state so future calls skip the
         // shared future entirely. Racing writers are harmless — the matches! guard

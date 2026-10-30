@@ -384,6 +384,13 @@ fn managed_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// FORK-LOCAL (Tideshift, WP-124): the managed bound, for a managed caller that waits on a connect
+/// it does not drive itself (a repository's background connect). Read when called, as a
+/// [`QuicConnection`] reads it when built.
+pub fn managed_wait_bound() -> Duration {
+    managed_idle_timeout()
+}
+
 impl QuicQuinnConnection {
     async fn close(&mut self) {
         let connection_id = self.connection.stable_id();

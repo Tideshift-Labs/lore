@@ -1064,10 +1064,13 @@ async fn push_impl_with_runner(
     attempts: Option<Arc<dyn AttemptStore>>,
     runner: Option<Arc<lore_revision::managed_push::ManagedPushRunner>>,
 ) -> Result<(), branch::push::PushError> {
+    // FORK-LOCAL (Tideshift, WP-124): a managed caller's wait for the remote ends at the managed
+    // bound with a not-sent marker; report it as `Disconnected`, as the push itself does.
     repository
         .remote()
         .await
-        .forward::<branch::push::PushError>("acquiring remote")?;
+        .forward::<branch::push::PushError>("acquiring remote")
+        .map_err(branch::push::not_sent_reads_disconnected)?;
 
     let options = PushOptions {
         branch: args.branch.into(),
