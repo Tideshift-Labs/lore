@@ -1094,6 +1094,26 @@ where
         ));
     }
 
+    // FORK-LOCAL (Tideshift, WP-124): the managed bound fired on a replay-safe read's own send
+    // (see [`send_bounded`]). That is the bound the caller was promised, so it ends here as a
+    // managed expiry, never as a reconnect that would start a second bound. A mutation never
+    // reaches this: a dispatched one returned above, and one not sent keeps its own error.
+    if service_client.replay_class(request_type) == ReplayClass::ReadRetryable
+        && matches!(
+            failure.error,
+            QuicClientError::WriterLockTimeout
+                | QuicClientError::WriteTimeout
+                | QuicClientError::AnswerTimeout
+        )
+    {
+        return Verdict::Failed(service_client.map_send_error(
+            request_type,
+            SendWithReconnectError::ManagedReconnectExpired {
+                dispatched: failure.dispatched != DispatchState::NotDispatched,
+            },
+        ));
+    }
+
     match failure.error {
         // Answers from the server that reconnecting cannot change. Bubble them up.
         QuicClientError::SlowDown
@@ -2256,7 +2276,8 @@ where
 /// progress in each of its three phases (see [`send_bounded`]).
 ///
 /// FORK-LOCAL (Tideshift, WP-124). Only a managed `Put`, `Copy`, `PutResolved` or healing
-/// `Verify` uses this. Every other command keeps the unbounded send.
+/// `Verify` uses this. Every other command is bounded the same way only inside a managed wait
+/// scope (see [`send_command_tracked`]), and keeps the unbounded send outside one.
 pub async fn send_managed_with_reconnect_outcome<ServiceClientType, const LEN: usize>(
     service_client: &ServiceClientType,
     request_type: ServiceClientType::RequestType,
@@ -2336,7 +2357,8 @@ pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>
 /// observe it rather than inferred from an error kind further up.
 ///
 /// `MANAGED` sends the command through [`send_bounded`] once it is framed. It implies
-/// `AWAIT_RESPONSE`: a bounded send is bounded up to its answer.
+/// `AWAIT_RESPONSE`: a bounded send is bounded up to its answer. An `AWAIT_RESPONSE` command sent
+/// inside a managed wait scope takes the same bounded send.
 ///
 /// `sink` is told the generation the command is framed on ([`OutcomeSink::framed_on`]). Zero
 /// bytes for [`IgnoreOutcome`], which every read passes.
@@ -2467,7 +2489,15 @@ async fn send_command_tracked<
         // FORK-LOCAL (Tideshift, WP-124): a managed write leaves here for the bounded send. Boxed,
         // and inside this block, so the read path's future carries only the box's variant and none
         // of the bounded send's timers.
-        if MANAGED {
+        //
+        // A command that waits for its answer inside a managed wait scope (a session start, a
+        // Query, a Get under a managed push) leaves too. Without it a read sent on a live
+        // connection whose path then goes black waits for quinn's idle timeout, then reconnects
+        // under a fresh managed bound, and the push pays two bounds plus the idle timeout.
+        // `classify` turns the bound's expiry on a read into a terminal managed expiry, never a
+        // reconnect. A runtime check rather than a const generic: the read path's instantiations
+        // carry only the box, and an unmanaged caller takes the unchanged path below.
+        if MANAGED || (AWAIT_RESPONSE && crate::caller_operation::in_managed_wait_scope()) {
             return Box::pin(send_bounded(&connection, &writer, chunks, rx)).await;
         }
         (writer.send.clone(), rx, inflight)
@@ -2563,6 +2593,13 @@ const MANAGED_STALL_CLOSE_CODE: u32 = 1;
 ///
 /// A command that times out before dispatch stays registered with the reader until the stream
 /// ends; no answer can come for it, so the entry only costs its slot.
+///
+/// A read inside a managed wait scope takes this send too (see [`send_command_tracked`]), and is
+/// bounded the same way: idle per connection, not per stream. Bytes received on any stream of the
+/// connection count as progress for its answer, and the connection is shared process-wide per url
+/// and identity, so sibling traffic extends a stalled read, as it does a stalled write. Per-stream
+/// progress stamps are a WP-124 follow-up, wanted only if a server that hangs one stream on a
+/// healthy connection is ever seen.
 async fn send_bounded(
     connection: &QuicConnection,
     writer: &StreamWriter,

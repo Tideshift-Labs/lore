@@ -34,6 +34,12 @@ name = "quic_managed_push_hang"
 path = "tests/quic_managed_push_hang_test.rs"
 required-features = ["integration_tests"]
 
+# Its own target for the same reason as `quic_managed_push_hang` (process-wide managed bound).
+[[test]]
+name = "quic_managed_read_bound"
+path = "tests/quic_managed_read_bound_test.rs"
+required-features = ["integration_tests"]
+
 [[test]]
 name = "store_gc_trigger"
 path = "tests/store_gc_trigger_test.rs"

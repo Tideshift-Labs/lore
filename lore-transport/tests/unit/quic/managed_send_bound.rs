@@ -1601,3 +1601,78 @@ async fn the_read_expiry_is_the_bound_marker_but_carries_no_not_sent_proof() {
     assert!(!text.contains("before the command was sent"), "{text}");
     assert!(!text.contains("command was not sent"), "{text}");
 }
+
+/// A read sent inside a managed wait scope (here a workflow marker with no managed caller, as a
+/// spawned push step runs) takes the bounded send. Against a peer that reads the Get and never
+/// answers, it ends at about one bound with the read expiry: no reconnect, one dispatch.
+#[tokio::test]
+async fn a_managed_get_whose_answer_never_comes_ends_at_one_bound_without_a_reconnect() {
+    let peer = Peer::start();
+    let client = connect(&peer).await;
+    let session = declared_session(&peer, &client).await;
+    client.quic().set_managed_idle_for_test(BOUND);
+    peer.rule(Command::Get as u8, Reply::Silent);
+    let (address, _, _) = put_args(0);
+    let generation = client.quic().connection_generation();
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        BOUND * 10,
+        lore_transport::with_managed_workflow(client.get(session, &address)),
+    )
+    .await
+    .expect("the managed Get outlasted ten times the idle bound: the send is unbounded");
+    let elapsed = started.elapsed();
+
+    let error = result
+        .map(|_| ())
+        .expect_err("a silent peer ends a managed Get");
+    assert!(
+        lore_transport::is_managed_reconnect_expired(&error),
+        "{error:?}"
+    );
+    let text = format!("{error} | {error:?}");
+    assert!(text.contains("after the read was sent"), "{text}");
+    assert!(!text.contains("command was not sent"), "{text}");
+    assert!(
+        elapsed >= BOUND - Duration::from_millis(100),
+        "fired early: {elapsed:?}"
+    );
+    assert!(elapsed < BOUND * 2, "more than one bound: {elapsed:?}");
+    settle().await;
+    assert_eq!(
+        client.quic().connection_generation(),
+        generation,
+        "the connection was replaced"
+    );
+    assert_eq!(peer.accepted_connections(), 1, "no reconnect");
+    assert_eq!(peer.closed_connections(), 0);
+    assert_eq!(
+        peer.seen_opcode(Command::Get as u8).len(),
+        1,
+        "exactly one dispatch of the Get"
+    );
+}
+
+/// Control for the case above: the same silent peer and the same Get, outside any managed scope,
+/// keeps waiting. The bound is for a managed wait only.
+#[tokio::test]
+async fn an_unmanaged_get_whose_answer_never_comes_is_still_pending_after_four_bounds() {
+    let peer = Peer::start();
+    let client = connect(&peer).await;
+    let session = declared_session(&peer, &client).await;
+    client.quic().set_managed_idle_for_test(BOUND);
+    peer.rule(Command::Get as u8, Reply::Silent);
+    let (address, _, _) = put_args(0);
+
+    let waiting = tokio::time::timeout(BOUND * 4, client.get(session, &address)).await;
+    assert!(
+        waiting.is_err(),
+        "an unmanaged Get must keep waiting past four bounds"
+    );
+    assert_eq!(
+        peer.seen_opcode(Command::Get as u8).len(),
+        1,
+        "the Get was dispatched and is still waiting"
+    );
+}

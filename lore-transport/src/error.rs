@@ -410,9 +410,10 @@ pub(crate) fn is_request_not_sent(error: &ProtocolError) -> bool {
 }
 
 /// FORK-LOCAL (Tideshift, WP-124): typed proof that a managed QUIC command was not dispatched
-/// because the connection could not be replaced within the managed bound.
+/// because the connection could not be replaced within the managed bound, or, for a replay-safe
+/// read, because its stream took none of its bytes within that bound.
 ///
-/// Built only when the command's own first send failed before dispatch. Its source is
+/// Built only when the command's own send failed before dispatch. Its source is
 /// [`RequestNotSent`], so a journaled caller settles the attempt not applied. It is deliberately
 /// not [`SessionRebindRequired`]: the session layer must not spend a second bound on a retry.
 /// The connection is not given up, so a later command reconnects as usual.
@@ -434,19 +435,21 @@ pub(crate) fn managed_reconnect_expired(command: &str) -> ProtocolError {
     )
 }
 
-/// FORK-LOCAL (Tideshift, WP-124): the managed bound fired while a replay-safe read (a session
-/// start, a Query) waited for a reconnect after its answer was lost. The read may have reached the
-/// server, so this is no proof of non-dispatch and carries no [`RequestNotSent`]; asking again is
-/// safe by its replay class. A dispatched mutation never gets this.
+/// FORK-LOCAL (Tideshift, WP-124): the managed bound fired on a dispatched replay-safe read (a
+/// session start, a Query): its answer did not come within the bound, or the reconnect after a
+/// lost answer did not finish within it. The read may have reached the server, so this is no proof
+/// of non-dispatch and carries no [`RequestNotSent`]; asking again is safe by its replay class. A
+/// dispatched mutation never gets this.
 #[derive(Debug, Clone, Error)]
-#[error("storage read lost its answer: the connection was not replaced within the managed bound")]
+#[error("storage read lost its answer within the managed bound")]
 pub(crate) struct ManagedReconnectExpiredRead;
 
-/// The error a dispatched replay-safe read gets when the managed bound fired during its reconnect.
+/// The error a dispatched replay-safe read gets when the managed bound fired on its answer wait or
+/// its reconnect.
 pub(crate) fn managed_reconnect_expired_read(command: &str) -> ProtocolError {
     ProtocolError::internal_with_context(
         ManagedReconnectExpiredRead,
-        &format!("{command}: managed reconnect expired after the read was sent"),
+        &format!("{command}: managed bound expired after the read was sent"),
     )
 }
 
