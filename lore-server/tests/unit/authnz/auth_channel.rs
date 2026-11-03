@@ -22,8 +22,8 @@ use lore_base::types::Context as LoreContext;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_server::auth::jwt::AuthorizationToken;
-use lore_server::authnz::auth::AUTH_CALL_TIMEOUT;
 use lore_server::authnz::auth::AUTH_CONNECT_TIMEOUT;
+use lore_server::authnz::auth::AUTH_DEADLINE;
 use lore_server::authnz::auth::AuthChannel;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -611,7 +611,7 @@ async fn an_abandoned_failed_dial_leaves_no_stale_failure() {
 }
 
 /// On an established connection, a service that never answers an RPC fails
-/// that call within the call timeout, as `Internal`, and the next call
+/// that call within the request deadline, as `Internal`, and the next call
 /// redials.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_rpc_the_service_never_answers_times_out_and_the_next_call_redials() {
@@ -621,14 +621,17 @@ async fn an_rpc_the_service_never_answers_times_out_and_the_next_call_redials() 
 
     server.set_mode(HANG);
     let started = Instant::now();
-    let status = tokio::time::timeout(AUTH_CALL_TIMEOUT * 3, check(&authorizer))
+    let status = tokio::time::timeout(AUTH_DEADLINE * 3, check(&authorizer))
         .await
         .expect("an unanswered RPC was not bounded")
         .unwrap_err();
     let elapsed = started.elapsed();
-    assert!(elapsed >= AUTH_CALL_TIMEOUT, "{elapsed:?}");
     assert!(
-        elapsed < AUTH_CALL_TIMEOUT + Duration::from_secs(3),
+        elapsed >= AUTH_DEADLINE - Duration::from_millis(200),
+        "{elapsed:?}"
+    );
+    assert!(
+        elapsed < AUTH_DEADLINE + Duration::from_secs(2),
         "{elapsed:?}"
     );
     assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
@@ -636,6 +639,12 @@ async fn an_rpc_the_service_never_answers_times_out_and_the_next_call_redials() 
         status
             .message()
             .starts_with("Failed to call auth check_user_permission:"),
+        "{status:?}"
+    );
+    assert!(
+        status
+            .message()
+            .contains("did not answer check_user_permission within"),
         "{status:?}"
     );
 
@@ -646,4 +655,98 @@ async fn an_rpc_the_service_never_answers_times_out_and_the_next_call_redials() 
         2,
         "the timed-out channel should be replaced"
     );
+}
+
+/// A TCP relay that holds each new connection for `delay` before it starts
+/// forwarding to `upstream`. Over plain h2c the client's dial finishes without
+/// a server reply, so the delay lands on the first call, not on the dial (the
+/// TLS test in `auth_channel_tls.rs` covers a delay inside the dial).
+fn start_delayed_relay(
+    upstream: SocketAddr,
+    delay: Duration,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = socket.listen(128).unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = lore_base::lore_spawn!(async move {
+        while let Ok((mut down, _)) = listener.accept().await {
+            lore_base::lore_spawn!(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut up) = tokio::net::TcpStream::connect(upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut down, &mut up).await;
+                }
+            });
+        }
+    });
+    (format!("http://{address}"), task)
+}
+
+/// A delayed first connection followed by a call the service never answers
+/// fails at about the deadline. Over h2c the delay lands on the call, not the
+/// dial (see `start_delayed_relay`), so this does not prove the dial and the
+/// call share one deadline; the TLS test in `auth_channel_tls.rs` does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_connection_then_a_hanging_call_fails_within_the_deadline() {
+    let server = FakeServer::start();
+    server.set_mode(HANG);
+    let dial_delay = Duration::from_secs(3);
+    let (url, relay) = start_delayed_relay(server.address, dial_delay);
+    let authorizer = AuthClientAuthorizer::new(url);
+
+    let started = Instant::now();
+    let status = tokio::time::timeout(AUTH_DEADLINE * 3, check(&authorizer))
+        .await
+        .expect("a delayed connection plus an unanswered RPC was not bounded")
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    relay.abort();
+    assert!(
+        elapsed >= AUTH_DEADLINE - Duration::from_millis(200),
+        "{elapsed:?}"
+    );
+    assert!(
+        elapsed < AUTH_DEADLINE + Duration::from_secs(2),
+        "dial delay plus a fresh deadline: {elapsed:?}"
+    );
+    assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+    assert!(
+        status
+            .message()
+            .contains(&format!("within {AUTH_DEADLINE:?}")),
+        "{status:?}"
+    );
+    eprintln!("delayed connection + hanging call failed after {elapsed:?}");
+}
+
+/// A delayed first connection that still leaves budget for the call is not a
+/// failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delayed_connection_within_the_deadline_still_succeeds() {
+    let server = FakeServer::start();
+    let (url, relay) = start_delayed_relay(server.address, Duration::from_secs(3));
+    let authorizer = AuthClientAuthorizer::new(url);
+
+    let started = Instant::now();
+    check(&authorizer)
+        .await
+        .expect("a delayed but in-budget connection failed the check");
+    let elapsed = started.elapsed();
+    relay.abort();
+    assert!(elapsed < AUTH_DEADLINE, "{elapsed:?}");
+    assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+}
+
+/// The deadline must stay under the desktop's 15 s online-op budget
+/// (lorehub-desktop/crates/lore-engine/src/deadline.rs:29) with room to spare,
+/// so the server answers with an auth error before the client gives up with
+/// an offline-shaped one. It must also exceed the dial ceiling so a call that
+/// has to re-dial can still finish.
+#[test]
+fn the_auth_deadline_fits_under_the_desktop_budget_and_over_the_dial_ceiling() {
+    assert!(
+        AUTH_DEADLINE <= Duration::from_secs(10),
+        "{AUTH_DEADLINE:?}"
+    );
+    assert!(AUTH_DEADLINE > AUTH_CONNECT_TIMEOUT, "{AUTH_DEADLINE:?}");
 }

@@ -43,17 +43,19 @@ type LoreAuthApiResult<T> = Result<Response<T>, Status>;
 /// DNS, TCP connect, TLS handshake and HTTP/2 handshake together. Every
 /// caller sharing a dial waits at most about this long for it. Also set as
 /// the endpoint's TCP connect timeout, which bounds the TCP step of tonic's
-/// own re-dials. Matches the internal gRPC client's default; no per-call
-/// deadline exists on this path to stay under.
+/// own re-dials. Matches the internal gRPC client's default.
 pub const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// FORK-LOCAL (Tideshift): ceiling on one auth RPC on the shared channel,
-/// including any re-dial tonic makes under it. Nothing else bounds a call:
+/// FORK-LOCAL (Tideshift): ceiling on one whole auth request, from
+/// [`AuthChannel::client`] to the RPC's answer: any wait on a dial, then the
+/// RPC with any re-dial tonic makes under it. Nothing else bounds a call:
 /// HTTP/2 PINGs need a finished handshake, and neither the authorizer nor the
-/// gRPC server sets a deadline. A call that hits it fails as a connection
-/// failure, so the channel is discarded and the next call takes the dial
-/// path, bounded by [`AUTH_CONNECT_TIMEOUT`]. Longer than that, so a call
-/// that has to re-dial can still finish.
-pub const AUTH_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// gRPC server sets a deadline. Well under a client's own operation budget
+/// (the desktop gives an online op 15 s), so a slow auth service fails the
+/// request as an auth error before the client gives up on the operation. A
+/// call that hits it fails as a connection failure, so the channel is
+/// discarded and the next call takes the dial path. Longer than
+/// [`AUTH_CONNECT_TIMEOUT`], so a call that has to re-dial can still finish.
+pub const AUTH_DEADLINE: Duration = Duration::from_secs(8);
 /// FORK-LOCAL (Tideshift): TCP keep-alive on the shared auth connection, so a
 /// peer that vanished without closing is found while the connection idles.
 /// Matches the internal gRPC client's default.
@@ -231,19 +233,29 @@ impl AuthChannel {
 
     /// A client on the shared channel, dialling first when there is none.
     /// A failed dial is returned as the per-call path always returned it.
+    /// Starts the request's [`AUTH_DEADLINE`]: the wait on a dial and the
+    /// returned client's one call share it.
     pub async fn client(&self) -> Result<AuthClient<'_>, Status> {
+        let deadline = tokio::time::Instant::now() + AUTH_DEADLINE;
         let (attempt, dial) = {
             let mut slot = lock(&self.slot);
             match &slot.state {
                 ChannelState::Ready(channel) => {
                     let channel = channel.clone();
-                    return Ok(self.client_on(channel, Some(slot.generation)));
+                    return Ok(self.client_on(channel, Some(slot.generation), deadline));
                 }
                 ChannelState::Dialing { attempt, dial } => (*attempt, dial.clone()),
                 ChannelState::Empty => self.start_dial(&mut slot),
             }
         };
-        let result = dial.await;
+        // Giving up on the wait leaves the dial running and named: its own
+        // task records its outcome, and later callers still share it.
+        let Ok(result) = tokio::time::timeout_at(deadline, dial).await else {
+            debug!("lore auth connect did not finish within {AUTH_DEADLINE:?}");
+            return Err(Status::internal(format!(
+                "lore auth service did not connect within {AUTH_DEADLINE:?}"
+            )));
+        };
         let mut slot = lock(&self.slot);
         match result {
             Ok(channel) => {
@@ -252,11 +264,11 @@ impl AuthChannel {
                 // generation, rather than tagging an old channel with it.
                 if let ChannelState::Ready(current) = &slot.state {
                     let current = current.clone();
-                    return Ok(self.client_on(current, Some(slot.generation)));
+                    return Ok(self.client_on(current, Some(slot.generation), deadline));
                 }
                 // Already discarded, no replacement yet: a channel that may
                 // discard nothing.
-                Ok(self.client_on(channel, None))
+                Ok(self.client_on(channel, None, deadline))
             }
             Err(status) => {
                 // Only a task that never finished leaves its attempt named.
@@ -268,10 +280,16 @@ impl AuthChannel {
         }
     }
 
-    fn client_on(&self, channel: Channel, generation: Option<u64>) -> AuthClient<'_> {
+    fn client_on(
+        &self,
+        channel: Channel,
+        generation: Option<u64>,
+        deadline: tokio::time::Instant,
+    ) -> AuthClient<'_> {
         AuthClient {
             owner: self,
             generation,
+            deadline,
             helper: LoreAuthClientHelper::new(channel),
         }
     }
@@ -284,27 +302,34 @@ impl AuthChannel {
     }
 }
 
-/// Runs `call` under [`AUTH_CALL_TIMEOUT`]. A timeout becomes
-/// `Unavailable`, which [`is_connection_failure`] matches, so the caller's
-/// error mapping still turns it into a denial or `Internal`, never an allow.
-async fn within_call_timeout<T>(
+/// Runs `call` until `deadline`, the end of the request's [`AUTH_DEADLINE`].
+/// A timeout becomes `Unavailable`, which [`is_connection_failure`] matches,
+/// so the caller's error mapping still turns it into a denial or `Internal`,
+/// never an allow.
+async fn within_deadline<T>(
     rpc: &str,
+    deadline: tokio::time::Instant,
     call: impl Future<Output = LoreAuthApiResult<T>>,
 ) -> LoreAuthApiResult<T> {
-    tokio::time::timeout(AUTH_CALL_TIMEOUT, call)
+    tokio::time::timeout_at(deadline, call)
         .await
         .unwrap_or_else(|_elapsed| {
-            debug!("lore auth {rpc} timed out after {AUTH_CALL_TIMEOUT:?}");
-            Err(Status::unavailable(format!("lore auth {rpc} timed out")))
+            debug!("lore auth {rpc} did not answer within {AUTH_DEADLINE:?}");
+            Err(Status::unavailable(format!(
+                "lore auth service did not answer {rpc} within {AUTH_DEADLINE:?}"
+            )))
         })
 }
 
-/// One caller's handle on an [`AuthChannel`]'s connection.
+/// One caller's handle on an [`AuthChannel`]'s connection, for one call: the
+/// call gets only what remains of the deadline [`AuthChannel::client`] started.
 pub struct AuthClient<'a> {
     owner: &'a AuthChannel,
     /// The installed channel this client uses; `None` when it is not the
     /// installed one, so its failures discard nothing.
     generation: Option<u64>,
+    /// End of the request's [`AUTH_DEADLINE`], set by [`AuthChannel::client`].
+    deadline: tokio::time::Instant,
     helper: LoreAuthClientHelper,
 }
 
@@ -324,8 +349,9 @@ impl AuthClient<'_> {
         &mut self,
         request: Request<CheckUserPermissionRequest>,
     ) -> LoreAuthApiResult<CheckUserPermissionResponse> {
-        let result = within_call_timeout(
+        let result = within_deadline(
             "check_user_permission",
+            self.deadline,
             self.helper.check_user_permission(request),
         )
         .await;
@@ -336,8 +362,9 @@ impl AuthClient<'_> {
         &mut self,
         request: Request<LookupUserPermissionsRequest>,
     ) -> LoreAuthApiResult<LookupUserPermissionsResponse> {
-        let result = within_call_timeout(
+        let result = within_deadline(
             "lookup_user_permissions",
+            self.deadline,
             self.helper.lookup_user_permissions(request),
         )
         .await;
