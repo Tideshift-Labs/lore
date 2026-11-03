@@ -2063,8 +2063,8 @@ where
 
         // CR-034's bound: exactly one refresh and one retry per call, in a local counter rather
         // than shared state or a config key. A second refresh within one attempt could only help
-        // if the head moved twice during one charge, which the successor-fence rule below refuses
-        // anyway, and a configurable bound invites a value that loops.
+        // if the head moved again during the retry, and a configurable bound invites a value that
+        // loops.
         let mut refreshes_remaining: u32 = 1;
         let mut refreshed_to: Option<BudgetPin> = None;
         let grant = loop {
@@ -2112,15 +2112,16 @@ where
                             ));
                         }
                     };
-                    // Successor-only, the exact predicate publish enforces. A head at N+2 or
-                    // higher is a generation whose accounting this writer never saw, and a fence
-                    // that did not move forward is not a renewal at all. Both stay a typed
-                    // decisive refusal and still need the restart cutover.
+                    // Any strictly newer fence renews. Publish is gapless and carries every
+                    // bucket forward under the charge lock, so a head at N+k already holds all
+                    // the debits made at N+1..N+k-1, and the charge still exact-matches the head
+                    // fence and revision. A fence that did not move forward is not a renewal at
+                    // all, and stays a typed decisive refusal. Comparing rather than adding keeps
+                    // the check free of overflow.
                     // A renewal also keeps the provenance class. A local pin never refreshes
                     // into a documented-provider one, or back: the class was checked against
                     // this cell's endpoint at boot, and a head of the other class was published
                     // for some other endpoint.
-                    let successor = charge_request.budget_pin().fence.checked_add(1);
                     let same_class = matches!(
                         (
                             classify_budget_pin(charge_request.budget_pin()),
@@ -2134,7 +2135,7 @@ where
                             Ok(BudgetPinProvenance::DocumentedProvider { .. })
                         )
                     );
-                    if Some(refreshed.fence) != successor
+                    if refreshed.fence <= charge_request.budget_pin().fence
                         || refreshed.revision == charge_request.budget_pin().revision
                         || !same_class
                     {
@@ -2169,7 +2170,7 @@ where
         // Validate against this attempt's exact pin before publishing its successful refresh.
         // A charge reply can arrive after a peer already proved a later renewal. Never let that
         // delayed reply rewind the shared cache, or overwrite its revision at the same fence.
-        // This does not relax the per-attempt successor-only check above.
+        // This does not relax the per-attempt newer-fence check above.
         if let Some(pin) = refreshed_to {
             let mut guard = self
                 .refreshed_pin

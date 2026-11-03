@@ -239,12 +239,13 @@ async fn live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the
 }
 
 // ---------------------------------------------------------------------------------------------
-// Case 12: two generations of drift (N+1 and N+2 both published) refuses, decisively, no debit.
+// Case 12: two generations of drift (N+1 and N+2 both published) renews to N+2 and debits only N+2.
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
 #[ignore = "requires a fresh disposable PostgreSQL 16 database"]
-async fn live_postgres_two_generations_of_drift_refuses_the_attempt_and_debits_nothing() {
+async fn live_postgres_two_generations_of_drift_renews_to_the_head_and_debits_only_the_newest_fence()
+ {
     let url = env::var(ENV_URL).expect("runner must set LORE_TEST_BUDGET_PIN_REFRESH_PG_URL");
     let admin = connect(&url).await;
     install(&admin).await;
@@ -299,20 +300,18 @@ async fn live_postgres_two_generations_of_drift_refuses_the_attempt_and_debits_n
     let outcome = client.execute(&mut ledger, &metered, &()).await;
 
     assert_eq!(
-        outcome,
-        Err(ProviderClientError::ChargeRefused(
-            ProviderChargeError::BudgetPinRejected
-        )),
-        "N+2 drift is more than one generation and must stay a typed decisive refusal"
+        outcome.map(|execution| execution.outcome),
+        Ok(ProviderAttemptOutcome::Decisive),
+        "a head more than one generation ahead is a renewal: any strictly newer fence renews"
     );
     assert_eq!(
         refresh_calls.load(Ordering::SeqCst),
         1,
-        "the head is read once, then refused as a non-successor fence"
+        "exactly one head read"
     );
-    assert_eq!(transport_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(ledger.committed_grant_count(), 0);
-    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(transport_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger.committed_grant_count(), 1);
+    assert_eq!(ledger.attempt_count(), 1);
     assert_eq!(ledger.poisoned(), None);
 
     let logical_request_id =
@@ -320,20 +319,31 @@ async fn live_postgres_two_generations_of_drift_refuses_the_attempt_and_debits_n
     let attempt_id = Uuid::parse_str(&request.attempt_id).expect("fixture attempt_id is a uuid");
     assert_eq!(
         grant_count_for(&admin, logical_request_id, attempt_id).await,
-        0,
-        "no grant row anywhere for this attempt"
+        1,
+        "exactly one grant row for this (attempt_id, attempt_ordinal)"
     );
+
+    // Only the N+2 fence's shared bucket is debited; N and N+1 are untouched.
     assert_eq!(
         bucket_available_at(&admin, REVISION, FENCE, 1).await,
-        before_old
+        before_old,
+        "the original fence's bucket must not be debited"
     );
     assert_eq!(
         bucket_available_at(&admin, "Budget.Rev_2", FENCE + 1, 1).await,
-        before_first_successor
+        before_first_successor,
+        "the skipped N+1 fence's bucket must not be debited"
     );
-    assert_eq!(
-        bucket_available_at(&admin, "Budget.Rev_3", FENCE + 2, 1).await,
-        before_second_successor
+    let after_second_successor = bucket_available_at(&admin, "Budget.Rev_3", FENCE + 2, 1).await;
+    let before_units: i128 = before_second_successor
+        .parse()
+        .expect("scaled balance is numeric");
+    let after_units: i128 = after_second_successor
+        .parse()
+        .expect("scaled balance is numeric");
+    assert!(
+        after_units < before_units,
+        "the N+2 fence's bucket must be debited by the granted attempt: before {before_units}, after {after_units}"
     );
 }
 

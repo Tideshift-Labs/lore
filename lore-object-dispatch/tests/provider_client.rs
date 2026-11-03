@@ -2518,8 +2518,8 @@ async fn execute_hands_the_transport_the_exact_authorized_permit() {
 //
 // CR-034: a `BudgetPinRejected` refusal triggers exactly one `refresh_budget_pin` call and one
 // retry of the same attempt (same attempt_id/attempt_ordinal), accepted only when the refreshed
-// pin is the exact successor fence. Exhaustion is always a typed, decisive
-// `ChargeRefused(BudgetPinRejected)` -- never `OutcomeUnknown`. See
+// pin has a strictly newer fence, a changed revision and the same provenance class. Exhaustion is
+// always a typed, decisive `ChargeRefused(BudgetPinRejected)` -- never `OutcomeUnknown`. See
 // `lorehub/docs/lore-change-requests/cr-034-runtime-budget-pin-re-read.md`.
 
 /// A `ProviderChargeAuthority` test double that scripts `charge` and `refresh_budget_pin`
@@ -2640,8 +2640,8 @@ where
 /// A real publish always mints a fresh revision token (a revision string cannot be reused after an
 /// intervening configuration -- see `provider_charge_live.rs`'s
 /// `live_postgres_successor_fence_and_stage3_publication_matrix`), so a genuine renewal changes
-/// both the fence AND the revision. `execute`'s successor check refuses an unchanged revision even
-/// when the fence is the exact successor, on the same belt-and-braces principle.
+/// both the fence AND the revision. `execute`'s renewal check refuses an unchanged revision even
+/// when the fence is newer, on a belt-and-braces principle.
 fn refreshed_pin() -> BudgetPin {
     let base = budget_pin();
     BudgetPin {
@@ -2713,7 +2713,7 @@ async fn refresh_then_retry_succeeds_the_grant_echoes_the_refreshed_pin_and_is_a
 /// an intervening configuration), so a "refresh" that lands on the exact successor fence but the
 /// SAME revision string is not a real renewal -- it is what a partial or hand-rolled renewal path
 /// would produce if it bumped a fence counter without publishing a new configuration. `execute`
-/// refuses this on the same belt-and-braces principle as a non-successor fence. Pinned explicitly,
+/// refuses this on a belt-and-braces principle, as it does a fence that is not newer. Pinned explicitly,
 /// not only exercised incidentally through `refreshed_pin()`'s fixture (an earlier version of that
 /// fixture made exactly this mistake and was refused by the real implementation, which is what
 /// surfaced this as a case worth naming on its own).
@@ -2767,68 +2767,210 @@ async fn refresh_to_the_exact_successor_fence_but_an_unchanged_revision_is_still
     assert_eq!(pins[0], budget_pin());
 }
 
-/// Case 2: a refresh that lands on a non-successor fence (here, +2) is refused outright, with no
-/// retry -- and the rejected pin must never become sticky for a later, distinct attempt on the
-/// same client.
+/// Case 2: a refresh that lands on a later, non-adjacent fence (here, +2) renews. Publish is
+/// gapless and carries every bucket forward, so a head at N+2 already holds the N+1 debits. The
+/// retry is charged once more under the N+2 pin, and the shared cache moves to N+2: the client's
+/// next `execute` opens directly with N+2 and issues no further refresh.
 #[tokio::test]
-async fn refresh_to_a_non_successor_fence_refuses_without_a_retry_and_never_becomes_sticky() {
-    let non_successor = {
+async fn refresh_to_a_later_non_adjacent_fence_renews_charges_once_more_and_moves_the_cache() {
+    let later = {
         let base = budget_pin();
-        // A distinct revision isolates this test to the fence check alone: it must fail for a
-        // non-successor fence specifically, not merely because the revision also matched.
+        // A distinct revision isolates this test to the fence rule: only the fence is under test.
         BudgetPin {
-            revision: format!("{}-successor", base.revision),
+            revision: format!("{}-later", base.revision),
             fence: base.fence + 2,
         }
     };
-    let non_successor_for_script = non_successor.clone();
+    let later_for_script = later.clone();
     let (charge_authority, charge_calls, refresh_calls, observed_pins) =
         RefreshScriptedChargeAuthority::new(
-            |_call, _request| Err(ProviderChargeError::BudgetPinRejected),
-            move |_boundary| Ok(non_successor_for_script.clone()),
+            |call, request| {
+                if call == 1 {
+                    Err(ProviderChargeError::BudgetPinRejected)
+                } else {
+                    Ok(binding_grant(request))
+                }
+            },
+            move |_boundary| Ok(later_for_script.clone()),
         );
-    let (transport, transport_calls) =
-        ScriptedTransport::new(|_attempt| unreachable!("an exhausted refresh must not send"));
+    let (transport, transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
     let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
     let first = base_request(ProviderAttemptClass::Readiness);
     let mut second = base_request(ProviderAttemptClass::Readiness);
     second.attempt_id = other_attempt_id();
     let mut ledger = new_ledger();
 
-    let outcome = client.execute(&mut ledger, &first).await;
     assert_eq!(
-        outcome,
-        Err(ProviderClientError::ChargeRefused(
-            ProviderChargeError::BudgetPinRejected
-        ))
+        client.execute(&mut ledger, &first).await,
+        Ok(ProviderAttemptOutcome::Decisive)
     );
-    assert_eq!(
-        charge_calls.get(),
-        1,
-        "a non-successor fence must not be retried"
-    );
+    assert_eq!(charge_calls.get(), 2, "one rejected attempt, one retry");
     assert_eq!(refresh_calls.get(), 1);
-    assert_eq!(transport_calls.get(), 0);
-    assert_eq!(ledger.committed_grant_count(), 0);
-    assert_eq!(ledger.attempt_count(), 0);
+    assert_eq!(transport_calls.get(), 1);
+    assert_eq!(ledger.committed_grant_count(), 1);
     assert_eq!(ledger.poisoned(), None);
 
-    let outcome2 = client.execute(&mut ledger, &second).await;
     assert_eq!(
-        outcome2,
-        Err(ProviderClientError::ChargeRefused(
-            ProviderChargeError::BudgetPinRejected
-        ))
+        client.execute(&mut ledger, &second).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    assert_eq!(charge_calls.get(), 3);
+    assert_eq!(
+        refresh_calls.get(),
+        1,
+        "the cached N+2 pin must not trigger another refresh"
     );
 
     let pins = observed_pins.lock().expect("test mutex");
-    assert_eq!(pins.len(), 2);
+    assert_eq!(pins.len(), 3);
     assert_eq!(pins[0], budget_pin());
+    assert_eq!(pins[1], later, "the retry carries the N+2 pin");
+    assert_eq!(pins[2], later, "the shared cache moved to N+2");
+}
+
+/// Case 2b: a refreshed head whose fence is not newer than the held one is not a renewal. An older
+/// fence (N-1) and the same fence under a different revision both refuse as a typed, decisive
+/// `BudgetPinRejected`, issue no retry charge, and leave the shared cache unchanged (a later
+/// distinct attempt still opens with the original pin).
+#[tokio::test]
+async fn refresh_to_an_older_or_same_fence_refuses_without_a_retry_and_leaves_the_cache_unchanged()
+{
+    let base = budget_pin();
+    let heads = [
+        (
+            "older fence",
+            BudgetPin {
+                revision: format!("{}-older", base.revision),
+                fence: base.fence - 1,
+            },
+        ),
+        (
+            "same fence, different revision",
+            BudgetPin {
+                revision: format!("{}-sibling", base.revision),
+                fence: base.fence,
+            },
+        ),
+    ];
+    for (label, head) in heads {
+        let head_for_script = head.clone();
+        let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+            RefreshScriptedChargeAuthority::new(
+                |_call, _request| Err(ProviderChargeError::BudgetPinRejected),
+                move |_boundary| Ok(head_for_script.clone()),
+            );
+        let (transport, transport_calls) =
+            ScriptedTransport::new(|_attempt| unreachable!("a refused renewal must not send"));
+        let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+        let first = base_request(ProviderAttemptClass::Readiness);
+        let mut second = base_request(ProviderAttemptClass::Readiness);
+        second.attempt_id = other_attempt_id();
+        let mut ledger = new_ledger();
+
+        let outcome = client.execute(&mut ledger, &first).await;
+        assert_eq!(
+            outcome,
+            Err(ProviderClientError::ChargeRefused(
+                ProviderChargeError::BudgetPinRejected
+            )),
+            "{label}"
+        );
+        assert_eq!(charge_calls.get(), 1, "{label}: no retry charge");
+        assert_eq!(refresh_calls.get(), 1, "{label}");
+        assert_eq!(transport_calls.get(), 0, "{label}");
+        assert_eq!(ledger.committed_grant_count(), 0, "{label}");
+        assert_eq!(ledger.attempt_count(), 0, "{label}");
+        assert_eq!(ledger.poisoned(), None, "{label}");
+
+        let outcome2 = client.execute(&mut ledger, &second).await;
+        assert_eq!(
+            outcome2,
+            Err(ProviderClientError::ChargeRefused(
+                ProviderChargeError::BudgetPinRejected
+            )),
+            "{label}"
+        );
+
+        let pins = observed_pins.lock().expect("test mutex");
+        assert_eq!(pins.len(), 2, "{label}");
+        assert_eq!(pins[0], base, "{label}");
+        assert_eq!(
+            pins[1], base,
+            "{label}: the refused head must never become sticky"
+        );
+    }
+}
+
+/// Case 2c: the cache already holds a peer-proved N+1 when the head moves on to N+3. The next
+/// attempt opens with N+1, is rejected, refreshes N+1 -> N+3, and the cache moves to N+3, so the
+/// attempt after that opens with N+3 and does not refresh.
+#[tokio::test]
+async fn a_cached_pin_renews_to_a_later_head_and_the_cache_moves_to_it() {
+    let head = Arc::new(AtomicU32::new(43));
+    let head_for_charge = head.clone();
+    let head_for_refresh = head.clone();
+    let pin_at = |fence: u64| BudgetPin {
+        revision: format!("rev-{fence}"),
+        fence,
+    };
+    let (charge_authority, charge_calls, refresh_calls, observed_pins) =
+        RefreshScriptedChargeAuthority::new(
+            move |_call, request| {
+                if request.budget_pin().fence == u64::from(head_for_charge.load(Ordering::SeqCst)) {
+                    Ok(binding_grant(request))
+                } else {
+                    Err(ProviderChargeError::BudgetPinRejected)
+                }
+            },
+            move |_boundary| Ok(pin_at(u64::from(head_for_refresh.load(Ordering::SeqCst)))),
+        );
+    let (transport, _transport_calls) = ScriptedTransport::new(|_attempt| {
+        Ok(ProviderAttemptReport {
+            outcome: ProviderAttemptOutcome::Decisive,
+            provider_requests_issued: 1,
+            response: (),
+        })
+    });
+    let client = client_with(ProviderCapabilities::none(), charge_authority, transport);
+    let mut ledger = new_ledger();
+
+    // Attempt 1 starts at 42 and proves N+1 = 43 into the shared cache.
+    let first = base_request(ProviderAttemptClass::Readiness);
     assert_eq!(
-        pins[1],
-        budget_pin(),
-        "the rejected non-successor pin must never become sticky"
+        client.execute(&mut ledger, &first).await,
+        Ok(ProviderAttemptOutcome::Decisive)
     );
+    // The head then moves to N+3 = 45. Attempt 2 opens from the cache (43) and renews to 45.
+    head.store(45, Ordering::SeqCst);
+    let mut second = base_request(ProviderAttemptClass::Readiness);
+    second.attempt_id = other_attempt_id();
+    assert_eq!(
+        client.execute(&mut ledger, &second).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+    // Attempt 3 opens directly with 45.
+    let mut third = base_request(ProviderAttemptClass::Readiness);
+    third.attempt_id = uuid_v7(REQUEST_TIMESTAMP_MS, "0000000000cc");
+    assert_eq!(
+        client.execute(&mut ledger, &third).await,
+        Ok(ProviderAttemptOutcome::Decisive)
+    );
+
+    assert_eq!(refresh_calls.get(), 2, "one refresh for each renewal");
+    assert_eq!(charge_calls.get(), 5);
+    let fences: Vec<u64> = observed_pins
+        .lock()
+        .expect("test mutex")
+        .iter()
+        .map(|pin| pin.fence)
+        .collect();
+    assert_eq!(fences, vec![42, 43, 43, 45, 45]);
 }
 
 /// Case 3: the retry itself is also rejected. The bound is exactly one refresh and one retry per
@@ -5003,16 +5145,26 @@ async fn late_successful_grant_must_not_regress_the_proven_pin() {
         Ok(ProviderAttemptOutcome::Decisive)
     );
     head.store(45, Ordering::SeqCst);
+    let charges_before = seen.lock().unwrap().len();
     let mut ledger = new_ledger();
     let outcome = client
         .execute(&mut ledger, &request_for_attempt_number(4))
         .await;
+    // Any newer head renews, so a rewound cache (43) would still end in a success via a refresh
+    // to 45. Only the pin the attempt OPENS with shows whether the delayed fence-43 success
+    // rewound the cache.
+    let seen = seen.lock().unwrap();
+    assert_eq!(
+        seen[charges_before],
+        (4, 44),
+        "attempt 4 must open with the proven fence-44 pin, not a rewound 43; observed charges \
+         (ordinal, fence) = {seen:?}"
+    );
     assert_eq!(
         outcome,
         Ok(ProviderAttemptOutcome::Decisive),
-        "a proven N+2 pin must survive a delayed N+1 success; then N+3 is one generation of \
-         drift; observed charge pins = {:?}",
-        seen.lock().unwrap()
+        "a proven fence-44 pin must survive a delayed fence-43 success, then renew to 45; \
+         observed charges = {seen:?}"
     );
 }
 

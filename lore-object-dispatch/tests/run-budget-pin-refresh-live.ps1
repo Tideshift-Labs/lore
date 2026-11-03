@@ -31,7 +31,7 @@ $priorEnv = [Environment]::GetEnvironmentVariable($envName, 'Process')
 $tests = @(
     'live_postgres_head_read_function_is_the_only_door_and_is_least_privilege',
     'live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the_new_fence',
-    'live_postgres_two_generations_of_drift_refuses_the_attempt_and_debits_nothing',
+    'live_postgres_two_generations_of_drift_renews_to_the_head_and_debits_only_the_newest_fence',
     'live_postgres_expiry_refuses_typed_and_never_enters_the_refresh_branch'
 )
 

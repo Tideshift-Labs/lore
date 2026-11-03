@@ -110,7 +110,7 @@ impl InstrumentProvider for BudgetInstrumentProvider {
 /// Record the hard expiry, in unix seconds, that a documented-provider budget pin names. Label
 /// free. The value is the expiry instant, not the time left, so a single record stays true until
 /// the pin moves; the alert subtracts its own clock. A local pin carries no expiry and records
-/// nothing: absence is not zero. Called at boot and when a CR-034 refresh adopts a successor.
+/// nothing: absence is not zero. Called at boot and when a CR-034 refresh adopts a newer head.
 /// The pin is the publisher's statement; the cell database still enforces the real expiry.
 pub fn record_budget_pin_hard_expiry(pin: &crate::provider_client::BudgetPin) {
     static EXPIRY: std::sync::OnceLock<Gauge<i64>> = std::sync::OnceLock::new();
