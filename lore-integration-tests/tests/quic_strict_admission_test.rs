@@ -597,31 +597,22 @@ mod quic_strict_admission_tests {
     /// Counts the strict QUIC refusals the SERVER answered, from the event its stream handler
     /// emits for each (`handler_error_label = "UnsupportedClient"`).
     ///
-    /// The handler runs on the net runtime's threads, so the subscriber is process-global. Tests
-    /// in this binary run concurrently, so each refusal is attributed by the execution context
-    /// its task runs under: a test registers its own context and reads only its own count.
-    struct RefusalCounter;
-
+    /// The handler runs on the net runtime's threads, so this counts through the binary's one
+    /// process-global subscriber (`tracing_common`), as an event tap. Tests in this binary run
+    /// concurrently, so each refusal is attributed by the execution context its task runs under:
+    /// a test registers its own context and reads only its own count.
     static REFUSALS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
 
     fn context_key(context: &Arc<dyn std::any::Any + Send + Sync>) -> usize {
         Arc::as_ptr(context).cast::<()>() as usize
     }
 
-    /// Installs the process-global counting subscriber (once) and registers `execution` so its
-    /// refusals are counted. Returns the key to read them with.
+    /// Adds the refusal tap to the global subscriber and registers `execution` so its refusals
+    /// are counted. Returns the key to read them with.
     fn count_refusals_for(
         execution: &Arc<lore_revision::interface::ExecutionContext>,
     ) -> Result<usize, Box<dyn Error>> {
-        static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let installed = *INSTALLED.get_or_init(|| {
-            tracing::subscriber::set_global_default(tracing_subscriber::layer::SubscriberExt::with(
-                tracing_subscriber::registry(),
-                RefusalCounter,
-            ))
-            .is_ok()
-        });
-        if !installed {
+        if !crate::common::tracing_common::add_event_tap(count_refusal) {
             return Err("another global tracing subscriber is installed; cannot count".into());
         }
         let context: Arc<dyn std::any::Any + Send + Sync> = execution.clone();
@@ -664,25 +655,19 @@ mod quic_strict_admission_tests {
         }
     }
 
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalCounter {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _ctx: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let mut visitor = LabelVisitor(false);
-            event.record(&mut visitor);
-            if !visitor.0 {
-                return;
-            }
-            let Ok(key) = LORE_CONTEXT.try_with(context_key) else {
-                return;
-            };
-            if let Ok(mut entries) = REFUSALS.lock()
-                && let Some((_, count)) = entries.iter_mut().find(|(entry, _)| *entry == key)
-            {
-                *count += 1;
-            }
+    fn count_refusal(event: &tracing::Event<'_>) {
+        let mut visitor = LabelVisitor(false);
+        event.record(&mut visitor);
+        if !visitor.0 {
+            return;
+        }
+        let Ok(key) = LORE_CONTEXT.try_with(context_key) else {
+            return;
+        };
+        if let Ok(mut entries) = REFUSALS.lock()
+            && let Some((_, count)) = entries.iter_mut().find(|(entry, _)| *entry == key)
+        {
+            *count += 1;
         }
     }
 

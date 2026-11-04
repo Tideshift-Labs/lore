@@ -324,6 +324,77 @@ pub(crate) mod net_common {
 }
 
 #[cfg(all(test, feature = "integration_tests"))]
+pub(crate) mod tracing_common {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Called with every event the process emits, from whichever thread emits it.
+    pub(crate) type EventTap = fn(&tracing::Event<'_>);
+
+    static TAPS: Mutex<Vec<EventTap>> = Mutex::new(Vec::new());
+
+    /// Installs this binary's one process-global subscriber, once: `fmt` output filtered by
+    /// `RUST_LOG` (what `tracing_subscriber::fmt::try_init` gave), plus the taps tests add.
+    ///
+    /// Tests share one process and run in any order, so a test that installs a global subscriber
+    /// of its own fails whenever another test installed one first. Every test that needs a global
+    /// subscriber comes here instead. False only if something else installed one first.
+    pub(crate) fn install_global_subscriber() -> bool {
+        static INSTALLED: OnceLock<bool> = OnceLock::new();
+        *INSTALLED.get_or_init(|| {
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry()
+                    .with(
+                        tracing_subscriber::fmt::layer()
+                            .with_test_writer()
+                            .with_filter(EnvFilter::from_default_env()),
+                    )
+                    .with(Taps),
+            )
+            .is_ok()
+        })
+    }
+
+    /// Installs the global subscriber and adds `tap` to it. False if the subscriber is not ours.
+    pub(crate) fn add_event_tap(tap: EventTap) -> bool {
+        if !install_global_subscriber() {
+            return false;
+        }
+        let Ok(mut taps) = TAPS.lock() else {
+            return false;
+        };
+        if !taps.contains(&tap) {
+            taps.push(tap);
+        }
+        true
+    }
+
+    /// Unfiltered, so a tap sees every event whatever `RUST_LOG` says.
+    struct Taps;
+
+    impl<S: tracing::Subscriber> Layer<S> for Taps {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // A copy, so a tap that emits an event cannot deadlock on the lock.
+            let taps = match TAPS.lock() {
+                Ok(taps) => taps.clone(),
+                Err(_poisoned) => return,
+            };
+            for tap in taps {
+                tap(event);
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "integration_tests"))]
 pub(crate) mod aws_common {
     use std::error::Error;
     use std::sync::Arc;
@@ -369,7 +440,7 @@ pub(crate) mod aws_common {
     pub async fn setup(
         tables: Vec<&str>,
     ) -> Result<(S3, DynamoDb, DynamoDb), Box<dyn Error + 'static>> {
-        let _ = tracing_subscriber::fmt::try_init();
+        let _ = crate::common::tracing_common::install_global_subscriber();
         let s3_endpoint = std::env::var("LORE_INTEGRATION_S3_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:9000".to_string());
         let dynamodb_endpoint = dynamodb_endpoint();
