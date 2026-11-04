@@ -407,6 +407,54 @@ async fn a_failing_enumeration_denies() {
     assert!(inner.0.lock().unwrap().is_empty());
 }
 
+/// FORK-LOCAL (Tideshift): an auth service that did not answer is the
+/// server's condition, not a denial: the caller gets the auth-unavailable
+/// status (`Internal`, 13), never the uniform "Unauthorized".
+#[tokio::test]
+async fn an_auth_timeout_answers_internal_not_unauthorized() {
+    struct TimedOutAuthorizer;
+
+    #[async_trait]
+    impl RepositoryAuthorizer for TimedOutAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+            _action: Option<&str>,
+        ) -> Result<(), Status> {
+            unreachable!("the failed enumeration is the verdict");
+        }
+
+        async fn granted_actions(
+            &self,
+            _token: Option<&VerifiedToken<'_>>,
+            _repository_id: RepositoryId,
+        ) -> Result<Option<Grants>, Status> {
+            Err(lore_server::authnz::auth::auth_unavailable_status(
+                "lore auth service did not answer check_user_permission within 8s".to_string(),
+            ))
+        }
+    }
+
+    let inner = GrantsInner::default();
+    let mut service =
+        PartitionAccessLayer::new(Arc::new(TimedOutAuthorizer), TEST_TIMEOUT).layer(inner.clone());
+
+    let response = service
+        .call(request(Some(repository()), true))
+        .await
+        .unwrap();
+
+    let status = status_of(&response);
+    assert_eq!(status.code(), Code::Internal);
+    assert_eq!(
+        status.message(),
+        "lore auth service did not answer check_user_permission within 8s"
+    );
+    assert_ne!(status.message(), no_repository_access_status().message());
+    assert!(inner.0.lock().unwrap().is_empty());
+}
+
 /// A stalled authorizer cannot park the request: the authorization stage
 /// is bounded on its own, and elapsing answers with a server status
 /// naming that stage rather than a denial.

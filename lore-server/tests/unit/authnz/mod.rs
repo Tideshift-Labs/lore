@@ -4,6 +4,7 @@
 mod auth;
 mod auth_channel;
 pub(crate) mod auth_client_fixture;
+mod auth_hold;
 mod common;
 mod global_grants_authorizer;
 mod rebac;

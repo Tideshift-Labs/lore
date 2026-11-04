@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -105,9 +106,7 @@ impl Message for Connect {
                     let grants = repository_authorizer
                         .granted_access(Some(&token), self.repository)
                         .await
-                        .map_err(|status| {
-                            MessageHandleError::AuthorizationFailure(status.message().to_string())
-                        })?;
+                        .map_err(|status| MessageHandleError::from_authorization_status(&status))?;
                     if let Some(grants) = grants {
                         context.insert(PartitionGrants {
                             repository_id: self.repository,

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
@@ -277,9 +278,7 @@ impl QuicService for StorageServiceV4 {
                         .repository_authorizer
                         .granted_access(Some(&verified), repository)
                         .await
-                        .map_err(|status| {
-                            MessageHandleError::AuthorizationFailure(status.message().to_string())
-                        })?;
+                        .map_err(|status| MessageHandleError::from_authorization_status(&status))?;
                     token = Some(Arc::new(verified.owned()));
 
                     permissions =
@@ -488,9 +487,7 @@ impl QuicService for StorageServiceV4 {
                                 )
                                 .await
                                 .map_err(|status| {
-                                    MessageHandleError::AuthorizationFailure(
-                                        status.message().to_string(),
-                                    )
+                                    MessageHandleError::from_authorization_status(&status)
                                 })?;
                             authorized_sources.insert(copy.source_repository);
                         }

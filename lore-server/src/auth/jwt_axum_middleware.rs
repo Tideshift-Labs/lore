@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 
@@ -16,6 +17,7 @@ use serde::Deserialize;
 use tracing::Span;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::auth::is_auth_unavailable;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -43,11 +45,21 @@ pub async fn jwt_axum_verify_authorization(
                     raw: &accesstoken,
                     claims: &user_info,
                 };
-                if let Ok(grants) = state
+                let access = state
                     .repository_authorizer
                     .granted_access(Some(&token), repository)
-                    .await
+                    .await;
+                // FORK-LOCAL (Tideshift): an auth service that did not answer
+                // in time is a server error, not a refusal.
+                if let Err(status) = &access
+                    && is_auth_unavailable(status)
                 {
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .body(Body::from(status.message().to_string()))
+                        .unwrap();
+                }
+                if let Ok(grants) = access {
                     Span::current().record(USER_ID, user_info.identity());
                     if let Some(grants) = grants {
                         request.extensions_mut().insert(PartitionGrants {

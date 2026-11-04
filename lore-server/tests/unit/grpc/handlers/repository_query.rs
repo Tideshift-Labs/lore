@@ -106,6 +106,52 @@ async fn denied_query_answers_not_found_for_an_existing_repository() {
         .await;
 }
 
+/// An authorizer whose auth service did not answer in time.
+struct TimedOutRepositoryAuthorizer;
+
+#[async_trait::async_trait]
+impl RepositoryAuthorizer for TimedOutRepositoryAuthorizer {
+    async fn check_repository_access(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Option<&str>,
+    ) -> Result<(), Status> {
+        Err(lore_server::authnz::auth::auth_unavailable_status(
+            "lore auth service did not answer check_user_permission within 8s".to_string(),
+        ))
+    }
+}
+
+/// FORK-LOCAL (Tideshift): an auth timeout is the server's condition, not
+/// "the repository is gone": it answers `Internal`, never `NotFound`.
+#[tokio::test]
+async fn an_auth_timeout_answers_internal_not_found() {
+    let id = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    LORE_CONTEXT
+        .scope(execution, async move {
+            seed_repository(immutable_store.clone(), mutable_store.clone(), id, "repo").await;
+            for request in [query_by_id(id), query_by_name("repo")] {
+                let err = handler(
+                    request,
+                    Arc::new(TimedOutRepositoryAuthorizer),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("a timed-out check must fail");
+                assert_eq!(err.code(), Code::Internal, "{err:?}");
+                assert!(
+                    lore_server::authnz::auth::is_auth_unavailable(&err),
+                    "{err:?}"
+                );
+            }
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn permitted_query_resolves_by_id_and_by_name() {
     let id = random::<RepositoryId>();

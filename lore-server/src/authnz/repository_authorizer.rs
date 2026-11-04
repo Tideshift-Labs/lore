@@ -15,6 +15,8 @@ use tonic::Status;
 use tracing::info;
 
 use super::auth::AuthChannel;
+use super::auth::is_auth_unavailable;
+use super::auth::with_auth_budget;
 use super::common::create_request_with_authorization;
 use super::global_grants_authorizer::GlobalGrantsAuthorizer;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
@@ -169,8 +171,9 @@ impl dyn RepositoryAuthorizer {
                 .check_repository_access(token, repository_id, None)
                 .await
                 .map(|()| None)
-                .map_err(|_denied| crate::grpc::no_repository_access_status()),
-            _ => Err(crate::grpc::no_repository_access_status()),
+                .map_err(flatten_denial),
+            Ok(Some(_denied)) => Err(crate::grpc::no_repository_access_status()),
+            Err(status) => Err(flatten_denial(status)),
         }
     }
 
@@ -219,18 +222,115 @@ impl dyn RepositoryAuthorizer {
         repository_id: RepositoryId,
         action: &str,
     ) -> Result<(), Status> {
-        let permitted = match self.granted_access(token, repository_id).await? {
-            Some(grants) => grants.permits(action),
-            None => self
-                .check_repository_access(token, repository_id, Some(action))
-                .await
-                .is_ok(),
-        };
-        if permitted {
-            Ok(())
-        } else {
-            Err(Status::permission_denied("Permission denied"))
+        // FORK-LOCAL (Tideshift): both questions share one auth budget.
+        with_auth_budget(async {
+            let permitted = match self.granted_access(token, repository_id).await? {
+                Some(grants) => grants.permits(action),
+                None => match self
+                    .check_repository_access(token, repository_id, Some(action))
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(status) if is_auth_unavailable(&status) => return Err(status),
+                    Err(_denied) => false,
+                },
+            };
+            if permitted {
+                Ok(())
+            } else {
+                Err(Status::permission_denied("Permission denied"))
+            }
+        })
+        .await
+    }
+}
+
+/// FORK-LOCAL (Tideshift): the status an authorization check reports for a
+/// failed question. A denial, or any error, is flattened to
+/// [`no_repository_access_status`] so an unauthorized caller learns nothing
+/// from the reason. An auth service that did not answer in time
+/// ([`is_auth_unavailable`]) is passed on: it is the server's condition, says
+/// nothing about the repository, and must not read as "not authorized".
+///
+/// [`no_repository_access_status`]: crate::grpc::no_repository_access_status
+pub fn flatten_denial(status: Status) -> Status {
+    if is_auth_unavailable(&status) {
+        status
+    } else {
+        crate::grpc::no_repository_access_status()
+    }
+}
+
+/// FORK-LOCAL (Tideshift): an authorizer that remembers an auth service
+/// timeout, for a call path whose error type cannot carry a [`Status`] (the
+/// repository lookups answer `RepositoryError`, which their handlers report
+/// as not found). The handler asks [`Self::unavailable`] before reporting
+/// not found, so an auth outage is not read as "the repository is gone".
+pub struct UnavailableRecorder<'a> {
+    inner: &'a dyn RepositoryAuthorizer,
+    seen: std::sync::Mutex<Option<Status>>,
+}
+
+impl<'a> UnavailableRecorder<'a> {
+    pub fn new(inner: &'a dyn RepositoryAuthorizer) -> Self {
+        Self {
+            inner,
+            seen: std::sync::Mutex::new(None),
         }
+    }
+
+    /// The auth service timeout a check through this authorizer met, if any.
+    pub fn unavailable(&self) -> Option<Status> {
+        self.seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn record<T>(&self, result: Result<T, Status>) -> Result<T, Status> {
+        if let Err(status) = &result
+            && is_auth_unavailable(status)
+        {
+            *self
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(status.clone());
+        }
+        result
+    }
+}
+
+#[async_trait]
+impl RepositoryAuthorizer for UnavailableRecorder<'_> {
+    async fn check_repository_access(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        self.record(
+            self.inner
+                .check_repository_access(token, repository_id, action)
+                .await,
+        )
+    }
+
+    async fn granted_actions(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+    ) -> Result<Option<Grants>, Status> {
+        self.record(self.inner.granted_actions(token, repository_id).await)
+    }
+
+    fn check_repository_access_sync(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Option<Result<(), Status>> {
+        self.inner
+            .check_repository_access_sync(token, repository_id, action)
     }
 }
 
@@ -304,7 +404,9 @@ impl AuthClientAuthorizer {
             .check_user_permission(request)
             .await
             .warn_map_err(|err| {
-                if err.code() == Code::PermissionDenied {
+                if is_auth_unavailable(err) {
+                    return err.clone();
+                } else if err.code() == Code::PermissionDenied {
                     return Status::permission_denied("Query resource denied");
                 } else if err.code() == Code::Unauthenticated {
                     return Status::unauthenticated("Query resource failed - unauthenticated");

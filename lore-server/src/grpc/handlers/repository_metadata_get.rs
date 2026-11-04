@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
@@ -14,11 +15,11 @@ use tonic::Status;
 use tracing::warn;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
-use crate::grpc::no_repository_access_status;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "RepositoryMetadataGet::handle", skip_all)]
@@ -53,7 +54,7 @@ pub async fn handler(
                     None,
                 )
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .map_err(flatten_denial)?;
 
             let metadata_hash = repository::metadata_hash(repository)
                 .await

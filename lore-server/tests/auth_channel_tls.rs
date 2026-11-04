@@ -22,7 +22,9 @@ use futures::future::join_all;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_server::authnz::auth::AUTH_CONNECT_TIMEOUT;
 use lore_server::authnz::auth::AUTH_DEADLINE;
+use lore_server::authnz::auth::AUTH_OUTAGE_HOLD;
 use lore_server::authnz::auth::AuthChannel;
+use lore_server::authnz::auth::is_auth_unavailable;
 use tonic::codegen::*;
 
 #[derive(Clone)]
@@ -242,7 +244,8 @@ async fn an_idle_drop_then_a_tls_stall_is_bounded_and_recovers() {
         .unwrap_err();
     let elapsed = started.elapsed();
     assert!(elapsed < AUTH_DEADLINE + margin, "{elapsed:?}");
-    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+    assert!(is_auth_unavailable(&status), "{status:?}");
     assert!(
         status
             .message()
@@ -255,6 +258,18 @@ async fn an_idle_drop_then_a_tls_stall_is_bounded_and_recovers() {
         "the re-dial was tonic's own, under the call"
     );
 
+    // The timeout started a hold: a wave right after it fails at once and
+    // dials nothing.
+    let started = Instant::now();
+    let held = join_all((0..10).map(|_| call(&channel))).await;
+    assert!(
+        held.iter()
+            .all(|result| matches!(result, Err(status) if is_auth_unavailable(status)))
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    assert_eq!(channel.dial_attempts(), 1);
+    tokio::time::sleep(AUTH_OUTAGE_HOLD + Duration::from_millis(300)).await;
+
     // The channel was discarded: a wave shares one fresh, bounded dial.
     let started = Instant::now();
     let wave = tokio::time::timeout(AUTH_DEADLINE * 3, join_all((0..10).map(|_| call(&channel))))
@@ -265,7 +280,9 @@ async fn an_idle_drop_then_a_tls_stall_is_bounded_and_recovers() {
     assert!(elapsed < AUTH_CONNECT_TIMEOUT + margin, "{elapsed:?}");
     assert_eq!(channel.dial_attempts(), 2);
 
+    // The stalled dial timed out, which started another hold: wait it out.
     // The peer answers again: the next call dials and passes.
+    tokio::time::sleep(AUTH_OUTAGE_HOLD + Duration::from_millis(300)).await;
     front.stall.store(false, Ordering::SeqCst);
     call(&channel).await.expect("call after the peer recovered");
     assert_eq!(channel.dial_attempts(), 3);
@@ -312,7 +329,8 @@ async fn a_slow_tls_dial_then_a_hanging_call_fail_together_within_one_deadline()
         elapsed < AUTH_DEADLINE + Duration::from_millis(1500),
         "dial delay plus a fresh deadline: {elapsed:?}"
     );
-    assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+    assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
+    assert!(is_auth_unavailable(&status), "{status:?}");
     assert!(
         status
             .message()

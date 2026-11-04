@@ -22,10 +22,10 @@ use tracing::debug;
 use tracing::instrument;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::flatten_denial;
 use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
-use crate::grpc::no_repository_access_status;
 
 #[derive(Clone)]
 pub struct NotificationService {
@@ -81,17 +81,16 @@ impl lore_notification::NotificationService for NotificationService {
         // in the body need custom verification logic. A denial is folded
         // into the boolean inside the bound, so elapsing is the only other
         // thing the check reports.
-        let permitted = tokio::time::timeout(self.authorization_timeout, async {
+        tokio::time::timeout(self.authorization_timeout, async {
             self.authorizer
                 .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
                 .await
-                .is_ok()
+                // FORK-LOCAL (Tideshift): an auth service that did not answer
+                // in time is passed on, not reported as a denial.
+                .map_err(flatten_denial)
         })
         .await
-        .map_err(|_elapsed| authorization_timeout_status())?;
-        if !permitted {
-            return Err(no_repository_access_status());
-        }
+        .map_err(|_elapsed| authorization_timeout_status())??;
 
         let rx = self.sender.register(repository);
 

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
@@ -423,6 +424,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::UnsupportedClient => "UnsupportedClient",
         MessageHandleError::DomainKeyRefused(_) => "DomainKeyRefused",
         MessageHandleError::SessionExpired => "SessionExpired",
+        MessageHandleError::AuthUnavailable(_) => "AuthUnavailable",
     }
 }
 
@@ -449,6 +451,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::UnsupportedClient
         | MessageHandleError::DomainKeyRefused(_)
         | MessageHandleError::SessionExpired
+        | MessageHandleError::AuthUnavailable(_)
         | MessageHandleError::OutcomeUnknown => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError

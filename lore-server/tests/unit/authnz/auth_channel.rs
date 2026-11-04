@@ -24,7 +24,9 @@ use lore_proto::auth::CheckUserPermissionRequest;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::auth::AUTH_CONNECT_TIMEOUT;
 use lore_server::authnz::auth::AUTH_DEADLINE;
+use lore_server::authnz::auth::AUTH_OUTAGE_HOLD;
 use lore_server::authnz::auth::AuthChannel;
+use lore_server::authnz::auth::is_auth_unavailable;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
@@ -518,13 +520,30 @@ async fn a_stalled_tls_handshake_fails_the_shared_dial_within_the_timeout() {
     .expect("callers joined a dial that never ends");
     for (result, elapsed) in &results {
         let status = result.as_ref().unwrap_err();
-        assert_eq!(status.message(), "Failed to connect to lore auth service");
+        assert!(is_auth_unavailable(status), "{status:?}");
+        assert_eq!(
+            status.message(),
+            format!("lore auth service did not connect within {AUTH_CONNECT_TIMEOUT:?}")
+        );
         assert!(*elapsed < bound, "a caller failed after {elapsed:?}");
     }
     assert_eq!(channel.dial_attempts(), 1);
+    let held_at = Instant::now();
 
-    // The stuck dial is gone: the next caller starts its own, and it is
-    // bounded the same way.
+    // The dial timeout started a hold: the next caller fails at once, with no
+    // second dial.
+    let started = Instant::now();
+    let held = channel.client().await.map(|_| ()).unwrap_err();
+    assert!(is_auth_unavailable(&held), "{held:?}");
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert_eq!(channel.dial_attempts(), 1);
+
+    // After the hold the stuck dial is gone: the next caller starts its own,
+    // and it is bounded the same way.
+    tokio::time::sleep(
+        (AUTH_OUTAGE_HOLD + Duration::from_millis(300)).saturating_sub(held_at.elapsed()),
+    )
+    .await;
     let started = Instant::now();
     let next = tokio::time::timeout(bound * 2, channel.client())
         .await
@@ -532,6 +551,9 @@ async fn a_stalled_tls_handshake_fails_the_shared_dial_within_the_timeout() {
     assert!(next.is_err());
     assert!(started.elapsed() < bound);
     assert_eq!(channel.dial_attempts(), 2);
+
+    // That dial timed out too, so wait out its hold before the next one.
+    tokio::time::sleep(AUTH_OUTAGE_HOLD + Duration::from_millis(300)).await;
 
     // The peer is fixed (here: it now refuses at once): the next dial sees
     // the change rather than the old stall.
@@ -635,20 +657,15 @@ async fn an_rpc_the_service_never_answers_times_out_and_the_next_call_redials() 
         "{elapsed:?}"
     );
     assert_eq!(status.code(), tonic::Code::Internal, "{status:?}");
-    assert!(
-        status
-            .message()
-            .starts_with("Failed to call auth check_user_permission:"),
-        "{status:?}"
-    );
-    assert!(
-        status
-            .message()
-            .contains("did not answer check_user_permission within"),
-        "{status:?}"
+    assert!(is_auth_unavailable(&status), "{status:?}");
+    assert_eq!(
+        status.message(),
+        format!("lore auth service did not answer check_user_permission within {AUTH_DEADLINE:?}")
     );
 
+    // The timeout started a hold: wait it out, then the next call redials.
     server.set_mode(ALLOW);
+    tokio::time::sleep(AUTH_OUTAGE_HOLD + Duration::from_millis(300)).await;
     check(&authorizer).await.unwrap();
     assert_eq!(
         server.accepted(),

@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::pin::Pin;
 use std::sync::Arc;
@@ -18,6 +19,8 @@ use tonic::server::NamedService;
 use tower::Layer;
 use tower::Service;
 
+use crate::authnz::auth::is_auth_unavailable;
+use crate::authnz::auth::with_auth_budget;
 use crate::authnz::repository_authorizer::Grants;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -114,6 +117,8 @@ enum Access {
     /// Reachable; the enumerated grants when the authorizer had them.
     Granted(Option<Grants>),
     Denied,
+    /// FORK-LOCAL (Tideshift): the auth service did not answer in time.
+    Unavailable(Status),
 }
 
 /// The partition the request names, [`None`] when doesn't name one.
@@ -146,7 +151,9 @@ where
         let authorizer = self.authorizer.clone();
         let authorization_timeout = self.authorization_timeout;
 
-        Box::pin(async move {
+        // FORK-LOCAL (Tideshift): the layer's check and any the handler makes
+        // (a cross-partition copy's source) share one auth budget.
+        Box::pin(with_auth_budget(async move {
             let mut request = request;
             let repository = match named_partition(request.headers()) {
                 Ok(Some(repository)) => repository,
@@ -165,6 +172,9 @@ where
                     let token = get_verified_token(extensions);
                     match authorizer.granted_access(token.as_ref(), repository).await {
                         Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
+                        // FORK-LOCAL (Tideshift): an auth service that did
+                        // not answer in time is not a denial.
+                        Err(status) if is_auth_unavailable(&status) => Access::Unavailable(status),
                         Err(_denied) => Access::Denied,
                     }
                 })
@@ -190,9 +200,10 @@ where
                 // Flattened to one uniform status, so an unauthorized caller
                 // learns nothing from the reason.
                 Ok(Access::Denied) => Ok(no_repository_access_status().into_http()),
+                Ok(Access::Unavailable(status)) => Ok(status.into_http()),
                 Err(_elapsed) => Ok(authorization_timeout_status().into_http()),
             }
-        })
+        }))
     }
 }
 

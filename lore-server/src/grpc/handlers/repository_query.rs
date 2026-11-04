@@ -22,6 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::UnavailableRecorder;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
@@ -57,36 +58,43 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             let token = get_verified_token(&extensions);
+            // FORK-LOCAL (Tideshift): an auth service timeout is reported as
+            // itself, not as an unknown repository.
+            let authorizer = UnavailableRecorder::new(authorizer.as_ref());
             let repository = match query {
                 lore_proto::repository_query_request::Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
                     repository_query_id_with_repairs(
                         repository.clone(),
                         id,
-                        Some(authorizer.as_ref()),
+                        Some(&authorizer),
                         token.as_ref(),
                         allow_repairs,
                     )
                     .await
                     .filter_slow_down()?
                     .map_err(|err| {
-                        warn!("Repository ID {id} not known: {err}",);
-                        Status::not_found(err.to_string())
+                        authorizer.unavailable().unwrap_or_else(|| {
+                            warn!("Repository ID {id} not known: {err}",);
+                            Status::not_found(err.to_string())
+                        })
                     })?
                 }
                 lore_proto::repository_query_request::Query::Name(name) => {
                     repository_query_name_with_repairs(
                         repository.clone(),
                         name.as_str(),
-                        Some(authorizer.as_ref()),
+                        Some(&authorizer),
                         token.as_ref(),
                         allow_repairs,
                     )
                     .await
                     .filter_slow_down()?
                     .map_err(|err| {
-                        warn!("Repository name {name} not known: {err}");
-                        Status::not_found(err.to_string())
+                        authorizer.unavailable().unwrap_or_else(|| {
+                            warn!("Repository name {name} not known: {err}");
+                            Status::not_found(err.to_string())
+                        })
                     })?
                 }
             };

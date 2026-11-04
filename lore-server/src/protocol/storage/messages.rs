@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::error::Error;
@@ -116,6 +117,24 @@ pub enum MessageHandleError {
     /// a fresh token and may send the command again.
     #[error("session token expired")]
     SessionExpired,
+    /// FORK-LOCAL (Tideshift): the auth service did not answer an
+    /// authorization check in time. A server condition, not a denial: it must
+    /// not reach the client as "not authorized".
+    #[error("{0}")]
+    AuthUnavailable(String),
+}
+
+impl MessageHandleError {
+    /// FORK-LOCAL (Tideshift): the error for a failed authorization check:
+    /// [`Self::AuthUnavailable`] when the auth service did not answer in time,
+    /// [`Self::AuthorizationFailure`] for a denial or any other failure.
+    pub fn from_authorization_status(status: &tonic::Status) -> Self {
+        if crate::authnz::auth::is_auth_unavailable(status) {
+            Self::AuthUnavailable(status.message().to_string())
+        } else {
+            Self::AuthorizationFailure(status.message().to_string())
+        }
+    }
 }
 
 impl From<StoreError> for MessageHandleError {

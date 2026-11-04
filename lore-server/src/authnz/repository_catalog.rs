@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use std::collections::HashSet;
 use std::fmt;
@@ -25,6 +26,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::auth::AuthChannel;
+use super::auth::is_auth_unavailable;
 use super::common::create_request_with_authorization;
 use super::repository_authorizer::VerifiedToken;
 use super::repository_authorizer::bearer_header;
@@ -214,7 +216,9 @@ impl RepositoryCatalog for AuthClientRepositoryCatalog {
             .lookup_user_permissions(request)
             .await
             .warn_map_err(|err| {
-                if err.code() == Code::PermissionDenied {
+                if is_auth_unavailable(err) {
+                    return err.clone();
+                } else if err.code() == Code::PermissionDenied {
                     return Status::permission_denied("List resources denied");
                 } else if err.code() == Code::Unauthenticated {
                     return Status::unauthenticated("list resource failed - unauthenticated");

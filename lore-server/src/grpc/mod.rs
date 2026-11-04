@@ -105,6 +105,10 @@ pub fn map_message_handle_error_to_status(
             Code::PermissionDenied,
             message.unwrap_or_else(|| format!("Authorization failed {err}")),
         ),
+        // FORK-LOCAL (Tideshift): a server condition, not a denial.
+        MessageHandleError::AuthUnavailable(err) => {
+            (Code::Internal, message.unwrap_or_else(|| err.clone()))
+        }
         MessageHandleError::MissingToken => (
             Code::Unauthenticated,
             message.unwrap_or_else(|| "Missing auth token".into()),

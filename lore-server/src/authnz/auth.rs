@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -34,6 +35,7 @@ use tonic::codegen::InterceptedService;
 use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 use tracing::debug;
+use tracing::warn;
 
 use crate::grpc::ServerResultExt;
 
@@ -56,6 +58,14 @@ pub const AUTH_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// discarded and the next call takes the dial path. Longer than
 /// [`AUTH_CONNECT_TIMEOUT`], so a call that has to re-dial can still finish.
 pub const AUTH_DEADLINE: Duration = Duration::from_secs(8);
+/// FORK-LOCAL (Tideshift): how long an [`AuthChannel`] fails every new call at
+/// once after a call or a dial ran out of time. One client operation can send
+/// several requests in series (`metadata set` reads, then writes), and each
+/// would otherwise wait out its own [`AUTH_DEADLINE`] on a hung auth service.
+/// Only a timeout starts it: a denial, any other answer and a fast transport
+/// error do not. The first call after it sends a real request; a successful
+/// call ends it early.
+pub const AUTH_OUTAGE_HOLD: Duration = Duration::from_secs(5);
 /// FORK-LOCAL (Tideshift): TCP keep-alive on the shared auth connection, so a
 /// peer that vanished without closing is found while the connection idles.
 /// Matches the internal gRPC client's default.
@@ -66,6 +76,61 @@ const AUTH_TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 /// auth service's gRPC stack may treat idle pings as abuse.
 const AUTH_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const AUTH_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// FORK-LOCAL (Tideshift): the source that marks a [`Status`] as "the auth
+/// service did not answer in time", as opposed to an answer. Set only by this
+/// module, and a source never crosses the wire, so neither the auth service
+/// nor a client can forge it.
+#[derive(Debug, thiserror::Error)]
+#[error("lore auth service unavailable")]
+pub struct AuthUnavailable;
+
+/// An `Internal` status carrying `message` and the [`AuthUnavailable`]
+/// marker. `Internal`, not `Unavailable`: a Lore client reads `Unavailable` as
+/// a lost connection and reconnects, and `Cancelled` or `DeadlineExceeded` as
+/// a lost answer, while this is the server's decisive refusal.
+#[lore_macro::test_pub]
+fn auth_unavailable_status(message: String) -> Status {
+    let mut status = Status::internal(message);
+    status.set_source(Arc::new(AuthUnavailable));
+    status
+}
+
+/// Whether `status` says the auth service did not answer in time. An
+/// authorization check passes such a status on rather than reporting it as a
+/// denial; it fails the request either way.
+pub fn is_auth_unavailable(status: &Status) -> bool {
+    std::error::Error::source(status).is_some_and(|source| source.is::<AuthUnavailable>())
+}
+
+tokio::task_local! {
+    /// Auth time one request has spent so far, across all its auth calls.
+    static AUTH_SPENT: Cell<Duration>;
+}
+
+/// FORK-LOCAL (Tideshift): runs `request` under one [`AUTH_DEADLINE`] shared
+/// by every auth call it makes on this task, so a request that asks twice
+/// still fails within one deadline. Only time inside auth calls counts. A
+/// nested call joins the budget already running. Outside it (a spawned task,
+/// say) each call gets a whole deadline of its own.
+pub async fn with_auth_budget<F: Future>(request: F) -> F::Output {
+    if AUTH_SPENT.try_with(|_| ()).is_ok() {
+        request.await
+    } else {
+        AUTH_SPENT.scope(Cell::new(Duration::ZERO), request).await
+    }
+}
+
+fn budget_left() -> Duration {
+    AUTH_SPENT
+        .try_with(|spent| AUTH_DEADLINE.saturating_sub(spent.get()))
+        .unwrap_or(AUTH_DEADLINE)
+}
+
+fn charge(started: tokio::time::Instant) {
+    // Outside a budget there is nothing to charge.
+    let _ = AUTH_SPENT.try_with(|spent| spent.set(spent.get() + started.elapsed()));
+}
 
 pub struct LoreAuthClientHelper {
     client: UrcAuthApiClient<InterceptedService<Channel, CorrelationInterceptor>>,
@@ -103,10 +168,21 @@ async fn connect_auth_channel(auth_url: String) -> Result<Channel, Status> {
     let started = Instant::now();
     let endpoint = auth_endpoint(&auth_url)?;
     let endpoint_built = started.elapsed();
-    let channel = tokio::time::timeout(AUTH_CONNECT_TIMEOUT, endpoint.connect())
-        .await
-        .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?
-        .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?;
+    // A dial that ran out of time is a timeout whether this bound or the
+    // endpoint's own TCP connect timeout (the same length) fired first.
+    let timed_out = || {
+        auth_unavailable_status(format!(
+            "lore auth service did not connect within {AUTH_CONNECT_TIMEOUT:?}"
+        ))
+    };
+    let channel = match tokio::time::timeout(AUTH_CONNECT_TIMEOUT, endpoint.connect()).await {
+        Ok(Ok(channel)) => channel,
+        Ok(Err(error)) if started.elapsed() < AUTH_CONNECT_TIMEOUT => {
+            return Err(error)
+                .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"));
+        }
+        Ok(Err(_)) | Err(_) => return Err(timed_out()),
+    };
     debug!(
         endpoint_build_ms = endpoint_built.as_secs_f64() * 1000.0,
         connect_ms = (started.elapsed() - endpoint_built).as_secs_f64() * 1000.0,
@@ -150,11 +226,43 @@ struct ChannelSlot {
     /// Bumped each time a channel is installed, so a call that failed on an
     /// old channel cannot discard its replacement.
     generation: u64,
+    /// The [`AUTH_OUTAGE_HOLD`] the last timeout started, if any.
+    hold: Option<Hold>,
+}
+
+struct Hold {
+    until: tokio::time::Instant,
+    /// The timeout's own message, which every call the hold fails repeats.
+    message: String,
 }
 
 impl ChannelSlot {
     fn names(&self, attempt: u64) -> bool {
         matches!(&self.state, ChannelState::Dialing { attempt: current, .. } if *current == attempt)
+    }
+
+    /// The refusal for a call arriving now, while a hold is running.
+    fn held(&self, now: tokio::time::Instant) -> Option<Status> {
+        self.hold
+            .as_ref()
+            .filter(|hold| hold.until > now)
+            .map(|hold| auth_unavailable_status(hold.message.clone()))
+    }
+
+    /// Starts (or restarts) the hold after a timeout carrying `message`.
+    /// Logs only when no hold was running, so a burst of timeouts logs once.
+    fn start_hold(&mut self, message: &str) {
+        let now = tokio::time::Instant::now();
+        if self.hold.as_ref().is_none_or(|hold| hold.until <= now) {
+            warn!(
+                "lore auth service timed out; failing auth calls at once for \
+                 {AUTH_OUTAGE_HOLD:?}: {message}"
+            );
+        }
+        self.hold = Some(Hold {
+            until: now + AUTH_OUTAGE_HOLD,
+            message: message.to_string(),
+        });
     }
 }
 
@@ -207,6 +315,11 @@ impl AuthChannel {
         let task = lore_spawn_net_nocontext!(async move {
             let result = connect_auth_channel(auth_url).await;
             let mut slot = lock(&shared);
+            if let Err(status) = &result
+                && is_auth_unavailable(status)
+            {
+                slot.start_hold(status.message());
+            }
             if slot.names(attempt) {
                 match &result {
                     Ok(channel) => {
@@ -233,16 +346,23 @@ impl AuthChannel {
 
     /// A client on the shared channel, dialling first when there is none.
     /// A failed dial is returned as the per-call path always returned it.
-    /// Starts the request's [`AUTH_DEADLINE`]: the wait on a dial and the
-    /// returned client's one call share it.
+    /// Fails at once, sending nothing, while an [`AUTH_OUTAGE_HOLD`] runs.
+    /// Starts the call's deadline: what is left of the request's
+    /// [`AUTH_DEADLINE`] (see [`with_auth_budget`]), shared by the wait on a
+    /// dial and the returned client's one call.
     pub async fn client(&self) -> Result<AuthClient<'_>, Status> {
-        let deadline = tokio::time::Instant::now() + AUTH_DEADLINE;
+        let started = tokio::time::Instant::now();
+        let allowance = budget_left();
+        let deadline = started + allowance;
         let (attempt, dial) = {
             let mut slot = lock(&self.slot);
+            if let Some(refusal) = slot.held(started) {
+                return Err(refusal);
+            }
             match &slot.state {
                 ChannelState::Ready(channel) => {
                     let channel = channel.clone();
-                    return Ok(self.client_on(channel, Some(slot.generation), deadline));
+                    return Ok(self.client_on(channel, Some(slot.generation), started, allowance));
                 }
                 ChannelState::Dialing { attempt, dial } => (*attempt, dial.clone()),
                 ChannelState::Empty => self.start_dial(&mut slot),
@@ -251,10 +371,15 @@ impl AuthChannel {
         // Giving up on the wait leaves the dial running and named: its own
         // task records its outcome, and later callers still share it.
         let Ok(result) = tokio::time::timeout_at(deadline, dial).await else {
-            debug!("lore auth connect did not finish within {AUTH_DEADLINE:?}");
-            return Err(Status::internal(format!(
-                "lore auth service did not connect within {AUTH_DEADLINE:?}"
-            )));
+            debug!("lore auth connect did not finish within {allowance:?}");
+            charge(started);
+            let message = format!("lore auth service did not connect within {allowance:?}");
+            // A request that spent most of its budget elsewhere says nothing
+            // about the service: only a whole deadline starts a hold.
+            if allowance == AUTH_DEADLINE {
+                lock(&self.slot).start_hold(&message);
+            }
+            return Err(auth_unavailable_status(message));
         };
         let mut slot = lock(&self.slot);
         match result {
@@ -264,13 +389,14 @@ impl AuthChannel {
                 // generation, rather than tagging an old channel with it.
                 if let ChannelState::Ready(current) = &slot.state {
                     let current = current.clone();
-                    return Ok(self.client_on(current, Some(slot.generation), deadline));
+                    return Ok(self.client_on(current, Some(slot.generation), started, allowance));
                 }
                 // Already discarded, no replacement yet: a channel that may
                 // discard nothing.
-                Ok(self.client_on(channel, None, deadline))
+                Ok(self.client_on(channel, None, started, allowance))
             }
             Err(status) => {
+                charge(started);
                 // Only a task that never finished leaves its attempt named.
                 if slot.names(attempt) {
                     slot.state = ChannelState::Empty;
@@ -284,12 +410,14 @@ impl AuthChannel {
         &self,
         channel: Channel,
         generation: Option<u64>,
-        deadline: tokio::time::Instant,
+        started: tokio::time::Instant,
+        allowance: Duration,
     ) -> AuthClient<'_> {
         AuthClient {
             owner: self,
             generation,
-            deadline,
+            started,
+            allowance,
             helper: LoreAuthClientHelper::new(channel),
         }
     }
@@ -302,21 +430,22 @@ impl AuthChannel {
     }
 }
 
-/// Runs `call` until `deadline`, the end of the request's [`AUTH_DEADLINE`].
-/// A timeout becomes `Unavailable`, which [`is_connection_failure`] matches,
-/// so the caller's error mapping still turns it into a denial or `Internal`,
-/// never an allow.
+/// Runs `call` for `allowance` from `started`: what was left of the request's
+/// [`AUTH_DEADLINE`]. A timeout becomes an [`auth_unavailable_status`], which
+/// [`is_connection_failure`] matches (it has a source), and which every
+/// caller's error mapping passes on as a failure, never an allow.
 async fn within_deadline<T>(
     rpc: &str,
-    deadline: tokio::time::Instant,
+    started: tokio::time::Instant,
+    allowance: Duration,
     call: impl Future<Output = LoreAuthApiResult<T>>,
 ) -> LoreAuthApiResult<T> {
-    tokio::time::timeout_at(deadline, call)
+    tokio::time::timeout_at(started + allowance, call)
         .await
         .unwrap_or_else(|_elapsed| {
-            debug!("lore auth {rpc} did not answer within {AUTH_DEADLINE:?}");
-            Err(Status::unavailable(format!(
-                "lore auth service did not answer {rpc} within {AUTH_DEADLINE:?}"
+            debug!("lore auth {rpc} did not answer within {allowance:?}");
+            Err(auth_unavailable_status(format!(
+                "lore auth service did not answer {rpc} within {allowance:?}"
             )))
         })
 }
@@ -328,14 +457,36 @@ pub struct AuthClient<'a> {
     /// The installed channel this client uses; `None` when it is not the
     /// installed one, so its failures discard nothing.
     generation: Option<u64>,
-    /// End of the request's [`AUTH_DEADLINE`], set by [`AuthChannel::client`].
-    deadline: tokio::time::Instant,
+    /// When [`AuthChannel::client`] was called: the call's charge to the
+    /// request's budget runs from here.
+    started: tokio::time::Instant,
+    /// What was left of the request's [`AUTH_DEADLINE`] when
+    /// [`AuthChannel::client`] was called; the call's deadline runs from
+    /// `started`.
+    allowance: Duration,
     helper: LoreAuthClientHelper,
 }
 
 impl AuthClient<'_> {
     fn settle<T>(&self, result: LoreAuthApiResult<T>) -> LoreAuthApiResult<T> {
+        charge(self.started);
+        // A call that had only the rest of a spent budget and ran out of it
+        // says nothing about the service or the connection: it neither starts
+        // a hold nor discards the channel.
+        let budget_short = self.allowance < AUTH_DEADLINE
+            && matches!(&result, Err(status) if is_auth_unavailable(status));
+        match &result {
+            // Only this module's own timeout starts a hold; any status the
+            // service sent, a denial included, does not.
+            Err(status) if is_auth_unavailable(status) && !budget_short => {
+                lock(&self.owner.slot).start_hold(status.message());
+            }
+            Err(_) => {}
+            // The service answered: any hold is over.
+            Ok(_) => lock(&self.owner.slot).hold = None,
+        }
         if let Err(status) = &result
+            && !budget_short
             && is_connection_failure(status)
             && let Some(generation) = self.generation
         {
@@ -351,7 +502,8 @@ impl AuthClient<'_> {
     ) -> LoreAuthApiResult<CheckUserPermissionResponse> {
         let result = within_deadline(
             "check_user_permission",
-            self.deadline,
+            self.started,
+            self.allowance,
             self.helper.check_user_permission(request),
         )
         .await;
@@ -364,7 +516,8 @@ impl AuthClient<'_> {
     ) -> LoreAuthApiResult<LookupUserPermissionsResponse> {
         let result = within_deadline(
             "lookup_user_permissions",
-            self.deadline,
+            self.started,
+            self.allowance,
             self.helper.lookup_user_permissions(request),
         )
         .await;

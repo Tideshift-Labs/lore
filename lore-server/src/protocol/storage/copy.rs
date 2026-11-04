@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
@@ -151,9 +152,7 @@ impl Message for Copy {
             repository_authorizer
                 .check_repository_access(token.as_ref(), self.source_repository, None)
                 .await
-                .map_err(|status| {
-                    MessageHandleError::AuthorizationFailure(status.message().to_string())
-                })?;
+                .map_err(|status| MessageHandleError::from_authorization_status(&status))?;
         }
 
         let user_id = get_user_id_from_context(&context);
