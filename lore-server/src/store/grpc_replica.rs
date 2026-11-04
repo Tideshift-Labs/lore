@@ -34,7 +34,7 @@ use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
 use lore_telemetry::observe::ObserveResult;
-#[cfg(feature = "test-util")]
+#[cfg(feature = "mock-replication-client")]
 use mockall::automock;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -225,14 +225,17 @@ pub struct ReplicationClientImpl {
     instruments: Arc<ReplicationClientInstruments>,
 }
 
-#[cfg(feature = "test-util")]
+// Fork: the mock swap has its own feature, not `test-util`. `lore-integration-tests` enables
+// `test-util` for the crate's test-only accessors, and under `test-util` its real-server
+// replication tests got an unprogrammed mock in place of the real client.
+#[cfg(feature = "mock-replication-client")]
 pub use MockReplicationClientImpl as ReplicationClient;
-#[cfg(not(feature = "test-util"))]
+#[cfg(not(feature = "mock-replication-client"))]
 pub use ReplicationClientImpl as ReplicationClient;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
 
-#[cfg_attr(feature = "test-util", automock)]
+#[cfg_attr(feature = "mock-replication-client", automock)]
 impl ReplicationClientImpl {
     pub fn new(
         client: ReplicationServiceClient<Channel>,
