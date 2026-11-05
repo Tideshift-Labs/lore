@@ -510,6 +510,79 @@ fn pending_observation(pending_files: u64) -> WriteBehindObservation {
     }
 }
 
+// --- A falling cell-wide pending count is drain progress ---------------
+//
+// f5 (2026-11-04): a replica answered `drain_not_progressing` while its peer drained
+// the cell. `pending_files` is cell-wide, so a fall is progress even when this replica
+// promoted nothing itself.
+
+#[test]
+fn a_falling_cell_wide_pending_count_counts_as_drain_progress_without_own_promotions() {
+    let now = Instant::now();
+    let old = now - Duration::from_secs(30);
+    let mut state = healthy_state(now);
+    state.progress = Some(old);
+    record_observation(&mut state, Some(pending_observation(10)), now);
+    assert_eq!(reason(&state), Some("drain_not_progressing"));
+    record_observation(&mut state, Some(pending_observation(7)), now);
+    assert_eq!(state.progress, Some(now));
+    assert_eq!(reason(&state), None);
+}
+
+#[test]
+fn a_flat_or_rising_pending_count_is_not_drain_progress() {
+    let now = Instant::now();
+    let old = now - Duration::from_secs(30);
+    for next in [10, 12] {
+        let mut state = healthy_state(now);
+        state.progress = Some(old);
+        record_observation(&mut state, Some(pending_observation(10)), now);
+        record_observation(&mut state, Some(pending_observation(next)), now);
+        assert_eq!(state.progress, Some(old), "pending {next}");
+        assert_eq!(
+            reason(&state),
+            Some("drain_not_progressing"),
+            "pending {next}"
+        );
+    }
+}
+
+#[test]
+fn a_pending_count_that_fell_then_stalls_ages_out_from_the_last_fall() {
+    let now = Instant::now();
+    let old = now - Duration::from_secs(30);
+    for (fall_age_secs, expected) in [(6, Some("drain_not_progressing")), (2, None)] {
+        let fall_at = now - Duration::from_secs(fall_age_secs);
+        let mut state = healthy_state(now);
+        state.progress = Some(old);
+        record_observation(
+            &mut state,
+            Some(pending_observation(10)),
+            fall_at - Duration::from_secs(1),
+        );
+        record_observation(&mut state, Some(pending_observation(8)), fall_at);
+        assert_eq!(state.progress, Some(fall_at), "fall {fall_age_secs} s ago");
+        // Flat samples after the fall do not move the clock; the newest is fresh.
+        record_observation(&mut state, Some(pending_observation(8)), now);
+        assert_eq!(state.progress, Some(fall_at), "fall {fall_age_secs} s ago");
+        assert_eq!(reason(&state), expected, "fall {fall_age_secs} s ago");
+    }
+}
+
+#[test]
+fn a_pending_fall_across_an_observation_gap_is_not_drain_progress() {
+    // A gap leaves nothing to compare with.
+    let now = Instant::now();
+    let old = now - Duration::from_secs(30);
+    let mut state = healthy_state(now);
+    state.progress = Some(old);
+    record_observation(&mut state, Some(pending_observation(10)), now);
+    record_observation(&mut state, None, now);
+    record_observation(&mut state, Some(pending_observation(3)), now);
+    assert_eq!(state.progress, Some(old));
+    assert_eq!(reason(&state), Some("drain_not_progressing"));
+}
+
 #[test]
 fn a_failed_observation_keeps_the_last_good_one_until_it_is_stale() {
     // Row 76: a 1-sample `observe()` failure on one replica answered 503 at once, at the
@@ -597,7 +670,7 @@ fn a_gap_extends_the_drain_clock_by_the_blind_time_only() {
 }
 
 #[test]
-fn consecutive_good_observations_never_move_the_drain_clock() {
+fn consecutive_flat_good_observations_never_move_the_drain_clock() {
     let now = Instant::now();
     let mut state = healthy_state(now);
     let old = now - Duration::from_secs(30);

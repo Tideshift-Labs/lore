@@ -437,10 +437,11 @@ fn record_pass_outcome(
 /// failures have outlived the budget. A one-tick `observe()` stall used to answer
 /// 503 at once, and when it met a peer's own 503 the cell had no ready replica.
 ///
-/// **Blind time is not drain time.** Drain progress is credited only by this
-/// replica's own promotions or a fresh observation showing nothing pending, and
-/// `pending_files` is cell-wide. During a run of failed observations nothing can
-/// credit it, so the first good observation after a long run found the clock
+/// **Blind time is not drain time.** Drain progress is credited by this
+/// replica's own promotions, a fresh observation showing nothing pending, or a
+/// cell-wide pending count that fell (below). During a run of failed
+/// observations nothing can credit it, so the first good observation after a
+/// long run found the clock
 /// already past `stale_after` and answered `drain_not_progressing` at once. So
 /// the first good observation after a run extends the progress clock by the
 /// length of the run, capped at now. It is extended, not reset: age the clock
@@ -463,6 +464,14 @@ fn record_pass_outcome(
 /// The cost: a replica whose passes succeed but clean nothing reads ready while
 /// a peer drains the cell. A replica whose passes fail still ages out through
 /// `cleanup_stale`.
+///
+/// **A cell-wide pending count that fell since the last sample is drain
+/// progress, by the same rule.** `pending_files` is cell-wide, so a replica
+/// whose peer promoted its work, or whose own claims are cooling down after
+/// reserve contention, promoted nothing itself while the cell drained. Crediting
+/// only its own promotions answered `drain_not_progressing` there. A count that
+/// stays flat or rises with no own promotion still ages out over `stale_after`,
+/// measured from the last fall.
 ///
 /// Pure and synchronous, so the rule is testable without a store, a runtime or a
 /// Postgres fixture — the same reason `record_pass_outcome` is.
@@ -504,12 +513,14 @@ fn record_observation(
         state.capacity_run_began_after_stale_gap = after_stale_gap;
     }
     if after_gap.is_none()
-        && state
-            .observation
-            .as_ref()
-            .is_some_and(|(_, previous)| value.cleanup_backlog < previous.cleanup_backlog)
+        && let Some((_, previous)) = state.observation.as_ref()
     {
-        state.cleanup_progress = state.cleanup_progress.max(Some(at));
+        if value.pending_files < previous.pending_files {
+            state.progress = state.progress.max(Some(at));
+        }
+        if value.cleanup_backlog < previous.cleanup_backlog {
+            state.cleanup_progress = state.cleanup_progress.max(Some(at));
+        }
     }
     state.observation = Some((at, value));
 }
