@@ -35,7 +35,6 @@ use lore_server::authnz::auth::with_auth_budget;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::Grants;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
-use lore_server::authnz::repository_authorizer::UnavailableRecorder;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::authnz::repository_authorizer::flatten_denial;
 use lore_server::grpc::no_repository_access_status;
@@ -53,6 +52,8 @@ const ALLOW_OTHER_RESOURCE: u8 = 3;
 /// Answers an allow after five seconds.
 const SLOW_ALLOW: u8 = 4;
 const HANG: u8 = 5;
+/// Answers an allow after four seconds.
+const SLOW_ALLOW_4S: u8 = 6;
 
 fn repository() -> RepositoryId {
     LoreContext::from_str("0194b726b34e72b0b45550b88a967076")
@@ -104,6 +105,10 @@ impl tonic::server::UnaryService<lore_proto::auth::CheckUserPermissionRequest>
             match mode {
                 ALLOW => allow(resource_id),
                 ALLOW_OTHER_RESOURCE => allow("urc-someone-else".to_string()),
+                SLOW_ALLOW_4S => {
+                    tokio::time::sleep(Duration::from_secs(4)).await;
+                    allow(resource_id)
+                }
                 SLOW_ALLOW => {
                     tokio::time::sleep(Duration::from_secs(5)).await;
                     allow(resource_id)
@@ -447,11 +452,11 @@ async fn raw_call(channel: &AuthChannel) -> Result<(), Status> {
         .map(|_| ())
 }
 
-// A timeout on a call that had only the rest of a spent budget says nothing
-// about the service: no hold, no discarded channel.
+// A timeout on a call left with less than AUTH_CONNECT_TIMEOUT of a spent
+// budget says nothing about the service: no hold, no discarded channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_timeout_on_a_part_spent_budget_starts_no_hold_and_keeps_the_channel() {
-    let stub = Stub::start(SLOW_ALLOW);
+    let stub = Stub::start(SLOW_ALLOW_4S);
     let channel = AuthChannel::new(stub.url());
 
     let started = Instant::now();
@@ -478,8 +483,8 @@ async fn a_timeout_on_a_part_spent_budget_starts_no_hold_and_keeps_the_channel()
     })
     .await;
     assert!(
-        second_took >= Duration::from_millis(2500) && second_took < Duration::from_millis(4500),
-        "{second_took:?}"
+        second_took >= Duration::from_millis(3000) && second_took < Duration::from_millis(5000),
+        "the second call should get the ~4 s left, got {second_took:?}"
     );
     assert!(started.elapsed() < AUTH_DEADLINE + Duration::from_secs(2));
     assert_eq!(stub.calls(), 2);
@@ -493,6 +498,81 @@ async fn a_timeout_on_a_part_spent_budget_starts_no_hold_and_keeps_the_channel()
     assert!(began.elapsed() < Duration::from_secs(2));
     assert_eq!(stub.calls(), 3, "the call after was fast-failed");
     assert_eq!(channel.dial_attempts(), 1, "the channel was discarded");
+}
+
+// A few milliseconds of healthy auth earlier in the scope leave the hung call
+// a whole allowance (>= AUTH_CONNECT_TIMEOUT): it runs to near the full
+// deadline and its timeout does start a hold, discarding the channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timeout_after_a_few_ms_of_spent_budget_still_starts_a_hold() {
+    let stub = Stub::start(ALLOW);
+    let channel = AuthChannel::new(stub.url());
+
+    let started = Instant::now();
+    with_auth_budget(async {
+        raw_call(&channel).await.unwrap();
+        stub.set_mode(HANG);
+        let status = raw_call(&channel).await.unwrap_err();
+        assert!(is_auth_unavailable(&status), "{status:?}");
+    })
+    .await;
+    assert_timeout_bound(started.elapsed());
+    assert_eq!(stub.calls(), 2);
+
+    // Outside the scope the hold fails the call at once, sending nothing.
+    let began = Instant::now();
+    let status = raw_call(&channel).await.unwrap_err();
+    assert!(
+        began.elapsed() < Duration::from_millis(100),
+        "a held call took {:?}",
+        began.elapsed()
+    );
+    assert!(is_auth_unavailable(&status), "{status:?}");
+    assert_eq!(stub.calls(), 2, "a held call reached the auth service");
+}
+
+// The Copy shape: in one budget scope a healthy partition-style call on repo
+// A is answered at once, then the source check on repo B hangs. The hung call
+// still had a whole allowance, so its timeout is a real one: unavailable,
+// and a hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_source_check_after_a_healthy_partition_call_starts_a_hold() {
+    let source: RepositoryId = LoreContext::from_str("0194b726b34e72b0b45550b88a967077")
+        .unwrap()
+        .into();
+    let stub = Stub::start(ALLOW);
+    let authorizer = AuthClientAuthorizer::new(stub.url());
+
+    let started = Instant::now();
+    with_auth_budget(async {
+        granted(&authorizer).await.unwrap();
+        stub.set_mode(HANG);
+        let claims = AuthorizationToken::default();
+        let token = VerifiedToken {
+            raw: "identity.jwt",
+            claims: &claims,
+        };
+        let status = authorizer
+            .check_repository_access(Some(&token), source, None)
+            .await
+            .unwrap_err();
+        assert!(is_auth_unavailable(&status), "{status:?}");
+        assert_eq!(status.code(), Code::Internal);
+    })
+    .await;
+    assert_timeout_bound(started.elapsed());
+    let sent = stub.calls();
+    assert!(sent >= 2, "{sent}");
+
+    let began = Instant::now();
+    let status = check(&authorizer).await.unwrap_err();
+    assert!(
+        began.elapsed() < Duration::from_millis(100),
+        "a held call took {:?}",
+        began.elapsed()
+    );
+    assert!(is_auth_unavailable(&status), "{status:?}");
+    assert_eq!(stub.calls(), sent, "a held call reached the auth service");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -708,154 +788,4 @@ async fn require_action_on_a_hung_service_fails_within_one_deadline() {
         .unwrap_err();
     assert!(is_auth_unavailable(&status), "{status:?}");
     assert_timeout_bound(started.elapsed());
-}
-
-// The recorder wraps an authorizer for a path whose error type cannot carry a
-// `Status`; it must record a timeout and change nothing else.
-
-/// Answers like `Fixed`, and answers the sync question too.
-struct WithSync {
-    inner: Fixed,
-    sync: Option<Result<(), Status>>,
-}
-
-#[async_trait]
-impl RepositoryAuthorizer for WithSync {
-    async fn check_repository_access(
-        &self,
-        token: Option<&VerifiedToken<'_>>,
-        repository_id: RepositoryId,
-        action: Option<&str>,
-    ) -> Result<(), Status> {
-        self.inner
-            .check_repository_access(token, repository_id, action)
-            .await
-    }
-
-    async fn granted_actions(
-        &self,
-        token: Option<&VerifiedToken<'_>>,
-        repository_id: RepositoryId,
-    ) -> Result<Option<Grants>, Status> {
-        self.inner.granted_actions(token, repository_id).await
-    }
-
-    fn check_repository_access_sync(
-        &self,
-        _token: Option<&VerifiedToken<'_>>,
-        _repository_id: RepositoryId,
-        _action: Option<&str>,
-    ) -> Option<Result<(), Status>> {
-        self.sync.clone()
-    }
-}
-
-#[tokio::test]
-async fn the_recorder_records_only_an_auth_unavailable_error() {
-    let denied = Fixed {
-        enumerate: Err(Status::permission_denied("no")),
-        check: Err(Status::permission_denied("no")),
-    };
-    let recorder = UnavailableRecorder::new(&denied);
-    assert!(recorder.unavailable().is_none());
-    let check = recorder
-        .check_repository_access(None, repository(), None)
-        .await
-        .unwrap_err();
-    let granted = recorder
-        .granted_actions(None, repository())
-        .await
-        .unwrap_err();
-    // Results pass through unchanged and nothing is recorded for a denial.
-    assert_eq!(check.code(), Code::PermissionDenied);
-    assert_eq!(granted.code(), Code::PermissionDenied);
-    assert!(recorder.unavailable().is_none());
-
-    let allowed = Fixed {
-        enumerate: Ok(Some(Grants::All)),
-        check: Ok(()),
-    };
-    let recorder = UnavailableRecorder::new(&allowed);
-    recorder
-        .check_repository_access(None, repository(), None)
-        .await
-        .unwrap();
-    assert!(matches!(
-        recorder.granted_actions(None, repository()).await,
-        Ok(Some(Grants::All))
-    ));
-    assert!(recorder.unavailable().is_none());
-
-    let timed_out = Fixed {
-        enumerate: Err(unavailable()),
-        check: Err(unavailable()),
-    };
-    let recorder = UnavailableRecorder::new(&timed_out);
-    let status = recorder
-        .check_repository_access(None, repository(), None)
-        .await
-        .unwrap_err();
-    assert!(is_auth_unavailable(&status));
-    let seen = recorder
-        .unavailable()
-        .expect("the timeout was not recorded");
-    assert!(is_auth_unavailable(&seen));
-    assert_eq!(seen.message(), unavailable().message());
-
-    let recorder = UnavailableRecorder::new(&timed_out);
-    recorder
-        .granted_actions(None, repository())
-        .await
-        .unwrap_err();
-    assert!(recorder.unavailable().is_some());
-}
-
-#[tokio::test]
-async fn the_recorder_keeps_a_timeout_seen_before_a_later_denial() {
-    let timed_out = Fixed {
-        enumerate: Ok(None),
-        check: Err(unavailable()),
-    };
-    let recorder = UnavailableRecorder::new(&timed_out);
-    recorder
-        .check_repository_access(None, repository(), None)
-        .await
-        .unwrap_err();
-    // A later answer through the same recorder does not clear the record.
-    let allowed = Fixed {
-        enumerate: Ok(None),
-        check: Ok(()),
-    };
-    let other = UnavailableRecorder::new(&allowed);
-    other
-        .check_repository_access(None, repository(), None)
-        .await
-        .unwrap();
-    assert!(other.unavailable().is_none());
-    assert!(recorder.unavailable().is_some());
-}
-
-#[test]
-fn the_recorder_delegates_the_sync_path() {
-    for sync in [
-        None,
-        Some(Ok(())),
-        Some(Err(Status::permission_denied("no"))),
-    ] {
-        let inner = WithSync {
-            inner: Fixed {
-                enumerate: Ok(None),
-                check: Ok(()),
-            },
-            sync: sync.clone(),
-        };
-        let recorder = UnavailableRecorder::new(&inner);
-        let got = recorder.check_repository_access_sync(None, repository(), None);
-        match (sync, got) {
-            (None, None) | (Some(Ok(())), Some(Ok(()))) => {}
-            (Some(Err(want)), Some(Err(got))) => assert_eq!(want.code(), got.code()),
-            (want, got) => panic!("sync path changed: want {want:?}, got {got:?}"),
-        }
-        assert!(recorder.unavailable().is_none());
-    }
 }

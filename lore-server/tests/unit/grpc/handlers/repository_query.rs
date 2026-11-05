@@ -123,29 +123,42 @@ impl RepositoryAuthorizer for TimedOutRepositoryAuthorizer {
     }
 }
 
-/// FORK-LOCAL (Tideshift): an auth timeout is the server's condition, not
-/// "the repository is gone": it answers `Internal`, never `NotFound`.
+/// FORK-LOCAL (Tideshift): non-disclosure. An auth timeout answers exactly
+/// like a deny (`NotFound`, same message), by id and by name: a caller
+/// without access must not tell a timeout from a deny.
 #[tokio::test]
-async fn an_auth_timeout_answers_internal_not_found() {
+async fn an_auth_timeout_answers_the_same_not_found_as_a_deny() {
     let id = random::<RepositoryId>();
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
     LORE_CONTEXT
         .scope(execution, async move {
             seed_repository(immutable_store.clone(), mutable_store.clone(), id, "repo").await;
-            for request in [query_by_id(id), query_by_name("repo")] {
-                let err = handler(
-                    request,
+            let requests: [fn(RepositoryId) -> Request<RepositoryQueryRequest>; 2] =
+                [query_by_id, |_| query_by_name("repo")];
+            for request in requests {
+                let denied = handler(
+                    request(id),
+                    Arc::new(DenyAllRepositoryAuthorizer),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("a denied check must fail");
+                let timed_out = handler(
+                    request(id),
                     Arc::new(TimedOutRepositoryAuthorizer),
                     immutable_store.clone(),
                     mutable_store.clone(),
                 )
                 .await
                 .expect_err("a timed-out check must fail");
-                assert_eq!(err.code(), Code::Internal, "{err:?}");
+                assert_eq!(timed_out.code(), Code::NotFound, "{timed_out:?}");
+                assert_eq!(timed_out.code(), denied.code());
+                assert_eq!(timed_out.message(), denied.message());
                 assert!(
-                    lore_server::authnz::auth::is_auth_unavailable(&err),
-                    "{err:?}"
+                    !lore_server::authnz::auth::is_auth_unavailable(&timed_out),
+                    "{timed_out:?}"
                 );
             }
         })

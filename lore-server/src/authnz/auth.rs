@@ -127,6 +127,13 @@ fn budget_left() -> Duration {
         .unwrap_or(AUTH_DEADLINE)
 }
 
+/// Whether a call that ran out of `allowance` says the service is down: it
+/// had at least [`AUTH_CONNECT_TIMEOUT`], so a few milliseconds of earlier
+/// healthy auth on the request do not hide an outage.
+fn whole_enough(allowance: Duration) -> bool {
+    allowance >= AUTH_CONNECT_TIMEOUT
+}
+
 fn charge(started: tokio::time::Instant) {
     // Outside a budget there is nothing to charge.
     let _ = AUTH_SPENT.try_with(|spent| spent.set(spent.get() + started.elapsed()));
@@ -375,8 +382,8 @@ impl AuthChannel {
             charge(started);
             let message = format!("lore auth service did not connect within {allowance:?}");
             // A request that spent most of its budget elsewhere says nothing
-            // about the service: only a whole deadline starts a hold.
-            if allowance == AUTH_DEADLINE {
+            // about the service.
+            if whole_enough(allowance) {
                 lock(&self.slot).start_hold(&message);
             }
             return Err(auth_unavailable_status(message));
@@ -470,10 +477,10 @@ pub struct AuthClient<'a> {
 impl AuthClient<'_> {
     fn settle<T>(&self, result: LoreAuthApiResult<T>) -> LoreAuthApiResult<T> {
         charge(self.started);
-        // A call that had only the rest of a spent budget and ran out of it
-        // says nothing about the service or the connection: it neither starts
-        // a hold nor discards the channel.
-        let budget_short = self.allowance < AUTH_DEADLINE
+        // A call left with less than AUTH_CONNECT_TIMEOUT of a spent budget
+        // that ran out of it says nothing about the service or the
+        // connection: it neither starts a hold nor discards the channel.
+        let budget_short = !whole_enough(self.allowance)
             && matches!(&result, Err(status) if is_auth_unavailable(status));
         match &result {
             // Only this module's own timeout starts a hold; any status the

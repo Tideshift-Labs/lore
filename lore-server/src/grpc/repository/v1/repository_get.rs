@@ -25,9 +25,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
-use crate::authnz::auth::is_auth_unavailable;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::authnz::repository_authorizer::UnavailableRecorder;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::domain::DomainContext;
 use crate::domain::read_generation;
@@ -138,9 +136,6 @@ pub async fn repository_get_implementation(
     LORE_CONTEXT
         .scope(execution, async move {
             let token = get_verified_token(&extensions);
-            // FORK-LOCAL (Tideshift): an auth service timeout is reported as
-            // itself, not as an unknown repository.
-            let authorizer = UnavailableRecorder::new(authorizer.as_ref());
             // Authorize, then read the generation, then the record (WP-120). A
             // denied caller gets the same NotFound as before and causes no
             // generation read. Reading the generation before the record means
@@ -148,7 +143,7 @@ pub async fn repository_get_implementation(
             let authorized = generation_before_record(
                 repository.clone(),
                 &query,
-                &authorizer,
+                authorizer.as_ref(),
                 token.as_ref(),
                 domain_context,
             )
@@ -163,18 +158,14 @@ pub async fn repository_get_implementation(
                     let (metadata, metadata_hash) = repository_load_id_with_repairs(
                         repository.clone(),
                         id,
-                        Some(&authorizer),
+                        Some(authorizer.as_ref()),
                         token.as_ref(),
                         allow_repairs,
                         pre_authorized,
                     )
                     .await
                     .filter_slow_down()?
-                    .map_err(|_err| {
-                        authorizer.unavailable().unwrap_or_else(|| {
-                            Status::not_found(format!("Repository {id} not found"))
-                        })
-                    })?;
+                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
@@ -182,18 +173,14 @@ pub async fn repository_get_implementation(
                     let (id, metadata, metadata_hash) = repository_load_name_with_repairs(
                         repository.clone(),
                         name.as_str(),
-                        Some(&authorizer),
+                        Some(authorizer.as_ref()),
                         token.as_ref(),
                         allow_repairs,
                         pre_authorized,
                     )
                     .await
                     .filter_slow_down()?
-                    .map_err(|_err| {
-                        authorizer.unavailable().unwrap_or_else(|| {
-                            Status::not_found(format!("Repository {name} not found"))
-                        })
-                    })?;
+                    .map_err(|_err| Status::not_found(format!("Repository {name} not found")))?;
                     (id, metadata, metadata_hash)
                 }
             };
@@ -255,12 +242,7 @@ async fn generation_before_record(
         .await
         .map_err(|status| {
             debug!(%id, "User authorization failed: {status}");
-            // FORK-LOCAL (Tideshift): an auth service timeout is not a miss.
-            if is_auth_unavailable(&status) {
-                status
-            } else {
-                Status::not_found(denied)
-            }
+            Status::not_found(denied)
         })?;
     let generation = read_generation::repository_generation(domain_context, id.data()).await;
     Ok(Some((id, generation)))
