@@ -29,6 +29,7 @@ use tracing::info;
 use super::drain_status;
 use super::event_readiness;
 use super::health_check;
+use super::lb_health;
 use super::presigned;
 use super::security_headers::ContentTypeAllowlist;
 use super::security_headers::ContentTypePolicy;
@@ -240,6 +241,11 @@ pub fn create_router(
         .route(
             "/health_check",
             routing::get(health_check::handler).with_state(server_health.clone()),
+        )
+        // FORK-LOCAL (Tideshift): replica-local membership only; see `lb_health`.
+        .route(
+            "/lb_health",
+            routing::get(lb_health::handler).with_state(server_health.clone()),
         )
         .route(
             "/drain_status",

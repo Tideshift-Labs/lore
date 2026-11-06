@@ -1771,3 +1771,98 @@ fn the_retired_floor_age_gauge_is_recorded_outside_the_good_observation_branch()
          good-observation branch (skips {skips}, record {record}, branch {good_branch})"
     );
 }
+
+// --- /lb_health: only replica-local write-behind faults ----------------
+
+fn fault(state: &State) -> Option<&'static str> {
+    replica_fault(state, Duration::from_secs(5))
+}
+
+#[test]
+fn replica_fault_is_none_without_an_observation() {
+    // Cannot decide: must not eject.
+    let state = State::default();
+    assert_eq!(reason(&state), Some("observation_unknown"));
+    assert_eq!(fault(&state), None);
+}
+
+#[test]
+fn replica_fault_reports_a_stopped_worker() {
+    let mut state = healthy_state(Instant::now());
+    assert_eq!(fault(&state), None);
+    state.stopped = true;
+    assert_eq!(fault(&state), Some("worker_stopped"));
+    // Stopped is a fault even with no observation at all.
+    let state = State {
+        stopped: true,
+        ..State::default()
+    };
+    assert_eq!(fault(&state), Some("worker_stopped"));
+}
+
+#[test]
+fn replica_fault_reports_unusable_roots_only_on_a_fresh_observation() {
+    let now = Instant::now();
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.roots_usable = false;
+    assert_eq!(fault(&state), Some("root_unavailable"));
+
+    // Stale: the roots are unknown, not unusable.
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().0 = now - Duration::from_secs(30);
+    state.observation.as_mut().unwrap().1.roots_usable = false;
+    assert_eq!(fault(&state), None);
+
+    // Fresh and usable: no fault.
+    assert_eq!(fault(&healthy_state(now)), None);
+}
+
+#[test]
+fn replica_fault_ignores_every_cell_wide_readiness_reason() {
+    let now = Instant::now();
+    let stale = now - Duration::from_secs(30);
+
+    let mut cases: Vec<(&'static str, State)> = Vec::new();
+
+    let mut state = healthy_state(now);
+    state.worker = Some(stale);
+    cases.push(("worker_stale", state));
+
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.pending_files = 1;
+    state.progress = Some(stale);
+    cases.push(("drain_not_progressing", state));
+
+    let mut state = healthy_state(now);
+    state.cleanup = Some(stale);
+    cases.push(("cleanup_stale", state));
+
+    let mut state = healthy_state(now);
+    state.capacity_unavailable_since = Some(stale);
+    cases.push(("capacity_unavailable", state));
+
+    let mut state = healthy_state(now);
+    state.drain_backpressure_since = Some(stale);
+    cases.push(("drain_backpressure_sustained", state));
+
+    let mut state = healthy_state(now);
+    state.cleanup_backpressure_since = Some(stale);
+    cases.push(("cleanup_backpressure_sustained", state));
+
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().0 = stale;
+    cases.push(("observation_unknown", state));
+
+    for (expected, state) in &cases {
+        assert_eq!(
+            reason(state),
+            Some(*expected),
+            "readiness_reason for {expected}"
+        );
+        assert_eq!(
+            fault(state),
+            None,
+            "{expected} is cell-wide and must not be a replica fault"
+        );
+    }
+}

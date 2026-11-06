@@ -5,6 +5,7 @@ mod content_upload_drain;
 mod drain_status;
 mod event_readiness;
 mod health_check;
+mod lb_health;
 mod presign_token;
 mod presigned;
 mod repositories;

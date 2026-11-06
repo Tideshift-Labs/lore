@@ -3,6 +3,8 @@
 pub mod drain_status;
 pub mod event_readiness;
 pub mod health_check;
+// FORK-LOCAL (Tideshift): NLB membership check, see the module docs.
+pub mod lb_health;
 pub mod presign_token;
 pub mod presigned;
 pub mod repositories;

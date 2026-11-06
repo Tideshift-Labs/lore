@@ -714,6 +714,31 @@ fn readiness_reason(
     }
 }
 
+/// FORK-LOCAL (Tideshift): the write-behind faults that belong to THIS replica
+/// alone, for `/lb_health`.
+///
+/// Only two conditions qualify. `worker_stopped`: this process's write-behind
+/// task has ended. `root_unavailable`: a fresh observation says this host's own
+/// stage or spool root cannot be read. The stage and spool are a per-host
+/// volume, so no other replica shares that fault.
+///
+/// Every other `readiness_reason` is computed from the cell's shared Postgres
+/// and spool, so it is the same on every replica and must not eject one. A
+/// stale or absent observation is "cannot decide", which is `None`, never a
+/// fault: the roots are unknown, not unusable.
+#[lore_macro::test_pub]
+fn replica_fault(state: &State, stale_after: Duration) -> Option<&'static str> {
+    if state.stopped {
+        return Some("worker_stopped");
+    }
+    match state.observation.as_ref() {
+        Some((at, value)) if at.elapsed() < stale_after && !value.roots_usable => {
+            Some("root_unavailable")
+        }
+        _ => None,
+    }
+}
+
 /// A slow condition that is reported but does not fail readiness.
 ///
 /// **A slow cell-wide cleanup is not unreadiness (INV-FT, row 71).** The backlog
@@ -797,6 +822,12 @@ fn refresh_activity(state: &mut State, activity: WriteBehindActivity) {
 }
 
 impl FragmentWriteBehindReadiness {
+    /// The replica-local fault `/lb_health` acts on. Reads in-memory state only.
+    pub fn replica_fault(&self) -> Option<&'static str> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        replica_fault(&state, self.stale_after)
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         refresh_activity(&mut state, self.handle.activity());
