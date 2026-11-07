@@ -505,6 +505,17 @@ pub struct QuicConnection {
 }
 
 impl QuicConnection {
+    /// FORK-LOCAL (Tideshift, WP-124): hold the reconnect guard, so a test can make a reconnect's
+    /// managed deadline fire while it waits for the guard, with the old connection still open.
+    #[cfg(feature = "test_seams")]
+    pub async fn hold_reconnect_guard_for_test(&self) -> tokio::sync::SemaphorePermit<'_> {
+        #[allow(clippy::expect_used)]
+        self.reconnect_guard
+            .acquire()
+            .await
+            .expect("the reconnect guard is never closed")
+    }
+
     #[cfg(feature = "test_seams")]
     pub fn take_authorize_retry_observations_for_test(&self) -> AuthorizeRetryObservations {
         std::mem::take(&mut *self.authorize_retry_observations.lock())
@@ -1206,6 +1217,27 @@ where
     ServiceClientType: ServiceClient,
     Sink: OutcomeSink,
 {
+    // FORK-LOCAL (Tideshift, WP-124 follow-up (l)): a dispatched command that must not be repeated
+    // never reconnects here, whatever its caller decided. After a successful reconnect a
+    // session-less command (`session_id == 0`) is sent again below, which for a dispatched
+    // `MutableNoReplay` is the second dispatch the replay contract forbids. `classify` already
+    // keeps these commands out of this function; this guard makes the function safe on its own.
+    // A lost answer (or a peer's unknown outcome) is an unknown outcome; an answered failure keeps
+    // its own error.
+    if first_failure.dispatched != DispatchState::NotDispatched
+        && service_client.replay_class(request_type) == ReplayClass::MutableNoReplay
+    {
+        if outcome_is_unknown(ReplayClass::MutableNoReplay, first_failure.dispatched)
+            || matches!(first_failure.error, QuicClientError::OutcomeUnknown)
+        {
+            return Err(report_unknown(service_client, request_type, unknown));
+        }
+        return Err(service_client.map_send_error(
+            request_type,
+            SendWithReconnectError::ClientError(first_failure.error),
+        ));
+    }
+
     // FORK-LOCAL (Tideshift, WP-124): in a managed scope the reconnect is bounded by the managed
     // bound, as the send phases are. Without it a dead path costs the whole backoff loop (minutes)
     // with no error. Outside a scope the deadline is `None` and the loop is unchanged. A managed
@@ -1233,9 +1265,9 @@ where
         // asking again is safe, and the caller must learn the bound fired. A dispatched mutation
         // is never read as not sent: a lost answer is an unknown outcome, recorded in the sink as
         // `classify` would record it, and an answered failure keeps its own error. Those two arms
-        // are defence in depth: `classify` ends a dispatched `MutableNoReplay` command before it
-        // reaches this reconnect, so no production path reaches them today. The unit tests in
-        // `managed_reconnect_bound.rs` call this function directly to pin them.
+        // are defence in depth behind two gates: `classify` and the guard at the top of this
+        // function both end a dispatched `MutableNoReplay` command before it reaches this
+        // reconnect, so nothing reaches them today.
         Err(ReconnectDeadline) => {
             if first_failure.dispatched == DispatchState::NotDispatched {
                 return Err(service_client.map_send_error(

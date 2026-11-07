@@ -35,6 +35,7 @@ use lore_transport::quic::client::RecordOutcome;
 use lore_transport::quic::client::SendFailure;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::client::reconnect_and_retry;
+use lore_transport::quic::client::send_with_reconnect;
 use lore_transport::quic::storage_service::Command;
 use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::replay::MutableOutcome;
@@ -140,6 +141,15 @@ fn assert_expired(error: &ProtocolError, what: &str) {
     assert!(
         !text.contains("storage command was not dispatched"),
         "{what}: must not read as the session-rebind proof, or StorageSession::attempt retries it: {text}"
+    );
+}
+
+/// The guard at the top of `reconnect_and_retry` ends a dispatched `MutableNoReplay` before any
+/// reconnect: no wait, so well under the bound.
+fn assert_immediate(elapsed: Duration, what: &str) {
+    assert!(
+        elapsed < BOUND / 3,
+        "{what}: a dispatched mutation must not wait for a reconnect: {elapsed:?}"
     );
 }
 
@@ -425,6 +435,7 @@ async fn an_unmanaged_put_with_the_server_unreachable_is_still_pending_after_twi
 async fn deadline_outcome(
     request: Command,
     first_failure: SendFailure,
+    no_reconnect: bool,
 ) -> (ProtocolError, Option<OutcomeUnknown>, Duration) {
     let peer = Peer::start();
     let (client, session) = client_with_session(&peer).await;
@@ -451,6 +462,13 @@ async fn deadline_outcome(
 
     let error = result.expect_err("an unreachable server never yields a reply");
     let recorded = sink.lock().clone();
+    if no_reconnect {
+        assert_eq!(
+            client.quic().epoch.load(Ordering::Relaxed),
+            epoch,
+            "a dispatched mutation must not start a reconnect"
+        );
+    }
     (error, recorded, elapsed)
 }
 
@@ -462,18 +480,20 @@ fn assert_collapsed_unknown(error: &ProtocolError, recorded: &Option<OutcomeUnkn
     assert!(!is_managed_reconnect_expired(error), "{error:?}");
     assert!(error.is_disconnected(), "{error:?}");
 }
-/// A dispatched `MutableNoReplay` whose answer was lost, at the deadline, is an unknown outcome:
-/// reported in the sink and never the not-sent expiry. Nothing is resent.
+
+/// A dispatched `MutableNoReplay` whose answer was lost is an unknown outcome: reported in the sink
+/// and never the not-sent expiry. `reconnect_and_retry` returns at once, without a reconnect.
 #[tokio::test]
 async fn a_lost_mutable_answer_at_the_reconnect_deadline_is_an_unknown_outcome() {
     let (error, recorded, elapsed) = deadline_outcome(
         Command::Put,
         SendFailure::response_lost(QuicClientError::Read),
+        true,
     )
     .await;
 
     assert_collapsed_unknown(&error, &recorded);
-    assert_bounded(elapsed, "lost mutable answer");
+    assert_immediate(elapsed, "lost mutable answer");
 }
 
 /// The peer reported a lost lower transport: the same unknown outcome, even though the failure
@@ -483,11 +503,12 @@ async fn a_peer_reported_outcome_unknown_at_the_reconnect_deadline_stays_unknown
     let (error, recorded, elapsed) = deadline_outcome(
         Command::Put,
         SendFailure::answered(QuicClientError::OutcomeUnknown),
+        true,
     )
     .await;
 
     assert_collapsed_unknown(&error, &recorded);
-    assert_bounded(elapsed, "peer-reported unknown");
+    assert_immediate(elapsed, "peer-reported unknown");
 }
 
 /// An answered failure is final: it keeps its own error, is not the expiry and is not recorded as
@@ -497,6 +518,7 @@ async fn an_answered_failure_at_the_reconnect_deadline_keeps_its_own_error() {
     let (error, recorded, elapsed) = deadline_outcome(
         Command::Put,
         SendFailure::answered(QuicClientError::NotFound),
+        true,
     )
     .await;
 
@@ -508,7 +530,7 @@ async fn an_answered_failure_at_the_reconnect_deadline_keeps_its_own_error() {
             || format!("{error}").to_lowercase().contains("not found"),
         "the answered error is kept: {error:?}"
     );
-    assert_bounded(elapsed, "answered failure");
+    assert_immediate(elapsed, "answered failure");
 }
 
 /// Not dispatched: the typed expiry, recorded as nothing.
@@ -517,6 +539,7 @@ async fn a_not_dispatched_failure_at_the_reconnect_deadline_is_the_not_sent_expi
     let (error, recorded, elapsed) = deadline_outcome(
         Command::Put,
         SendFailure::not_dispatched(QuicClientError::StreamOpen),
+        false,
     )
     .await;
 
@@ -531,6 +554,7 @@ async fn a_dispatched_read_at_the_reconnect_deadline_still_gets_the_read_expiry(
     let (error, recorded, elapsed) = deadline_outcome(
         Command::Get,
         SendFailure::response_lost(QuicClientError::Read),
+        false,
     )
     .await;
 
@@ -538,4 +562,326 @@ async fn a_dispatched_read_at_the_reconnect_deadline_still_gets_the_read_expiry(
     assert!(!error.is_outcome_unknown(), "{error:?}");
     assert!(recorded.is_none());
     assert_bounded(elapsed, "dispatched read");
+}
+
+// ---- Executed no-resend proof: a dispatched `MutableNoReplay` is never sent again around the
+// managed reconnect deadline. The peer stays alive and counts every `Put` header it reads.
+
+/// The raw `Put` body the scripted peer reads. It does not parse a `Put`, only its framing.
+fn raw_put() -> [Bytes; 1] {
+    [Bytes::from(vec![0xA5u8; 64])]
+}
+
+/// Dispatch one `Put` for real to a peer that reads it and never answers, and wait until the peer
+/// has counted it. The sending task is then aborted so it cannot act on the failure that follows.
+async fn dispatch_silent_put(peer: &Peer, client: &Arc<StorageClient>, session: u32) {
+    peer.rule(PUT, Reply::Silent);
+    let sender = {
+        let client = client.clone();
+        lore_base::lore_spawn!(lore_transport::with_managed_workflow(async move {
+            let sink = parking_lot::Mutex::new(None);
+            let _ = send_with_reconnect::<_, _, 1, false, true>(
+                &*client,
+                Command::Put,
+                session,
+                raw_put,
+                RecordOutcome(&sink),
+            )
+            .await;
+        }))
+    };
+    peer.wait_until("the Put to reach the peer", |peer| {
+        peer.seen_opcode(PUT).len() == 1
+    })
+    .await;
+    sender.abort();
+}
+
+/// Let anything a bug would have sent after the call reach the peer before the count is read.
+const GRACE: Duration = Duration::from_millis(700);
+
+/// A `Put` was dispatched and its answer lost. Drive `reconnect_and_retry` at the current epoch in
+/// a managed workflow. `peer_stays_reachable` decides what the peer does to the connection first.
+async fn recover_lost_put(
+    session_id_of: impl FnOnce(u32) -> u32,
+    peer_stays_reachable: bool,
+    failure: SendFailure,
+) -> (
+    ProtocolError,
+    Option<OutcomeUnknown>,
+    Duration,
+    usize,
+    Peer,
+    Arc<StorageClient>,
+) {
+    let peer = Peer::start();
+    let (client, session) = client_with_session(&peer).await;
+    let client = Arc::new(client);
+    dispatch_silent_put(&peer, &client, session).await;
+    assert_eq!(
+        peer.seen_opcode(PUT).len(),
+        1,
+        "the Put was dispatched once"
+    );
+
+    if peer_stays_reachable {
+        // The connection dies; the peer keeps accepting, so the reconnect succeeds.
+        peer.close_connections();
+        peer.wait_until("the connection to close", |peer| {
+            peer.closed_connections() == peer.accepted_connections()
+        })
+        .await;
+    } else {
+        // Every new handshake fails until the deadline. The peer object stays alive and counting.
+        make_unreachable(&peer).await;
+    }
+
+    let sink = parking_lot::Mutex::new(None);
+    let epoch = client.quic().epoch.load(Ordering::Relaxed);
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        lore_transport::with_managed_workflow(reconnect_and_retry::<_, _, 1, false, true>(
+            &*client,
+            Command::Put,
+            session_id_of(session),
+            raw_put,
+            RecordOutcome(&sink),
+            epoch,
+            failure,
+        )),
+    )
+    .await
+    .expect("reconnect_and_retry never returned");
+    let elapsed = started.elapsed();
+    tokio::time::sleep(GRACE).await;
+    let error = result.expect_err("a lost Put is never answered");
+    let recorded = sink.lock().clone();
+    let puts = peer.seen_opcode(PUT).len();
+    (error, recorded, elapsed, puts, peer, client)
+}
+
+/// A. A live, counting peer whose handshakes all fail: one dispatch, an unknown outcome, and an
+/// immediate return (the guard at the top of `reconnect_and_retry` ends it before any reconnect).
+#[tokio::test]
+async fn a_dispatched_put_is_not_resent_when_the_reconnect_deadline_fires() {
+    let (error, recorded, elapsed, puts, _peer, _client) = recover_lost_put(
+        |session| session,
+        false,
+        SendFailure::response_lost(QuicClientError::Read),
+    )
+    .await;
+
+    assert_eq!(puts, 1, "the Put must be dispatched exactly once");
+    assert_collapsed_unknown(&error, &recorded);
+    assert_immediate(elapsed, "dispatched put, dead peer");
+}
+
+/// B1. The connection is replaced before the deadline, with a session id: the id belongs to the
+/// dead connection, so nothing may be framed on the new one. One dispatch.
+#[tokio::test]
+async fn a_dispatched_put_with_a_session_is_not_resent_on_the_replaced_connection() {
+    let (error, recorded, elapsed, puts, peer, _client) = recover_lost_put(
+        |session| session,
+        true,
+        SendFailure::response_lost(QuicClientError::Read),
+    )
+    .await;
+
+    eprintln!(
+        "B session!=0: puts={puts} connections={} elapsed={elapsed:?} sink={recorded:?} error={error:?}",
+        peer.accepted_connections()
+    );
+    assert_eq!(puts, 1, "no second Put on the replacement connection");
+    assert!(!is_managed_reconnect_expired(&error), "{error:?}");
+}
+
+/// B0. The same with session id 0: after a successful reconnect `reconnect_and_retry` sends again
+/// when the id is 0, and only `classify` keeps a lost mutation out of that path.
+#[tokio::test]
+async fn a_dispatched_put_without_a_session_is_not_resent_on_the_replaced_connection() {
+    let (error, recorded, elapsed, puts, peer, _client) = recover_lost_put(
+        |_| 0,
+        true,
+        SendFailure::response_lost(QuicClientError::Read),
+    )
+    .await;
+
+    eprintln!(
+        "B session==0: puts={puts} connections={} elapsed={elapsed:?} sink={recorded:?} error={error:?}",
+        peer.accepted_connections()
+    );
+    assert_eq!(puts, 1, "no second Put on the replacement connection");
+}
+
+/// C. The real entry: `send_with_reconnect` for a `Put` in a managed workflow, against a live
+/// peer that reads it and never answers. The silence is a lost answer at the managed bound: one
+/// dispatch, the unknown outcome in the sink, about one bound, and no reconnect.
+#[tokio::test]
+async fn send_with_reconnect_dispatches_a_silent_put_once_and_reports_unknown() {
+    let peer = Peer::start();
+    let (client, session) = client_with_session(&peer).await;
+    peer.rule(PUT, Reply::Silent);
+    let sink = parking_lot::Mutex::new(None);
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        lore_transport::with_managed_workflow(send_with_reconnect::<_, _, 1, false, true>(
+            &client,
+            Command::Put,
+            session,
+            raw_put,
+            RecordOutcome(&sink),
+        )),
+    )
+    .await
+    .expect("send_with_reconnect never returned");
+    let elapsed = started.elapsed();
+    tokio::time::sleep(GRACE).await;
+
+    let error = result.expect_err("a silent peer never answers");
+    let recorded = sink.lock().clone();
+    assert_eq!(peer.seen_opcode(PUT).len(), 1, "dispatched exactly once");
+    assert_collapsed_unknown(&error, &recorded);
+    assert_bounded(elapsed, "send_with_reconnect");
+    assert_eq!(peer.accepted_connections(), 1, "no reconnect, no resend");
+}
+
+/// C0. As C, outside any session (id 0), the one shape where a reconnect would be followed by a
+/// second send: `classify` alone keeps the lost `Put` from being sent again.
+#[tokio::test]
+async fn send_with_reconnect_without_a_session_dispatches_a_silent_put_once() {
+    let peer = Peer::start();
+    let (client, _) = client_with_session(&peer).await;
+    peer.rule(PUT, Reply::Silent);
+    let sink = parking_lot::Mutex::new(None);
+
+    let result = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        lore_transport::with_managed_workflow(send_with_reconnect::<_, _, 1, false, true>(
+            &client,
+            Command::Put,
+            0,
+            raw_put,
+            RecordOutcome(&sink),
+        )),
+    )
+    .await
+    .expect("send_with_reconnect never returned");
+    tokio::time::sleep(GRACE).await;
+
+    let error = result.expect_err("a silent peer never answers");
+    let recorded = sink.lock().clone();
+    assert_eq!(peer.seen_opcode(PUT).len(), 1, "dispatched exactly once");
+    assert_collapsed_unknown(&error, &recorded);
+}
+
+/// B0 answered twin. An answered failure on a dispatched, session-less `Put`, with a peer that
+/// accepts the reconnect: it keeps its own error, records nothing, and sends nothing more.
+#[tokio::test]
+async fn an_answered_put_without_a_session_is_not_resent_on_the_replaced_connection() {
+    let (error, recorded, _elapsed, puts, _peer, _client) = recover_lost_put(
+        |_| 0,
+        true,
+        SendFailure::answered(QuicClientError::NotFound),
+    )
+    .await;
+
+    assert_eq!(puts, 1, "an answered Put is final and is never sent again");
+    assert!(recorded.is_none(), "an answered failure is not unknown");
+    assert!(!is_managed_reconnect_expired(&error), "{error:?}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(
+        format!("{error:?}").to_lowercase().contains("notfound")
+            || format!("{error}").to_lowercase().contains("not found"),
+        "the answered error is kept: {error:?}"
+    );
+}
+
+/// D. The deadline fires during the wait for the reconnect guard, so the OLD connection is still
+/// open and the peer is reachable: a send in the deadline arm would be counted. A command that was
+/// not dispatched gets the not-sent expiry after one bound, and the peer sees no `Put`.
+#[cfg(feature = "test_seams")]
+#[tokio::test]
+async fn the_deadline_arm_sends_nothing_for_a_not_dispatched_put_on_a_live_connection() {
+    let peer = Peer::start();
+    let (client, session) = client_with_session(&peer).await;
+    let guard = client.quic().hold_reconnect_guard_for_test().await;
+    peer.rule(PUT, Reply::Silent);
+
+    let sink = parking_lot::Mutex::new(None);
+    let epoch = client.quic().epoch.load(Ordering::Relaxed);
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        lore_transport::with_managed_workflow(reconnect_and_retry::<_, _, 1, false, true>(
+            &client,
+            Command::Put,
+            session,
+            raw_put,
+            RecordOutcome(&sink),
+            epoch,
+            SendFailure::not_dispatched(QuicClientError::StreamOpen),
+        )),
+    )
+    .await
+    .expect("reconnect_and_retry never returned");
+    let elapsed = started.elapsed();
+    drop(guard);
+    tokio::time::sleep(GRACE).await;
+
+    let error = result.expect_err("the deadline ends the call");
+    assert_eq!(
+        peer.seen_opcode(PUT).len(),
+        0,
+        "the deadline arm must not send the command"
+    );
+    assert_expired(&error, "not dispatched, guard held");
+    assert!(sink.lock().is_none());
+    assert_bounded(elapsed, "not dispatched, guard held");
+    assert_eq!(peer.accepted_connections(), 1, "no reconnect happened");
+}
+
+/// C, dispatched. The same hold, a `Put` that was dispatched and lost: one dispatch, an unknown
+/// outcome, at once. The old connection is open, so a send in any branch would be counted.
+#[cfg(feature = "test_seams")]
+#[tokio::test]
+async fn the_deadline_arm_sends_nothing_for_a_dispatched_put_on_a_live_connection() {
+    let peer = Peer::start();
+    let (client, session) = client_with_session(&peer).await;
+    let client = Arc::new(client);
+    dispatch_silent_put(&peer, &client, session).await;
+    let guard = client.quic().hold_reconnect_guard_for_test().await;
+
+    let sink = parking_lot::Mutex::new(None);
+    let epoch = client.quic().epoch.load(Ordering::Relaxed);
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        lore_transport::with_managed_workflow(reconnect_and_retry::<_, _, 1, false, true>(
+            &*client,
+            Command::Put,
+            session,
+            raw_put,
+            RecordOutcome(&sink),
+            epoch,
+            SendFailure::response_lost(QuicClientError::Read),
+        )),
+    )
+    .await
+    .expect("reconnect_and_retry never returned");
+    let elapsed = started.elapsed();
+    drop(guard);
+    tokio::time::sleep(GRACE).await;
+
+    let error = result.expect_err("a lost Put is never answered");
+    let recorded = sink.lock().clone();
+    assert_eq!(
+        peer.seen_opcode(PUT).len(),
+        1,
+        "a dispatched Put is never sent again"
+    );
+    assert_collapsed_unknown(&error, &recorded);
+    assert_immediate(elapsed, "dispatched, guard held");
 }
