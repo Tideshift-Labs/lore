@@ -697,7 +697,8 @@ async fn a_dispatched_put_with_a_session_is_not_resent_on_the_replaced_connectio
 }
 
 /// B0. The same with session id 0: after a successful reconnect `reconnect_and_retry` sends again
-/// when the id is 0, and only `classify` keeps a lost mutation out of that path.
+/// when the id is 0. The guard at the top of the function keeps a dispatched mutation out of that
+/// path; before the guard this test saw two Puts.
 #[tokio::test]
 async fn a_dispatched_put_without_a_session_is_not_resent_on_the_replaced_connection() {
     let (error, recorded, elapsed, puts, peer, _client) = recover_lost_put(
@@ -749,7 +750,8 @@ async fn send_with_reconnect_dispatches_a_silent_put_once_and_reports_unknown() 
 }
 
 /// C0. As C, outside any session (id 0), the one shape where a reconnect would be followed by a
-/// second send: `classify` alone keeps the lost `Put` from being sent again.
+/// second send: `classify` keeps the lost `Put` from reaching the reconnect at all (the guard in
+/// `reconnect_and_retry` is the second gate).
 #[tokio::test]
 async fn send_with_reconnect_without_a_session_dispatches_a_silent_put_once() {
     let peer = Peer::start();
