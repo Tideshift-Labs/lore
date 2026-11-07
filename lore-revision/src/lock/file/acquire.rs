@@ -304,7 +304,8 @@ pub async fn acquire(
     let remote = repository
         .remote()
         .await
-        .forward::<AcquireError>("Unable to acquire lock while offline")?;
+        .forward::<AcquireError>("Unable to acquire lock while offline")
+        .map_err(lock::util::not_sent_reads_disconnected)?;
 
     let resources_count = resources.len();
 

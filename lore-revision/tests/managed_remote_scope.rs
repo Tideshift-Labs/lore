@@ -16,6 +16,8 @@
 //!   shared connect to the marker; one that did not carry it is unbounded (the defect).
 //! - An unmanaged `remote()` is unchanged.
 //! - A push whose remote resolved to the marker reports ffi 28 (`Disconnected`).
+//! - A lock acquire or release whose remote resolved to the marker reports ffi 28 too.
+//! - `RemoteHandle` shares the remote state without keeping the context alive.
 #![allow(clippy::disallowed_methods)] // Fixture temp directories only.
 
 use std::sync::Arc;
@@ -34,9 +36,13 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::FfiError;
 use lore_revision::branch::push::PushOptions;
+use lore_revision::interface::LoreArray;
+use lore_revision::interface::LoreString;
 use lore_revision::live_fixture::LiveRepository;
 use lore_revision::live_fixture::LockServer;
 use lore_revision::live_fixture::fixture_execution_context;
+use lore_revision::lock::file::acquire::AcquireOptions;
+use lore_revision::lock::file::release::ReleaseOptions;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RemoteFuture;
 use lore_revision::repository::RemoteState;
@@ -392,4 +398,129 @@ async fn push_with_marker_remote() {
     assert_eq!(lore_base::error::Disconnected::FFI_CODE, 28);
     drop(repository);
     drop(fixture);
+}
+
+/// The lock verbs read `remote()` once, up front, and forward its error. A remote that resolved to
+/// the not-sent marker must read as `Disconnected` (28) for an embedder, as the push does.
+#[tokio::test]
+async fn a_lock_acquire_whose_remote_resolved_to_the_marker_fails_with_ffi_code_disconnected() {
+    LORE_CONTEXT
+        .scope(
+            fixture_execution_context(),
+            Box::pin(lock_verb_with_marker_remote(true)),
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_lock_release_whose_remote_resolved_to_the_marker_fails_with_ffi_code_disconnected() {
+    LORE_CONTEXT
+        .scope(
+            fixture_execution_context(),
+            Box::pin(lock_verb_with_marker_remote(false)),
+        )
+        .await;
+}
+
+async fn lock_verb_with_marker_remote(acquire: bool) {
+    let server = LockServer::start().await;
+    let fixture = LiveRepository::create(&server.remote_url()).await;
+    let repository = fixture.connect(RepositoryAccess::ReadOnly).await;
+    let (open, expired) = gated_remote(Err(lore_transport::managed_reconnect_expired_for_test(
+        "session",
+    )));
+    open.send(())
+        .expect("the gate is held by the shared future");
+    *repository.remote.write().await = RemoteState::Pending(expired);
+
+    let paths = || {
+        LoreArray::from_vec(
+            fixture
+                .committed_files_absolute
+                .iter()
+                .map(LoreString::from)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let ownership: Arc<dyn AttemptStore> = Arc::new(VolatileAttemptStore::new());
+    let (verb, code) = if acquire {
+        let error = lore_revision::lock::file::acquire::acquire(
+            repository.clone(),
+            AcquireOptions {
+                paths: paths(),
+                branch: String::new(),
+                owner: String::new(),
+            },
+            ownership,
+            None,
+        )
+        .await
+        .expect_err("an acquire with an expired remote cannot succeed");
+        ("acquire", error.ffi_code())
+    } else {
+        let error = lore_revision::lock::file::release::release(
+            repository.clone(),
+            ReleaseOptions {
+                paths: paths(),
+                branch: String::new(),
+                owner: String::new(),
+                owner_id: String::new(),
+                all_owners: false,
+            },
+            ownership,
+            None,
+        )
+        .await
+        .expect_err("a release with an expired remote cannot succeed");
+        ("release", error.ffi_code())
+    };
+
+    assert_eq!(
+        code,
+        lore_base::error::Disconnected::FFI_CODE,
+        "{verb}: expected Disconnected (28), not Internal (-1)"
+    );
+    assert_eq!(lore_base::error::Disconnected::FFI_CODE, 28);
+    assert!(
+        server.calls().is_empty(),
+        "{verb}: nothing may be sent once the remote is the not-sent marker"
+    );
+    drop(repository);
+    drop(fixture);
+}
+
+/// `RemoteHandle` shares the context's remote state but holds no reference to the context, so a
+/// pending connect awaited through it does not keep the context (and its working-copy lock) alive.
+#[tokio::test]
+async fn a_remote_handle_does_not_keep_the_context_alive() {
+    let (_server, connection) = live_connection().await;
+    let (open, shared) = gated_remote(Ok(connection.clone()));
+    let context = context_with_state(RemoteState::Pending(shared)).await;
+    let weak = Arc::downgrade(&context);
+    let handle = context.remote_handle();
+
+    drop(context);
+    assert!(
+        weak.upgrade().is_none(),
+        "the handle must not keep the context alive"
+    );
+
+    let waiting = {
+        let handle = handle.clone();
+        tokio::spawn(async move { handle.remote().await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!waiting.is_finished(), "the connect has not resolved yet");
+
+    open.send(())
+        .expect("the gate is held by the shared future");
+    let resolved = tokio::time::timeout(HANG_GUARD, waiting)
+        .await
+        .expect("the handle never resolved")
+        .expect("handle task")
+        .expect("the gated connect resolved Ok");
+    assert!(Arc::ptr_eq(&resolved, &connection));
+    // A second call takes the promoted fast path.
+    let again = handle.remote().await.expect("promoted state");
+    assert!(Arc::ptr_eq(&again, &connection));
 }

@@ -166,7 +166,8 @@ pub async fn release(
     let remote = repository
         .remote()
         .await
-        .forward::<ReleaseError>("Unable to release lock while offline")?;
+        .forward::<ReleaseError>("Unable to release lock while offline")
+        .map_err(lock::util::not_sent_reads_disconnected)?;
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await

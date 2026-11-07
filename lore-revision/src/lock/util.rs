@@ -8,6 +8,35 @@ use crate::lore_error;
 
 pub const LOCK_BATCH_SIZE: usize = 100;
 
+/// FORK-LOCAL (Tideshift, WP-124): report a lock verb's remote that resolved to the managed
+/// not-sent marker as `Disconnected`.
+///
+/// The repository connect returns the pre-warm's managed expiry when the QUIC path could not be
+/// replaced within the managed bound. The marker rides inside `Internal`, whose FFI code is -1, and
+/// an embedder reads the code: `Disconnected` (28) is the code it treats as offline and retryable.
+/// Nothing was sent, so nothing about a lock changed. Any other error is returned as it is. The
+/// original message is kept in the trace. The push counterpart is
+/// [`crate::branch::push::not_sent_reads_disconnected`].
+pub fn not_sent_reads_disconnected<E>(err: E) -> E
+where
+    E: lore_error_set::ErrorSet + From<lore_base::error::Disconnected>,
+{
+    if !lore_transport::is_managed_reconnect_expired(&err) {
+        return err;
+    }
+    let mut disconnected = E::from(lore_base::error::Disconnected);
+    lore_error_set::ErrorSet::push_trace(
+        &mut disconnected,
+        lore_error_set::Location::with_context(
+            file!(),
+            line!(),
+            column!(),
+            std::sync::Arc::from(err.to_string()),
+        ),
+    );
+    disconnected
+}
+
 pub fn assemble_resource_for_path(path: &str, branch: BranchId) -> lock::LockResource {
     let hash = hash::hash_slice(path.as_bytes());
     let description = path.to_string();
