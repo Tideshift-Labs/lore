@@ -36,6 +36,11 @@
 //   the first QUIC use is the Query of the fragments the second commit added.
 // A hang guard of 40 s turns a missing bound into a failure that does not wait out the unbounded
 // reconnect (about 236 s measured).
+//
+// The unmanaged cases (no managed scope anywhere) pin the other half of the fix: the repository's
+// connect always runs its session-pool pre-warm in a managed workflow, so an unmanaged open or a
+// local commit after QUIC died waits about one bound for the pre-warm and ignores its error
+// instead of waiting out the whole reconnect loop.
 #[cfg(all(test, feature = "integration_tests"))]
 #[allow(dead_code)]
 mod common;
@@ -556,5 +561,115 @@ mod hang {
     fn a_fragment_query_on_a_dead_quic_path_ends_disconnected_at_the_bound() {
         let (status, elapsed) = lore::runtime().block_on(point_bound_push("warm-correlation"));
         assert_ended_at_the_bound(status, elapsed);
+    }
+
+    /// Unmanaged: opening the repository after QUIC died. The connect's pre-warm reconnects on a
+    /// dead path; it must end at the managed bound and be ignored, so `remote()` resolves Ok.
+    /// Before the fix this waited the whole reconnect loop (about 236 s).
+    #[test]
+    fn an_unmanaged_remote_after_the_quic_path_dies_resolves_ok_within_the_bound() {
+        let (result, elapsed) = lore::runtime().block_on(async {
+            let mut live = Live::start().await;
+            let path = live.source.clone();
+            let _black_hole = live.kill_quic().await;
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                HANG_GUARD,
+                LORE_CONTEXT.scope(live.execution("unmanaged-open"), async {
+                    let token = RepositoryWriteToken::acquire(path.as_path()).await;
+                    let context = lore_revision::repository::load_and_connect_with_token(
+                        path.as_path(),
+                        RepositoryAccess::ReadWrite,
+                        Some(token.share()),
+                    )
+                    .await
+                    .expect("opening the repository");
+                    assert!(!lore_transport::in_managed_wait_scope());
+                    let remote = context.remote().await.map(|_| ());
+                    drop(context);
+                    drop(token);
+                    remote
+                }),
+            )
+            .await;
+            (result, started.elapsed())
+        });
+        eprintln!("unmanaged remote() after kill_quic resolved in {elapsed:?}");
+        let remote = result.unwrap_or_else(|_| {
+            panic!("an unmanaged remote() never returned (hang guard, {elapsed:?}): the pre-warm has no deadline")
+        });
+        assert!(
+            remote.is_ok(),
+            "an unmanaged caller ignores every pre-warm error: {remote:?}"
+        );
+        assert!(elapsed < BOUND + MARGIN, "outlasted the bound: {elapsed:?}");
+    }
+
+    /// Unmanaged: a local stage of a new file and a commit through the public API after QUIC
+    /// died. Each command opens the repository and awaits the remote, so each is held by the
+    /// bounded pre-warm. Each must succeed (status 0) within the bound plus margin.
+    #[test]
+    fn an_unmanaged_stage_and_commit_after_the_quic_path_dies_succeed_within_the_bound() {
+        let (stage, commit) = lore::runtime().block_on(async {
+            let mut live = Live::start().await;
+            let _black_hole = live.kill_quic().await;
+            std::fs::write(live.source.join("after-quic-death.txt"), "unmanaged edit")
+                .expect("writing the fixture file");
+
+            let started = Instant::now();
+            let staged = tokio::time::timeout(
+                HANG_GUARD,
+                file::stage(
+                    live.globals.clone(),
+                    file::LoreFileStageArgs {
+                        paths: LoreArray::from_vec(vec![LoreString::from(".")]),
+                        case_change: 0,
+                        scan: 1,
+                    },
+                    None,
+                ),
+            )
+            .await;
+            let stage = (staged, started.elapsed());
+
+            let started = Instant::now();
+            let committed = tokio::time::timeout(
+                HANG_GUARD,
+                revision::commit(
+                    live.globals.clone(),
+                    revision::LoreRevisionCommitArgs {
+                        message: "after quic death".into(),
+                        link: Default::default(),
+                        link_paths: Default::default(),
+                        layer: Default::default(),
+                        layer_paths: Default::default(),
+                        link_messages: Default::default(),
+                        layer_messages: Default::default(),
+                    },
+                    None,
+                ),
+            )
+            .await;
+            (stage, (committed, started.elapsed()))
+        });
+        eprintln!(
+            "unmanaged stage took {:?}, commit took {:?}",
+            stage.1, commit.1
+        );
+        assert_eq!(stage.0.ok(), Some(0), "stage ({:?})", stage.1);
+        assert_eq!(commit.0.ok(), Some(0), "commit ({:?})", commit.1);
+        assert!(
+            stage.1 < BOUND + MARGIN,
+            "stage outlasted the bound: {:?}",
+            stage.1
+        );
+        // Two bounds: the open's pre-warm ends at one, then the commit's first best-effort upload
+        // ends at its own; the session latch then stops a third for later fragments.
+        assert!(
+            commit.1 < BOUND * 2 + MARGIN,
+            "commit outlasted two bounds: {:?}",
+            commit.1
+        );
     }
 }

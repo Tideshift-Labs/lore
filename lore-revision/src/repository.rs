@@ -1222,32 +1222,65 @@ impl RepositoryContext {
     /// `Shared` future. After resolution, the state is promoted so subsequent calls
     /// hit the read-lock fast path.
     pub async fn remote(&self) -> Result<Arc<Connection>, ProtocolError> {
-        // Fast path: resolved states take only the read lock and return immediately.
-        let fut = match &*self.remote.read().await {
-            RemoteState::Offline => return Err(ProtocolError::from(NoRemote)),
-            RemoteState::Connected(c) => return Ok(c.clone()),
-            RemoteState::Failed(e) => return Err(e.clone()),
-            RemoteState::Pending(fut) => fut.clone(),
-        };
-
-        // Slow path: await the shared future. All concurrent callers awaken together
-        // when it resolves.
-        let result = fut.await;
-
-        // Opportunistically promote to the terminal state so future calls skip the
-        // shared future entirely. Racing writers are harmless — the matches! guard
-        // makes the second write a no-op.
-        let mut guard = self.remote.write().await;
-        if matches!(*guard, RemoteState::Pending(_)) {
-            *guard = match &result {
-                Ok(c) => RemoteState::Connected(c.clone()),
-                Err(ProtocolError::NoRemote(_)) => RemoteState::Offline,
-                Err(e) => RemoteState::Failed(e.clone()),
-            };
-        }
-        result
+        resolve_remote(&self.remote).await
     }
 
+    /// FORK-LOCAL (Tideshift, WP-124): a handle that awaits this context's remote without keeping
+    /// the context alive.
+    ///
+    /// The context holds the working-copy lock. A task that only has to wait for a pending connect
+    /// (to unpin the session pool it will pin) takes this handle and drops the context, so the
+    /// lock is released when the command ends rather than when the connect resolves.
+    pub fn remote_handle(&self) -> RemoteHandle {
+        RemoteHandle(self.remote.clone())
+    }
+}
+
+/// FORK-LOCAL (Tideshift, WP-124): the remote connection state of a [`RepositoryContext`], shared
+/// with it, without the context. See [`RepositoryContext::remote_handle`].
+#[derive(Clone)]
+pub struct RemoteHandle(Arc<tokio::sync::RwLock<RemoteState>>);
+
+impl RemoteHandle {
+    /// The same as [`RepositoryContext::remote`] on the context this handle came from.
+    pub async fn remote(&self) -> Result<Arc<Connection>, ProtocolError> {
+        resolve_remote(&self.0).await
+    }
+}
+
+/// Awaits the pending connect on first call. Concurrent callers share a single in-flight connect
+/// via the state machine's `Shared` future. After resolution, the state is promoted so subsequent
+/// calls hit the read-lock fast path.
+async fn resolve_remote(
+    remote: &tokio::sync::RwLock<RemoteState>,
+) -> Result<Arc<Connection>, ProtocolError> {
+    // Fast path: resolved states take only the read lock and return immediately.
+    let fut = match &*remote.read().await {
+        RemoteState::Offline => return Err(ProtocolError::from(NoRemote)),
+        RemoteState::Connected(c) => return Ok(c.clone()),
+        RemoteState::Failed(e) => return Err(e.clone()),
+        RemoteState::Pending(fut) => fut.clone(),
+    };
+
+    // Slow path: await the shared future. All concurrent callers awaken together
+    // when it resolves.
+    let result = fut.await;
+
+    // Opportunistically promote to the terminal state so future calls skip the
+    // shared future entirely. Racing writers are harmless — the matches! guard
+    // makes the second write a no-op.
+    let mut guard = remote.write().await;
+    if matches!(*guard, RemoteState::Pending(_)) {
+        *guard = match &result {
+            Ok(c) => RemoteState::Connected(c.clone()),
+            Err(ProtocolError::NoRemote(_)) => RemoteState::Offline,
+            Err(e) => RemoteState::Failed(e.clone()),
+        };
+    }
+    result
+}
+
+impl RepositoryContext {
     /// The storage session pool for this repository, resolved once and reused for
     /// as long as it lives.
     ///
@@ -2028,14 +2061,28 @@ fn connect(
     let correlation_id = globals.correlation_id.to_string();
     // FORK-LOCAL (Tideshift, WP-124): the connect keeps the managed deadline of the command that
     // opened the repository, so the pre-warm's QUIC reconnect is bounded per command, as the
-    // command's own would be. Unmanaged commands are unchanged.
+    // command's own would be. Decided here, in the spawning task: task-locals do not cross the
+    // spawn.
+    let managed = lore_transport::in_managed_wait_scope();
     let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> =
         lore_spawn!(lore_transport::carry_managed_wait_scope(async move {
             let connection =
                 protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
-            // Pre-warm the session pool so it's ready when the command runs
+            // Pre-warm the session pool so it's ready when the command runs.
+            //
+            // FORK-LOCAL (Tideshift, WP-124): the pre-warm always runs in a managed wait scope, so
+            // its QUIC reconnect and its session starts end at the managed bound for every
+            // caller. Unbounded, a dead QUIC path held an unmanaged command that awaits the
+            // remote (a local commit) for the whole reconnect loop (about 236 s), and every
+            // retry left one more such loop running in a task nobody awaits. A pre-warm is
+            // best effort: an unmanaged command that needs QUIC still reconnects on its own
+            // first use, unbounded as before.
             if !repository.is_zero()
-                && let Err(error) = connection.session_pool(repository, &correlation_id).await
+                && let Err(error) = lore_transport::with_managed_workflow(
+                    connection.session_pool(repository, &correlation_id),
+                )
+                .await
+                && managed
                 && lore_transport::is_managed_reconnect_expired(&error)
             {
                 // FORK-LOCAL (Tideshift, WP-124): the QUIC path could not be replaced within the
@@ -2043,6 +2090,7 @@ fn connect(
                 // bound again, so the command gets the expiry now (ffi 28, offline and retryable).
                 // Accepted cost: a managed command that needs only gRPC (a lock verb) also fails
                 // as offline here, where ignoring the pre-warm would have let it finish.
+                // An unmanaged command ignores every pre-warm error, as it always did.
                 return Err(error);
             }
             Ok(connection)

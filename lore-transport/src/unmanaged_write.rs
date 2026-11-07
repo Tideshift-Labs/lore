@@ -12,7 +12,12 @@
 //! Unmanaged writes start exactly as before. The first typed refusal latches; a write that has not
 //! been sent yet then skips its upload, which leaves the fragment exactly where a refusal would
 //! have. Writes already in flight finish normally. Only the typed refusal latches: a transient or
-//! network failure says nothing about the server's policy. The latch is final for the session:
+//! network failure says nothing about the server's policy.
+//!
+//! FORK-LOCAL (Tideshift, WP-124 follow-up (k)): one network failure latches too. An unmanaged
+//! upload runs in a managed wait scope, and when its QUIC path cannot be replaced within the
+//! managed bound it fails with the not-sent marker. Without the latch, each later fragment of the
+//! command would wait the bound again. The latch is final for the session:
 //! a long-lived session on a cell that later turns compatible keeps unmanaged writes local, and
 //! push uploads them as it does after any refusal.
 

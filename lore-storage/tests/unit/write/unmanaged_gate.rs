@@ -68,6 +68,9 @@ enum Script {
     ServerError,
     /// Lose every put's answer after dispatch.
     OutcomeUnknown,
+    /// Fail every put with the managed not-sent expiry marker (the QUIC path could not be
+    /// replaced within the managed bound).
+    Expired,
 }
 
 struct ScriptedStorage {
@@ -121,6 +124,7 @@ impl ScriptedStorage {
         let script = *self.script.lock();
         match script {
             Script::Refuse => Err(refusal()),
+            Script::Expired => Err(lore_transport::managed_reconnect_expired_for_test("Put")),
             Script::Disconnect => Err(ProtocolError::from(Disconnected)),
             Script::SlowDown => Err(ProtocolError::from(SlowDown)),
             Script::ServerError => Err(ProtocolError::internal("generic server error")),
@@ -581,6 +585,73 @@ async fn a_lost_answer_does_not_latch() {
         .await;
 }
 
+/// FORK-LOCAL (Tideshift, WP-124 follow-up (k)): an unmanaged upload whose QUIC path could not be
+/// replaced within the managed bound fails with the not-sent expiry marker. It latches the
+/// session, so the rest of the command does not pay the bound again per fragment.
+#[tokio::test]
+async fn an_unmanaged_expiry_latches_and_later_writes_skip() {
+    let (_dir, store) = make_test_store().await;
+    let storage = ScriptedStorage::new(Script::Expired);
+    let session = session("qlflatchexpired", &storage).await;
+    let stats = Arc::new(FragmentWriteStats::default());
+
+    let first = store_one(&store, &session, &stats, 221).await;
+    assert!(!first.stored_durable, "the expired upload is not durable");
+    assert!(first.stored_local, "the payload stays local for push");
+    assert_eq!(storage.puts(), 1, "the first write reached the server");
+    assert!(
+        session.unmanaged_writes().is_refused(),
+        "an unmanaged expiry must latch the session"
+    );
+
+    let later = store_one(&store, &session, &stats, 222).await;
+    assert_eq!(storage.puts(), 1, "a latched session sends nothing more");
+    assert!(!later.stored_durable);
+    assert!(later.stored_local);
+}
+
+/// A managed write returns the expiry to its caller and never sets the unmanaged latch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_expiry_is_the_callers_error_and_leaves_the_latch_unset() {
+    let (_dir, store) = make_test_store().await;
+    let storage = ScriptedStorage::new(Script::Expired);
+    let session = session("qlflatchmanagedexpired", &storage).await;
+    let stats = Arc::new(FragmentWriteStats::default());
+    let context = CallerOperationContext::new(
+        Uuid::from_u128(0x9abc),
+        RepositoryId::default(),
+        Arc::new(VolatileAttemptStore::new()),
+    );
+
+    let (address, fragment, payload) = input(231);
+    let result = with_caller_operation(context, {
+        let store = store.clone();
+        let session = session.clone();
+        let stats = stats.clone();
+        async move {
+            store_fragment(
+                store,
+                partition(),
+                address,
+                fragment,
+                payload,
+                true,
+                Some(session),
+                WriteContext::counted(Some(stats)),
+                None,
+            )
+            .await
+        }
+    })
+    .await;
+
+    assert!(result.is_err(), "a managed write returns the expiry");
+    assert_eq!(storage.puts(), 1, "the managed write reached the server");
+    assert!(
+        !session.unmanaged_writes().is_refused(),
+        "a managed expiry never sets the unmanaged latch"
+    );
+}
 /// (e) A refused Copy latches, and the upload that would have followed it is skipped. The
 /// compatible-for-puts server would have accepted that upload, so the skip is the latch's.
 #[tokio::test]

@@ -484,12 +484,39 @@ async fn remote_put_resolved_retry(
 
 /// FORK-LOCAL (Tideshift, WP-124 follow-up (b)): an unmanaged write the server refused as an
 /// unsupported client sets the session's unmanaged-write latch, so later writes skip the upload.
-/// Only that typed refusal latches. Managed writes never touch the latch.
+/// FORK-LOCAL (Tideshift, WP-124 follow-up (k)): so does an unmanaged write whose QUIC path could
+/// not be replaced within the managed bound (see [`bounded_if_unmanaged`]), so the rest of the
+/// command does not pay the bound again per fragment. Only those two typed errors latch. Managed
+/// writes never touch the latch.
 fn note_unmanaged_refusal(session: &StorageSession, err: &lore_transport::ProtocolError) {
-    if lore_transport::is_unsupported_client(err)
+    if (lore_transport::is_unsupported_client(err)
+        || lore_transport::is_managed_reconnect_expired(err))
         && lore_transport::caller_operation::current_caller_operation().is_none()
     {
         session.unmanaged_writes().refuse();
+    }
+}
+
+/// FORK-LOCAL (Tideshift, WP-124 follow-up (k)): run an unmanaged write's remote leg in a managed
+/// wait scope.
+///
+/// An unmanaged upload is best effort: when it fails the fragment stays local and the next push
+/// uploads it. Outside a scope, a dead QUIC path held it for the whole unbounded reconnect loop
+/// (about 236 s), and the command (a `lore commit`) waited for it. In the scope its reconnect and
+/// its session start end at the managed bound with the not-sent marker, which latches the session
+/// (see [`note_unmanaged_refusal`]). Replay classes, dispatch proofs and the caller operation are
+/// unchanged, so a dispatched write whose answer is lost is still an unknown outcome and is never
+/// resent. What the scope adds is the managed send bound (`send_bounded`): answer silence for the
+/// managed idle bound on a connection that still carries other traffic is now a lost answer (an
+/// unmanaged Copy then fails the write with its unknown outcome, as a dead connection already made
+/// it do), and a stall after a partial write closes the connection, which a managed push in the
+/// same process shares. Both need a full bound with no progress. A managed write is already in its
+/// scope.
+async fn bounded_if_unmanaged<F: Future>(unmanaged: bool, future: F) -> F::Output {
+    if unmanaged {
+        lore_transport::with_managed_workflow(future).await
+    } else {
+        future.await
     }
 }
 
@@ -1218,7 +1245,8 @@ fn leader_body(
             && !refused(session)
             && let Some(source) = copy_source(&query, address)
         {
-            stored_durable = copy_association(session, source, address).await?;
+            stored_durable =
+                bounded_if_unmanaged(unmanaged, copy_association(session, source, address)).await?;
             if stored_durable {
                 registered_remotely = true;
                 if let Some(stats) = stats {
@@ -1292,10 +1320,25 @@ fn leader_body(
         {
             let result = match publish {
                 Some(key) => {
-                    remote_put_resolved_retry(session, key, address, fragment, Some(buffer.share()))
-                        .await
+                    bounded_if_unmanaged(
+                        unmanaged,
+                        remote_put_resolved_retry(
+                            session,
+                            key,
+                            address,
+                            fragment,
+                            Some(buffer.share()),
+                        ),
+                    )
+                    .await
                 }
-                None => remote_put_retry(session, address, fragment, Some(buffer.share())).await,
+                None => {
+                    bounded_if_unmanaged(
+                        unmanaged,
+                        remote_put_retry(session, address, fragment, Some(buffer.share())),
+                    )
+                    .await
+                }
             };
             // A managed parent cannot complete from a local fallback after its remote intent
             // failed to journal, dispatch, or settle. Preserve the caller's exact failure.
