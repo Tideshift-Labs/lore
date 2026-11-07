@@ -849,6 +849,7 @@ impl SendFailure {
     /// A failure after the request was handed to the stream, with no answer from the server.
     /// Written this way round on purpose: a partial write may already have reached the peer,
     /// so an incomplete write counts as dispatched rather than being assumed harmless.
+    #[lore_macro::test_pub]
     fn response_lost(error: QuicClientError) -> Self {
         Self {
             error,
@@ -858,6 +859,7 @@ impl SendFailure {
 
     /// An error the server sent back. The command reached it; the answer does not prove the
     /// handler had no effect.
+    #[lore_macro::test_pub]
     fn answered(error: QuicClientError) -> Self {
         Self {
             error,
@@ -1184,6 +1186,7 @@ where
 /// There is no loop. The end-to-end budget is two dispatches — the caller's first and the one
 /// below — and expressing that structurally is what makes "no layer resets or nests it" a
 /// property of the code rather than of a counter someone has to reason about.
+#[lore_macro::test_pub]
 async fn reconnect_and_retry<
     ServiceClientType,
     Sink,
@@ -1228,13 +1231,25 @@ where
         // Only a failure before dispatch may say the command was not sent. A dispatched
         // replay-safe read (a session start, a Query) gets the expiry too, as a dispatched one:
         // asking again is safe, and the caller must learn the bound fired. A dispatched mutation
-        // keeps its own error, so its lost answer is never read as not sent. That last arm is
-        // defence in depth and unpinned: `classify` ends a dispatched `MutableNoReplay` command
-        // (an unknown outcome or an answered failure) before it reaches this reconnect.
+        // is never read as not sent: a lost answer is an unknown outcome, recorded in the sink as
+        // `classify` would record it, and an answered failure keeps its own error. Those two arms
+        // are defence in depth: `classify` ends a dispatched `MutableNoReplay` command before it
+        // reaches this reconnect, so no production path reaches them today. The unit tests in
+        // `managed_reconnect_bound.rs` call this function directly to pin them.
         Err(ReconnectDeadline) => {
-            let error = if first_failure.dispatched == DispatchState::NotDispatched {
-                SendWithReconnectError::ManagedReconnectExpired { dispatched: false }
-            } else if service_client.replay_class(request_type) == ReplayClass::ReadRetryable {
+            if first_failure.dispatched == DispatchState::NotDispatched {
+                return Err(service_client.map_send_error(
+                    request_type,
+                    SendWithReconnectError::ManagedReconnectExpired { dispatched: false },
+                ));
+            }
+            let replay_class = service_client.replay_class(request_type);
+            if outcome_is_unknown(replay_class, first_failure.dispatched)
+                || matches!(first_failure.error, QuicClientError::OutcomeUnknown)
+            {
+                return Err(report_unknown(service_client, request_type, unknown));
+            }
+            let error = if replay_class == ReplayClass::ReadRetryable {
                 SendWithReconnectError::ManagedReconnectExpired { dispatched: true }
             } else {
                 SendWithReconnectError::ClientError(first_failure.error)

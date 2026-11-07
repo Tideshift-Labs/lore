@@ -30,10 +30,15 @@ use lore_transport::VolatileAttemptStore;
 use lore_transport::error::ProtocolError;
 use lore_transport::error::is_managed_reconnect_expired;
 use lore_transport::error::is_unjournaled_answer_lost;
+use lore_transport::quic::QuicClientError;
+use lore_transport::quic::client::RecordOutcome;
+use lore_transport::quic::client::SendFailure;
 use lore_transport::quic::client::ServiceClient;
+use lore_transport::quic::client::reconnect_and_retry;
 use lore_transport::quic::storage_service::Command;
 use lore_transport::quic::storage_service::client::StorageClient;
 use lore_transport::replay::MutableOutcome;
+use lore_transport::replay::OutcomeUnknown;
 use lore_transport::with_caller_operation;
 use uuid::Uuid;
 
@@ -408,4 +413,129 @@ async fn an_unmanaged_put_with_the_server_unreachable_is_still_pending_after_twi
     // The timeout dropped the future mid-loop. The epoch is untouched because the loop has not
     // given up.
     assert_ne!(client.quic().epoch.load(Ordering::Relaxed), 0);
+}
+
+/// What `reconnect_and_retry` returns when its managed deadline fires after `first_failure`, on a
+/// connection whose peer is gone, for `request`. Calls the function directly with the CURRENT
+/// epoch: an older epoch means "someone else reconnected" and skips the deadline entirely.
+///
+/// Returns the error, the outcome sink contents and the elapsed time. The peer is dead, so a resend
+/// is unobservable here; the no-resend proof is that the call returns at the deadline arm, before
+/// any resend code runs.
+async fn deadline_outcome(
+    request: Command,
+    first_failure: SendFailure,
+) -> (ProtocolError, Option<OutcomeUnknown>, Duration) {
+    let peer = Peer::start();
+    let (client, session) = client_with_session(&peer).await;
+    make_unreachable(&peer).await;
+    let sink = parking_lot::Mutex::new(None);
+    let epoch = client.quic().epoch.load(Ordering::Relaxed);
+
+    let started = Instant::now();
+    let result = tokio::time::timeout(
+        BOUND + Duration::from_secs(40),
+        lore_transport::with_managed_workflow(reconnect_and_retry::<_, _, 1, false, true>(
+            &client,
+            request,
+            session,
+            || [Bytes::from_static(b"payload")],
+            RecordOutcome(&sink),
+            epoch,
+            first_failure,
+        )),
+    )
+    .await
+    .expect("reconnect_and_retry never returned: the managed deadline did not arm");
+    let elapsed = started.elapsed();
+
+    let error = result.expect_err("an unreachable server never yields a reply");
+    let recorded = sink.lock().clone();
+    (error, recorded, elapsed)
+}
+
+/// The storage client's `map_send_error` collapses an unknown outcome to `Disconnected`; the typed
+/// `OutcomeUnknown` travels in the sink, exactly as `classify` reports it. So an unknown outcome is
+/// the sink holding `Some` and the error being neither the expiry nor an answered refusal.
+fn assert_collapsed_unknown(error: &ProtocolError, recorded: &Option<OutcomeUnknown>) {
+    assert!(recorded.is_some(), "the sink must hold the unknown outcome");
+    assert!(!is_managed_reconnect_expired(error), "{error:?}");
+    assert!(error.is_disconnected(), "{error:?}");
+}
+/// A dispatched `MutableNoReplay` whose answer was lost, at the deadline, is an unknown outcome:
+/// reported in the sink and never the not-sent expiry. Nothing is resent.
+#[tokio::test]
+async fn a_lost_mutable_answer_at_the_reconnect_deadline_is_an_unknown_outcome() {
+    let (error, recorded, elapsed) = deadline_outcome(
+        Command::Put,
+        SendFailure::response_lost(QuicClientError::Read),
+    )
+    .await;
+
+    assert_collapsed_unknown(&error, &recorded);
+    assert_bounded(elapsed, "lost mutable answer");
+}
+
+/// The peer reported a lost lower transport: the same unknown outcome, even though the failure
+/// itself was an answered one.
+#[tokio::test]
+async fn a_peer_reported_outcome_unknown_at_the_reconnect_deadline_stays_unknown() {
+    let (error, recorded, elapsed) = deadline_outcome(
+        Command::Put,
+        SendFailure::answered(QuicClientError::OutcomeUnknown),
+    )
+    .await;
+
+    assert_collapsed_unknown(&error, &recorded);
+    assert_bounded(elapsed, "peer-reported unknown");
+}
+
+/// An answered failure is final: it keeps its own error, is not the expiry and is not recorded as
+/// unknown.
+#[tokio::test]
+async fn an_answered_failure_at_the_reconnect_deadline_keeps_its_own_error() {
+    let (error, recorded, elapsed) = deadline_outcome(
+        Command::Put,
+        SendFailure::answered(QuicClientError::NotFound),
+    )
+    .await;
+
+    assert!(!is_managed_reconnect_expired(&error), "{error:?}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(recorded.is_none(), "an answered failure is not unknown");
+    assert!(
+        format!("{error:?}").to_lowercase().contains("notfound")
+            || format!("{error}").to_lowercase().contains("not found"),
+        "the answered error is kept: {error:?}"
+    );
+    assert_bounded(elapsed, "answered failure");
+}
+
+/// Not dispatched: the typed expiry, recorded as nothing.
+#[tokio::test]
+async fn a_not_dispatched_failure_at_the_reconnect_deadline_is_the_not_sent_expiry() {
+    let (error, recorded, elapsed) = deadline_outcome(
+        Command::Put,
+        SendFailure::not_dispatched(QuicClientError::StreamOpen),
+    )
+    .await;
+
+    assert_expired(&error, "not dispatched");
+    assert!(recorded.is_none());
+    assert_bounded(elapsed, "not dispatched");
+}
+
+/// A dispatched `ReadRetryable` still gets the dispatched expiry, not an unknown outcome.
+#[tokio::test]
+async fn a_dispatched_read_at_the_reconnect_deadline_still_gets_the_read_expiry() {
+    let (error, recorded, elapsed) = deadline_outcome(
+        Command::Get,
+        SendFailure::response_lost(QuicClientError::Read),
+    )
+    .await;
+
+    assert!(is_managed_reconnect_expired(&error), "{error:?}");
+    assert!(!error.is_outcome_unknown(), "{error:?}");
+    assert!(recorded.is_none());
+    assert_bounded(elapsed, "dispatched read");
 }
