@@ -77,8 +77,29 @@ pub(crate) const INCOMING_DIR: &str = "incoming";
 ///
 /// The inventory walk counts every file under the root, and a file no ledger
 /// charges fails the capacity predicate (`stage_unknown_entries`). So the walk
-/// skips this one directory at the top level, and nothing else reads it. A
-/// binary older than K11 does not skip it; roll every host of a cell together.
+/// skips this one directory at the top level, and nothing else reads it.
+///
+/// No older pattern could hold the probe instead: the walk before K11 skips
+/// no name at all. It counts every regular file, and every non-file entry is
+/// unknown. A `<hash>.s<epoch>.tmp` name would be a cleanup candidate.
+///
+/// **Deploy note: the release that adds this needs a full-cell roll.** While
+/// a pre-K11 binary still runs, its walk can catch a peer's probe file. The
+/// file exists for a few milliseconds every 2 s per stage replica, and the walk
+/// must list it and stat it inside that window. Each hit has this effect on
+/// that older host:
+///
+/// - The walk reports `stage_unknown_entries`. That predicate is not
+///   reconciling, so staging admission refuses at once: `StagingMode::Refuse`,
+///   and PUTs answer `SlowDown`. It is not `DirectFallback`.
+/// - The refusal lasts until that host's next completed walk. That is one
+///   observer tick (1 s) for a stage under 4096 entries, and one more tick for
+///   each further 4096 entries.
+/// - Only if the run outlives `drain_stale_after` does `/health_check` on that
+///   host answer `capacity_unavailable`.
+/// - `/lb_health` on an older `stage` replica does not change, because it
+///   ignores capacity. An older `drain` replica answers `drain_role` in every
+///   case.
 pub const LIVENESS_DIR: &str = "liveness";
 
 /// A staged path this process derived and may act on.
