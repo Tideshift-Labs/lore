@@ -17,5 +17,6 @@ mod outcome;
 mod quic;
 mod session;
 mod session_pool;
+mod session_rebind_expiry;
 mod types;
 mod unmanaged_write;

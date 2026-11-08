@@ -73,6 +73,23 @@ struct SessionBinding {
     /// declares, or `None` for an undeclared session. Fixed at construction, so a rebind of a
     /// declared session declares again and a rebind of an undeclared one never does.
     declared: Option<(Uuid, &'static str)>,
+    /// FORK-LOCAL (Tideshift, WP-124 K10): how the replacement starts under `rebind` ended.
+    starts: Mutex<StartHistory>,
+}
+
+/// FORK-LOCAL (Tideshift, WP-124 K10): the replacement starts a [`SessionBinding`] has finished,
+/// and the error of the last one when the managed bound ended it.
+///
+/// A caller that queued on the rebind guard behind a start shares that start's result: a success
+/// through the binding, and a managed-bound expiry through this record. Without it, each caller
+/// queued behind a start that a dead QUIC path expired spent a whole bound on its own start, in
+/// turn, so N queued commands cost N bounds. A caller that arrives after the expiry is not queued
+/// behind it and starts again.
+#[derive(Default)]
+struct StartHistory {
+    finished: u64,
+    /// The connection generation the expired start ran on, and its error.
+    expired: Option<(u32, ProtocolError)>,
 }
 
 /// A session id and the connection generation it is valid on.
@@ -129,12 +146,28 @@ impl SessionBinding {
             return Ok((id, current));
         }
 
+        // FORK-LOCAL (Tideshift, WP-124 K10): the starts finished before we queue, so the
+        // record below can tell whether one we waited behind expired.
+        let queued_after = self.starts.lock().finished;
         let _flight = self.rebind.lock().await;
         // Re-read under the guard: whoever held it before us may already have rebound, and the
         // generation may have moved again while we waited.
         let current = self.storage.connection_generation();
         if let Some(id) = self.current_on(current) {
             return Ok((id, current));
+        }
+        // FORK-LOCAL (Tideshift, WP-124 K10): a start we waited behind ended at the managed
+        // bound, and the connection has not been replaced since, so ours would only wait the
+        // bound again. Our command was not sent; it gets the error its own start would have
+        // ended with.
+        {
+            let starts = self.starts.lock();
+            if starts.finished > queued_after
+                && let Some((generation, expired)) = &starts.expired
+                && *generation == current
+            {
+                return Err(expired.clone());
+            }
         }
 
         // FORK-LOCAL (Tideshift, WP-124): a session still bound to the current generation is
@@ -149,18 +182,29 @@ impl SessionBinding {
         // A fresh `session_start` re-runs the token exchange and the server's authorization
         // check for this partition. Nothing from the old session's permission snapshot carries
         // over, which is the point: the replacement connection decides for itself.
-        let (id, generation) = match self.declared {
+        let started = match self.declared {
             Some((_, capabilities)) => {
                 self.storage
                     .session_start_declared(self.partition, &self.correlation_id, capabilities)
-                    .await?
+                    .await
             }
             None => {
                 self.storage
                     .session_start_bound(self.partition, &self.correlation_id)
-                    .await?
+                    .await
             }
         };
+        {
+            let mut starts = self.starts.lock();
+            starts.finished += 1;
+            starts.expired = match &started {
+                Err(error) if crate::error::is_managed_reconnect_expired(error) => {
+                    Some((current, error.clone()))
+                }
+                _ => None,
+            };
+        }
+        let (id, generation) = started?;
         *self.session.lock() = BoundSession {
             id,
             generation: Some(generation),
@@ -269,6 +313,7 @@ impl DeclaredBindings {
                     partition: undeclared.partition,
                     correlation_id: undeclared.correlation_id.clone(),
                     declared: Some((parent_id, capabilities)),
+                    starts: Mutex::default(),
                 })
             })
             .clone()
@@ -383,6 +428,7 @@ impl StorageSession {
                     partition,
                     correlation_id,
                     declared: None,
+                    starts: Mutex::default(),
                 }),
                 connection,
             }),
