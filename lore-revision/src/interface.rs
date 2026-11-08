@@ -1129,6 +1129,14 @@ pub struct ExecutionContext {
     /// Kept whatever the statistics level: the per-revision progress event reads
     /// its share out of these, so they are load-bearing rather than diagnostic.
     push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
+    /// FORK-LOCAL (Tideshift, WP-124 K10): set when a repository this call opened could not
+    /// pre-warm its storage session pool within the managed bound (a dead QUIC path). A
+    /// declared, best-effort upload scope reads it and skips every upload. Shared so the scope can
+    /// read it without holding this context.
+    prewarm_expired: Arc<std::sync::atomic::AtomicBool>,
+    /// FORK-LOCAL (Tideshift, WP-124 K10): this call's declared, best-effort upload scope, when
+    /// the command installed one. See `crate::managed_commit_uploads`.
+    managed_uploads: parking_lot::Mutex<Option<Arc<lore_storage::managed_uploads::ManagedUploads>>>,
 }
 
 impl ExecutionContext {
@@ -1214,6 +1222,34 @@ impl ExecutionContext {
         self.push_stats
             .get_or_init(|| Arc::new(crate::branch::push::PushStats::new(self.globals().stats())))
     }
+
+    /// FORK-LOCAL (Tideshift, WP-124 K10): record that a pre-warm of this call expired. See the
+    /// field.
+    pub(crate) fn note_prewarm_expired(&self) {
+        self.prewarm_expired
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124 K10): the flag [`Self::note_prewarm_expired`] sets.
+    pub(crate) fn prewarm_expired_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.prewarm_expired.clone()
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124 K10): this call's declared, best-effort upload scope.
+    pub(crate) fn managed_uploads(
+        &self,
+    ) -> Option<Arc<lore_storage::managed_uploads::ManagedUploads>> {
+        self.managed_uploads.lock().clone()
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124 K10): install, or with `None` remove, this call's declared,
+    /// best-effort upload scope. Returns the scope it replaced.
+    pub(crate) fn set_managed_uploads(
+        &self,
+        uploads: Option<Arc<lore_storage::managed_uploads::ManagedUploads>>,
+    ) -> Option<Arc<lore_storage::managed_uploads::ManagedUploads>> {
+        std::mem::replace(&mut *self.managed_uploads.lock(), uploads)
+    }
 }
 
 impl Default for ExecutionContext {
@@ -1229,6 +1265,8 @@ impl Default for ExecutionContext {
             caller_state: None,
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
+            prewarm_expired: Arc::default(),
+            managed_uploads: parking_lot::Mutex::new(None),
         }
     }
 }

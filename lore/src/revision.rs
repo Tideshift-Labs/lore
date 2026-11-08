@@ -109,6 +109,21 @@ pub async fn commit(
     dispatch_call(globals, args, callback, commit_local).await
 }
 
+/// FORK-LOCAL (Tideshift, WP-124 K10): [`commit`] for a managed client: its uploads go out
+/// declared, so a strict cell accepts them, and stay best effort (see
+/// [`lore_revision::managed_commit_uploads`]). A commit relayed to the Lore service runs as
+/// [`commit`] does there.
+pub async fn commit_with_managed_uploads(
+    globals: LoreGlobalArgs,
+    args: LoreRevisionCommitArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    lore_revision::managed_commit_uploads::with_managed_commit_uploads(Box::pin(commit(
+        globals, args, callback,
+    )))
+    .await
+}
+
 /// Commits exactly the normalized content/action and file-metadata selection.
 ///
 /// This Rust-only CLIENT facade returns the structured admission result or
@@ -130,6 +145,8 @@ pub async fn commit_exact_selection(
             if !ctx.globals().local() && !ctx.globals().offline() {
                 repository.set_disable_upload(false);
             }
+            // FORK-LOCAL (Tideshift, WP-124 K10): declared, best-effort uploads when asked.
+            let _uploads = lore_revision::managed_commit_uploads::install(&repository);
 
             lore_revision::exact_selection::commit_exact_selection(repository, &token, options)
                 .await
@@ -256,6 +273,8 @@ pub async fn finalize_resolved_merge(
             if !ctx.globals().local() && !ctx.globals().offline() {
                 repository.set_disable_upload(false);
             }
+            // FORK-LOCAL (Tideshift, WP-124 K10): declared, best-effort uploads when asked.
+            let _uploads = lore_revision::managed_commit_uploads::install(&repository);
 
             lore_revision::commit::commit_boxed(repository, &token, CommitOptions::new(message))
                 .await
@@ -331,6 +350,8 @@ fn commit_local(
             if !ctx.globals().local() && !ctx.globals().offline() {
                 repository.set_disable_upload(false);
             }
+            // FORK-LOCAL (Tideshift, WP-124 K10): declared, best-effort uploads when asked.
+            let _uploads = lore_revision::managed_commit_uploads::install(&repository);
 
             lore_revision::commit::commit_boxed(repository, &token, options).await
         },
@@ -368,6 +389,8 @@ pub async fn commit_with_metadata(
             if !ctx.globals().local() && !ctx.globals().offline() {
                 repository.set_disable_upload(false);
             }
+            // FORK-LOCAL (Tideshift, WP-124 K10): declared, best-effort uploads when asked.
+            let _uploads = lore_revision::managed_commit_uploads::install(&repository);
 
             lore_revision::commit::commit_with_metadata_boxed(
                 repository,

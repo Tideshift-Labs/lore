@@ -117,12 +117,20 @@ pub fn write_context(
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
 ) -> lore_storage::WriteContext {
     lore_storage::WriteContext::tracked(tracker, ambient_fragment_stats())
+        .with_managed_uploads(ambient_managed_uploads())
 }
 
 /// The write context for a call that has no tracker, so its writes run inline
 /// but still land in this call's totals.
 pub fn counted_write_context() -> lore_storage::WriteContext {
     lore_storage::WriteContext::counted(ambient_fragment_stats())
+        .with_managed_uploads(ambient_managed_uploads())
+}
+
+/// FORK-LOCAL (Tideshift, WP-124 K10): the call's declared, best-effort upload scope, if its
+/// command installed one (see [`crate::managed_commit_uploads`]).
+fn ambient_managed_uploads() -> Option<Arc<lore_storage::managed_uploads::ManagedUploads>> {
+    crate::runtime::try_execution_context()?.managed_uploads()
 }
 
 /// Construct [`WriteOptions`] from a repository context.

@@ -22,6 +22,7 @@ pub mod hash;
 pub mod immutable_store;
 pub mod local;
 pub mod maintenance;
+pub mod managed_uploads;
 pub mod mutable_store;
 pub mod options;
 pub mod packstore;

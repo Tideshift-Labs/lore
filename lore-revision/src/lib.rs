@@ -55,6 +55,7 @@ pub mod shared_store;
 #[doc(hidden)]
 pub use lore_base;
 pub mod lore;
+pub mod managed_commit_uploads;
 pub mod managed_push;
 pub mod merge;
 pub mod merge_carry;

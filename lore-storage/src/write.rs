@@ -489,6 +489,9 @@ async fn remote_put_resolved_retry(
 /// command does not pay the bound again per fragment. Only those two typed errors latch. Managed
 /// writes never touch the latch.
 fn note_unmanaged_refusal(session: &StorageSession, err: &lore_transport::ProtocolError) {
+    // FORK-LOCAL (Tideshift, WP-124 K10): an upload in a declared, best-effort scope latches that
+    // scope instead. It runs in a caller operation, so the session latch below never applies.
+    crate::managed_uploads::note_failure(err);
     if (lore_transport::is_unsupported_client(err)
         || lore_transport::is_managed_reconnect_expired(err))
         && lore_transport::caller_operation::current_caller_operation().is_none()
@@ -890,6 +893,7 @@ fn store_fragment_inline(
                 query,
                 None,
                 writes.stats(),
+                writes.managed_uploads(),
                 permit,
                 publish,
             )
@@ -934,6 +938,7 @@ fn store_fragment_inline(
             query,
             guard,
             writes.stats(),
+            writes.managed_uploads(),
             permit,
             publish,
         )
@@ -1040,6 +1045,7 @@ async fn store_fragment_dispatched(
         query,
         Some(guard),
         stats,
+        writes.managed_uploads(),
         permit,
         None,
     ));
@@ -1146,6 +1152,8 @@ async fn copy_association(
             Ok(true)
         }
         Err(err) => {
+            // FORK-LOCAL (Tideshift, WP-124 K10): no-op outside a declared, best-effort scope.
+            crate::managed_uploads::note_failure(&err);
             if lore_transport::caller_operation::current_caller_operation().is_some() {
                 return Err(crate::error::protocol_error_to_storage(err, address));
             }
@@ -1216,6 +1224,7 @@ fn leader_body(
     query: StoreMatchResult,
     guard: Option<StoreInFlightGuard>,
     stats: Option<Arc<FragmentWriteStats>>,
+    uploads: Option<Arc<crate::managed_uploads::ManagedUploads>>,
     permit: Option<OwnedSemaphorePermit>,
     publish: Option<Hash>,
 ) -> impl Future<Output = Result<Placement, StorageError>> {
@@ -1235,8 +1244,20 @@ fn leader_body(
         // one does: local, not durable, pushed later. Read before each send, so a refused copy
         // also skips the upload. Managed writes never read it.
         let unmanaged = lore_transport::caller_operation::current_caller_operation().is_none();
-        let refused =
-            |session: &StorageSession| unmanaged && session.unmanaged_writes().is_refused();
+        // FORK-LOCAL (Tideshift, WP-124 K10): an unmanaged write in a command that asked for
+        // declared, best-effort uploads runs its remote legs in that scope instead. A publishing
+        // write (the storage C API) keeps the unmanaged path: its mapping write is not a fragment
+        // write. See [`crate::managed_uploads`].
+        let uploads = uploads.filter(|_| unmanaged && publish.is_none());
+        // The session latch is about undeclared writes; the scope keeps its own.
+        let refused = |session: &StorageSession| {
+            unmanaged && uploads.is_none() && session.unmanaged_writes().is_refused()
+        };
+        // Set when the copy leg in the scope was skipped, or failed in any way other than an
+        // outright refusal (a lost answer among them): no fallback upload follows, the fragment
+        // stays local and the next push uploads it. A copy the server refused outright still
+        // falls back to one upload.
+        let mut skip_upload = false;
 
         // Before the payload is prepared: succeeding means neither the load nor the compression below
         // is work this fragment has to pay for.
@@ -1245,8 +1266,31 @@ fn leader_body(
             && !refused(session)
             && let Some(source) = copy_source(&query, address)
         {
-            stored_durable =
-                bounded_if_unmanaged(unmanaged, copy_association(session, source, address)).await?;
+            stored_durable = match uploads.as_ref() {
+                // Boxed, like the upload leg below: inline, the scope's future made a clone's
+                // future cross the `large_futures` bound.
+                Some(uploads) => {
+                    match Box::pin(uploads.run(session, copy_association(session, source, address)))
+                        .await
+                    {
+                        crate::managed_uploads::UploadLeg::Done(durable) => durable,
+                        crate::managed_uploads::UploadLeg::Skipped => {
+                            skip_upload = true;
+                            false
+                        }
+                        // Only a copy the server refused outright never applied; any other
+                        // failure (a lost answer among them) gets no fallback upload.
+                        crate::managed_uploads::UploadLeg::Failed { refused } => {
+                            skip_upload = !refused;
+                            false
+                        }
+                    }
+                }
+                None => {
+                    bounded_if_unmanaged(unmanaged, copy_association(session, source, address))
+                        .await?
+                }
+            };
             if stored_durable {
                 registered_remotely = true;
                 if let Some(stats) = stats {
@@ -1315,11 +1359,28 @@ fn leader_body(
 
         // Remote upload if session provided and not already durable
         if !stored_durable
+            && !skip_upload
             && let Some(session) = remote_session.clone()
             && !refused(&session)
         {
-            let result = match publish {
-                Some(key) => {
+            let result = match (publish, uploads.as_ref()) {
+                // FORK-LOCAL (Tideshift, WP-124 K10): the declared, best-effort upload. Any
+                // outcome other than an applied upload leaves the fragment local and not durable.
+                (None, Some(uploads)) => {
+                    match Box::pin(uploads.run(
+                        &session,
+                        remote_put_retry(session.clone(), address, fragment, Some(buffer.share())),
+                    ))
+                    .await
+                    {
+                        crate::managed_uploads::UploadLeg::Done(()) => Ok(()),
+                        crate::managed_uploads::UploadLeg::Skipped
+                        | crate::managed_uploads::UploadLeg::Failed { .. } => {
+                            Err(StorageError::internal("commit upload kept local"))
+                        }
+                    }
+                }
+                (Some(key), _) => {
                     bounded_if_unmanaged(
                         unmanaged,
                         remote_put_resolved_retry(
@@ -1332,7 +1393,7 @@ fn leader_body(
                     )
                     .await
                 }
-                None => {
+                (None, None) => {
                     bounded_if_unmanaged(
                         unmanaged,
                         remote_put_retry(session, address, fragment, Some(buffer.share())),

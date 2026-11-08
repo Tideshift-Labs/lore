@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 mod clone;
+mod connect_identity_tests;
 mod name_validation_tests;
 mod path_optional_tests;
 mod remote_state_tests;

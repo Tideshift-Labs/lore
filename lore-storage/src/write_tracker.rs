@@ -251,6 +251,8 @@ impl Default for WriteTracker {
 pub struct WriteContext {
     tracker: Option<Arc<WriteTracker>>,
     stats: Option<Arc<FragmentWriteStats>>,
+    /// FORK-LOCAL (Tideshift, WP-124 K10): the command's declared, best-effort upload scope.
+    uploads: Option<Arc<crate::managed_uploads::ManagedUploads>>,
 }
 
 impl WriteContext {
@@ -264,6 +266,7 @@ impl WriteContext {
         Self {
             tracker: None,
             stats,
+            uploads: None,
         }
     }
 
@@ -272,7 +275,27 @@ impl WriteContext {
         tracker: Option<Arc<WriteTracker>>,
         stats: Option<Arc<FragmentWriteStats>>,
     ) -> Self {
-        Self { tracker, stats }
+        Self {
+            tracker,
+            stats,
+            uploads: None,
+        }
+    }
+
+    /// FORK-LOCAL (Tideshift, WP-124 K10): run this context's unmanaged uploads in `uploads`, a
+    /// declared, best-effort scope. See [`crate::managed_uploads`]. Writes inside a managed caller
+    /// operation ignore it.
+    pub fn with_managed_uploads(
+        mut self,
+        uploads: Option<Arc<crate::managed_uploads::ManagedUploads>>,
+    ) -> Self {
+        self.uploads = uploads;
+        self
+    }
+
+    /// The declared, best-effort upload scope, owned so a spawned task can take it.
+    pub fn managed_uploads(&self) -> Option<Arc<crate::managed_uploads::ManagedUploads>> {
+        self.uploads.clone()
     }
 
     /// The tracker to dispatch background writes into, if any.

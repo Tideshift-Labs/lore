@@ -2037,6 +2037,25 @@ pub async fn create_client_memory_stores()
     Ok((immutable, mutable))
 }
 
+/// FORK-LOCAL (Tideshift, WP-124 K10): the identity the repository connect authenticates as.
+///
+/// `identity` is the one the command runs under (the given one, else the repository's). A commit
+/// that asked for declared uploads and was given an identity uses it as the author only: its
+/// connect uses the repository's `config_identity`, or none. See `load_and_connect`.
+#[lore_macro::test_pub]
+fn connect_identity(
+    managed_commit_uploads: bool,
+    identity_given: bool,
+    config_identity: &Option<String>,
+    identity: &Option<String>,
+) -> Option<String> {
+    if managed_commit_uploads && identity_given {
+        config_identity.clone()
+    } else {
+        identity.clone()
+    }
+}
+
 fn connect(
     repository: RepositoryId,
     globals: &LoreGlobalArgs,
@@ -2082,7 +2101,6 @@ fn connect(
                     connection.session_pool(repository, &correlation_id),
                 )
                 .await
-                && managed
                 && lore_transport::is_managed_reconnect_expired(&error)
             {
                 // FORK-LOCAL (Tideshift, WP-124): the QUIC path could not be replaced within the
@@ -2091,7 +2109,15 @@ fn connect(
                 // Accepted cost: a managed command that needs only gRPC (a lock verb) also fails
                 // as offline here, where ignoring the pre-warm would have let it finish.
                 // An unmanaged command ignores every pre-warm error, as it always did.
-                return Err(error);
+                if managed {
+                    return Err(error);
+                }
+                // FORK-LOCAL (Tideshift, WP-124 K10): an unmanaged command still finishes, but
+                // its declared, best-effort uploads (a commit's) skip instead of spending a second
+                // bound on their own reconnect. This task runs in the opening call's context.
+                if let Some(context) = crate::runtime::try_execution_context() {
+                    context.note_prewarm_expired();
+                }
             }
             Ok(connection)
         }));
@@ -2263,7 +2289,19 @@ pub async fn load_and_connect_with_token(
             .await;
     }
 
-    let remote = connect(repository, global, &config, identity);
+    // FORK-LOCAL (Tideshift, WP-124 K10): a commit that asked for declared uploads may name its
+    // author with a given identity (the desktop passes the user's display name). That name is
+    // not an auth identity, and the connect looks its token up by identity, so its uploads would
+    // go out with no token. Its connect authenticates as the repository's own identity instead,
+    // or resolves one from the token store when the repository has none; the author is still
+    // the given identity.
+    let connect_identity = connect_identity(
+        crate::managed_commit_uploads::managed_commit_uploads_requested(),
+        global.identity().is_some(),
+        &config.identity,
+        &identity,
+    );
+    let remote = connect(repository, global, &config, connect_identity);
 
     // Setup data store with loaded configuration
     let config_store = config.store.as_ref();

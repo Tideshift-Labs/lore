@@ -1318,7 +1318,13 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
             .with_defaults(),
     ));
 
-    let commit_result = run_command(globals.clone(), commit_args.into(), callback) as u8;
+    // FORK-LOCAL (Tideshift, WP-124 K10): our CLI is a managed client, as its push and lock verbs
+    // are, so the commit's uploads go out declared (a strict cell accepts them) and best effort.
+    let commit_result = lore::runtime().block_on(lore::revision::commit_with_managed_uploads(
+        globals.clone(),
+        commit_args,
+        callback,
+    )) as u8;
 
     // If the revision commit returned an error then don't bother resolving usernames
     if commit_result != 0 {

@@ -108,7 +108,18 @@ For detailed historical context, gotchas, and design invariants, see the [Append
   client `lore-transport/tests/unit/quic/session_expiry.rs` (typed 201, `session_refresh_due`) and
   `lore-transport/tests/session_expiry_attempt.rs` (rebind/resend through `StorageSession`); live
   `lore-integration-tests/tests/quic_token_expiry_test.rs`. Gate: `cargo test -p lore-transport --test
-  session_expiry_attempt` and `... -- quic_token_expiry` (live, ~16 s).- **Managed fragment Put, Copy and PutResolved are unjournaled [CLIENT]**: `StorageService::put`,
+  session_expiry_attempt` and `... -- quic_token_expiry` (live, ~16 s).
+- **WP-124 K10 managed commit uploads (`ManagedUploads`, `commit_with_managed_uploads`) [CLIENT]**:
+  unit `lore-storage/tests/unit/write/managed_uploads.rs` (scripted declaring `Storage` through
+  `store_fragment`: latch rules, `ready`, copy legs, tracker path; `run`/`note_failure`/the
+  refusing journal are `pub(crate)` and reached only through the legs); live
+  `lore-integration-tests/tests/quic_managed_push_hang_test.rs` `hang::k10::*` (strict cell accept +
+  push-uploads-nothing, dead path both orders, lost answer via `Probe::put_keys`). Gate: `cargo
+  test -p lore-storage --test unit write::managed_uploads` and `cargo test -p lore-integration-tests
+  --features integration_tests --test quic_managed_push_hang -- --test-threads 1`. Mutants proven
+  red: ignore `ready`/latch in `may_start`; resend after `is_unjournaled_answer_lost` in
+  `remote_put_retry`.
+- **Managed fragment Put, Copy and PutResolved are unjournaled [CLIENT]**: `StorageService::put`,
   `copy` and `put_resolved` inside a caller operation mint and send an attempt id + capability
   header but write no journal child (Copy/PutResolved since 2026-10-23); `unjournaled_result` maps
   request-not-sent to `Disconnected` and any lost answer to an `Internal` carrying

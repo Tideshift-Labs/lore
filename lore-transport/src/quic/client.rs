@@ -384,6 +384,13 @@ fn managed_idle_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// FORK-LOCAL (Tideshift, WP-124 K10): the managed bound, for a caller that bounds its own wait
+/// on a connect the same way (a commit's best-effort uploads wait at most this for the
+/// repository connect, whatever transport hangs it).
+pub fn managed_wait_bound() -> Duration {
+    managed_idle_timeout()
+}
+
 impl QuicQuinnConnection {
     async fn close(&mut self) {
         let connection_id = self.connection.stable_id();

@@ -105,6 +105,9 @@ pub(crate) struct HoldFirstPutAnswer {
     pub(crate) applied: Arc<tokio::sync::Notify>,
     pub(crate) grace: Duration,
     pub(crate) armed: Arc<AtomicBool>,
+    /// While set, EVERY applied `Put` answer is withheld (a connection that has gone silent),
+    /// whatever `armed` says.
+    pub(crate) hold_all: Arc<AtomicBool>,
 }
 
 /// What a test reads back from the server.
@@ -113,11 +116,18 @@ pub(crate) struct Probe {
     pub(crate) log: Arc<StdMutex<Vec<Wire>>>,
     /// One `SessionMap` per accepted connection.
     pub(crate) maps: Arc<StdMutex<Vec<Arc<SessionMap>>>>,
+    /// The first 48 bytes (the fragment address) of every `Put` parsed, in arrival order, so a
+    /// test can tell a fragment dispatched twice from two fragments.
+    pub(crate) put_keys: Arc<StdMutex<Vec<Vec<u8>>>>,
 }
 
 impl Probe {
     pub(crate) fn wire(&self) -> Vec<Wire> {
         self.log.lock().expect("log mutex").clone()
+    }
+
+    pub(crate) fn put_keys(&self) -> Vec<Vec<u8>> {
+        self.put_keys.lock().expect("put keys mutex").clone()
     }
 
     pub(crate) fn count_opcode(&self, opcode: Command) -> usize {
@@ -173,6 +183,7 @@ impl Probe {
 pub(crate) struct ProbeService {
     inner: StorageServiceV4,
     log: Arc<StdMutex<Vec<Wire>>>,
+    put_keys: Arc<StdMutex<Vec<Vec<u8>>>>,
     hold: Option<HoldFirstPutAnswer>,
 }
 
@@ -194,6 +205,12 @@ impl QuicService for ProbeService {
         let action = (header.cmd == Command::Authorize as u8)
             .then(|| bytes.first().copied())
             .flatten();
+        if header.cmd == Command::Put as u8 {
+            self.put_keys
+                .lock()
+                .expect("put keys mutex")
+                .push(bytes.iter().take(48).copied().collect());
+        }
         self.log.lock().expect("log mutex").push(Wire {
             opcode: header.cmd,
             session_id: header.session_id,
@@ -216,7 +233,7 @@ impl QuicService for ProbeService {
         if is_put
             && result.is_ok()
             && let Some(hold) = &self.hold
-            && hold.armed.swap(false, Ordering::SeqCst)
+            && (hold.hold_all.load(Ordering::SeqCst) || hold.armed.swap(false, Ordering::SeqCst))
         {
             // The real write is done. Let the test close the server, then keep the answer
             // back long enough that the closed connection wins deterministically.
@@ -287,6 +304,7 @@ impl ProbeFactory {
                 let service = ProbeService {
                     inner,
                     log: probe.log.clone(),
+                    put_keys: probe.put_keys.clone(),
                     hold: hold.clone(),
                 };
                 Box::new(StreamHandler::new(
@@ -593,6 +611,7 @@ pub(crate) fn hold_first_put_answer() -> HoldFirstPutAnswer {
         // Comfortably longer than an in-process `QuinnServer::close()` takes.
         grace: Duration::from_millis(400),
         armed: Arc::new(AtomicBool::new(true)),
+        hold_all: Arc::new(AtomicBool::new(false)),
     }
 }
 
