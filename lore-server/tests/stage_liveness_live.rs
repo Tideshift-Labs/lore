@@ -29,10 +29,12 @@ use lore_postgres::pool::TlsConfig;
 use lore_server::fragment_write_behind::WriteBehindRole;
 use lore_server::fragment_write_behind::combined_replica_fault;
 use lore_server::http::lb_health::verdict_from;
+use lore_server::stage_liveness::LivenessTick;
 use lore_server::stage_liveness::RETAIN;
 use lore_server::stage_liveness::STAGE_UNAVAILABLE_LOCAL;
 use lore_server::stage_liveness::StageLiveness;
 use lore_server::stage_liveness::exchange_once;
+use lore_server::stage_liveness::liveness_tick;
 
 const CELL: &str = "k11-cell";
 const STALE_AFTER: Duration = Duration::from_millis(1500);
@@ -233,6 +235,68 @@ async fn departed_rows_are_pruned_and_ids_are_bounded() {
             replica.len()
         );
     }
+
+    drop(store);
+    namespace.release().await;
+}
+
+/// A draining peer must not count as fresh. During a one-host roll the host
+/// going down is the fresh one; if the remaining host's mount is stale it
+/// must stay in the pool, or the cell goes dark.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_draining_peer_withdraws_and_no_longer_ejects_a_stale_replica() {
+    let Some(base_url) = pg_url() else {
+        eprintln!("LORE_TEST_PG_URL unset; skipping");
+        return;
+    };
+    let namespace = CaseNamespace::acquire(&base_url, "k11-drain").await;
+    let store = PostgresDomainStore::connect(namespace.pg_url(), 2, &TlsConfig::default())
+        .await
+        .expect("boot the domain store");
+    let coordinator = store.fragment_coordinator();
+
+    let stale = replica("web-a");
+    let leaving = replica("web-b");
+    tokio::time::sleep(STALE_AFTER + Duration::from_millis(300)).await;
+    leaving.note_good(Instant::now());
+    exchange(&coordinator, CELL, &leaving).await;
+    exchange(&coordinator, CELL, &stale).await;
+    assert_eq!(
+        lb_health(&stale),
+        (StatusCode::SERVICE_UNAVAILABLE, STAGE_UNAVAILABLE_LOCAL),
+        "control: a stale replica with a fresh serving peer is ejected"
+    );
+
+    // web-b starts to drain (lame duck or SIGTERM): it withdraws.
+    let mut withdrawn = false;
+    let tick = liveness_tick(
+        &leaving,
+        true,
+        &mut withdrawn,
+        |age| {
+            coordinator.exchange_stage_liveness(
+                CELL,
+                leaving.replica_id(),
+                age,
+                STALE_AFTER,
+                RETAIN,
+            )
+        },
+        || coordinator.withdraw_stage_liveness(CELL, leaving.replica_id()),
+        Duration::from_secs(5),
+        &mut None,
+    )
+    .await;
+    assert_eq!(tick, LivenessTick::Withdrew);
+
+    // web-b is still fresh by its own probe, but it no longer counts.
+    leaving.note_good(Instant::now());
+    exchange(&coordinator, CELL, &stale).await;
+    assert_eq!(lb_health(&stale), (StatusCode::OK, "ok"));
+    let view = stale.snapshot(Instant::now());
+    assert_eq!(view.peers, Some(0), "the draining peer's row must be gone");
+    assert_eq!(view.fresh_peers, Some(0));
 
     drop(store);
     namespace.release().await;

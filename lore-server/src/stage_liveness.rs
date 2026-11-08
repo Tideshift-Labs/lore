@@ -452,6 +452,76 @@ fn probe_loop(liveness: &StageLiveness, probe: &ProbeFn, interval: Duration, sto
     }
 }
 
+/// What one tick of the exchange task did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LivenessTick {
+    /// Published and read peers.
+    Exchanged,
+    /// The exchange failed or timed out.
+    ExchangeFailed,
+    /// Draining: this tick deleted the row.
+    Withdrew,
+    /// Draining: the delete failed or timed out; the next tick retries.
+    WithdrawFailed,
+    /// Draining and already withdrawn: nothing to do.
+    Withdrawn,
+}
+
+/// One tick of the exchange task.
+///
+/// A draining replica (lame duck or SIGTERM) never publishes again. It deletes
+/// its row once, so a peer whose own mount is stale does not count it as a
+/// fresh peer and eject itself while this one leaves: during a one-host roll
+/// that would take the cell dark. A peer's cached view can still show the
+/// row for up to one exchange interval after the delete.
+pub async fn liveness_tick<X, XFut, W, WFut, E>(
+    liveness: &StageLiveness,
+    draining: bool,
+    withdrawn: &mut bool,
+    exchange: X,
+    withdraw: W,
+    timeout: Duration,
+    warn_every: &mut Option<Instant>,
+) -> LivenessTick
+where
+    X: FnOnce(Duration) -> XFut,
+    XFut: std::future::Future<Output = Result<StagePeerLiveness, E>>,
+    W: FnOnce() -> WFut,
+    WFut: std::future::Future<Output = Result<bool, E>>,
+    E: std::fmt::Display,
+{
+    if !draining {
+        return if exchange_once(liveness, exchange, timeout, warn_every).await {
+            LivenessTick::Exchanged
+        } else {
+            LivenessTick::ExchangeFailed
+        };
+    }
+    if *withdrawn {
+        return LivenessTick::Withdrawn;
+    }
+    match tokio::time::timeout(timeout, withdraw()).await {
+        Ok(Ok(_deleted)) => {
+            *withdrawn = true;
+            info!(
+                replica_id = %liveness.replica_id(),
+                "stage liveness withdrawn for drain; peers no longer count this replica"
+            );
+            LivenessTick::Withdrew
+        }
+        Ok(Err(error)) => {
+            warn!(%error, "stage liveness withdraw failed; the row ages out within the freshness window");
+            LivenessTick::WithdrawFailed
+        }
+        Err(_elapsed) => {
+            warn!(
+                "stage liveness withdraw timed out; the row ages out within the freshness window"
+            );
+            LivenessTick::WithdrawFailed
+        }
+    }
+}
+
 /// One exchange: publish, read peers, record the view. A failure or a timeout
 /// records nothing, so the last view ages to [`PeerEvidence::Unknown`].
 ///

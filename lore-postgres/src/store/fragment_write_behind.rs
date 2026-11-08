@@ -1354,6 +1354,15 @@ impl FragmentWriteBehindHandle {
         }
     }
 
+    /// FORK-LOCAL (Tideshift), WP-115 K11: delete this replica's liveness row
+    /// when it starts to drain, so no peer counts it as fresh.
+    pub async fn withdraw_stage_liveness(&self, replica_id: &str) -> Result<bool, StoreError> {
+        self.coordinator
+            .withdraw_stage_liveness(&self.policy.cell_id, replica_id)
+            .await
+            .map_err(domain_store_err)
+    }
+
     /// FORK-LOCAL (Tideshift), WP-115 K11: publish this replica's last good
     /// stage probe for its cell and count the cell's fresh peers. On the
     /// shared domain pool, never the observer's reserved connection.

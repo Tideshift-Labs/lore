@@ -2997,6 +2997,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             postgres_write_behind_settings(&settings)?.map(|config| config.runtime),
             &mut endpoints,
             _shutdown_rx.clone(),
+            // WP-115 K11: a draining replica withdraws its stage liveness row.
+            Some(drain_state.clone()),
         )?;
         // CR-032 / WP-119 Step B, in two halves.
         //

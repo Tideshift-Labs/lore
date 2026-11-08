@@ -29,6 +29,30 @@ pub struct StagePeerLiveness {
 }
 
 impl PostgresFragmentCoordinator {
+    /// Delete this replica's row, so its peers stop counting it as fresh.
+    ///
+    /// A replica calls this when it starts to drain (lame duck or SIGTERM).
+    /// Without it, a draining peer still reads fresh for up to the freshness
+    /// window, and a peer whose own mount is stale ejects itself while the
+    /// draining one leaves: the cell goes dark. Returns whether a row was
+    /// deleted.
+    pub async fn withdraw_stage_liveness(
+        &self,
+        cell_id: &str,
+        replica_id: &str,
+    ) -> Result<bool, DomainError> {
+        let client = self.checkout().await?;
+        let deleted = client
+            .execute(
+                "DELETE FROM lore_domain_write_behind_liveness \
+                 WHERE cell_id = $1 AND replica_id = $2",
+                &[&cell_id, &replica_id],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg("stage liveness withdraw", error))?;
+        Ok(deleted > 0)
+    }
+
     /// Publish this replica's last good stage probe and count fresh peers.
     ///
     /// One statement: the upsert, the prune of rows not published for

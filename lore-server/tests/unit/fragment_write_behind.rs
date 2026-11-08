@@ -70,13 +70,15 @@ async fn absent_configuration_starts_no_tasks_and_partial_configuration_refuses(
     let mut tasks = JoinSet::new();
     let (_, shutdown) = watch::channel(false);
     assert!(
-        configure_fragment_write_behind(None, None, &mut tasks, shutdown.clone())
+        configure_fragment_write_behind(None, None, &mut tasks, shutdown.clone(), None)
             .unwrap()
             .is_none()
     );
     assert!(tasks.is_empty());
     let settings = FragmentWriteBehindSettings::new(1000, 64, 1000, 5000, 5000, 64).unwrap();
-    assert!(configure_fragment_write_behind(None, Some(settings), &mut tasks, shutdown).is_err());
+    assert!(
+        configure_fragment_write_behind(None, Some(settings), &mut tasks, shutdown, None).is_err()
+    );
     assert!(tasks.is_empty());
 }
 

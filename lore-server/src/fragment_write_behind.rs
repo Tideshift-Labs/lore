@@ -35,6 +35,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::drain::DrainState;
 use crate::stage_liveness::StageLiveness;
 use crate::stage_liveness::StageLivenessSnapshot;
 
@@ -1188,6 +1189,7 @@ pub(crate) fn configure_fragment_write_behind(
     settings: Option<FragmentWriteBehindSettings>,
     endpoints: &mut JoinSet<Result<()>>,
     shutdown: watch::Receiver<bool>,
+    drain: Option<Arc<DrainState>>,
 ) -> Result<Option<Arc<FragmentWriteBehindReadiness>>> {
     let (handle, settings) = match (handle, settings) {
         (None, None) => return Ok(None),
@@ -1198,7 +1200,7 @@ pub(crate) fn configure_fragment_write_behind(
         handle.set_drain_concurrency(concurrency);
     }
     let stage_liveness = if settings.runs_stage_liveness() {
-        start_stage_liveness(&handle, endpoints, &shutdown)?
+        start_stage_liveness(&handle, endpoints, &shutdown, drain)?
     } else {
         None
     };
@@ -1241,6 +1243,7 @@ fn start_stage_liveness(
     handle: &Arc<FragmentWriteBehindHandle>,
     endpoints: &mut JoinSet<Result<()>>,
     shutdown: &watch::Receiver<bool>,
+    drain: Option<Arc<DrainState>>,
 ) -> Result<Option<Arc<StageLiveness>>> {
     let Some(root) = handle.stage_root() else {
         return Ok(None);
@@ -1269,6 +1272,8 @@ fn start_stage_liveness(
         let mut ticks = tokio::time::interval(crate::stage_liveness::EXCHANGE_INTERVAL);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut warned = None;
+        let mut withdrawn = false;
+        let draining = || drain.as_ref().is_some_and(|drain| drain.is_draining());
         loop {
             tokio::select! { biased;
                 _ = exchange_shutdown.wait_for(|value| *value) => break,
@@ -1276,20 +1281,39 @@ fn start_stage_liveness(
             }
             tokio::select! { biased;
                 _ = exchange_shutdown.wait_for(|value| *value) => break,
-                _ = crate::stage_liveness::exchange_once(
+                _ = crate::stage_liveness::liveness_tick(
                     &exchange_liveness,
+                    draining(),
+                    &mut withdrawn,
                     |age| exchange_handle.exchange_stage_liveness(
                         exchange_liveness.replica_id(),
                         age,
                         exchange_liveness.stale_after(),
                         crate::stage_liveness::RETAIN,
                     ),
+                    || exchange_handle.withdraw_stage_liveness(exchange_liveness.replica_id()),
                     crate::stage_liveness::EXCHANGE_TIMEOUT,
                     &mut warned,
                 ) => {}
             }
             exchange_liveness.report(Instant::now());
         }
+        // Shutdown without a drain phase (or before the tick that would have
+        // withdrawn): withdraw now, bounded, so peers stop counting this row.
+        let _ = crate::stage_liveness::liveness_tick(
+            &exchange_liveness,
+            true,
+            &mut withdrawn,
+            |_age| {
+                std::future::ready(Ok(
+                    lore_postgres::domain::fragments::StagePeerLiveness::default(),
+                ))
+            },
+            || exchange_handle.withdraw_stage_liveness(exchange_liveness.replica_id()),
+            crate::stage_liveness::EXCHANGE_TIMEOUT,
+            &mut warned,
+        )
+        .await;
         Ok(())
     });
     Ok(Some(liveness))

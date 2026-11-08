@@ -322,3 +322,94 @@ fn replica_ids_are_file_safe_and_bounded() {
         "{id}"
     );
 }
+
+/// A draining replica never publishes again: it withdraws its row once, and
+/// a failed withdraw is retried on the next tick.
+#[tokio::test]
+async fn a_draining_replica_withdraws_once_and_never_publishes() {
+    let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    let exchanges = std::sync::atomic::AtomicUsize::new(0);
+    let withdraws = std::sync::atomic::AtomicUsize::new(0);
+    let mut withdrawn = false;
+    let mut warned = None;
+    let exchange = |_age: Duration| {
+        exchanges.fetch_add(1, Ordering::SeqCst);
+        async { Ok::<_, String>(view(1, 1)) }
+    };
+    let ok_withdraw = || {
+        withdraws.fetch_add(1, Ordering::SeqCst);
+        async { Ok::<_, String>(true) }
+    };
+    let timeout = Duration::from_secs(1);
+
+    // Serving: exchanges, never withdraws.
+    let tick = liveness_tick(
+        &state,
+        false,
+        &mut withdrawn,
+        exchange,
+        ok_withdraw,
+        timeout,
+        &mut warned,
+    )
+    .await;
+    assert_eq!(tick, LivenessTick::Exchanged);
+    assert_eq!(
+        (
+            exchanges.load(Ordering::SeqCst),
+            withdraws.load(Ordering::SeqCst)
+        ),
+        (1, 0)
+    );
+
+    // Draining, the delete fails: no publish, retried next tick.
+    let failing_withdraw = || {
+        withdraws.fetch_add(1, Ordering::SeqCst);
+        async { Err::<bool, _>("connection refused".to_owned()) }
+    };
+    let tick = liveness_tick(
+        &state,
+        true,
+        &mut withdrawn,
+        exchange,
+        failing_withdraw,
+        timeout,
+        &mut warned,
+    )
+    .await;
+    assert_eq!(tick, LivenessTick::WithdrawFailed);
+    assert!(!withdrawn);
+
+    // Draining: withdraws, and never publishes.
+    let tick = liveness_tick(
+        &state,
+        true,
+        &mut withdrawn,
+        exchange,
+        ok_withdraw,
+        timeout,
+        &mut warned,
+    )
+    .await;
+    assert_eq!(tick, LivenessTick::Withdrew);
+    assert!(withdrawn);
+    let tick = liveness_tick(
+        &state,
+        true,
+        &mut withdrawn,
+        exchange,
+        ok_withdraw,
+        timeout,
+        &mut warned,
+    )
+    .await;
+    assert_eq!(tick, LivenessTick::Withdrawn);
+    assert_eq!(
+        (
+            exchanges.load(Ordering::SeqCst),
+            withdraws.load(Ordering::SeqCst)
+        ),
+        (1, 2),
+        "a draining replica must never publish again, and withdraws once it succeeds"
+    );
+}
