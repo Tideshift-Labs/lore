@@ -186,3 +186,24 @@ fn drain_reasons_outrank_a_write_behind_fault() {
         (StatusCode::SERVICE_UNAVAILABLE, "draining")
     );
 }
+
+#[test]
+fn a_drain_role_replica_is_always_out_of_the_pool() {
+    use lore_server::fragment_write_behind::DRAIN_ROLE_LB_FAULT;
+    assert_eq!(
+        lb_health::verdict_from(None, Some(DRAIN_ROLE_LB_FAULT)),
+        (StatusCode::SERVICE_UNAVAILABLE, "drain_role")
+    );
+    let idle = DrainState::new();
+    assert_eq!(
+        lb_health::verdict_from(Some(&idle), Some(DRAIN_ROLE_LB_FAULT)),
+        (StatusCode::SERVICE_UNAVAILABLE, "drain_role")
+    );
+    let lame_duck = DrainState::new();
+    lame_duck.begin_lame_duck();
+    assert_eq!(
+        lb_health::verdict_from(Some(&lame_duck), Some(DRAIN_ROLE_LB_FAULT)),
+        (StatusCode::SERVICE_UNAVAILABLE, "lame_duck"),
+        "lame duck outranks the role fault"
+    );
+}

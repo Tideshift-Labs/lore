@@ -56,6 +56,11 @@ struct Instruments {
     /// Seconds the spool retired floor trails this replica's clock (WP-115 f2). Recorded every
     /// tick from memory, so it keeps growing while the floor is stuck or the database fails.
     spool_retired_floor_age: Gauge<u64>,
+    /// Age in seconds of the cell's oldest staged, unpromoted fragment, read
+    /// from Postgres by every replica's observer (0 when nothing is pending).
+    /// WP-115 K6: the cell-wide drain-stall signal. It is exported by the stage
+    /// replicas too, so it keeps growing after the drain worker dies.
+    oldest_pending_age: Gauge<u64>,
     /// Each `observe()` step's duration, by `step` and `outcome`.
     observe_step_ms: Histogram<f64>,
 }
@@ -84,14 +89,65 @@ fn instruments() -> &'static Instruments {
             spool_retired_floor_age: meter
                 .u64_gauge(provider.scope_name("spool_retired_floor_age_seconds"))
                 .build(),
+            oldest_pending_age: meter
+                .u64_gauge(provider.scope_name("oldest_pending_age_seconds"))
+                .build(),
             observe_step_ms: provider.latency_histogram_ms("observe_step"),
         }
     })
 }
 
+/// FORK-LOCAL (Tideshift): which write-behind work this replica runs (WP-115 K6).
+///
+/// The stage is one tree shared by every replica of the cell (an NFS export
+/// in the multi-host topology), so the drain does not have to run where the
+/// writes land. `Full` is the default and is the behaviour every existing
+/// configuration already has.
+///
+/// The Postgres claims stay the only authority over who promotes or cleans
+/// what. A role only decides which loops this process starts; it grants
+/// nothing. Two drain workers in one cell, or a `full` replica beside a
+/// `drain` one, is therefore wasted work, never a correctness fault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteBehindRole {
+    /// Stage writes and run the drain, cleanup and observer loops.
+    #[default]
+    Full,
+    /// Stage writes, serve staged reads and run the observer only. No
+    /// promotion, no stage or spool cleanup, no spool writes.
+    ///
+    /// Two things still touch disk here, by design. `spool_root` is still
+    /// required: boot opens the spool writer (one probe file), and the observer
+    /// walks that empty local spool and reads its free space into the capacity
+    /// check. And an obliterate request purges its staged epoch on whichever
+    /// replica serves it; that path is request-driven and claim-gated, not a
+    /// background loop.
+    Stage,
+    /// The cell's dedicated drain worker: the same loops as `Full`. It is not a
+    /// load-balancer member, so `/lb_health` always answers 503 `drain_role`.
+    Drain,
+}
+
+impl WriteBehindRole {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Stage => "stage",
+            Self::Drain => "drain",
+        }
+    }
+
+    /// Whether this role runs the drain and cleanup loops.
+    pub fn runs_drain(self) -> bool {
+        !matches!(self, Self::Stage)
+    }
+}
+
 #[lore_macro::test_pub]
 #[derive(Debug, Clone)]
 pub(crate) struct FragmentWriteBehindSettings {
+    role: WriteBehindRole,
     worker_interval: Duration,
     worker_batch: u32,
     /// `None` keeps the handle's default (row 77).
@@ -127,6 +183,7 @@ impl FragmentWriteBehindSettings {
             bail!("write-behind worker_batch and cleanup_batch must be between 1 and 256");
         }
         Ok(Self {
+            role: WriteBehindRole::Full,
             worker_interval: Duration::from_millis(worker),
             worker_batch: batch,
             worker_concurrency: None,
@@ -146,6 +203,18 @@ impl FragmentWriteBehindSettings {
         }
         self.worker_concurrency = concurrency;
         Ok(self)
+    }
+
+    /// Set which loops this replica runs (WP-115 K6).
+    #[lore_macro::test_pub]
+    pub(crate) fn with_role(mut self, role: WriteBehindRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    #[lore_macro::test_pub]
+    pub(crate) fn role(&self) -> WriteBehindRole {
+        self.role
     }
 
     /// How often the observer runs, which is also each attempt's budget.
@@ -187,6 +256,7 @@ struct State {
 
 pub struct FragmentWriteBehindReadiness {
     handle: Arc<FragmentWriteBehindHandle>,
+    role: WriteBehindRole,
     state: Mutex<State>,
     stale_after: Duration,
     cleanup_stale_after: Duration,
@@ -194,6 +264,8 @@ pub struct FragmentWriteBehindReadiness {
 
 #[derive(Serialize)]
 pub struct Snapshot {
+    /// `full`, `stage` or `drain` (WP-115 K6).
+    pub role: &'static str,
     pub mode: &'static str,
     pub ready: bool,
     pub reason: Option<&'static str>,
@@ -304,6 +376,15 @@ fn log_capacity_transition(available: bool, detail: &CapacityDetail) {
 #[lore_macro::test_pub]
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+/// The `oldest_pending_age_seconds` gauge value for one observation: 0 when
+/// nothing is pending.
+#[lore_macro::test_pub]
+fn oldest_pending_age_seconds(observation: &WriteBehindObservation) -> u64 {
+    observation
+        .oldest_pending_age
+        .map_or(0, |age| age.as_secs())
 }
 
 /// Which worker loop a pass belongs to.
@@ -739,6 +820,92 @@ fn replica_fault(state: &State, stale_after: Duration) -> Option<&'static str> {
     }
 }
 
+/// FORK-LOCAL (Tideshift): readiness for a `stage` role replica (WP-115 K6).
+///
+/// A stage replica runs only the observer. It has no drain or cleanup loop,
+/// so every verdict about those loops (`worker_stale`,
+/// `drain_backpressure_sustained`, `drain_not_progressing`, `cleanup_stale`,
+/// `cleanup_backpressure_sustained`) belongs to the drain worker and is left
+/// out here. What remains is what this replica's own PUTs and staged reads
+/// depend on: a live observer, a fresh observation, usable roots and room on
+/// the stage.
+///
+/// `observer_stopped` replaces `worker_stopped`: the task that ended is the
+/// observer, the only write-behind task this replica has.
+#[lore_macro::test_pub]
+fn stage_readiness_reason(state: &State, stale_after: Duration) -> Option<&'static str> {
+    let observation = state.observation.as_ref().map(|(_, value)| value);
+    let observation_age = state.observation.as_ref().map(|(at, _)| at.elapsed());
+    if state.stopped {
+        Some("observer_stopped")
+    } else if observation_age.is_none_or(|age| age >= stale_after) {
+        Some("observation_unknown")
+    } else if observation.is_none_or(|value| !value.roots_usable) {
+        Some("root_unavailable")
+    } else if state
+        .capacity_unavailable_since
+        .is_some_and(|at| at.elapsed() >= stale_after)
+    {
+        Some("capacity_unavailable")
+    } else {
+        None
+    }
+}
+
+/// FORK-LOCAL (Tideshift): the `/lb_health` fault for a `stage` role replica
+/// (WP-115 K6).
+///
+/// Only `observer_stopped` qualifies. `root_unavailable` is left out on
+/// purpose: in this topology the stage is one shared export, so a stage-root
+/// fault is the same on every web replica, and ejecting them one after another
+/// refuses the whole cell. It stays on `/health_check` and in the metrics.
+#[lore_macro::test_pub]
+fn stage_replica_fault(state: &State) -> Option<&'static str> {
+    state.stopped.then_some("observer_stopped")
+}
+
+/// The `/lb_health` word a `drain` role replica always answers. The worker is
+/// not a load-balancer member; this keeps a misconfigured pool from sending it
+/// client connections.
+pub const DRAIN_ROLE_LB_FAULT: &str = "drain_role";
+
+/// The `/lb_health` fault for `role`. Pure, so the per-role mapping is
+/// testable without a live handle.
+#[lore_macro::test_pub]
+fn role_replica_fault(
+    role: WriteBehindRole,
+    state: &State,
+    stale_after: Duration,
+) -> Option<&'static str> {
+    match role {
+        WriteBehindRole::Full => replica_fault(state, stale_after),
+        WriteBehindRole::Stage => stage_replica_fault(state),
+        WriteBehindRole::Drain => Some(DRAIN_ROLE_LB_FAULT),
+    }
+}
+
+/// The readiness reason and the degraded condition for `role`.
+///
+/// A stage replica runs no cleanup loop, so it never credits cleanup progress
+/// and would read `cleanup_not_progressing` whenever the backlog is non-zero.
+/// That verdict belongs to the drain worker, so a stage replica reports none.
+#[lore_macro::test_pub]
+fn role_readiness(
+    role: WriteBehindRole,
+    state: &State,
+    stale_after: Duration,
+    cleanup_stale_after: Duration,
+) -> (Option<&'static str>, Option<&'static str>) {
+    if role.runs_drain() {
+        (
+            readiness_reason(state, stale_after, cleanup_stale_after),
+            degraded_reason(state, cleanup_stale_after),
+        )
+    } else {
+        (stage_readiness_reason(state, stale_after), None)
+    }
+}
+
 /// A slow condition that is reported but does not fail readiness.
 ///
 /// **A slow cell-wide cleanup is not unreadiness (INV-FT, row 71).** The backlog
@@ -825,7 +992,11 @@ impl FragmentWriteBehindReadiness {
     /// The replica-local fault `/lb_health` acts on. Reads in-memory state only.
     pub fn replica_fault(&self) -> Option<&'static str> {
         let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        replica_fault(&state, self.stale_after)
+        role_replica_fault(self.role, &state, self.stale_after)
+    }
+
+    pub fn role(&self) -> WriteBehindRole {
+        self.role
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -834,8 +1005,14 @@ impl FragmentWriteBehindReadiness {
         let observation = state.observation.as_ref().map(|(_, value)| value);
         let observation_age = state.observation.as_ref().map(|(at, _)| at.elapsed());
         let worker_age = state.worker.map(|at| at.elapsed());
-        let reason = readiness_reason(&state, self.stale_after, self.cleanup_stale_after);
+        let (reason, degraded) = role_readiness(
+            self.role,
+            &state,
+            self.stale_after,
+            self.cleanup_stale_after,
+        );
         Snapshot {
+            role: self.role.name(),
             mode: match self.handle.mode() {
                 StagingMode::Stage => "stage",
                 StagingMode::DirectFallback => "direct_fallback",
@@ -844,9 +1021,7 @@ impl FragmentWriteBehindReadiness {
             },
             ready: reason.is_none(),
             reason,
-            degraded: degraded_reason(&state, self.cleanup_stale_after)
-                .into_iter()
-                .collect(),
+            degraded: degraded.into_iter().collect(),
             worker_age_millis: worker_age.map(millis),
             observation_age_millis: observation_age.map(millis),
             pending_bytes: observation.map(|value| value.pending_bytes),
@@ -938,10 +1113,43 @@ pub(crate) fn configure_fragment_write_behind(
     }
     let readiness = Arc::new(FragmentWriteBehindReadiness {
         handle: handle.clone(),
+        role: settings.role,
         state: Mutex::new(State::default()),
         stale_after: settings.stale_after,
         cleanup_stale_after: settings.cleanup_interval * 2 + settings.stale_after,
     });
+    info!(
+        role = settings.role.name(),
+        "write-behind role selects which loops this replica runs"
+    );
+    if settings.role.runs_drain() {
+        spawn_drain_and_cleanup(&handle, &readiness, &settings, endpoints, &shutdown);
+    }
+    let observer_readiness = readiness.clone();
+    // A stage replica has no drain loop to own the stop guard, so its observer
+    // owns it: the observer is the one task whose end leaves this replica
+    // unable to keep admission fresh.
+    let observer_guard =
+        (!settings.role.runs_drain()).then(|| StopGuard(handle.clone(), readiness.clone()));
+    let mut observer_shutdown = shutdown;
+    lore_spawn!(endpoints, async move {
+        let _guard = observer_guard;
+        observe_loop(handle, observer_readiness, settings, &mut observer_shutdown).await;
+        Ok(())
+    });
+    Ok(Some(readiness))
+}
+
+/// The drain and cleanup loops, which only `full` and `drain` replicas run.
+fn spawn_drain_and_cleanup(
+    handle: &Arc<FragmentWriteBehindHandle>,
+    readiness: &Arc<FragmentWriteBehindReadiness>,
+    settings: &FragmentWriteBehindSettings,
+    endpoints: &mut JoinSet<Result<()>>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let cleanup_settings = settings.clone();
+    let settings = settings.clone();
     let worker_handle = handle.clone();
     let worker_readiness = readiness.clone();
     let mut worker_shutdown = shutdown.clone();
@@ -992,6 +1200,7 @@ pub(crate) fn configure_fragment_write_behind(
     let cleanup_readiness = readiness.clone();
     let mut cleanup_shutdown = shutdown.clone();
     lore_spawn!(endpoints, async move {
+        let settings = cleanup_settings;
         let mut ticks = tokio::time::interval(settings.cleanup_interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
@@ -1030,111 +1239,125 @@ pub(crate) fn configure_fragment_write_behind(
         }
         Ok(())
     });
-    let observer_readiness = readiness.clone();
-    let mut observer_shutdown = shutdown;
-    lore_spawn!(endpoints, async move {
-        let mut ticks = tokio::time::interval(settings.observer_interval);
-        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut limiter = WarnLimiter::default();
-        let mut previous_attempt: Option<Instant> = None;
-        let mut counted_skips = CleanupSkips::default();
-        loop {
-            tokio::select! { biased;
-                _ = observer_shutdown.wait_for(|value| *value) => break,
-                _ = ticks.tick() => {}
+}
+
+/// The observer loop, which every role runs. It feeds admission (occupancy,
+/// capacity, pending, heartbeat) and readiness from the cell's Postgres and
+/// this host's view of the roots.
+async fn observe_loop(
+    handle: Arc<FragmentWriteBehindHandle>,
+    observer_readiness: Arc<FragmentWriteBehindReadiness>,
+    settings: FragmentWriteBehindSettings,
+    observer_shutdown: &mut watch::Receiver<bool>,
+) {
+    let mut ticks = tokio::time::interval(settings.observer_interval);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut limiter = WarnLimiter::default();
+    let mut previous_attempt: Option<Instant> = None;
+    let mut counted_skips = CleanupSkips::default();
+    loop {
+        tokio::select! { biased;
+            _ = observer_shutdown.wait_for(|value| *value) => break,
+            _ = ticks.tick() => {}
+        }
+        handle.note_observation_unknown();
+        let attempt = Instant::now();
+        let result = tokio::select! { biased;
+            _ = observer_shutdown.wait_for(|value| *value) => break,
+            result = tokio::time::timeout(settings.observer_interval, handle.observe()) => result,
+        };
+        let (outcome, error) = match &result {
+            Ok(Ok(_)) => (ObserveOutcome::Ok, None),
+            Ok(Err(error)) => (ObserveOutcome::Failed, Some(error.to_string())),
+            Err(_) => (ObserveOutcome::TimedOut, None),
+        };
+        report_observe_attempt(
+            &handle.observe_trace(),
+            outcome,
+            error.as_deref(),
+            previous_attempt.map(|previous| attempt.saturating_duration_since(previous)),
+            settings.observer_interval,
+            &mut limiter,
+        );
+        previous_attempt = Some(attempt);
+        // Every tick, not only after a good observation: skips are most
+        // likely while the database is failing.
+        record_cleanup_skips(
+            &instruments().cleanup_skipped,
+            &mut counted_skips,
+            handle.cleanup_skips(),
+        );
+        instruments()
+            .spool_retired_floor_age
+            .record(handle.spool_retired_floor_age().as_secs(), &[]);
+        if let Ok(Ok(observation)) = result {
+            instruments().pending.record(observation.pending_files, &[]);
+            instruments()
+                .oldest_pending_age
+                .record(oldest_pending_age_seconds(&observation), &[]);
+            instruments()
+                .usage
+                .record(observation.stage_bytes, &[KeyValue::new("root", "stage")]);
+            instruments()
+                .usage
+                .record(observation.spool_bytes, &[KeyValue::new("root", "spool")]);
+            instruments()
+                .stage_tombstones_kept
+                .record(observation.stage_tombstones_kept, &[]);
+            // Explicit block, matching the worker loops: the guard is released at the
+            // brace rather than at a statement temporary, so `snapshot()` below cannot
+            // be folded into the same expression and self-deadlock this std `Mutex`.
+            let transition = {
+                let mut state = observer_readiness
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                record_capacity_observation(
+                    &mut state,
+                    observation,
+                    Instant::now(),
+                    settings.stale_after,
+                )
+            };
+            if let Some((available, detail)) = transition {
+                log_capacity_transition(available, &detail);
+            }
+            apply_heartbeat(
+                &handle,
+                heartbeat_action(true, observer_readiness.snapshot().ready),
+            );
+        } else {
+            {
+                let mut state = observer_readiness
+                    .state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                record_observation(&mut state, None, Instant::now(), settings.stale_after);
             }
             handle.note_observation_unknown();
-            let attempt = Instant::now();
-            let result = tokio::select! { biased;
-                _ = observer_shutdown.wait_for(|value| *value) => break,
-                result = tokio::time::timeout(settings.observer_interval, handle.observe()) => result,
-            };
-            let (outcome, error) = match &result {
-                Ok(Ok(_)) => (ObserveOutcome::Ok, None),
-                Ok(Err(error)) => (ObserveOutcome::Failed, Some(error.to_string())),
-                Err(_) => (ObserveOutcome::TimedOut, None),
-            };
-            report_observe_attempt(
-                &handle.observe_trace(),
-                outcome,
-                error.as_deref(),
-                previous_attempt.map(|previous| attempt.saturating_duration_since(previous)),
-                settings.observer_interval,
-                &mut limiter,
+            apply_heartbeat(
+                &handle,
+                heartbeat_action(false, observer_readiness.snapshot().ready),
             );
-            previous_attempt = Some(attempt);
-            // Every tick, not only after a good observation: skips are most
-            // likely while the database is failing.
-            record_cleanup_skips(
-                &instruments().cleanup_skipped,
-                &mut counted_skips,
-                handle.cleanup_skips(),
-            );
-            instruments()
-                .spool_retired_floor_age
-                .record(handle.spool_retired_floor_age().as_secs(), &[]);
-            if let Ok(Ok(observation)) = result {
-                instruments().pending.record(observation.pending_files, &[]);
-                instruments()
-                    .usage
-                    .record(observation.stage_bytes, &[KeyValue::new("root", "stage")]);
-                instruments()
-                    .usage
-                    .record(observation.spool_bytes, &[KeyValue::new("root", "spool")]);
-                instruments()
-                    .stage_tombstones_kept
-                    .record(observation.stage_tombstones_kept, &[]);
-                // Explicit block, matching the worker loops: the guard is released at the
-                // brace rather than at a statement temporary, so `snapshot()` below cannot
-                // be folded into the same expression and self-deadlock this std `Mutex`.
-                let transition = {
-                    let mut state = observer_readiness
-                        .state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    record_capacity_observation(
-                        &mut state,
-                        observation,
-                        Instant::now(),
-                        settings.stale_after,
-                    )
-                };
-                if let Some((available, detail)) = transition {
-                    log_capacity_transition(available, &detail);
-                }
-                apply_heartbeat(
-                    &handle,
-                    heartbeat_action(true, observer_readiness.snapshot().ready),
-                );
-            } else {
-                {
-                    let mut state = observer_readiness
-                        .state
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
-                    record_observation(&mut state, None, Instant::now(), settings.stale_after);
-                }
-                handle.note_observation_unknown();
-                apply_heartbeat(
-                    &handle,
-                    heartbeat_action(false, observer_readiness.snapshot().ready),
-                );
-            }
-            let snapshot = observer_readiness.snapshot();
-            instruments().ready.record(
-                u64::from(snapshot.ready),
-                &[KeyValue::new(
-                    "reason",
-                    snapshot.reason.unwrap_or("healthy"),
-                )],
-            );
+        }
+        let snapshot = observer_readiness.snapshot();
+        instruments().ready.record(
+            u64::from(snapshot.ready),
+            &[KeyValue::new(
+                "reason",
+                snapshot.reason.unwrap_or("healthy"),
+            )],
+        );
+        // The gauge carries no labels, so every replica of a cell writes one
+        // series and the monitoring rule reads it across replicas. A stage
+        // replica has no cleanup verdict; recording 0 there would hide the
+        // drain worker's 1 from a `min` rule. So it records nothing.
+        if settings.role.runs_drain() {
             record_cleanup_not_progressing(
                 &instruments().cleanup_not_progressing,
                 &snapshot.degraded,
             );
         }
-        handle.note_worker_stopped();
-        Ok(())
-    });
-    Ok(Some(readiness))
+    }
+    handle.note_worker_stopped();
 }

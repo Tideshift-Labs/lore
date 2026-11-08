@@ -1760,7 +1760,7 @@ fn the_retired_floor_age_gauge_is_recorded_outside_the_good_observation_branch()
         "exactly one recording site"
     );
     let skips = SOURCE
-        .find("handle.cleanup_skips(),\n            );")
+        .find("handle.cleanup_skips(),\n        );")
         .expect("the per-tick cleanup skip recording is present");
     let good_branch = SOURCE
         .find("if let Ok(Ok(observation)) = result {")
@@ -1865,4 +1865,306 @@ fn replica_fault_ignores_every_cell_wide_readiness_reason() {
             "{expected} is cell-wide and must not be a replica fault"
         );
     }
+}
+
+// --- WP-115 K6: write-behind roles -------------------------------------
+
+fn stage_reason(state: &State) -> Option<&'static str> {
+    stage_readiness_reason(state, Duration::from_secs(5))
+}
+
+#[test]
+fn only_the_stage_role_skips_the_drain_loops() {
+    assert!(WriteBehindRole::Full.runs_drain());
+    assert!(WriteBehindRole::Drain.runs_drain());
+    assert!(!WriteBehindRole::Stage.runs_drain());
+    assert_eq!(WriteBehindRole::default(), WriteBehindRole::Full);
+    assert_eq!(WriteBehindRole::Full.name(), "full");
+    assert_eq!(WriteBehindRole::Stage.name(), "stage");
+    assert_eq!(WriteBehindRole::Drain.name(), "drain");
+}
+
+#[test]
+fn settings_default_to_the_full_role_and_carry_the_one_they_are_given() {
+    let settings = || FragmentWriteBehindSettings::new(1000, 64, 1000, 5000, 5000, 64).unwrap();
+    assert_eq!(settings().role(), WriteBehindRole::Full);
+    for role in [
+        WriteBehindRole::Full,
+        WriteBehindRole::Stage,
+        WriteBehindRole::Drain,
+    ] {
+        assert_eq!(settings().with_role(role).role(), role);
+    }
+}
+
+#[test]
+fn a_stage_replica_reports_each_of_its_four_reasons() {
+    let now = Instant::now();
+    let stale = now - Duration::from_secs(30);
+
+    assert_eq!(stage_reason(&healthy_state(now)), None);
+
+    let mut state = healthy_state(now);
+    state.stopped = true;
+    assert_eq!(stage_reason(&state), Some("observer_stopped"));
+    // The full verdict names the other task.
+    assert_eq!(reason(&state), Some("worker_stopped"));
+
+    assert_eq!(
+        stage_reason(&State::default()),
+        Some("observation_unknown"),
+        "no observation yet"
+    );
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().0 = stale;
+    assert_eq!(stage_reason(&state), Some("observation_unknown"));
+
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.roots_usable = false;
+    assert_eq!(stage_reason(&state), Some("root_unavailable"));
+
+    let mut state = healthy_state(now);
+    state.capacity_unavailable_since = Some(stale);
+    assert_eq!(stage_reason(&state), Some("capacity_unavailable"));
+    // A run younger than stale_after is not yet a reason.
+    state.capacity_unavailable_since = Some(now - Duration::from_secs(1));
+    assert_eq!(stage_reason(&state), None);
+}
+
+#[test]
+fn a_stage_replica_ignores_the_verdicts_that_belong_to_the_drain_worker() {
+    let now = Instant::now();
+    let stale = now - Duration::from_secs(30);
+    let mut cases: Vec<(&'static str, State)> = Vec::new();
+
+    let mut state = healthy_state(now);
+    state.worker = Some(stale);
+    cases.push(("worker_stale", state));
+
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.pending_files = 1;
+    state.progress = Some(stale);
+    cases.push(("drain_not_progressing", state));
+
+    let mut state = healthy_state(now);
+    state.cleanup = Some(stale);
+    cases.push(("cleanup_stale", state));
+
+    let mut state = healthy_state(now);
+    state.drain_backpressure_since = Some(stale);
+    cases.push(("drain_backpressure_sustained", state));
+
+    let mut state = healthy_state(now);
+    state.cleanup_backpressure_since = Some(stale);
+    cases.push(("cleanup_backpressure_sustained", state));
+
+    for (expected, state) in &cases {
+        assert_eq!(
+            reason(state),
+            Some(*expected),
+            "full verdict for {expected}"
+        );
+        assert_eq!(
+            stage_reason(state),
+            None,
+            "a stage replica runs no loop that could cause {expected}"
+        );
+    }
+}
+
+#[test]
+fn stage_replica_fault_is_only_a_stopped_observer() {
+    let now = Instant::now();
+    assert_eq!(stage_replica_fault(&healthy_state(now)), None);
+    assert_eq!(stage_replica_fault(&State::default()), None);
+
+    let mut state = healthy_state(now);
+    state.stopped = true;
+    assert_eq!(stage_replica_fault(&state), Some("observer_stopped"));
+    assert_eq!(
+        stage_replica_fault(&State {
+            stopped: true,
+            ..State::default()
+        }),
+        Some("observer_stopped"),
+        "stopped is a fault even with no observation"
+    );
+}
+
+#[test]
+fn unusable_roots_eject_a_full_replica_but_not_a_stage_one() {
+    let mut state = healthy_state(Instant::now());
+    state.observation.as_mut().unwrap().1.roots_usable = false;
+    assert_eq!(fault(&state), Some("root_unavailable"));
+    assert_eq!(
+        stage_replica_fault(&state),
+        None,
+        "the stage is one shared export, so ejecting replicas one by one would refuse the cell"
+    );
+    // It still fails readiness and so /health_check.
+    assert_eq!(stage_reason(&state), Some("root_unavailable"));
+}
+
+#[test]
+fn the_drain_role_lb_fault_is_the_word_the_verdict_answers() {
+    assert_eq!(DRAIN_ROLE_LB_FAULT, "drain_role");
+}
+
+#[test]
+fn oldest_pending_age_gauge_is_whole_seconds_and_zero_when_nothing_is_pending() {
+    let mut observation = healthy_observation();
+    assert_eq!(oldest_pending_age_seconds(&observation), 0);
+    observation.oldest_pending_age = Some(Duration::from_secs_f64(90.7));
+    assert_eq!(oldest_pending_age_seconds(&observation), 90);
+    observation.oldest_pending_age = Some(Duration::ZERO);
+    assert_eq!(oldest_pending_age_seconds(&observation), 0);
+}
+
+// --- Per-role dispatch: every role over the same states ------------------
+
+fn role_states() -> Vec<(&'static str, State)> {
+    let now = Instant::now();
+    let stale = now - Duration::from_secs(30);
+    let mut states: Vec<(&'static str, State)> = vec![
+        ("healthy", healthy_state(now)),
+        ("no observation", State::default()),
+    ];
+    let mut state = healthy_state(now);
+    state.stopped = true;
+    states.push(("stopped", state));
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.roots_usable = false;
+    states.push(("roots unusable", state));
+    let mut state = healthy_state(now);
+    state.worker = Some(stale);
+    states.push(("worker stale", state));
+    let mut state = healthy_state(now);
+    state.cleanup = Some(stale);
+    states.push(("cleanup stale", state));
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.pending_files = 1;
+    state.progress = Some(stale);
+    states.push(("drain not progressing", state));
+    let mut state = healthy_state(now);
+    state.observation.as_mut().unwrap().1.cleanup_backlog = 3;
+    state.cleanup_progress = None;
+    states.push(("cleanup backlog without progress", state));
+    states
+}
+
+const ROLE_STALE_AFTER: Duration = Duration::from_secs(5);
+const ROLE_CLEANUP_STALE_AFTER: Duration = Duration::from_secs(15);
+
+#[test]
+fn role_replica_fault_dispatches_each_role_to_its_own_rule() {
+    for (name, state) in role_states() {
+        assert_eq!(
+            role_replica_fault(WriteBehindRole::Full, &state, ROLE_STALE_AFTER),
+            replica_fault(&state, ROLE_STALE_AFTER),
+            "full, {name}"
+        );
+        assert_eq!(
+            role_replica_fault(WriteBehindRole::Stage, &state, ROLE_STALE_AFTER),
+            stage_replica_fault(&state),
+            "stage, {name}"
+        );
+        assert_eq!(
+            role_replica_fault(WriteBehindRole::Drain, &state, ROLE_STALE_AFTER),
+            Some(DRAIN_ROLE_LB_FAULT),
+            "drain, {name}: always out of the pool, even when healthy"
+        );
+    }
+    // The three rules differ on these states, so a swapped arm cannot pass.
+    let states = role_states();
+    let get = |wanted: &str| &states.iter().find(|(name, _)| *name == wanted).unwrap().1;
+    let roots = get("roots unusable");
+    assert_eq!(
+        role_replica_fault(WriteBehindRole::Full, roots, ROLE_STALE_AFTER),
+        Some("root_unavailable")
+    );
+    assert_eq!(
+        role_replica_fault(WriteBehindRole::Stage, roots, ROLE_STALE_AFTER),
+        None
+    );
+    let stopped = get("stopped");
+    assert_eq!(
+        role_replica_fault(WriteBehindRole::Full, stopped, ROLE_STALE_AFTER),
+        Some("worker_stopped")
+    );
+    assert_eq!(
+        role_replica_fault(WriteBehindRole::Stage, stopped, ROLE_STALE_AFTER),
+        Some("observer_stopped")
+    );
+    assert_eq!(
+        role_replica_fault(WriteBehindRole::Stage, get("healthy"), ROLE_STALE_AFTER),
+        None
+    );
+    assert_eq!(
+        role_replica_fault(WriteBehindRole::Drain, get("healthy"), ROLE_STALE_AFTER),
+        Some("drain_role")
+    );
+}
+
+#[test]
+fn role_readiness_dispatches_each_role_to_its_own_verdicts() {
+    let readiness = |role, state: &State| {
+        role_readiness(role, state, ROLE_STALE_AFTER, ROLE_CLEANUP_STALE_AFTER)
+    };
+    for (name, state) in role_states() {
+        let full = (
+            readiness_reason(&state, ROLE_STALE_AFTER, ROLE_CLEANUP_STALE_AFTER),
+            degraded_reason(&state, ROLE_CLEANUP_STALE_AFTER),
+        );
+        assert_eq!(
+            readiness(WriteBehindRole::Full, &state),
+            full,
+            "full, {name}"
+        );
+        assert_eq!(
+            readiness(WriteBehindRole::Drain, &state),
+            full,
+            "drain runs the full verdicts, {name}"
+        );
+        assert_eq!(
+            readiness(WriteBehindRole::Stage, &state),
+            (stage_readiness_reason(&state, ROLE_STALE_AFTER), None),
+            "stage, {name}: never degraded"
+        );
+    }
+    let states = role_states();
+    let get = |wanted: &str| &states.iter().find(|(name, _)| *name == wanted).unwrap().1;
+
+    // Where the role must matter: a drain-loop verdict only the full path reports.
+    let worker_stale = get("worker stale");
+    assert_eq!(
+        readiness(WriteBehindRole::Full, worker_stale).0,
+        Some("worker_stale")
+    );
+    assert_eq!(readiness(WriteBehindRole::Stage, worker_stale).0, None);
+    assert_eq!(
+        readiness(WriteBehindRole::Drain, worker_stale).0,
+        Some("worker_stale")
+    );
+
+    // A flat cleanup backlog is degraded for the loop-running roles only.
+    let backlog = get("cleanup backlog without progress");
+    assert_eq!(
+        readiness(WriteBehindRole::Full, backlog),
+        (None, Some("cleanup_not_progressing"))
+    );
+    assert_eq!(
+        readiness(WriteBehindRole::Drain, backlog),
+        (None, Some("cleanup_not_progressing"))
+    );
+    assert_eq!(readiness(WriteBehindRole::Stage, backlog), (None, None));
+
+    let stopped = get("stopped");
+    assert_eq!(
+        readiness(WriteBehindRole::Full, stopped).0,
+        Some("worker_stopped")
+    );
+    assert_eq!(
+        readiness(WriteBehindRole::Stage, stopped).0,
+        Some("observer_stopped")
+    );
 }

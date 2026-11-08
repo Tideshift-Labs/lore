@@ -1819,3 +1819,134 @@ async fn configured_domain_enforcement_reaches_the_published_postgres_mutable_st
         .await
         .expect("restore disposable schema-state enforcement flag");
 }
+
+// --- WP-115 K6: write-behind role --------------------------------------
+
+fn role_block(extra: &str) -> String {
+    format!("{}{extra}\n", valid_write_behind_block())
+}
+
+#[test]
+fn write_behind_role_parses_and_an_absent_role_is_full() {
+    use lore_server::fragment_write_behind::WriteBehindRole;
+    assert_eq!(raw_write_behind(&valid_write_behind_block()).role, None);
+    for (text, expected) in [
+        ("full", WriteBehindRole::Full),
+        ("stage", WriteBehindRole::Stage),
+        ("drain", WriteBehindRole::Drain),
+    ] {
+        let raw = raw_write_behind(&role_block(&format!("role = \"{text}\"")));
+        assert_eq!(raw.role, Some(expected));
+    }
+    let composition = validated_write_behind_settings(
+        PLUGIN_NAME,
+        &raw_write_behind(&valid_write_behind_block()),
+    );
+    match composition {
+        Ok(composition) => assert_eq!(composition.runtime.role(), WriteBehindRole::Full),
+        Err(error) => panic!("an absent role must validate as full: {error}"),
+    }
+}
+
+#[test]
+fn an_unknown_write_behind_role_fails_deserialization() {
+    for bad in ["drainer", "Stage", "FULL", ""] {
+        let text = format!(
+            "url = \"postgres://localhost/lore\"\n{}",
+            role_block(&format!("role = \"{bad}\""))
+        );
+        let parsed = toml::from_str::<toml::Value>(&text)
+            .and_then(toml::Value::try_into::<PostgresStoreConfig>);
+        assert!(parsed.is_err(), "role = {bad:?} must fail closed");
+    }
+}
+
+const STAGE_REFUSED_KNOBS: [(&str, &str); 10] = [
+    ("worker_interval_millis", "worker_interval_millis = 1000"),
+    ("worker_batch", "worker_batch = 64"),
+    ("worker_concurrency", "worker_concurrency = 2"),
+    ("drain_reserve_permits", "drain_reserve_permits = 2"),
+    (
+        "drain_reserve_permit_wait_millis",
+        "drain_reserve_permit_wait_millis = 300",
+    ),
+    ("drain_reserve_attempts", "drain_reserve_attempts = 3"),
+    (
+        "drain_reserve_backoff_base_millis",
+        "drain_reserve_backoff_base_millis = 10",
+    ),
+    (
+        "drain_reserve_backoff_cap_millis",
+        "drain_reserve_backoff_cap_millis = 40",
+    ),
+    ("cleanup_interval_millis", "cleanup_interval_millis = 5000"),
+    ("cleanup_batch", "cleanup_batch = 64"),
+];
+
+#[test]
+fn a_stage_role_refuses_each_drain_only_knob_by_name() {
+    for (field, line) in STAGE_REFUSED_KNOBS {
+        let raw = raw_write_behind(&role_block(&format!("role = \"stage\"\n{line}")));
+        let by_role = validated_write_behind_role(PLUGIN_NAME, &raw);
+        let error = match by_role {
+            Ok(_) => panic!("stage with {field} must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(field),
+            "refusal must name {field}; got {error}"
+        );
+        // And through the full validator, where the role check is wired in.
+        assert!(
+            validated_write_behind_settings(PLUGIN_NAME, &raw).is_err(),
+            "stage with {field} must be refused by the settings validator"
+        );
+    }
+}
+
+#[test]
+fn a_stage_role_without_drain_knobs_validates_and_carries_the_role() {
+    use lore_server::fragment_write_behind::WriteBehindRole;
+    let raw = raw_write_behind(&role_block("role = \"stage\""));
+    match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+        Ok(composition) => assert_eq!(composition.runtime.role(), WriteBehindRole::Stage),
+        Err(error) => panic!("a bare stage block must validate: {error}"),
+    }
+}
+
+#[test]
+fn full_and_drain_roles_accept_every_drain_knob() {
+    use lore_server::fragment_write_behind::WriteBehindRole;
+    let knobs = STAGE_REFUSED_KNOBS.map(|(_, line)| line).join("\n");
+    for (role, expected) in [
+        ("full", WriteBehindRole::Full),
+        ("drain", WriteBehindRole::Drain),
+    ] {
+        let raw = raw_write_behind(&role_block(&format!("role = \"{role}\"\n{knobs}")));
+        match validated_write_behind_settings(PLUGIN_NAME, &raw) {
+            Ok(composition) => assert_eq!(composition.runtime.role(), expected),
+            Err(error) => panic!("role {role} with every drain knob must validate: {error}"),
+        }
+    }
+}
+
+#[test]
+fn a_disabled_block_with_a_stage_or_drain_role_is_refused() {
+    for role in ["stage", "drain"] {
+        let parsed = parsed_config_with(&format!(
+            "[write_behind]\nenabled = false\nrole = \"{role}\"\n"
+        ));
+        let error = match enabled_write_behind_settings(PLUGIN_NAME, &parsed) {
+            Ok(_) => panic!("a disabled {role} block must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("enabled = true"), "got {error}");
+    }
+    for role_line in ["role = \"full\"\n", ""] {
+        let parsed = parsed_config_with(&format!("[write_behind]\nenabled = false\n{role_line}"));
+        assert!(matches!(
+            enabled_write_behind_settings(PLUGIN_NAME, &parsed),
+            Ok(None)
+        ));
+    }
+}

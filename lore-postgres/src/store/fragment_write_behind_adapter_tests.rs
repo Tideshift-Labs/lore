@@ -610,6 +610,115 @@ async fn adapter_parallel_drain_promotes_each_fragment_once() {
     assert_eq!(claims, 6, "one decisive claim per fragment");
 }
 
+/// WP-115 K6 safety pin: the drain role moves the drain to another process, so a
+/// misconfigured cell can run two drain workers (or `full` beside `drain`) over
+/// the ONE shared stage. The Postgres claims, not the role, decide who sends;
+/// two handles racing `drain_pass` over the same stage must send each fragment
+/// once, publish every head, and strand nothing in `Missing`. The second
+/// handle has its own spool root, as a second host's would.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn adapter_two_drain_handles_on_one_stage_send_each_fragment_once() {
+    const EXTRA: usize = 7;
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    fixture.port.put_delay_ms.store(100, Ordering::SeqCst);
+    let mut staged = fixture.stage_more("two-drains", EXTRA).await;
+    staged.push(fixture.address);
+    let total = staged.len();
+    assert_eq!(total, EXTRA + 1);
+
+    let custody_before: i64 = fixture
+        .admin
+        .query_one("SELECT count(*) FROM lore_fragment_stage_custody", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(custody_before >= total as i64);
+
+    let spool_root = fixture.root.join("spool-second");
+    std::fs::create_dir(&spool_root).unwrap();
+    let digest = fixture.handle.policy.digest;
+    let second = fixture
+        .store
+        .create_write_behind_handle(
+            spool_root,
+            "adapter-cell".into(),
+            "adapter-policy-v1".into(),
+            digest,
+            fixture.handle.observer.clone(),
+        )
+        .await
+        .unwrap();
+    for handle in [&fixture.handle, &second] {
+        handle.set_drain_concurrency(4);
+    }
+
+    // Batch 1 per pass so the two drains interleave over the same stage, and
+    // each loops until the cell's total reaches the staged count.
+    async fn drain_until(
+        handle: Arc<FragmentWriteBehindHandle>,
+        done: Arc<AtomicUsize>,
+        total: usize,
+    ) -> u32 {
+        let mut mine = 0;
+        for _ in 0..200 {
+            if done.load(Ordering::SeqCst) >= total {
+                break;
+            }
+            let promoted = handle.drain_pass(1).await.unwrap();
+            mine += promoted;
+            done.fetch_add(promoted as usize, Ordering::SeqCst);
+            if promoted == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+        mine
+    }
+    let done = Arc::new(AtomicUsize::new(0));
+    let (first, other) = tokio::join!(
+        drain_until(fixture.handle.clone(), done.clone(), total),
+        drain_until(second.clone(), done.clone(), total)
+    );
+    let promoted = first + other;
+    // One more pass from each side: nothing left to send.
+    assert_eq!(fixture.handle.drain_pass(1).await.unwrap(), 0);
+    assert_eq!(second.drain_pass(1).await.unwrap(), 0);
+    assert_eq!(
+        promoted as usize, total,
+        "each fragment promoted once (first handle {first}, second handle {other})"
+    );
+    assert_eq!(
+        fixture.port.puts.load(Ordering::SeqCst),
+        total,
+        "no fragment was sent twice"
+    );
+    for address in staged {
+        assert_eq!(
+            fixture.state_of(address).await,
+            FragmentLifecycleState::Remote
+        );
+    }
+    let missing: i64 = fixture
+        .admin
+        .query_one(
+            "SELECT count(*) FROM lore_fragment_lifecycle WHERE state = $1",
+            &[&FragmentLifecycleState::Missing.bits()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(missing, 0, "no head ended Missing");
+    let custody_after: i64 = fixture
+        .admin
+        .query_one("SELECT count(*) FROM lore_fragment_stage_custody", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        custody_after >= custody_before,
+        "no stage custody row was lost ({custody_before} before, {custody_after} after)"
+    );
+}
 /// Row 77: under parallelism the drain still records progress only when a
 /// promotion publishes (the case above checks that it does). A pass whose
 /// sends all fail leaves the progress clock alone and returns 0, which is

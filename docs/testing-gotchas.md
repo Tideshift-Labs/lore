@@ -269,6 +269,8 @@ Durable, recurring testing lessons grouped by topic.
 - **`cargo clippy ... -D warnings` on Windows stops at upstream-identical files** (`lore-revision/src/util/fs.rs`,
   `lore/src/remote/network/windows.rs`, unused imports in several `tests/unit` files). Rerun without `-D`
   and read only the files you touched.
+- Source-pin tests (`include_str!` of `src/fragment_write_behind.rs` with `find("...\n            );")`) hold indentation: moving a block one level deeper fails them with an `expect` panic, not a behavior fault. Re-anchor the string, keep the ordering assertion (`tests/unit/fragment_write_behind.rs`).
+
 ## Histogram/quantile fixtures
 
 - **Testing a quantile-from-bucket-counts function without re-deriving its formula**: build a fixture

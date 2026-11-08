@@ -415,6 +415,10 @@ pub struct WriteBehindConfig {
     pub observer_interval_millis: Option<u64>,
     pub cleanup_interval_millis: Option<u64>,
     pub cleanup_batch: Option<u32>,
+    /// FORK-LOCAL (Tideshift), WP-115 K6: which write-behind loops this
+    /// replica runs, `full` (the default), `stage` or `drain`. An unknown value
+    /// fails deserialization, so it fails closed at boot.
+    pub role: Option<crate::fragment_write_behind::WriteBehindRole>,
 }
 
 /// One enabled `[write_behind]` block, validated, as the two values composition
@@ -994,7 +998,8 @@ fn validated_write_behind_settings(
         raw.cleanup_batch.unwrap_or(64),
     )
     .and_then(|runtime| runtime.with_worker_concurrency(raw.worker_concurrency))
-    .map_err(|error| write_behind_error(name, error.to_string()))?;
+    .map_err(|error| write_behind_error(name, error.to_string()))?
+    .with_role(validated_write_behind_role(name, raw)?);
     Ok(WriteBehindComposition {
         settings,
         shared_spool_root,
@@ -1003,6 +1008,63 @@ fn validated_write_behind_settings(
         policy_digest,
         runtime,
     })
+}
+
+/// FORK-LOCAL (Tideshift), WP-115 K6: the role, refusing a `stage` block that
+/// sets a drain or cleanup knob.
+///
+/// A stage replica starts no drain or cleanup loop, so those knobs would be
+/// read, validated and then ignored. A setting with no effect is a
+/// configuration that reports healthy while doing something other than what
+/// it says, so it is refused rather than tolerated. A `drain` replica runs
+/// every loop, so every knob applies to it.
+#[lore_macro::test_pub]
+fn validated_write_behind_role(
+    name: &str,
+    raw: &WriteBehindConfig,
+) -> Result<crate::fragment_write_behind::WriteBehindRole, PluginError> {
+    use crate::fragment_write_behind::WriteBehindRole;
+    let role = raw.role.unwrap_or_default();
+    if role != WriteBehindRole::Stage {
+        return Ok(role);
+    }
+    let drain_only = [
+        (
+            "worker_interval_millis",
+            raw.worker_interval_millis.is_some(),
+        ),
+        ("worker_batch", raw.worker_batch.is_some()),
+        ("worker_concurrency", raw.worker_concurrency.is_some()),
+        ("drain_reserve_permits", raw.drain_reserve_permits.is_some()),
+        (
+            "drain_reserve_permit_wait_millis",
+            raw.drain_reserve_permit_wait_millis.is_some(),
+        ),
+        (
+            "drain_reserve_attempts",
+            raw.drain_reserve_attempts.is_some(),
+        ),
+        (
+            "drain_reserve_backoff_base_millis",
+            raw.drain_reserve_backoff_base_millis.is_some(),
+        ),
+        (
+            "drain_reserve_backoff_cap_millis",
+            raw.drain_reserve_backoff_cap_millis.is_some(),
+        ),
+        (
+            "cleanup_interval_millis",
+            raw.cleanup_interval_millis.is_some(),
+        ),
+        ("cleanup_batch", raw.cleanup_batch.is_some()),
+    ];
+    if let Some((field, _)) = drain_only.iter().find(|(_, set)| *set) {
+        return Err(write_behind_error(
+            name,
+            format!("role = \"stage\" runs no drain or cleanup loop, so it must not set {field}"),
+        ));
+    }
+    Ok(role)
 }
 
 /// Refuse a staging tier that nothing would ever consult.
@@ -1053,6 +1115,20 @@ fn enabled_write_behind_settings(
     name: &str,
     cfg: &PostgresStoreConfig,
 ) -> Result<Option<WriteBehindComposition>, PluginError> {
+    // WP-115 K6: a `stage` or `drain` role on a disabled block describes a
+    // replica that does not exist. A drain worker that boots with staging off
+    // drains nothing and reports healthy, so it is refused here.
+    if let Some(raw) = cfg.write_behind.as_ref()
+        && !raw.enabled
+        && raw
+            .role
+            .is_some_and(|role| role != crate::fragment_write_behind::WriteBehindRole::Full)
+    {
+        return Err(config_error(
+            name,
+            "write_behind role \"stage\" or \"drain\" requires enabled = true",
+        ));
+    }
     let Some(raw) = cfg
         .write_behind
         .as_ref()

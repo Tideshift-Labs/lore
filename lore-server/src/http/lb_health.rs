@@ -12,6 +12,15 @@
 //!   stage/spool roots are unusable
 //!   ([`FragmentWriteBehindReadiness::replica_fault`]).
 //!
+//! The write-behind fault depends on the replica's `write_behind.role`
+//! (WP-115 K6):
+//!
+//! - `full`: `worker_stopped` or `root_unavailable`, as above.
+//! - `stage`: `observer_stopped` only. The stage is one shared export, so a
+//!   stage-root fault is cell-wide and is not a membership signal here.
+//! - `drain`: always `drain_role`. The dedicated drain worker is not a
+//!   load-balancer member, and a 503 keeps a misconfigured pool from adding it.
+//!
 //! It deliberately ignores every cell-wide signal: store availability, the
 //! write-behind readiness verdict (`drain_not_progressing`, `worker_stale`,
 //! `cleanup_stale`, `capacity_unavailable`, backpressure), and the event-plane
