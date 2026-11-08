@@ -515,7 +515,14 @@ fn note_unmanaged_refusal(session: &StorageSession, err: &lore_transport::Protoc
 /// it do), and a stall after a partial write closes the connection, which a managed push in the
 /// same process shares. Both need a full bound with no progress. A managed write is already in its
 /// scope.
+///
+/// The leg is boxed, like the managed upload legs in [`leader_body`]: inline, the scope and this
+/// wrapper nested the remote leg's future into every caller's, and a clone's future then crossed
+/// the default query depth (`recursion_limit`, 128) in a downstream crate that awaits it in one
+/// block: the desktop's adopt test needed 129, 124 with the box (123 before the scope). Both arms
+/// pay the one allocation, which is small next to the round trip.
 async fn bounded_if_unmanaged<F: Future>(unmanaged: bool, future: F) -> F::Output {
+    let future = Box::pin(future);
     if unmanaged {
         lore_transport::with_managed_workflow(future).await
     } else {
