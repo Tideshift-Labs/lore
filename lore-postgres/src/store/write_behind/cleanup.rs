@@ -196,6 +196,13 @@ impl StageFileScanner {
                 return Err(WriteBehindError::RootDeviceChanged);
             }
             let kind = FileType::from_raw_mode(metadata.st_mode);
+            if kind.is_dir()
+                && relative.as_os_str().is_empty()
+                && name.to_bytes() == super::root::LIVENESS_DIR.as_bytes()
+            {
+                // WP-115 K11: the replicas' liveness probes, never staged data.
+                continue;
+            }
             let path = relative.join(std::ffi::OsStr::from_bytes(name.to_bytes()));
             if kind.is_dir() {
                 // Retained depth-first cursors bound open handles as well as

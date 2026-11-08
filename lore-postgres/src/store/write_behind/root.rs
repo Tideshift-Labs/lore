@@ -72,6 +72,14 @@ pub(crate) const STAGED_DIR: &str = "staged";
 /// under `staged/`, so both hold.
 #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
 pub(crate) const INCOMING_DIR: &str = "incoming";
+/// FORK-LOCAL (Tideshift), WP-115 K11: subdirectory of the stage root where
+/// each `role = "stage"` replica writes its liveness probe file.
+///
+/// The inventory walk counts every file under the root, and a file no ledger
+/// charges fails the capacity predicate (`stage_unknown_entries`). So the walk
+/// skips this one directory at the top level, and nothing else reads it. A
+/// binary older than K11 does not skip it; roll every host of a cell together.
+pub const LIVENESS_DIR: &str = "liveness";
 
 /// A staged path this process derived and may act on.
 #[derive(Debug, Clone)]

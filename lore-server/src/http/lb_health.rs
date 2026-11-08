@@ -16,8 +16,12 @@
 //! (WP-115 K6):
 //!
 //! - `full`: `worker_stopped` or `root_unavailable`, as above.
-//! - `stage`: `observer_stopped` only. The stage is one shared export, so a
-//!   stage-root fault is cell-wide and is not a membership signal here.
+//! - `stage`: `observer_stopped`. The stage is one shared export, so a
+//!   stage-root fault is cell-wide and is not a membership signal here. One
+//!   exception (WP-115 K11, `crate::stage_liveness`):
+//!   `stage_unavailable_local` when this host's own probe of the stage has
+//!   been failing for 15 s while a peer of the same cell can still write it.
+//!   With no fresh peer, or no recent peer view, it answers 200.
 //! - `drain`: always `drain_role`. The dedicated drain worker is not a
 //!   load-balancer member, and a 503 keeps a misconfigured pool from adding it.
 //!

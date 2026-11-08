@@ -183,6 +183,10 @@ impl PostgresDomainStore {
         // WP-115 row 68: which proof retired a generation, so an operator can
         // tell a `--confirm-receiver-stopped` retirement from a graceful one.
         crate::pool::ensure_schema_online(&pool, OUTBOX_RETIREMENT_BASIS_SCHEMA).await?;
+        // WP-115 K11: per-replica stage liveness for `/lb_health`. One new
+        // table, so a cell one revision behind is unaffected.
+        crate::pool::ensure_schema_online(&pool, crate::domain::fragments::STAGE_LIVENESS_SCHEMA)
+            .await?;
 
         let identity = read_database_identity(&pool)
             .await

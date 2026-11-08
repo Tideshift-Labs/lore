@@ -23,6 +23,7 @@ pub mod quic;
 pub mod server;
 pub mod server_config;
 pub mod settings;
+pub mod stage_liveness;
 pub mod store;
 pub mod telemetry;
 pub mod tls;

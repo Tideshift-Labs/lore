@@ -1,0 +1,324 @@
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// SPDX-License-Identifier: MIT
+//! FORK-LOCAL (Tideshift), WP-115 K11: stage liveness decision, probe thread
+//! and exchange, without Postgres. The Postgres-backed half is
+//! `tests/stage_liveness_live.rs`.
+
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::mpsc;
+use std::time::Duration;
+use std::time::Instant;
+
+use axum::http::StatusCode;
+use lore_postgres::domain::fragments::StagePeerLiveness;
+use lore_server::fragment_write_behind::WriteBehindRole;
+use lore_server::fragment_write_behind::combined_replica_fault;
+use lore_server::http::lb_health::verdict_from;
+use lore_server::stage_liveness::*;
+
+const LOCAL: Option<&str> = Some(STAGE_UNAVAILABLE_LOCAL);
+
+fn view(fresh_peers: u64, peers: u64) -> StagePeerLiveness {
+    StagePeerLiveness { fresh_peers, peers }
+}
+
+/// Every case of the rule: self fresh/stale x peers unknown (Postgres down or
+/// slow) / none fresh / one fresh.
+#[test]
+fn decide_ejects_only_a_stale_replica_with_a_fresh_peer() {
+    let cases = [
+        (false, PeerEvidence::Unknown, None),
+        (false, PeerEvidence::NoFreshPeer, None),
+        (false, PeerEvidence::FreshPeer, None),
+        (true, PeerEvidence::Unknown, None),
+        (true, PeerEvidence::NoFreshPeer, None),
+        (true, PeerEvidence::FreshPeer, LOCAL),
+    ];
+    for (self_stale, peers, expected) in cases {
+        assert_eq!(
+            decide(self_stale, peers),
+            expected,
+            "self_stale={self_stale} peers={peers:?}"
+        );
+    }
+}
+
+fn liveness(stale_after: Duration, peer_view_max_age: Duration) -> StageLiveness {
+    StageLiveness::with_thresholds("replica-a".to_owned(), stale_after, peer_view_max_age)
+}
+
+/// The same matrix through the stateful type: the probe age decides
+/// self-staleness, the peer view's own age decides whether it counts.
+#[test]
+fn the_fault_reads_probe_age_and_peer_view_age() {
+    let stale_after = Duration::from_secs(15);
+    let view_max = Duration::from_secs(10);
+    let state = liveness(stale_after, view_max);
+    let start = Instant::now();
+
+    // No peer view at all: Postgres never answered. Even far past stale.
+    assert_eq!(state.peer_evidence(start), PeerEvidence::Unknown);
+    assert_eq!(state.fault(start + Duration::from_secs(60)), None);
+
+    // Fresh self, fresh peer: no eject.
+    state.note_peers(start, view(1, 1));
+    assert_eq!(state.fault(start + Duration::from_secs(1)), None);
+
+    // Stale self (no good probe for 15 s), recent view with a fresh peer.
+    let late = start + Duration::from_secs(16);
+    state.note_peers(late, view(1, 2));
+    assert_eq!(state.peer_evidence(late), PeerEvidence::FreshPeer);
+    assert_eq!(state.fault(late), LOCAL);
+
+    // Stale self, recent view, no fresh peer: cell-wide, no eject.
+    state.note_peers(late, view(0, 2));
+    assert_eq!(state.peer_evidence(late), PeerEvidence::NoFreshPeer);
+    assert_eq!(state.fault(late), None);
+
+    // Stale self, the fresh-peer view has aged out (Postgres went away).
+    state.note_peers(late, view(1, 2));
+    let after = late + view_max;
+    assert_eq!(state.peer_evidence(after), PeerEvidence::Unknown);
+    assert_eq!(state.fault(after), None);
+
+    // One good probe brings the replica back at once.
+    state.note_peers(after, view(1, 2));
+    assert_eq!(state.fault(after), LOCAL);
+    state.note_good(after);
+    assert_eq!(state.fault(after), None);
+}
+
+/// The threshold is the hysteresis: just under `stale_after` is not stale,
+/// so one slow probe does not flap the host.
+#[test]
+fn a_probe_just_under_the_threshold_does_not_eject() {
+    let stale_after = Duration::from_secs(15);
+    let state = liveness(stale_after, Duration::from_secs(10));
+    let start = Instant::now();
+    let almost = start + stale_after - Duration::from_millis(1);
+    state.note_peers(almost, view(1, 1));
+    assert_eq!(state.fault(almost), None);
+    let exact = start + stale_after;
+    state.note_peers(exact, view(1, 1));
+    assert_eq!(state.fault(exact), LOCAL);
+}
+
+/// `note_good` never moves the clock back.
+#[test]
+fn an_older_good_probe_does_not_rewind_the_clock() {
+    let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    let start = Instant::now();
+    state.note_good(start + Duration::from_secs(20));
+    state.note_good(start + Duration::from_secs(5));
+    assert_eq!(
+        state.last_good_age(start + Duration::from_secs(21)),
+        Duration::from_secs(1)
+    );
+}
+
+/// The liveness fault reaches `/lb_health` only on a stage replica, and never
+/// overrides a fault that already answers.
+#[test]
+fn the_combined_fault_is_stage_only_and_never_overrides() {
+    assert_eq!(
+        combined_replica_fault(WriteBehindRole::Stage, None, LOCAL),
+        LOCAL
+    );
+    assert_eq!(
+        combined_replica_fault(WriteBehindRole::Stage, None, None),
+        None
+    );
+    assert_eq!(
+        combined_replica_fault(WriteBehindRole::Stage, Some("observer_stopped"), LOCAL),
+        Some("observer_stopped")
+    );
+    assert_eq!(
+        combined_replica_fault(WriteBehindRole::Full, None, LOCAL),
+        None
+    );
+    assert_eq!(
+        combined_replica_fault(WriteBehindRole::Drain, Some("drain_role"), LOCAL),
+        Some("drain_role")
+    );
+    // And the HTTP verdict maps it to a 503 with the word as the body.
+    assert_eq!(
+        verdict_from(None, LOCAL),
+        (StatusCode::SERVICE_UNAVAILABLE, STAGE_UNAVAILABLE_LOCAL)
+    );
+}
+
+/// A probe that never returns, as a write on a hung hard mount. The runtime
+/// stays responsive, the replica ages to stale and is ejected while a peer is
+/// fresh, and exactly one probe thread and one probe ever start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hung_probe_parks_one_thread_and_ages_the_replica_to_stale() {
+    let stale_after = Duration::from_millis(300);
+    let state = Arc::new(StageLiveness::with_thresholds(
+        "replica-hung".to_owned(),
+        stale_after,
+        Duration::from_secs(10),
+    ));
+    let (release, wait) = mpsc::channel::<()>();
+    let wait = Mutex::new(wait);
+    let entered = Arc::new(AtomicBool::new(false));
+    let probe_entered = entered.clone();
+    let probe: ProbeFn = Arc::new(move || {
+        probe_entered.store(true, Ordering::SeqCst);
+        // Blocks until the test releases it, like a hung NFS write.
+        let _ = wait
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .recv();
+        Ok(())
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    assert!(
+        spawn_probe_thread(
+            &state,
+            probe.clone(),
+            Duration::from_millis(10),
+            stop.clone()
+        )
+        .unwrap()
+    );
+    // A second start is refused: one thread per replica, ever.
+    assert!(!spawn_probe_thread(&state, probe, Duration::from_millis(10), stop.clone()).unwrap());
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "probe never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // The runtime keeps serving: exchanges run while the probe is parked.
+    let mut warned = None;
+    let mut exchanged = 0;
+    let started = Instant::now();
+    while started.elapsed() < stale_after + Duration::from_millis(200) {
+        let ok = exchange_once(
+            &state,
+            |_age| async { Ok::<_, String>(view(1, 2)) },
+            Duration::from_secs(1),
+            &mut warned,
+        )
+        .await;
+        assert!(ok);
+        exchanged += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(exchanged > 5, "the runtime must stay responsive");
+
+    let now = Instant::now();
+    assert_eq!(state.fault(now), LOCAL);
+    assert!(state.snapshot(now).probe_in_flight);
+    assert_eq!(state.threads_started(), 1);
+    assert_eq!(
+        state.probes_started(),
+        1,
+        "no second probe while one is parked"
+    );
+
+    // Release the hung write: the probe succeeds and the replica returns.
+    stop.store(true, Ordering::SeqCst);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while state.fault(Instant::now()).is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "a good probe must clear the fault"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A failed or timed-out exchange records nothing, so the peer view ages to
+/// unknown and this signal cannot eject without Postgres.
+#[tokio::test(start_paused = true)]
+async fn a_failed_or_slow_exchange_leaves_no_peer_view() {
+    let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    let mut warned = None;
+    let failed = exchange_once(
+        &state,
+        |_age| async { Err::<StagePeerLiveness, _>("connection refused") },
+        Duration::from_secs(1),
+        &mut warned,
+    )
+    .await;
+    assert!(!failed);
+    assert_eq!(state.peer_evidence(Instant::now()), PeerEvidence::Unknown);
+
+    let slow = exchange_once(
+        &state,
+        |_age| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<_, String>(view(1, 1))
+        },
+        Duration::from_secs(1),
+        &mut warned,
+    )
+    .await;
+    assert!(!slow);
+    assert_eq!(state.peer_evidence(Instant::now()), PeerEvidence::Unknown);
+}
+
+/// The exchange publishes the probe's age as this replica measures it.
+#[tokio::test]
+async fn the_exchange_publishes_the_last_good_probe_age() {
+    let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    let published = Mutex::new(None);
+    let ok = exchange_once(
+        &state,
+        |age| {
+            *published.lock().unwrap() = Some(age);
+            async { Ok::<_, String>(view(0, 0)) }
+        },
+        Duration::from_secs(1),
+        &mut None,
+    )
+    .await;
+    assert!(ok);
+    let age = published.lock().unwrap().expect("published");
+    assert!(age < Duration::from_secs(5), "{age:?}");
+}
+
+/// The real probe writes, fsyncs and removes its file, leaves nothing behind,
+/// and recreates its directory when it is gone.
+#[test]
+fn the_file_probe_leaves_nothing_and_heals_its_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let probe = file_probe(root.path().to_path_buf(), "replica-a");
+    probe().unwrap();
+    let directory = root.path().join("liveness");
+    assert!(directory.is_dir());
+    assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 0);
+    std::fs::remove_dir(&directory).unwrap();
+    probe().unwrap();
+    assert!(directory.is_dir());
+}
+
+/// A probe against a root that does not exist fails rather than reporting
+/// success.
+#[test]
+fn the_file_probe_fails_on_a_missing_root() {
+    let root = tempfile::tempdir().unwrap();
+    let probe = file_probe(root.path().join("absent"), "replica-a");
+    assert!(probe().is_err());
+}
+
+#[test]
+fn replica_ids_are_file_safe_and_bounded() {
+    assert_eq!(sanitize_replica_id("web-1/42"), "web-1_42");
+    assert_eq!(sanitize_replica_id(""), "replica");
+    assert_eq!(sanitize_replica_id(".."), "replica");
+    assert_eq!(sanitize_replica_id(&"x".repeat(500)).len(), 128);
+    let id = default_replica_id();
+    assert!(!id.is_empty() && id.len() <= 128);
+    assert!(
+        id.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)),
+        "{id}"
+    );
+}

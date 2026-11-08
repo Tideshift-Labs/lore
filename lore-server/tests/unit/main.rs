@@ -30,6 +30,7 @@ mod quic;
 mod root;
 mod server;
 mod settings;
+mod stage_liveness;
 mod store;
 mod telemetry;
 mod topology;

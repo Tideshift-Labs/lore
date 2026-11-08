@@ -419,6 +419,11 @@ pub struct WriteBehindConfig {
     /// replica runs, `full` (the default), `stage` or `drain`. An unknown value
     /// fails deserialization, so it fails closed at boot.
     pub role: Option<crate::fragment_write_behind::WriteBehindRole>,
+    /// FORK-LOCAL (Tideshift), WP-115 K11: the per-replica stage liveness
+    /// probe that lets `/lb_health` eject a stage replica whose own mount is
+    /// stale while a peer's is fresh. On by default for `role = "stage"`;
+    /// `false` turns it off. Refused on any other role, where it has no effect.
+    pub stage_liveness_probe: Option<bool>,
 }
 
 /// One enabled `[write_behind]` block, validated, as the two values composition
@@ -999,7 +1004,8 @@ fn validated_write_behind_settings(
     )
     .and_then(|runtime| runtime.with_worker_concurrency(raw.worker_concurrency))
     .map_err(|error| write_behind_error(name, error.to_string()))?
-    .with_role(validated_write_behind_role(name, raw)?);
+    .with_role(validated_write_behind_role(name, raw)?)
+    .with_stage_liveness(validated_stage_liveness_probe(name, raw)?);
     Ok(WriteBehindComposition {
         settings,
         shared_spool_root,
@@ -1065,6 +1071,25 @@ fn validated_write_behind_role(
         ));
     }
     Ok(role)
+}
+
+/// FORK-LOCAL (Tideshift), WP-115 K11: whether the stage liveness probe runs.
+/// On by default; only a `stage` replica runs it, so setting it on another
+/// role is refused like any other knob with no effect.
+#[lore_macro::test_pub]
+fn validated_stage_liveness_probe(
+    name: &str,
+    raw: &WriteBehindConfig,
+) -> Result<bool, PluginError> {
+    use crate::fragment_write_behind::WriteBehindRole;
+    match raw.stage_liveness_probe {
+        None => Ok(true),
+        Some(enabled) if raw.role == Some(WriteBehindRole::Stage) => Ok(enabled),
+        Some(_) => Err(write_behind_error(
+            name,
+            "stage_liveness_probe applies only to role = \"stage\"",
+        )),
+    }
 }
 
 /// Refuse a staging tier that nothing would ever consult.

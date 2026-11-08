@@ -63,6 +63,8 @@ mod creation;
 mod resolve_batch;
 #[path = "stage_custody.rs"]
 mod stage_custody;
+#[path = "stage_liveness.rs"]
+mod stage_liveness;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -79,6 +81,9 @@ pub use stage_custody::StageReservationInput;
 pub use stage_custody::StageTombstoneSweep;
 pub use stage_custody::is_stage_capacity_exhausted;
 pub use stage_custody::is_stage_custody_key_taken;
+pub use stage_liveness::MAX_STAGE_LIVENESS_ID_BYTES;
+pub use stage_liveness::STAGE_LIVENESS_SCHEMA;
+pub use stage_liveness::StagePeerLiveness;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::coordinator::CommittedVersions;

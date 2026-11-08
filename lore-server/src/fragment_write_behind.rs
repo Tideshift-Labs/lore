@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -33,6 +34,9 @@ use tokio::task::JoinSet;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
+
+use crate::stage_liveness::StageLiveness;
+use crate::stage_liveness::StageLivenessSnapshot;
 
 struct WriteBehindInstrumentProvider;
 impl InstrumentProvider for WriteBehindInstrumentProvider {
@@ -181,6 +185,9 @@ pub(crate) struct FragmentWriteBehindSettings {
     stale_after: Duration,
     cleanup_interval: Duration,
     cleanup_batch: u32,
+    /// WP-115 K11: run the per-replica stage liveness probe. Honoured only on
+    /// a `stage` replica; on by default.
+    stage_liveness: bool,
 }
 
 impl FragmentWriteBehindSettings {
@@ -216,6 +223,7 @@ impl FragmentWriteBehindSettings {
             stale_after: Duration::from_millis(stale),
             cleanup_interval: Duration::from_millis(cleanup),
             cleanup_batch,
+            stage_liveness: true,
         })
     }
 
@@ -240,6 +248,23 @@ impl FragmentWriteBehindSettings {
     #[lore_macro::test_pub]
     pub(crate) fn role(&self) -> WriteBehindRole {
         self.role
+    }
+
+    /// Turn the WP-115 K11 stage liveness probe on or off.
+    #[lore_macro::test_pub]
+    pub(crate) fn with_stage_liveness(mut self, enabled: bool) -> Self {
+        self.stage_liveness = enabled;
+        self
+    }
+
+    /// Whether this replica runs the WP-115 K11 stage liveness probe: only a
+    /// `stage` replica, and only while it is enabled. A `full` replica is the
+    /// only one in its cell, so it has no peer to compare with. A `drain`
+    /// replica already answers 503 `drain_role`, and its local stage would be
+    /// a false "fresh peer" for the web replicas.
+    #[lore_macro::test_pub]
+    pub(crate) fn runs_stage_liveness(&self) -> bool {
+        self.role == WriteBehindRole::Stage && self.stage_liveness
     }
 
     /// How often the observer runs, which is also each attempt's budget.
@@ -285,6 +310,8 @@ pub struct FragmentWriteBehindReadiness {
     state: Mutex<State>,
     stale_after: Duration,
     cleanup_stale_after: Duration,
+    /// WP-115 K11: this replica's stage liveness, on a `stage` replica only.
+    stage_liveness: Option<Arc<StageLiveness>>,
 }
 
 #[derive(Serialize)]
@@ -322,6 +349,9 @@ pub struct Snapshot {
     /// compared with, not the latest read. Observability only; no readiness
     /// decision reads it.
     pub capacity: Option<CapacityDetail>,
+    /// WP-115 K11: the stage liveness probe and peer view, on a `stage`
+    /// replica. `fault` is what `/lb_health` answers from it.
+    pub stage_liveness: Option<StageLivenessSnapshot>,
 }
 
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -909,6 +939,21 @@ fn role_replica_fault(
     }
 }
 
+/// WP-115 K11: [`role_replica_fault`] plus the stage liveness fault. Only a
+/// `stage` replica takes the liveness fault, and only when nothing else
+/// already answers.
+#[lore_macro::test_pub]
+fn combined_replica_fault(
+    role: WriteBehindRole,
+    base: Option<&'static str>,
+    stage_local: Option<&'static str>,
+) -> Option<&'static str> {
+    match role {
+        WriteBehindRole::Stage => base.or(stage_local),
+        WriteBehindRole::Full | WriteBehindRole::Drain => base,
+    }
+}
+
 /// The readiness reason and the degraded condition for `role`.
 ///
 /// A stage replica runs no cleanup loop, so it never credits cleanup progress
@@ -1016,8 +1061,20 @@ fn refresh_activity(state: &mut State, activity: WriteBehindActivity) {
 impl FragmentWriteBehindReadiness {
     /// The replica-local fault `/lb_health` acts on. Reads in-memory state only.
     pub fn replica_fault(&self) -> Option<&'static str> {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        role_replica_fault(self.role, &state, self.stale_after)
+        let base = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            role_replica_fault(self.role, &state, self.stale_after)
+        };
+        let stage_local = self
+            .stage_liveness
+            .as_ref()
+            .and_then(|liveness| liveness.fault(Instant::now()));
+        combined_replica_fault(self.role, base, stage_local)
+    }
+
+    /// WP-115 K11: this replica's stage liveness, when it runs one.
+    pub fn stage_liveness(&self) -> Option<&Arc<StageLiveness>> {
+        self.stage_liveness.as_ref()
     }
 
     pub fn role(&self) -> WriteBehindRole {
@@ -1069,6 +1126,10 @@ impl FragmentWriteBehindReadiness {
                 .capacity_unavailable_since
                 .map(|at| millis(at.elapsed())),
             capacity: observation.map(|value| CapacityDetail::from(&value.capacity)),
+            stage_liveness: self
+                .stage_liveness
+                .as_ref()
+                .map(|liveness| liveness.snapshot(Instant::now())),
         }
     }
 }
@@ -1136,12 +1197,18 @@ pub(crate) fn configure_fragment_write_behind(
     if let Some(concurrency) = settings.worker_concurrency {
         handle.set_drain_concurrency(concurrency);
     }
+    let stage_liveness = if settings.runs_stage_liveness() {
+        start_stage_liveness(&handle, endpoints, &shutdown)?
+    } else {
+        None
+    };
     let readiness = Arc::new(FragmentWriteBehindReadiness {
         handle: handle.clone(),
         role: settings.role,
         state: Mutex::new(State::default()),
         stale_after: settings.stale_after,
         cleanup_stale_after: settings.cleanup_interval * 2 + settings.stale_after,
+        stage_liveness,
     });
     info!(
         role = settings.role.name(),
@@ -1165,6 +1232,75 @@ pub(crate) fn configure_fragment_write_behind(
         Ok(())
     });
     Ok(Some(readiness))
+}
+
+/// WP-115 K11: start the stage liveness probe thread and its exchange task.
+///
+/// `None` where the platform opens no stage (the handle reports no root).
+fn start_stage_liveness(
+    handle: &Arc<FragmentWriteBehindHandle>,
+    endpoints: &mut JoinSet<Result<()>>,
+    shutdown: &watch::Receiver<bool>,
+) -> Result<Option<Arc<StageLiveness>>> {
+    let Some(root) = handle.stage_root() else {
+        return Ok(None);
+    };
+    let replica_id = crate::stage_liveness::default_replica_id();
+    let liveness = Arc::new(StageLiveness::new(replica_id.clone()));
+    let stop = Arc::new(AtomicBool::new(false));
+    crate::stage_liveness::spawn_probe_thread(
+        &liveness,
+        crate::stage_liveness::file_probe(root, &replica_id),
+        crate::stage_liveness::PROBE_INTERVAL,
+        stop.clone(),
+    )?;
+    info!(
+        replica_id = %replica_id,
+        stale_after_millis = millis(liveness.stale_after()),
+        "stage liveness probe started"
+    );
+    let exchange_handle = handle.clone();
+    let exchange_liveness = liveness.clone();
+    let mut exchange_shutdown = shutdown.clone();
+    lore_spawn!(endpoints, async move {
+        // Stops the probe thread at shutdown. A thread parked in a hung write
+        // never sees it, and the process exit ends it.
+        let _stop = StopFlag(stop);
+        let mut ticks = tokio::time::interval(crate::stage_liveness::EXCHANGE_INTERVAL);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut warned = None;
+        loop {
+            tokio::select! { biased;
+                _ = exchange_shutdown.wait_for(|value| *value) => break,
+                _ = ticks.tick() => {}
+            }
+            tokio::select! { biased;
+                _ = exchange_shutdown.wait_for(|value| *value) => break,
+                _ = crate::stage_liveness::exchange_once(
+                    &exchange_liveness,
+                    |age| exchange_handle.exchange_stage_liveness(
+                        exchange_liveness.replica_id(),
+                        age,
+                        exchange_liveness.stale_after(),
+                        crate::stage_liveness::RETAIN,
+                    ),
+                    crate::stage_liveness::EXCHANGE_TIMEOUT,
+                    &mut warned,
+                ) => {}
+            }
+            exchange_liveness.report(Instant::now());
+        }
+        Ok(())
+    });
+    Ok(Some(liveness))
+}
+
+/// Sets the flag when dropped.
+struct StopFlag(Arc<AtomicBool>);
+impl Drop for StopFlag {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The drain and cleanup loops, which only `full` and `drain` replicas run.

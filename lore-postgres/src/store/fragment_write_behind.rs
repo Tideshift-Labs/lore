@@ -1340,6 +1340,42 @@ impl FragmentWriteBehindHandle {
         self.stage.note_observation_unknown();
     }
 
+    /// FORK-LOCAL (Tideshift), WP-115 K11: the canonical stage root this
+    /// replica opened, for its liveness probe. `None` where staging is
+    /// unsupported (non-Unix), which never opens a stage anyway.
+    pub fn stage_root(&self) -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            Some(self.stage.root().inventory_root().to_path_buf())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    /// FORK-LOCAL (Tideshift), WP-115 K11: publish this replica's last good
+    /// stage probe for its cell and count the cell's fresh peers. On the
+    /// shared domain pool, never the observer's reserved connection.
+    pub async fn exchange_stage_liveness(
+        &self,
+        replica_id: &str,
+        last_good_age: Duration,
+        fresh_within: Duration,
+        retain: Duration,
+    ) -> Result<crate::domain::fragments::StagePeerLiveness, StoreError> {
+        self.coordinator
+            .exchange_stage_liveness(
+                &self.policy.cell_id,
+                replica_id,
+                last_good_age,
+                fresh_within,
+                retain,
+            )
+            .await
+            .map_err(domain_store_err)
+    }
+
     /// Step timings of the latest `observe()` attempt, including one a caller's
     /// deadline cancelled.
     pub fn observe_trace(&self) -> ObserveTrace {
