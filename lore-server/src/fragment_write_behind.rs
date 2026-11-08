@@ -142,6 +142,31 @@ impl WriteBehindRole {
     pub fn runs_drain(self) -> bool {
         !matches!(self, Self::Stage)
     }
+
+    /// What this role starts and records. One derivation for every role gate
+    /// in [`configure_fragment_write_behind`] and its observer, so a table
+    /// test pins all of them.
+    #[lore_macro::test_pub]
+    pub(crate) fn tasks(self) -> RoleTasks {
+        let drain = self.runs_drain();
+        RoleTasks {
+            drain_and_cleanup: drain,
+            // Without a drain loop to own it, the observer owns the stop
+            // guard, so a dead observer still answers `observer_stopped`.
+            observer_owns_stop_guard: !drain,
+            // A stage replica has no cleanup verdict; see the observer loop.
+            records_cleanup_gauge: drain,
+        }
+    }
+}
+
+/// The per-role task gates. See [`WriteBehindRole::tasks`].
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RoleTasks {
+    pub(crate) drain_and_cleanup: bool,
+    pub(crate) observer_owns_stop_guard: bool,
+    pub(crate) records_cleanup_gauge: bool,
 }
 
 #[lore_macro::test_pub]
@@ -1122,15 +1147,17 @@ pub(crate) fn configure_fragment_write_behind(
         role = settings.role.name(),
         "write-behind role selects which loops this replica runs"
     );
-    if settings.role.runs_drain() {
+    let tasks = settings.role.tasks();
+    if tasks.drain_and_cleanup {
         spawn_drain_and_cleanup(&handle, &readiness, &settings, endpoints, &shutdown);
     }
     let observer_readiness = readiness.clone();
     // A stage replica has no drain loop to own the stop guard, so its observer
     // owns it: the observer is the one task whose end leaves this replica
     // unable to keep admission fresh.
-    let observer_guard =
-        (!settings.role.runs_drain()).then(|| StopGuard(handle.clone(), readiness.clone()));
+    let observer_guard = tasks
+        .observer_owns_stop_guard
+        .then(|| StopGuard(handle.clone(), readiness.clone()));
     let mut observer_shutdown = shutdown;
     lore_spawn!(endpoints, async move {
         let _guard = observer_guard;
@@ -1352,7 +1379,7 @@ async fn observe_loop(
         // series and the monitoring rule reads it across replicas. A stage
         // replica has no cleanup verdict; recording 0 there would hide the
         // drain worker's 1 from a `min` rule. So it records nothing.
-        if settings.role.runs_drain() {
+        if settings.role.tasks().records_cleanup_gauge {
             record_cleanup_not_progressing(
                 &instruments().cleanup_not_progressing,
                 &snapshot.degraded,

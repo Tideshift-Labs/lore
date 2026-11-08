@@ -2168,3 +2168,43 @@ fn role_readiness_dispatches_each_role_to_its_own_verdicts() {
         Some("observer_stopped")
     );
 }
+
+/// WP-115 K6: every role gate comes from one derivation. A stage replica
+/// starts no drain or cleanup loop, its observer owns the stop guard, and it
+/// records no cleanup gauge sample (which would mask the worker's 1).
+#[test]
+fn each_role_derives_its_task_gates() {
+    for (role, drain_and_cleanup, observer_owns_stop_guard, records_cleanup_gauge) in [
+        (WriteBehindRole::Full, true, false, true),
+        (WriteBehindRole::Drain, true, false, true),
+        (WriteBehindRole::Stage, false, true, false),
+    ] {
+        assert_eq!(
+            role.tasks(),
+            RoleTasks {
+                drain_and_cleanup,
+                observer_owns_stop_guard,
+                records_cleanup_gauge,
+            },
+            "{role:?}"
+        );
+    }
+}
+
+/// The task gates are only pinned if the composition reads them. No unit test
+/// can build a live handle, so pin each use site in the source instead.
+#[test]
+fn the_composition_reads_every_role_task_gate() {
+    const SOURCE: &str = include_str!("../../src/fragment_write_behind.rs");
+    for use_site in [
+        "if tasks.drain_and_cleanup {\n        spawn_drain_and_cleanup(",
+        "let observer_guard = tasks\n        .observer_owns_stop_guard\n        .then(|| StopGuard(",
+        "if settings.role.tasks().records_cleanup_gauge {\n            record_cleanup_not_progressing(",
+    ] {
+        assert_eq!(
+            SOURCE.matches(use_site).count(),
+            1,
+            "the composition must read its role gate exactly once: {use_site}"
+        );
+    }
+}
