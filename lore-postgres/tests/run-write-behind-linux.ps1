@@ -230,6 +230,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_parallel_drain_respects_its_concurrency_bound',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_parallel_drain_promotes_each_fragment_once',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_parallel_drain_records_no_progress_when_every_send_fails',
+    'store::immutable_store::fragment_write_behind::adapter_tests::adapter_two_drain_handles_on_one_stage_send_each_fragment_once',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_capacity_refused_put_leaves_no_preparation_that_fences_the_retry',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_put_waits_for_a_staging_slot_freed_inside_its_budget',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observe_answers_with_every_shared_domain_connection_held',
