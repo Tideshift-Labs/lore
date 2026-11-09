@@ -20,6 +20,13 @@
 //!   observer counts an increase only if it ran after the observer's earlier
 //!   view, so an increase that ran before that view but committed after it
 //!   proves nothing.
+//! - The fresh-and-on-time test is made once, in the inserted row's
+//!   `progressed_at`: the statement time when it passes, else the Unix epoch,
+//!   which no observer can count. A new incarnation's row (an insert, or a
+//!   replacement of another incarnation's row) takes that stamp as is, so a
+//!   row that goes X, Y, X with a stale X success comes back with X's higher
+//!   count but an epoch stamp. An observer that missed Y then sees a higher
+//!   count it cannot count. No path stamps a time without the test.
 
 use super::*;
 
@@ -38,8 +45,10 @@ pub const MAX_STAGE_LIVENESS_INCARNATION_BYTES: usize = 64;
 pub struct StageProgressRecord {
     pub incarnation: String,
     pub progress: i64,
-    /// Database time of the last accepted increase (or of the row's first
-    /// write for this incarnation), in microseconds since the Unix epoch.
+    /// Database time of the last accepted increase, in microseconds since the
+    /// Unix epoch. A row first written for this incarnation carries the
+    /// statement time only if that write passed the fresh-and-on-time test,
+    /// else 0 (the Unix epoch), which never counts as progress.
     pub progressed_micros: i64,
 }
 
@@ -141,7 +150,7 @@ impl PostgresFragmentCoordinator {
                 &[&cell_id, &replica_id],
             )
             .await
-            .map_err(|error| DomainError::from_pg("stage liveness withdraw", error))?;
+            .map_err(|error| DomainError::from_pg_detailed("stage liveness withdraw", error))?;
         Ok(deleted > 0)
     }
 
@@ -183,14 +192,16 @@ impl PostgresFragmentCoordinator {
         let tx = client
             .transaction()
             .await
-            .map_err(|error| DomainError::from_pg("stage liveness transaction", error))?;
+            .map_err(|error| DomainError::from_pg_detailed("stage liveness transaction", error))?;
         let timeout = format!("{}ms", limits.statement_timeout.as_millis().max(1));
         tx.execute(
             "SELECT set_config('statement_timeout', $1, true)",
             &[&timeout],
         )
         .await
-        .map_err(|error| DomainError::from_pg("stage liveness statement timeout", error))?;
+        .map_err(|error| {
+            DomainError::from_pg_detailed("stage liveness statement timeout", error)
+        })?;
         // Measured after the checkout: see the doc comment.
         let sent = Instant::now();
         let last_good_age = sent.saturating_duration_since(publication.last_good);
@@ -213,25 +224,21 @@ impl PostgresFragmentCoordinator {
                  published AS ( \
                    INSERT INTO lore_domain_write_behind_stage_progress AS stored \
                      (cell_id, replica_id, incarnation, progress, progressed_at, published_at) \
-                   VALUES ($1, $2, $3, $4, clock_timestamp(), now()) \
+                   VALUES ($1, $2, $3, $4, \
+                     CASE WHEN $5::double precision <= $6::double precision \
+                       AND $7::bigint IS NOT NULL \
+                       AND (extract(epoch FROM clock_timestamp()) * 1000000)::bigint <= $7::bigint \
+                     THEN clock_timestamp() ELSE 'epoch'::timestamptz END, \
+                     now()) \
                    ON CONFLICT (cell_id, replica_id) DO UPDATE SET \
                      incarnation = EXCLUDED.incarnation, \
-                     progress = CASE \
-                       WHEN stored.incarnation <> EXCLUDED.incarnation THEN EXCLUDED.progress \
-                       WHEN EXCLUDED.progress > stored.progress \
-                         AND $5::double precision <= $6::double precision \
-                         AND $7::bigint IS NOT NULL \
-                         AND (extract(epoch FROM clock_timestamp()) * 1000000)::bigint <= $7::bigint \
-                       THEN EXCLUDED.progress \
-                       ELSE stored.progress END, \
-                     progressed_at = CASE \
-                       WHEN stored.incarnation <> EXCLUDED.incarnation THEN EXCLUDED.progressed_at \
-                       WHEN EXCLUDED.progress > stored.progress \
-                         AND $5::double precision <= $6::double precision \
-                         AND $7::bigint IS NOT NULL \
-                         AND (extract(epoch FROM clock_timestamp()) * 1000000)::bigint <= $7::bigint \
-                       THEN EXCLUDED.progressed_at \
-                       ELSE stored.progressed_at END, \
+                     (progress, progressed_at) = ( \
+                       SELECT \
+                         CASE WHEN take THEN EXCLUDED.progress ELSE stored.progress END, \
+                         CASE WHEN take THEN EXCLUDED.progressed_at ELSE stored.progressed_at END \
+                       FROM (SELECT stored.incarnation <> EXCLUDED.incarnation \
+                         OR (EXCLUDED.progress > stored.progress \
+                           AND EXCLUDED.progressed_at > 'epoch'::timestamptz) AS take) AS decision), \
                      published_at = EXCLUDED.published_at \
                    RETURNING incarnation, progress, \
                      (extract(epoch FROM progressed_at) * 1000000)::bigint AS progressed_micros), \
@@ -275,10 +282,10 @@ impl PostgresFragmentCoordinator {
                 ],
             )
             .await
-            .map_err(|error| DomainError::from_pg("stage liveness exchange", error))?;
+            .map_err(|error| DomainError::from_pg_detailed("stage liveness exchange", error))?;
         tx.commit()
             .await
-            .map_err(|error| DomainError::from_pg("stage liveness commit", error))?;
+            .map_err(|error| DomainError::from_pg_detailed("stage liveness commit", error))?;
         if row.get::<_, i64>("published") != 1 {
             return Err(DomainError::Internal(
                 "stage liveness exchange did not publish this replica".to_owned(),

@@ -593,6 +593,52 @@ async fn a_restarted_peer_resets_the_baseline() {
     namespace.release().await;
 }
 
+/// Two processes share one replica id (a misconfiguration), so the row goes
+/// X, Y, X. X's return carries a higher count from a stale success. A stale
+/// observer that never saw Y must not count it: a new incarnation's write is
+/// held to the same fresh-and-on-time test as any increase.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn an_incarnation_flip_back_with_a_stale_success_proves_nothing() {
+    let (namespace, store) = boot("k11-flip").await;
+    let coordinator = store.fragment_coordinator();
+    let a = replica("web-a");
+    let x = StageLiveness::with_incarnation("web-b".to_owned(), "b-x".to_owned(), thresholds());
+    let y = StageLiveness::with_incarnation("web-b".to_owned(), "b-y".to_owned(), thresholds());
+    exchange(&coordinator, CELL, &a).await;
+    exchange(&coordinator, CELL, &x).await;
+    // X's last success, never published while fresh.
+    x.note_good(Instant::now());
+    tokio::time::sleep(STALE_AFTER + Duration::from_millis(300)).await;
+    exchange(&coordinator, CELL, &a).await;
+    assert_eq!(lb_health(&a), OK, "baseline");
+    // Y writes the row; a does not look. Then X writes it back.
+    exchange(&coordinator, CELL, &y).await;
+    let back = coordinator
+        .exchange_stage_liveness(CELL, "web-b", &x.publication(), x.limits())
+        .await
+        .expect("X publishes again");
+    exchange(&coordinator, CELL, &a).await;
+    assert_eq!(
+        lb_health(&a),
+        OK,
+        "a stale success carried across an incarnation change"
+    );
+    let stored = back.published.expect("published");
+    assert_eq!((stored.incarnation.as_str(), stored.progress), ("b-x", 1));
+    assert_eq!(
+        stored.progressed_micros, 0,
+        "a stale success on an incarnation change must not be stamped"
+    );
+    // Control: a fresh X success counts.
+    x.note_good(Instant::now());
+    exchange(&coordinator, CELL, &x).await;
+    exchange(&coordinator, CELL, &a).await;
+    assert_eq!(lb_health(&a), EJECTED);
+    drop(store);
+    namespace.release().await;
+}
+
 /// The SQL rules on one row, on the database clock: the stored count never
 /// goes down; an increase needs a fresh success, a clock anchor, and a
 /// statement that runs by the deadline; a new incarnation replaces the row.

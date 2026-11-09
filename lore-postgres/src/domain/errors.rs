@@ -94,6 +94,22 @@ impl DomainError {
         Self::Internal(format!("{context}: {e}"))
     }
 
+    /// As [`Self::from_pg`], and the message also names the SQLSTATE and the
+    /// server's own message when the error came from the database. The driver's
+    /// display of a server error reads only "db error", which hides, for
+    /// example, a `statement_timeout` (57014) behind a generic word.
+    pub fn from_pg_detailed(context: &str, e: tokio_postgres::Error) -> Self {
+        let context = match e.as_db_error() {
+            Some(db) => format!(
+                "{context} (SQLSTATE {}: {})",
+                db.code().code(),
+                db.message()
+            ),
+            None => context.to_owned(),
+        };
+        Self::from_pg(&context, e)
+    }
+
     /// Classify one pool-checkout error.
     pub fn from_pool(context: &str, e: deadpool_postgres::PoolError) -> Self {
         if crate::pool::is_transient_pool(&e) {

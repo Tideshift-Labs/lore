@@ -33,17 +33,76 @@
 //!    `stage_unavailable_local`. Anything else is 200. When the peer stops
 //!    too, its last increase leaves the window and the replica is readmitted.
 //!
-//! **Why no cell-wide fault ejects.** In a cell-wide hang no probe succeeds,
-//! so no count moves after a baseline, and nobody ejects. Probe duration and
-//! skew do not matter. A delayed or replayed statement cannot fake a move: an
-//! accepted increase ran after the baseline, so it reports a peer success no
-//! more than `PUBLISH_FRESH + PUBLISH_DEADLINE` (6 s) before the baseline,
-//! which is at least [`STALE_AFTER`] after this replica's last success. So a
-//! replica ejects only if a peer succeeded at least 9 s after it last did.
-//! Two replicas cannot both meet that against each other, so a double eject
-//! is impossible in any timing.
-//!
 //! One own success brings the replica back.
+//!
+//! ## What an eject proves
+//!
+//! Write `S` = [`STALE_AFTER`] (15 s), `F` = [`PUBLISH_FRESH`] (4 s) and
+//! `D` = [`PUBLISH_DEADLINE`] (2 s).
+//!
+//! **Guarantee.** If replica A answers `stage_unavailable_local`, then a peer
+//! made a real probe success at least `S - F - D` (9 s) after A's last own
+//! success. It does NOT say that the peer still works now.
+//!
+//! **Assumptions.** The proof holds only while all of these hold:
+//!
+//! - (A1) The database clock and every replica's monotonic clock run at the
+//!   same rate. Their offsets may differ.
+//! - (A2) There is one database clock and it never goes back: no failover to
+//!   a server with another clock, and no backward step.
+//! - (A3) Replica ids are unique: one process at a time publishes under one
+//!   id. A duplicate is logged, not prevented.
+//! - (A4) A probe returns success only when the stage really worked for that
+//!   process: the write and the fsync reached the server.
+//! - (A5) One replica's exchanges are serialized: an exchange starts only
+//!   after the previous one ended, so the clock anchor it sends came from a
+//!   reply received before the send.
+//!
+//! **Proof.** All times below are real times; A1 lets us move a difference
+//! between clocks without change.
+//!
+//! 1. A ejects at its view V2 only if V2 holds a peer B with the same
+//!    incarnation as A's baseline view V1, a higher count, and a stored
+//!    `progressed_at` `p` later than V1's database clock `c1`.
+//! 2. V1 is the first view after A went stale, so V1's exchange started at
+//!    least `S` after A's last success `L`. `c1` is read during that exchange,
+//!    so `c1 >= L + S`.
+//! 3. By A2, `p > c1` means the statement that stamped `p` ran after `c1`.
+//!    `p` is never the epoch stamp (0), so that statement passed the
+//!    fresh-and-on-time test. Every stamp other than the epoch passes that
+//!    test, also on a new incarnation's first write (see
+//!    `lore_postgres::domain::fragments::StageLivenessPublication`).
+//! 4. Deadline: the statement ran by `anchor + (sent - received) + D` on the
+//!    database clock. The anchor was read no later than `received` (A5), so
+//!    by A1 and A2 the statement ran no later than `sent + D`. So
+//!    `sent >= p - D`.
+//! 5. Freshness: the success it reports, at `g`, was at most `F` old at
+//!    `sent`. So `g >= sent - F >= p - D - F > c1 - F - D >= L + S - F - D`.
+//! 6. By A3 and A4, `g` is a real success of B's own process. So B
+//!    succeeded at least 9 s after `L`.
+//!
+//! **No double eject.** By the guarantee, at any moment the replica with the
+//! latest own success is not ejected: no peer can have succeeded 9 s after
+//! it. So the whole cell is never ejected at once, and in a two-replica cell
+//! the two never both eject. A fault that hits every host within 9 s ejects
+//! nobody.
+//!
+//! **Known limits.**
+//!
+//! - Staggered hang. If the fault hits host B more than about 9 s after it
+//!   hits host A, B's successes in that gap eject A, although B is failing
+//!   too by then. A stays ejected until B's last increase leaves
+//!   [`PROGRESS_WINDOW`]. A live probe showed this: A's last success was 12 s
+//!   before the hang reached B, and A was ejected for about 10 s.
+//! - Flapping. A peer that succeeds less often than once per
+//!   [`PROGRESS_WINDOW`] readmits the stale replica between its successes.
+//!   With a success every 12 s, the stale replica is ejected for about 10 s
+//!   and readmitted for about 2 s, again and again. A longer window would
+//!   shorten that gap, but it would also make the staggered-hang eject and
+//!   the readmit after a cell-wide fault longer, so it is left as is.
+//! - The proof does not hold if an assumption fails, for example after a
+//!   database failover with a clock step, or with two processes sharing one
+//!   replica id.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -100,6 +159,12 @@ pub const PUBLISH_DEADLINE: Duration = EXCHANGE_TIMEOUT;
 /// so when the peer stops too (the fault became cell-wide) the stale replica
 /// is readmitted. Long enough to cover the gap between a slow peer's
 /// successes (a 4 s probe every 6 s) plus one exchange.
+///
+/// Known limit (flapping): a peer whose successes are further apart than
+/// this window readmits the stale replica between them. With a peer success
+/// every 12 s, the stale replica is ejected for about 10 s, then readmitted
+/// for about 2 s, in a loop. The no-double-eject proof in the module docs
+/// does not use this window.
 pub const PROGRESS_WINDOW: Duration = Duration::from_secs(10);
 /// Rows not published for this long are deleted, so restarts do not grow the
 /// table.
