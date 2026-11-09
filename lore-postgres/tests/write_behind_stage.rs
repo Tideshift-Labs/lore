@@ -675,3 +675,66 @@ async fn a_vanished_root_upgrades_to_unready_while_pending_staged_stands() {
          the root is still unavailable"
     );
 }
+
+/// A complete inventory: scan until one traversal finishes, and return its
+/// (bytes, files, unknown) occupancy.
+fn complete_inventory(stage: &WriteBehindStage) -> (u64, u64, u64) {
+    use lore_postgres::store::write_behind::cleanup::StageFileScanner;
+    let mut scanner = StageFileScanner::default();
+    for _ in 0..64 {
+        scanner.scan(stage, 256).unwrap();
+        if let Some((_, bytes, files, unknown)) = scanner.physical_observation() {
+            return (bytes, files, unknown);
+        }
+    }
+    panic!("the inventory never completed a traversal");
+}
+
+/// WP-115 K11: the replicas' probe files live in a top-level `liveness/`
+/// directory, and the inventory skips exactly that directory. The skip must
+/// not reach a `liveness` directory nested under `staged/` (staged data, or
+/// residue a hostile name could hide), nor a top-level FILE named
+/// `liveness`: both still count as unknown occupancy.
+#[tokio::test]
+async fn inventory_skips_only_the_top_level_liveness_directory() {
+    use lore_postgres::store::write_behind::root::LIVENESS_DIR;
+    let hash = [0x52; 32];
+    let key = staged_key(&hash, 1);
+
+    // The top-level directory is skipped; a nested one is counted.
+    let root = ScratchRoot::new("inventory-liveness-dir");
+    let stage = open(&root);
+    stage
+        .stage(&hash, 1, &key, &Bytes::from_static(b"final"))
+        .await
+        .unwrap();
+    let probes = root.path().join(LIVENESS_DIR);
+    std::fs::create_dir(&probes).unwrap();
+    std::fs::write(probes.join("web-a.probe"), b"lore-stage-liveness").unwrap();
+    let nested = root
+        .path()
+        .join("staged")
+        .join(&key[0..2])
+        .join(LIVENESS_DIR);
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("hidden"), b"nested").unwrap();
+    assert_eq!(
+        complete_inventory(&stage),
+        (5 + 6, 2, 1),
+        "the staged file and the nested file count; the probe file does not"
+    );
+
+    // A top-level FILE named `liveness` is not the probe directory.
+    let root = ScratchRoot::new("inventory-liveness-file");
+    let stage = open(&root);
+    stage
+        .stage(&hash, 1, &key, &Bytes::from_static(b"final"))
+        .await
+        .unwrap();
+    std::fs::write(root.path().join(LIVENESS_DIR), b"file").unwrap();
+    assert_eq!(
+        complete_inventory(&stage),
+        (5 + 4, 2, 1),
+        "a file named liveness is unknown occupancy"
+    );
+}

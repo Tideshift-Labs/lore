@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: 2026 Tideshift Labs
+// Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! FORK-LOCAL (Tideshift), WP-115 K11: stage liveness decision, probe thread
 //! and exchange, without Postgres. The Postgres-backed half is
@@ -21,8 +21,15 @@ use lore_server::stage_liveness::*;
 
 const LOCAL: Option<&str> = Some(STAGE_UNAVAILABLE_LOCAL);
 
+/// A view where every fresh peer also proves a write after this replica's
+/// last one.
 fn view(fresh_peers: u64, peers: u64) -> StagePeerLiveness {
-    StagePeerLiveness { fresh_peers, peers }
+    StagePeerLiveness {
+        fresh_peers,
+        proving_peers: fresh_peers,
+        peers,
+        ..StagePeerLiveness::default()
+    }
 }
 
 /// Every case of the rule: self fresh/stale x peers unknown (Postgres down or
@@ -47,7 +54,102 @@ fn decide_ejects_only_a_stale_replica_with_a_fresh_peer() {
 }
 
 fn liveness(stale_after: Duration, peer_view_max_age: Duration) -> StageLiveness {
-    StageLiveness::with_thresholds("replica-a".to_owned(), stale_after, peer_view_max_age)
+    StageLiveness::with_thresholds(
+        "replica-a".to_owned(),
+        stale_after,
+        peer_view_max_age,
+        PROVE_MARGIN,
+    )
+}
+
+/// The reviewer's double eject, without Postgres. Just before the threshold
+/// the view shows a peer that is fresh and even proves a later write; the
+/// replica then goes stale with that view still inside its max age. The view
+/// says nothing about after this replica stopped, so it must not eject.
+#[test]
+fn a_view_taken_before_self_went_stale_is_no_evidence() {
+    let stale_after = Duration::from_secs(15);
+    let state = liveness(stale_after, Duration::from_secs(10));
+    let start = Instant::now();
+    let before = start + stale_after - Duration::from_millis(150);
+    state.note_peers(before, view(1, 1));
+    let stale = start + stale_after + Duration::from_millis(400);
+    assert_eq!(state.peer_evidence(stale), PeerEvidence::Unknown);
+    assert_eq!(state.fault(stale), None);
+    // The next view, taken after self went stale, decides.
+    state.note_peers(stale, view(1, 1));
+    assert_eq!(state.fault(stale), LOCAL);
+}
+
+/// A fresh peer that does not prove a later write is not evidence: in a
+/// cell-wide hang every peer is still fresh for a moment.
+#[test]
+fn a_fresh_peer_without_a_later_write_is_no_evidence() {
+    let stale_after = Duration::from_secs(15);
+    let state = liveness(stale_after, Duration::from_secs(10));
+    let late = Instant::now() + Duration::from_secs(16);
+    state.note_peers(
+        late,
+        StagePeerLiveness {
+            fresh_peers: 1,
+            proving_peers: 0,
+            peers: 1,
+            ..StagePeerLiveness::default()
+        },
+    );
+    assert_eq!(state.peer_evidence(late), PeerEvidence::NoFreshPeer);
+    assert_eq!(state.fault(late), None);
+}
+
+/// The margin covers a cell-wide hang's spread, and still lets a real local
+/// fault eject. See `PROVE_MARGIN`'s doc for the terms.
+#[test]
+fn the_prove_margin_sits_between_the_hang_spread_and_a_local_fault() {
+    assert!(PROVE_MARGIN > PROBE_INTERVAL + EXCHANGE_TIMEOUT);
+    assert!(STALE_AFTER > PROVE_MARGIN + PROBE_INTERVAL + EXCHANGE_INTERVAL + EXCHANGE_TIMEOUT);
+    assert!(PEER_VIEW_MAX_AGE > EXCHANGE_INTERVAL + EXCHANGE_TIMEOUT);
+}
+
+/// A row this process did not write is another process with the same id.
+/// The check is quiet on the first exchange, on a matching row, and after a
+/// failed exchange (which may have written the row anyway).
+#[tokio::test]
+async fn a_row_this_process_did_not_write_is_a_duplicate_identity() {
+    let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    let published = |prior: Option<i64>, now: i64| StagePeerLiveness {
+        prior_last_good_micros: prior,
+        published_last_good_micros: Some(now),
+        ..StagePeerLiveness::default()
+    };
+    async fn run(state: &StageLiveness, view: Result<StagePeerLiveness, String>) -> bool {
+        exchange_once(
+            state,
+            |_last_good| async move { view },
+            Duration::from_secs(1),
+            &mut None,
+        )
+        .await
+    }
+    // The log line is the operator's signal; what the test pins is the
+    // comparison behind it.
+    assert!(run(&state, Ok(published(Some(7), 100))).await);
+    assert_eq!(state.duplicate_identity_seen(), None, "first exchange");
+    assert!(run(&state, Ok(published(Some(100), 200))).await);
+    assert_eq!(state.duplicate_identity_seen(), None, "matching row");
+    assert!(run(&state, Ok(published(Some(150), 300))).await);
+    assert_eq!(
+        state.duplicate_identity_seen(),
+        Some((200, 150)),
+        "a row written by someone else"
+    );
+
+    // After a failed exchange the row may hold what that exchange wrote, so
+    // the next one does not compare.
+    let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    assert!(run(&state, Ok(published(None, 100))).await);
+    assert!(!run(&state, Err("connection reset".to_owned())).await);
+    assert!(run(&state, Ok(published(Some(150), 200))).await);
+    assert_eq!(state.duplicate_identity_seen(), None, "after a failure");
 }
 
 /// The same matrix through the stateful type: the probe age decides
@@ -160,6 +262,7 @@ async fn a_hung_probe_parks_one_thread_and_ages_the_replica_to_stale() {
         "replica-hung".to_owned(),
         stale_after,
         Duration::from_secs(10),
+        PROVE_MARGIN,
     ));
     let (release, wait) = mpsc::channel::<()>();
     let wait = Mutex::new(wait);
@@ -264,24 +367,45 @@ async fn a_failed_or_slow_exchange_leaves_no_peer_view() {
     assert_eq!(state.peer_evidence(Instant::now()), PeerEvidence::Unknown);
 }
 
-/// The exchange publishes the probe's age as this replica measures it.
+/// The exchange hands the store the instant of the last good probe, so the
+/// store measures the age after its checkout, and the view is recorded at
+/// the instant the exchange started, not when it returned.
 #[tokio::test]
-async fn the_exchange_publishes_the_last_good_probe_age() {
+async fn the_exchange_publishes_the_last_good_probe_instant() {
     let state = liveness(Duration::from_secs(15), Duration::from_secs(10));
+    let good = Instant::now();
+    state.note_good(good);
     let published = Mutex::new(None);
+    let started = Instant::now();
     let ok = exchange_once(
         &state,
-        |age| {
-            *published.lock().unwrap() = Some(age);
-            async { Ok::<_, String>(view(0, 0)) }
+        |last_good| {
+            *published.lock().unwrap() = Some(last_good);
+            async {
+                // A slow checkout.
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok::<_, String>(view(0, 0))
+            }
         },
         Duration::from_secs(1),
         &mut None,
     )
     .await;
     assert!(ok);
-    let age = published.lock().unwrap().expect("published");
-    assert!(age < Duration::from_secs(5), "{age:?}");
+    let last_good = published.lock().unwrap().expect("published");
+    assert!(
+        last_good.saturating_duration_since(good) < Duration::from_millis(1),
+        "the instant, not an age measured before the checkout"
+    );
+    // Keyed by the start, the view is already about 900 ms old at return.
+    let view_age = state
+        .snapshot(started + Duration::from_millis(850))
+        .peer_view_age_millis
+        .expect("a view");
+    assert!(
+        view_age >= 840,
+        "the view is keyed by the exchange's start: {view_age} ms"
+    );
 }
 
 /// The real probe writes, fsyncs and removes its file, leaves nothing behind,
@@ -332,7 +456,7 @@ async fn a_draining_replica_withdraws_once_and_never_publishes() {
     let withdraws = std::sync::atomic::AtomicUsize::new(0);
     let mut withdrawn = false;
     let mut warned = None;
-    let exchange = |_age: Duration| {
+    let exchange = |_last_good: Instant| {
         exchanges.fetch_add(1, Ordering::SeqCst);
         async { Ok::<_, String>(view(1, 1)) }
     };

@@ -22,9 +22,16 @@
 //!    to Postgres, and reads how many peers of the same cell are fresh. The
 //!    database clock decides freshness, so host clock skew does not matter.
 //! 3. **Decision.** [`decide`]: 503 `stage_unavailable_local` only when this
-//!    replica is stale AND the last peer view (itself recent) shows at least
-//!    one fresh peer. No fresh peer is a cell-wide fault: 200. No recent peer
-//!    view (Postgres unreachable or slow) is "cannot decide": 200.
+//!    replica is stale AND the last peer view (itself recent, and taken after
+//!    this replica went stale) shows a peer that proved a good write more
+//!    than [`PROVE_MARGIN`] after this replica's last one. No such peer is a
+//!    cell-wide fault: 200. No usable peer view (Postgres unreachable or slow,
+//!    or a view from before this replica went stale) is "cannot decide": 200.
+//!
+//! A peer that is merely fresh is not enough. In a cell-wide hang every probe
+//! stops within moments of the others, so just before the threshold each
+//! replica's view shows the others fresh. If that view counted, every replica
+//! would eject itself as it crossed the threshold.
 //!
 //! The threshold is the hysteresis: a replica is stale only after
 //! [`STALE_AFTER`] with no good probe, so one slow probe does not flap it, and
@@ -70,6 +77,26 @@ pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 /// so a few slow exchanges do not drop the evidence, but a Postgres outage
 /// does within seconds.
 pub const PEER_VIEW_MAX_AGE: Duration = Duration::from_secs(10);
+/// A peer is evidence of a local fault only if its last good probe is more
+/// than this much later than this replica's own, both on database time.
+///
+/// In a cell-wide hang, two replicas' last good probes differ by at most:
+///
+/// - one [`PROBE_INTERVAL`] (2 s): the probes run on independent phases, so
+///   one may have last succeeded up to an interval before the other;
+/// - plus the measurement skew, at most [`EXCHANGE_TIMEOUT`] (2 s): each
+///   replica measures its age after the pool checkout, and its statement's
+///   `now()` runs later still, so its published time can look fresher by up
+///   to that gap. The exchange is cancelled at the timeout, so a published
+///   row's gap is under it;
+/// - plus slack (1 s) for the probe's own write time and the spread of the
+///   fault's onset across hosts (the reviewer measured 200 ms).
+///
+/// That is 5 s. It must also stay well under [`STALE_AFTER`] so a real local
+/// fault still ejects: a healthy peer's published probe is at most
+/// `PROBE_INTERVAL + EXCHANGE_INTERVAL + EXCHANGE_TIMEOUT` (6 s) old, and a
+/// stale replica's is at least 15 s old, so the gap is at least 9 s.
+pub const PROVE_MARGIN: Duration = Duration::from_secs(5);
 /// Rows not published for this long are deleted, so restarts do not grow the
 /// table.
 pub const RETAIN: Duration = Duration::from_secs(3600);
@@ -114,12 +141,15 @@ fn instruments() -> &'static Instruments {
 /// What the last peer view says, once its own age is taken into account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerEvidence {
-    /// No peer view, or one older than [`PEER_VIEW_MAX_AGE`]: Postgres is
-    /// unreachable or slow. Never ejects.
+    /// No peer view, one older than [`PEER_VIEW_MAX_AGE`] (Postgres is
+    /// unreachable or slow), or one taken before this replica went stale.
+    /// Never ejects.
     Unknown,
-    /// A recent view with no fresh peer: the stage is stale for everyone.
+    /// A recent view with no proving peer: the stage is stale for everyone.
     NoFreshPeer,
-    /// A recent view with at least one fresh peer.
+    /// A recent view, taken after this replica went stale, with at least one
+    /// peer that proved a good write [`PROVE_MARGIN`] after this replica's
+    /// last one.
     FreshPeer,
 }
 
@@ -209,6 +239,7 @@ pub struct StageLivenessSnapshot {
     pub probe_failures: u64,
     pub peer_view_age_millis: Option<u64>,
     pub fresh_peers: Option<u64>,
+    pub proving_peers: Option<u64>,
     pub peers: Option<u64>,
     pub fault: Option<&'static str>,
 }
@@ -226,22 +257,34 @@ pub struct StageLiveness {
     in_flight: AtomicBool,
     /// Probe threads ever started for this replica. Never above 1.
     threads_started: AtomicUsize,
+    /// The last peer view, keyed by when its exchange STARTED. That is no
+    /// later than the database read it reflects, so the view's age and the
+    /// "taken after self went stale" test both err toward "cannot decide".
     peers: Mutex<Option<(Instant, StagePeerLiveness)>>,
+    /// This process's own `last_good_at` as its last exchange left it
+    /// (database micros). `None` until an exchange succeeds, and again after
+    /// one fails, because a failed exchange may still have written the row.
+    last_published: Mutex<Option<i64>>,
+    /// The last duplicate-identity sighting: when it was last logged, and
+    /// the (published, found) pair that disagreed.
+    duplicate_warned: Mutex<Option<(Instant, i64, i64)>>,
     /// The last verdict, for one log line per transition.
     ejected: AtomicBool,
     stale_after: Duration,
     peer_view_max_age: Duration,
+    prove_margin: Duration,
 }
 
 impl StageLiveness {
     pub fn new(replica_id: String) -> Self {
-        Self::with_thresholds(replica_id, STALE_AFTER, PEER_VIEW_MAX_AGE)
+        Self::with_thresholds(replica_id, STALE_AFTER, PEER_VIEW_MAX_AGE, PROVE_MARGIN)
     }
 
     pub fn with_thresholds(
         replica_id: String,
         stale_after: Duration,
         peer_view_max_age: Duration,
+        prove_margin: Duration,
     ) -> Self {
         Self {
             replica_id,
@@ -252,10 +295,23 @@ impl StageLiveness {
             in_flight: AtomicBool::new(false),
             threads_started: AtomicUsize::new(0),
             peers: Mutex::new(None),
+            last_published: Mutex::new(None),
+            duplicate_warned: Mutex::new(None),
             ejected: AtomicBool::new(false),
             stale_after,
             peer_view_max_age,
+            prove_margin,
         }
+    }
+
+    pub fn prove_margin(&self) -> Duration {
+        self.prove_margin
+    }
+
+    /// When the last good probe was, on this process's monotonic clock.
+    pub fn last_good_at(&self) -> Instant {
+        let last = Duration::from_nanos(self.last_good.load(Ordering::Relaxed));
+        self.origin.checked_add(last).unwrap_or(self.origin)
     }
 
     pub fn replica_id(&self) -> &str {
@@ -296,17 +352,78 @@ impl StageLiveness {
     }
 
     /// The peer evidence at `now`.
+    ///
+    /// A proving peer counts only in a view taken after this replica went
+    /// stale. A view from before says nothing about whether a peer could
+    /// still write once this replica could not.
     pub fn peer_evidence(&self, now: Instant) -> PeerEvidence {
-        match self.peer_view(now) {
-            Some((age, view)) if age < self.peer_view_max_age => {
-                if view.fresh_peers > 0 {
-                    PeerEvidence::FreshPeer
-                } else {
-                    PeerEvidence::NoFreshPeer
-                }
-            }
-            _ => PeerEvidence::Unknown,
+        let Some((at, view)) = *self.peers.lock().unwrap_or_else(|error| error.into_inner()) else {
+            return PeerEvidence::Unknown;
+        };
+        if now.saturating_duration_since(at) >= self.peer_view_max_age {
+            return PeerEvidence::Unknown;
         }
+        if view.proving_peers == 0 {
+            return PeerEvidence::NoFreshPeer;
+        }
+        if self.last_good_age(at) >= self.stale_after {
+            PeerEvidence::FreshPeer
+        } else {
+            PeerEvidence::Unknown
+        }
+    }
+
+    /// Compare this replica's row as the exchange found it with what this
+    /// process last wrote. A difference means another process publishes
+    /// under the same `replica_id`, and its fresh probes can hide this
+    /// replica's stale mount (or the reverse). Warns, at most every
+    /// [`WARN_EVERY`].
+    pub fn note_publication(&self, now: Instant, view: &StagePeerLiveness) {
+        let mut last = self
+            .last_published
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let (Some(mine), Some(found)) = (*last, view.prior_last_good_micros)
+            && mine != found
+        {
+            let mut warned = self
+                .duplicate_warned
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let logged_at = warned
+                .map(|(at, _, _)| at)
+                .filter(|at| now.saturating_duration_since(*at) < WARN_EVERY);
+            let due = logged_at.is_none();
+            *warned = Some((logged_at.unwrap_or(now), mine, found));
+            if due {
+                warn!(
+                    replica_id = %self.replica_id,
+                    last_published_micros = mine,
+                    found_micros = found,
+                    "another process publishes stage liveness under this replica id; \
+                     give each replica a distinct id"
+                );
+            }
+        }
+        *last = view.published_last_good_micros;
+    }
+
+    /// The last duplicate-identity sighting, as (what this process last
+    /// published, what the exchange found), or `None`.
+    pub fn duplicate_identity_seen(&self) -> Option<(i64, i64)> {
+        self.duplicate_warned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .map(|(_, mine, found)| (mine, found))
+    }
+
+    /// Forget what this process last wrote: a failed exchange may still have
+    /// committed, so the next comparison would be a false alarm.
+    fn forget_publication(&self) {
+        *self
+            .last_published
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     /// The `/lb_health` fault at `now`, or `None`.
@@ -336,6 +453,7 @@ impl StageLiveness {
             probe_failures: self.probe_failures.load(Ordering::Relaxed),
             peer_view_age_millis: view.map(|(age, _)| millis(age)),
             fresh_peers: view.map(|(_, view)| view.fresh_peers),
+            proving_peers: view.map(|(_, view)| view.proving_peers),
             peers: view.map(|(_, view)| view.peers),
             fault: self.fault(now),
         }
@@ -359,6 +477,7 @@ impl StageLiveness {
                     probe_age_millis = snapshot.probe_age_millis,
                     probe_in_flight = snapshot.probe_in_flight,
                     fresh_peers = snapshot.fresh_peers,
+                    proving_peers = snapshot.proving_peers,
                     peers = snapshot.peers,
                     "stage mount is stale here while a peer's is fresh; /lb_health answers stage_unavailable_local"
                 );
@@ -484,7 +603,7 @@ pub async fn liveness_tick<X, XFut, W, WFut, E>(
     warn_every: &mut Option<Instant>,
 ) -> LivenessTick
 where
-    X: FnOnce(Duration) -> XFut,
+    X: FnOnce(Instant) -> XFut,
     XFut: std::future::Future<Output = Result<StagePeerLiveness, E>>,
     W: FnOnce() -> WFut,
     WFut: std::future::Future<Output = Result<bool, E>>,
@@ -525,6 +644,10 @@ where
 /// One exchange: publish, read peers, record the view. A failure or a timeout
 /// records nothing, so the last view ages to [`PeerEvidence::Unknown`].
 ///
+/// `exchange` gets the instant of the last good probe, not its age, so the
+/// store measures the age after its pool checkout. The view is recorded at
+/// the instant the exchange started: no later than the read it reflects.
+///
 /// Returns whether the exchange succeeded.
 pub async fn exchange_once<F, Fut, E>(
     liveness: &StageLiveness,
@@ -533,12 +656,12 @@ pub async fn exchange_once<F, Fut, E>(
     warn_every: &mut Option<Instant>,
 ) -> bool
 where
-    F: FnOnce(Duration) -> Fut,
+    F: FnOnce(Instant) -> Fut,
     Fut: std::future::Future<Output = Result<StagePeerLiveness, E>>,
     E: std::fmt::Display,
 {
-    let age = liveness.last_good_age(Instant::now());
-    let result = tokio::time::timeout(timeout, exchange(age)).await;
+    let started = Instant::now();
+    let result = tokio::time::timeout(timeout, exchange(liveness.last_good_at())).await;
     let now = Instant::now();
     let warn = |message: String, warn_every: &mut Option<Instant>| {
         if warn_every.is_none_or(|last| now.saturating_duration_since(last) >= WARN_EVERY) {
@@ -548,14 +671,17 @@ where
     };
     match result {
         Ok(Ok(view)) => {
-            liveness.note_peers(now, view);
+            liveness.note_publication(now, &view);
+            liveness.note_peers(started, view);
             true
         }
         Ok(Err(error)) => {
+            liveness.forget_publication();
             warn(error.to_string(), warn_every);
             false
         }
         Err(_elapsed) => {
+            liveness.forget_publication();
             warn(format!("timed out after {timeout:?}"), warn_every);
             false
         }

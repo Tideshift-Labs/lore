@@ -1285,10 +1285,11 @@ fn start_stage_liveness(
                     &exchange_liveness,
                     draining(),
                     &mut withdrawn,
-                    |age| exchange_handle.exchange_stage_liveness(
+                    |last_good| exchange_handle.exchange_stage_liveness(
                         exchange_liveness.replica_id(),
-                        age,
+                        last_good,
                         exchange_liveness.stale_after(),
+                        exchange_liveness.prove_margin(),
                         crate::stage_liveness::RETAIN,
                     ),
                     || exchange_handle.withdraw_stage_liveness(exchange_liveness.replica_id()),
@@ -1304,7 +1305,7 @@ fn start_stage_liveness(
             &exchange_liveness,
             true,
             &mut withdrawn,
-            |_age| {
+            |_last_good| {
                 std::future::ready(Ok(
                     lore_postgres::domain::fragments::StagePeerLiveness::default(),
                 ))

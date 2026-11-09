@@ -24,8 +24,21 @@ pub const MAX_STAGE_LIVENESS_ID_BYTES: usize = 128;
 pub struct StagePeerLiveness {
     /// Peers whose last good probe is within the freshness window.
     pub fresh_peers: u64,
+    /// Fresh peers whose last good probe is more than the margin AFTER this
+    /// replica's own. Only these prove that the stage was writable for a peer
+    /// after this replica stopped writing. In a cell-wide hang every probe
+    /// stops at about the same time, so no peer proves anything.
+    pub proving_peers: u64,
     /// Every peer row of this cell, fresh or not.
     pub peers: u64,
+    /// This replica's own `last_good_at` as the statement found it, before
+    /// the upsert, in microseconds since the Unix epoch on the database clock.
+    /// `None` when there was no row.
+    pub prior_last_good_micros: Option<i64>,
+    /// This replica's own `last_good_at` as the statement left it, in the same
+    /// unit. If the next exchange finds a different prior value, another
+    /// process publishes under the same `replica_id`.
+    pub published_last_good_micros: Option<i64>,
 }
 
 impl PostgresFragmentCoordinator {
@@ -58,14 +71,23 @@ impl PostgresFragmentCoordinator {
     /// One statement: the upsert, the prune of rows not published for
     /// `retain`, and the count. The count excludes this replica's own row.
     ///
-    /// `last_good_age` is how long ago this replica's last good probe was,
-    /// measured on its own clock. `fresh_within` is the freshness window.
+    /// `last_good` is when this replica's last good probe was, on its own
+    /// monotonic clock. The age is measured only after the pool checkout, so
+    /// a slow checkout does not make the published time look fresher than it
+    /// is. What remains is the time from the measurement to the statement's
+    /// `now()`, which the caller's exchange timeout bounds.
+    ///
+    /// `fresh_within` is the freshness window. `prove_margin` is how much
+    /// later than this replica's own last good probe a peer's must be to count
+    /// in [`StagePeerLiveness::proving_peers`]. Both timestamps compared are
+    /// database time.
     pub async fn exchange_stage_liveness(
         &self,
         cell_id: &str,
         replica_id: &str,
-        last_good_age: Duration,
+        last_good: Instant,
         fresh_within: Duration,
+        prove_margin: Duration,
         retain: Duration,
     ) -> Result<StagePeerLiveness, DomainError> {
         for (field, value) in [("cell_id", cell_id), ("replica_id", replica_id)] {
@@ -76,16 +98,26 @@ impl PostgresFragmentCoordinator {
             }
         }
         let client = self.checkout().await?;
+        // Measured after the checkout: see the doc comment.
+        let last_good_age = Instant::now().saturating_duration_since(last_good);
+        // Every CTE and the outer SELECT read the snapshot from before the
+        // upsert, so `prior` is this replica's row as another writer may
+        // have left it, and the outer count sees peers only.
         let row = client
             .query_one(
-                "WITH published AS ( \
+                "WITH prior AS ( \
+                   SELECT (extract(epoch FROM last_good_at) * 1000000)::bigint AS micros \
+                   FROM lore_domain_write_behind_liveness \
+                   WHERE cell_id = $1 AND replica_id = $2), \
+                 published AS ( \
                    INSERT INTO lore_domain_write_behind_liveness \
                      (cell_id, replica_id, last_good_at, published_at) \
                    VALUES ($1, $2, now() - make_interval(secs => $3::double precision), now()) \
                    ON CONFLICT (cell_id, replica_id) DO UPDATE \
                      SET last_good_at = EXCLUDED.last_good_at, \
                          published_at = EXCLUDED.published_at \
-                   RETURNING 1), \
+                   RETURNING last_good_at, \
+                     (extract(epoch FROM last_good_at) * 1000000)::bigint AS micros), \
                  pruned AS ( \
                    DELETE FROM lore_domain_write_behind_liveness \
                    WHERE cell_id = $1 AND replica_id <> $2 \
@@ -95,8 +127,15 @@ impl PostgresFragmentCoordinator {
                    count(*) FILTER ( \
                      WHERE now() - last_good_at < make_interval(secs => $4::double precision) \
                    )::bigint AS fresh_peers, \
+                   count(*) FILTER ( \
+                     WHERE now() - last_good_at < make_interval(secs => $4::double precision) \
+                       AND last_good_at > (SELECT last_good_at FROM published) \
+                         + make_interval(secs => $6::double precision) \
+                   )::bigint AS proving_peers, \
                    count(*)::bigint AS peers, \
                    (SELECT count(*) FROM published)::bigint AS published, \
+                   (SELECT micros FROM published) AS published_micros, \
+                   (SELECT micros FROM prior) AS prior_micros, \
                    (SELECT count(*) FROM pruned)::bigint AS pruned \
                  FROM lore_domain_write_behind_liveness \
                  WHERE cell_id = $1 AND replica_id <> $2",
@@ -106,6 +145,7 @@ impl PostgresFragmentCoordinator {
                     &last_good_age.as_secs_f64(),
                     &fresh_within.as_secs_f64(),
                     &retain.as_secs_f64(),
+                    &prove_margin.as_secs_f64(),
                 ],
             )
             .await
@@ -121,7 +161,10 @@ impl PostgresFragmentCoordinator {
         }
         Ok(StagePeerLiveness {
             fresh_peers: count("fresh_peers"),
+            proving_peers: count("proving_peers"),
             peers: count("peers"),
+            prior_last_good_micros: row.get("prior_micros"),
+            published_last_good_micros: row.get("published_micros"),
         })
     }
 }

@@ -1369,16 +1369,18 @@ impl FragmentWriteBehindHandle {
     pub async fn exchange_stage_liveness(
         &self,
         replica_id: &str,
-        last_good_age: Duration,
+        last_good: std::time::Instant,
         fresh_within: Duration,
+        prove_margin: Duration,
         retain: Duration,
     ) -> Result<crate::domain::fragments::StagePeerLiveness, StoreError> {
         self.coordinator
             .exchange_stage_liveness(
                 &self.policy.cell_id,
                 replica_id,
-                last_good_age,
+                last_good,
                 fresh_within,
+                prove_margin,
                 retain,
             )
             .await
