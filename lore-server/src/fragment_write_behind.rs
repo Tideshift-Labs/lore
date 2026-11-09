@@ -1285,12 +1285,10 @@ fn start_stage_liveness(
                     &exchange_liveness,
                     draining(),
                     &mut withdrawn,
-                    |last_good| exchange_handle.exchange_stage_liveness(
+                    |publication| exchange_handle.exchange_stage_liveness(
                         exchange_liveness.replica_id(),
-                        last_good,
-                        exchange_liveness.stale_after(),
-                        exchange_liveness.prove_margin(),
-                        crate::stage_liveness::RETAIN,
+                        publication,
+                        exchange_liveness.limits(),
                     ),
                     || exchange_handle.withdraw_stage_liveness(exchange_liveness.replica_id()),
                     crate::stage_liveness::EXCHANGE_TIMEOUT,
@@ -1305,7 +1303,7 @@ fn start_stage_liveness(
             &exchange_liveness,
             true,
             &mut withdrawn,
-            |_last_good| {
+            |_publication| {
                 std::future::ready(Ok(
                     lore_postgres::domain::fragments::StagePeerLiveness::default(),
                 ))

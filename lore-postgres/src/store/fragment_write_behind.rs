@@ -1363,26 +1363,17 @@ impl FragmentWriteBehindHandle {
             .map_err(domain_store_err)
     }
 
-    /// FORK-LOCAL (Tideshift), WP-115 K11: publish this replica's last good
-    /// stage probe for its cell and count the cell's fresh peers. On the
-    /// shared domain pool, never the observer's reserved connection.
+    /// FORK-LOCAL (Tideshift), WP-115 K11: publish this replica's stage
+    /// probe progress for its cell and read its peers'. On the shared domain
+    /// pool, never the observer's reserved connection.
     pub async fn exchange_stage_liveness(
         &self,
         replica_id: &str,
-        last_good: std::time::Instant,
-        fresh_within: Duration,
-        prove_margin: Duration,
-        retain: Duration,
+        publication: crate::domain::fragments::StageLivenessPublication,
+        limits: crate::domain::fragments::StageLivenessLimits,
     ) -> Result<crate::domain::fragments::StagePeerLiveness, StoreError> {
         self.coordinator
-            .exchange_stage_liveness(
-                &self.policy.cell_id,
-                replica_id,
-                last_good,
-                fresh_within,
-                prove_margin,
-                retain,
-            )
+            .exchange_stage_liveness(&self.policy.cell_id, replica_id, &publication, limits)
             .await
             .map_err(domain_store_err)
     }

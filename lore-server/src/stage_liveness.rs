@@ -1,42 +1,51 @@
 // Copyright 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 //! FORK-LOCAL (Tideshift), WP-115 K11: eject a `role = "stage"` replica whose
-//! own mount of the shared stage is stale, but only while a peer's is fresh.
+//! own mount of the shared stage is stale, but only while a peer is seen
+//! writing it.
 //!
 //! In the multi-host cell every web replica hard-mounts one NFS stage. A stage
 //! fault is normally cell-wide, and `/lb_health` must not eject on a cell-wide
 //! signal: ejecting replicas one after another refuses the whole cell (see
 //! `lorehub/docs/learnings/backpressure-routed-into-a-binary-liveness-verdict-ejects-every-replica-at-once.md`).
 //! But one host's mount can go stale alone, and that host then keeps taking
-//! connections whose uploads hang. A peer that can still write the same stage
+//! connections whose uploads hang. A peer that keeps writing the same stage
 //! is the evidence that the fault is local.
 //!
 //! Three parts:
 //!
 //! 1. **Probe.** One dedicated OS thread (not the tokio pool: a hard-mount write
 //!    can block forever) writes, fsyncs and removes one small file under
-//!    `<stage>/liveness/`, and records the time of each success. If a write
-//!    hangs, the thread hangs with it. No second thread is ever started, so at
-//!    most one probe is in flight.
-//! 2. **Exchange.** A tokio task publishes how long ago the last good probe was
-//!    to Postgres, and reads how many peers of the same cell are fresh. The
-//!    database clock decides freshness, so host clock skew does not matter.
-//! 3. **Decision.** [`decide`]: 503 `stage_unavailable_local` only when this
-//!    replica is stale AND the last peer view (itself recent, and taken after
-//!    this replica went stale) shows a peer that proved a good write more
-//!    than [`PROVE_MARGIN`] after this replica's last one. No such peer is a
-//!    cell-wide fault: 200. No usable peer view (Postgres unreachable or slow,
-//!    or a view from before this replica went stale) is "cannot decide": 200.
+//!    `<stage>/liveness/`. Each full success adds one to this process's
+//!    progress count. If a write hangs, the thread hangs with it. No second
+//!    thread is ever started, so at most one probe is in flight.
+//! 2. **Exchange.** A tokio task publishes the count, with this process's
+//!    incarnation id, to Postgres and reads every peer's. The database never
+//!    lowers a stored count, and accepts a higher one only if the success is
+//!    at most [`PUBLISH_FRESH`] old when sent and the statement runs within
+//!    [`PUBLISH_DEADLINE`] of being sent (see
+//!    `lore_postgres::domain::fragments::StageLivenessPublication`).
+//! 3. **Decision.** This replica is stale after [`STALE_AFTER`] with no own
+//!    success, on its monotonic clock. The first peer view taken after that is
+//!    the baseline. A later view in which a peer of the same incarnation has a
+//!    higher count, accepted after the baseline view and within
+//!    [`PROGRESS_WINDOW`], proves the stage still works for that peer: 503
+//!    `stage_unavailable_local`. Anything else is 200. When the peer stops
+//!    too, its last increase leaves the window and the replica is readmitted.
 //!
-//! A peer that is merely fresh is not enough. In a cell-wide hang every probe
-//! stops within moments of the others, so just before the threshold each
-//! replica's view shows the others fresh. If that view counted, every replica
-//! would eject itself as it crossed the threshold.
+//! **Why no cell-wide fault ejects.** In a cell-wide hang no probe succeeds,
+//! so no count moves after a baseline, and nobody ejects. Probe duration and
+//! skew do not matter. A delayed or replayed statement cannot fake a move: an
+//! accepted increase ran after the baseline, so it reports a peer success no
+//! more than `PUBLISH_FRESH + PUBLISH_DEADLINE` (6 s) before the baseline,
+//! which is at least [`STALE_AFTER`] after this replica's last success. So a
+//! replica ejects only if a peer succeeded at least 9 s after it last did.
+//! Two replicas cannot both meet that against each other, so a double eject
+//! is impossible in any timing.
 //!
-//! The threshold is the hysteresis: a replica is stale only after
-//! [`STALE_AFTER`] with no good probe, so one slow probe does not flap it, and
-//! one good probe brings it back.
+//! One own success brings the replica back.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -49,7 +58,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use lore_postgres::domain::fragments::MAX_STAGE_LIVENESS_ID_BYTES;
+use lore_postgres::domain::fragments::StageLivenessClock;
+use lore_postgres::domain::fragments::StageLivenessLimits;
+use lore_postgres::domain::fragments::StageLivenessPublication;
 use lore_postgres::domain::fragments::StagePeerLiveness;
+use lore_postgres::domain::fragments::StageProgressRecord;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::metrics::Gauge;
 use serde::Serialize;
@@ -57,13 +70,12 @@ use tracing::info;
 use tracing::warn;
 
 /// The `/lb_health` word for a replica whose own stage mount is stale while a
-/// peer's is fresh.
+/// peer is seen writing it.
 pub const STAGE_UNAVAILABLE_LOCAL: &str = "stage_unavailable_local";
 
 /// How often the probe thread writes its file.
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(2);
-/// A replica is stale after this long with no good probe. The same window
-/// decides, in SQL, whether a peer is fresh.
+/// A replica is stale after this long with no good probe.
 ///
 /// 15 s is about seven probe intervals: a single slow NFS round trip, or a
 /// short server hiccup that every host sees, does not eject anyone. It is
@@ -71,32 +83,24 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(2);
 pub const STALE_AFTER: Duration = Duration::from_secs(15);
 /// How often this replica publishes and reads peers.
 pub const EXCHANGE_INTERVAL: Duration = Duration::from_secs(2);
-/// The budget for one exchange.
+/// The budget for one exchange, and its transaction's `statement_timeout`.
 pub const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A peer view older than this is "cannot decide". Five exchange intervals,
 /// so a few slow exchanges do not drop the evidence, but a Postgres outage
 /// does within seconds.
 pub const PEER_VIEW_MAX_AGE: Duration = Duration::from_secs(10);
-/// A peer is evidence of a local fault only if its last good probe is more
-/// than this much later than this replica's own, both on database time.
-///
-/// In a cell-wide hang, two replicas' last good probes differ by at most:
-///
-/// - one [`PROBE_INTERVAL`] (2 s): the probes run on independent phases, so
-///   one may have last succeeded up to an interval before the other;
-/// - plus the measurement skew, at most [`EXCHANGE_TIMEOUT`] (2 s): each
-///   replica measures its age after the pool checkout, and its statement's
-///   `now()` runs later still, so its published time can look fresher by up
-///   to that gap. The exchange is cancelled at the timeout, so a published
-///   row's gap is under it;
-/// - plus slack (1 s) for the probe's own write time and the spread of the
-///   fault's onset across hosts (the reviewer measured 200 ms).
-///
-/// That is 5 s. It must also stay well under [`STALE_AFTER`] so a real local
-/// fault still ejects: a healthy peer's published probe is at most
-/// `PROBE_INTERVAL + EXCHANGE_INTERVAL + EXCHANGE_TIMEOUT` (6 s) old, and a
-/// stale replica's is at least 15 s old, so the gap is at least 9 s.
-pub const PROVE_MARGIN: Duration = Duration::from_secs(5);
+/// The oldest success an accepted increase may report, measured when the
+/// statement is sent. A success is published by the next exchange, at most
+/// one [`EXCHANGE_INTERVAL`] plus a checkout ([`EXCHANGE_TIMEOUT`]) later.
+pub const PUBLISH_FRESH: Duration = Duration::from_secs(4);
+/// How long after it is sent an increase may still run. The client has given
+/// up on the exchange by then, so a later run changes nothing.
+pub const PUBLISH_DEADLINE: Duration = EXCHANGE_TIMEOUT;
+/// A peer's increase counts only while it is this recent, on database time,
+/// so when the peer stops too (the fault became cell-wide) the stale replica
+/// is readmitted. Long enough to cover the gap between a slow peer's
+/// successes (a 4 s probe every 6 s) plus one exchange.
+pub const PROGRESS_WINDOW: Duration = Duration::from_secs(10);
 /// Rows not published for this long are deleted, so restarts do not grow the
 /// table.
 pub const RETAIN: Duration = Duration::from_secs(3600);
@@ -115,8 +119,8 @@ struct Instruments {
     ejected: Gauge<u64>,
     /// Seconds since this replica's last good stage probe.
     probe_age: Gauge<u64>,
-    /// Fresh peers in the last peer view.
-    fresh_peers: Gauge<u64>,
+    /// Peers seen making progress since this replica went stale.
+    progressing_peers: Gauge<u64>,
 }
 
 fn instruments() -> &'static Instruments {
@@ -131,8 +135,8 @@ fn instruments() -> &'static Instruments {
             probe_age: meter
                 .u64_gauge(provider.scope_name("stage_probe_age_seconds"))
                 .build(),
-            fresh_peers: meter
-                .u64_gauge(provider.scope_name("stage_liveness_fresh_peers"))
+            progressing_peers: meter
+                .u64_gauge(provider.scope_name("stage_liveness_progressing_peers"))
                 .build(),
         }
     })
@@ -141,21 +145,44 @@ fn instruments() -> &'static Instruments {
 /// What the last peer view says, once its own age is taken into account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerEvidence {
-    /// No peer view, one older than [`PEER_VIEW_MAX_AGE`] (Postgres is
-    /// unreachable or slow), or one taken before this replica went stale.
-    /// Never ejects.
+    /// No peer view, one older than the max age (Postgres is unreachable or
+    /// slow), or one taken before this replica went stale. Never ejects.
     Unknown,
-    /// A recent view with no proving peer: the stage is stale for everyone.
-    NoFreshPeer,
-    /// A recent view, taken after this replica went stale, with at least one
-    /// peer that proved a good write [`PROVE_MARGIN`] after this replica's
-    /// last one.
-    FreshPeer,
+    /// A recent view, taken after this replica went stale, in which no peer
+    /// has made progress since the baseline view.
+    NoProgress,
+    /// A recent view in which at least one peer of the same incarnation has
+    /// made progress that was accepted after the baseline view.
+    ProgressingPeer,
 }
 
 /// The K11 rule. Pure, so every case is a table test.
 pub fn decide(self_stale: bool, peers: PeerEvidence) -> Option<&'static str> {
-    (self_stale && peers == PeerEvidence::FreshPeer).then_some(STAGE_UNAVAILABLE_LOCAL)
+    (self_stale && peers == PeerEvidence::ProgressingPeer).then_some(STAGE_UNAVAILABLE_LOCAL)
+}
+
+/// The thresholds of one replica. Tests scale them down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LivenessThresholds {
+    pub stale_after: Duration,
+    pub peer_view_max_age: Duration,
+    pub publish_fresh: Duration,
+    pub publish_deadline: Duration,
+    pub statement_timeout: Duration,
+    pub progress_window: Duration,
+}
+
+impl Default for LivenessThresholds {
+    fn default() -> Self {
+        Self {
+            stale_after: STALE_AFTER,
+            peer_view_max_age: PEER_VIEW_MAX_AGE,
+            publish_fresh: PUBLISH_FRESH,
+            publish_deadline: PUBLISH_DEADLINE,
+            statement_timeout: EXCHANGE_TIMEOUT,
+            progress_window: PROGRESS_WINDOW,
+        }
+    }
 }
 
 /// One probe of the stage. Blocking; runs only on the probe thread.
@@ -191,10 +218,9 @@ pub fn file_probe(root: PathBuf, replica_id: &str) -> ProbeFn {
 
 /// This replica's identity in the liveness table: host and process id.
 ///
-/// Stable for the life of the process. A restarted process on the same host
-/// under systemd gets a new id; its old row ages out and is pruned. In a
-/// container the host is the container id and the process id is 1, so a
-/// restarted container keeps its id.
+/// Stable for the life of the process. In a container the host is the
+/// container id and the process id is 1, so a restarted container keeps its
+/// id; the incarnation tells the two processes apart.
 pub fn default_replica_id() -> String {
     let host = ["HOSTNAME", "COMPUTERNAME"]
         .iter()
@@ -234,102 +260,191 @@ pub fn sanitize_replica_id(raw: &str) -> String {
 #[derive(Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct StageLivenessSnapshot {
     pub replica_id: String,
+    pub incarnation: String,
+    pub progress: u64,
     pub probe_age_millis: u64,
     pub probe_in_flight: bool,
     pub probe_failures: u64,
     pub peer_view_age_millis: Option<u64>,
-    pub fresh_peers: Option<u64>,
-    pub proving_peers: Option<u64>,
+    pub progressing_peers: Option<u64>,
     pub peers: Option<u64>,
     pub fault: Option<&'static str>,
 }
 
-/// One replica's stage liveness: the probe's last success, the last peer
-/// view, and the verdict over both.
+/// A peer as the baseline holds it: its incarnation, its count, and the
+/// database time after which an increase must have run to count.
+#[derive(Debug, Clone)]
+struct PeerBaseline {
+    incarnation: String,
+    progress: i64,
+    after_micros: i64,
+}
+
+/// The first view taken after this replica went stale, per peer.
+#[derive(Debug, Clone)]
+struct Baseline {
+    /// `last_good` (nanos after origin) when the baseline was taken. A new
+    /// own success changes it, which ends this stale period.
+    epoch: u64,
+    peers: HashMap<String, PeerBaseline>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LatestView {
+    /// When the exchange that read it STARTED. That is no later than the
+    /// database read, so the view's age and the "taken after self went
+    /// stale" test both err toward "cannot decide".
+    at: Instant,
+    epoch: u64,
+    after_stale: bool,
+    peers: u64,
+    progressing: u64,
+}
+
+#[derive(Debug, Default)]
+struct PeerState {
+    latest: Option<LatestView>,
+    baseline: Option<Baseline>,
+}
+
+/// This process's own probe progress. Updated together so a publication
+/// never pairs a count with a newer success time.
+#[derive(Debug, Default, Clone, Copy)]
+struct OwnProgress {
+    count: u64,
+}
+
+/// One replica's stage liveness: its own progress, the peer views, and the
+/// verdict over both.
 pub struct StageLiveness {
     replica_id: String,
+    incarnation: String,
     origin: Instant,
     /// Nanoseconds after `origin` of the last good probe. Starts at 0: the
     /// stage was proven writable at boot by `WriteBehindStage::open`.
     last_good: AtomicU64,
+    own: Mutex<OwnProgress>,
     probes_started: AtomicU64,
     probe_failures: AtomicU64,
     in_flight: AtomicBool,
     /// Probe threads ever started for this replica. Never above 1.
     threads_started: AtomicUsize,
-    /// The last peer view, keyed by when its exchange STARTED. That is no
-    /// later than the database read it reflects, so the view's age and the
-    /// "taken after self went stale" test both err toward "cannot decide".
-    peers: Mutex<Option<(Instant, StagePeerLiveness)>>,
-    /// This process's own `last_good_at` as its last exchange left it
-    /// (database micros). `None` until an exchange succeeds, and again after
-    /// one fails, because a failed exchange may still have written the row.
-    last_published: Mutex<Option<i64>>,
+    peers: Mutex<PeerState>,
+    /// The last successful exchange's database clock, for the next deadline.
+    clock: Mutex<Option<StageLivenessClock>>,
+    /// This process's own row as its last exchange left it. `None` until an
+    /// exchange succeeds, and again after one fails, because a failed
+    /// exchange may still have written the row.
+    last_published: Mutex<Option<StageProgressRecord>>,
     /// The last duplicate-identity sighting: when it was last logged, and
     /// the (published, found) pair that disagreed.
-    duplicate_warned: Mutex<Option<(Instant, i64, i64)>>,
+    duplicate_warned: Mutex<Option<(Instant, StageProgressRecord, StageProgressRecord)>>,
     /// The last verdict, for one log line per transition.
     ejected: AtomicBool,
-    stale_after: Duration,
-    peer_view_max_age: Duration,
-    prove_margin: Duration,
+    thresholds: LivenessThresholds,
 }
 
 impl StageLiveness {
     pub fn new(replica_id: String) -> Self {
-        Self::with_thresholds(replica_id, STALE_AFTER, PEER_VIEW_MAX_AGE, PROVE_MARGIN)
+        Self::with_thresholds(replica_id, LivenessThresholds::default())
     }
 
-    pub fn with_thresholds(
+    pub fn with_thresholds(replica_id: String, thresholds: LivenessThresholds) -> Self {
+        Self::with_incarnation(
+            replica_id,
+            uuid::Uuid::new_v4().simple().to_string(),
+            thresholds,
+        )
+    }
+
+    /// As [`Self::with_thresholds`], with a chosen incarnation id. A test
+    /// uses it to stand in for one process across a restart.
+    pub fn with_incarnation(
         replica_id: String,
-        stale_after: Duration,
-        peer_view_max_age: Duration,
-        prove_margin: Duration,
+        incarnation: String,
+        thresholds: LivenessThresholds,
     ) -> Self {
         Self {
             replica_id,
+            incarnation,
             origin: Instant::now(),
             last_good: AtomicU64::new(0),
+            own: Mutex::new(OwnProgress::default()),
             probes_started: AtomicU64::new(0),
             probe_failures: AtomicU64::new(0),
             in_flight: AtomicBool::new(false),
             threads_started: AtomicUsize::new(0),
-            peers: Mutex::new(None),
+            peers: Mutex::new(PeerState::default()),
+            clock: Mutex::new(None),
             last_published: Mutex::new(None),
             duplicate_warned: Mutex::new(None),
             ejected: AtomicBool::new(false),
-            stale_after,
-            peer_view_max_age,
-            prove_margin,
+            thresholds,
         }
     }
 
-    pub fn prove_margin(&self) -> Duration {
-        self.prove_margin
+    pub fn thresholds(&self) -> LivenessThresholds {
+        self.thresholds
     }
 
-    /// When the last good probe was, on this process's monotonic clock.
-    pub fn last_good_at(&self) -> Instant {
-        let last = Duration::from_nanos(self.last_good.load(Ordering::Relaxed));
-        self.origin.checked_add(last).unwrap_or(self.origin)
+    /// The bounds an exchange passes to the store.
+    pub fn limits(&self) -> StageLivenessLimits {
+        StageLivenessLimits {
+            fresh_within: self.thresholds.publish_fresh,
+            deadline: self.thresholds.publish_deadline,
+            statement_timeout: self.thresholds.statement_timeout,
+            retain: RETAIN,
+        }
     }
 
     pub fn replica_id(&self) -> &str {
         &self.replica_id
     }
 
+    pub fn incarnation(&self) -> &str {
+        &self.incarnation
+    }
+
     pub fn stale_after(&self) -> Duration {
-        self.stale_after
+        self.thresholds.stale_after
+    }
+
+    /// Fully successful probes so far.
+    pub fn progress(&self) -> u64 {
+        lock(&self.own).count
     }
 
     fn nanos_since_origin(&self, at: Instant) -> u64 {
         u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
     }
 
-    /// Record a good probe at `at`. Never moves the clock back.
+    fn instant_of(&self, nanos: u64) -> Instant {
+        self.origin
+            .checked_add(Duration::from_nanos(nanos))
+            .unwrap_or(self.origin)
+    }
+
+    /// Record a good probe at `at`: one more success. The success time never
+    /// moves back.
     pub fn note_good(&self, at: Instant) {
+        let mut own = lock(&self.own);
+        own.count = own.count.saturating_add(1);
         self.last_good
             .fetch_max(self.nanos_since_origin(at), Ordering::Relaxed);
+    }
+
+    /// What the next exchange publishes.
+    pub fn publication(&self) -> StageLivenessPublication {
+        let (count, last_good) = {
+            let own = lock(&self.own);
+            (own.count, self.last_good.load(Ordering::Relaxed))
+        };
+        StageLivenessPublication {
+            incarnation: self.incarnation.clone(),
+            progress: count,
+            last_good: self.instant_of(last_good),
+            clock: *lock(&self.clock),
+        }
     }
 
     /// How long before `now` the last good probe was.
@@ -339,99 +454,149 @@ impl StageLiveness {
             .saturating_sub(last)
     }
 
-    /// Record a peer view taken at `at`.
-    pub fn note_peers(&self, at: Instant, view: StagePeerLiveness) {
-        *self.peers.lock().unwrap_or_else(|error| error.into_inner()) = Some((at, view));
+    fn is_stale_at(&self, at: Instant) -> bool {
+        self.last_good_age(at) >= self.thresholds.stale_after
     }
 
-    fn peer_view(&self, now: Instant) -> Option<(Duration, StagePeerLiveness)> {
-        self.peers
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .map(|(at, view)| (now.saturating_duration_since(at), view))
+    /// Record a peer view whose exchange started at `at`.
+    ///
+    /// The first view taken after this replica went stale becomes the
+    /// baseline. A later view counts a peer as progressing only if it has the
+    /// same incarnation as in the baseline, a higher count, and that count
+    /// was accepted after the view the baseline holds for it, and within
+    /// [`PROGRESS_WINDOW`] of this view. A peer that is
+    /// new, restarted (another incarnation) or reappears after a gap gets a
+    /// fresh baseline entry from this view. A peer absent from this view is
+    /// dropped from the baseline.
+    pub fn note_peers(&self, at: Instant, view: &StagePeerLiveness) {
+        let epoch = self.last_good.load(Ordering::Relaxed);
+        let after_stale = self.is_stale_at(at);
+        let mut state = lock(&self.peers);
+        let mut progressing = 0;
+        let window_start = view.db_clock_micros.saturating_sub(
+            i64::try_from(self.thresholds.progress_window.as_micros()).unwrap_or(i64::MAX),
+        );
+        if !after_stale {
+            state.baseline = None;
+        } else {
+            let entry = |record: &StageProgressRecord| PeerBaseline {
+                incarnation: record.incarnation.clone(),
+                progress: record.progress,
+                after_micros: view.db_clock_micros,
+            };
+            match state.baseline.as_mut() {
+                Some(baseline) if baseline.epoch == epoch => {
+                    let mut next = HashMap::with_capacity(view.peers.len());
+                    for peer in &view.peers {
+                        let record = &peer.record;
+                        let kept = match baseline.peers.remove(&peer.replica_id) {
+                            Some(base) if base.incarnation == record.incarnation => {
+                                if record.progress > base.progress
+                                    && record.progressed_micros > base.after_micros
+                                    && record.progressed_micros > window_start
+                                {
+                                    progressing += 1;
+                                }
+                                base
+                            }
+                            _ => entry(record),
+                        };
+                        next.insert(peer.replica_id.clone(), kept);
+                    }
+                    baseline.peers = next;
+                }
+                _ => {
+                    state.baseline = Some(Baseline {
+                        epoch,
+                        peers: view
+                            .peers
+                            .iter()
+                            .map(|peer| (peer.replica_id.clone(), entry(&peer.record)))
+                            .collect(),
+                    });
+                }
+            }
+        }
+        state.latest = Some(LatestView {
+            at,
+            epoch,
+            after_stale,
+            peers: u64::try_from(view.peers.len()).unwrap_or(u64::MAX),
+            progressing,
+        });
     }
 
     /// The peer evidence at `now`.
-    ///
-    /// A proving peer counts only in a view taken after this replica went
-    /// stale. A view from before says nothing about whether a peer could
-    /// still write once this replica could not.
     pub fn peer_evidence(&self, now: Instant) -> PeerEvidence {
-        let Some((at, view)) = *self.peers.lock().unwrap_or_else(|error| error.into_inner()) else {
+        let Some(latest) = lock(&self.peers).latest else {
             return PeerEvidence::Unknown;
         };
-        if now.saturating_duration_since(at) >= self.peer_view_max_age {
+        if now.saturating_duration_since(latest.at) >= self.thresholds.peer_view_max_age
+            || !latest.after_stale
+            || latest.epoch != self.last_good.load(Ordering::Relaxed)
+        {
             return PeerEvidence::Unknown;
         }
-        if view.proving_peers == 0 {
-            return PeerEvidence::NoFreshPeer;
-        }
-        if self.last_good_age(at) >= self.stale_after {
-            PeerEvidence::FreshPeer
+        if latest.progressing > 0 {
+            PeerEvidence::ProgressingPeer
         } else {
-            PeerEvidence::Unknown
+            PeerEvidence::NoProgress
         }
     }
 
     /// Compare this replica's row as the exchange found it with what this
     /// process last wrote. A difference means another process publishes
-    /// under the same `replica_id`, and its fresh probes can hide this
-    /// replica's stale mount (or the reverse). Warns, at most every
-    /// [`WARN_EVERY`].
+    /// under the same `replica_id`, and its progress can hide this replica's
+    /// stale mount (or the reverse). Warns, at most every [`WARN_EVERY`].
     pub fn note_publication(&self, now: Instant, view: &StagePeerLiveness) {
-        let mut last = self
-            .last_published
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let (Some(mine), Some(found)) = (*last, view.prior_last_good_micros)
+        let mut last = lock(&self.last_published);
+        if let (Some(mine), Some(found)) = (last.as_ref(), view.prior.as_ref())
             && mine != found
         {
-            let mut warned = self
-                .duplicate_warned
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let mut warned = lock(&self.duplicate_warned);
             let logged_at = warned
-                .map(|(at, _, _)| at)
+                .as_ref()
+                .map(|(at, _, _)| *at)
                 .filter(|at| now.saturating_duration_since(*at) < WARN_EVERY);
             let due = logged_at.is_none();
-            *warned = Some((logged_at.unwrap_or(now), mine, found));
+            *warned = Some((logged_at.unwrap_or(now), mine.clone(), found.clone()));
             if due {
                 warn!(
                     replica_id = %self.replica_id,
-                    last_published_micros = mine,
-                    found_micros = found,
+                    last_published = ?mine,
+                    found = ?found,
                     "another process publishes stage liveness under this replica id; \
                      give each replica a distinct id"
                 );
             }
         }
-        *last = view.published_last_good_micros;
+        *last = view.published.clone();
     }
 
     /// The last duplicate-identity sighting, as (what this process last
     /// published, what the exchange found), or `None`.
-    pub fn duplicate_identity_seen(&self) -> Option<(i64, i64)> {
-        self.duplicate_warned
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .map(|(_, mine, found)| (mine, found))
+    pub fn duplicate_identity_seen(&self) -> Option<(StageProgressRecord, StageProgressRecord)> {
+        lock(&self.duplicate_warned)
+            .as_ref()
+            .map(|(_, mine, found)| (mine.clone(), found.clone()))
     }
 
     /// Forget what this process last wrote: a failed exchange may still have
     /// committed, so the next comparison would be a false alarm.
     fn forget_publication(&self) {
-        *self
-            .last_published
-            .lock()
-            .unwrap_or_else(|error| error.into_inner()) = None;
+        *lock(&self.last_published) = None;
+    }
+
+    fn note_clock(&self, db_micros: i64, received: Instant) {
+        *lock(&self.clock) = Some(StageLivenessClock {
+            db_micros,
+            received,
+        });
     }
 
     /// The `/lb_health` fault at `now`, or `None`.
     pub fn fault(&self, now: Instant) -> Option<&'static str> {
-        decide(
-            self.last_good_age(now) >= self.stale_after,
-            self.peer_evidence(now),
-        )
+        decide(self.is_stale_at(now), self.peer_evidence(now))
     }
 
     /// Probe threads started so far.
@@ -445,16 +610,17 @@ impl StageLiveness {
     }
 
     pub fn snapshot(&self, now: Instant) -> StageLivenessSnapshot {
-        let view = self.peer_view(now);
+        let latest = lock(&self.peers).latest;
         StageLivenessSnapshot {
             replica_id: self.replica_id.clone(),
+            incarnation: self.incarnation.clone(),
+            progress: self.progress(),
             probe_age_millis: millis(self.last_good_age(now)),
             probe_in_flight: self.in_flight.load(Ordering::Relaxed),
             probe_failures: self.probe_failures.load(Ordering::Relaxed),
-            peer_view_age_millis: view.map(|(age, _)| millis(age)),
-            fresh_peers: view.map(|(_, view)| view.fresh_peers),
-            proving_peers: view.map(|(_, view)| view.proving_peers),
-            peers: view.map(|(_, view)| view.peers),
+            peer_view_age_millis: latest.map(|view| millis(now.saturating_duration_since(view.at))),
+            progressing_peers: latest.map(|view| view.progressing),
+            peers: latest.map(|view| view.peers),
             fault: self.fault(now),
         }
     }
@@ -467,8 +633,8 @@ impl StageLiveness {
         instruments()
             .probe_age
             .record(snapshot.probe_age_millis / 1000, &[]);
-        if let Some(fresh) = snapshot.fresh_peers {
-            instruments().fresh_peers.record(fresh, &[]);
+        if let Some(progressing) = snapshot.progressing_peers {
+            instruments().progressing_peers.record(progressing, &[]);
         }
         if self.ejected.swap(ejected, Ordering::Relaxed) != ejected {
             if ejected {
@@ -476,21 +642,24 @@ impl StageLiveness {
                     replica_id = %snapshot.replica_id,
                     probe_age_millis = snapshot.probe_age_millis,
                     probe_in_flight = snapshot.probe_in_flight,
-                    fresh_peers = snapshot.fresh_peers,
-                    proving_peers = snapshot.proving_peers,
+                    progressing_peers = snapshot.progressing_peers,
                     peers = snapshot.peers,
-                    "stage mount is stale here while a peer's is fresh; /lb_health answers stage_unavailable_local"
+                    "stage mount is stale here while a peer keeps writing it; /lb_health answers stage_unavailable_local"
                 );
             } else {
                 info!(
                     replica_id = %snapshot.replica_id,
                     probe_age_millis = snapshot.probe_age_millis,
-                    fresh_peers = snapshot.fresh_peers,
+                    progressing_peers = snapshot.progressing_peers,
                     "stage liveness no longer ejects this replica"
                 );
             }
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|error| error.into_inner())
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -588,11 +757,9 @@ pub enum LivenessTick {
 
 /// One tick of the exchange task.
 ///
-/// A draining replica (lame duck or SIGTERM) never publishes again. It deletes
-/// its row once, so a peer whose own mount is stale does not count it as a
-/// fresh peer and eject itself while this one leaves: during a one-host roll
-/// that would take the cell dark. A peer's cached view can still show the
-/// row for up to one exchange interval after the delete.
+/// A draining replica (lame duck or SIGTERM) never publishes again, so its
+/// count stops moving and no peer can count it as progressing. It also
+/// deletes its row once, so it leaves the peers' baselines.
 pub async fn liveness_tick<X, XFut, W, WFut, E>(
     liveness: &StageLiveness,
     draining: bool,
@@ -603,7 +770,7 @@ pub async fn liveness_tick<X, XFut, W, WFut, E>(
     warn_every: &mut Option<Instant>,
 ) -> LivenessTick
 where
-    X: FnOnce(Instant) -> XFut,
+    X: FnOnce(StageLivenessPublication) -> XFut,
     XFut: std::future::Future<Output = Result<StagePeerLiveness, E>>,
     W: FnOnce() -> WFut,
     WFut: std::future::Future<Output = Result<bool, E>>,
@@ -629,13 +796,11 @@ where
             LivenessTick::Withdrew
         }
         Ok(Err(error)) => {
-            warn!(%error, "stage liveness withdraw failed; the row ages out within the freshness window");
+            warn!(%error, "stage liveness withdraw failed; the next tick retries");
             LivenessTick::WithdrawFailed
         }
         Err(_elapsed) => {
-            warn!(
-                "stage liveness withdraw timed out; the row ages out within the freshness window"
-            );
+            warn!("stage liveness withdraw timed out; the next tick retries");
             LivenessTick::WithdrawFailed
         }
     }
@@ -644,9 +809,9 @@ where
 /// One exchange: publish, read peers, record the view. A failure or a timeout
 /// records nothing, so the last view ages to [`PeerEvidence::Unknown`].
 ///
-/// `exchange` gets the instant of the last good probe, not its age, so the
-/// store measures the age after its pool checkout. The view is recorded at
-/// the instant the exchange started: no later than the read it reflects.
+/// The view is recorded at the instant the exchange started: no later than
+/// the read it reflects. The reply's database clock becomes the anchor for
+/// the next publication's deadline.
 ///
 /// Returns whether the exchange succeeded.
 pub async fn exchange_once<F, Fut, E>(
@@ -656,12 +821,12 @@ pub async fn exchange_once<F, Fut, E>(
     warn_every: &mut Option<Instant>,
 ) -> bool
 where
-    F: FnOnce(Instant) -> Fut,
+    F: FnOnce(StageLivenessPublication) -> Fut,
     Fut: std::future::Future<Output = Result<StagePeerLiveness, E>>,
     E: std::fmt::Display,
 {
     let started = Instant::now();
-    let result = tokio::time::timeout(timeout, exchange(liveness.last_good_at())).await;
+    let result = tokio::time::timeout(timeout, exchange(liveness.publication())).await;
     let now = Instant::now();
     let warn = |message: String, warn_every: &mut Option<Instant>| {
         if warn_every.is_none_or(|last| now.saturating_duration_since(last) >= WARN_EVERY) {
@@ -671,8 +836,9 @@ where
     };
     match result {
         Ok(Ok(view)) => {
+            liveness.note_clock(view.db_clock_micros, now);
             liveness.note_publication(now, &view);
-            liveness.note_peers(started, view);
+            liveness.note_peers(started, &view);
             true
         }
         Ok(Err(error)) => {
