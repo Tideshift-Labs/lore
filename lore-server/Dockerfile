@@ -24,11 +24,20 @@ COPY . .
 # user-agent report "{CARGO_PKG_VERSION}+{LORE_REVISION}" (see CONTRIBUTING.md).
 ARG LORE_REVISION
 
+# The cargo target cache is keyed by this id. Cargo decides freshness by file
+# mtime, and the BuildKit COPY layer cache ignores host mtime. So one target
+# cache shared by builds of different Lore sources can keep a stale crate from
+# another source and fail (or link old code). The default id is for builds of
+# the working tree (dev.ts, the integration suites). Every build of another
+# source (acceptance, baseline, failpoint images) passes its own id with the
+# source sha. A new default id starts from an empty cache.
+ARG LORESERVER_TARGET_CACHE_ID=loreserver-target-dev-v2
+
 # arm64 always builds Graviton3+/Neoverse V1-tuned.
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,id=${LORESERVER_TARGET_CACHE_ID},target=/build/target \
     if [ "$TARGETARCH" = "arm64" ]; then \
         cargo build --release --bin loreserver --bin cell-schema-install --bin cell-budget-configure --bin cell-drain-policy-configure --bin lore-stamp \
             --config .cargo/neoverse-512tvb.toml --features lore-base/neoverse-512tvb; \
