@@ -9985,8 +9985,9 @@ async fn shared_hash_fanout_transition_and_promotion_cost_is_measured_at_increas
 /// only its verdicts, so its `bump_association_generation` call was unpinned.
 ///
 /// This closes that gap in both directions: an admitted copy moves the
-/// association scalar exactly once and the lifecycle scalar not at all, and a
-/// fenced copy moves neither.
+/// association scalar exactly once and the lifecycle scalar not at all, a
+/// replay onto the same live key moves nothing, and a fenced copy moves
+/// neither.
 #[tokio::test]
 #[ignore = "run with tests/run-fragment-lifecycle-live.ps1"]
 async fn create_association_if_current_bumps_the_association_generation_on_every_admitted_copy() {
@@ -10052,14 +10053,12 @@ async fn create_association_if_current_bumps_the_association_generation_on_every
         "the scalar bump must be accompanied by the association row it is atomic with"
     );
 
-    // A replayed copy into the *same* context still moves the scalar. The
-    // insert is `ON CONFLICT ... DO UPDATE`, and the bump is unconditional, so
-    // a retried copy-on-write publication re-arms every concurrent push's
-    // witness. That direction is the safe one -- a spurious bump costs a
-    // conservative abort, a missed one would let a push commit against a
-    // membership change it never revalidated -- so pin it, or a later
-    // "optimisation" that skips the bump when the row already existed would
-    // land silently.
+    // A replayed copy into the *same* LIVE context under the same readable
+    // witness is an idempotent no-op (A6, KV option (c), 2026-11-10). The
+    // key is the content hash and the row binds no representation, so a
+    // rewrite would change no membership; it would only move the epoch and
+    // the scalars and abort concurrent pushes. No row write means no scalar
+    // and no summary event. Tombstoned-key recreation still bumps both.
     assert_eq!(
         coordinator
             .create_association_if_current(&witness, &repository_id, &copy_context)
@@ -10073,14 +10072,13 @@ async fn create_association_if_current_bumps_the_association_generation_on_every
         .expect("capture after the replayed copy")
         .expect("the repository must exist");
     assert_eq!(
-        after_replay.content_association_generation,
-        after_copy.content_association_generation + 1,
-        "a replayed copy is still an association write and must move the scalar again"
+        after_replay, after_copy,
+        "a replayed copy onto a live key writes nothing and moves no scalar"
     );
     assert_eq!(
         live_association_rows(&direct, &hash, &repository_id, &copy_context).await,
         1,
-        "the replay upserts the existing row rather than adding a second one"
+        "the replay keeps the existing row rather than adding a second one"
     );
 
     // A stale witness is refused. Deliberately NOT paired with a

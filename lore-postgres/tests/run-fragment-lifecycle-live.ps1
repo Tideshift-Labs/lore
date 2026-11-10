@@ -109,6 +109,9 @@ $inventory = @(
         Cases         = @(
             'domain_fragment_membership::fresh_exact_keys_preserve_invalidation_but_rebind_and_recreate_advance_it',
             'domain_fragment_membership::guarded_binding_classifies_absence_and_replacement_and_fenced_calls_change_nothing',
+            # A6: a guarded same-content re-put onto a LIVE key is a no-op; other states unchanged.
+            'domain_fragment_membership::guarded_live_rebind_keeps_the_binding_and_every_push_scalar',
+            'domain_fragment_membership::guarded_rebind_of_non_live_states_is_unchanged',
             'domain_fragment_membership::both_obliterate_retirement_paths_advance_invalidation_with_retained_payload_control',
             'domain_fragment_membership::invalidation_overflow_rolls_back_rebind_and_retirement_without_wrapping',
             'concurrent_absent_direct_writes_cannot_replace_the_first_lineage',

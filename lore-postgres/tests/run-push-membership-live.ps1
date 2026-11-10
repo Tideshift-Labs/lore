@@ -46,6 +46,8 @@ $inventory = @(
             'grpc::handlers::branch_push::governed_tests::membership_tests::v0_required_rebind_after_preflight_refuses',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v1_unrelated_rebind_after_preflight_refuses',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v1_tombstone_recreate_after_preflight_refuses',
+            'grpc::handlers::branch_push::governed_tests::membership_tests::v0_same_content_live_reput_after_preflight_publishes',
+            'grpc::handlers::branch_push::governed_tests::membership_tests::v1_same_content_live_reput_after_preflight_publishes',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v0_lifecycle_move_without_complete_proof_refuses',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v1_more_than_4096_real_dependencies_allow_fresh_addition',
             'grpc::handlers::branch_push::governed_tests::membership_tests::v0_publication_blocks_required_retirement_until_commit',
@@ -71,6 +73,8 @@ $inventory = @(
     [pscustomobject]@{ Package='lore-postgres'; Kind='test'; Target='domain_fragment_lifecycle'; Exact=$false; ExactPrefixes=@('domain_fragment_membership::'); Cases=@(
             'domain_fragment_membership::fresh_exact_keys_preserve_invalidation_but_rebind_and_recreate_advance_it',
             'domain_fragment_membership::guarded_binding_classifies_absence_and_replacement_and_fenced_calls_change_nothing',
+            'domain_fragment_membership::guarded_live_rebind_keeps_the_binding_and_every_push_scalar',
+            'domain_fragment_membership::guarded_rebind_of_non_live_states_is_unchanged',
             'domain_fragment_membership::both_obliterate_retirement_paths_advance_invalidation_with_retained_payload_control',
             'domain_fragment_membership::invalidation_overflow_rolls_back_rebind_and_retirement_without_wrapping'
     ) }

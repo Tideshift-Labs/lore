@@ -3810,6 +3810,10 @@ impl PostgresFragmentCoordinator {
     /// resolver still holds. This is the copy/dedup publication path: unlike
     /// [`Self::create_association`], it refuses `Missing` and every other
     /// witness movement atomically with the insert.
+    ///
+    /// A re-PUT of a LIVE key is a no-op: no fence, no scalar move and no
+    /// outbox event. A Tombstoned key is recreated and invalidates the
+    /// repository's association binding.
     pub async fn create_association_if_current(
         &self,
         witness: &EpochWitness,
@@ -3838,8 +3842,28 @@ impl PostgresFragmentCoordinator {
             return Ok(CommitVerdict::Fenced);
         }
         sequence.enter(LockClass::Associations)?;
-        let invalidates_binding =
-            association_key_exists(&tx, &witness.hash, repository_id, context).await?;
+        let existing_state =
+            association_key_state(&tx, &witness.hash, repository_id, context).await?;
+        // A LIVE key re-put with the same witness is an idempotent success.
+        // The key is the content hash, and the row binds no representation:
+        // the head just matched a readable witness, so the live row already
+        // resolves to these bytes. Rewriting it would only move its
+        // association_epoch and the invalidation scalar, which aborts every
+        // concurrent push for a membership change that did not happen (A6).
+        // Nothing is written, so no scalar or outbox event moves. Creation's
+        // live-key no-op (creation.rs) is the same, except it also requires the
+        // row's repository_generation to equal the expected one. This path
+        // needs no such match: the head already matched a readable witness
+        // above, the repository generation only goes up, and the resolver
+        // accepts a row with `repository_generation <= r.generation`, so a
+        // live row bound at an older generation still resolves. Tombstoned
+        // keys still recreate and invalidate below.
+        if existing_state == Some(schema::ASSOCIATION_LIVE) {
+            classify_commit(tx.commit().await, "guarded association live no-op commit")?;
+            failpoint!("association.create_guarded.settled")?;
+            return Ok(CommitVerdict::Published);
+        }
+        let invalidates_binding = existing_state.is_some();
         super::membership::allow_association(&tx).await?;
         let association_epoch = next_fence(&tx).await?;
         tx.execute(
@@ -7006,6 +7030,26 @@ async fn association_key_exists(
     .await
     .map(|row| row.get(0))
     .map_err(|error| DomainError::from_pg("association key classification", error))
+}
+
+/// Read the exact key's association state while its Repository row is
+/// already locked, or `None` when the key was never bound. The Repository
+/// lock serializes every coordinated writer of this key, as for
+/// [`association_key_exists`].
+async fn association_key_state(
+    tx: &tokio_postgres::Transaction<'_>,
+    hash: &[u8],
+    repository_id: &[u8],
+    context: &[u8],
+) -> Result<Option<i16>, DomainError> {
+    tx.query_opt(
+        "SELECT state FROM lore_fragment_associations \
+         WHERE hash = $1 AND repository_id = $2 AND context = $3",
+        &[&hash, &repository_id, &context],
+    )
+    .await
+    .map(|row| row.map(|row| row.get(0)))
+    .map_err(|error| DomainError::from_pg("association key state", error))
 }
 
 /// Move one repository's association scalar. The row is already locked by the

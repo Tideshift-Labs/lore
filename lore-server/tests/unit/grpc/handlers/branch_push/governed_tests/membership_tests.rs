@@ -256,6 +256,9 @@ enum Change {
     Rebind,
     Recreate,
     Missing,
+    /// A6: a second client PUTs the same bytes onto the already LIVE key
+    /// through the guarded store path. Not a membership change.
+    LiveReput,
 }
 
 async fn wait_for_blocked_backend(observer: &Client, blocker: i32) -> i32 {
@@ -313,6 +316,24 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
         )
         .await
         .unwrap();
+    // The witness a guarded re-put carries, as the immutable store's PUT
+    // would capture it from the readable head before binding.
+    let reput_witness = {
+        let resolutions = fixture
+            .immutable
+            .coordinator
+            .resolve(
+                &fixture.repository,
+                address.context.as_ref(),
+                &[address.hash.as_ref().to_vec()],
+            )
+            .await
+            .unwrap();
+        let FragmentVerdict::Readable { witness, .. } = &resolutions[0].verdict else {
+            panic!("required readable fixture")
+        };
+        witness.clone()
+    };
     let before = fixture
         .immutable
         .coordinator
@@ -419,6 +440,19 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
                         CommitVerdict::Published
                     );
                 }
+                Change::LiveReput => {
+                    assert_eq!(
+                        coordinator
+                            .create_association_if_current(
+                                &reput_witness,
+                                &fixture.repository,
+                                address.context.as_ref()
+                            )
+                            .await
+                            .unwrap(),
+                        CommitVerdict::Published
+                    );
+                }
             }
         };
         if matches!(change, Change::Fresh) {
@@ -473,7 +507,7 @@ async fn mutation_first_count(url: &str, v1: bool, change: Change, required: boo
     }))
     .await
     .expect("handler watchdog");
-    let applied = matches!(change, Change::Fresh);
+    let applied = matches!(change, Change::Fresh | Change::LiveReput);
     if applied {
         assert_eq!(result.unwrap(), fixture.revision);
     } else {
@@ -580,6 +614,32 @@ async fn v1_tombstone_recreate_after_preflight_refuses() {
         &pg_url().unwrap(),
         true,
         Change::Recreate,
+        true,
+    ))
+    .await;
+}
+/// A6: another client's same-content PUT onto a required LIVE key, committed
+/// while this push waits at final publication, must not abort the push.
+#[tokio::test]
+#[ignore = "isolated PostgreSQL required"]
+async fn v0_same_content_live_reput_after_preflight_publishes() {
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        false,
+        Change::LiveReput,
+        true,
+    ))
+    .await;
+}
+#[tokio::test]
+#[ignore = "isolated PostgreSQL required"]
+async fn v1_same_content_live_reput_after_preflight_publishes() {
+    // boxed: future is ~30 KB on the stack
+    Box::pin(mutation_first(
+        &pg_url().unwrap(),
+        true,
+        Change::LiveReput,
         true,
     ))
     .await;
@@ -702,7 +762,7 @@ async fn push_first_count(url: &str, v1: bool, change: Change, required: bool, c
                         .await
                         .unwrap();
                 }
-                Change::Missing => unreachable!(),
+                Change::Missing | Change::LiveReput => unreachable!(),
             }
         };
         let release = async {
