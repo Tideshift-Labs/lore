@@ -1369,17 +1369,24 @@ async fn push_local_history(
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
-            let push_result = push_revision_stage(
-                runner.as_ref(),
-                attempts.as_ref(),
-                repository.id,
-                GrpcRpc::RevisionBranchPush,
+            // FORK-LOCAL (Tideshift, A6): each send is its own stage and attempt; see
+            // `send_branch_push`. One budget covers this revision's sends, the resend after a
+            // server-side branch recreate included.
+            let mut verdict_budget = PushVerdictBudget::new(branch_push_verdict_retry());
+            let branch_push = move || {
                 revision_protocol.branch_push(
                     branch,
                     current_revision,
                     force,
                     options.fast_forward_merge,
-                ),
+                )
+            };
+            let push_result = send_branch_push(
+                runner.as_ref(),
+                attempts.as_ref(),
+                repository.id,
+                &mut verdict_budget,
+                branch_push,
             )
             .await;
 
@@ -1422,17 +1429,12 @@ async fn push_local_history(
                     .send();
 
                     forward_branch_push(
-                        push_revision_stage(
+                        send_branch_push(
                             runner.as_ref(),
                             attempts.as_ref(),
                             repository.id,
-                            GrpcRpc::RevisionBranchPush,
-                            revision_protocol.branch_push(
-                                branch,
-                                current_revision,
-                                force,
-                                options.fast_forward_merge,
-                            ),
+                            &mut verdict_budget,
+                            branch_push,
                         )
                         .await,
                     )?
@@ -1610,6 +1612,148 @@ where
         under_own_attempt(attempts, repository, rpc, dispatch),
     )
     .await
+}
+
+/// FORK-LOCAL (Tideshift, A6): attempts one `BranchPush` gets against a transient server verdict,
+/// the first included.
+pub const BRANCH_PUSH_VERDICT_ATTEMPTS: usize = 3;
+/// FORK-LOCAL (Tideshift, A6): first wait before a `BranchPush` is sent again, in milliseconds.
+/// Doubled per wait and jittered.
+pub const BRANCH_PUSH_VERDICT_BACKOFF_MS: u64 = 250;
+/// FORK-LOCAL (Tideshift, A6): longest wait before a `BranchPush` is sent again, in milliseconds.
+pub const BRANCH_PUSH_VERDICT_MAX_BACKOFF_MS: u64 = 2_000;
+/// FORK-LOCAL (Tideshift, A6): resends a `SlowDown` answer may cause within one budget.
+///
+/// One only: the server already waits out `SlowDown` inside each `BranchPush` (`verify_fragments`
+/// loops for about 43 s per send), so stacking more client resends on top is a long stall.
+pub const BRANCH_PUSH_SLOW_DOWN_RESENDS: usize = 1;
+
+/// FORK-LOCAL (Tideshift, A6): the resends one revision's `BranchPush` may still make against a
+/// transient server verdict. Every call to [`retry_transient_push_verdict`] sends once; only the
+/// resends draw on this. One budget spans a revision's sends, so the resend after a server-side
+/// branch recreate does not start a fresh one.
+#[lore_macro::test_pub]
+struct PushVerdictBudget {
+    retry: crate::util::time::Retry,
+    slow_down_resends: usize,
+}
+
+impl PushVerdictBudget {
+    #[lore_macro::test_pub]
+    fn new(retry: crate::util::time::Retry) -> Self {
+        Self {
+            retry,
+            slow_down_resends: BRANCH_PUSH_SLOW_DOWN_RESENDS,
+        }
+    }
+}
+
+/// The wait schedule [`retry_transient_push_verdict`] runs on in production.
+#[lore_macro::test_pub]
+fn branch_push_verdict_retry() -> crate::util::time::Retry {
+    crate::util::time::retry(
+        BRANCH_PUSH_VERDICT_BACKOFF_MS,
+        BRANCH_PUSH_VERDICT_MAX_BACKOFF_MS,
+        BRANCH_PUSH_VERDICT_ATTEMPTS - 1,
+    )
+}
+
+/// FORK-LOCAL (Tideshift, A6): whether a failed `BranchPush` is a transient server verdict that
+/// proves the push did not apply, so the same push may be sent again.
+///
+/// Two verdicts qualify:
+///
+/// - `ABORTED required_fragment_changed`: the governed commit returned `NotApplied` because a
+///   required fragment's membership generation moved after the push's own preflight. Concurrent
+///   identical uploads from another client move it without changing any content.
+/// - `SlowDown`: the server's in-band back-pressure, decisive by the transport's own mapping
+///   (a lost answer on the same code is not `SlowDown`). Only when the transport did not already
+///   retry it: the unmanaged gRPC path loops on `SlowDown` inside the RPC, and retrying here too
+///   would multiply that wall-clock budget.
+///
+/// Never an unknown outcome, a disconnect, or any other refusal. The send is not blind: the
+/// server captures a fresh witness and verifies every required fragment on each `BranchPush`, so a
+/// fragment that is really gone comes back as `AddressNotFound`, which is not retried.
+#[lore_macro::test_pub]
+fn is_transient_push_verdict(error: &ProtocolError, transport_retries_slow_down: bool) -> bool {
+    if error.is_outcome_unknown() || error.is_disconnected() {
+        return false;
+    }
+    lore_transport::is_required_fragment_changed(error)
+        || (!transport_retries_slow_down && error.is_slow_down())
+}
+
+/// FORK-LOCAL (Tideshift, A6): send one `BranchPush` built by `branch_push` as its own stage and
+/// attempt, and send it again on a transient verdict within `budget`.
+///
+/// Without a runner or an outer caller operation the gRPC client already loops on `SlowDown`
+/// inside the RPC, so a `SlowDown` is not resent here. That is the stock CLI's path; the desktop's
+/// managed path gets the resend.
+#[lore_macro::test_pub]
+async fn send_branch_push<T, B, Fut>(
+    runner: Option<&Arc<ManagedPushRunner>>,
+    attempts: Option<&Arc<dyn AttemptStore>>,
+    repository: RepositoryId,
+    budget: &mut PushVerdictBudget,
+    mut branch_push: B,
+) -> Result<T, ProtocolError>
+where
+    B: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ProtocolError>>,
+{
+    let transport_retries_slow_down =
+        runner.is_none() && lore_transport::current_caller_operation().is_none();
+    retry_transient_push_verdict(budget, transport_retries_slow_down, || {
+        push_revision_stage(
+            runner,
+            attempts,
+            repository,
+            GrpcRpc::RevisionBranchPush,
+            branch_push(),
+        )
+    })
+    .await
+}
+
+/// FORK-LOCAL (Tideshift, A6): send one `BranchPush` through `dispatch`, sending it again while
+/// the server answers with a transient verdict ([`is_transient_push_verdict`]) and `budget` has
+/// resends left. A `SlowDown` resends at most [`BRANCH_PUSH_SLOW_DOWN_RESENDS`] times. The last
+/// answer is returned as it is, so an exhausted budget surfaces the server's own refusal.
+///
+/// `dispatch` must build a whole new dispatch on each call: under a managed runner that is a new
+/// stage with its own attempt id, never a resend of the settled one.
+#[lore_macro::test_pub]
+async fn retry_transient_push_verdict<T, D, Fut>(
+    budget: &mut PushVerdictBudget,
+    transport_retries_slow_down: bool,
+    mut dispatch: D,
+) -> Result<T, ProtocolError>
+where
+    D: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, ProtocolError>>,
+{
+    loop {
+        let result = dispatch().await;
+        match &result {
+            Err(error) if is_transient_push_verdict(error, transport_retries_slow_down) => {
+                let slow_down = error.is_slow_down();
+                if slow_down && budget.slow_down_resends == 0 {
+                    return result;
+                }
+                if !budget.retry.wait().await {
+                    return result;
+                }
+                if slow_down {
+                    budget.slow_down_resends = budget.slow_down_resends.saturating_sub(1);
+                }
+                lore_debug!(
+                    "Branch push refused with a transient verdict, sending it again: {}",
+                    error
+                );
+            }
+            _ => return result,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

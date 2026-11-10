@@ -1035,3 +1035,50 @@ fn a_quic_declaration_refusal_names_its_status() {
         "storage server refused the caller declaration (status 200)"
     );
 }
+
+// --- A6: `ABORTED required_fragment_changed` on a governed BranchPush ---
+
+/// The exact refusal the server sends is marked, and it reads exactly as it did before the mark.
+#[test]
+fn a_required_fragment_changed_refusal_is_marked_and_reads_as_before() {
+    let status = tonic::Status::aborted(REQUIRED_FRAGMENT_CHANGED_REASON);
+    let rendered = status.to_string();
+    let error = ProtocolError::from(status);
+    assert!(is_required_fragment_changed(&error), "{error:?}");
+    assert!(matches!(error, ProtocolError::Internal(_)), "{error:?}");
+    assert!(!error.is_outcome_unknown());
+    assert_eq!(error.to_string(), rendered);
+}
+
+/// Only that refusal: the other `ABORTED` push refusals, the reason under another code, and a
+/// message that merely contains the reason are not marked.
+#[test]
+fn other_refusals_are_not_a_required_fragment_change() {
+    for status in [
+        tonic::Status::aborted("required_fragment_proof_unavailable"),
+        tonic::Status::aborted("Branch preflight changed; rerun preflight"),
+        tonic::Status::aborted("required_fragment_changed (again)"),
+        tonic::Status::failed_precondition(REQUIRED_FRAGMENT_CHANGED_REASON),
+        tonic::Status::internal(REQUIRED_FRAGMENT_CHANGED_REASON),
+        tonic::Status::resource_exhausted(REQUIRED_FRAGMENT_CHANGED_REASON),
+    ] {
+        let rendered = status.to_string();
+        let error = ProtocolError::from(status);
+        assert!(!is_required_fragment_changed(&error), "{rendered}");
+    }
+}
+
+/// A server that marked the outcome unknown outranks the reason: the push may have applied.
+#[test]
+fn an_unknown_outcome_marker_outranks_a_required_fragment_change() {
+    let mut status = tonic::Status::aborted(REQUIRED_FRAGMENT_CHANGED_REASON);
+    status.metadata_mut().insert(
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+        lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE
+            .parse()
+            .unwrap(),
+    );
+    let error = ProtocolError::from(status);
+    assert!(error.is_outcome_unknown(), "{error:?}");
+    assert!(!is_required_fragment_changed(&error));
+}

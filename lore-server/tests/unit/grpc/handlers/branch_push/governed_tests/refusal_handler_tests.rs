@@ -203,3 +203,16 @@ async fn both_push_handlers_terminalize_actual_early_store_slowdown_without_publ
         assert_eq!(count, 0);
     }
 }
+
+/// FORK-LOCAL (Tideshift, A6): the client resends a `BranchPush` refused as `ABORTED` with this
+/// reason, and matches it by a wire string it restates because it cannot name this crate's
+/// constant. This pins the two together: the server's reason, sent as the handler sends it, must
+/// reach the client classified as a required-fragment change.
+#[test]
+fn required_fragment_changed_reason_reaches_the_client_classified() {
+    let reason = lore_postgres::domain::fragments::REQUIRED_FRAGMENT_CHANGED;
+    assert_eq!(reason, lore_transport::REQUIRED_FRAGMENT_CHANGED_REASON);
+    assert!(lore_transport::is_required_fragment_changed(
+        &lore_transport::ProtocolError::from(Status::aborted(reason))
+    ));
+}

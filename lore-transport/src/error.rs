@@ -531,6 +531,36 @@ pub fn is_session_expired(error: &ProtocolError) -> bool {
     false
 }
 
+/// FORK-LOCAL (Tideshift, A6): the reason a governed `BranchPush` is refused with when a
+/// repository's required-fragment membership generation moved between the push's own preflight
+/// and its publication (`lore-postgres`'s `REQUIRED_FRAGMENT_CHANGED`). The server sends it as the
+/// whole message of an `ABORTED` status. This crate cannot name the server constant, so the value
+/// is restated here; it is a wire string and must not change on either side alone.
+pub const REQUIRED_FRAGMENT_CHANGED_REASON: &str = "required_fragment_changed";
+
+/// FORK-LOCAL (Tideshift, A6): typed mark of a governed `BranchPush` the server refused as
+/// `ABORTED` [`REQUIRED_FRAGMENT_CHANGED_REASON`]. The refusal is the domain commit's own
+/// `NotApplied` verdict, so the push did not apply. It rides inside `ProtocolError::Internal`, where
+/// this status always landed, and displays exactly as the status did before the mark existed.
+#[derive(Debug, Clone, Error)]
+#[error("{status}")]
+pub(crate) struct RequiredFragmentChanged {
+    pub(crate) status: String,
+}
+
+/// Whether `error` is a `BranchPush` refused because a required fragment's membership moved. See
+/// [`RequiredFragmentChanged`].
+pub fn is_required_fragment_changed(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<RequiredFragmentChanged>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
 pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
@@ -698,6 +728,18 @@ impl From<tonic::Status> for ProtocolError {
                 answer_lost(&value)
             }
             tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
+            // Exact message only: the server's other `ABORTED` push refusals (a moved branch
+            // preflight, an unavailable membership proof) are not marked, and neither is a
+            // message that merely contains the reason.
+            // No trace context: a context would prefix the rendering, and this keeps it.
+            tonic::Code::Aborted if value.message() == REQUIRED_FRAGMENT_CHANGED_REASON => {
+                ProtocolError::Internal(
+                    lore_error_set::Internal::new(std::sync::Arc::new(RequiredFragmentChanged {
+                        status: value.to_string(),
+                    }))
+                    .into(),
+                )
+            }
             _ => ProtocolError::internal(value.to_string()),
         }
     }

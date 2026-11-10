@@ -398,3 +398,365 @@ mod reconnect_expiry_translation {
         assert!(translated == LoreError::Internal, "{forwarded:?}");
     }
 }
+
+/// FORK-LOCAL (Tideshift, A6): a `BranchPush` the server refused with a transient verdict that
+/// proves it did not apply is sent again, within a small budget, and nothing else is.
+mod transient_push_verdict {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::error::AddressNotFound;
+    use lore_base::error::OutcomeUnknown;
+    use lore_revision::branch::push::*;
+    use lore_transport::ProtocolError;
+
+    /// A scripted transport: each send takes the next answer. A send past the script fails with
+    /// a distinct refusal, so a loop that ignores its budget ends with a wrong count, not a hang.
+    struct Script {
+        answers: parking_lot::Mutex<VecDeque<Result<u32, ProtocolError>>>,
+        sends: AtomicUsize,
+    }
+
+    impl Script {
+        fn new(answers: Vec<Result<u32, ProtocolError>>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: parking_lot::Mutex::new(answers.into()),
+                sends: AtomicUsize::new(0),
+            })
+        }
+
+        fn sends(&self) -> usize {
+            self.sends.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The production budget, with no waiting.
+    fn budget() -> PushVerdictBudget {
+        PushVerdictBudget::new(lore_revision::util::time::retry(
+            0,
+            0,
+            BRANCH_PUSH_VERDICT_ATTEMPTS - 1,
+        ))
+    }
+
+    impl Script {
+        /// One send: take the next answer.
+        fn send(self: &Arc<Self>) -> impl Future<Output = Result<u32, ProtocolError>> + use<> {
+            let script = self.clone();
+            async move {
+                script.sends.fetch_add(1, Ordering::SeqCst);
+                script
+                    .answers
+                    .lock()
+                    .pop_front()
+                    .unwrap_or_else(|| Err(ProtocolError::internal("script exhausted")))
+            }
+        }
+    }
+
+    async fn run(
+        script: &Arc<Script>,
+        transport_retries_slow_down: bool,
+    ) -> Result<u32, ProtocolError> {
+        retry_transient_push_verdict(&mut budget(), transport_retries_slow_down, || script.send())
+            .await
+    }
+
+    fn required_fragment_changed() -> ProtocolError {
+        ProtocolError::from(tonic::Status::aborted("required_fragment_changed"))
+    }
+
+    fn verdict_changed() -> ProtocolError {
+        // What the server's `verdict_changed` SlowDown reaches the client as.
+        ProtocolError::from(tonic::Status::resource_exhausted("verdict_changed"))
+    }
+
+    #[test]
+    fn the_budget_is_three_attempts() {
+        assert_eq!(BRANCH_PUSH_VERDICT_ATTEMPTS, 3);
+        assert_eq!(branch_push_verdict_retry().limit(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_required_fragment_change_then_success_succeeds_on_the_second_send() {
+        let script = Script::new(vec![Err(required_fragment_changed()), Ok(7)]);
+        assert_eq!(run(&script, false).await.unwrap(), 7);
+        assert_eq!(script.sends(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_required_fragment_change_is_retried_even_where_the_transport_retries_slow_down() {
+        let script = Script::new(vec![Err(required_fragment_changed()), Ok(7)]);
+        assert_eq!(run(&script, true).await.unwrap(), 7);
+        assert_eq!(script.sends(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_verdict_change_then_success_succeeds_on_the_second_send() {
+        let script = Script::new(vec![Err(verdict_changed()), Ok(7)]);
+        assert_eq!(run(&script, false).await.unwrap(), 7);
+        assert_eq!(script.sends(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_budget_surfaces_the_servers_refusal() {
+        let script = Script::new((0..10).map(|_| Err(required_fragment_changed())).collect());
+        let error = run(&script, false).await.unwrap_err();
+        assert!(
+            lore_transport::is_required_fragment_changed(&error),
+            "{error:?}"
+        );
+        assert_eq!(script.sends(), BRANCH_PUSH_VERDICT_ATTEMPTS);
+    }
+
+    /// The server already waits out `SlowDown` inside each send, so a `SlowDown` buys one resend.
+    #[tokio::test]
+    async fn slow_down_is_resent_at_most_once() {
+        assert_eq!(BRANCH_PUSH_SLOW_DOWN_RESENDS, 1);
+
+        let script = Script::new(vec![Err(verdict_changed()), Err(verdict_changed()), Ok(7)]);
+        let error = run(&script, false).await.unwrap_err();
+        assert!(error.is_slow_down(), "{error:?}");
+        assert_eq!(script.sends(), 2);
+
+        // A required-fragment change spends the general budget, not the `SlowDown` resend.
+        let script = Script::new(vec![
+            Err(required_fragment_changed()),
+            Err(verdict_changed()),
+            Ok(7),
+        ]);
+        assert_eq!(run(&script, false).await.unwrap(), 7);
+        assert_eq!(script.sends(), 3);
+
+        let script = Script::new(vec![
+            Err(verdict_changed()),
+            Err(required_fragment_changed()),
+            Err(verdict_changed()),
+            Ok(7),
+        ]);
+        assert!(run(&script, false).await.unwrap_err().is_slow_down());
+        assert_eq!(script.sends(), 3);
+    }
+
+    /// One budget spans a revision's sends: the push after a server-side branch recreate does not
+    /// start a fresh one, and still sends once.
+    #[tokio::test]
+    async fn a_shared_budget_carries_across_calls() {
+        let mut shared = budget();
+        let script = Script::new(vec![
+            Err(required_fragment_changed()),
+            Err(ProtocolError::from(tonic::Status::not_found(
+                "Branch not found",
+            ))),
+            Err(required_fragment_changed()),
+            Err(required_fragment_changed()),
+            Ok(7),
+        ]);
+        let first = retry_transient_push_verdict(&mut shared, false, || script.send()).await;
+        assert!(
+            matches!(first, Err(ProtocolError::NotFound(_))),
+            "{first:?}"
+        );
+        assert_eq!(script.sends(), 2);
+        let second = retry_transient_push_verdict(&mut shared, false, || script.send()).await;
+        assert!(
+            lore_transport::is_required_fragment_changed(&second.unwrap_err()),
+            "the recreate push had one resend left"
+        );
+        assert_eq!(script.sends(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_mixed_run_of_transient_verdicts_shares_one_budget() {
+        let script = Script::new(vec![
+            Err(required_fragment_changed()),
+            Err(verdict_changed()),
+            Err(required_fragment_changed()),
+            Ok(7),
+        ]);
+        let error = run(&script, false).await.unwrap_err();
+        assert!(
+            lore_transport::is_required_fragment_changed(&error),
+            "{error:?}"
+        );
+        assert_eq!(script.sends(), BRANCH_PUSH_VERDICT_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn a_non_retryable_refusal_is_sent_once() {
+        let refusals = [
+            ProtocolError::from(tonic::Status::permission_denied("protected")),
+            ProtocolError::from(tonic::Status::aborted(
+                "required_fragment_proof_unavailable",
+            )),
+            ProtocolError::from(tonic::Status::aborted(
+                "Branch preflight changed; rerun preflight",
+            )),
+            ProtocolError::from(tonic::Status::not_found("Branch not found")),
+            ProtocolError::from(AddressNotFound { address: [7u8; 48] }),
+            ProtocolError::internal("remote rejected the request"),
+        ];
+        for refusal in refusals {
+            let rendered = refusal.to_string();
+            let script = Script::new(vec![Err(refusal), Ok(7)]);
+            assert!(run(&script, false).await.is_err(), "{rendered}");
+            assert_eq!(script.sends(), 1, "{rendered}");
+        }
+    }
+
+    /// The unmanaged gRPC client already loops on `SlowDown` inside the RPC.
+    #[tokio::test]
+    async fn slow_down_is_sent_once_where_the_transport_already_retried_it() {
+        let script = Script::new(vec![Err(verdict_changed()), Ok(7)]);
+        assert!(run(&script, true).await.unwrap_err().is_slow_down());
+        assert_eq!(script.sends(), 1);
+    }
+
+    /// The replay contract: a dispatch that may have applied is never sent again.
+    #[tokio::test]
+    async fn an_unknown_outcome_or_a_lost_answer_is_sent_once() {
+        let mut marked = tonic::Status::aborted("required_fragment_changed");
+        marked.metadata_mut().insert(
+            lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_KEY,
+            lore_transport::outcome::OUTCOME_UNKNOWN_METADATA_VALUE
+                .parse()
+                .unwrap(),
+        );
+        let lost = [
+            ProtocolError::from(OutcomeUnknown {
+                operation: "RevisionService.BranchPush".into(),
+                attempt_id: "fixture".into(),
+            }),
+            ProtocolError::from(marked),
+            ProtocolError::from(tonic::Status::unavailable("gone")),
+            ProtocolError::from(tonic::Status::cancelled("answer lost")),
+        ];
+        for error in lost {
+            let rendered = format!("{error:?}");
+            let script = Script::new(vec![Err(error), Ok(7)]);
+            assert!(run(&script, false).await.is_err(), "{rendered}");
+            assert_eq!(script.sends(), 1, "{rendered}");
+        }
+    }
+
+    /// The call site `push_local_history` uses, under a real `ManagedPushRunner` (the desktop's
+    /// path) and without one (the stock CLI's).
+    mod call_site {
+        use std::sync::Arc;
+
+        use lore_base::types::RepositoryId;
+        use lore_revision::managed_push::ManagedPushRunner;
+        use lore_revision::repository_fence::RepositoryMutationGuard;
+        use lore_transport::AttemptId;
+        use uuid::Uuid;
+
+        use super::*;
+
+        const REPOSITORY: [u8; 16] = [5; 16];
+
+        /// Each send as the transport saw it: its stage and its attempt id.
+        type Sends = Arc<parking_lot::Mutex<Vec<(Option<Uuid>, Option<AttemptId>)>>>;
+
+        #[allow(clippy::disallowed_methods)] // This test's owned temporary worktree only.
+        async fn managed_runner() -> (tempfile::TempDir, Arc<ManagedPushRunner>) {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir(directory.path().join(".lore")).unwrap();
+            let guard = Arc::new(
+                RepositoryMutationGuard::acquire(directory.path())
+                    .await
+                    .unwrap(),
+            );
+            (directory, Arc::new(ManagedPushRunner::new(guard, None)))
+        }
+
+        async fn send(
+            runner: Option<&Arc<ManagedPushRunner>>,
+            answers: Vec<Result<u32, ProtocolError>>,
+        ) -> (Result<u32, ProtocolError>, Sends) {
+            let script = Script::new(answers);
+            let sends = Sends::default();
+            let result = send_branch_push(
+                runner,
+                None,
+                RepositoryId::from(REPOSITORY),
+                &mut budget(),
+                || {
+                    let sends = sends.clone();
+                    let answer = script.send();
+                    async move {
+                        sends.lock().push((
+                            lore_transport::current_caller_operation()
+                                .map(|context| context.parent_id()),
+                            lore_transport::outcome::current_dispatch_attempt(),
+                        ));
+                        answer.await
+                    }
+                },
+            )
+            .await;
+            (result, sends)
+        }
+
+        /// Every send ran in its own stage under its own attempt id.
+        fn assert_distinct_stages(sends: &Sends, count: usize) {
+            let sends = sends.lock();
+            assert_eq!(sends.len(), count, "{sends:?}");
+            let parents: std::collections::HashSet<_> = sends
+                .iter()
+                .map(|(parent, _)| parent.expect("a managed stage"))
+                .collect();
+            let attempts: std::collections::HashSet<_> = sends
+                .iter()
+                .map(|(_, attempt)| attempt.expect("an attempt id"))
+                .collect();
+            assert_eq!(parents.len(), count, "{sends:?}");
+            assert_eq!(attempts.len(), count, "{sends:?}");
+        }
+
+        #[tokio::test]
+        async fn managed_slow_down_then_success_sends_twice_with_new_attempts() {
+            let (_directory, runner) = managed_runner().await;
+            let (result, sends) = send(Some(&runner), vec![Err(verdict_changed()), Ok(7)]).await;
+            assert_eq!(result.unwrap(), 7);
+            assert_distinct_stages(&sends, 2);
+        }
+
+        #[tokio::test]
+        async fn managed_slow_down_twice_surfaces_slow_down_after_two_sends() {
+            let (_directory, runner) = managed_runner().await;
+            let (result, sends) = send(
+                Some(&runner),
+                vec![Err(verdict_changed()), Err(verdict_changed()), Ok(7)],
+            )
+            .await;
+            assert!(result.unwrap_err().is_slow_down());
+            assert_distinct_stages(&sends, 2);
+        }
+
+        #[tokio::test]
+        async fn managed_required_fragment_change_twice_then_success_sends_three_times() {
+            let (_directory, runner) = managed_runner().await;
+            let (result, sends) = send(
+                Some(&runner),
+                vec![
+                    Err(required_fragment_changed()),
+                    Err(required_fragment_changed()),
+                    Ok(7),
+                ],
+            )
+            .await;
+            assert_eq!(result.unwrap(), 7);
+            assert_distinct_stages(&sends, 3);
+        }
+
+        /// The stock CLI's gRPC client already looped on `SlowDown` inside the RPC.
+        #[tokio::test]
+        async fn unmanaged_slow_down_is_sent_once() {
+            let (result, sends) = send(None, vec![Err(verdict_changed()), Ok(7)]).await;
+            assert!(result.unwrap_err().is_slow_down());
+            assert_eq!(sends.lock().len(), 1);
+        }
+    }
+}
