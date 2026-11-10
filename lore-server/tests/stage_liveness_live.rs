@@ -1242,6 +1242,117 @@ async fn a_drain_anchors_the_check_and_holds_a_misplaced_replica() {
     namespace.release().await;
 }
 
+/// Review k11-guard-4 should-fix, live. A misplaced web replica answers 503
+/// from a completed read on its wrong directory. Then its real probe thread
+/// hangs (an NFS hard mount). Past `marker_stuck_after`, and before K11's
+/// own stale eject, it still answers the shared-stage 503: the hang does not
+/// undo the completed read. (Before this fix it flapped to 200.)
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_hung_step_keeps_a_misplaced_replica_at_503() {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+
+    use lore_server::stage_liveness::ProbeFn;
+    use lore_server::stage_liveness::spawn_probe_thread_with_markers;
+
+    const STUCK_AFTER: Duration = Duration::from_millis(300);
+    let (namespace, store) = boot("k11-guard-hung-absent").await;
+    let coordinator = store.fragment_coordinator();
+    let (real, wrong) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let real_markers = ShareMarkers::new(real.path());
+    let wrong_markers = ShareMarkers::new(wrong.path());
+    let worker = drain("drain-1");
+    markers_step(&worker, &real_markers);
+    exchange(&coordinator, CELL, &worker).await;
+    let early = Arc::new(
+        StageLiveness::with_thresholds(
+            "web-a".to_owned(),
+            LivenessThresholds {
+                share_grace: SHARE_GRACE,
+                share_peer_fresh: SHARE_PEER_FRESH,
+                marker_stuck_after: STUCK_AFTER,
+                ..thresholds()
+            },
+        )
+        .with_share_guard(),
+    );
+    markers_step(&early, &wrong_markers);
+    exchange(&coordinator, CELL, &early).await;
+    markers_step(&early, &wrong_markers);
+    assert_eq!(
+        lb_health(&early),
+        UNVERIFIED,
+        "control: a completed read on the wrong directory"
+    );
+
+    let (release, hold) = mpsc::channel::<()>();
+    let hold = Mutex::new(hold);
+    let entered = Arc::new(AtomicBool::new(false));
+    let probe: ProbeFn = {
+        let entered = entered.clone();
+        Arc::new(move || {
+            entered.store(true, Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    assert!(
+        spawn_probe_thread_with_markers(
+            &early,
+            probe,
+            Some(ShareMarkers::new(wrong.path())),
+            Duration::from_millis(20),
+            stop.clone(),
+        )
+        .unwrap()
+    );
+    let started = Instant::now();
+    while !entered.load(Ordering::SeqCst) {
+        assert!(started.elapsed() < Duration::from_secs(5), "probe starts");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let hung_at = Instant::now();
+    let mut samples = Vec::new();
+    // Past the stuck threshold, but before K11's stale eject.
+    while hung_at.elapsed() < STUCK_AFTER + Duration::from_millis(500) {
+        markers_step(&worker, &real_markers);
+        exchange(&coordinator, CELL, &worker).await;
+        exchange(&coordinator, CELL, &early).await;
+        let now = Instant::now();
+        samples.push((
+            hung_at.elapsed().as_millis(),
+            early.step_stuck(now),
+            lb_health(&early),
+        ));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.store(true, Ordering::SeqCst);
+    release.send(()).unwrap();
+    assert!(
+        samples.iter().any(|(_, stuck, _)| *stuck),
+        "control: the step was seen hung: {samples:?}"
+    );
+    assert!(
+        samples
+            .iter()
+            .all(|(_, _, health)| *health == UNVERIFIED || *health == NOT_SHARED),
+        "a hung step must keep the decided 503: {samples:?}"
+    );
+    assert!(held(&early));
+    let finished = Instant::now();
+    while early.step_stuck(Instant::now()) {
+        assert!(finished.elapsed() < Duration::from_secs(5), "step ends");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(store);
+    namespace.release().await;
+}
+
 /// A drain row older than the fresh window is no anchor: the replica serves
 /// and does not stage. It never waits for the drain.
 #[tokio::test]

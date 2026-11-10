@@ -954,6 +954,91 @@ fn a_hung_probe_step_is_undecided_and_answers_200() {
     assert_eq!(b.fault(Instant::now()), Some(STAGE_NOT_SHARED));
 }
 
+/// Review k11-guard-4 should-fix. A completed read found the drain's marker
+/// absent (a misplaced replica, 503). Then its probe step hangs. The hang
+/// says nothing new, so the last completed read stands: the replica stays
+/// 503 and does not flap to 200 at `marker_stuck_after`.
+#[test]
+fn a_hung_step_keeps_a_marker_a_completed_read_found_absent() {
+    let wrong = tempfile::tempdir().unwrap();
+    let stuck_after = Duration::from_millis(150);
+    let b = Arc::new(
+        StageLiveness::with_thresholds(
+            "web-b".to_owned(),
+            LivenessThresholds {
+                share_grace: GRACE,
+                marker_stuck_after: stuck_after,
+                ..LivenessThresholds::default()
+            },
+        )
+        .with_share_guard(),
+    );
+    let clock = 9_000_000;
+    b.note_share(
+        Instant::now(),
+        &with_drains(
+            share_view(clock, &[]),
+            &[("drain-1", "inc-d", clock, StageLivenessRole::Drain)],
+        ),
+    );
+    b.share_step(&ShareMarkers::new(wrong.path())).unwrap();
+    assert_eq!(
+        b.fault(Instant::now()),
+        Some(STAGE_SHARE_UNVERIFIED),
+        "control: a completed read found the marker absent"
+    );
+    let (release, hold) = mpsc::channel::<()>();
+    let hold = Mutex::new(hold);
+    let entered = Arc::new(AtomicBool::new(false));
+    let probe: ProbeFn = {
+        let entered = entered.clone();
+        Arc::new(move || {
+            entered.store(true, Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    assert!(
+        spawn_probe_thread_with_markers(
+            &b,
+            probe,
+            Some(ShareMarkers::new(wrong.path())),
+            Duration::from_millis(20),
+            stop.clone(),
+        )
+        .unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the probe thread must start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(stuck_after + Duration::from_millis(50));
+    let now = Instant::now();
+    assert!(b.step_stuck(now), "control: the step is hung");
+    assert_ne!(b.share_verdict(now), ShareVerdict::Undecided);
+    assert!(
+        matches!(
+            b.fault(now),
+            Some(STAGE_SHARE_UNVERIFIED | STAGE_NOT_SHARED)
+        ),
+        "a hung step must not turn a decided 503 into 200: {:?}",
+        b.fault(now)
+    );
+    assert_eq!(b.fault(now + GRACE), Some(STAGE_NOT_SHARED));
+    assert!(gate_held(&b));
+    assert_gate_agrees(&b, now);
+
+    stop.store(true, Ordering::SeqCst);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.step_stuck(Instant::now()) {
+        assert!(Instant::now() < deadline, "the step must finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The first replica, no drain row: it serves (200) but never stages.
 #[test]
 fn a_replica_with_no_drain_row_serves_but_never_stages() {

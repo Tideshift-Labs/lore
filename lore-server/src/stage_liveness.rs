@@ -158,7 +158,9 @@
 //!    answers 200, staging stays off (new fragments are written directly,
 //!    and a staged read that finds no file is not evidence of absence), and
 //!    the `stage_share_undecided` gauge is 1. The next completed read
-//!    decides again.
+//!    decides again. A hung step does not undo a completed read: a marker
+//!    that a completed read already found absent still counts toward 503,
+//!    so a misplaced replica does not flap 503 -> 200 when its step hangs.
 //!
 //! **Never all, never both.** A web replica answers a shared-stage 503 only
 //! in two cases:
@@ -169,7 +171,8 @@
 //!   so the marker is really there. Replicas that are anchor-proven are
 //!   never held again, so no later fault (NFS hang, Postgres outage, drain
 //!   restart, drain marker loss) touches them. A marker read fault or a hung
-//!   step is "cannot decide" (step 6), so it never answers 503. So both web
+//!   step is "cannot decide" (step 6), so it never starts a 503; a hung step
+//!   only keeps a 503 that a completed read already decided. So both web
 //!   replicas answer 503 only if both are unproven at the same time and both
 //!   READ a liveness directory that does not hold the drain's marker: a
 //!   wrong mount on both hosts.
@@ -189,10 +192,12 @@
 //!   writes cost a direct object-store round trip.
 //! - Start-up 503 (review probe RV3-C). A fresh drain row that this replica
 //!   has not yet looked for counts as "not seen". So from the first view
-//!   that names a fresh drain until the next marker step (at most one
-//!   [`PROBE_INTERVAL`], about 2 s), an unproven replica answers 503
-//!   [`STAGE_SHARE_UNVERIFIED`]. At a cell start both web replicas do this
-//!   at once, for about 2 s.
+//!   that names a fresh drain until the next marker step completes, an
+//!   unproven replica answers 503 [`STAGE_SHARE_UNVERIFIED`]. That is at
+//!   most one [`PROBE_INTERVAL`] (about 2 s) when the step completes. If
+//!   that step hangs, the 503 lasts until [`MARKER_STUCK_AFTER`] (6 s), and
+//!   then the replica answers 200 (cannot decide). At a cell start both web
+//!   replicas can do this at once.
 //! - Web-only roll with an old drain. A drain worker built before this
 //!   guard publishes no `drain` role, so the cell has no anchor: every web
 //!   replica stays at [`ShareVerdict::NoAnchor`], answers 200 and stages
@@ -452,7 +457,8 @@ pub enum ShareVerdict {
     NotShared,
     /// A fresh drain's marker is not seen, but no completed read found it
     /// absent: every unseen marker's last read failed with an I/O error, or
-    /// the probe-thread step has hung for [`MARKER_STUCK_AFTER`].
+    /// the probe-thread step hung for [`MARKER_STUCK_AFTER`] before reading
+    /// it.
     /// `/lb_health` is 200 ("cannot decide"); staging stays off.
     Undecided,
     /// Every fresh drain's marker was seen once: latched for the life of the
@@ -516,6 +522,10 @@ struct ShareState {
     /// Required, unconfirmed pairs whose last marker read failed with an I/O
     /// error other than "not found": this replica cannot decide them.
     unreadable: HashSet<(String, String)>,
+    /// Required, unconfirmed pairs whose last marker read completed without
+    /// the marker (no file, or another incarnation). A hung step does not
+    /// undo this: the last completed read stands.
+    absent: HashSet<(String, String)>,
     /// Latched once every fresh drain anchor's marker was seen. Only this
     /// opens staging, and nothing closes it again.
     proven: bool,
@@ -537,8 +547,9 @@ impl ShareState {
     }
 
     /// The verdict at `now`. `stuck` is whether the probe-thread step has
-    /// hung for `marker_stuck_after`: then no marker read can complete, so
-    /// nothing is decided.
+    /// hung for `marker_stuck_after`: then no new marker read can complete,
+    /// so a pair not yet read is not decided. A pair that a completed read
+    /// already found absent still counts: the last completed read stands.
     fn verdict(&self, now: Instant, grace: Duration, born: Instant, stuck: bool) -> ShareVerdict {
         if self.proven {
             return ShareVerdict::Shared;
@@ -553,24 +564,22 @@ impl ShareState {
         if self.required.is_empty() {
             return ShareVerdict::NoAnchor;
         }
-        if stuck {
-            return ShareVerdict::Undecided;
-        }
         // Only an unseen marker that was not last read with an I/O error
         // counts toward the 503 words. A marker not read yet counts (the
-        // start-up 503, RV3-C in the module docs).
+        // start-up 503, RV3-C in the module docs), unless the step is hung:
+        // then only a marker a completed read found absent counts.
         let mut decided = self
             .unconfirmed()
             .filter(|(id, incarnation)| {
-                !self
-                    .unreadable
-                    .contains(&((*id).clone(), (*incarnation).clone()))
+                let key = ((*id).clone(), (*incarnation).clone());
+                !self.unreadable.contains(&key) && (!stuck || self.absent.contains(&key))
             })
             .peekable();
         if decided.peek().is_none() {
             // Every anchor confirmed latches `proven` in the same lock
             // (`sync_gate`), so an unproven state always has one unseen;
-            // here every unseen one was unreadable.
+            // here every unseen one was unreadable, or not read before the
+            // step hung.
             return ShareVerdict::Undecided;
         }
         let oldest = decided
@@ -972,6 +981,7 @@ impl StageLiveness {
             state.required.clear();
             state.since.clear();
             state.unreadable.clear();
+            state.absent.clear();
         }
         self.share_gate.store(!state.proven, Ordering::Release);
     }
@@ -1018,6 +1028,9 @@ impl StageLiveness {
         state
             .unreadable
             .retain(|key| required.get(&key.0) == Some(&key.1));
+        state
+            .absent
+            .retain(|key| required.get(&key.0) == Some(&key.1));
         for (id, incarnation) in &required {
             let key = (id.clone(), incarnation.clone());
             if !state.confirmed.contains(&key) {
@@ -1044,6 +1057,7 @@ impl StageLiveness {
         let key = (id.to_owned(), incarnation.to_owned());
         state.since.remove(&key);
         state.unreadable.remove(&key);
+        state.absent.remove(&key);
         state.confirmed.insert(key);
         self.sync_gate(&mut state);
     }
@@ -1059,7 +1073,9 @@ impl StageLiveness {
         let key = (id.to_owned(), incarnation.to_owned());
         if readable {
             state.unreadable.remove(&key);
+            state.absent.insert(key);
         } else {
+            state.absent.remove(&key);
             state.unreadable.insert(key);
         }
     }
