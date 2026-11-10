@@ -1354,6 +1354,16 @@ impl FragmentWriteBehindHandle {
         }
     }
 
+    /// FORK-LOCAL (Tideshift), WP-115 K11 guard: attach the "share not yet
+    /// proven" flag to this replica's stage. See
+    /// `WriteBehindStage::attach_share_gate`. `false` if one was attached.
+    pub fn attach_stage_share_gate(
+        &self,
+        gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> bool {
+        self.stage.attach_share_gate(gate)
+    }
+
     /// FORK-LOCAL (Tideshift), WP-115 K11: delete this replica's liveness row
     /// when it starts to drain, so no peer counts it as fresh.
     pub async fn withdraw_stage_liveness(&self, replica_id: &str) -> Result<bool, StoreError> {

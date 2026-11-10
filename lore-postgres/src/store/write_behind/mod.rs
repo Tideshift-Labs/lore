@@ -173,6 +173,10 @@ pub enum WriteBehindError {
     /// or was cancelled.
     #[error("write-behind staging attempt was withdrawn before its rename")]
     Withdrawn,
+    /// WP-115 K11 guard: this replica has not yet proven that its stage is
+    /// the one its peers use, so a missing file is not evidence of absence.
+    #[error("write-behind staging root is not yet proven shared with this cell's peers")]
+    RootShareUnproven,
     #[error("write-behind staging I/O failed during {operation}")]
     Io {
         operation: &'static str,
@@ -207,6 +211,7 @@ impl WriteBehindError {
             | Self::RootProbeFailed
             | Self::RootDeviceChanged
             | Self::Withdrawn
+            | Self::RootShareUnproven
             | Self::Io { .. } => StoreError::from(SlowDown),
             Self::HashWidth
             | Self::EpochNegative
@@ -354,6 +359,11 @@ pub struct WriteBehindStage {
     stage_io_wait: Duration,
     stage_read_wait: Duration,
     drain_reserve: drain_reserve::DrainReserveSettings,
+    /// WP-115 K11 guard: `true` while this replica has not proven that its
+    /// stage is the one its peers use. Attached once by a `stage` replica's
+    /// stage liveness; never attached on other roles, which then behave as
+    /// before. See [`Self::attach_share_gate`].
+    share_gate: std::sync::OnceLock<Arc<AtomicBool>>,
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -438,8 +448,33 @@ impl WriteBehindStage {
             stage_io_wait: settings.stage_io_wait,
             stage_read_wait: settings.stage_read_wait,
             drain_reserve: settings.drain_reserve,
+            share_gate: std::sync::OnceLock::new(),
             sampler,
         }))
+    }
+
+    /// WP-115 K11 guard: attach the flag that says this replica has not yet
+    /// proven its stage is shared with its peers. Returns `false` if a gate
+    /// was already attached.
+    ///
+    /// While the flag is `true`, nothing is staged: a mode that would be
+    /// [`StagingMode::Stage`] is [`StagingMode::DirectFallback`] (a direct
+    /// object-store write), and a PUT that chose `Stage` before the flag rose
+    /// refuses with `SlowDown` at its re-check. A staged read that finds no
+    /// file answers [`StagedRead::Unavailable`], not [`StagedRead::Absent`].
+    /// A replica on a separate stage would otherwise read every peer's staged
+    /// fragment as absent and demote it to `Missing` (the D1 data loss), and
+    /// stage files its drain can never read.
+    pub fn attach_share_gate(&self, gate: Arc<AtomicBool>) -> bool {
+        self.share_gate.set(gate).is_ok()
+    }
+
+    /// Whether the attached share gate holds staging now. `false` with no
+    /// gate attached.
+    pub(crate) fn share_unproven(&self) -> bool {
+        self.share_gate
+            .get()
+            .is_some_and(|gate| gate.load(Ordering::Acquire))
     }
 
     /// The drain's reserve permit and retry schedule, as configured.
@@ -462,11 +497,14 @@ impl WriteBehindStage {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .refuses(std::time::Instant::now(), self.observation_stale_after);
-        staging_mode(
-            &self.admission,
-            fresh,
-            self.pending_staged.load(Ordering::Acquire),
-            capacity_refused,
+        share_limited(
+            staging_mode(
+                &self.admission,
+                fresh,
+                self.pending_staged.load(Ordering::Acquire),
+                capacity_refused,
+            ),
+            self.share_unproven(),
         )
     }
 
@@ -613,7 +651,10 @@ impl WriteBehindStage {
             Ok(resolved) => resolved,
             Err(error) => return StagedRead::Unavailable(error),
         };
-        Self::staged_read(self.root.read_regular(&resolved).await)
+        Self::staged_read(
+            self.root.read_regular(&resolved).await,
+            self.share_unproven(),
+        )
     }
 
     /// [`Self::read_staged`] for a foreground GET.
@@ -637,12 +678,24 @@ impl WriteBehindStage {
             self.root
                 .read_regular_within(&resolved, self.stage_read_wait)
                 .await,
+            self.share_unproven(),
         )
     }
 
-    fn staged_read(read: Result<Option<Bytes>, WriteBehindError>) -> StagedRead {
+    /// Map one read. `share_unproven` is read AFTER the read returns, so a
+    /// gate raised while the read ran still turns its `ENOENT` into
+    /// `Unavailable`.
+    fn staged_read(
+        read: Result<Option<Bytes>, WriteBehindError>,
+        share_unproven: bool,
+    ) -> StagedRead {
         match read {
             Ok(Some(bytes)) => StagedRead::Found(bytes),
+            // WP-115 K11 guard: an `ENOENT` on a stage not yet proven shared
+            // may only mean this replica looks at another directory.
+            Ok(None) if share_unproven => {
+                StagedRead::Unavailable(WriteBehindError::RootShareUnproven)
+            }
             // An `ENOENT` is decisive absence only because `read_regular`
             // revalidates the root's device first. Without that check this arm
             // would also cover "the mount went away", which is the demotion
@@ -727,6 +780,17 @@ fn staging_mode(
     admission.mode()
 }
 
+/// WP-115 K11 guard: on a stage not proven shared, `Stage` becomes
+/// `DirectFallback`. Every other mode is kept, so `Unready` and `Refuse` keep
+/// their meaning, and the guard never opens staging.
+fn share_limited(mode: StagingMode, share_unproven: bool) -> StagingMode {
+    if share_unproven && mode == StagingMode::Stage {
+        StagingMode::DirectFallback
+    } else {
+        mode
+    }
+}
+
 /// One admission snapshot, exposed for the store's metrics and readiness.
 pub use self::admission::AdmissionSnapshot;
 
@@ -775,7 +839,7 @@ mod tests {
             operation: "staging I/O capacity",
             kind: std::io::ErrorKind::WouldBlock,
         };
-        match WriteBehindStage::staged_read(Err(refusal())) {
+        match WriteBehindStage::staged_read(Err(refusal()), false) {
             StagedRead::Unavailable(error) => {
                 assert!(error.store_error().is_slow_down(), "capacity is retryable");
             }
@@ -783,13 +847,57 @@ mod tests {
             StagedRead::Found(_) => panic!("a refused read found bytes"),
         }
         assert!(matches!(
-            WriteBehindStage::staged_read(Ok(None)),
+            WriteBehindStage::staged_read(Ok(None), false),
             StagedRead::Absent
         ));
         assert!(matches!(
-            WriteBehindStage::staged_read(Ok(Some(Bytes::from_static(b"x")))),
+            WriteBehindStage::staged_read(Ok(Some(Bytes::from_static(b"x"))), false),
             StagedRead::Found(_)
         ));
+    }
+
+    /// WP-115 K11 guard: on a stage not yet proven shared, a missing file is
+    /// `Unavailable` (`SlowDown`), never `Absent`, so it cannot demote a
+    /// peer's staged fragment to `Missing`. Found bytes and other errors are
+    /// unchanged.
+    #[test]
+    fn an_unproven_share_turns_absence_into_slow_down_only() {
+        match WriteBehindStage::staged_read(Ok(None), true) {
+            StagedRead::Unavailable(error) => {
+                assert_eq!(error, WriteBehindError::RootShareUnproven);
+                assert!(error.store_error().is_slow_down());
+            }
+            other => panic!("an unproven share must not read as {other:?}"),
+        }
+        assert!(matches!(
+            WriteBehindStage::staged_read(Ok(Some(Bytes::from_static(b"x"))), true),
+            StagedRead::Found(_)
+        ));
+        assert!(matches!(
+            WriteBehindStage::staged_read(Err(WriteBehindError::RootDeviceChanged), true),
+            StagedRead::Unavailable(WriteBehindError::RootDeviceChanged)
+        ));
+    }
+
+    /// WP-115 K11 guard: an unproven share turns only `Stage` into
+    /// `DirectFallback`. It never opens staging and never weakens `Unready`
+    /// or `Refuse`.
+    #[test]
+    fn an_unproven_share_turns_only_stage_into_direct_fallback() {
+        for mode in [
+            StagingMode::Stage,
+            StagingMode::DirectFallback,
+            StagingMode::Refuse,
+            StagingMode::Unready,
+        ] {
+            assert_eq!(share_limited(mode, false), mode, "{mode:?}, proven");
+            let expected = if mode == StagingMode::Stage {
+                StagingMode::DirectFallback
+            } else {
+                mode
+            };
+            assert_eq!(share_limited(mode, true), expected, "{mode:?}, unproven");
+        }
     }
 
     fn staging_admission() -> Admission {

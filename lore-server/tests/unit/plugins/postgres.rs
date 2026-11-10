@@ -1951,10 +1951,10 @@ fn a_disabled_block_with_a_stage_or_drain_role_is_refused() {
     }
 }
 
-/// WP-115 K11: the stage liveness probe is on by default for a stage replica,
-/// can be turned off there, and is refused on any other role.
+/// WP-115 K11: the stage liveness probe is on by default for a stage or drain
+/// replica, can be turned off there, and is refused on a full replica.
 #[test]
-fn the_stage_liveness_probe_defaults_on_for_stage_and_is_refused_elsewhere() {
+fn the_stage_liveness_probe_defaults_on_for_stage_and_drain_and_is_refused_on_full() {
     let runs = |extra: &str| -> Result<bool, String> {
         let raw = raw_write_behind(&role_block(extra));
         validated_write_behind_settings(PLUGIN_NAME, &raw)
@@ -1970,13 +1970,17 @@ fn the_stage_liveness_probe_defaults_on_for_stage_and_is_refused_elsewhere() {
         runs("role = \"stage\"\nstage_liveness_probe = false"),
         Ok(false)
     );
-    // Full and drain never run it, whatever the default says.
+    // The drain runs the shared-stage anchor half by default (K11 guard).
+    assert_eq!(runs("role = \"drain\""), Ok(true));
+    assert_eq!(
+        runs("role = \"drain\"\nstage_liveness_probe = false"),
+        Ok(false)
+    );
+    // Full never runs it, whatever the default says.
     assert_eq!(runs(""), Ok(false));
-    assert_eq!(runs("role = \"drain\""), Ok(false));
     for extra in [
         "stage_liveness_probe = true",
         "role = \"full\"\nstage_liveness_probe = false",
-        "role = \"drain\"\nstage_liveness_probe = true",
     ] {
         match runs(extra) {
             Ok(value) => panic!("{extra:?} must be refused, got {value}"),

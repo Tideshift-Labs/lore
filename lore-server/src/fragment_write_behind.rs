@@ -258,14 +258,18 @@ impl FragmentWriteBehindSettings {
         self
     }
 
-    /// Whether this replica runs the WP-115 K11 stage liveness probe: only a
-    /// `stage` replica, and only while it is enabled. A `full` replica is the
-    /// only one in its cell, so it has no peer to compare with. A `drain`
-    /// replica already answers 503 `drain_role`, and its local stage would be
-    /// a false "fresh peer" for the web replicas.
+    /// Whether this replica runs the WP-115 K11 stage liveness: a `stage` or
+    /// `drain` replica, while it is enabled. A `full` replica is the only one
+    /// in its cell, so it has no peer to compare with.
+    ///
+    /// A `drain` replica runs only the shared-stage half: it keeps a marker
+    /// and publishes a row with role `drain` while it reads that marker back,
+    /// the anchor a stage replica must see before it stages. It runs no
+    /// probe, its count never rises, it is never a K11 eject peer, and it is
+    /// never held or ejected (it answers `drain_role`).
     #[lore_macro::test_pub]
     pub(crate) fn runs_stage_liveness(&self) -> bool {
-        self.role == WriteBehindRole::Stage && self.stage_liveness
+        matches!(self.role, WriteBehindRole::Stage | WriteBehindRole::Drain) && self.stage_liveness
     }
 
     /// How often the observer runs, which is also each attempt's budget.
@@ -1200,7 +1204,7 @@ pub(crate) fn configure_fragment_write_behind(
         handle.set_drain_concurrency(concurrency);
     }
     let stage_liveness = if settings.runs_stage_liveness() {
-        start_stage_liveness(&handle, endpoints, &shutdown, drain)?
+        start_stage_liveness(&handle, settings.role, endpoints, &shutdown, drain)?
     } else {
         None
     };
@@ -1241,6 +1245,7 @@ pub(crate) fn configure_fragment_write_behind(
 /// `None` where the platform opens no stage (the handle reports no root).
 fn start_stage_liveness(
     handle: &Arc<FragmentWriteBehindHandle>,
+    role: WriteBehindRole,
     endpoints: &mut JoinSet<Result<()>>,
     shutdown: &watch::Receiver<bool>,
     drain: Option<Arc<DrainState>>,
@@ -1249,14 +1254,40 @@ fn start_stage_liveness(
         return Ok(None);
     };
     let replica_id = crate::stage_liveness::default_replica_id();
-    let liveness = Arc::new(StageLiveness::new(replica_id.clone()));
+    let markers = crate::stage_liveness::ShareMarkers::new(&root);
     let stop = Arc::new(AtomicBool::new(false));
-    crate::stage_liveness::spawn_probe_thread(
-        &liveness,
-        crate::stage_liveness::file_probe(root, &replica_id),
-        crate::stage_liveness::PROBE_INTERVAL,
-        stop.clone(),
-    )?;
+    let liveness = if role == WriteBehindRole::Drain {
+        // The anchor: a marker, read back every step, and a `drain` row while
+        // the read-back holds; no probe, never held.
+        let liveness = Arc::new(
+            StageLiveness::new(replica_id.clone())
+                .with_role(lore_postgres::domain::fragments::StageLivenessRole::Drain),
+        );
+        crate::stage_liveness::spawn_marker_thread(
+            &liveness,
+            markers,
+            crate::stage_liveness::PROBE_INTERVAL,
+            stop.clone(),
+        )?;
+        liveness
+    } else {
+        let liveness = Arc::new(StageLiveness::new(replica_id.clone()).with_share_guard());
+        // The K11 guard: no staging until this stage is proven shared (the
+        // marker of a fresh, verified drain row is seen); until then PUTs
+        // write directly. The gate starts held, so nothing is staged and no
+        // missing file reads as absent before the first exchange.
+        if !handle.attach_stage_share_gate(liveness.share_gate()) {
+            bail!("the stage share gate was already attached");
+        }
+        crate::stage_liveness::spawn_probe_thread_with_markers(
+            &liveness,
+            crate::stage_liveness::file_probe(root, &replica_id),
+            Some(markers),
+            crate::stage_liveness::PROBE_INTERVAL,
+            stop.clone(),
+        )?;
+        liveness
+    };
     info!(
         replica_id = %replica_id,
         stale_after_millis = millis(liveness.stale_after()),

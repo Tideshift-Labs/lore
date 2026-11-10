@@ -221,6 +221,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_stale_occupancy_ledger_refusal_is_slow_down',
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_missing_stage_usage_row_is_internal_not_slow_down',
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_reservation_over_the_stage_policy_is_internal_not_slow_down',
+    'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_unproven_share_writes_directly_and_an_in_flight_staged_put_refuses',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observer_completes_inventory_across_more_than_one_bounded_scan',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_stalled_put_releases_the_single_domain_connection_and_survives_task_abort',
     'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',

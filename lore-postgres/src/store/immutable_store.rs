@@ -1947,7 +1947,13 @@ impl PostgresImmutableStore {
         // Re-read it, so a stage that began refusing while this PUT queued
         // takes no new preparation. `DirectFallback` still stages: it only
         // prefers direct writes, and staging is no less safe than before.
-        if matches!(stage.mode(), StagingMode::Refuse | StagingMode::Unready) {
+        // The one exception is the WP-115 K11 share guard: a stage not proven
+        // shared must receive no staged file at all, so a PUT that chose
+        // `Stage` before the guard held refuses here (`SlowDown`), and its
+        // retry writes directly.
+        if matches!(stage.mode(), StagingMode::Refuse | StagingMode::Unready)
+            || stage.share_unproven()
+        {
             return Err(staged_put_refusal("mode"));
         }
         let begin = coordinator

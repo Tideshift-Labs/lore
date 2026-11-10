@@ -52,11 +52,51 @@ pub struct StageProgressRecord {
     pub progressed_micros: i64,
 }
 
+/// Which kind of replica published a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StageLivenessRole {
+    /// A `role = "stage"` web replica. Also every row an older binary wrote.
+    #[default]
+    Stage,
+    /// The `role = "drain"` worker, while a read-back of its own stage marker
+    /// shows its current incarnation. It anchors the K11 shared-stage check
+    /// and is never a K11 eject peer.
+    Drain,
+    /// The drain worker while its own marker read-back fails or is too old.
+    /// Not an anchor, and not a K11 eject peer either.
+    DrainUnverified,
+}
+
+impl StageLivenessRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stage => "stage",
+            Self::Drain => "drain",
+            Self::DrainUnverified => "drain_unverified",
+        }
+    }
+
+    /// Decode a stored value. Anything not named here (also NULL) is
+    /// `Stage`.
+    pub fn from_stored(value: Option<&str>) -> Self {
+        match value {
+            Some("drain") => Self::Drain,
+            Some("drain_unverified") => Self::DrainUnverified,
+            _ => Self::Stage,
+        }
+    }
+}
+
 /// One peer's row.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StagePeerProgress {
     pub replica_id: String,
     pub record: StageProgressRecord,
+    /// Database time of the peer's last publication, in microseconds since
+    /// the Unix epoch.
+    pub published_micros: i64,
+    /// Who published the row.
+    pub role: StageLivenessRole,
 }
 
 /// What one exchange learned.
@@ -101,6 +141,8 @@ pub struct StageLivenessPublication {
     /// `None` before the first successful exchange: then no increase is
     /// accepted (a first row for a new incarnation is still written).
     pub clock: Option<StageLivenessClock>,
+    /// Who publishes.
+    pub role: StageLivenessRole,
 }
 
 /// The bounds of one exchange.
@@ -214,22 +256,38 @@ impl PostgresFragmentCoordinator {
         // Every CTE reads the snapshot from before the upsert, so `prior` is
         // this replica's row as another writer may have left it and `peers`
         // excludes this statement's own write.
+        //
+        // `stamp` reads `clock_timestamp()` once. The deadline test and the
+        // stored `progressed_at` use that one value, so the stored time is
+        // exactly the time that passed the test.
+        //
+        // The stamp is taken when the insert row is built, which is before
+        // any wait for this row's lock in `ON CONFLICT`. That is safe: the
+        // proof (`lore_server::stage_liveness`, steps 3 to 5) uses only the
+        // stored stamp `p` (it must pass the deadline and be later than the
+        // observer's baseline clock). A commit later than `p` can only hide
+        // the increase from views taken between `p` and the commit, so they
+        // err toward "no eject". The transaction's `statement_timeout` bounds
+        // the wait. Only this process writes this row (assumption A3), so the
+        // wait is normally zero.
         let row = tx
             .query_one(
-                "WITH prior AS ( \
+                "WITH stamp AS MATERIALIZED (SELECT clock_timestamp() AS at), \
+                 prior AS ( \
                    SELECT incarnation, progress, \
                      (extract(epoch FROM progressed_at) * 1000000)::bigint AS progressed_micros \
                    FROM lore_domain_write_behind_stage_progress \
                    WHERE cell_id = $1 AND replica_id = $2), \
                  published AS ( \
                    INSERT INTO lore_domain_write_behind_stage_progress AS stored \
-                     (cell_id, replica_id, incarnation, progress, progressed_at, published_at) \
+                     (cell_id, replica_id, incarnation, progress, progressed_at, published_at, \
+                      role) \
                    VALUES ($1, $2, $3, $4, \
-                     CASE WHEN $5::double precision <= $6::double precision \
+                     (SELECT CASE WHEN $5::double precision <= $6::double precision \
                        AND $7::bigint IS NOT NULL \
-                       AND (extract(epoch FROM clock_timestamp()) * 1000000)::bigint <= $7::bigint \
-                     THEN clock_timestamp() ELSE 'epoch'::timestamptz END, \
-                     now()) \
+                       AND (extract(epoch FROM stamp.at) * 1000000)::bigint <= $7::bigint \
+                     THEN stamp.at ELSE 'epoch'::timestamptz END FROM stamp), \
+                     now(), $9) \
                    ON CONFLICT (cell_id, replica_id) DO UPDATE SET \
                      incarnation = EXCLUDED.incarnation, \
                      (progress, progressed_at) = ( \
@@ -239,7 +297,8 @@ impl PostgresFragmentCoordinator {
                        FROM (SELECT stored.incarnation <> EXCLUDED.incarnation \
                          OR (EXCLUDED.progress > stored.progress \
                            AND EXCLUDED.progressed_at > 'epoch'::timestamptz) AS take) AS decision), \
-                     published_at = EXCLUDED.published_at \
+                     published_at = EXCLUDED.published_at, \
+                     role = EXCLUDED.role \
                    RETURNING incarnation, progress, \
                      (extract(epoch FROM progressed_at) * 1000000)::bigint AS progressed_micros), \
                  pruned AS ( \
@@ -249,7 +308,9 @@ impl PostgresFragmentCoordinator {
                    RETURNING 1), \
                  peers AS ( \
                    SELECT replica_id, incarnation, progress, \
-                     (extract(epoch FROM progressed_at) * 1000000)::bigint AS progressed_micros \
+                     (extract(epoch FROM progressed_at) * 1000000)::bigint AS progressed_micros, \
+                     (extract(epoch FROM published_at) * 1000000)::bigint AS published_micros, \
+                     role \
                    FROM lore_domain_write_behind_stage_progress \
                    WHERE cell_id = $1 AND replica_id <> $2) \
                  SELECT \
@@ -261,6 +322,10 @@ impl PostgresFragmentCoordinator {
                      '{}'::bigint[]) AS peer_progress, \
                    coalesce((SELECT array_agg(progressed_micros ORDER BY replica_id) FROM peers), \
                      '{}'::bigint[]) AS peer_progressed, \
+                   coalesce((SELECT array_agg(published_micros ORDER BY replica_id) FROM peers), \
+                     '{}'::bigint[]) AS peer_published, \
+                   coalesce((SELECT array_agg(role ORDER BY replica_id) FROM peers), \
+                     '{}'::text[]) AS peer_roles, \
                    (SELECT count(*) FROM published)::bigint AS published, \
                    (SELECT incarnation FROM published) AS published_incarnation, \
                    (SELECT progress FROM published) AS published_progress, \
@@ -279,6 +344,7 @@ impl PostgresFragmentCoordinator {
                     &limits.fresh_within.as_secs_f64(),
                     &deadline_micros,
                     &limits.retain.as_secs_f64(),
+                    &publication.role.as_str(),
                 ],
             )
             .await
@@ -295,7 +361,16 @@ impl PostgresFragmentCoordinator {
         let incarnations: Vec<String> = row.get("peer_incarnations");
         let progress: Vec<i64> = row.get("peer_progress");
         let progressed: Vec<i64> = row.get("peer_progressed");
-        if [incarnations.len(), progress.len(), progressed.len()] != [ids.len(); 3] {
+        let published_at: Vec<i64> = row.get("peer_published");
+        let roles: Vec<Option<String>> = row.get("peer_roles");
+        if [
+            incarnations.len(),
+            progress.len(),
+            progressed.len(),
+            published_at.len(),
+            roles.len(),
+        ] != [ids.len(); 5]
+        {
             return Err(DomainError::Internal(
                 "stage liveness exchange returned uneven peer columns".to_owned(),
             ));
@@ -305,14 +380,21 @@ impl PostgresFragmentCoordinator {
             .zip(incarnations)
             .zip(progress)
             .zip(progressed)
+            .zip(published_at)
+            .zip(roles)
             .map(
-                |(((replica_id, incarnation), progress), progressed_micros)| StagePeerProgress {
+                |(
+                    ((((replica_id, incarnation), progress), progressed_micros), published_micros),
+                    role,
+                )| StagePeerProgress {
                     replica_id,
+                    role: StageLivenessRole::from_stored(role.as_deref()),
                     record: StageProgressRecord {
                         incarnation,
                         progress,
                         progressed_micros,
                     },
+                    published_micros,
                 },
             )
             .collect();

@@ -8,9 +8,9 @@
 //! domain boot, the stored count never goes down, an increase is accepted
 //! only while fresh and on time on the database clock, a peer of another cell
 //! never counts, and the verdict each replica reaches from real exchanges is
-//! the one `/lb_health` answers. Two cases put a TCP proxy between a replica
-//! and Postgres that holds back the publish statement, as a slow network or a
-//! stalled host would.
+//! the one `/lb_health` answers. Some cases put a TCP proxy between a replica
+//! and Postgres that holds back the publish statement or its COMMIT, as a
+//! slow network or a stalled host would.
 //!
 //! Needs `LORE_TEST_PG_URL` (a database the run may create schemas in). An
 //! unset URL under `--ignored` panics: an unconfigured live case is NOT RUN,
@@ -32,6 +32,7 @@ use lore_postgres::domain::PostgresDomainStore;
 use lore_postgres::domain::fragments::PostgresFragmentCoordinator;
 use lore_postgres::domain::fragments::StageLivenessClock;
 use lore_postgres::domain::fragments::StageLivenessPublication;
+use lore_postgres::domain::fragments::StageLivenessRole;
 use lore_postgres::domain::fragments::StagePeerLiveness;
 use lore_postgres::pool::TlsConfig;
 use lore_server::fragment_write_behind::WriteBehindRole;
@@ -40,6 +41,8 @@ use lore_server::http::lb_health::verdict_from;
 use lore_server::stage_liveness::LivenessThresholds;
 use lore_server::stage_liveness::LivenessTick;
 use lore_server::stage_liveness::STAGE_UNAVAILABLE_LOCAL;
+use lore_server::stage_liveness::ShareMarkers;
+use lore_server::stage_liveness::ShareVerdict;
 use lore_server::stage_liveness::StageLiveness;
 use lore_server::stage_liveness::exchange_once;
 use lore_server::stage_liveness::liveness_tick;
@@ -58,6 +61,7 @@ fn thresholds() -> LivenessThresholds {
         publish_deadline: PUBLISH_DEADLINE,
         statement_timeout: Duration::from_secs(2),
         progress_window: Duration::from_secs(1),
+        ..LivenessThresholds::default()
     }
 }
 
@@ -242,6 +246,7 @@ mod delay_proxy {
     pub struct DelayProxy {
         pub addr: SocketAddr,
         delay_millis: Arc<AtomicU64>,
+        commit_millis: Arc<AtomicU64>,
     }
 
     impl DelayProxy {
@@ -249,21 +254,36 @@ mod delay_proxy {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let delay_millis = Arc::new(AtomicU64::new(0));
+            let commit_millis = Arc::new(AtomicU64::new(0));
             let delay = delay_millis.clone();
+            let commit = commit_millis.clone();
             lore_base::lore_spawn!(async move {
                 while let Ok((client, _)) = listener.accept().await {
                     let delay = delay.clone();
+                    let commit = commit.clone();
                     lore_base::lore_spawn!(async move {
-                        let _ = relay(client, upstream, delay).await;
+                        let _ = relay(client, upstream, delay, commit).await;
                     });
                 }
             });
-            Self { addr, delay_millis }
+            Self {
+                addr,
+                delay_millis,
+                commit_millis,
+            }
         }
 
         /// Hold back every liveness publish that reaches the proxy from now on.
         pub fn delay_publishes(&self, delay: Duration) {
             self.delay_millis
+                .store(u64::try_from(delay.as_millis()).unwrap(), Ordering::SeqCst);
+        }
+
+        /// Hold back every `COMMIT` that reaches the proxy from now on. The
+        /// statement before it has run, so its writes exist but are not yet
+        /// visible to other sessions.
+        pub fn delay_commits(&self, delay: Duration) {
+            self.commit_millis
                 .store(u64::try_from(delay.as_millis()).unwrap(), Ordering::SeqCst);
         }
     }
@@ -272,6 +292,7 @@ mod delay_proxy {
         client: TcpStream,
         upstream: SocketAddr,
         delay: Arc<AtomicU64>,
+        commit: Arc<AtomicU64>,
     ) -> std::io::Result<()> {
         let server = TcpStream::connect(upstream).await?;
         let (mut client_read, mut client_write) = client.into_split();
@@ -314,6 +335,14 @@ mod delay_proxy {
                     let name = fields.next().unwrap_or_default();
                     let millis = delay.load(Ordering::SeqCst);
                     if statements.get(name).copied().unwrap_or(false) && millis > 0 {
+                        tokio::time::sleep(Duration::from_millis(millis)).await;
+                    }
+                }
+                // A simple query: `transaction().commit()` sends `COMMIT`.
+                b'Q' => {
+                    let query = String::from_utf8_lossy(&body).to_uppercase();
+                    let millis = commit.load(Ordering::SeqCst);
+                    if query.trim_end_matches('\0').trim() == "COMMIT" && millis > 0 {
                         tokio::time::sleep(Duration::from_millis(millis)).await;
                     }
                 }
@@ -655,6 +684,7 @@ async fn the_stored_count_only_moves_forward_and_only_on_time() {
             progress,
             last_good: Instant::now().checked_sub(age).unwrap(),
             clock,
+            role: StageLivenessRole::Stage,
         };
         let coordinator = &coordinator;
         async move {
@@ -765,6 +795,7 @@ async fn departed_rows_are_pruned_and_ids_are_bounded() {
         progress: 0,
         last_good: Instant::now(),
         clock: None,
+        role: StageLivenessRole::Stage,
     };
     let long_id = "x".repeat(129);
     let long_incarnation = "y".repeat(65);
@@ -845,4 +876,551 @@ async fn a_draining_peer_withdraws_and_no_longer_ejects_a_stale_replica() {
 
     drop(store);
     namespace.release().await;
+}
+
+// ---------------------------------------------------------------------------
+// WP-115 K11 guard: real exchanges, real stage directories, a drain anchor.
+// ---------------------------------------------------------------------------
+
+const SHARE_GRACE: Duration = Duration::from_millis(600);
+const SHARE_PEER_FRESH: Duration = Duration::from_secs(1);
+const NOT_SHARED: (StatusCode, &str) = (
+    StatusCode::SERVICE_UNAVAILABLE,
+    lore_server::stage_liveness::STAGE_NOT_SHARED,
+);
+const UNVERIFIED: (StatusCode, &str) = (
+    StatusCode::SERVICE_UNAVAILABLE,
+    lore_server::stage_liveness::STAGE_SHARE_UNVERIFIED,
+);
+/// The wire word for a replica whose first exchange has not succeeded for
+/// the grace.
+const PENDING_TOO_LONG: (StatusCode, &str) =
+    (StatusCode::SERVICE_UNAVAILABLE, "stage_share_pending");
+
+fn guarded(id: &str) -> StageLiveness {
+    StageLiveness::with_thresholds(
+        id.to_owned(),
+        LivenessThresholds {
+            share_grace: SHARE_GRACE,
+            share_peer_fresh: SHARE_PEER_FRESH,
+            ..thresholds()
+        },
+    )
+    .with_share_guard()
+}
+
+fn drain(id: &str) -> StageLiveness {
+    StageLiveness::with_thresholds(id.to_owned(), thresholds()).with_role(StageLivenessRole::Drain)
+}
+
+/// One probe-thread (or drain marker-thread) step, as the real thread runs
+/// it.
+fn markers_step(replica: &StageLiveness, markers: &ShareMarkers) {
+    replica
+        .share_step(markers)
+        .expect("the own marker must be written");
+}
+
+/// Whether staging is off: the gate the stage reads.
+fn held(replica: &StageLiveness) -> bool {
+    replica
+        .share_gate()
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// The role this cell's table holds for `id`, as a peer reads it.
+async fn stored_role(
+    coordinator: &PostgresFragmentCoordinator,
+    reader: &StageLiveness,
+    id: &str,
+) -> Option<StageLivenessRole> {
+    coordinator
+        .exchange_stage_liveness(
+            CELL,
+            reader.replica_id(),
+            &reader.publication(),
+            reader.limits(),
+        )
+        .await
+        .expect("raw exchange")
+        .peers
+        .iter()
+        .find(|peer| peer.replica_id == id)
+        .map(|peer| peer.role)
+}
+
+/// The first web replica, no drain row: it serves (200) and never stages.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn the_first_replica_alone_serves_without_staging() {
+    let (namespace, store) = boot("k11-guard-alone").await;
+    let coordinator = store.fragment_coordinator();
+    let stage = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(stage.path());
+    let first = guarded("web-a");
+    assert!(
+        held(&first),
+        "control: nothing is proven before an exchange"
+    );
+    assert_eq!(lb_health(&first), OK, "pending is 200");
+    markers_step(&first, &markers);
+    exchange(&coordinator, CELL, &first).await;
+    markers_step(&first, &markers);
+    assert_eq!(lb_health(&first), OK);
+    assert!(held(&first), "no drain row proves the stage, so no staging");
+    assert_eq!(first.share_verdict(Instant::now()), ShareVerdict::NoAnchor);
+    drop(store);
+    namespace.release().await;
+}
+
+/// The drain and two web replicas on one stage: both web replicas stage once
+/// they see the drain's marker.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn two_replicas_on_the_drains_stage_both_stage() {
+    let (namespace, store) = boot("k11-guard-shared").await;
+    let coordinator = store.fragment_coordinator();
+    let stage = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(stage.path());
+    let worker = drain("drain-1");
+    markers_step(&worker, &markers);
+    exchange(&coordinator, CELL, &worker).await;
+    let a = guarded("web-a");
+    let b = guarded("web-b");
+    for replica in [&a, &b] {
+        markers_step(replica, &markers);
+        exchange(&coordinator, CELL, replica).await;
+        // The real probe thread checks markers after the exchange names them.
+        markers_step(replica, &markers);
+    }
+    tokio::time::sleep(SHARE_GRACE + Duration::from_millis(100)).await;
+    markers_step(&worker, &markers);
+    exchange(&coordinator, CELL, &worker).await;
+    exchange(&coordinator, CELL, &a).await;
+    exchange(&coordinator, CELL, &b).await;
+    assert_eq!(lb_health(&a), OK);
+    assert_eq!(lb_health(&b), OK);
+    assert!(!held(&a) && !held(&b));
+    assert_eq!(
+        a.snapshot(Instant::now()).peers,
+        Some(1),
+        "the drain row is not a K11 peer"
+    );
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review probe R2, now a test. Cold boot with no drain row: web-a (first)
+/// on a WRONG directory, web-b on the real stage. For three graces neither
+/// stages and neither is ejected. (Before this fix web-a, the earliest by
+/// join, opened staging on the wrong directory and web-b answered 503.)
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn with_no_drain_row_no_replica_stages_and_none_is_ejected() {
+    let (namespace, store) = boot("k11-guard-r2").await;
+    let coordinator = store.fragment_coordinator();
+    let (real, wrong) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (real_markers, wrong_markers) = (
+        ShareMarkers::new(real.path()),
+        ShareMarkers::new(wrong.path()),
+    );
+    let a = guarded("web-a");
+    let b = guarded("web-b");
+    markers_step(&a, &wrong_markers);
+    exchange(&coordinator, CELL, &a).await;
+    let deadline = Instant::now() + SHARE_GRACE * 3;
+    while Instant::now() < deadline {
+        markers_step(&a, &wrong_markers);
+        markers_step(&b, &real_markers);
+        exchange(&coordinator, CELL, &a).await;
+        exchange(&coordinator, CELL, &b).await;
+        for replica in [&a, &b] {
+            assert!(held(replica), "{} must not stage", replica.replica_id());
+            assert_eq!(lb_health(replica), OK, "{}", replica.replica_id());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(a.share_verdict(Instant::now()), ShareVerdict::NoAnchor);
+    assert_eq!(b.share_verdict(Instant::now()), ShareVerdict::NoAnchor);
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review probe R1, now a test. Both web replicas ARE on the drain's stage,
+/// the drain's row is fresh, but the drain cannot write its marker (a
+/// directory sits at the marker path, as an EACCES or a wrong-uid
+/// `liveness/` would). The drain publishes `drain_unverified`, so it anchors
+/// nobody: both web replicas answer 200 and write directly, past the grace.
+/// (Before this fix both answered 503, a whole-cell eject.) When the drain
+/// can write its marker again, both web replicas see it and stage.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_drain_that_cannot_read_its_marker_back_anchors_nobody() {
+    let (namespace, store) = boot("k11-guard-r1").await;
+    let coordinator = store.fragment_coordinator();
+    let real = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(real.path());
+    let worker = drain("drain-1");
+    let blocker = real.path().join("liveness").join("drain-1.present");
+    std::fs::create_dir_all(&blocker).unwrap();
+    assert!(
+        worker.share_step(&markers).is_err(),
+        "control: the drain marker write fails"
+    );
+    let a = guarded("web-a");
+    let b = guarded("web-b");
+    let deadline = Instant::now() + SHARE_GRACE + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        assert!(worker.share_step(&markers).is_err());
+        exchange(&coordinator, CELL, &worker).await;
+        markers_step(&a, &markers);
+        markers_step(&b, &markers);
+        exchange(&coordinator, CELL, &a).await;
+        exchange(&coordinator, CELL, &b).await;
+        for replica in [&a, &b] {
+            assert_eq!(lb_health(replica), OK, "{}", replica.replica_id());
+            assert!(held(replica), "{} must not stage", replica.replica_id());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        stored_role(&coordinator, &a, "drain-1").await,
+        Some(StageLivenessRole::DrainUnverified)
+    );
+    assert_eq!(
+        worker.fault(Instant::now()),
+        Some(lore_server::stage_liveness::STAGE_ANCHOR_UNVERIFIED)
+    );
+
+    // The drain's marker becomes writable again: it anchors, and both web
+    // replicas, on the same stage, see it and stage.
+    std::fs::remove_dir(&blocker).unwrap();
+    markers_step(&worker, &markers);
+    exchange(&coordinator, CELL, &worker).await;
+    assert_eq!(worker.fault(Instant::now()), None);
+    for replica in [&a, &b] {
+        exchange(&coordinator, CELL, replica).await;
+        markers_step(replica, &markers);
+        assert_eq!(lb_health(replica), OK);
+        assert!(!held(replica), "{} stages", replica.replica_id());
+    }
+    assert_eq!(
+        stored_role(&coordinator, &a, "drain-1").await,
+        Some(StageLivenessRole::Drain)
+    );
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review probe RV3-B, now a test. The drain anchors on the real stage, and
+/// both web replicas boot unproven while every read of the drain's marker on
+/// their hosts fails with an I/O error (a directory at the marker path, as a
+/// stale handle or `EIO` would). That is "cannot decide": past the grace both
+/// answer 200 and keep staging off, so new fragments are written directly.
+/// (Before this fix both answered 503 `stage_share_unverified`, then
+/// `stage_not_shared`: a whole-cell eject.) When the reads work again and
+/// show the marker, both stage.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn marker_read_errors_on_both_unproven_replicas_answer_200_with_direct_writes() {
+    let (namespace, store) = boot("k11-guard-rv3b").await;
+    let coordinator = store.fragment_coordinator();
+    let real = tempfile::tempdir().unwrap();
+    let real_markers = ShareMarkers::new(real.path());
+    let worker = drain("drain-1");
+    markers_step(&worker, &real_markers);
+    exchange(&coordinator, CELL, &worker).await;
+    // The verdict `Undecided` below needs a fresh `drain` row (without one it
+    // is `NoAnchor`), so each loop step also proves the drain anchors.
+
+    let a = guarded("web-a");
+    let b = guarded("web-b");
+    let (stage_a, stage_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let blockers: Vec<_> = [&stage_a, &stage_b]
+        .iter()
+        .map(|stage| stage.path().join("liveness").join("drain-1.present"))
+        .collect();
+    for blocker in &blockers {
+        std::fs::create_dir_all(blocker).unwrap();
+    }
+    let (markers_a, markers_b) = (
+        ShareMarkers::new(stage_a.path()),
+        ShareMarkers::new(stage_b.path()),
+    );
+    assert!(
+        markers_a.read("drain-1").is_err() && markers_b.read("drain-1").is_err(),
+        "control: the web replicas' marker reads fail with an I/O error"
+    );
+    let deadline = Instant::now() + SHARE_GRACE + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        markers_step(&worker, &real_markers);
+        exchange(&coordinator, CELL, &worker).await;
+        for (replica, markers) in [(&a, &markers_a), (&b, &markers_b)] {
+            exchange(&coordinator, CELL, replica).await;
+            markers_step(replica, markers);
+            assert_eq!(lb_health(replica), OK, "{}", replica.replica_id());
+            assert!(held(replica), "{} writes directly", replica.replica_id());
+            assert_eq!(
+                replica.share_verdict(Instant::now()),
+                ShareVerdict::Undecided,
+                "{}",
+                replica.replica_id()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(a.snapshot(Instant::now()).share, Some("undecided"));
+
+    // The reads work again and show the drain's marker: both stage.
+    let incarnation = worker.incarnation().to_owned();
+    for (blocker, markers) in blockers.iter().zip([&markers_a, &markers_b]) {
+        std::fs::remove_dir(blocker).unwrap();
+        markers.ensure("drain-1", &incarnation).unwrap();
+    }
+    markers_step(&worker, &real_markers);
+    exchange(&coordinator, CELL, &worker).await;
+    for (replica, markers) in [(&a, &markers_a), (&b, &markers_b)] {
+        exchange(&coordinator, CELL, replica).await;
+        markers_step(replica, markers);
+        assert_eq!(lb_health(replica), OK);
+        assert!(!held(replica), "{} stages", replica.replica_id());
+    }
+    drop(store);
+    namespace.release().await;
+}
+
+/// The anchor. The first web replica is on its own directory; the drain and
+/// a later web replica share the real stage. The misplaced one answers 503
+/// and never stages; the other stages. A proven replica stays proven: the
+/// drain's restart (marker not yet written) does not hold it.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_drain_anchors_the_check_and_holds_a_misplaced_replica() {
+    let (namespace, store) = boot("k11-guard-anchor").await;
+    let coordinator = store.fragment_coordinator();
+    let (real, wrong) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (real_markers, wrong_markers) = (
+        ShareMarkers::new(real.path()),
+        ShareMarkers::new(wrong.path()),
+    );
+    let worker = drain("drain-1");
+    markers_step(&worker, &real_markers);
+    exchange(&coordinator, CELL, &worker).await;
+    let early = guarded("web-a");
+    let late = guarded("web-b");
+    markers_step(&early, &wrong_markers);
+    exchange(&coordinator, CELL, &early).await;
+    markers_step(&late, &real_markers);
+    exchange(&coordinator, CELL, &late).await;
+    markers_step(&early, &wrong_markers);
+    markers_step(&late, &real_markers);
+    assert_eq!(lb_health(&late), OK, "web-b sees the drain's marker");
+    assert!(!held(&late));
+    assert_eq!(lb_health(&early), UNVERIFIED);
+    assert!(held(&early));
+    tokio::time::sleep(SHARE_GRACE + Duration::from_millis(100)).await;
+    markers_step(&worker, &real_markers);
+    exchange(&coordinator, CELL, &worker).await;
+    exchange(&coordinator, CELL, &early).await;
+    markers_step(&early, &wrong_markers);
+    assert_eq!(lb_health(&early), NOT_SHARED);
+    assert!(held(&early));
+    assert_eq!(worker.share_verdict(Instant::now()), ShareVerdict::Shared);
+    assert_eq!(
+        worker.fault(Instant::now()),
+        None,
+        "the drain is never held"
+    );
+
+    let restarted = drain("drain-1");
+    exchange(&coordinator, CELL, &restarted).await;
+    exchange(&coordinator, CELL, &late).await;
+    markers_step(&late, &real_markers);
+    assert_eq!(lb_health(&late), OK);
+    assert!(!held(&late));
+    drop(store);
+    namespace.release().await;
+}
+
+/// A drain row older than the fresh window is no anchor: the replica serves
+/// and does not stage. It never waits for the drain.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_stale_drain_row_is_no_anchor() {
+    let (namespace, store) = boot("k11-guard-stale-drain").await;
+    let coordinator = store.fragment_coordinator();
+    let real = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(real.path());
+    let worker = drain("drain-1");
+    markers_step(&worker, &markers);
+    exchange(&coordinator, CELL, &worker).await;
+    tokio::time::sleep(SHARE_PEER_FRESH + Duration::from_millis(200)).await;
+    let first = guarded("web-a");
+    markers_step(&first, &markers);
+    exchange(&coordinator, CELL, &first).await;
+    markers_step(&first, &markers);
+    assert_eq!(lb_health(&first), OK, "a stale drain row is not an anchor");
+    assert!(held(&first));
+    assert_eq!(first.share_verdict(Instant::now()), ShareVerdict::NoAnchor);
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review probe P1, the cold-boot race. Two web replicas exchange before the
+/// drain's first row: web-a on a WRONG directory, web-c on the real stage.
+/// Neither stages and both answer 200 until the drain row appears. Then
+/// web-a answers 503 (unverified, then not shared) and still never stages;
+/// web-c sees the marker and stages, for life. A web replica that boots
+/// after the drain on the real stage stages too.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_cold_boot_stages_nothing_until_the_drains_marker_is_seen() {
+    let (namespace, store) = boot("k11-guard-cold-boot").await;
+    let coordinator = store.fragment_coordinator();
+    let (real, wrong) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (real_markers, wrong_markers) = (
+        ShareMarkers::new(real.path()),
+        ShareMarkers::new(wrong.path()),
+    );
+    let early = guarded("web-a");
+    let other = guarded("web-c");
+    markers_step(&early, &wrong_markers);
+    exchange(&coordinator, CELL, &early).await;
+    markers_step(&other, &real_markers);
+    exchange(&coordinator, CELL, &other).await;
+    for replica in [&early, &other] {
+        assert_eq!(lb_health(replica), OK, "no drain row: 200");
+        assert!(held(replica), "no drain row: no staging");
+    }
+
+    let worker = drain("drain-1");
+    markers_step(&worker, &real_markers);
+    exchange(&coordinator, CELL, &worker).await;
+    exchange(&coordinator, CELL, &early).await;
+    exchange(&coordinator, CELL, &other).await;
+    assert_eq!(lb_health(&early), UNVERIFIED);
+    assert!(held(&early));
+    let deadline = Instant::now() + SHARE_GRACE + Duration::from_millis(200);
+    while Instant::now() < deadline {
+        markers_step(&early, &wrong_markers);
+        markers_step(&other, &real_markers);
+        markers_step(&worker, &real_markers);
+        exchange(&coordinator, CELL, &worker).await;
+        exchange(&coordinator, CELL, &early).await;
+        exchange(&coordinator, CELL, &other).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        lb_health(&early),
+        NOT_SHARED,
+        "the misplaced replica leaves"
+    );
+    assert!(held(&early));
+    assert_eq!(lb_health(&other), OK, "web-c sees the drain's marker");
+    assert!(!held(&other));
+
+    let restarted = drain("drain-1");
+    exchange(&coordinator, CELL, &restarted).await;
+    exchange(&coordinator, CELL, &other).await;
+    markers_step(&other, &real_markers);
+    assert_eq!(lb_health(&other), OK);
+    assert!(!held(&other), "an anchor proof is for life");
+
+    markers_step(&restarted, &real_markers);
+    exchange(&coordinator, CELL, &restarted).await;
+    let late = guarded("web-b");
+    markers_step(&late, &real_markers);
+    exchange(&coordinator, CELL, &late).await;
+    markers_step(&late, &real_markers);
+    assert_eq!(lb_health(&late), OK);
+    assert!(!held(&late));
+    drop(store);
+    namespace.release().await;
+}
+
+/// The network holds the drain's COMMIT back 800 ms. A web replica that
+/// exchanges in that window sees no drain row: it answers 200 and does not
+/// stage. Once the row is visible it answers 503 unverified until its next
+/// marker step, then stages. Every step checks the `/lb_health` word.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_late_drain_commit_keeps_web_replicas_direct_until_it_is_visible() {
+    let (namespace, store) = boot("k11-guard-late-commit").await;
+    let coordinator = store.fragment_coordinator();
+    let upstream = upstream_addr(namespace.pg_url());
+    let proxy = delay_proxy::DelayProxy::start(upstream).await;
+    let drain_store = PostgresDomainStore::connect(
+        &via(namespace.pg_url(), upstream, proxy.addr),
+        1,
+        &TlsConfig::default(),
+    )
+    .await
+    .expect("boot through the proxy");
+    let delayed = drain_store.fragment_coordinator();
+    let stage = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(stage.path());
+    let worker = drain("drain-1");
+    let b = guarded("web-b");
+    markers_step(&worker, &markers);
+    markers_step(&b, &markers);
+
+    proxy.delay_commits(Duration::from_millis(800));
+    let b_early = std::sync::Mutex::new(None);
+    let drain_first = exchange(&delayed, CELL, &worker);
+    let web_first = async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        exchange(&coordinator, CELL, &b).await;
+        markers_step(&b, &markers);
+        *b_early.lock().unwrap() = Some((lb_health(&b), held(&b), b.share_verdict(Instant::now())));
+    };
+    tokio::join!(drain_first, web_first);
+    proxy.delay_commits(Duration::ZERO);
+    assert_eq!(
+        b_early.into_inner().unwrap(),
+        Some((OK, true, ShareVerdict::NoAnchor)),
+        "before the drain row is visible: 200, no staging"
+    );
+
+    // Keep the drain row inside the (scaled) fresh window: the delayed
+    // statement stamped `published_at` at its start.
+    markers_step(&worker, &markers);
+    exchange(&coordinator, CELL, &worker).await;
+    exchange(&coordinator, CELL, &b).await;
+    assert_eq!(
+        lb_health(&b),
+        UNVERIFIED,
+        "the row is visible, marker not yet checked"
+    );
+    assert!(held(&b));
+    markers_step(&b, &markers);
+    assert_eq!(lb_health(&b), OK);
+    assert!(!held(&b), "the drain's marker is seen: staging opens");
+    drop((store, drain_store));
+    namespace.release().await;
+}
+
+/// Review probe P3. Postgres is slower than the exchange timeout at boot,
+/// so no exchange completes. Staging stays off, and after the grace
+/// `/lb_health` answers 503 `stage_share_pending`, not 200.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_replica_with_no_exchange_after_the_grace_answers_503() {
+    let a = guarded("web-a");
+    assert_eq!(lb_health(&a), OK, "inside the grace pending is 200");
+    let deadline = Instant::now() + SHARE_GRACE + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        let ok = exchange_once(
+            &a,
+            |_publication| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Err::<StagePeerLiveness, String>("slow".to_owned())
+            },
+            Duration::from_millis(200),
+            &mut None,
+        )
+        .await;
+        assert!(!ok, "control: the exchange times out");
+    }
+    assert!(held(&a));
+    assert_eq!(lb_health(&a), PENDING_TOO_LONG);
 }

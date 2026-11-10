@@ -421,8 +421,9 @@ pub struct WriteBehindConfig {
     pub role: Option<crate::fragment_write_behind::WriteBehindRole>,
     /// FORK-LOCAL (Tideshift), WP-115 K11: the per-replica stage liveness
     /// probe that lets `/lb_health` eject a stage replica whose own mount is
-    /// stale while a peer's is fresh. On by default for `role = "stage"`;
-    /// `false` turns it off. Refused on any other role, where it has no effect.
+    /// stale while a peer's is fresh. On by default for `role = "stage"` and
+    /// `role = "drain"` (the drain keeps the shared-stage anchor marker and
+    /// row); `false` turns it off. Refused on `full`, where it has no effect.
     pub stage_liveness_probe: Option<bool>,
 }
 
@@ -1074,8 +1075,9 @@ fn validated_write_behind_role(
 }
 
 /// FORK-LOCAL (Tideshift), WP-115 K11: whether the stage liveness probe runs.
-/// On by default; only a `stage` replica runs it, so setting it on another
-/// role is refused like any other knob with no effect.
+/// On by default; `stage` and `drain` replicas run it (the drain as the
+/// shared-stage anchor), so setting it on `full` is refused like any other
+/// knob with no effect.
 #[lore_macro::test_pub]
 fn validated_stage_liveness_probe(
     name: &str,
@@ -1084,10 +1086,17 @@ fn validated_stage_liveness_probe(
     use crate::fragment_write_behind::WriteBehindRole;
     match raw.stage_liveness_probe {
         None => Ok(true),
-        Some(enabled) if raw.role == Some(WriteBehindRole::Stage) => Ok(enabled),
+        Some(enabled)
+            if matches!(
+                raw.role,
+                Some(WriteBehindRole::Stage | WriteBehindRole::Drain)
+            ) =>
+        {
+            Ok(enabled)
+        }
         Some(_) => Err(write_behind_error(
             name,
-            "stage_liveness_probe applies only to role = \"stage\"",
+            "stage_liveness_probe applies only to role = \"stage\" or \"drain\"",
         )),
     }
 }

@@ -368,6 +368,112 @@ async fn admission_lost_root_with_no_pending_staged_bytes_falls_back_to_direct_w
     );
 }
 
+/// WP-115 K11 guard at the store adapter. While the share gate holds (the
+/// stage is not proven shared with the drain), a PUT that would stage writes
+/// directly instead: `DirectFallback` is the real route, with no stage
+/// custody. A PUT that chose `Stage` before the gate rose, and then waited for
+/// a staging slot, refuses with `SlowDown` at its re-check and leaves no row;
+/// its retry writes directly. A fragment staged while the gate was open stays
+/// readable and the drain still promotes it. So a switch from `Stage` to
+/// `DirectFallback` in the middle of a write loses nothing and stages nothing.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn admission_unproven_share_writes_directly_and_an_in_flight_staged_put_refuses() {
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    bind_repository(&fixture).await;
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 1);
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 1);
+    observe_settled(&fixture).await;
+    fixture.handle.note_drain_heartbeat();
+    assert_eq!(fixture.handle.mode(), StagingMode::Stage, "control");
+
+    let gate = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(fixture.stage.attach_share_gate(gate.clone()));
+    assert_eq!(
+        fixture.handle.mode(),
+        StagingMode::DirectFallback,
+        "an unproven stage writes directly"
+    );
+    let unproven = fragment_bytes("share-unproven");
+    accept(&fixture, &unproven);
+    put(&fixture.store, &unproven)
+        .await
+        .expect("an unproven stage falls back to a direct write");
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        readable_state(&fixture, &unproven).await,
+        Some(FragmentLifecycleState::Remote)
+    );
+    for (table, count) in rows_for(&fixture, &unproven).await {
+        if table == "lore_fragment_stage_custody" {
+            assert_eq!(count, 0, "a direct write takes no stage custody");
+        }
+    }
+
+    // Proven: the next PUT stages.
+    gate.store(false, Ordering::Release);
+    assert_eq!(fixture.handle.mode(), StagingMode::Stage);
+    let staged = fragment_bytes("share-proven");
+    accept(&fixture, &staged);
+    put(&fixture.store, &staged)
+        .await
+        .expect("a proven stage stages");
+    assert_eq!(
+        readable_state(&fixture, &staged).await,
+        Some(FragmentLifecycleState::Staged)
+    );
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 2);
+
+    // In flight: the PUT chooses `Stage`, then waits for a staging slot. The
+    // gate rises while it waits.
+    let permits = std::iter::from_fn(|| {
+        fixture
+            .stage
+            .root()
+            .try_io_permit(crate::store::write_behind::StageIoPath::Put)
+            .ok()
+    })
+    .take(64)
+    .collect::<Vec<_>>();
+    assert!(!permits.is_empty(), "the case holds every staging slot");
+    let in_flight = fragment_bytes("share-in-flight");
+    accept(&fixture, &in_flight);
+    let raise = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        gate.store(true, Ordering::Release);
+        drop(permits);
+    };
+    let (refused, ()) = tokio::join!(put(&fixture.store, &in_flight), raise);
+    assert!(
+        matches!(&refused, Err(error) if error.is_slow_down()),
+        "a staged PUT whose stage lost its proof refuses at the re-check, got {refused:?}"
+    );
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 2);
+    for (table, count) in rows_for(&fixture, &in_flight).await {
+        assert_eq!(count, 0, "the refused PUT writes no {table} row");
+    }
+    put(&fixture.store, &in_flight)
+        .await
+        .expect("the retry writes directly");
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 3);
+    assert_eq!(
+        readable_state(&fixture, &in_flight).await,
+        Some(FragmentLifecycleState::Remote)
+    );
+
+    // The fragment staged while the gate was open is not lost.
+    assert_eq!(
+        readable_state(&fixture, &staged).await,
+        Some(FragmentLifecycleState::Staged)
+    );
+    assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 1);
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        readable_state(&fixture, &staged).await,
+        Some(FragmentLifecycleState::Remote)
+    );
+}
+
 /// Observe until `done` holds for one observation, and return it.
 async fn observe_until(
     fixture: &Fixture,

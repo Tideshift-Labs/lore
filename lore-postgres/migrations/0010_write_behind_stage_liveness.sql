@@ -37,3 +37,16 @@ CREATE TABLE IF NOT EXISTS lore_domain_write_behind_stage_progress (
         AND progress >= 0
     )
 );
+
+-- WP-115 K11 guard: `role` is `stage`, `drain` or `drain_unverified`. The
+-- drain worker publishes a row and keeps a marker in the stage. It publishes
+-- `drain` only while a read-back of its own marker shows its current
+-- incarnation, else `drain_unverified`. A stage replica stages only after it
+-- has seen the marker of a fresh `drain` row; until then it writes directly
+-- to the object store. A drain row is never a K11 eject peer, and its count
+-- never rises, so an older binary never counts it as progress either.
+-- Nullable: rows written by an older binary have none (NULL reads as
+-- `stage`). An `ADD COLUMN IF NOT EXISTS`, so a database that ran the earlier
+-- form of this file gets the column on the next boot.
+ALTER TABLE lore_domain_write_behind_stage_progress
+    ADD COLUMN IF NOT EXISTS role text;

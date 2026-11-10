@@ -412,6 +412,76 @@ async fn a_fragment_that_was_never_staged_reads_as_decisive_absent() {
     );
 }
 
+/// WP-115 K11 guard, end to end on a real root: while the share gate is
+/// held, a missing staged file is `Unavailable` (never `Absent`, which would
+/// demote a peer's fragment) and a mode that would stage is `DirectFallback`
+/// (a direct write, so nothing is staged and nothing is refused). A staged
+/// file is still found. Releasing the gate restores decisive absence and the
+/// mode it had.
+#[tokio::test]
+async fn a_held_share_gate_never_answers_absent_and_never_stages() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    let root = ScratchRoot::new("share-gate");
+    let stage = open(&root);
+    let present = random_hash();
+    let present_key = staged_key(&present, 0);
+    let payload = Bytes::from_static(b"lore-write-behind-share-gate");
+    stage
+        .stage(&present, 0, &present_key, &payload)
+        .await
+        .expect("stage before the gate is attached");
+    // A live drain heartbeat is what lets a healthy tier choose `Stage`.
+    stage.note_drain_heartbeat();
+    let mode_before = stage.mode();
+    assert_eq!(
+        mode_before,
+        StagingMode::Stage,
+        "control: a healthy tier stages"
+    );
+
+    let gate = Arc::new(AtomicBool::new(true));
+    assert!(stage.attach_share_gate(gate.clone()));
+    assert!(
+        !stage.attach_share_gate(Arc::new(AtomicBool::new(false))),
+        "a second gate is refused"
+    );
+    let missing = random_hash();
+    let missing_key = staged_key(&missing, 0);
+    let read = stage.read_staged(&missing, 0, &missing_key).await;
+    assert!(
+        matches!(
+            read,
+            StagedRead::Unavailable(WriteBehindError::RootShareUnproven)
+        ),
+        "a held gate must never read as absence, got {read:?}"
+    );
+    assert!(matches!(
+        stage
+            .read_staged_foreground(&missing, 0, &missing_key)
+            .await,
+        StagedRead::Unavailable(WriteBehindError::RootShareUnproven)
+    ));
+    assert_eq!(
+        found_bytes(stage.read_staged(&present, 0, &present_key).await),
+        payload
+    );
+    assert_eq!(
+        stage.mode(),
+        StagingMode::DirectFallback,
+        "an unproven stage writes directly; it neither stages nor refuses"
+    );
+
+    gate.store(false, Ordering::Release);
+    assert!(matches!(
+        stage.read_staged(&missing, 0, &missing_key).await,
+        StagedRead::Absent
+    ));
+    assert_eq!(stage.mode(), mode_before);
+}
+
 /// THE CASE THAT MATTERS MOST.
 ///
 /// A staging root that goes away at runtime (unmounted, or the process loses

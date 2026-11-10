@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use axum::http::StatusCode;
 use lore_postgres::domain::fragments::StageLivenessPublication;
+use lore_postgres::domain::fragments::StageLivenessRole;
 use lore_postgres::domain::fragments::StagePeerLiveness;
 use lore_postgres::domain::fragments::StagePeerProgress;
 use lore_postgres::domain::fragments::StageProgressRecord;
@@ -43,6 +44,7 @@ fn view(clock: i64, peers: &[(&str, &str, i64, i64)]) -> StagePeerLiveness {
             .map(|(id, incarnation, progress, at)| StagePeerProgress {
                 replica_id: (*id).to_owned(),
                 record: record(incarnation, *progress, *at),
+                ..StagePeerProgress::default()
             })
             .collect(),
         db_clock_micros: clock,
@@ -688,4 +690,726 @@ async fn a_draining_replica_withdraws_once_and_never_publishes() {
         (1, 2),
         "a draining replica must never publish again, and withdraws once it succeeds"
     );
+}
+
+// ---------------------------------------------------------------------------
+// WP-115 K11 guard: the shared-stage check.
+// ---------------------------------------------------------------------------
+
+const GRACE: Duration = Duration::from_millis(200);
+
+fn guarded(id: &str) -> StageLiveness {
+    StageLiveness::with_thresholds(
+        id.to_owned(),
+        LivenessThresholds {
+            share_grace: GRACE,
+            ..LivenessThresholds::default()
+        },
+    )
+    .with_share_guard()
+}
+
+fn drain_worker(id: &str) -> StageLiveness {
+    StageLiveness::with_thresholds(id.to_owned(), LivenessThresholds::default())
+        .with_role(StageLivenessRole::Drain)
+}
+
+/// A view at database time `clock` with stage peers as
+/// `(replica, incarnation, published)`.
+fn share_view(clock: i64, peers: &[(&str, &str, i64)]) -> StagePeerLiveness {
+    StagePeerLiveness {
+        peers: peers
+            .iter()
+            .map(|(id, incarnation, published)| StagePeerProgress {
+                replica_id: (*id).to_owned(),
+                record: record(incarnation, 1, 0),
+                published_micros: *published,
+                role: StageLivenessRole::Stage,
+            })
+            .collect(),
+        db_clock_micros: clock,
+        ..StagePeerLiveness::default()
+    }
+}
+
+/// `view` plus drain rows `(replica, incarnation, published, role)`.
+fn with_drains(
+    mut view: StagePeerLiveness,
+    drains: &[(&str, &str, i64, StageLivenessRole)],
+) -> StagePeerLiveness {
+    for (id, incarnation, published, role) in drains {
+        view.peers.push(StagePeerProgress {
+            replica_id: (*id).to_owned(),
+            record: record(incarnation, 0, 0),
+            published_micros: *published,
+            role: *role,
+        });
+    }
+    view
+}
+
+fn gate_held(replica: &StageLiveness) -> bool {
+    replica.share_gate().load(Ordering::Acquire)
+}
+
+/// The gate the stage reads and the verdict the gauge reads must agree:
+/// staging is off exactly when the verdict holds staging.
+fn assert_gate_agrees(replica: &StageLiveness, now: Instant) {
+    assert_eq!(
+        gate_held(replica),
+        replica.share_verdict(now).holds_staging(),
+        "gate and verdict disagree at {:?}",
+        replica.share_verdict(now)
+    );
+}
+
+/// Every verdict but `Shared` keeps staging off; only `Unverified`,
+/// `NotShared` and `PendingTooLong` answer 503; every word is distinct.
+#[test]
+fn every_share_verdict_but_shared_keeps_staging_off() {
+    for verdict in ShareVerdict::ALL {
+        assert_eq!(
+            verdict.holds_staging(),
+            verdict != ShareVerdict::Shared,
+            "{verdict:?}"
+        );
+    }
+    let faults: Vec<_> = ShareVerdict::ALL
+        .iter()
+        .map(|verdict| (verdict.name(), verdict.fault()))
+        .collect();
+    assert_eq!(
+        faults,
+        vec![
+            ("pending", None),
+            ("pending_too_long", Some(STAGE_SHARE_PENDING)),
+            ("no_anchor", None),
+            ("unverified", Some(STAGE_SHARE_UNVERIFIED)),
+            ("not_shared", Some(STAGE_NOT_SHARED)),
+            ("undecided", None),
+            ("shared", None),
+        ]
+    );
+}
+
+/// A stage directory where `id`'s marker cannot be read: a directory sits at
+/// the marker path, so the read fails with an I/O error (Windows refuses the
+/// open, Linux the read), not with "not found".
+fn unreadable_marker_stage(id: &str) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(
+        root.path()
+            .join("liveness")
+            .join(format!("{id}{SHARE_MARKER_SUFFIX}")),
+    )
+    .unwrap();
+    assert!(
+        ShareMarkers::new(root.path()).read(id).is_err(),
+        "control: the marker read fails with an I/O error"
+    );
+    root
+}
+
+/// Review probe RV3-B, unit half. A marker read that fails with an I/O error
+/// is "cannot decide": 200, staging off, word `undecided`, for longer than
+/// the grace. A later completed read without the marker decides again (503).
+#[test]
+fn a_marker_read_error_is_undecided_and_answers_200() {
+    let broken = unreadable_marker_stage("drain-1");
+    let markers = ShareMarkers::new(broken.path());
+    let b = guarded("web-b");
+    let clock = 9_000_000;
+    let now = Instant::now();
+    let drains = with_drains(
+        share_view(clock, &[]),
+        &[("drain-1", "inc-d", clock, StageLivenessRole::Drain)],
+    );
+    b.note_share(now, &drains);
+    b.share_step(&markers).unwrap();
+    for at in [now, now + GRACE * 3] {
+        assert_eq!(b.share_verdict(at), ShareVerdict::Undecided);
+        assert_eq!(b.fault(at), None, "cannot decide is 200");
+        assert!(gate_held(&b), "staging stays off");
+        assert_gate_agrees(&b, at);
+    }
+    assert_eq!(b.snapshot(now).share, Some("undecided"));
+    assert_eq!(
+        b.snapshot(now).share_unconfirmed,
+        vec!["drain-1".to_owned()]
+    );
+
+    // The fault clears and the directory reads without the marker: decided.
+    std::fs::remove_dir(broken.path().join("liveness").join("drain-1.present")).unwrap();
+    b.share_step(&markers).unwrap();
+    assert_eq!(b.share_verdict(now), ShareVerdict::Unverified);
+    assert_eq!(b.fault(now), Some(STAGE_SHARE_UNVERIFIED));
+    assert_eq!(b.fault(now + GRACE), Some(STAGE_NOT_SHARED));
+}
+
+/// One unreadable drain marker does not hide a second fresh drain whose
+/// marker a completed read did not find: that one still counts toward 503.
+#[test]
+fn a_readable_missing_marker_still_answers_503_beside_an_unreadable_one() {
+    let root = unreadable_marker_stage("drain-1");
+    let markers = ShareMarkers::new(root.path());
+    let b = guarded("web-b");
+    let clock = 9_000_000;
+    let now = Instant::now();
+    b.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[]),
+            &[
+                ("drain-1", "inc-1", clock, StageLivenessRole::Drain),
+                ("drain-2", "inc-2", clock, StageLivenessRole::Drain),
+            ],
+        ),
+    );
+    b.share_step(&markers).unwrap();
+    assert_eq!(b.share_verdict(now), ShareVerdict::Unverified);
+    assert_eq!(b.fault(now), Some(STAGE_SHARE_UNVERIFIED));
+    assert!(gate_held(&b));
+}
+
+/// A probe-thread step that hangs (an NFS hard mount whose server is gone)
+/// never completes a marker read. After `marker_stuck_after` the check is
+/// "cannot decide": 200, staging off. When the step finishes and reads the
+/// directory without the marker, it decides again.
+#[test]
+fn a_hung_probe_step_is_undecided_and_answers_200() {
+    let root = tempfile::tempdir().unwrap();
+    let stuck_after = Duration::from_millis(150);
+    let b = Arc::new(
+        StageLiveness::with_thresholds(
+            "web-b".to_owned(),
+            LivenessThresholds {
+                share_grace: GRACE,
+                marker_stuck_after: stuck_after,
+                ..LivenessThresholds::default()
+            },
+        )
+        .with_share_guard(),
+    );
+    let clock = 9_000_000;
+    b.note_share(
+        Instant::now(),
+        &with_drains(
+            share_view(clock, &[]),
+            &[("drain-1", "inc-d", clock, StageLivenessRole::Drain)],
+        ),
+    );
+    assert_eq!(
+        b.fault(Instant::now()),
+        Some(STAGE_SHARE_UNVERIFIED),
+        "control: the start-up 503 before any marker step (RV3-C)"
+    );
+    let (release, hold) = mpsc::channel::<()>();
+    let hold = Mutex::new(hold);
+    let entered = Arc::new(AtomicBool::new(false));
+    let probe: ProbeFn = {
+        let entered = entered.clone();
+        Arc::new(move || {
+            entered.store(true, Ordering::SeqCst);
+            let _ = hold.lock().unwrap().recv();
+            Ok(())
+        })
+    };
+    let stop = Arc::new(AtomicBool::new(false));
+    assert!(
+        spawn_probe_thread_with_markers(
+            &b,
+            probe,
+            Some(ShareMarkers::new(root.path())),
+            Duration::from_millis(20),
+            stop.clone(),
+        )
+        .unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !entered.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "the probe thread must start");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(stuck_after + Duration::from_millis(50));
+    let now = Instant::now();
+    assert!(b.step_stuck(now));
+    assert_eq!(b.share_verdict(now), ShareVerdict::Undecided);
+    assert_eq!(b.fault(now), None, "a hung step is 200");
+    assert!(gate_held(&b));
+    assert_gate_agrees(&b, now);
+
+    // The mount comes back: the step ends and reads a directory with no
+    // drain marker, so the check decides again.
+    stop.store(true, Ordering::SeqCst);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while b.step_stuck(Instant::now()) || b.share_verdict(Instant::now()) == ShareVerdict::Undecided
+    {
+        assert!(Instant::now() < deadline, "the step must finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The pair was required more than the grace ago, so the decided word is
+    // `stage_not_shared`.
+    assert_eq!(b.share_verdict(Instant::now()), ShareVerdict::NotShared);
+    assert_eq!(b.fault(Instant::now()), Some(STAGE_NOT_SHARED));
+}
+
+/// The first replica, no drain row: it serves (200) but never stages.
+#[test]
+fn a_replica_with_no_drain_row_serves_but_never_stages() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let first = guarded("web-a");
+    let now = Instant::now();
+    assert_eq!(first.share_verdict(now), ShareVerdict::Pending);
+    assert!(
+        gate_held(&first),
+        "nothing is proven before the first exchange"
+    );
+    assert_eq!(first.fault(now), None, "pending is 200");
+    assert_gate_agrees(&first, now);
+
+    first.share_step(&markers).unwrap();
+    first.note_share(now, &share_view(1_000, &[]));
+    first.share_step(&markers).unwrap();
+    assert_eq!(first.share_verdict(now), ShareVerdict::NoAnchor);
+    assert!(gate_held(&first), "no anchor proof, so no staging");
+    assert_eq!(first.fault(now), None, "no drain row is 200");
+    assert_eq!(
+        first.fault(now + GRACE * 10),
+        None,
+        "for as long as it lasts"
+    );
+    assert_gate_agrees(&first, now);
+    assert_eq!(first.snapshot(now).share, Some("no_anchor"));
+}
+
+/// Review probe R2: no drain row; web-a on a WRONG directory joined first,
+/// web-b on the real stage. Neither stages, and neither is ejected. (Before,
+/// the earliest-joined replica opened staging on the wrong directory.)
+#[test]
+fn no_drain_row_opens_staging_for_nobody_and_ejects_nobody() {
+    let (real, wrong) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (real_markers, wrong_markers) = (
+        ShareMarkers::new(real.path()),
+        ShareMarkers::new(wrong.path()),
+    );
+    let a = guarded("web-a");
+    let b = guarded("web-b");
+    let clock = 9_000_000;
+    let now = Instant::now();
+    for _ in 0..3 {
+        a.share_step(&wrong_markers).unwrap();
+        b.share_step(&real_markers).unwrap();
+        a.note_share(
+            now,
+            &share_view(clock, &[("web-b", b.incarnation(), clock)]),
+        );
+        b.note_share(
+            now,
+            &share_view(clock, &[("web-a", a.incarnation(), clock)]),
+        );
+    }
+    let later = now + GRACE * 3;
+    for replica in [&a, &b] {
+        assert!(gate_held(replica), "{}", replica.replica_id());
+        assert_eq!(replica.share_verdict(later), ShareVerdict::NoAnchor);
+        assert_eq!(replica.fault(later), None);
+        assert_gate_agrees(replica, later);
+    }
+}
+
+/// A fresh, verified drain row is the anchor: staging opens only once this
+/// replica has seen the drain's marker. Before that, 503 unverified.
+#[test]
+fn a_replica_stages_only_after_it_sees_the_fresh_drains_marker() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let worker = drain_worker("drain-1");
+    worker.share_step(&markers).unwrap();
+    let b = guarded("web-b");
+    let clock = 5_000_000;
+    let now = Instant::now();
+    b.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[]),
+            &[(
+                "drain-1",
+                worker.incarnation(),
+                clock,
+                StageLivenessRole::Drain,
+            )],
+        ),
+    );
+    assert_eq!(b.share_verdict(now), ShareVerdict::Unverified);
+    assert!(gate_held(&b));
+    assert_eq!(b.fault(now), Some(STAGE_SHARE_UNVERIFIED));
+    assert_eq!(
+        b.share_checks(),
+        vec![("drain-1".to_owned(), worker.incarnation().to_owned())]
+    );
+    assert_gate_agrees(&b, now);
+
+    b.share_step(&markers).unwrap();
+    assert_eq!(b.share_verdict(now), ShareVerdict::Shared);
+    assert!(!gate_held(&b));
+    assert_eq!(b.fault(now), None);
+    assert_gate_agrees(&b, now);
+}
+
+/// D1's topology with a drain: web-a on its own directory, web-b and the
+/// drain on the real stage. web-a never stages and reads `stage_not_shared`
+/// after the grace; web-b stages. The drain's row is never a K11 peer.
+#[test]
+fn a_misplaced_replica_is_held_and_the_right_one_stages() {
+    let (real, wrong) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let worker = drain_worker("drain-1");
+    worker.share_step(&ShareMarkers::new(real.path())).unwrap();
+    let clock = 9_000_000;
+    let now = Instant::now();
+    let early = guarded("web-a");
+    let late = guarded("web-b");
+    let drains = [(
+        "drain-1",
+        worker.incarnation(),
+        clock,
+        StageLivenessRole::Drain,
+    )];
+    early.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[("web-b", late.incarnation(), clock)]),
+            &drains,
+        ),
+    );
+    late.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[("web-a", early.incarnation(), clock)]),
+            &drains,
+        ),
+    );
+    assert_eq!(
+        early.share_checks(),
+        vec![("drain-1".to_owned(), worker.incarnation().to_owned())],
+        "only the drain is required, never a web peer"
+    );
+    early.share_step(&ShareMarkers::new(wrong.path())).unwrap();
+    late.share_step(&ShareMarkers::new(real.path())).unwrap();
+    assert_eq!(early.fault(now), Some(STAGE_SHARE_UNVERIFIED));
+    assert_eq!(late.share_verdict(now), ShareVerdict::Shared);
+    let later = now + GRACE;
+    assert_eq!(early.share_verdict(later), ShareVerdict::NotShared);
+    assert_eq!(early.fault(later), Some(STAGE_NOT_SHARED));
+    assert!(gate_held(&early));
+    assert_eq!(early.snapshot(later).share, Some("not_shared"));
+    assert_eq!(
+        early.snapshot(later).share_unconfirmed,
+        vec!["drain-1".to_owned()]
+    );
+    assert_gate_agrees(&early, later);
+    // The drain's row is never a K11 peer.
+    late.note_peers(now, &with_drains(StagePeerLiveness::default(), &drains));
+    assert_eq!(late.snapshot(now).peers, Some(0));
+}
+
+/// A stale drain row, or a fresh `drain_unverified` row, is no anchor: the
+/// replica serves without staging, and the unverified drain is not a K11
+/// peer either.
+#[test]
+fn a_stale_or_unverified_drain_row_is_not_an_anchor() {
+    let clock = 100_000_000;
+    let old = clock - i64::try_from(SHARE_PEER_FRESH.as_micros()).unwrap() - 1;
+    let now = Instant::now();
+    for (published, role) in [
+        (old, StageLivenessRole::Drain),
+        (clock, StageLivenessRole::DrainUnverified),
+    ] {
+        let first = guarded("web-a");
+        let view = with_drains(
+            share_view(clock, &[]),
+            &[("drain-1", "inc-d", published, role)],
+        );
+        first.note_share(now, &view);
+        assert_eq!(first.share_verdict(now), ShareVerdict::NoAnchor, "{role:?}");
+        assert!(gate_held(&first));
+        assert_eq!(first.fault(now), None);
+        assert!(first.share_checks().is_empty());
+        first.note_peers(now, &view);
+        assert_eq!(
+            first.snapshot(now).peers,
+            Some(0),
+            "{role:?} is no K11 peer"
+        );
+    }
+}
+
+/// Once a drain's marker was seen, a later transient fault cannot hold the
+/// replica again: the proof latches.
+#[test]
+fn an_anchor_proven_replica_is_never_held_again() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let worker = drain_worker("drain-1");
+    worker.share_step(&markers).unwrap();
+    let b = guarded("web-b");
+    let clock = 9_000_000;
+    let now = Instant::now();
+    let anchored = |incarnation: &str| {
+        with_drains(
+            share_view(clock, &[]),
+            &[("drain-1", incarnation, clock, StageLivenessRole::Drain)],
+        )
+    };
+    b.note_share(now, &anchored(worker.incarnation()));
+    assert!(
+        gate_held(&b),
+        "control: held until the drain marker is seen"
+    );
+    b.share_step(&markers).unwrap();
+    assert_eq!(b.share_verdict(now), ShareVerdict::Shared);
+    // The marker disappears, the drain restarts, then the drain leaves.
+    markers.remove_if("drain-1", worker.incarnation()).unwrap();
+    b.note_share(now, &anchored("restarted"));
+    b.share_step(&markers).unwrap();
+    b.note_share(now, &share_view(clock, &[]));
+    assert_eq!(b.share_verdict(now + GRACE), ShareVerdict::Shared);
+    assert!(!gate_held(&b));
+    assert!(b.share_checks().is_empty());
+    assert_gate_agrees(&b, now + GRACE);
+}
+
+/// A drain's restart (new incarnation) needs its new marker: the old marker
+/// does not confirm it.
+#[test]
+fn a_marker_confirms_only_the_incarnation_it_holds() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let worker = drain_worker("drain-1");
+    worker.share_step(&markers).unwrap();
+    let b = guarded("web-b");
+    let clock = 9_000_000;
+    let now = Instant::now();
+    b.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[]),
+            &[(
+                "drain-1",
+                "another-incarnation",
+                clock,
+                StageLivenessRole::Drain,
+            )],
+        ),
+    );
+    b.share_step(&markers).unwrap();
+    assert_eq!(b.share_verdict(now), ShareVerdict::Unverified);
+    assert!(gate_held(&b));
+}
+
+#[test]
+fn the_guard_off_never_answers_lb_health() {
+    let b = StageLiveness::with_thresholds("web-b".to_owned(), LivenessThresholds::default());
+    let clock = 9_000_000;
+    let now = Instant::now();
+    b.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[]),
+            &[("drain-1", "inc-d", clock, StageLivenessRole::Drain)],
+        ),
+    );
+    assert_eq!(b.share_verdict(now), ShareVerdict::Unverified);
+    assert_eq!(b.fault(now), None);
+    assert_eq!(b.snapshot(now).share, None);
+}
+
+#[test]
+fn markers_are_written_once_kept_per_incarnation_and_never_read_for_unsafe_ids() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    assert!(markers.ensure("web-a", "one").unwrap(), "first write");
+    assert!(
+        !markers.ensure("web-a", "one").unwrap(),
+        "unchanged: no write"
+    );
+    assert_eq!(markers.read("web-a").unwrap().as_deref(), Some("one"));
+    assert!(
+        markers.ensure("web-a", "two").unwrap(),
+        "a new value is written"
+    );
+    markers.remove_if("web-a", "one").unwrap();
+    assert_eq!(
+        markers.read("web-a").unwrap().as_deref(),
+        Some("two"),
+        "a stopping process never removes a newer marker"
+    );
+    markers.remove_if("web-a", "two").unwrap();
+    assert_eq!(markers.read("web-a").unwrap(), None);
+    for unsafe_id in ["..", "a/b", "a\\b", ""] {
+        assert_eq!(markers.read(unsafe_id).unwrap(), None, "{unsafe_id:?}");
+    }
+}
+
+/// The probe thread keeps the marker and removes it when it stops.
+#[test]
+fn the_probe_thread_writes_the_marker_and_removes_it_at_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let replica = Arc::new(guarded("web-a"));
+    let stop = Arc::new(AtomicBool::new(false));
+    let probe: ProbeFn = Arc::new(|| Ok(()));
+    assert!(
+        spawn_probe_thread_with_markers(
+            &replica,
+            probe,
+            Some(markers.clone()),
+            Duration::from_millis(20),
+            stop.clone(),
+        )
+        .unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while markers.read("web-a").unwrap().as_deref() != Some(replica.incarnation()) {
+        assert!(Instant::now() < deadline, "the marker was never written");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while markers.read("web-a").unwrap().is_some() {
+        assert!(Instant::now() < deadline, "the marker was never removed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The drain is never held, whatever it sees. Its one fault is its own
+/// anchor, which `/lb_health` never shows (it answers `drain_role`).
+#[test]
+fn the_drain_is_never_held() {
+    let root = tempfile::tempdir().unwrap();
+    let worker = drain_worker("drain-1").with_share_guard();
+    worker.share_step(&ShareMarkers::new(root.path())).unwrap();
+    let clock = 9_000_000;
+    let now = Instant::now();
+    worker.note_share(
+        now,
+        &with_drains(
+            share_view(clock, &[("web-a", "inc-a", clock)]),
+            &[("drain-2", "inc-d", clock, StageLivenessRole::Drain)],
+        ),
+    );
+    assert_eq!(worker.share_verdict(now), ShareVerdict::Shared);
+    assert_eq!(worker.fault(now), None);
+    assert_eq!(
+        verdict_from(
+            None,
+            combined_replica_fault(WriteBehindRole::Drain, None, Some(STAGE_ANCHOR_UNVERIFIED)),
+        ),
+        (StatusCode::OK, "ok"),
+        "the drain's own anchor word never reaches /lb_health"
+    );
+}
+
+/// Review should-fix R1, without Postgres: the drain publishes `drain` (an
+/// anchor) only while a read-back of its own marker shows its incarnation.
+/// A marker it cannot write, or a read-back older than the limit (a hung
+/// marker thread), publishes `drain_unverified` and raises its fault.
+#[test]
+fn the_drain_anchors_only_while_it_reads_its_own_marker_back() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let worker = StageLiveness::with_thresholds(
+        "drain-1".to_owned(),
+        LivenessThresholds {
+            anchor_verify_max_age: Duration::from_millis(100),
+            ..LivenessThresholds::default()
+        },
+    )
+    .with_role(StageLivenessRole::Drain);
+    assert_eq!(
+        worker.publication().role,
+        StageLivenessRole::DrainUnverified,
+        "no read-back yet"
+    );
+    assert_eq!(worker.fault(Instant::now()), Some(STAGE_ANCHOR_UNVERIFIED));
+
+    // A directory where the marker file belongs: the write fails, as an
+    // EACCES or a wrong-uid `liveness/` would.
+    let blocker = root.path().join("liveness").join("drain-1.present");
+    std::fs::create_dir_all(&blocker).unwrap();
+    assert!(worker.share_step(&markers).is_err());
+    assert_eq!(
+        worker.publication().role,
+        StageLivenessRole::DrainUnverified
+    );
+    assert_eq!(worker.fault(Instant::now()), Some(STAGE_ANCHOR_UNVERIFIED));
+
+    std::fs::remove_dir(&blocker).unwrap();
+    worker.share_step(&markers).unwrap();
+    assert_eq!(worker.publication().role, StageLivenessRole::Drain);
+    assert_eq!(worker.fault(Instant::now()), None);
+
+    // No new read-back: it ages out.
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        worker.publication().role,
+        StageLivenessRole::DrainUnverified
+    );
+    assert_eq!(worker.fault(Instant::now()), Some(STAGE_ANCHOR_UNVERIFIED));
+
+    // A web replica never publishes a drain role.
+    assert_eq!(
+        guarded("web-a").publication().role,
+        StageLivenessRole::Stage
+    );
+}
+
+/// The drain's marker thread writes, reads back, and removes its marker.
+#[test]
+fn the_drain_marker_thread_verifies_its_marker_and_removes_it_at_stop() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let worker = Arc::new(drain_worker("drain-1"));
+    let stop = Arc::new(AtomicBool::new(false));
+    assert!(
+        spawn_marker_thread(
+            &worker,
+            markers.clone(),
+            Duration::from_millis(20),
+            stop.clone()
+        )
+        .unwrap()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while worker.publication().role != StageLivenessRole::Drain {
+        assert!(Instant::now() < deadline, "the anchor was never verified");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        markers.read("drain-1").unwrap().as_deref(),
+        Some(worker.incarnation())
+    );
+    stop.store(true, Ordering::Relaxed);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while markers.read("drain-1").unwrap().is_some() {
+        assert!(Instant::now() < deadline, "the marker was never removed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// No exchange has succeeded for the grace: 503 `stage_share_pending`.
+/// Staging is off throughout.
+#[test]
+fn a_replica_pending_past_the_grace_answers_stage_share_pending() {
+    let a = guarded("web-a");
+    let now = Instant::now();
+    assert_eq!(a.share_verdict(now), ShareVerdict::Pending);
+    assert_eq!(a.fault(now), None);
+    let later = now + GRACE;
+    assert_eq!(a.share_verdict(later), ShareVerdict::PendingTooLong);
+    assert_eq!(a.fault(later), Some(STAGE_SHARE_PENDING));
+    assert!(gate_held(&a));
+    assert_gate_agrees(&a, later);
+    assert_eq!(a.snapshot(later).share, Some("pending_too_long"));
 }

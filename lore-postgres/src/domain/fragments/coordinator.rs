@@ -87,6 +87,7 @@ pub use stage_liveness::STAGE_LIVENESS_SCHEMA;
 pub use stage_liveness::StageLivenessClock;
 pub use stage_liveness::StageLivenessLimits;
 pub use stage_liveness::StageLivenessPublication;
+pub use stage_liveness::StageLivenessRole;
 pub use stage_liveness::StagePeerLiveness;
 pub use stage_liveness::StagePeerProgress;
 pub use stage_liveness::StageProgressRecord;

@@ -199,6 +199,7 @@ pub use coordinator::StageCleanupIntent;
 pub use coordinator::StageLivenessClock;
 pub use coordinator::StageLivenessLimits;
 pub use coordinator::StageLivenessPublication;
+pub use coordinator::StageLivenessRole;
 pub use coordinator::StageObservation;
 pub use coordinator::StagePeerLiveness;
 pub use coordinator::StagePeerProgress;
