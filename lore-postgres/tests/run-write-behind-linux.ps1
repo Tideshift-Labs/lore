@@ -830,6 +830,14 @@ try {
     if ($privilegedStart.ExitCode -ne 0) {
         $privilegedNote = "privileged container refused (exit $($privilegedStart.ExitCode))"
         Write-Warning "  NOT RUN: $privilegedNote`n$($privilegedStart.Output)"
+        # `docker run` can create the container and still exit non-zero (for example when the
+        # start step fails). Such a container exists but was never tracked. Check by exact name
+        # and track it so the cleanup in `finally` removes it.
+        $leftover = Invoke-Captured docker @('container', 'inspect', $privilegedContainer)
+        if ($leftover.ExitCode -eq 0) {
+            Write-Warning "  $privilegedContainer exists after the failed run; it is tracked for removal"
+            $createdContainers.Add($privilegedContainer)
+        }
     }
     else {
         $createdContainers.Add($privilegedContainer)

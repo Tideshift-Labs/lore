@@ -336,6 +336,9 @@ fn a_recovery_ends_the_baseline() {
 fn a_probe_just_under_the_threshold_does_not_eject() {
     let state = liveness(STALE, Duration::from_secs(10));
     let start = Instant::now();
+    // The state stamped its own "last good" at construction, before `start`.
+    // Pin the success time to `start` so the 1 ms margin is exact.
+    state.note_good(start);
     let almost = start + STALE - Duration::from_millis(1);
     state.note_peers(almost, &view(100, &[("b", "i", 1, 50)]));
     state.note_peers(almost, &view(200, &[("b", "i", 2, 150)]));
