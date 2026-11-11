@@ -34,16 +34,20 @@ use lore_postgres::domain::fragments::StageLivenessClock;
 use lore_postgres::domain::fragments::StageLivenessPublication;
 use lore_postgres::domain::fragments::StageLivenessRole;
 use lore_postgres::domain::fragments::StagePeerLiveness;
+use lore_postgres::domain::fragments::StagerAbsence;
+use lore_postgres::domain::fragments::StagerIdentity;
 use lore_postgres::pool::TlsConfig;
 use lore_server::fragment_write_behind::WriteBehindRole;
 use lore_server::fragment_write_behind::combined_replica_fault;
 use lore_server::http::lb_health::verdict_from;
+use lore_server::stage_liveness::CHALLENGE_EVERY_STEPS;
 use lore_server::stage_liveness::LivenessThresholds;
 use lore_server::stage_liveness::LivenessTick;
 use lore_server::stage_liveness::STAGE_UNAVAILABLE_LOCAL;
 use lore_server::stage_liveness::ShareMarkers;
 use lore_server::stage_liveness::ShareVerdict;
 use lore_server::stage_liveness::StageLiveness;
+use lore_server::stage_liveness::echoed_challenge;
 use lore_server::stage_liveness::exchange_once;
 use lore_server::stage_liveness::liveness_tick;
 
@@ -1534,4 +1538,706 @@ async fn a_replica_with_no_exchange_after_the_grace_answers_503() {
     }
     assert!(held(&a));
     assert_eq!(lb_health(&a), PENDING_TOO_LONG);
+}
+
+// ---------------------------------------------------------------------------
+// WP-115 drain guard (`stage_liveness` module docs, "Drain guard").
+// ---------------------------------------------------------------------------
+
+/// One round of a cell over real stage directories and real exchanges, in
+/// the order the threads and tasks run: each reader steps in its own
+/// directory (marker, challenge, and the echo files of its candidates) and
+/// publishes; each web replica reads its view, steps in its own directory
+/// (reading challenges, writing its echo file) and publishes; each reader
+/// then reads its view (its candidates for the next step).
+async fn round(
+    coordinator: &PostgresFragmentCoordinator,
+    readers: &[(&StageLiveness, &ShareMarkers)],
+    webs: &[(&StageLiveness, &ShareMarkers)],
+) {
+    for (reader, markers) in readers {
+        markers_step(reader, markers);
+        exchange(coordinator, CELL, reader).await;
+    }
+    for (web, markers) in webs {
+        exchange(coordinator, CELL, web).await;
+        markers_step(web, markers);
+        exchange(coordinator, CELL, web).await;
+    }
+    for (reader, _) in readers.iter().chain(webs.iter()) {
+        exchange(coordinator, CELL, reader).await;
+    }
+}
+
+/// Run rounds until `reader` confirms `stager`, at most `rounds`. Returns
+/// whether it did.
+async fn confirm_within(
+    coordinator: &PostgresFragmentCoordinator,
+    readers: &[(&StageLiveness, &ShareMarkers)],
+    webs: &[(&StageLiveness, &ShareMarkers)],
+    reader: &StageLiveness,
+    stager: &StagerIdentity,
+    rounds: u64,
+) -> bool {
+    for _ in 0..rounds {
+        round(coordinator, readers, webs).await;
+        if reader.confirms(stager) {
+            return true;
+        }
+    }
+    false
+}
+
+/// What `reader`'s absence guard decides for `(hash, epoch)`: the real
+/// stager read, asked against the reader's own confirmations.
+async fn decision(
+    coordinator: &PostgresFragmentCoordinator,
+    reader: &StageLiveness,
+    hash: &[u8],
+    epoch: i64,
+) -> StagerAbsence {
+    coordinator
+        .stager_absence(hash, epoch, Duration::ZERO, &|stager| {
+            reader.confirms(stager)
+        })
+        .await
+        .unwrap()
+}
+
+fn identity(replica: &StageLiveness) -> StagerIdentity {
+    StagerIdentity::new(replica.replica_id(), replica.incarnation()).unwrap()
+}
+
+/// A fixed fragment key per stager.
+fn probe_hash(stager: &StagerIdentity) -> Vec<u8> {
+    blake3::hash(format!("{}/{}", stager.replica_id, stager.incarnation).as_bytes())
+        .as_bytes()
+        .to_vec()
+}
+
+/// Record `stager` as the stager of `(hash, epoch)`, as `begin_stage_by`
+/// does inside the custody transaction.
+async fn record_stager(
+    namespace: &CaseNamespace,
+    hash: &[u8],
+    epoch: i64,
+    stager: &StagerIdentity,
+) {
+    let (client, connection) = tokio_postgres::connect(namespace.pg_url(), tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    let _connection = lore_base::lore_spawn!(connection);
+    client
+        .execute(
+            "INSERT INTO lore_domain_write_behind_stagers (hash, epoch, replica_id, incarnation) \
+             VALUES ($1, $2, $3, $4)",
+            &[&hash, &epoch, &stager.replica_id, &stager.incarnation],
+        )
+        .await
+        .expect("record the stager");
+}
+
+/// Copy every file of `from`'s liveness directory into `to`'s (overwriting),
+/// as `rsync -a` of the stage or a volume clone gives.
+fn copy_liveness(from: &std::path::Path, to: &std::path::Path) {
+    let (from, to) = (from.join("liveness"), to.join("liveness"));
+    std::fs::create_dir_all(&to).unwrap();
+    for entry in std::fs::read_dir(&from).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+/// Review blocker N1 (round 2) as a live test, the drain side. Drain d1 and
+/// web-a run on A; d1 confirms web-a there. B is then a full copy of A (as
+/// rsync or a volume clone gives: every liveness file, d1's challenge too).
+/// The drain restarts as d2 on B while web-a keeps staging into A, then
+/// web-a leaves. d2 never confirms web-a, so web-a's file stays `Staged`
+/// (`Unconfirmed`) on B. A restart d3 back on A has no confirmations either
+/// (nothing is stored): web-a's file stays kept there too, the documented
+/// liveness cost, while a new web replica on A is confirmed by d3.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_copy_of_the_stage_keeps_a_departed_writers_file_staged_across_drain_restarts() {
+    let (namespace, store) = boot("drain-guard-n1").await;
+    let coordinator = store.fragment_coordinator();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (
+        ShareMarkers::new(a_dir.path()),
+        ShareMarkers::new(b_dir.path()),
+    );
+    let web = guarded("web-a");
+    let web_a = identity(&web);
+    let (hash, epoch) = (probe_hash(&web_a), 1_i64);
+    record_stager(&namespace, &hash, epoch, &web_a).await;
+    let unrecorded = blake3::hash(b"no stager").as_bytes().to_vec();
+
+    let d1 = drain("drain-1");
+    assert!(
+        confirm_within(&coordinator, &[(&d1, &a)], &[(&web, &a)], &d1, &web_a, 20).await,
+        "control: d1 confirms web-a in A through real exchanges"
+    );
+    assert_eq!(
+        decision(&coordinator, &d1, &hash, epoch).await,
+        StagerAbsence::Confirmed
+    );
+    assert_eq!(
+        decision(&coordinator, &d1, &unrecorded, epoch).await,
+        StagerAbsence::NoStager
+    );
+    copy_liveness(a_dir.path(), b_dir.path());
+    coordinator
+        .withdraw_stage_liveness(CELL, d1.replica_id())
+        .await
+        .unwrap();
+    drop(d1);
+
+    // d2 on the copy B while web-a keeps staging into A.
+    let d2 = drain("drain-2");
+    assert!(
+        !confirm_within(&coordinator, &[(&d2, &b)], &[(&web, &a)], &d2, &web_a, 16).await,
+        "a drain on a copy never confirms a web replica on the original"
+    );
+    assert_eq!(
+        decision(&coordinator, &d2, &hash, epoch).await,
+        StagerAbsence::Unconfirmed,
+        "web-a's file is kept Staged on B"
+    );
+    // web-a leaves.
+    assert!(
+        coordinator
+            .withdraw_stage_liveness(CELL, web.replica_id())
+            .await
+            .unwrap()
+    );
+    for _ in 0..4 {
+        round(&coordinator, &[(&d2, &b)], &[]).await;
+    }
+    assert_eq!(
+        decision(&coordinator, &d2, &hash, epoch).await,
+        StagerAbsence::Unconfirmed,
+        "still kept after web-a left"
+    );
+
+    // d3 back on A: nothing carries over a restart.
+    let d3 = drain("drain-3");
+    let fresh = guarded("web-a2");
+    assert!(
+        confirm_within(
+            &coordinator,
+            &[(&d3, &a)],
+            &[(&fresh, &a)],
+            &d3,
+            &identity(&fresh),
+            20
+        )
+        .await,
+        "control: d3 confirms a live web replica on A"
+    );
+    assert_eq!(
+        decision(&coordinator, &d3, &hash, epoch).await,
+        StagerAbsence::Unconfirmed,
+        "a restarted drain has no confirmation of a writer that left before it"
+    );
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review should-fix S1 (round 2) as a live test: a one-way copy loop from
+/// web-a's directory A to the drain's directory B, every round. B gets
+/// web-a's marker and probe files, but never gives web-a the drain's
+/// challenge, so web-a's file stays `Staged` on B.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_one_way_copy_loop_keeps_the_file_staged_through_real_exchanges() {
+    let (namespace, store) = boot("drain-guard-s1").await;
+    let coordinator = store.fragment_coordinator();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (
+        ShareMarkers::new(a_dir.path()),
+        ShareMarkers::new(b_dir.path()),
+    );
+    let web = guarded("web-a");
+    let web_a = identity(&web);
+    let (hash, epoch) = (probe_hash(&web_a), 1_i64);
+    record_stager(&namespace, &hash, epoch, &web_a).await;
+    let on_b = drain("drain-b");
+    for _ in 0..16 {
+        round(&coordinator, &[(&on_b, &b)], &[(&web, &a)]).await;
+        copy_liveness(a_dir.path(), b_dir.path());
+    }
+    assert!(
+        b.read(web.replica_id()).unwrap().is_some(),
+        "the loop copies"
+    );
+    assert!(!on_b.confirms(&web_a));
+    assert_eq!(
+        decision(&coordinator, &on_b, &hash, epoch).await,
+        StagerAbsence::Unconfirmed
+    );
+    assert_eq!(
+        on_b.snapshot(Instant::now()).absence_unconfirmed,
+        vec![web.replica_id().to_owned()]
+    );
+    // Control: a drain on A confirms web-a with the same rounds.
+    let on_a = drain("drain-a");
+    assert!(
+        confirm_within(
+            &coordinator,
+            &[(&on_a, &a)],
+            &[(&web, &a)],
+            &on_a,
+            &web_a,
+            20
+        )
+        .await,
+        "control: the drain on A confirms"
+    );
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review blocker N1 (round 2) as a live test, the web side, and the old
+/// web-side B1. Drain d1 on A anchors web-a, which latches. B is then a copy
+/// of A; drain d2 on B anchors web-c, which stages into B. Each web replica
+/// is a reader. On web-a (A), web-c's file stays `Unconfirmed` (a GET that
+/// finds no file answers `SlowDown`, never Missing), and web-a's own file is
+/// `Confirmed`. On web-c (B) it is the other way round. `/lb_health` and the
+/// share gate of both web replicas are what K11 gives them.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn the_web_side_guard_keeps_a_fragment_staged_into_another_directory() {
+    let (namespace, store) = boot("drain-guard-web-n1").await;
+    let coordinator = store.fragment_coordinator();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a_markers, b_markers) = (
+        ShareMarkers::new(a_dir.path()),
+        ShareMarkers::new(b_dir.path()),
+    );
+
+    // web-a proves against d1 on A, then d1 leaves.
+    let d1 = drain("drain-1");
+    let web_a = guarded("web-a");
+    markers_step(&d1, &a_markers);
+    exchange(&coordinator, CELL, &d1).await;
+    for _ in 0..3 {
+        markers_step(&web_a, &a_markers);
+        exchange(&coordinator, CELL, &web_a).await;
+        markers_step(&web_a, &a_markers);
+    }
+    assert!(!held(&web_a), "web-a is proven on A and latched");
+    copy_liveness(a_dir.path(), b_dir.path());
+    assert!(
+        coordinator
+            .withdraw_stage_liveness(CELL, d1.replica_id())
+            .await
+            .unwrap()
+    );
+
+    // web-c proves against d2 on the copy B.
+    let d2 = drain("drain-2");
+    let web_c = guarded("web-c");
+    markers_step(&d2, &b_markers);
+    exchange(&coordinator, CELL, &d2).await;
+    for _ in 0..3 {
+        markers_step(&web_c, &b_markers);
+        exchange(&coordinator, CELL, &web_c).await;
+        markers_step(&web_c, &b_markers);
+    }
+    assert!(!held(&web_c), "web-c is proven on B");
+
+    let (a_id, c_id) = (identity(&web_a), identity(&web_c));
+    let (a_hash, c_hash) = (probe_hash(&a_id), probe_hash(&c_id));
+    record_stager(&namespace, &a_hash, 1, &a_id).await;
+    record_stager(&namespace, &c_hash, 1, &c_id).await;
+
+    for _ in 0..16 {
+        round(
+            &coordinator,
+            &[(&d2, &b_markers)],
+            &[(&web_a, &a_markers), (&web_c, &b_markers)],
+        )
+        .await;
+    }
+    for (reader, hash, expected, why) in [
+        (
+            &web_a,
+            &c_hash,
+            StagerAbsence::Unconfirmed,
+            "web-c's file on web-a: kept, never Missing",
+        ),
+        (
+            &web_a,
+            &a_hash,
+            StagerAbsence::Confirmed,
+            "web-a's own file on web-a",
+        ),
+        (
+            &web_c,
+            &a_hash,
+            StagerAbsence::Unconfirmed,
+            "web-a's file on web-c: kept",
+        ),
+        (
+            &web_c,
+            &c_hash,
+            StagerAbsence::Confirmed,
+            "web-c's own file on web-c",
+        ),
+        (
+            &d2,
+            &a_hash,
+            StagerAbsence::Unconfirmed,
+            "web-a's file on the drain on B: kept",
+        ),
+        (
+            &d2,
+            &c_hash,
+            StagerAbsence::Confirmed,
+            "control: web-c's file on the drain on B",
+        ),
+    ] {
+        assert_eq!(
+            decision(&coordinator, reader, hash, 1).await,
+            expected,
+            "{why}"
+        );
+    }
+    // K11 and the share guard are unchanged by the absence guard.
+    for web in [&web_a, &web_c] {
+        assert!(!held(web), "{} still stages", web.replica_id());
+        assert_eq!(lb_health(web), OK, "{}", web.replica_id());
+    }
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review S2 (round 2): the stager prune deletes in passes until one is
+/// short, bounded per call, and keeps a row whose custody is live. Custody is
+/// a minimal stand-in table here: the domain boot does not create the
+/// fragment schema.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn the_drain_guard_prune_runs_in_passes_and_keeps_live_rows() {
+    let (namespace, store) = boot("drain-guard-prune").await;
+    let coordinator = store.fragment_coordinator();
+    let (client, connection) = tokio_postgres::connect(namespace.pg_url(), tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    let _connection = lore_base::lore_spawn!(connection);
+    client
+        .batch_execute(
+            "CREATE TABLE lore_fragment_stage_custody ( \
+               hash bytea NOT NULL, epoch bigint NOT NULL, state smallint NOT NULL, \
+               PRIMARY KEY (hash, epoch))",
+        )
+        .await
+        .expect("the custody stand-in");
+    let stager = StagerIdentity::new("web-a", "inc").unwrap();
+    let key = |tag: &str| blake3::hash(tag.as_bytes()).as_bytes().to_vec();
+    let (live, released) = (key("live"), key("released"));
+    record_stager(&namespace, &live, 1, &stager).await;
+    record_stager(&namespace, &released, 1, &stager).await;
+    for (hash, state) in [(&live, 1_i16), (&released, 3_i16)] {
+        client
+            .execute(
+                "INSERT INTO lore_fragment_stage_custody VALUES ($1, 1, $2)",
+                &[hash, &state],
+            )
+            .await
+            .unwrap();
+    }
+    for index in 0..34 {
+        record_stager(&namespace, &key(&format!("gone-{index}")), 1, &stager).await;
+    }
+    let count = || async {
+        client
+            .query_one("SELECT count(*) FROM lore_domain_write_behind_stagers", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0)
+    };
+    assert_eq!(count().await, 36);
+
+    let bounded = coordinator
+        .prune_drain_guard(10, 2, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        (bounded.stagers, bounded.passes),
+        (20, 2),
+        "two full passes: the bound stops it"
+    );
+    let rest = coordinator
+        .prune_drain_guard(10, 10, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        (rest.stagers, rest.passes),
+        (15, 2),
+        "passes until a short one: 10, then 5 (14 gone, one released)"
+    );
+    assert_eq!(count().await, 1);
+    assert_eq!(
+        coordinator
+            .stager_of(&live, 1, Duration::ZERO)
+            .await
+            .unwrap(),
+        Some((stager, true)),
+        "a live custody row keeps its stager"
+    );
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review B S1 (round 4): a confirmed stager's miss reads as absent only once
+/// the representation's epoch row is at least the minimum staged age old, by
+/// the database clock. A younger row, or none, is `TooRecent`; an unconfirmed
+/// stager stays `Unconfirmed` whatever the age; a zero minimum asks for no
+/// age. The epoch table is a minimal stand-in here: the domain boot does not
+/// create the fragment schema.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_confirmed_miss_reads_as_absent_only_after_the_minimum_staged_age() {
+    let (namespace, store) = boot("drain-guard-min-age").await;
+    let coordinator = store.fragment_coordinator();
+    let (client, connection) = tokio_postgres::connect(namespace.pg_url(), tokio_postgres::NoTls)
+        .await
+        .expect("raw connection");
+    let _connection = lore_base::lore_spawn!(connection);
+    client
+        .batch_execute(
+            "CREATE TABLE lore_fragment_epochs ( \
+               hash bytea NOT NULL, epoch bigint NOT NULL, \
+               created_at timestamptz NOT NULL DEFAULT clock_timestamp(), \
+               PRIMARY KEY (hash, epoch))",
+        )
+        .await
+        .expect("the epoch stand-in");
+    let stager = StagerIdentity::new("web-a", "inc-a").unwrap();
+    let (aged, fresh, unpublished) = (
+        blake3::hash(b"aged").as_bytes().to_vec(),
+        blake3::hash(b"fresh").as_bytes().to_vec(),
+        blake3::hash(b"unpublished").as_bytes().to_vec(),
+    );
+    for hash in [&aged, &fresh, &unpublished] {
+        record_stager(&namespace, hash, 1, &stager).await;
+    }
+    for hash in [&aged, &fresh] {
+        client
+            .execute(
+                "INSERT INTO lore_fragment_epochs (hash, epoch) VALUES ($1, 1)",
+                &[hash],
+            )
+            .await
+            .unwrap();
+    }
+    client
+        .execute(
+            "UPDATE lore_fragment_epochs SET created_at = clock_timestamp() - interval '2 minutes' \
+             WHERE hash = $1",
+            &[&aged],
+        )
+        .await
+        .unwrap();
+    let minimum = lore_postgres::store::fragment_write_behind::MIN_STAGED_ABSENCE_AGE;
+    let confirmed = |_: &StagerIdentity| true;
+    let unconfirmed = |_: &StagerIdentity| false;
+    for (why, hash, min_age, confirms, expected) in [
+        (
+            "aged past the minimum",
+            &aged,
+            minimum,
+            true,
+            StagerAbsence::Confirmed,
+        ),
+        (
+            "younger than the minimum",
+            &fresh,
+            minimum,
+            true,
+            StagerAbsence::TooRecent,
+        ),
+        (
+            "no epoch row",
+            &unpublished,
+            minimum,
+            true,
+            StagerAbsence::TooRecent,
+        ),
+        (
+            "unconfirmed, aged",
+            &aged,
+            minimum,
+            false,
+            StagerAbsence::Unconfirmed,
+        ),
+        (
+            "unconfirmed, young",
+            &fresh,
+            minimum,
+            false,
+            StagerAbsence::Unconfirmed,
+        ),
+        (
+            "no minimum",
+            &fresh,
+            Duration::ZERO,
+            true,
+            StagerAbsence::Confirmed,
+        ),
+    ] {
+        let decided = if confirms {
+            coordinator
+                .stager_absence(hash, 1, min_age, &confirmed)
+                .await
+        } else {
+            coordinator
+                .stager_absence(hash, 1, min_age, &unconfirmed)
+                .await
+        };
+        assert_eq!(decided.unwrap(), expected, "{why}");
+    }
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review blocker B1 (round 3), probe P1, as a live test: a one-way copy loop
+/// from the drain's directory B to web-a's directory A, every round. web-a
+/// reads the drain's challenges in A and echoes them there, but the echo
+/// never reaches B. The drain on B never confirms web-a, so web-a's file
+/// stays `Staged` (`Unconfirmed`). Control: the same rounds with the drain
+/// on A confirm.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_reader_to_web_copy_loop_keeps_the_file_staged_through_real_exchanges() {
+    let (namespace, store) = boot("drain-guard-b1").await;
+    let coordinator = store.fragment_coordinator();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (
+        ShareMarkers::new(a_dir.path()),
+        ShareMarkers::new(b_dir.path()),
+    );
+    let web = guarded("web-a");
+    let web_a = identity(&web);
+    let (hash, epoch) = (probe_hash(&web_a), 1_i64);
+    record_stager(&namespace, &hash, epoch, &web_a).await;
+    let on_b = drain("drain-b");
+    for _ in 0..16 {
+        round(&coordinator, &[(&on_b, &b)], &[(&web, &a)]).await;
+        copy_liveness(b_dir.path(), a_dir.path());
+    }
+    let echoed = a
+        .read_echo(web.replica_id())
+        .unwrap()
+        .is_some_and(|content| {
+            echoed_challenge(&content, web.incarnation(), on_b.incarnation()).is_some()
+        });
+    assert!(echoed, "the loop does show web-a the drain's challenge");
+    assert!(!on_b.confirms(&web_a));
+    assert_eq!(
+        decision(&coordinator, &on_b, &hash, epoch).await,
+        StagerAbsence::Unconfirmed
+    );
+    let on_a = drain("drain-a");
+    assert!(
+        confirm_within(
+            &coordinator,
+            &[(&on_a, &a)],
+            &[(&web, &a)],
+            &on_a,
+            &web_a,
+            20
+        )
+        .await,
+        "control: the drain on A confirms"
+    );
+    assert_eq!(
+        decision(&coordinator, &on_a, &hash, epoch).await,
+        StagerAbsence::Confirmed
+    );
+    drop(store);
+    namespace.release().await;
+}
+
+/// Review should-fix A1/A2 and B S1 (round 3), with the v1 fail-safe kept,
+/// through real exchanges. web-c stages into another directory B, then
+/// crashes: no withdraw, so its row stays in the table, but it stops being
+/// fresh. The drain on A never confirmed web-c: its fragment stays
+/// `Unconfirmed` (never Missing) before and after its row goes stale. Once
+/// the row is stale it no longer holds the drain's "not confirmed yet"
+/// signal, while web-a (same directory, fresh) is confirmed and its
+/// fragment proves absence as before.
+#[tokio::test]
+#[ignore = "needs live Postgres env (see module docs); run with -- --ignored"]
+async fn a_departed_stager_stays_kept_after_its_row_goes_stale() {
+    let (namespace, store) = boot("drain-guard-stale").await;
+    let coordinator = store.fragment_coordinator();
+    let (a_dir, b_dir) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (a, b) = (
+        ShareMarkers::new(a_dir.path()),
+        ShareMarkers::new(b_dir.path()),
+    );
+    let on_a = StageLiveness::with_thresholds(
+        "drain-a".to_owned(),
+        LivenessThresholds {
+            share_peer_fresh: SHARE_PEER_FRESH,
+            ..thresholds()
+        },
+    )
+    .with_role(StageLivenessRole::Drain);
+    let (web_a, web_c) = (guarded("web-a"), guarded("web-c"));
+    let (a_id, c_id) = (identity(&web_a), identity(&web_c));
+    let (a_hash, c_hash) = (probe_hash(&a_id), probe_hash(&c_id));
+    record_stager(&namespace, &a_hash, 1, &a_id).await;
+    record_stager(&namespace, &c_hash, 1, &c_id).await;
+    assert!(
+        confirm_within(
+            &coordinator,
+            &[(&on_a, &a)],
+            &[(&web_a, &a), (&web_c, &b)],
+            &on_a,
+            &a_id,
+            20
+        )
+        .await,
+        "control: the drain confirms web-a in A"
+    );
+    assert!(on_a.absence_unproven(), "web-c is fresh and unconfirmed");
+    assert_eq!(
+        decision(&coordinator, &on_a, &c_hash, 1).await,
+        StagerAbsence::Unconfirmed
+    );
+
+    // web-c crashes: it neither exchanges nor withdraws.
+    tokio::time::sleep(SHARE_PEER_FRESH + Duration::from_millis(500)).await;
+    for _ in 0..(CHALLENGE_EVERY_STEPS * 2) {
+        round(&coordinator, &[(&on_a, &a)], &[(&web_a, &a)]).await;
+    }
+    let view = coordinator
+        .exchange_stage_liveness(CELL, on_a.replica_id(), &on_a.publication(), on_a.limits())
+        .await
+        .unwrap();
+    assert!(
+        view.peers.iter().any(|peer| peer.replica_id == "web-c"),
+        "web-c's row is still in the table"
+    );
+    assert!(
+        !on_a.absence_unproven(),
+        "a stale row no longer holds the aggregate signal"
+    );
+    assert_eq!(
+        decision(&coordinator, &on_a, &c_hash, 1).await,
+        StagerAbsence::Unconfirmed,
+        "fail-safe: web-c's fragment stays kept"
+    );
+    assert_eq!(
+        decision(&coordinator, &on_a, &a_hash, 1).await,
+        StagerAbsence::Confirmed,
+        "web-a's fragment still proves absence"
+    );
+    drop(store);
+    namespace.release().await;
 }

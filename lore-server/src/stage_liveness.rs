@@ -52,7 +52,9 @@
 //! - (A2) There is one database clock and it never goes back: no failover to
 //!   a server with another clock, and no backward step.
 //! - (A3) Replica ids are unique: one process at a time publishes under one
-//!   id. A duplicate is logged, not prevented.
+//!   id. [`default_replica_id`] adds a random part, so two containers with
+//!   the same host name and process id do not share one. A duplicate is
+//!   logged, not prevented.
 //! - (A4) A probe returns success only when the stage really worked for that
 //!   process: the write and the fsync reached the server.
 //! - (A5) One replica's exchanges are serialized: an exchange starts only
@@ -185,9 +187,11 @@
 //!
 //! **Limits.**
 //!
-//! - A drain on the wrong directory is not detected; it is the reference.
-//!   Two fresh drains on two directories hold every replica that is not yet
-//!   anchor-proven.
+//! - The drain is the reference: web replicas do not check the drain's
+//!   directory. A drain on the wrong directory cannot demote fragments (see
+//!   "Drain guard" below), but the web replicas it anchors stage where it
+//!   reads. Two fresh drains on two directories hold every replica that is
+//!   not yet anchor-proven.
 //! - While no `drain` row is fresh, unproven replicas stage nothing, so
 //!   writes cost a direct object-store round trip.
 //! - Start-up 503 (review probe RV3-C). A fresh drain row that this replica
@@ -206,9 +210,219 @@
 //! - A hung step is noticed only after [`MARKER_STUCK_AFTER`]; until then
 //!   the last completed read stands.
 //! - Turning `stage_liveness_probe` off turns this guard off too.
+//!
+//! ## Drain guard
+//!
+//! The shared-stage guard keeps an unproven web replica from staging, but it
+//! trusts the drain's directory. A drain worker on another directory than
+//! the web replicas (a wrong mount on the drain host, a copy of the stage,
+//! or a drain restarted there while web replicas proven against an earlier
+//! drain keep staging) reads each staged fragment's `ENOENT` as absent, and
+//! `mark_missing` demotes acknowledged fragments. A drain-wide gate is not
+//! enough: a web replica that staged into another directory and then left
+//! (a withdraw, or its row pruned after a crash) is no longer in any view,
+//! but its files are still in that other directory.
+//!
+//! So the decision is per fragment. A staged read on a READER (the drain
+//! worker, or a web replica, see below) that finds no file reads as absent
+//! only when the fragment's own stager is proven, to this reader process, to
+//! write the reader's directory. Otherwise it answers `SlowDown`: the
+//! promotion is deferred and retried, and the fragment stays `Staged`.
+//! Found files promote as usual, and admission does not change.
+//!
+//! 1. **Stager.** A web stage replica records its (replica id, incarnation)
+//!    with every representation it stages, in the transaction that reserves
+//!    the stage custody (`lore_domain_write_behind_stagers`).
+//! 2. **Challenge.** Every reader writes a fresh random challenge into its
+//!    own `<stage>/liveness/<replica>.challenge` (`<incarnation>
+//!    <challenge>`) and rotates it every [`CHALLENGE_EVERY_STEPS`] steps. A
+//!    challenge counts as CURRENT only after its write completed. Outside
+//!    the stage's liveness files the challenge is stored nowhere: not in
+//!    Postgres, not in a log.
+//! 3. **Echo.** Each web stage replica reads the challenge file of the other
+//!    processes in its last view, in its OWN liveness directory, and writes
+//!    what it found as a FILE in that same directory:
+//!    `<stage>/liveness/<replica>.echo`, its own incarnation on the first
+//!    line, then one `<reader incarnation> <challenge>` line per reader
+//!    (temporary file, fsync, rename). Only rows published within
+//!    [`SHARE_PEER_FRESH`] count, drain rows first, at most
+//!    [`MAX_CHALLENGE_ECHOES`]: a dead row never takes the drain's place.
+//! 4. **Confirmation.** A reader reads the echo file of each web replica of
+//!    its last view (fresh rows only) in ITS OWN liveness directory. It
+//!    confirms that process only when the file names the process's
+//!    incarnation and echoes the reader's CURRENT challenge under the
+//!    reader's own incarnation, and then, after a rotation, echoes a LATER
+//!    current challenge. An echo of an older challenge, or of another
+//!    reader's, counts for nothing. A process never echoes, nor confirms
+//!    from, its own files. The confirmations live in the reader's
+//!    memory, for its current incarnation only: a restarted reader starts
+//!    with none, and nothing about them is stored.
+//! 5. **Decision.** On `ENOENT` the reader reads the fragment's stager row
+//!    and asks its own confirmations. Only a confirmed stager reads as
+//!    absent, and only once the representation was published `Staged` at
+//!    least `MIN_STAGED_ABSENCE_AGE` (60 s, six rotations) ago by the
+//!    database clock; a younger one is kept (`too_recent`). The `ENOENT`
+//!    itself comes from an open beneath the stage's pinned `staged/`
+//!    directory, with the stage tree checked before the read and after the
+//!    miss, so it is a miss in that directory and in no other one.
+//!
+//! Why this proves the directory (review B1 of round 3): a confirmation needs
+//! data to move BOTH ways through one directory. The reader's new challenge
+//! must reach the web replica's directory (the web replica read it), and the
+//! web replica's echo of it must reach the reader's directory (the reader
+//! read it). So:
+//!
+//! - A copy of the reader's directory (rsync, a volume clone, a snapshot)
+//!   never shows the reader's NEW challenges to a web replica on the
+//!   original.
+//! - A one-way copy loop either way fails: from the web replica's directory
+//!   to the reader's, the challenge never reaches the web replica; from the
+//!   reader's directory to the web replica's, the echo never reaches the
+//!   reader.
+//! - A union or overlay mount (reads see the shared directory, writes stay
+//!   local) on either side fails the same way: one direction never arrives.
+//! - One stray copy of one challenge cannot confirm, because a later,
+//!   rotated challenge must be echoed too.
+//!
+//! What goes through the pinned stage tree (review B1 of round 4). At open
+//! the stage pins its root (device, inode, a held descriptor) and `staged/`;
+//! it pins `liveness/` on first use. Both are opened beneath the held root
+//! descriptor with `openat2(RESOLVE_BENEATH | RESOLVE_NO_XDEV |
+//! RESOLVE_NO_SYMLINKS)` and `O_NOFOLLOW`: a symlink or a mount point (a bind
+//! mount included) at `staged` refuses to start, and at `liveness` fails
+//! every liveness file and root check. `O_NOFOLLOW` refuses a symlink at the
+//! last component and `RESOLVE_BENEATH` keeps the middle components inside
+//! the pinned directory, so `RESOLVE_NO_SYMLINKS` is defence in depth here.
+//! `openat2` needs Linux 5.6 or later: where it fails (`ENOSYS`, or `EPERM`
+//! from a seccomp filter) the stage does not open and the server does not
+//! boot. Then:
+//!
+//! - every challenge, echo and share marker file is read and written through
+//!   the held `liveness/` descriptor, never by path;
+//! - every staged read opens its file beneath the held `staged/` descriptor,
+//!   confined the same way, and the finalizer creates its fan-out
+//!   directories and renames into them there too;
+//! - every proof I/O (challenge write, echo write, echo or challenge read)
+//!   runs only while the root check holds before and after it: the root path
+//!   still names the pinned root, and `staged` and `liveness` under it,
+//!   opened confined now, are still the pinned directories (device and
+//!   inode). A failed check after a challenge write leaves no current
+//!   challenge; after an echo write it removes the echo file and nothing
+//!   counts as written; after a read it drops what was read.
+//!
+//! So a liveness file proves something about one `liveness/` directory, and
+//! a directory has one parent: two processes that exchange a challenge and
+//! its echo share one root, and so one `staged/`. A process never changes
+//! its pinned tree, so one confirmation covers every file that process
+//! staged, also after it left. Off Linux there is no `openat2`, so the root
+//! check is always false and a guarded read never proves a miss.
+//!
+//! Not through the pinned tree: the finalizer's temporary file under
+//! `incoming/` (a rename from elsewhere fails across a mount, or still lands
+//! in the pinned leaf), the boot probe, the free-space sample, and the K11
+//! probe file (`file_probe`), which tests the mount, not the tree.
+//!
+//! The web replica's marker no longer holds a nonce (round 2's two-nonce
+//! rule). Its only job was to show the marker advancing in the reader's
+//! directory, and a one-way copy loop does that too (S1). The challenge
+//! proves the stronger fact, so the nonce adds nothing.
+//!
+//! Costs (liveness only; nothing is lost while a file is kept):
+//!
+//! - A file with no recorded stager (staged by an older binary, by a replica
+//!   with stage liveness off, or by a full-role replica) is never read as
+//!   absent by a guarded reader. The `no_stager` count shows it.
+//! - A web replica that leaves before this reader process confirmed it
+//!   (about two [`CHALLENGE_EVERY_STEPS`] rotations, 10 to 25 s) leaves
+//!   files this reader never reads as absent. So does every web replica that
+//!   left before a READER RESTART: a restarted drain has no confirmations.
+//!   The `unconfirmed` count shows them. A web replica that is still running
+//!   and confirmed that stager earlier still decides them on a GET. Such a
+//!   replica's row stops being fresh within [`SHARE_PEER_FRESH`]; it then
+//!   leaves the "not confirmed yet" signal (`absence_unconfirmed`, the
+//!   gauge), but its files stay kept: only a confirmation reads a file as
+//!   absent, and a departed process can never be confirmed.
+//! - Two directories kept in step by a sync in BOTH directions faster than a
+//!   rotation act as one directory for the challenge and the echo, but not
+//!   for the staged files. The minimum staged age (step 5) covers a sync
+//!   that carries a file within 60 s; a slower one that still keeps up with
+//!   the echo is not covered. **Operator rule: never run a sync or copy tool
+//!   on the stage directory.** The stage is one shared directory.
+//! - A path change and change back inside one step is not seen by the root
+//!   check, but no proof I/O follows the path any more: it goes through the
+//!   held descriptors.
+//! - Removing `<stage>/liveness` while replicas run fails their liveness
+//!   root checks until each restarts. Staging continues on every replica
+//!   already anchor-proven (admission checks only the root and `staged/`,
+//!   and a proven replica is never held again; one not yet proven stays
+//!   direct). Only absence proofs stop: no new confirmation, and every
+//!   missing file is kept. Do not remove it.
+//! - Recreating `staged/` (`rm -rf` and `mkdir` on the file server) leaves
+//!   every replica's pinned `staged/` descriptor stale (`ESTALE` on NFS) for
+//!   good. Admission then reports `RootUnavailable`: staging is off and PUTs
+//!   write directly, `/health_check` shows `root_unavailable`, and
+//!   `/lb_health` stays 200. No staged read is absent. Every replica must
+//!   restart. Do not recreate it.
+//! - Accepted risk T1 (review B of round 5): a process with write access to
+//!   the stage that renames `<root>/staged` away and back at each step can
+//!   make a reader confirm a stager whose pinned `staged/` differs from its
+//!   own. Such a process can also delete staged files outright, so it is
+//!   outside the threat model.
+//!
+//! Cost of the echo (review A of round 4): with five or more readers the
+//! echo content changes almost every step, because readers rotate out of
+//! phase. So each web replica writes its echo (temporary file, fsync,
+//! rename) about every 2 s for its whole life. With 10 web replicas and 1
+//! drain that is about 55 file opens a second and 5 fsync-renames a second
+//! cell-wide (computed, not measured). The root checks add three directory
+//! opens per check, a few checks per step.
+//!
+//! Every process leaves `.present`, `.challenge` and `.echo` files under
+//! `<stage>/liveness/` (about 100 bytes each). A clean stop removes its own;
+//! a crashed process's stay. Nothing else removes them.
+//!
+//! **Operator action** when the drain's `absence_counts.unconfirmed` or
+//! `no_stager` keeps rising, or its log names a staged file kept because it
+//! is not proven gone: first check the stage mount on the drain host and on
+//! every web host (the usual cause is a wrong or stale mount; fix it, and the
+//! files are found and promoted). A file that is truly gone and whose stager
+//! has left stays `Staged` after a drain restart: each pass retries it, and a
+//! GET of it answers `SlowDown`. No command marks it `Missing` today; a GET
+//! on a web replica that confirmed the stager before it left does. Record
+//! the hashes from the log line and escalate.
+//!
+//! **Web replicas run the same guard.** A web replica proven against one
+//! drain keeps that proof for its life, so in the same split (web-a latched
+//! on A, web-c proven on B) a GET on web-a for a web-c fragment would read
+//! ENOENT on A. So a `stage` web replica is a reader too: it writes its own
+//! challenge, confirms peer web replicas that echo it, and confirms itself
+//! (its own files are in its own pinned root, which its reads use). While
+//! the K11 share gate holds, a missing file is never absent, as before. The
+//! guard changes only how a staged read that finds no file answers:
+//! `/lb_health`, the K11 eject rule and the shared-stage verdicts are
+//! unchanged, and only the drain prunes the stager table.
+//!
+//! A GET whose miss the guard cannot prove re-reads the lifecycle head: if
+//! the head is no longer that `Staged` epoch (a promotion and purge won the
+//! race), it answers for the new head, not `SlowDown` (review N1 of round 2).
+//!
+//! `/health_check` shows `absence` (`guarded`, or [`ABSENCE_NO_CHALLENGE`]
+//! while this reader has no current challenge), the fresh web replicas in the
+//! last view not yet confirmed, how many are confirmed, and the decision
+//! counts. On every reader (the drain and each guarded web replica), the
+//! `stage_share_absence_unproven` gauge is 1 while a fresh web replica in the
+//! view is unconfirmed or there is no current challenge, and a state change
+//! logs one line; one held for [`SHARE_GRACE`] logs one error. The
+//! `stage_drain_absence_kept` gauge is the number of kept decisions since
+//! boot (a kept file adds one per retry). Both gauges are local; nothing
+//! exports them to Lorehub.
+//!
+//! Turning `stage_liveness_probe` off turns this guard off too.
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -228,6 +442,9 @@ use lore_postgres::domain::fragments::StageLivenessRole;
 use lore_postgres::domain::fragments::StagePeerLiveness;
 use lore_postgres::domain::fragments::StagePeerProgress;
 use lore_postgres::domain::fragments::StageProgressRecord;
+use lore_postgres::domain::fragments::StagerIdentity;
+use lore_postgres::store::fragment_write_behind::DrainAbsenceCounts;
+use lore_postgres::store::fragment_write_behind::DrainAbsenceSnapshot;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::metrics::Gauge;
 use serde::Serialize;
@@ -288,6 +505,56 @@ pub const SHARE_GRACE: Duration = Duration::from_secs(90);
 /// The marker file suffix under `<stage>/liveness/`.
 pub const SHARE_MARKER_SUFFIX: &str = ".present";
 
+/// The challenge file suffix under `<stage>/liveness/` (drain guard).
+pub const CHALLENGE_SUFFIX: &str = ".challenge";
+
+/// The echo file suffix under `<stage>/liveness/` (drain guard): a web stage
+/// replica's echoes of the challenges it read in its own stage.
+pub const ECHO_SUFFIX: &str = ".echo";
+
+/// The `/health_check` `absence` word while this reader has no current
+/// challenge: no staged file it cannot find reads as absent.
+pub const ABSENCE_NO_CHALLENGE: &str = "no_challenge";
+
+/// A reader writes a new challenge every this many steps (about 10 s at
+/// [`PROBE_INTERVAL`]). Longer than one echo round trip (the web replica's
+/// next step reads it and writes the echo file, then the reader's next step
+/// reads that: about 4 s), so an echo usually arrives while its challenge is
+/// still current.
+pub const CHALLENGE_EVERY_STEPS: u64 = 5;
+
+/// The most reader challenges a web stage replica echoes: the fresh drain
+/// rows of its view first, then fresh web rows (review S1 of round 3). Each
+/// echo line is under 70 bytes.
+pub const MAX_CHALLENGE_ECHOES: usize = 64;
+
+/// The most echo files a reader reads in one step: one per fresh web row of
+/// its view that it has not confirmed yet.
+pub const MAX_ECHO_READS: usize = 256;
+
+/// The longest echo file content read, in bytes. A full echo file
+/// ([`MAX_CHALLENGE_ECHOES`] lines) is shorter.
+const ECHO_READ_LIMIT: u64 = 16 * 1024;
+
+/// The most confirmations a reader keeps; the oldest goes first. Losing one
+/// only keeps that stager's missing files `Staged`.
+pub const MAX_CONFIRMED_STAGERS: usize = 4096;
+
+/// The drain prunes the stager table every this many exchanges (about one
+/// minute).
+pub const DRAIN_GUARD_PRUNE_EVERY: u64 = 30;
+
+/// The most stager rows one prune pass deletes.
+pub const DRAIN_GUARD_PRUNE_LIMIT: i64 = 1000;
+
+/// The most prune passes per prune tick. A pass that deletes a full
+/// [`DRAIN_GUARD_PRUNE_LIMIT`] runs another, so one tick deletes up to
+/// 10,000 rows a minute; the drain stages and promotes about 25 a second
+/// (review S2 of round 2).
+pub const DRAIN_GUARD_PRUNE_MAX_PASSES: u32 = 10;
+
+/// The `statement_timeout` of one drain guard prune pass.
+pub const DRAIN_GUARD_PRUNE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The longest marker content read, in bytes. An incarnation is shorter.
 const MARKER_READ_LIMIT: u64 = 256;
 
@@ -354,6 +621,15 @@ struct Instruments {
     /// 1 while the drain worker publishes `drain_unverified` (its own marker
     /// read-back fails or is too old), else 0. Only the drain records it.
     share_anchor_unverified: Gauge<u64>,
+    /// 1 while a fresh web stage replica in a reader's last view is not
+    /// confirmed by that reader process, or the reader has no current
+    /// challenge, else 0. Every reader (the drain, and each web stage replica
+    /// with the guard) records it for itself. Local only.
+    share_absence_unproven: Gauge<u64>,
+    /// Decisions since boot that kept a staged file a reader could not find
+    /// `Staged`, because it could not prove the file gone. A kept file adds
+    /// one per retry. Every reader records it for itself. Local only.
+    drain_absence_kept: Gauge<u64>,
 }
 
 fn instruments() -> &'static Instruments {
@@ -379,6 +655,12 @@ fn instruments() -> &'static Instruments {
                 .build(),
             share_anchor_unverified: meter
                 .u64_gauge(provider.scope_name("stage_share_anchor_unverified"))
+                .build(),
+            share_absence_unproven: meter
+                .u64_gauge(provider.scope_name("stage_share_absence_unproven"))
+                .build(),
+            drain_absence_kept: meter
+                .u64_gauge(provider.scope_name("stage_drain_absence_kept"))
                 .build(),
         }
     })
@@ -507,6 +789,88 @@ impl ShareVerdict {
     }
 }
 
+/// A check that the stage tree is still the one pinned at open: the root
+/// path names the pinned root, and its `staged` and `liveness`, opened with
+/// no symlink and no mount point, are the pinned directories. Blocking;
+/// called on the probe or marker thread only. See the module docs ("Drain
+/// guard").
+pub type RootCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// The absence guard's state on a reader (the drain worker, or a guarded web
+/// replica). See the module docs ("Drain guard").
+#[derive(Debug, Default)]
+struct GuardState {
+    /// Every fresh `stage` row of the last successful view: the sequence
+    /// number of the first current challenge of this reader that its echo
+    /// file showed, if any. A later current challenge confirms it.
+    candidates: BTreeMap<StagerIdentity, Option<u64>>,
+    /// Stagers this reader process confirmed in its own stage. Kept for the
+    /// life of this incarnation (a process never changes its directory),
+    /// never stored, at most [`MAX_CONFIRMED_STAGERS`].
+    confirmed: BTreeSet<StagerIdentity>,
+    /// `confirmed` in the order it grew, to drop the oldest first.
+    confirmed_order: VecDeque<StagerIdentity>,
+    /// The other processes of the last view whose challenges a web stage
+    /// replica echoes, as (replica id, incarnation): fresh rows only, drain
+    /// rows first, at most [`MAX_CHALLENGE_ECHOES`].
+    checkers: Vec<(String, String)>,
+}
+
+impl GuardState {
+    /// Web replicas of the last view not confirmed by this reader.
+    fn unconfirmed(&self) -> impl Iterator<Item = &StagerIdentity> {
+        self.candidates
+            .keys()
+            .filter(|stager| !self.confirmed.contains(stager))
+    }
+
+    fn confirm(&mut self, stager: StagerIdentity) {
+        if self.confirmed.insert(stager.clone()) {
+            self.confirmed_order.push_back(stager);
+        }
+        while self.confirmed_order.len() > MAX_CONFIRMED_STAGERS {
+            if let Some(oldest) = self.confirmed_order.pop_front() {
+                self.confirmed.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// A reader's own challenge (module docs, "Drain guard").
+#[derive(Debug, Default)]
+struct ChallengeState {
+    /// Challenge steps so far.
+    steps: u64,
+    /// The sequence number of the last challenge written.
+    seq: u64,
+    /// The current challenge: the last one whose write completed while the
+    /// root path named the pinned root. `None` before the first, and after a
+    /// root check fails.
+    current: Option<(u64, String)>,
+}
+/// What [`StageLiveness::report_absence`] logged on one call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbsenceLog {
+    /// Nothing new.
+    None,
+    /// The first report, while something is unproven (info).
+    StartHeld,
+    /// Proven before, unproven now (warn).
+    Held,
+    /// Unproven before, proven now (info).
+    Proven,
+    /// Unproven for [`SHARE_GRACE`] (error, once per hold).
+    Escalated,
+}
+
+/// The drain guard's last reported state, for its log lines.
+#[derive(Debug, Clone, Copy)]
+struct AbsenceReport {
+    held: bool,
+    since: Instant,
+    escalated: bool,
+}
+
 /// The shared-stage check's state. See the module docs.
 #[derive(Debug, Default)]
 struct ShareState {
@@ -600,90 +964,298 @@ pub fn is_marker_safe_id(id: &str) -> bool {
     sanitize_replica_id(id) == id
 }
 
-/// The marker files under `<stage>/liveness/`. Blocking; used only on the
-/// probe thread.
+/// The marker, challenge and echo files under `<stage>/liveness/`. Blocking;
+/// used only on the probe or marker thread.
+///
+/// A replica's stage liveness uses [`Self::pinned`]: every file goes through
+/// the `liveness/` directory the stage pinned at open (a held descriptor,
+/// confined: no symlink, no mount point), never through a path, so a file it
+/// reads or writes is in its own pinned stage tree (review B1 of round 4).
+/// [`Self::new`] works on a plain path; tests and tools only.
 #[derive(Debug, Clone)]
 pub struct ShareMarkers {
-    directory: PathBuf,
+    directory: MarkerDirectory,
 }
 
-impl ShareMarkers {
-    pub fn new(root: &std::path::Path) -> Self {
-        Self {
-            directory: root.join(lore_postgres::store::write_behind::root::LIVENESS_DIR),
+#[derive(Debug, Clone)]
+enum MarkerDirectory {
+    /// `<root>/liveness` by path, created on demand.
+    Path(PathBuf),
+    /// The stage's pinned `liveness/` directory.
+    Pinned(lore_postgres::store::write_behind::StageLivenessDir),
+}
+
+impl MarkerDirectory {
+    /// The trimmed content of `name`, at most `limit` bytes, or `None` when
+    /// there is no such file.
+    fn read(&self, name: &str, limit: u64) -> std::io::Result<Option<String>> {
+        match self {
+            Self::Path(directory) => read_limited(&directory.join(name), limit),
+            Self::Pinned(directory) => match directory.read(name, limit)? {
+                None => Ok(None),
+                Some(bytes) => String::from_utf8(bytes)
+                    .map(|content| Some(content.trim().to_owned()))
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+            },
         }
     }
 
-    fn path(&self, replica_id: &str) -> Option<PathBuf> {
-        is_marker_safe_id(replica_id).then(|| {
-            self.directory
-                .join(format!("{replica_id}{SHARE_MARKER_SUFFIX}"))
-        })
+    /// Replace `name` with `content` through `temporary` (write, fsync,
+    /// rename), so a reader never sees a partial file.
+    fn replace(&self, name: &str, temporary: &str, content: &str) -> std::io::Result<()> {
+        match self {
+            Self::Path(directory) => write_atomic(
+                directory,
+                &directory.join(temporary),
+                &directory.join(name),
+                content,
+            ),
+            Self::Pinned(directory) => directory.replace(name, temporary, content.as_bytes()),
+        }
+    }
+
+    /// Remove `name`. An absent file is a success.
+    fn remove(&self, name: &str) -> std::io::Result<()> {
+        match self {
+            Self::Path(directory) => match std::fs::remove_file(directory.join(name)) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+            Self::Pinned(directory) => directory.remove(name),
+        }
+    }
+
+    /// Remove `name` if its first word is `incarnation`. A file of another
+    /// process under the same name is kept.
+    fn remove_if_named(&self, name: &str, incarnation: &str, limit: u64) -> std::io::Result<()> {
+        let held = self.read(name, limit)?;
+        if held
+            .as_deref()
+            .and_then(|content| content.split_whitespace().next())
+            != Some(incarnation)
+        {
+            return Ok(());
+        }
+        self.remove(name)
+    }
+}
+
+/// Split marker or challenge content into its incarnation and the word after
+/// it (a challenge file's challenge), if any. `None` for empty content or
+/// more than two words.
+pub fn parse_marker(content: &str) -> Option<(&str, Option<&str>)> {
+    let mut words = content.split_whitespace();
+    let incarnation = words.next()?;
+    let word = words.next();
+    if words.next().is_some() {
+        return None;
+    }
+    Some((incarnation, word))
+}
+
+/// A new random challenge (and the random part of a replica id).
+fn new_nonce() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+/// The challenge `reader_incarnation` is echoed with in the content of an
+/// echo file (`content`) written by the process `stager_incarnation`, if
+/// any. The first line must name exactly that incarnation; each later line
+/// is `<reader incarnation> <challenge>`. Only an exact incarnation match
+/// counts: an echo of another reader's challenge, or a file another process
+/// wrote under the same replica id, is never this reader's echo.
+pub fn echoed_challenge<'a>(
+    content: &'a str,
+    stager_incarnation: &str,
+    reader_incarnation: &str,
+) -> Option<&'a str> {
+    let mut lines = content.lines();
+    if lines.next()?.trim() != stager_incarnation {
+        return None;
+    }
+    lines
+        .filter_map(parse_marker)
+        .find(|(incarnation, _)| *incarnation == reader_incarnation)
+        .and_then(|(_, challenge)| challenge)
+}
+
+/// The trimmed content of the file at `path`, at most `limit` bytes, or
+/// `None` when there is no file.
+fn read_limited(path: &std::path::Path, limit: u64) -> std::io::Result<Option<String>> {
+    use std::io::Read as _;
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut content = String::new();
+    file.take(limit).read_to_string(&mut content)?;
+    Ok(Some(content.trim().to_owned()))
+}
+
+/// Replace `path` with `content` through `temporary` in `directory`
+/// (created on demand): write, fsync, then rename, so a reader never sees a
+/// partial file.
+fn write_atomic(
+    directory: &std::path::Path,
+    temporary: &std::path::Path,
+    path: &std::path::Path,
+    content: &str,
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    match std::fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    {
+        let mut handle = std::fs::File::create(temporary)?;
+        handle.write_all(content.as_bytes())?;
+        handle.sync_all()?;
+    }
+    std::fs::rename(temporary, path)
+}
+
+/// `replica_id` followed by `suffix`, if the id is safe as a file name.
+fn file_name(replica_id: &str, suffix: &str) -> Option<String> {
+    is_marker_safe_id(replica_id).then(|| format!("{replica_id}{suffix}"))
+}
+
+/// The error for a write under a replica id that is not safe as a file name.
+fn unsafe_name(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("replica id is not safe as a {what} file name"),
+    )
+}
+
+impl ShareMarkers {
+    /// The files under `<root>/liveness` by path, created on demand. Tests
+    /// and tools only: a replica's stage liveness uses [`Self::pinned`].
+    pub fn new(root: &std::path::Path) -> Self {
+        Self {
+            directory: MarkerDirectory::Path(
+                root.join(lore_postgres::store::write_behind::root::LIVENESS_DIR),
+            ),
+        }
+    }
+
+    /// The files in the stage's pinned `liveness/` directory.
+    pub fn pinned(directory: lore_postgres::store::write_behind::StageLivenessDir) -> Self {
+        Self {
+            directory: MarkerDirectory::Pinned(directory),
+        }
+    }
+
+    /// Whether this goes through a stage's pinned `liveness/` directory.
+    pub fn is_pinned(&self) -> bool {
+        matches!(self.directory, MarkerDirectory::Pinned(_))
+    }
+
+    /// The content of `replica_id`'s challenge file (`<incarnation>
+    /// <challenge>`), or `None` when there is none (or the id is not safe as
+    /// a file name).
+    pub fn read_challenge(&self, replica_id: &str) -> std::io::Result<Option<String>> {
+        match file_name(replica_id, CHALLENGE_SUFFIX) {
+            Some(name) => self.directory.read(&name, MARKER_READ_LIMIT),
+            None => Ok(None),
+        }
+    }
+
+    /// Replace `replica_id`'s challenge file with `content`: a temporary
+    /// file, fsync, then rename, so a reader never sees a partial challenge.
+    pub fn write_challenge(&self, replica_id: &str, content: &str) -> std::io::Result<()> {
+        let Some(name) = file_name(replica_id, CHALLENGE_SUFFIX) else {
+            return Err(unsafe_name("challenge"));
+        };
+        self.directory
+            .replace(&name, &format!("{name}.tmp"), content)
+    }
+
+    /// Remove `replica_id`'s challenge file if it still names `incarnation`,
+    /// so a stopped reader leaves nothing behind. A newer process's file
+    /// under the same id is kept.
+    pub fn remove_challenge_if(&self, replica_id: &str, incarnation: &str) -> std::io::Result<()> {
+        match file_name(replica_id, CHALLENGE_SUFFIX) {
+            Some(name) => self
+                .directory
+                .remove_if_named(&name, incarnation, MARKER_READ_LIMIT),
+            None => Ok(()),
+        }
+    }
+
+    /// The content of `replica_id`'s echo file, or `None` when there is none
+    /// (or the id is not safe as a file name). See [`echoed_challenge`].
+    pub fn read_echo(&self, replica_id: &str) -> std::io::Result<Option<String>> {
+        match file_name(replica_id, ECHO_SUFFIX) {
+            Some(name) => self.directory.read(&name, ECHO_READ_LIMIT),
+            None => Ok(None),
+        }
+    }
+
+    /// Replace `replica_id`'s echo file with `content` (temporary file,
+    /// fsync, rename).
+    pub fn write_echo(&self, replica_id: &str, content: &str) -> std::io::Result<()> {
+        let Some(name) = file_name(replica_id, ECHO_SUFFIX) else {
+            return Err(unsafe_name("echo"));
+        };
+        self.directory
+            .replace(&name, &format!("{name}.tmp"), content)
+    }
+
+    /// Remove `replica_id`'s echo file if it still names `incarnation`. A
+    /// newer process's file under the same id is kept.
+    pub fn remove_echo_if(&self, replica_id: &str, incarnation: &str) -> std::io::Result<()> {
+        match file_name(replica_id, ECHO_SUFFIX) {
+            Some(name) => self
+                .directory
+                .remove_if_named(&name, incarnation, ECHO_READ_LIMIT),
+            None => Ok(()),
+        }
     }
 
     /// The incarnation in `replica_id`'s marker, or `None` when there is no
     /// marker (or the id is not safe as a file name).
     pub fn read(&self, replica_id: &str) -> std::io::Result<Option<String>> {
-        use std::io::Read as _;
-        let Some(path) = self.path(replica_id) else {
-            return Ok(None);
-        };
-        let file = match std::fs::File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
-        let mut content = String::new();
-        file.take(MARKER_READ_LIMIT).read_to_string(&mut content)?;
-        Ok(Some(content.trim().to_owned()))
+        match file_name(replica_id, SHARE_MARKER_SUFFIX) {
+            Some(name) => self.directory.read(&name, MARKER_READ_LIMIT),
+            None => Ok(None),
+        }
     }
 
     /// Make `replica_id`'s marker hold `incarnation`. Writes only when it is
     /// missing or holds another value: a temporary file, fsync, then rename,
     /// so a reader never sees a partial marker. Returns whether it wrote.
     pub fn ensure(&self, replica_id: &str, incarnation: &str) -> std::io::Result<bool> {
-        use std::io::Write as _;
         if self.read(replica_id)?.as_deref() == Some(incarnation) {
             return Ok(false);
         }
-        let Some(path) = self.path(replica_id) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "replica id is not safe as a marker file name",
-            ));
+        let Some(name) = file_name(replica_id, SHARE_MARKER_SUFFIX) else {
+            return Err(unsafe_name("marker"));
         };
-        match std::fs::create_dir(&self.directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        let temporary = self
-            .directory
-            .join(format!("{replica_id}{SHARE_MARKER_SUFFIX}.tmp"));
-        {
-            let mut handle = std::fs::File::create(&temporary)?;
-            handle.write_all(incarnation.as_bytes())?;
-            handle.sync_all()?;
-        }
-        std::fs::rename(&temporary, &path)?;
+        self.directory
+            .replace(&name, &format!("{name}.tmp"), incarnation)?;
         Ok(true)
     }
 
     /// Remove `replica_id`'s marker if it still holds `incarnation`, so a
-    /// stopped replica leaves nothing behind. A newer process's marker under
-    /// the same id is kept.
+    /// stopped replica leaves nothing behind.
+    /// A newer process's marker under the same id is kept.
     pub fn remove_if(&self, replica_id: &str, incarnation: &str) -> std::io::Result<()> {
-        if self.read(replica_id)?.as_deref() != Some(incarnation) {
+        let held = self.read(replica_id)?;
+        if held
+            .as_deref()
+            .and_then(parse_marker)
+            .map(|(found, _)| found)
+            != Some(incarnation)
+        {
             return Ok(());
         }
-        let Some(path) = self.path(replica_id) else {
+        let Some(name) = file_name(replica_id, SHARE_MARKER_SUFFIX) else {
             return Ok(());
         };
-        match std::fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error),
-        }
+        self.directory.remove(&name)
     }
 }
 
@@ -718,13 +1290,33 @@ pub fn file_probe(root: PathBuf, replica_id: &str) -> ProbeFn {
     })
 }
 
-/// This replica's identity in the liveness table: host and process id.
+/// This replica's identity in the liveness table: host, process id, and a
+/// random part.
 ///
-/// Stable for the life of the process. In a container the host is the
-/// container id and the process id is 1, so a restarted container keeps its
-/// id; the incarnation tells the two processes apart.
+/// Stable for the life of the process and unique per process (assumption
+/// A3). Host and process id alone are not: two containers given the same
+/// host name both run as process 1 and would share one row, so their
+/// incarnations would replace each other and the K11 baseline and the
+/// shared-stage checks would flap (review S2). The random part ends that.
+/// A restarted process gets a new id; its old row is withdrawn at drain, or
+/// pruned after [`RETAIN`]. The host part is cut first if the id is too
+/// long, so the random part always survives.
 pub fn default_replica_id() -> String {
-    let host = ["HOSTNAME", "COMPUTERNAME"]
+    replica_id_for(&default_host(), std::process::id(), &new_nonce()[..8])
+}
+
+/// [`default_replica_id`] from its parts. The suffix `-<pid>-<random>` is
+/// always kept whole; only the host is cut to fit.
+pub fn replica_id_for(host: &str, pid: u32, random: &str) -> String {
+    let suffix = sanitize_replica_id(&format!("{pid}-{random}"));
+    let room = MAX_STAGE_LIVENESS_ID_BYTES.saturating_sub(suffix.len() + 1);
+    let host: String = sanitize_replica_id(host).chars().take(room).collect();
+    sanitize_replica_id(&format!("{host}-{suffix}"))
+}
+
+/// The host part of [`default_replica_id`].
+fn default_host() -> String {
+    ["HOSTNAME", "COMPUTERNAME"]
         .iter()
         .find_map(|key| std::env::var(key).ok().filter(|value| !value.is_empty()))
         .or_else(|| {
@@ -733,8 +1325,7 @@ pub fn default_replica_id() -> String {
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or_else(|| "unknown-host".to_owned());
-    sanitize_replica_id(&format!("{host}-{}", std::process::id()))
+        .unwrap_or_else(|| "unknown-host".to_owned())
 }
 
 /// Keep `[A-Za-z0-9._-]`, map anything else to `_`, and bound the length, so
@@ -778,6 +1369,57 @@ pub struct StageLivenessSnapshot {
     pub share: Option<&'static str>,
     /// Fresh drains whose marker this replica has not seen.
     pub share_unconfirmed: Vec<String>,
+    /// The absence guard (the drain, and a web replica with the guard
+    /// attached): `guarded`, or [`ABSENCE_NO_CHALLENGE`] while this replica
+    /// has no current challenge. `None` without the guard.
+    pub absence: Option<&'static str>,
+    /// Web stage replicas of the last view not yet confirmed by this
+    /// process.
+    pub absence_unconfirmed: Vec<String>,
+    /// Web stage replica processes this process confirmed (also ones that
+    /// have left). `None` without the guard.
+    pub absence_confirmed: Option<u64>,
+    /// What the guard decided for staged files this replica could not find,
+    /// since boot. Decisions, not files: a kept file adds one per retry.
+    pub absence_counts: Option<AbsenceCounts>,
+}
+
+/// The drain guard's decision counts, for `/health_check`.
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AbsenceCounts {
+    /// Read as absent (the stager was confirmed here).
+    pub proven: u64,
+    /// Kept `Staged`: this process has not confirmed the stager.
+    pub unconfirmed: u64,
+    /// Kept `Staged`: no stager is recorded.
+    pub no_stager: u64,
+    /// Kept `Staged`: the stager is confirmed, but the representation is
+    /// younger than `MIN_STAGED_ABSENCE_AGE`.
+    pub too_recent: u64,
+    /// Kept `Staged`: the stager read failed.
+    pub failed: u64,
+}
+
+impl AbsenceCounts {
+    /// Files kept `Staged`, for every cause.
+    pub fn kept(&self) -> u64 {
+        self.unconfirmed
+            .saturating_add(self.no_stager)
+            .saturating_add(self.too_recent)
+            .saturating_add(self.failed)
+    }
+}
+
+impl From<DrainAbsenceSnapshot> for AbsenceCounts {
+    fn from(snapshot: DrainAbsenceSnapshot) -> Self {
+        Self {
+            proven: snapshot.proven,
+            unconfirmed: snapshot.unconfirmed,
+            no_stager: snapshot.no_stager,
+            too_recent: snapshot.too_recent,
+            failed: snapshot.failed,
+        }
+    }
 }
 
 /// A peer as the baseline holds it: its incarnation, its count, and the
@@ -873,6 +1515,23 @@ pub struct StageLiveness {
     /// The drain worker only: the last reported anchor state, for one log
     /// line per transition.
     anchor_reported: Mutex<Option<bool>>,
+    /// A reader (the drain worker, or a guarded web replica): the absence
+    /// guard's confirmations (module docs, "Drain guard").
+    guard: Mutex<GuardState>,
+    /// A reader: the stage's decision counts, once attached.
+    absence_counts: OnceLock<Arc<DrainAbsenceCounts>>,
+    /// A reader: the last reported drain guard state.
+    absence_reported: Mutex<Option<AbsenceReport>>,
+    /// A reader: its own challenge. Written on the probe or marker thread,
+    /// read by the exchange task; never held across file I/O.
+    challenge: Mutex<ChallengeState>,
+    /// A web stage replica: the echo file content its last step wrote (and
+    /// the root check confirmed), so an unchanged echo is not written again.
+    /// `None` before the first, and after a failed write or root check.
+    echo_written: Mutex<Option<String>>,
+    /// Whether the configured root path still names the pinned stage root.
+    /// `None` (tests): always.
+    root_check: Option<RootCheck>,
 }
 
 impl StageLiveness {
@@ -919,6 +1578,12 @@ impl StageLiveness {
             role: StageLivenessRole::Stage,
             anchor_verified: Mutex::new(None),
             anchor_reported: Mutex::new(None),
+            guard: Mutex::new(GuardState::default()),
+            absence_counts: OnceLock::new(),
+            absence_reported: Mutex::new(None),
+            challenge: Mutex::new(ChallengeState::default()),
+            echo_written: Mutex::new(None),
+            root_check: None,
         }
     }
 
@@ -952,6 +1617,258 @@ impl StageLiveness {
         self.share_gate.clone()
     }
 
+    /// Check, around every challenge write and read, that the stage tree is
+    /// still the one pinned at open ([`RootCheck`]). Without one (tests), the
+    /// tree always counts as pinned.
+    #[must_use]
+    pub fn with_root_check(mut self, check: RootCheck) -> Self {
+        self.root_check = Some(check);
+        self
+    }
+
+    fn root_ok(&self) -> bool {
+        self.root_check.as_ref().is_none_or(|check| check())
+    }
+
+    /// A reader: the stage's absence guard counters, once
+    /// [`FragmentWriteBehindHandle::attach_drain_absence_guard`] returned
+    /// them. `false` if they were already set.
+    ///
+    /// [`FragmentWriteBehindHandle::attach_drain_absence_guard`]:
+    ///     lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle::attach_drain_absence_guard
+    pub fn set_absence_counts(&self, counts: Arc<DrainAbsenceCounts>) -> bool {
+        self.absence_counts.set(counts).is_ok()
+    }
+
+    /// A reader: whether `stager` is proven, to this process, to stage into
+    /// this process's own stage directory. A web stage replica always
+    /// confirms itself: its own files are in its own pinned root. Any other
+    /// stager only after its echo file, read in this process's own stage,
+    /// showed two of this process's current challenges
+    /// ([`Self::confirm_step`]). The absence guard asks this for each staged
+    /// file the stage cannot find.
+    pub fn confirms(&self, stager: &StagerIdentity) -> bool {
+        if self.role == StageLivenessRole::Stage
+            && stager.replica_id == self.replica_id
+            && stager.incarnation == self.incarnation
+        {
+            return true;
+        }
+        lock(&self.guard).confirmed.contains(stager)
+    }
+
+    /// A reader: its current challenge, as (sequence number, challenge), or
+    /// `None`. The challenge is a secret of this process's stage directory:
+    /// never log it.
+    #[lore_macro::test_pub]
+    pub(crate) fn current_challenge(&self) -> Option<(u64, String)> {
+        lock(&self.challenge).current.clone()
+    }
+
+    /// A reader: record the absence guard's part of a view. Only rows
+    /// published within `share_peer_fresh` count (review A1/A2 and S1 of
+    /// round 3): a crashed or departed process's row stays in the table for
+    /// [`RETAIN`], and must neither hold the "not confirmed yet" signal nor
+    /// take an echo slot.
+    ///
+    /// Every fresh `stage` row is a candidate, which [`Self::confirm_step`]
+    /// may confirm from its echo file. A candidate whose row is gone or stale
+    /// is dropped, but a confirmation never is: it is a fact about a process
+    /// that never changes its directory. A stager this process never
+    /// confirmed stays unconfirmed whatever its row does, so its staged files
+    /// are never read as absent here.
+    ///
+    /// Every other fresh process of the view is also a checker whose
+    /// challenge a web stage replica echoes: drain rows first, then the
+    /// others in replica-id order, at most [`MAX_CHALLENGE_ECHOES`].
+    #[lore_macro::test_pub]
+    pub(crate) fn note_guard_view(&self, view: &StagePeerLiveness) {
+        let fresh_micros =
+            i64::try_from(self.thresholds.share_peer_fresh.as_micros()).unwrap_or(i64::MAX);
+        let fresh = |peer: &StagePeerProgress| {
+            view.db_clock_micros.saturating_sub(peer.published_micros) <= fresh_micros
+        };
+        // This process itself is neither a checker nor a candidate (review A
+        // nit of round 4): echoing its own challenge proves nothing, and a
+        // web replica confirms itself anyway (`confirms`).
+        let other = |peer: &StagePeerProgress| {
+            peer.replica_id != self.replica_id || peer.record.incarnation != self.incarnation
+        };
+        let mut checkers: Vec<&StagePeerProgress> = view
+            .peers
+            .iter()
+            .filter(|peer| {
+                fresh(peer)
+                    && other(peer)
+                    && is_marker_safe_id(&peer.replica_id)
+                    && !peer.record.incarnation.is_empty()
+            })
+            .collect();
+        // A stable sort: drain rows (any drain role) first, each group in
+        // view (replica id) order.
+        checkers.sort_by_key(|peer| peer.role == StageLivenessRole::Stage);
+        let mut guard = lock(&self.guard);
+        let state = &mut *guard;
+        state.checkers = checkers
+            .into_iter()
+            .take(MAX_CHALLENGE_ECHOES)
+            .map(|peer| (peer.replica_id.clone(), peer.record.incarnation.clone()))
+            .collect();
+        let mut next = BTreeMap::new();
+        for peer in &view.peers {
+            if peer.role != StageLivenessRole::Stage || !fresh(peer) || !other(peer) {
+                continue;
+            }
+            let Some(stager) = StagerIdentity::new(&peer.replica_id, &peer.record.incarnation)
+            else {
+                continue;
+            };
+            let first = state.candidates.remove(&stager).flatten();
+            next.insert(stager, first);
+        }
+        state.candidates = next;
+    }
+
+    /// A reader, on the probe or marker thread: read the echo file of each
+    /// candidate not confirmed yet (at most [`MAX_ECHO_READS`]) in this
+    /// process's own stage. A file that names the candidate's incarnation and
+    /// echoes this reader's CURRENT challenge under this reader's incarnation
+    /// notes that challenge's sequence number; a later current challenge
+    /// confirms the candidate. Only while the root path names the pinned root
+    /// before and after the reads; else nothing read counts.
+    #[lore_macro::test_pub]
+    pub(crate) fn confirm_step(&self, markers: &ShareMarkers) {
+        let Some((seq, challenge)) = lock(&self.challenge).current.clone() else {
+            return;
+        };
+        let candidates: Vec<StagerIdentity> = {
+            let guard = lock(&self.guard);
+            guard.unconfirmed().take(MAX_ECHO_READS).cloned().collect()
+        };
+        if candidates.is_empty() || !self.root_ok() {
+            return;
+        }
+        let echoed: Vec<StagerIdentity> = candidates
+            .into_iter()
+            .filter(|stager| {
+                markers
+                    .read_echo(&stager.replica_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|content| {
+                        echoed_challenge(&content, &stager.incarnation, &self.incarnation)
+                            == Some(challenge.as_str())
+                    })
+            })
+            .collect();
+        if !self.root_ok() {
+            return;
+        }
+        let mut guard = lock(&self.guard);
+        for stager in echoed {
+            let confirm = match guard.candidates.get_mut(&stager) {
+                Some(slot @ None) => {
+                    *slot = Some(seq);
+                    false
+                }
+                Some(Some(earlier)) => *earlier < seq,
+                None => false,
+            };
+            if confirm {
+                guard.confirm(stager);
+            }
+        }
+    }
+
+    /// A reader, on the probe or marker thread: write a new challenge every
+    /// [`CHALLENGE_EVERY_STEPS`] steps (and on every step while there is
+    /// none). It becomes current only after its write completed, with the
+    /// root path naming the pinned root before and after. A failed root
+    /// check clears the current challenge. A failed write keeps the last
+    /// one: the file still holds it, or the new one that nobody counts.
+    #[lore_macro::test_pub]
+    pub(crate) fn challenge_step(&self, markers: &ShareMarkers) {
+        let due = {
+            let mut state = lock(&self.challenge);
+            let due = state.current.is_none() || state.steps.is_multiple_of(CHALLENGE_EVERY_STEPS);
+            state.steps = state.steps.wrapping_add(1);
+            due
+        };
+        if !self.root_ok() {
+            lock(&self.challenge).current = None;
+            return;
+        }
+        if !due {
+            return;
+        }
+        let challenge = new_nonce();
+        let written = markers
+            .write_challenge(
+                &self.replica_id,
+                &format!("{} {challenge}", self.incarnation),
+            )
+            .is_ok();
+        let rooted = self.root_ok();
+        let mut state = lock(&self.challenge);
+        if !rooted {
+            state.current = None;
+        } else if written {
+            state.seq = state.seq.saturating_add(1);
+            state.current = Some((state.seq, challenge));
+        }
+    }
+
+    /// A web stage replica, on the probe thread: read the challenge file of
+    /// each checker of the last view in this replica's own stage, keep those
+    /// that name the checker's current incarnation, and write them as this
+    /// replica's echo file in the same directory (module docs, "Drain guard",
+    /// step 3). An unchanged echo is not written again.
+    ///
+    /// Only while the root path names the pinned root before the reads and
+    /// after the write. If it no longer does after the write, the echo may
+    /// sit in another directory, so the echo file the path names now is
+    /// removed (if it holds this process's incarnation) and nothing counts as
+    /// written.
+    #[lore_macro::test_pub]
+    pub(crate) fn echo_step(&self, markers: &ShareMarkers) {
+        let checkers = lock(&self.guard).checkers.clone();
+        if !self.root_ok() {
+            *lock(&self.echo_written) = None;
+            return;
+        }
+        let mut content = self.incarnation.clone();
+        for (id, incarnation) in &checkers {
+            if let Ok(Some(found)) = markers.read_challenge(id)
+                && let Some((named, Some(challenge))) = parse_marker(&found)
+                && named == incarnation
+            {
+                content.push('\n');
+                content.push_str(incarnation);
+                content.push(' ');
+                content.push_str(challenge);
+            }
+        }
+        let unchanged = lock(&self.echo_written).as_deref() == Some(content.as_str());
+        let written = unchanged || markers.write_echo(&self.replica_id, &content).is_ok();
+        if !self.root_ok() {
+            *lock(&self.echo_written) = None;
+            if let Err(error) = markers.remove_echo_if(&self.replica_id, &self.incarnation) {
+                warn!(%error, "stage echo file could not be removed after the root path moved");
+            }
+            return;
+        }
+        *lock(&self.echo_written) = written.then_some(content);
+    }
+
+    /// A reader: whether something is not proven: this process has no
+    /// current challenge, or a web replica in the last view is not confirmed
+    /// by it yet.
+    pub fn absence_unproven(&self) -> bool {
+        if lock(&self.challenge).current.is_none() {
+            return true;
+        }
+        lock(&self.guard).unconfirmed().next().is_some()
+    }
     /// The shared-stage verdict at `now`.
     pub fn share_verdict(&self, now: Instant) -> ShareVerdict {
         let stuck = self.step_stuck(now);
@@ -995,6 +1912,7 @@ impl StageLiveness {
     /// fresh `drain` row nothing is required and nothing is proven: staging
     /// stays off and `/lb_health` stays 200.
     pub fn note_share(&self, now: Instant, view: &StagePeerLiveness) {
+        self.note_guard_view(view);
         let mut state = lock(&self.share);
         state.exchanged = true;
         if self.role != StageLivenessRole::Stage {
@@ -1085,19 +2003,30 @@ impl StageLiveness {
     /// marker. A completed read without it is "not seen"; a read that fails
     /// with an I/O error is "cannot decide" (module docs, step 6). The drain
     /// worker reads its own marker back and records whether it shows its
-    /// current incarnation: only then does it publish as an anchor. Returns
-    /// the own marker's write result.
+    /// current incarnation: only then does it publish as an anchor. Every
+    /// reader also keeps its challenge and reads its candidates' echo files,
+    /// and a stage replica reads the other processes' challenges and writes
+    /// its own echo file (module docs, "Drain guard").
+    /// Returns the own marker's write result.
     pub fn share_step(&self, markers: &ShareMarkers) -> std::io::Result<()> {
-        let own = markers
-            .ensure(&self.replica_id, &self.incarnation)
-            .map(|_| ());
         if self.role != StageLivenessRole::Stage {
+            let own = markers
+                .ensure(&self.replica_id, &self.incarnation)
+                .map(|_| ());
             let read_back = own.is_ok()
                 && markers.read(&self.replica_id).ok().flatten().as_deref()
                     == Some(self.incarnation.as_str());
             *lock(&self.anchor_verified) = read_back.then(Instant::now);
+            self.challenge_step(markers);
+            self.confirm_step(markers);
             return own;
         }
+        let own = markers
+            .ensure(&self.replica_id, &self.incarnation)
+            .map(|_| ());
+        self.challenge_step(markers);
+        self.confirm_step(markers);
+        self.echo_step(markers);
         for (id, incarnation) in self.share_checks() {
             match markers.read(&id) {
                 Ok(Some(found)) if found == incarnation => {
@@ -1109,7 +2038,6 @@ impl StageLiveness {
         }
         own
     }
-
     /// The drain worker only: whether its last marker read-back showed its
     /// incarnation and is at most `anchor_verify_max_age` old at `now`.
     /// `true` for a stage replica, which anchors nobody.
@@ -1398,9 +2326,35 @@ impl StageLiveness {
         } else {
             (None, Vec::new())
         };
+        let (absence, absence_unconfirmed, absence_confirmed, absence_counts) =
+            if self.role == StageLivenessRole::Drain || self.absence_counts.get().is_some() {
+                let challenged = lock(&self.challenge).current.is_some();
+                let state = lock(&self.guard);
+                (
+                    Some(if challenged {
+                        "guarded"
+                    } else {
+                        ABSENCE_NO_CHALLENGE
+                    }),
+                    state
+                        .unconfirmed()
+                        .map(|stager| stager.replica_id.clone())
+                        .collect(),
+                    Some(u64::try_from(state.confirmed.len()).unwrap_or(u64::MAX)),
+                    self.absence_counts
+                        .get()
+                        .map(|counts| AbsenceCounts::from(counts.snapshot())),
+                )
+            } else {
+                (None, Vec::new(), None, None)
+            };
         StageLivenessSnapshot {
             share,
             share_unconfirmed,
+            absence,
+            absence_unconfirmed,
+            absence_confirmed,
+            absence_counts,
             replica_id: self.replica_id.clone(),
             incarnation: self.incarnation.clone(),
             progress: self.progress(),
@@ -1419,6 +2373,7 @@ impl StageLiveness {
         let snapshot = self.snapshot(now);
         if self.role != StageLivenessRole::Stage {
             self.report_anchor(now, &snapshot);
+            self.report_absence(now, &snapshot);
             return;
         }
         instruments()
@@ -1435,6 +2390,11 @@ impl StageLiveness {
         }
         if self.share_guard {
             self.report_share(now, &snapshot);
+        }
+        // A web stage replica with the absence guard is a reader too: the
+        // same local gauges and state log as the drain (review S3, round 3).
+        if self.absence_counts.get().is_some() {
+            self.report_absence(now, &snapshot);
         }
         if self.ejected.swap(ejected, Ordering::Relaxed) != ejected {
             if ejected {
@@ -1482,6 +2442,87 @@ impl StageLiveness {
                 "the drain reads back its own stage marker again; it anchors the shared-stage check"
             );
         }
+    }
+
+    /// A reader's drain guard gauges (the drain, or a web stage replica with
+    /// the guard), one log line per change, and one error line when
+    /// something has been unproven for [`SHARE_GRACE`]. Unproven at boot (no
+    /// view or marker step yet) is logged at info: a healthy cell leaves it
+    /// within a few exchanges. Returns the log line it wrote. The gauges are
+    /// this process's own; nothing exports them to Lorehub.
+    #[lore_macro::test_pub]
+    pub(crate) fn report_absence(
+        &self,
+        now: Instant,
+        snapshot: &StageLivenessSnapshot,
+    ) -> AbsenceLog {
+        let held = self.absence_unproven();
+        instruments()
+            .share_absence_unproven
+            .record(u64::from(held), &[]);
+        if let Some(counts) = snapshot.absence_counts {
+            instruments().drain_absence_kept.record(counts.kept(), &[]);
+        }
+        let unconfirmed = &snapshot.absence_unconfirmed;
+        let mut reported = lock(&self.absence_reported);
+        let logged = match reported.as_mut() {
+            Some(report) if report.held == held => {
+                if held
+                    && !report.escalated
+                    && now.saturating_duration_since(report.since) >= self.thresholds.share_grace
+                {
+                    report.escalated = true;
+                    error!(
+                        replica_id = %snapshot.replica_id,
+                        role = self.role.as_str(),
+                        ?unconfirmed,
+                        "this reader has not confirmed every web stage replica in its own stage \
+                         for a long time; a staged file such a replica wrote that this reader \
+                         cannot find is retried, never marked Missing. Check the stage mount on \
+                         this host and on the listed web hosts"
+                    );
+                    return AbsenceLog::Escalated;
+                }
+                return AbsenceLog::None;
+            }
+            Some(_) if held => {
+                warn!(
+                    replica_id = %snapshot.replica_id,
+                    role = self.role.as_str(),
+                    ?unconfirmed,
+                    "this reader has a web stage replica it has not confirmed in its own stage; \
+                     a staged file that replica wrote that this reader cannot find is retried, \
+                     never marked Missing"
+                );
+                AbsenceLog::Held
+            }
+            Some(_) => {
+                info!(
+                    replica_id = %snapshot.replica_id,
+                    role = self.role.as_str(),
+                    "this reader has confirmed every fresh web stage replica in its view in its \
+                     own stage"
+                );
+                AbsenceLog::Proven
+            }
+            None if held => {
+                info!(
+                    replica_id = %snapshot.replica_id,
+                    role = self.role.as_str(),
+                    "until this reader confirms a web stage replica in its own stage, a staged \
+                     file that replica wrote that this reader cannot find is retried, never \
+                     marked Missing"
+                );
+                AbsenceLog::StartHeld
+            }
+            None => AbsenceLog::None,
+        };
+        *reported = Some(AbsenceReport {
+            held,
+            since: now,
+            escalated: false,
+        });
+        logged
     }
 
     /// The share gauge and one log line per share verdict change.
@@ -1657,6 +2698,9 @@ fn marker_loop(
     if let Err(error) = markers.remove_if(liveness.replica_id(), liveness.incarnation()) {
         warn!(%error, "stage share marker could not be removed at stop");
     }
+    if let Err(error) = markers.remove_challenge_if(liveness.replica_id(), liveness.incarnation()) {
+        warn!(%error, "stage challenge file could not be removed at stop");
+    }
 }
 
 fn probe_loop(
@@ -1703,10 +2747,18 @@ fn probe_loop(
             std::thread::sleep(left.min(Duration::from_millis(100)));
         }
     }
-    if let Some(markers) = markers
-        && let Err(error) = markers.remove_if(liveness.replica_id(), liveness.incarnation())
-    {
-        warn!(%error, "stage share marker could not be removed at stop");
+    if let Some(markers) = markers {
+        if let Err(error) = markers.remove_if(liveness.replica_id(), liveness.incarnation()) {
+            warn!(%error, "stage share marker could not be removed at stop");
+        }
+        if let Err(error) =
+            markers.remove_challenge_if(liveness.replica_id(), liveness.incarnation())
+        {
+            warn!(%error, "stage challenge file could not be removed at stop");
+        }
+        if let Err(error) = markers.remove_echo_if(liveness.replica_id(), liveness.incarnation()) {
+            warn!(%error, "stage echo file could not be removed at stop");
+        }
     }
 }
 

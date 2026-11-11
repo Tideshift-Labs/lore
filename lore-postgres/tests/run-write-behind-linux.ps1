@@ -27,6 +27,11 @@ zero tests, not a failure:
     platforms, because each platform drops one case and gains the other. The discriminating
     evidence is name presence, which is what this runner now pins.
 
+  * The `lore-server` unit case
+    `stage_liveness::pinned_tree::a_bind_mount_on_staged_or_liveness_never_confirms_nor_reads_absent`,
+    `#[ignore]` because it needs CAP_SYS_ADMIN. It runs in its own short-lived `--privileged`
+    container, as its own gating row; without privileged Docker that row is NOT RUN.
+
 This runner executes all of them on Linux and reports ENUMERATED COUNTS, not just exit codes.
 It also runs the provider's default library and the feature-enabled postgres library offline.
 `-Clippy` adds strict, exit-code-gating lint checks for dispatch, provider, postgres and server.
@@ -194,6 +199,10 @@ $offlineInventory = @(
 # and asserted present-exactly-once in the Linux catalog: this is the direct evidence that the
 # Linux run contained what the Windows run cannot contain.
 $libUnixOnlyOffline = @(
+    # WP-115 drain guard (review B1 of round 4), cfg(target_os = "linux").
+    'pinned_tree_tests::a_staged_dir_replaced_before_a_miss_is_refused_not_absent',
+    'pinned_tree_tests::a_staged_dir_replaced_before_a_hit_still_reads_the_pinned_file',
+    'pinned_tree_tests::fanout_dirs_are_created_beneath_the_pinned_staged_dir',
     'durability_tests::root_clones_share_each_bounded_io_pool_and_puts_cannot_starve_reads',
     'durability_tests::a_put_waits_for_a_freed_slot_within_its_budget_and_is_refused_after_it',
     'durability_tests::a_burst_larger_than_the_put_pool_completes_without_a_refusal',
@@ -222,6 +231,7 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_missing_stage_usage_row_is_internal_not_slow_down',
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_reservation_over_the_stage_policy_is_internal_not_slow_down',
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_unproven_share_writes_directly_and_an_in_flight_staged_put_refuses',
+    'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::drain_guard_keeps_a_departed_writers_file_staged_and_marks_it_missing_only_where_confirmed',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observer_completes_inventory_across_more_than_one_bounded_scan',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_stalled_put_releases_the_single_domain_connection_and_survives_task_abort',
     'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',
@@ -275,6 +285,7 @@ $activeKillCase = 'store::immutable_store::fragment_write_behind::adapter_tests:
 $stagedReadRacePrefix = 'store::immutable_store::fragment_write_behind::adapter_tests::staged_read_tests::race::'
 $stagedReadRaceCases = @(
     "${stagedReadRacePrefix}promote_then_cleanup_under_a_paused_unleased_get_falls_back_to_the_remote_epoch",
+    "${stagedReadRacePrefix}promote_then_cleanup_under_a_paused_guarded_get_answers_for_the_remote_epoch_not_slow_down",
     "${stagedReadRacePrefix}obliterate_under_a_paused_unleased_get_is_not_found_and_never_missing",
     "${stagedReadRacePrefix}genuinely_lost_staged_file_is_not_found_and_published_missing_without_a_lease",
     "${stagedReadRacePrefix}fenced_fallback_onto_a_restaged_epoch_takes_exactly_one_lease_pair"
@@ -744,7 +755,14 @@ try {
     $serverCatalog = @(Get-Catalog -Kind 'test' -Target 'unit' -Package 'lore-server')
     $serverUnixOnly = 'plugins::postgres::the_same_write_behind_block_is_accepted_on_linux'
     $serverNonUnixOnly = 'plugins::postgres::an_otherwise_valid_write_behind_block_is_refused_at_boot_off_linux'
-    foreach ($suffix in @($serverUnixOnly)) {
+    # WP-115 drain guard (review B1 of round 4): the pinned-tree cases are
+    # `cfg(target_os = "linux")`; pin that they ran here.
+    $serverLinuxOnly = @(
+        'stage_liveness::pinned_tree::processes_on_one_pinned_tree_confirm',
+        'stage_liveness::pinned_tree::a_shared_liveness_symlink_after_open_never_confirms_split_data_dirs',
+        'stage_liveness::pinned_tree::a_replaced_staged_dir_fails_the_root_check_and_no_read_is_absent'
+    )
+    foreach ($suffix in @($serverUnixOnly) + $serverLinuxOnly) {
         $matched = @($serverCatalog | Where-Object { $_ -eq $suffix -or $_.EndsWith(":$suffix") })
         if ($matched.Count -ne 1) {
             throw "lore-server unit catalog must contain the Unix-only case '$suffix' exactly once; found $($matched.Count)"
@@ -773,6 +791,81 @@ try {
         -Failed $serverCounts.Failed `
         -Note "carries the cfg(unix) write-behind arm; $($serverCounts.Ignored) ignored"
     if ($serverStatus -ne 'PASS') { Write-Warning "  FAIL`n$($serverRun.Output)" } else { Write-Host "  PASS ($($serverCounts.Passed) passed, $($serverCounts.Ignored) ignored)" }
+
+    # ---- privileged bind-mount case ---------------------------------------------------------
+    # WP-115 drain guard (review B S2 of round 5): RESOLVE_NO_XDEV on the stage pins is killed
+    # only by this `#[ignore]` case, which bind-mounts over `<root>/staged` and `<root>/liveness`
+    # and so needs CAP_SYS_ADMIN. It runs from the binary the pass above built, in its OWN
+    # `--privileged` container (the build container stays unprivileged), removed right after.
+    # It is GATING. When privileged Docker or a bind mount is not available the row is NOT RUN,
+    # never PASS, and the run exits 1: that box has not run this case.
+    $bindMountCase = 'stage_liveness::pinned_tree::a_bind_mount_on_staged_or_liveness_never_confirms_nor_reads_absent'
+    $privilegedContainer = "wb-linux-priv-$shortId"
+    $serverIgnored = @(Get-Catalog -Kind 'test' -Target 'unit' -Package 'lore-server' -IgnoredOnly)
+    if (@($serverIgnored | Where-Object { $_ -eq $bindMountCase }).Count -ne 1) {
+        throw "lore-server unit catalog must list the ignored case '$bindMountCase' exactly once"
+    }
+    $privilegedStatus = 'NOT RUN'
+    $privilegedNote = ''
+    $privilegedCounts = [pscustomobject]@{ Ran = 0; Passed = 0; Failed = 0; Ignored = 0 }
+    $binaryRun = Invoke-InContainer -Command @(
+        'sh', '-c',
+        ('cargo test -p lore-server --test unit --no-run --message-format=json 2>/dev/null ' +
+            '| grep -o ''"executable":"[^"]*/unit-[^"]*"'' | head -1 | cut -d''"'' -f4')
+    )
+    $unitBinary = ($binaryRun.Output -split "`r?`n" | Where-Object { $_ -match '^/cargo-target/' } | Select-Object -First 1)
+    if ($binaryRun.ExitCode -ne 0 -or -not $unitBinary) {
+        throw "could not locate the lore-server unit test binary:`n$($binaryRun.Output)"
+    }
+    $privilegedStart = Invoke-Captured docker @(
+        'run', '--detach', '--privileged', '--name', $privilegedContainer,
+        '--label', "$labelName=$runId",
+        '--label', "$labelName.pid=$PID",
+        '--network', 'none',
+        '--volume', "$($sourceCopy):/src:ro",
+        '--volume', "$($targetVolume):/cargo-target:ro",
+        '--workdir', '/src',
+        $imageTag, 'sleep', 'infinity'
+    )
+    if ($privilegedStart.ExitCode -ne 0) {
+        $privilegedNote = "privileged container refused (exit $($privilegedStart.ExitCode))"
+        Write-Warning "  NOT RUN: $privilegedNote`n$($privilegedStart.Output)"
+    }
+    else {
+        $createdContainers.Add($privilegedContainer)
+        try {
+            $mountProbe = Invoke-Captured docker @(
+                'exec', $privilegedContainer, 'sh', '-c',
+                'mkdir -p /tmp/wb-bind-a /tmp/wb-bind-b && mount --bind /tmp/wb-bind-a /tmp/wb-bind-b && umount /tmp/wb-bind-b'
+            )
+            if ($mountProbe.ExitCode -ne 0) {
+                $privilegedNote = "a bind mount is refused in the privileged container (exit $($mountProbe.ExitCode))"
+                Write-Warning "  NOT RUN: $privilegedNote`n$($mountProbe.Output)"
+            }
+            else {
+                Write-Host "Running $bindMountCase in privileged container $privilegedContainer ..."
+                $privilegedRun = Invoke-Captured docker @(
+                    'exec', '--workdir', '/src', $privilegedContainer, $unitBinary,
+                    '--ignored', '--exact', $bindMountCase, '--test-threads=1', '--nocapture'
+                )
+                Write-Host $privilegedRun.Output
+                $privilegedCounts = Read-TestCounts -Output $privilegedRun.Output
+                $privilegedStatus = if ($privilegedRun.ExitCode -eq 0 -and $privilegedCounts.Ran -eq 1 -and
+                    $privilegedCounts.Passed -eq 1 -and $privilegedCounts.Failed -eq 0) { 'PASS' }
+                elseif ($privilegedCounts.Ran -eq 1) { 'FAIL' } else { 'NOT RUN' }
+                $privilegedNote = "exit $($privilegedRun.ExitCode); kills a dropped RESOLVE_NO_XDEV"
+            }
+        }
+        finally {
+            $removeRun = Invoke-Captured docker @('rm', '--force', $privilegedContainer)
+            if ($removeRun.ExitCode -eq 0) { [void]$createdContainers.Remove($privilegedContainer) }
+            else { Write-Warning "failed to remove $privilegedContainer (exit $($removeRun.ExitCode)):`n$($removeRun.Output)" }
+        }
+    }
+    Add-Result -Target 'lore-server unit (privileged)' -Case $bindMountCase -Status $privilegedStatus `
+        -Enumerated 1 -Ran $privilegedCounts.Ran -Passed $privilegedCounts.Passed -Failed $privilegedCounts.Failed `
+        -Note $privilegedNote
+    if ($privilegedStatus -eq 'PASS') { Write-Host '  PASS (privileged)' } elseif ($privilegedStatus -eq 'FAIL') { Write-Warning '  FAIL (privileged)' }
 
     if ($IncludeCompileFail) {
         # Best-effort, and in a DIFFERENT crate: both compile-fail targets belong to

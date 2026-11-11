@@ -1077,6 +1077,24 @@ impl PostgresImmutableStore {
                 })
             }
             StagedRead::Absent => Err(MissingDiagnostic::Absent),
+            // No file, and the stage could not prove it gone (the K11 share
+            // gate, or the WP-115 drain guard). If the head has moved off
+            // this (Staged, epoch) meanwhile (a promotion and purge, or an
+            // obliterate, won the race), the miss says nothing about the
+            // fragment: answer for the new head from a fresh resolve, as
+            // `Fenced` does below, rather than `SlowDown` (review N1). The
+            // fresh pass is leased, so no purge can race it.
+            StagedRead::Unavailable(WriteBehindError::RootShareUnproven) => {
+                return if coordinator
+                    .staged_head_current(&witness.hash, witness.epoch)
+                    .await
+                    .map_err(domain_store_err)?
+                {
+                    Err(StoreError::from(SlowDown))
+                } else {
+                    Ok(CoordinatedLoad::RetryLeased)
+                };
+            }
             StagedRead::Unavailable(_) => return Err(StoreError::from(SlowDown)),
         };
         match result {
@@ -1956,13 +1974,17 @@ impl PostgresImmutableStore {
         {
             return Err(staged_put_refusal("mode"));
         }
+        // WP-115 drain guard: the web replica process that stages this
+        // representation commits with its custody, so a guarded drain can
+        // tell where the file was written.
         let begin = coordinator
-            .begin_stage(
+            .begin_stage_by(
                 address.hash.data(),
                 crate::domain::fragments::coordinator::StageReservationInput {
                     size_payload: u64::from(fragment.size_payload),
                     original_flags: fragment.flags,
                 },
+                stage.stager(),
             )
             .await
             .map_err(begin_stage_err)?;

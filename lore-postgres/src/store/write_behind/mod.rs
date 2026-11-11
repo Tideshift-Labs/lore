@@ -61,6 +61,68 @@ pub use self::admission::WriteBehindWatermarks;
 use self::root::ConfinedRoot;
 pub(crate) use self::root::StageIoPath;
 
+/// WP-115 drain guard: decides whether one staged representation that the
+/// stage cannot find may read as absent. See
+/// [`WriteBehindStage::attach_absence_guard`].
+pub trait StagedAbsenceGuard: Send + Sync {
+    /// `true` only when the absence of `(hash, epoch)`'s file in this stage
+    /// is proven to mean the file is gone, not that it was staged into
+    /// another directory. Any doubt, including an error, is `false`.
+    fn absence_proven<'a>(
+        &'a self,
+        hash: &'a [u8],
+        epoch: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+/// FORK-LOCAL (Tideshift), WP-115 drain guard: the stage liveness files'
+/// directory, `<root>/liveness`, pinned on first use beneath the stage's
+/// held root descriptor. Every call goes through
+/// the held directory descriptor, confined on Linux (no symlink, no mount
+/// point; see the `root` module header), so a liveness file read or written
+/// here is in the pinned stage tree and in no other directory. Blocking.
+/// Names must be one plain file name. Every call fails off Unix.
+#[derive(Clone)]
+pub struct StageLivenessDir {
+    root: ConfinedRoot,
+}
+
+impl std::fmt::Debug for StageLivenessDir {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StageLivenessDir")
+    }
+}
+
+impl StageLivenessDir {
+    /// The bytes of `name`, at most `limit`, or `None` when there is no
+    /// such file.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error other than "not found", and an invalid name.
+    pub fn read(&self, name: &str, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+        self.root.liveness_read(name, limit)
+    }
+
+    /// Replace `name` with `content`: write `temporary`, fsync, rename.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error, and an invalid name.
+    pub fn replace(&self, name: &str, temporary: &str, content: &[u8]) -> std::io::Result<()> {
+        self.root.liveness_replace(name, temporary, content)
+    }
+
+    /// Remove `name`. An absent file is a success.
+    ///
+    /// # Errors
+    ///
+    /// Any I/O error other than "not found", and an invalid name.
+    pub fn remove(&self, name: &str) -> std::io::Result<()> {
+        self.root.liveness_remove(name)
+    }
+}
+
 /// One reserved staging I/O slot. See [`WriteBehindStage::reserve_io`].
 pub(crate) struct StageIoPermit(tokio::sync::OwnedSemaphorePermit);
 
@@ -158,6 +220,11 @@ pub enum WriteBehindError {
     RootProbeFailed,
     #[error("write-behind staging root left its recorded filesystem")]
     RootDeviceChanged,
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: `<root>/staged` (at open)
+    /// or `<root>/liveness` (at first use) is a symlink, a mount point or not
+    /// a directory.
+    #[error("write-behind staging subdirectory is a symlink, a mount point or not a directory")]
+    StageTreeUnconfined,
     #[error("a fragment hash for staging was not 32 bytes")]
     HashWidth,
     #[error("a staged epoch was negative")]
@@ -210,6 +277,7 @@ impl WriteBehindError {
             | Self::RootNotADirectory
             | Self::RootProbeFailed
             | Self::RootDeviceChanged
+            | Self::StageTreeUnconfined
             | Self::Withdrawn
             | Self::RootShareUnproven
             | Self::Io { .. } => StoreError::from(SlowDown),
@@ -364,6 +432,16 @@ pub struct WriteBehindStage {
     /// stage liveness; never attached on other roles, which then behave as
     /// before. See [`Self::attach_share_gate`].
     share_gate: std::sync::OnceLock<Arc<AtomicBool>>,
+    /// WP-115 drain guard: decides, per staged representation, whether a
+    /// staged read that finds no file may read as absent. Attached once by
+    /// the stage liveness of a `drain` or `stage` replica. It changes only how
+    /// a staged read that finds no file answers; admission is untouched. See
+    /// [`Self::attach_absence_guard`].
+    absence_guard: std::sync::OnceLock<Arc<dyn StagedAbsenceGuard>>,
+    /// WP-115 drain guard: the web replica process this stage stages for,
+    /// recorded with each staged representation's custody. Attached once by
+    /// a `stage` replica's stage liveness. See [`Self::attach_stager`].
+    stager: std::sync::OnceLock<crate::domain::fragments::StagerIdentity>,
     /// Aborted on drop, so a store that goes away cannot leave a sampler probing
     /// a root it no longer owns. `lore_spawn!` gives the task `LORE_CONTEXT`;
     /// the `AbortOnDropHandle` wrapper gives it the stage's lifetime, which is
@@ -449,6 +527,8 @@ impl WriteBehindStage {
             stage_read_wait: settings.stage_read_wait,
             drain_reserve: settings.drain_reserve,
             share_gate: std::sync::OnceLock::new(),
+            absence_guard: std::sync::OnceLock::new(),
+            stager: std::sync::OnceLock::new(),
             sampler,
         }))
     }
@@ -475,6 +555,71 @@ impl WriteBehindStage {
         self.share_gate
             .get()
             .is_some_and(|gate| gate.load(Ordering::Acquire))
+    }
+
+    /// WP-115 drain guard: attach the per-fragment absence check. Returns
+    /// `false` if one was already attached.
+    ///
+    /// With a guard attached, a staged read that finds no file answers
+    /// [`StagedRead::Absent`] only when the guard proves that this
+    /// representation's stager wrote into this very directory; otherwise
+    /// [`StagedRead::Unavailable`] with [`WriteBehindError::RootShareUnproven`],
+    /// so the drain defers the fragment instead of marking it `Missing`. A
+    /// reader on another directory would otherwise read every staged fragment
+    /// as absent and demote it (the D1 data loss from the drain side).
+    /// Admission and the other read answers do not change.
+    pub fn attach_absence_guard(&self, guard: Arc<dyn StagedAbsenceGuard>) -> bool {
+        self.absence_guard.set(guard).is_ok()
+    }
+
+    /// WP-115 drain guard: attach the identity of the web replica process
+    /// that stages through this stage. Each staged representation records it
+    /// with its custody. Returns `false` if one was already attached.
+    pub fn attach_stager(&self, stager: crate::domain::fragments::StagerIdentity) -> bool {
+        self.stager.set(stager).is_ok()
+    }
+
+    /// The attached stager, if any.
+    pub(crate) fn stager(&self) -> Option<&crate::domain::fragments::StagerIdentity> {
+        self.stager.get()
+    }
+
+    /// WP-115 drain guard: whether the configured root path still names the
+    /// pinned root, and its `staged/` and `liveness/` entries, opened with no
+    /// symlink and no mount point, are the directories pinned at open.
+    /// Blocking; any error, and every platform but Linux, is `false`. Stage
+    /// liveness checks this before and after each challenge or echo write
+    /// and read, which go through [`Self::liveness_dir`].
+    #[must_use]
+    pub fn pinned_tree_intact(&self) -> bool {
+        self.root.liveness_tree_intact()
+    }
+
+    /// WP-115 drain guard: the stage liveness files' directory, pinned on
+    /// first use. Every liveness file goes through it, never through a path.
+    #[must_use]
+    pub fn liveness_dir(&self) -> StageLivenessDir {
+        StageLivenessDir {
+            root: self.root.clone(),
+        }
+    }
+
+    /// Whether a staged read of `(hash, epoch)` that found no file must not
+    /// read as absent: the share gate holds, or an absence guard is attached
+    /// and does not prove the absence. `false` with neither attached.
+    ///
+    /// Off Linux an attached guard never proves an absence: there the
+    /// stage tree cannot be pinned against a mount point (see
+    /// [`Self::pinned_tree_intact`]).
+    async fn absence_unproven(&self, hash: &[u8], epoch: i64) -> bool {
+        if self.share_unproven() {
+            return true;
+        }
+        match self.absence_guard.get() {
+            Some(_) if !cfg!(target_os = "linux") => true,
+            Some(guard) => !guard.absence_proven(hash, epoch).await,
+            None => false,
+        }
     }
 
     /// The drain's reserve permit and retry schedule, as configured.
@@ -651,10 +796,9 @@ impl WriteBehindStage {
             Ok(resolved) => resolved,
             Err(error) => return StagedRead::Unavailable(error),
         };
-        Self::staged_read(
-            self.root.read_regular(&resolved).await,
-            self.share_unproven(),
-        )
+        let read = self.root.read_regular(&resolved).await;
+        let unproven = matches!(read, Ok(None)) && self.absence_unproven(hash, epoch).await;
+        Self::staged_read(read, unproven)
     }
 
     /// [`Self::read_staged`] for a foreground GET.
@@ -674,26 +818,27 @@ impl WriteBehindStage {
             Ok(resolved) => resolved,
             Err(error) => return StagedRead::Unavailable(error),
         };
-        Self::staged_read(
-            self.root
-                .read_regular_within(&resolved, self.stage_read_wait)
-                .await,
-            self.share_unproven(),
-        )
+        let read = self
+            .root
+            .read_regular_within(&resolved, self.stage_read_wait)
+            .await;
+        let unproven = matches!(read, Ok(None)) && self.absence_unproven(hash, epoch).await;
+        Self::staged_read(read, unproven)
     }
 
-    /// Map one read. `share_unproven` is read AFTER the read returns, so a
-    /// gate raised while the read ran still turns its `ENOENT` into
+    /// Map one read. `absence_unproven` is decided AFTER the read returns,
+    /// so a gate raised while the read ran still turns its `ENOENT` into
     /// `Unavailable`.
     fn staged_read(
         read: Result<Option<Bytes>, WriteBehindError>,
-        share_unproven: bool,
+        absence_unproven: bool,
     ) -> StagedRead {
         match read {
             Ok(Some(bytes)) => StagedRead::Found(bytes),
-            // WP-115 K11 guard: an `ENOENT` on a stage not yet proven shared
-            // may only mean this replica looks at another directory.
-            Ok(None) if share_unproven => {
+            // WP-115 K11 and drain guards: an `ENOENT` on a stage not yet
+            // proven shared may only mean this replica looks at another
+            // directory.
+            Ok(None) if absence_unproven => {
                 StagedRead::Unavailable(WriteBehindError::RootShareUnproven)
             }
             // An `ENOENT` is decisive absence only because `read_regular`

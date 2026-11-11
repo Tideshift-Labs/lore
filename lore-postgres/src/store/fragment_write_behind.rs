@@ -1037,6 +1037,159 @@ type HeldDrainSlot = tokio::sync::OwnedMutexGuard<DrainSlot>;
 type JoinedPromotion =
     Result<(Vec<u8>, Result<bool, PromotionDeferred>, HeldDrainSlot), tokio::task::JoinError>;
 
+/// WP-115 drain guard: whether the reader process (the drain worker, or a web
+/// stage replica) confirmed a stager in its own stage directory, for its
+/// current incarnation. Supplied by the reader's stage liveness; see
+/// [`FragmentWriteBehindHandle::attach_drain_absence_guard`].
+pub type ConfirmedStagers =
+    Arc<dyn Fn(&crate::domain::fragments::StagerIdentity) -> bool + Send + Sync>;
+
+/// WP-115 drain guard: what the guard decided for staged files this reader
+/// could not find, since boot. Each counts DECISIONS, not files: a file kept
+/// `Staged` is read again on each retry, and each read adds one.
+#[derive(Debug, Default)]
+pub struct DrainAbsenceCounts {
+    /// Read as absent: the stager was confirmed in this directory.
+    pub proven: std::sync::atomic::AtomicU64,
+    /// Kept: the stager was not confirmed by this reader process.
+    pub unconfirmed: std::sync::atomic::AtomicU64,
+    /// Kept: no stager is recorded (an older binary, stage liveness off, or
+    /// a full-role replica). Such a file is never read as absent here.
+    pub no_stager: std::sync::atomic::AtomicU64,
+    /// Kept: the stager was confirmed, but the representation was published
+    /// less than [`MIN_STAGED_ABSENCE_AGE`] ago.
+    pub too_recent: std::sync::atomic::AtomicU64,
+    /// Kept: the stager read failed.
+    pub failed: std::sync::atomic::AtomicU64,
+}
+
+/// FORK-LOCAL (Tideshift), WP-115 drain guard (review B S1 of round 4): a
+/// staged file a guarded reader cannot find reads as absent only when its
+/// representation was published `Staged` at least this long ago, by the
+/// database clock.
+///
+/// Why: a challenge and its echo prove that data moves both ways between
+/// the stager's and the reader's directories within one challenge rotation
+/// (`CHALLENGE_EVERY_STEPS` x `PROBE_INTERVAL` = 10 s in `lore-server`).
+/// Two directories kept in step by a two-way sync tool faster than that
+/// pass the proof, but a file staged just before a sync pass is not yet in
+/// the reader's copy. Such a sync carries a file within one rotation, so a
+/// file 60 s (six rotations) old that is still missing is not merely late.
+/// The cost is liveness only: a truly lost file is marked `Missing` up to
+/// 60 s later, and a GET of it answers `SlowDown` until then.
+///
+/// This is a margin, not a proof: a sync tool slower than 60 s that keeps
+/// up with the echo is not covered. **Operator rule: never run a sync or
+/// copy tool on the stage directory.** The stage must be one shared
+/// directory (NFS or one host's disk).
+pub const MIN_STAGED_ABSENCE_AGE: Duration = Duration::from_secs(60);
+
+/// A point-in-time copy of [`DrainAbsenceCounts`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainAbsenceSnapshot {
+    pub proven: u64,
+    pub unconfirmed: u64,
+    pub no_stager: u64,
+    pub too_recent: u64,
+    pub failed: u64,
+}
+
+impl DrainAbsenceCounts {
+    pub fn snapshot(&self) -> DrainAbsenceSnapshot {
+        let read = |counter: &std::sync::atomic::AtomicU64| {
+            counter.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        DrainAbsenceSnapshot {
+            proven: read(&self.proven),
+            unconfirmed: read(&self.unconfirmed),
+            no_stager: read(&self.no_stager),
+            too_recent: read(&self.too_recent),
+            failed: read(&self.failed),
+        }
+    }
+
+    /// Count one decision. A kept file logs the first time and then at each
+    /// power of two, so a lasting cause stays visible without a line per
+    /// pass. `error` is the cause of a failed stager read, if any.
+    fn note(
+        counter: &std::sync::atomic::AtomicU64,
+        cause: &'static str,
+        kept: bool,
+        error: Option<&crate::domain::errors::DomainError>,
+    ) {
+        let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if kept && count.is_power_of_two() {
+            tracing::warn!(
+                cause,
+                count,
+                error = error.map(tracing::field::display),
+                "a staged file was not found and is not proven gone; the file stays Staged \
+                 and is retried, never marked Missing"
+            );
+        }
+    }
+}
+
+/// WP-115 drain guard on a reader's stage (the drain worker, or a web stage
+/// replica): a staged file it cannot find reads as absent only when the
+/// representation's recorded stager was confirmed by this reader process in
+/// its own stage. A stager is a web replica process; it never changes its
+/// stage directory, so one confirmation holds for every file it staged.
+struct DrainAbsenceGuard {
+    coordinator: PostgresFragmentCoordinator,
+    confirmed: ConfirmedStagers,
+    /// [`MIN_STAGED_ABSENCE_AGE`] in production.
+    min_staged_age: Duration,
+    counts: Arc<DrainAbsenceCounts>,
+}
+
+impl crate::store::write_behind::StagedAbsenceGuard for DrainAbsenceGuard {
+    fn absence_proven<'a>(
+        &'a self,
+        hash: &'a [u8],
+        epoch: i64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            use crate::domain::fragments::StagerAbsence;
+            match self
+                .coordinator
+                .stager_absence(hash, epoch, self.min_staged_age, self.confirmed.as_ref())
+                .await
+            {
+                Ok(StagerAbsence::Confirmed) => {
+                    DrainAbsenceCounts::note(&self.counts.proven, "proven", false, None);
+                    true
+                }
+                Ok(StagerAbsence::TooRecent) => {
+                    DrainAbsenceCounts::note(&self.counts.too_recent, "too_recent", true, None);
+                    false
+                }
+                Ok(StagerAbsence::Unconfirmed) => {
+                    DrainAbsenceCounts::note(
+                        &self.counts.unconfirmed,
+                        "stager_unconfirmed",
+                        true,
+                        None,
+                    );
+                    false
+                }
+                Ok(StagerAbsence::NoStager) => {
+                    DrainAbsenceCounts::note(&self.counts.no_stager, "no_stager", true, None);
+                    false
+                }
+                Err(error) => {
+                    DrainAbsenceCounts::note(
+                        &self.counts.failed,
+                        "stager_read_failed",
+                        true,
+                        Some(&error),
+                    );
+                    false
+                }
+            }
+        })
+    }
+}
 pub struct FragmentWriteBehindHandle {
     coordinator: PostgresFragmentCoordinator,
     /// The observer's two reads, on the domain connection reserved for it
@@ -1364,6 +1517,68 @@ impl FragmentWriteBehindHandle {
         self.stage.attach_share_gate(gate)
     }
 
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: on a reader of the shared
+    /// stage (the drain worker, or a web stage replica), read a staged file
+    /// this stage cannot find as absent only when its stager is one that
+    /// `confirmed` says this reader process confirmed in its own stage, and
+    /// the representation was published at least `min_staged_age` ago (see
+    /// [`DrainAbsenceGuard`]; production passes [`MIN_STAGED_ABSENCE_AGE`]).
+    /// Returns the guard's counters, or `None` if a guard was already
+    /// attached.
+    pub fn attach_drain_absence_guard(
+        &self,
+        confirmed: ConfirmedStagers,
+        min_staged_age: Duration,
+    ) -> Option<Arc<DrainAbsenceCounts>> {
+        let counts = Arc::new(DrainAbsenceCounts::default());
+        let guard = DrainAbsenceGuard {
+            coordinator: self.coordinator.clone(),
+            confirmed,
+            min_staged_age,
+            counts: counts.clone(),
+        };
+        self.stage
+            .attach_absence_guard(Arc::new(guard))
+            .then_some(counts)
+    }
+
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: on a web stage replica,
+    /// record `stager` with every representation it stages. `false` if one
+    /// was already attached.
+    pub fn attach_stager(&self, stager: crate::domain::fragments::StagerIdentity) -> bool {
+        self.stage.attach_stager(stager)
+    }
+
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: a check that the stage
+    /// root path still names the pinned root and its pinned `staged/` and
+    /// `liveness/` (see `WriteBehindStage::pinned_tree_intact`). Blocking;
+    /// for the liveness probe or marker thread only.
+    pub fn pinned_tree_check(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let stage = self.stage.clone();
+        Arc::new(move || stage.pinned_tree_intact())
+    }
+
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: the stage liveness files'
+    /// directory, pinned at open. Every challenge, echo and share marker
+    /// goes through it.
+    pub fn stage_liveness_dir(&self) -> crate::store::write_behind::StageLivenessDir {
+        self.stage.liveness_dir()
+    }
+
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: delete stager rows nothing
+    /// needs any more, `limit` per pass, until a pass deletes fewer, at most
+    /// `max_passes` passes.
+    pub async fn prune_drain_guard(
+        &self,
+        limit: i64,
+        max_passes: u32,
+        statement_timeout: Duration,
+    ) -> Result<crate::domain::fragments::DrainGuardPrune, StoreError> {
+        self.coordinator
+            .prune_drain_guard(limit, max_passes, statement_timeout)
+            .await
+            .map_err(domain_store_err)
+    }
     /// FORK-LOCAL (Tideshift), WP-115 K11: delete this replica's liveness row
     /// when it starts to drain, so no peer counts it as fresh.
     pub async fn withdraw_stage_liveness(&self, replica_id: &str) -> Result<bool, StoreError> {

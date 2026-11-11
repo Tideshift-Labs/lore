@@ -35,10 +35,118 @@ use super::*;
 pub const STAGE_LIVENESS_SCHEMA: &str =
     include_str!("../../../migrations/0010_write_behind_stage_liveness.sql");
 
+/// The boot-time declaration of the drain guard's one relation (WP-115 drain
+/// guard): the stager of each staged representation. An `include_str!` of
+/// the migration, so the two cannot drift.
+pub const DRAIN_GUARD_SCHEMA: &str =
+    include_str!("../../../migrations/0011_write_behind_drain_guard.sql");
+
 /// The longest `cell_id` or `replica_id` the table accepts, in bytes.
 pub const MAX_STAGE_LIVENESS_ID_BYTES: usize = 128;
 /// The longest `incarnation` the table accepts, in bytes.
 pub const MAX_STAGE_LIVENESS_INCARNATION_BYTES: usize = 64;
+
+/// The web replica process that staged one representation: its liveness
+/// replica id and incarnation. Recorded with the stage custody reservation
+/// (WP-115 drain guard).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct StagerIdentity {
+    pub replica_id: String,
+    pub incarnation: String,
+}
+
+impl StagerIdentity {
+    /// A stager identity, or `None` when either part is empty or too long
+    /// for the table.
+    pub fn new(replica_id: &str, incarnation: &str) -> Option<Self> {
+        let fits = |value: &str, max: usize| !value.is_empty() && value.len() <= max;
+        (fits(replica_id, MAX_STAGE_LIVENESS_ID_BYTES)
+            && fits(incarnation, MAX_STAGE_LIVENESS_INCARNATION_BYTES))
+        .then(|| Self {
+            replica_id: replica_id.to_owned(),
+            incarnation: incarnation.to_owned(),
+        })
+    }
+}
+
+/// What the drain guard knows about one staged representation it cannot
+/// find in its own stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagerAbsence {
+    /// Its stager was confirmed in the reader's stage directory: the file is
+    /// really gone, so it may read as absent.
+    Confirmed,
+    /// Its stager was confirmed, but the representation was published
+    /// `Staged` less than the minimum staged age ago (database clock), or
+    /// its epoch row is not found. A copy of the stage kept in step by a
+    /// sync tool may not carry the file yet, so it is not read as absent
+    /// yet (review B S1 of round 4).
+    TooRecent,
+    /// Its stager was not confirmed by this reader process. It may have
+    /// staged the file into another directory.
+    Unconfirmed,
+    /// No stager is recorded (an older binary, stage liveness off, or a
+    /// full-role replica). Never read as absent through the drain guard.
+    NoStager,
+}
+
+/// What one drain guard prune deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DrainGuardPrune {
+    /// Stager rows whose representation no longer has a live custody row.
+    pub stagers: u64,
+    /// Prune statements run. Each is its own transaction.
+    pub passes: u32,
+}
+
+/// Record `stager` as the stager of `(hash, epoch)`, in the transaction that
+/// reserves its stage custody. The epoch was just taken from the fence
+/// sequence, so no other row can hold its key.
+///
+/// Call it BEFORE `stage_custody::reserve_stage_locked`: that statement
+/// updates the cell-wide `lore_fragment_stage_usage` row, and every
+/// `begin_stage` in the cell waits on that row lock until this transaction
+/// ends. A round trip after it is paid by the whole cell (review S1).
+pub(super) async fn record_stager_locked(
+    tx: &Transaction<'_>,
+    hash: &[u8],
+    epoch: i64,
+    stager: &StagerIdentity,
+) -> Result<(), DomainError> {
+    tx.execute_cached(
+        "INSERT INTO lore_domain_write_behind_stagers (hash, epoch, replica_id, incarnation) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (hash, epoch) DO NOTHING",
+        &[&hash, &epoch, &stager.replica_id, &stager.incarnation],
+    )
+    .await
+    .map_err(|error| DomainError::from_pg("stage stager record", error))?;
+    Ok(())
+}
+
+/// Run `pass` until one deletes fewer than `limit` rows, at most
+/// `max_passes` times. A single bounded pass per tick is slower than a busy
+/// drain creates rows (review S2), so the table would grow without bound.
+/// Returns the rows deleted and the passes run. Stops at the first error.
+pub async fn prune_in_passes<F, Fut, E>(
+    limit: u64,
+    max_passes: u32,
+    mut pass: F,
+) -> Result<DrainGuardPrune, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<u64, E>>,
+{
+    let mut total = DrainGuardPrune::default();
+    while total.passes < max_passes.max(1) {
+        let deleted = pass().await?;
+        total.passes += 1;
+        total.stagers = total.stagers.saturating_add(deleted);
+        if deleted < limit {
+            break;
+        }
+    }
+    Ok(total)
+}
 
 /// One replica's progress row as an exchange read it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -412,5 +520,154 @@ impl PostgresFragmentCoordinator {
             ),
             db_clock_micros: row.get("db_clock_micros"),
         })
+    }
+
+    /// WP-115 drain guard: the web replica process recorded as the stager of
+    /// `(hash, epoch)`, and whether that representation's epoch row was
+    /// published at least `min_age` ago by the database clock (`false` when
+    /// the epoch row is not found; always `true` for a zero `min_age`, which
+    /// asks for no minimum), or `None` when no stager is recorded. One read.
+    pub async fn stager_of(
+        &self,
+        hash: &[u8],
+        epoch: i64,
+        min_age: std::time::Duration,
+    ) -> Result<Option<(StagerIdentity, bool)>, DomainError> {
+        let min_age_ms = i64::try_from(min_age.as_millis()).unwrap_or(i64::MAX);
+        let client = self.checkout().await?;
+        let row = if min_age_ms <= 0 {
+            client
+                .query_opt(
+                    "SELECT replica_id, incarnation, true AS settled \
+                     FROM lore_domain_write_behind_stagers \
+                     WHERE hash = $1 AND epoch = $2",
+                    &[&hash, &epoch],
+                )
+                .await
+        } else {
+            // The epoch row of a `Staged` representation is inserted by
+            // `commit_staged`, after the stager made its file durable, so its
+            // `created_at` is the earliest time the file existed in the
+            // stager's directory.
+            client
+                .query_opt(
+                    "SELECT s.replica_id, s.incarnation, \
+                            COALESCE((SELECT e.created_at <= clock_timestamp() \
+                                             - ($3::bigint * interval '1 millisecond') \
+                                      FROM lore_fragment_epochs e \
+                                      WHERE e.hash = s.hash AND e.epoch = s.epoch), false) \
+                            AS settled \
+                     FROM lore_domain_write_behind_stagers s \
+                     WHERE s.hash = $1 AND s.epoch = $2",
+                    &[&hash, &epoch, &min_age_ms],
+                )
+                .await
+        }
+        .map_err(|error| DomainError::from_pg_detailed("drain guard stager read", error))?;
+        Ok(row.map(|row| {
+            (
+                StagerIdentity {
+                    replica_id: row.get("replica_id"),
+                    incarnation: row.get("incarnation"),
+                },
+                row.get("settled"),
+            )
+        }))
+    }
+
+    /// WP-115 drain guard: whether the stager of `(hash, epoch)` is one the
+    /// calling reader process confirmed in its own stage (`confirmed`), and
+    /// whether the representation was published `Staged` at least `min_age`
+    /// ago. The confirmations live in the reader's memory, for its current
+    /// incarnation only; nothing about them is stored.
+    pub async fn stager_absence(
+        &self,
+        hash: &[u8],
+        epoch: i64,
+        min_age: std::time::Duration,
+        confirmed: &(dyn Fn(&StagerIdentity) -> bool + Send + Sync),
+    ) -> Result<StagerAbsence, DomainError> {
+        Ok(match self.stager_of(hash, epoch, min_age).await? {
+            None => StagerAbsence::NoStager,
+            Some((stager, _)) if !confirmed(&stager) => StagerAbsence::Unconfirmed,
+            Some((_, false)) => StagerAbsence::TooRecent,
+            Some((_, true)) => StagerAbsence::Confirmed,
+        })
+    }
+
+    /// WP-115 drain guard: whether `hash`'s lifecycle head is still `Staged`
+    /// at `epoch`. A staged read that found no file and could not prove it
+    /// gone asks this: when the head moved (a promotion and purge, or an
+    /// obliterate, won the race), the miss says nothing about the fragment,
+    /// and the read must answer for the new head instead of `SlowDown`.
+    pub async fn staged_head_current(&self, hash: &[u8], epoch: i64) -> Result<bool, DomainError> {
+        let client = self.checkout().await?;
+        let row = client
+            .query_opt(
+                "SELECT 1 FROM lore_fragment_lifecycle \
+                 WHERE hash = $1 AND current_epoch = $2 AND state = $3",
+                &[&hash, &epoch, &FragmentLifecycleState::Staged.bits()],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg_detailed("staged head read", error))?;
+        Ok(row.is_some())
+    }
+
+    /// WP-115 drain guard: delete stager rows whose representation has no
+    /// live stage custody row (no row, or a released `state = 3` tombstone),
+    /// at most `limit` per pass, in passes until one deletes fewer than
+    /// `limit`, at most `max_passes` ([`prune_in_passes`]).
+    ///
+    /// Safe against a concurrent `begin_stage`: its stager row commits with
+    /// its custody row, so a pass sees both or neither. Each pass is one
+    /// transaction with its own `statement_timeout`, so a statement a caller
+    /// stopped waiting for cannot run on.
+    pub async fn prune_drain_guard(
+        &self,
+        limit: i64,
+        max_passes: u32,
+        statement_timeout: Duration,
+    ) -> Result<DrainGuardPrune, DomainError> {
+        let limit = limit.max(1);
+        prune_in_passes(u64::try_from(limit).unwrap_or(1), max_passes, || {
+            self.prune_drain_guard_pass(limit, statement_timeout)
+        })
+        .await
+    }
+
+    async fn prune_drain_guard_pass(
+        &self,
+        limit: i64,
+        statement_timeout: Duration,
+    ) -> Result<u64, DomainError> {
+        let mut client = self.checkout().await?;
+        let tx = client.transaction().await.map_err(|error| {
+            DomainError::from_pg_detailed("drain guard prune transaction", error)
+        })?;
+        let timeout = format!("{}ms", statement_timeout.as_millis().max(1));
+        tx.execute(
+            "SELECT set_config('statement_timeout', $1, true)",
+            &[&timeout],
+        )
+        .await
+        .map_err(|error| DomainError::from_pg_detailed("drain guard prune timeout", error))?;
+        let deleted = tx
+            .execute(
+                "WITH gone AS ( \
+                   SELECT s.hash, s.epoch FROM lore_domain_write_behind_stagers s \
+                   WHERE NOT EXISTS ( \
+                     SELECT 1 FROM lore_fragment_stage_custody c \
+                     WHERE c.hash = s.hash AND c.epoch = s.epoch AND c.state <> 3) \
+                   LIMIT $1) \
+                 DELETE FROM lore_domain_write_behind_stagers s USING gone g \
+                 WHERE s.hash = g.hash AND s.epoch = g.epoch",
+                &[&limit],
+            )
+            .await
+            .map_err(|error| DomainError::from_pg_detailed("drain guard prune", error))?;
+        tx.commit()
+            .await
+            .map_err(|error| DomainError::from_pg_detailed("drain guard prune commit", error))?;
+        Ok(deleted)
     }
 }

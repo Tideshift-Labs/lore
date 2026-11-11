@@ -444,6 +444,76 @@ mod race {
         );
     }
 
+    /// WP-115 drain guard, review N1: case (a) on a reader whose absence
+    /// guard does not prove the miss (its stager is not confirmed here). The
+    /// guard turns the miss into "cannot decide", but the head is no longer
+    /// that `Staged` epoch, so the GET answers for the new head (the promoted
+    /// `Remote` epoch) instead of `SlowDown`. It never reaches
+    /// `mark_missing`: the moved head is read, not fenced.
+    #[tokio::test]
+    #[ignore = "requires owned PostgreSQL BLAKE3 fixture, Linux roots and staged_read.unleased.resolved=pause"]
+    async fn promote_then_cleanup_under_a_paused_guarded_get_answers_for_the_remote_epoch_not_slow_down()
+     {
+        let body = payload();
+        let fixture = Fixture::open(
+            PutResult::Created,
+            remote(raw_fragment(&body), &body),
+            body.clone(),
+        )
+        .await;
+        bind_association(&fixture).await;
+        let counts = fixture
+            .handle
+            .attach_drain_absence_guard(Arc::new(|_| false), Duration::ZERO)
+            .expect("the guard attaches");
+        let coordinator = &fixture.handle.coordinator;
+        let hash = fixture.address.hash.data();
+        let gate = Gate::arm();
+        let before = Checkouts::take(coordinator);
+
+        let (got, ()) = tokio::join!(optimistic_get(&fixture), async {
+            gate.reached().await;
+            assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 1);
+            assert_eq!(
+                fixture.current().await.state,
+                FragmentLifecycleState::Remote
+            );
+            let cleanup = coordinator
+                .begin_stage_cleanup(hash, fixture.source_epoch)
+                .await
+                .unwrap()
+                .expect("the promoted predecessor can be reclaimed: nothing leases it");
+            fixture
+                .handle
+                .stage
+                .purge_placement(cleanup.target())
+                .unwrap();
+            coordinator.commit_stage_cleanup(&cleanup).await.unwrap();
+            gate.release();
+        });
+
+        let (_, loaded) = got.expect("the GET answers for the promoted head, not SlowDown");
+        assert_eq!(loaded, body, "correct bytes, from the promoted epoch");
+        let delta = Checkouts::take(coordinator).since(before);
+        assert_eq!(delta.mark_missing, 0, "a moved head is read, not fenced");
+        assert_no_lease(delta);
+        assert_eq!(
+            fixture.port.gets.load(Ordering::SeqCst),
+            1,
+            "one remote read"
+        );
+        assert!(
+            counts.snapshot().no_stager + counts.snapshot().unconfirmed >= 1,
+            "the guard was asked and did not prove the miss: {:?}",
+            counts.snapshot()
+        );
+        assert_eq!(
+            head_state(&fixture).await,
+            FragmentLifecycleState::Remote.bits(),
+            "the fragment was never demoted to Missing"
+        );
+    }
+
     /// Case (b): an obliterate purges the epoch under a paused unleased GET.
     /// The fenced miss falls back, the fresh resolve finds nothing readable,
     /// and the client sees `NotFound` with the head left deleting or

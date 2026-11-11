@@ -81,6 +81,8 @@ pub use stage_custody::StageReservationInput;
 pub use stage_custody::StageTombstoneSweep;
 pub use stage_custody::is_stage_capacity_exhausted;
 pub use stage_custody::is_stage_custody_key_taken;
+pub use stage_liveness::DRAIN_GUARD_SCHEMA;
+pub use stage_liveness::DrainGuardPrune;
 pub use stage_liveness::MAX_STAGE_LIVENESS_ID_BYTES;
 pub use stage_liveness::MAX_STAGE_LIVENESS_INCARNATION_BYTES;
 pub use stage_liveness::STAGE_LIVENESS_SCHEMA;
@@ -91,6 +93,9 @@ pub use stage_liveness::StageLivenessRole;
 pub use stage_liveness::StagePeerLiveness;
 pub use stage_liveness::StagePeerProgress;
 pub use stage_liveness::StageProgressRecord;
+pub use stage_liveness::StagerAbsence;
+pub use stage_liveness::StagerIdentity;
+pub use stage_liveness::prune_in_passes;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::coordinator::CommittedVersions;
@@ -2754,13 +2759,26 @@ impl PostgresFragmentCoordinator {
         hash: &[u8],
         reservation: StageReservationInput,
     ) -> Result<BeginOutcome, DomainError> {
+        self.begin_stage_by(hash, reservation, None).await
+    }
+
+    /// [`Self::begin_stage`], also recording `stager` as the web replica
+    /// process that stages this representation, in the same transaction as
+    /// its custody reservation (WP-115 drain guard). With `None` no stager is
+    /// recorded, and a guarded drain never reads the file as absent.
+    pub async fn begin_stage_by(
+        &self,
+        hash: &[u8],
+        reservation: StageReservationInput,
+        stager: Option<&StagerIdentity>,
+    ) -> Result<BeginOutcome, DomainError> {
         self.begin_publication(
             hash,
             EpochAuthority::Staged,
             None,
             None,
             false,
-            Some(reservation),
+            Some((reservation, stager)),
         )
         .await
     }
@@ -5022,7 +5040,7 @@ impl PostgresFragmentCoordinator {
         legacy_object_key: Option<&str>,
         claim_input: Option<&FragmentWriteClaimInput>,
         require_missing: bool,
-        stage_reservation: Option<StageReservationInput>,
+        stage_reservation: Option<(StageReservationInput, Option<&StagerIdentity>)>,
     ) -> Result<BeginOutcome, DomainError> {
         // Only a lost first-head insertion followed by an acknowledged rollback
         // permits another pass. Errors, including uncertain commits, never retry here.
@@ -5054,7 +5072,7 @@ impl PostgresFragmentCoordinator {
         legacy_object_key: Option<&str>,
         claim_input: Option<&FragmentWriteClaimInput>,
         require_missing: bool,
-        stage_reservation: Option<StageReservationInput>,
+        stage_reservation: Option<(StageReservationInput, Option<&StagerIdentity>)>,
     ) -> Result<Option<BeginOutcome>, DomainError> {
         match (authority, claim_input) {
             (EpochAuthority::Remote, None) => {
@@ -5289,8 +5307,17 @@ impl PostgresFragmentCoordinator {
             None
         };
         if authority == EpochAuthority::Staged {
-            let reservation = stage_reservation
+            let (reservation, stager) = stage_reservation
                 .ok_or_else(|| DomainError::InvalidInput("stage reservation required".into()))?;
+            // WP-115 drain guard: the stager commits with its custody row.
+            // A table outside `LockSequence`: this insert takes only its own
+            // new (hash, epoch) key, which no other transaction locks first.
+            // It runs BEFORE the reservation, which takes the cell-wide
+            // `lore_fragment_stage_usage` row lock until commit, so its round
+            // trip is not added to that lock's hold time (review S1).
+            if let Some(stager) = stager {
+                stage_liveness::record_stager_locked(&tx, hash, epoch, stager).await?;
+            }
             stage_custody::reserve_stage_locked(
                 &tx,
                 &mut sequence,

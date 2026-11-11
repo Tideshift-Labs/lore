@@ -474,6 +474,231 @@ async fn admission_unproven_share_writes_directly_and_an_in_flight_staged_put_re
     );
 }
 
+/// The lifecycle head state of `hash`, as stored.
+async fn head_state_of(fixture: &Fixture, hash: &[u8]) -> i16 {
+    fixture
+        .admin
+        .query_one(
+            "SELECT state FROM lore_fragment_lifecycle WHERE hash=$1",
+            &[&hash],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// The staged file of `(hash, epoch)` under the fixture's stage.
+fn staged_path(fixture: &Fixture, hash: &Hash, epoch: i64) -> PathBuf {
+    let key = format!("{hash}.s{epoch}");
+    fixture
+        .root
+        .join("stage/staged")
+        .join(&key[..2])
+        .join(&key[2..4])
+        .join(&key)
+}
+
+/// WP-115 drain guard at the drain, end to end through `put_coordinated`,
+/// the real coordinator and a drain pass (review probe P1 as a test).
+///
+/// A web replica (`web-a`) stages a fragment; its stager row commits with the
+/// custody. Its file is then lost, as a reader on ANOTHER directory sees it.
+/// The reader process has not confirmed `web-a` (no echo of its challenge
+/// from `web-a`; for example a drain restarted after `web-a` left). The
+/// drain keeps the fragment `Staged` across passes: never `Missing`. A GET
+/// answers `SlowDown` (the head is still that `Staged` epoch). The fixture's
+/// own source fragment has no stager at all and stays `Staged` for the same
+/// reason. Once the reader confirms `web-a` in its own stage, the drain reads
+/// the loss as real and marks only that fragment `Missing`.
+#[tokio::test]
+#[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]
+async fn drain_guard_keeps_a_departed_writers_file_staged_and_marks_it_missing_only_where_confirmed()
+ {
+    use crate::domain::fragments::StagerIdentity;
+    let fixture = Fixture::open(PutResult::Created, FragmentGetResponse::NotFound, payload()).await;
+    bind_repository(&fixture).await;
+    observe_settled(&fixture).await;
+    fixture.handle.note_drain_heartbeat();
+    assert_eq!(fixture.handle.mode(), StagingMode::Stage, "control");
+
+    // The web replica stages, recording itself as the stager.
+    let web_a = StagerIdentity::new("web-a", "inc-a").unwrap();
+    assert!(fixture.handle.attach_stager(web_a.clone()));
+    assert!(
+        !fixture
+            .handle
+            .attach_stager(StagerIdentity::new("web-b", "inc-b").unwrap()),
+        "a second stager is refused"
+    );
+    let bytes = fragment_bytes("drain-guard");
+    accept(&fixture, &bytes);
+    put(&fixture.store, &bytes).await.expect("staged");
+    let hash = address_of(&bytes).hash;
+    assert_eq!(
+        readable_state(&fixture, &bytes).await,
+        Some(FragmentLifecycleState::Staged)
+    );
+    let epoch: i64 = fixture
+        .admin
+        .query_one(
+            "SELECT current_epoch FROM lore_fragment_lifecycle WHERE hash=$1",
+            &[&hash.data().as_slice()],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let recorded = fixture
+        .admin
+        .query_one(
+            "SELECT replica_id, incarnation FROM lore_domain_write_behind_stagers \
+             WHERE hash=$1 AND epoch=$2",
+            &[&hash.data().as_slice(), &epoch],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (recorded.get::<_, String>(0), recorded.get::<_, String>(1)),
+        ("web-a".to_owned(), "inc-a".to_owned()),
+        "the stager commits with the custody"
+    );
+
+    // This reader process has not confirmed web-a. The minimum staged age
+    // is the production one, so a confirmed miss stays kept until the test
+    // ages the epoch row (review B S1 of rounds 4 and 5). The epoch row was
+    // created moments ago; the steps below take well under that age.
+    let confirmed = Arc::new(std::sync::Mutex::new(Vec::<StagerIdentity>::new()));
+    let source = confirmed.clone();
+    let counts = fixture
+        .handle
+        .attach_drain_absence_guard(
+            Arc::new(move |stager| source.lock().unwrap().contains(stager)),
+            MIN_STAGED_ABSENCE_AGE,
+        )
+        .expect("the drain guard attaches");
+    assert!(
+        fixture
+            .handle
+            .attach_drain_absence_guard(Arc::new(|_| true), Duration::ZERO)
+            .is_none(),
+        "a second drain guard is refused"
+    );
+    assert_eq!(
+        fixture.handle.mode(),
+        StagingMode::Stage,
+        "the drain guard does not touch admission"
+    );
+
+    std::fs::remove_file(staged_path(&fixture, &hash, epoch)).expect("the staged file exists");
+    std::fs::remove_file(staged_path(
+        &fixture,
+        &fixture.address.hash,
+        fixture.source_epoch,
+    ))
+    .expect("the fixture's staged file exists");
+
+    // A GET on this reader: the head is still (Staged, epoch), so the miss
+    // answers SlowDown, and the fragment stays Staged.
+    let FragmentLifecycleRoute::Coordinated {
+        coordinator,
+        provider,
+        ..
+    } = &fixture.store.fragment_route
+    else {
+        panic!("the fixture store is coordinated");
+    };
+    let got = fixture
+        .store
+        .load_coordinated_optimistic(
+            coordinator,
+            provider.as_ref(),
+            Context::from(REPOSITORY),
+            address_of(&bytes),
+        )
+        .await;
+    assert!(
+        matches!(&got, Err(error) if error.is_slow_down()),
+        "a GET for an unconfirmed stager's lost file answers SlowDown, got {:?}",
+        got.as_ref().map(|_| ())
+    );
+    assert_eq!(
+        head_state_of(&fixture, hash.data().as_slice()).await,
+        FragmentLifecycleState::Staged.bits(),
+        "a GET never marks it Missing"
+    );
+
+    for _ in 0..3 {
+        assert_eq!(fixture.handle.drain_pass(8).await.unwrap(), 0);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for (what, hash) in [
+        ("the departed writer's file", hash.data().as_slice()),
+        (
+            "a file with no stager",
+            fixture.address.hash.data().as_slice(),
+        ),
+    ] {
+        assert_eq!(
+            head_state_of(&fixture, hash).await,
+            FragmentLifecycleState::Staged.bits(),
+            "{what} stays Staged on another directory, never Missing"
+        );
+    }
+    let seen = counts.snapshot();
+    assert!(seen.unconfirmed >= 1, "{seen:?}");
+    assert!(seen.no_stager >= 1, "{seen:?}");
+    assert_eq!(seen.proven, 0, "{seen:?}");
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 0);
+
+    // This reader confirms web-a in its own stage, but the representation is
+    // younger than the minimum staged age: a two-way sync may not have
+    // carried the file yet, so it stays Staged.
+    confirmed.lock().unwrap().push(web_a.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while counts.snapshot().too_recent == 0 {
+            fixture.handle.drain_pass(8).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("a confirmed miss younger than the minimum staged age is read");
+    assert_eq!(
+        head_state_of(&fixture, hash.data().as_slice()).await,
+        FragmentLifecycleState::Staged.bits(),
+        "a confirmed miss younger than the minimum staged age stays Staged"
+    );
+    assert_eq!(counts.snapshot().proven, 0, "{:?}", counts.snapshot());
+
+    // Once the representation is older than the minimum staged age (by the
+    // database clock, from its epoch row), the loss is real. A deferred
+    // fragment waits out its cool-down, so pass until one reads.
+    fixture
+        .admin
+        .execute(
+            "UPDATE lore_fragment_epochs SET created_at = created_at - interval '2 hours' \
+             WHERE hash = $1 AND epoch = $2",
+            &[&hash.data().as_slice(), &epoch],
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while head_state_of(&fixture, hash.data().as_slice()).await
+            != FragmentLifecycleState::Missing.bits()
+        {
+            fixture.handle.drain_pass(8).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("a drain that confirmed the stager marks a truly lost file Missing");
+    assert!(counts.snapshot().proven >= 1);
+    assert_eq!(
+        head_state_of(&fixture, fixture.address.hash.data().as_slice()).await,
+        FragmentLifecycleState::Staged.bits(),
+        "a file with no stager is never read as absent by a guarded drain"
+    );
+    assert_eq!(fixture.port.puts.load(Ordering::SeqCst), 0);
+}
+
 /// Observe until `done` holds for one observation, and return it.
 async fn observe_until(
     fixture: &Fixture,

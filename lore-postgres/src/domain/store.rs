@@ -187,6 +187,10 @@ impl PostgresDomainStore {
         // table, so a cell one revision behind is unaffected.
         crate::pool::ensure_schema_online(&pool, crate::domain::fragments::STAGE_LIVENESS_SCHEMA)
             .await?;
+        // WP-115 drain guard: one new table (the stager of each staged
+        // representation), after the liveness table.
+        crate::pool::ensure_schema_online(&pool, crate::domain::fragments::DRAIN_GUARD_SCHEMA)
+            .await?;
 
         let identity = read_database_identity(&pool)
             .await

@@ -13,8 +13,11 @@ use std::time::Instant;
 use anyhow::Result;
 use anyhow::bail;
 use lore_base::lore_spawn;
+use lore_postgres::domain::fragments::StagerIdentity;
 use lore_postgres::store::fragment_write_behind::CapacityEvidence;
 use lore_postgres::store::fragment_write_behind::CleanupSkips;
+use lore_postgres::store::fragment_write_behind::ConfirmedStagers;
+use lore_postgres::store::fragment_write_behind::DrainAbsenceCounts;
 use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
 use lore_postgres::store::fragment_write_behind::MAX_DRAIN_CONCURRENCY;
 use lore_postgres::store::fragment_write_behind::ObserveStep;
@@ -131,6 +134,8 @@ pub enum WriteBehindRole {
     Stage,
     /// The cell's dedicated drain worker: the same loops as `Full`. It is not a
     /// load-balancer member, so `/lb_health` always answers 503 `drain_role`.
+    /// With stage liveness on, it also anchors the shared-stage check and
+    /// runs the drain guard; `Full` runs neither.
     Drain,
 }
 
@@ -266,7 +271,15 @@ impl FragmentWriteBehindSettings {
     /// and publishes a row with role `drain` while it reads that marker back,
     /// the anchor a stage replica must see before it stages. It runs no
     /// probe, its count never rises, it is never a K11 eject peer, and it is
-    /// never held or ejected (it answers `drain_role`).
+    /// never held or ejected (it answers `drain_role`). It also runs the drain
+    /// guard: a staged file it cannot find is marked `Missing` only when the
+    /// web replica that staged it echoed this drain process's challenges
+    /// into this drain's own stage, both ways through one directory
+    /// (`stage_liveness` module docs, "Drain guard").
+    ///
+    /// A `full` replica (the default role) runs neither guard: it stages and
+    /// drains in one process on one stage, so its drain reads a staged file
+    /// it cannot find as absent, as before.
     #[lore_macro::test_pub]
     pub(crate) fn runs_stage_liveness(&self) -> bool {
         matches!(self.role, WriteBehindRole::Stage | WriteBehindRole::Drain) && self.stage_liveness
@@ -1254,40 +1267,14 @@ fn start_stage_liveness(
         return Ok(None);
     };
     let replica_id = crate::stage_liveness::default_replica_id();
-    let markers = crate::stage_liveness::ShareMarkers::new(&root);
     let stop = Arc::new(AtomicBool::new(false));
-    let liveness = if role == WriteBehindRole::Drain {
-        // The anchor: a marker, read back every step, and a `drain` row while
-        // the read-back holds; no probe, never held.
-        let liveness = Arc::new(
-            StageLiveness::new(replica_id.clone())
-                .with_role(lore_postgres::domain::fragments::StageLivenessRole::Drain),
-        );
-        crate::stage_liveness::spawn_marker_thread(
-            &liveness,
-            markers,
-            crate::stage_liveness::PROBE_INTERVAL,
-            stop.clone(),
-        )?;
-        liveness
-    } else {
-        let liveness = Arc::new(StageLiveness::new(replica_id.clone()).with_share_guard());
-        // The K11 guard: no staging until this stage is proven shared (the
-        // marker of a fresh, verified drain row is seen); until then PUTs
-        // write directly. The gate starts held, so nothing is staged and no
-        // missing file reads as absent before the first exchange.
-        if !handle.attach_stage_share_gate(liveness.share_gate()) {
-            bail!("the stage share gate was already attached");
-        }
-        crate::stage_liveness::spawn_probe_thread_with_markers(
-            &liveness,
-            crate::stage_liveness::file_probe(root, &replica_id),
-            Some(markers),
-            crate::stage_liveness::PROBE_INTERVAL,
-            stop.clone(),
-        )?;
-        liveness
-    };
+    let liveness = stage_liveness_for_role(
+        handle.as_ref(),
+        role,
+        replica_id.clone(),
+        root,
+        stop.clone(),
+    )?;
     info!(
         replica_id = %replica_id,
         stale_after_millis = millis(liveness.stale_after()),
@@ -1296,6 +1283,7 @@ fn start_stage_liveness(
     let exchange_handle = handle.clone();
     let exchange_liveness = liveness.clone();
     let mut exchange_shutdown = shutdown.clone();
+    let guards_drain = role == WriteBehindRole::Drain;
     lore_spawn!(endpoints, async move {
         // Stops the probe thread at shutdown. A thread parked in a hung write
         // never sees it, and the process exit ends it.
@@ -1304,6 +1292,7 @@ fn start_stage_liveness(
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut warned = None;
         let mut withdrawn = false;
+        let mut since_prune = 0_u64;
         let draining = || drain.as_ref().is_some_and(|drain| drain.is_draining());
         loop {
             tokio::select! { biased;
@@ -1325,6 +1314,31 @@ fn start_stage_liveness(
                     crate::stage_liveness::EXCHANGE_TIMEOUT,
                     &mut warned,
                 ) => {}
+            }
+            if guards_drain {
+                // Only the drain drops stager rows nothing needs any more:
+                // in passes until one deletes less than its limit, so the
+                // table keeps up with a busy drain (review S2).
+                since_prune += 1;
+                if since_prune >= crate::stage_liveness::DRAIN_GUARD_PRUNE_EVERY {
+                    since_prune = 0;
+                    let passes = crate::stage_liveness::DRAIN_GUARD_PRUNE_MAX_PASSES;
+                    tokio::select! { biased;
+                        _ = exchange_shutdown.wait_for(|value| *value) => break,
+                        result = tokio::time::timeout(
+                            crate::stage_liveness::DRAIN_GUARD_PRUNE_TIMEOUT * (passes + 1),
+                            exchange_handle.prune_drain_guard(
+                                crate::stage_liveness::DRAIN_GUARD_PRUNE_LIMIT,
+                                passes,
+                                crate::stage_liveness::DRAIN_GUARD_PRUNE_TIMEOUT,
+                            ),
+                        ) => match result {
+                            Ok(Ok(pruned)) => debug!(?pruned, "drain guard pruned"),
+                            Ok(Err(error)) => warn!(%error, "drain guard prune failed; it runs again later"),
+                            Err(_elapsed) => warn!("drain guard prune timed out; it runs again later"),
+                        },
+                    }
+                }
             }
             exchange_liveness.report(Instant::now());
         }
@@ -1349,6 +1363,154 @@ fn start_stage_liveness(
     Ok(Some(liveness))
 }
 
+/// What [`stage_liveness_for_role`] attaches to the stage: the write-behind
+/// handle in production, a fake in tests.
+#[lore_macro::test_pub]
+pub(crate) trait StageAttach {
+    /// The K11 share gate. `false` if one was already attached.
+    fn share_gate(&self, gate: Arc<AtomicBool>) -> bool;
+    /// The web replica process recorded with each staged representation.
+    /// `false` if one was already attached.
+    fn stager(&self, stager: StagerIdentity) -> bool;
+    /// The absence guard on a reader's stage, with the minimum staged age
+    /// before a confirmed miss reads as absent. `None` if one was already
+    /// attached.
+    fn drain_absence_guard(
+        &self,
+        confirmed: ConfirmedStagers,
+        min_staged_age: Duration,
+    ) -> Option<Arc<DrainAbsenceCounts>>;
+    /// The liveness files of the stage under `root` and a check that the
+    /// stage tree is still the one pinned at open: the pinned `liveness/`
+    /// directory and `WriteBehindStage::pinned_tree_intact` in production.
+    fn liveness(
+        &self,
+        root: &std::path::Path,
+    ) -> (
+        crate::stage_liveness::ShareMarkers,
+        crate::stage_liveness::RootCheck,
+    );
+}
+
+impl StageAttach for FragmentWriteBehindHandle {
+    fn share_gate(&self, gate: Arc<AtomicBool>) -> bool {
+        self.attach_stage_share_gate(gate)
+    }
+
+    fn stager(&self, stager: StagerIdentity) -> bool {
+        self.attach_stager(stager)
+    }
+
+    // A pure forward: `stage_liveness_for_role` chooses the age (pinned by
+    // `the_production_attach_forwards_the_minimum_staged_age`).
+    fn drain_absence_guard(
+        &self,
+        confirmed: ConfirmedStagers,
+        min_staged_age: Duration,
+    ) -> Option<Arc<DrainAbsenceCounts>> {
+        self.attach_drain_absence_guard(confirmed, min_staged_age)
+    }
+
+    fn liveness(
+        &self,
+        _root: &std::path::Path,
+    ) -> (
+        crate::stage_liveness::ShareMarkers,
+        crate::stage_liveness::RootCheck,
+    ) {
+        (
+            crate::stage_liveness::ShareMarkers::pinned(self.stage_liveness_dir()),
+            self.pinned_tree_check(),
+        )
+    }
+}
+
+/// WP-115 K11 and the drain guard: build this replica's stage liveness for
+/// `role`, attach its guards to the stage, and start its probe or marker
+/// thread under `root`.
+///
+/// - The drain worker is the shared-stage anchor (a marker read back every
+///   step, a `drain` row while it holds; no probe, never held). Its stage
+///   gets the absence guard: a staged file it cannot find reads as absent
+///   only when the file's stager wrote echoes of this drain process's
+///   challenges into this drain's own stage (`stage_liveness` module docs,
+///   "Drain guard"). Until then, nothing does.
+/// - A web stage replica gets the K11 share gate (no staging until the
+///   stage is proven shared; until then PUTs write directly, and no missing
+///   file reads as absent), its stager identity, recorded with each
+///   representation it stages, and the same absence guard: its own files
+///   are confirmed by itself, a peer's only after the peer echoed this
+///   replica's challenges.
+///
+/// Both read and write every liveness file through the stage's pinned
+/// `liveness/` directory, and check, around every challenge and echo write
+/// and read, that the stage tree is still the one pinned at open.
+#[lore_macro::test_pub]
+pub(crate) fn stage_liveness_for_role(
+    attach: &dyn StageAttach,
+    role: WriteBehindRole,
+    replica_id: String,
+    root: std::path::PathBuf,
+    stop: Arc<AtomicBool>,
+) -> Result<Arc<StageLiveness>> {
+    let (markers, root_check) = attach.liveness(&root);
+    if role == WriteBehindRole::Drain {
+        let liveness = Arc::new(
+            StageLiveness::new(replica_id)
+                .with_role(lore_postgres::domain::fragments::StageLivenessRole::Drain)
+                .with_root_check(root_check),
+        );
+        let reader = liveness.clone();
+        let Some(counts) = attach.drain_absence_guard(
+            Arc::new(move |stager| reader.confirms(stager)),
+            lore_postgres::store::fragment_write_behind::MIN_STAGED_ABSENCE_AGE,
+        ) else {
+            bail!("the drain absence guard was already attached");
+        };
+        liveness.set_absence_counts(counts);
+        crate::stage_liveness::spawn_marker_thread(
+            &liveness,
+            markers,
+            crate::stage_liveness::PROBE_INTERVAL,
+            stop,
+        )?;
+        return Ok(liveness);
+    }
+    let liveness = Arc::new(
+        StageLiveness::new(replica_id.clone())
+            .with_share_guard()
+            .with_root_check(root_check),
+    );
+    if !attach.share_gate(liveness.share_gate()) {
+        bail!("the stage share gate was already attached");
+    }
+    let Some(stager) = StagerIdentity::new(liveness.replica_id(), liveness.incarnation()) else {
+        bail!("the stage liveness identity does not fit the stager table");
+    };
+    if !attach.stager(stager) {
+        bail!("the stager identity was already attached");
+    }
+    // The same absence guard as the drain: a peer's staged file this replica
+    // cannot find is absent only when that peer's echo file, in this
+    // replica's own stage, showed this replica's challenges; its own files
+    // are its own.
+    let reader = liveness.clone();
+    let Some(counts) = attach.drain_absence_guard(
+        Arc::new(move |stager| reader.confirms(stager)),
+        lore_postgres::store::fragment_write_behind::MIN_STAGED_ABSENCE_AGE,
+    ) else {
+        bail!("the stage absence guard was already attached");
+    };
+    liveness.set_absence_counts(counts);
+    crate::stage_liveness::spawn_probe_thread_with_markers(
+        &liveness,
+        crate::stage_liveness::file_probe(root, &replica_id),
+        Some(markers),
+        crate::stage_liveness::PROBE_INTERVAL,
+        stop,
+    )?;
+    Ok(liveness)
+}
 /// Sets the flag when dropped.
 struct StopFlag(Arc<AtomicBool>);
 impl Drop for StopFlag {

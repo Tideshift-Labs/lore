@@ -34,17 +34,36 @@
 //! this function's output; a `pub(crate)` export from the coordinator would let
 //! the compiler hold this instead, and is worth taking if that lane offers one.
 //!
-//! # Cleanup confinement and the remaining writer/read boundary
+//! # What goes through the pinned tree, and what does not
 //!
-//! Cleanup walks from a pinned root descriptor with `openat(O_NOFOLLOW)` for
-//! every directory, then uses `unlinkat` and fsync on that same descriptor.
-//! Root inode and device identity are rechecked before each operation. Reads
-//! and finalization still use path-based intermediate components.
-//! [`ConfinedRoot::ensure_parent`] accepts
-//! `AlreadyExists` from `create_dir`, which does not prove the existing entry
-//! is a directory rather than a symlink. A party able to modify the root can
-//! still substitute an intermediate component on those two paths. They must
-//! not be treated as offering cleanup's descriptor-relative confinement.
+//! At open the root is pinned (device, inode and a held descriptor), and so
+//! is its `staged/` subdirectory; `liveness/` is pinned on first use
+//! (FORK-LOCAL, WP-115 drain guard). Each subdirectory is opened relative to
+//! the held root descriptor with `openat2(RESOLVE_BENEATH | RESOLVE_NO_XDEV |
+//! RESOLVE_NO_SYMLINKS)` on Linux, so a symlink or a mount point (a bind
+//! mount included) there refuses the open: at `staged` the stage refuses to
+//! start, at `liveness` every liveness file call fails. Every later root
+//! check (`verify_device`) also checks that `<root path>/staged` still names
+//! the pinned `staged/`, with the same confined open; the liveness root
+//! check (`liveness_tree_intact`) checks `liveness` the same way.
+//!
+//! Through the pinned descriptors, confined the same way:
+//!
+//! - staged reads: the file is opened relative to the held `staged/`
+//!   descriptor, so an `ENOENT` is a miss in the pinned directory and in no
+//!   other one; the root check runs before the read and again after a miss;
+//! - the fan-out directories a finalizer creates and the rename target;
+//! - cleanup's walk and exact unlinks (each level confined, `staged/` itself
+//!   checked against the pinned inode);
+//! - every stage liveness file (`liveness/`), see [`StageLivenessDir`].
+//!
+//! Not through them: the finalizer's temporary file under `incoming/` is
+//! created and renamed from by path. A rename out of another directory than
+//! the pinned root's `incoming/` either fails (`EXDEV` across a mount) or
+//! still lands in the pinned leaf. The boot probe and the free-space sample
+//! also use paths.
+//!
+//! [`StageLivenessDir`]: super::StageLivenessDir
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -107,11 +126,19 @@ pub const LIVENESS_DIR: &str = "liveness";
 pub(crate) struct ResolvedStagedPath {
     path: PathBuf,
     parent: PathBuf,
+    /// `<aa>/<bb>/<key>`, relative to `staged/`: what reads open beneath the
+    /// pinned `staged/` descriptor.
+    relative: PathBuf,
 }
 
 impl ResolvedStagedPath {
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
+    pub(crate) fn relative(&self) -> &Path {
+        &self.relative
     }
 
     #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
@@ -146,6 +173,17 @@ struct RootInner {
     inode: u64,
     #[cfg(unix)]
     directory: std::fs::File,
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: `<root>/staged`, opened
+    /// confined beneath the root descriptor at open. Reads, fan-out creation
+    /// and the rename target go through it.
+    #[cfg(unix)]
+    staged_dir: PinnedDir,
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: `<root>/liveness`, opened
+    /// confined beneath the held root descriptor on first use (created if
+    /// absent, as the K11 probe always did). Every stage liveness file goes
+    /// through it.
+    #[cfg(unix)]
+    liveness_dir: std::sync::OnceLock<PinnedDir>,
     /// Shared by all clones. Each blocking closure owns its permit until its
     /// final syscall completes, even if the async caller stops waiting.
     /// Drain and cleanup reads, purge and the physical inventory use this
@@ -162,6 +200,15 @@ struct RootInner {
     /// shared pool would let a queue of puts starve drain reads, which then
     /// age into `drain_backpressure_sustained`.
     put_capacity: Arc<Semaphore>,
+}
+
+/// One subdirectory of the root, opened confined beneath it at open: its held
+/// descriptor and the identity it had then.
+#[cfg(unix)]
+struct PinnedDir {
+    file: std::fs::File,
+    device: u64,
+    inode: u64,
 }
 
 /// A proven staging root.
@@ -343,7 +390,14 @@ impl ConfinedRoot {
         // reintroduce exactly the caller-controlled path this design removes.
         let parent = self.inner.staged.join(&derived[0..2]).join(&derived[2..4]);
         let path = parent.join(&derived);
-        Ok(ResolvedStagedPath { path, parent })
+        let relative = Path::new(&derived[0..2])
+            .join(&derived[2..4])
+            .join(&derived);
+        Ok(ResolvedStagedPath {
+            path,
+            parent,
+            relative,
+        })
     }
 }
 
@@ -354,7 +408,6 @@ mod platform {
     use std::io::Read as _;
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
-    use std::os::fd::FromRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
     use std::os::unix::fs::OpenOptionsExt as _;
@@ -368,6 +421,7 @@ mod platform {
     use super::AdmissionSample;
     use super::ConfinedRoot;
     use super::INCOMING_DIR;
+    use super::LIVENESS_DIR;
     use super::ResolvedStagedPath;
     use super::RootInner;
     use super::STAGED_DIR;
@@ -416,17 +470,22 @@ mod platform {
             let inode = metadata.ino();
             let staged = canonical.join(STAGED_DIR);
             let incoming = canonical.join(INCOMING_DIR);
-            for directory in [&staged, &incoming] {
-                if let Err(error) = fs::create_dir(directory)
-                    && error.kind() != std::io::ErrorKind::AlreadyExists
-                {
-                    return Err(WriteBehindError::io("root directory create", &error));
+            for name in [STAGED_DIR, INCOMING_DIR] {
+                match rustix::fs::mkdirat(&directory, name, directory_mode()) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => {
+                        return Err(WriteBehindError::io("root directory create", &error.into()));
+                    }
                 }
             }
             // Both entry points must survive a crash before any stage can be
             // acknowledged. AlreadyExists is not durability evidence: another
             // process may have created the directory without syncing this root.
             sync_directory(&canonical)?;
+            // WP-115 drain guard: a symlink or a mount point at `staged`
+            // refuses the open, so it refuses to start. `liveness/` is
+            // pinned on first use (`pinned_liveness`).
+            let staged_dir = pin_child(&directory, STAGED_DIR)?;
             let root = Self {
                 inner: Arc::new(RootInner {
                     canonical,
@@ -435,6 +494,8 @@ mod platform {
                     device,
                     inode,
                     directory,
+                    staged_dir,
+                    liveness_dir: std::sync::OnceLock::new(),
                     // Bounds unfinished drain reads and exact removals, and
                     // separately GET reads and finalizers, including
                     // cancelled callers, to sixteen each per root handle.
@@ -488,7 +549,54 @@ mod platform {
             self.verified_root_directory().map(|_| ())
         }
 
-        pub(crate) fn verified_root_directory(&self) -> Result<fs::File, WriteBehindError> {
+        /// FORK-LOCAL (Tideshift), WP-115 drain guard: whether the configured
+        /// root path, as it resolves now, still names the pinned root, AND
+        /// its `staged/` and `liveness/` entries, opened confined beneath it
+        /// (no symlink, no mount point), are the directories pinned at open.
+        /// Blocking. Any error is `false`, and so is every platform but
+        /// Linux: without `openat2` a mount point at either name cannot be
+        /// told apart, so nothing there counts as proven.
+        ///
+        /// Stage liveness checks this before and after each proof I/O
+        /// (challenge write, echo write, echo or challenge read). The I/O
+        /// itself goes through the pinned `liveness/` descriptor.
+        pub(crate) fn liveness_tree_intact(&self) -> bool {
+            if !cfg!(target_os = "linux") {
+                return false;
+            }
+            self.current_root().is_ok_and(|current| {
+                self.pinned_liveness()
+                    .is_ok_and(|pinned| child_is(&current, LIVENESS_DIR, pinned))
+            })
+        }
+
+        /// WP-115 drain guard: `<root>/liveness`, pinned on first use: created
+        /// beneath the HELD root descriptor if absent, then opened confined
+        /// beneath it (no symlink, no mount point), never by path. A symlink
+        /// or a mount point there fails every liveness file call and every
+        /// liveness root check, so nothing is proven through it.
+        fn pinned_liveness(&self) -> std::io::Result<&super::PinnedDir> {
+            if let Some(pinned) = self.inner.liveness_dir.get() {
+                return Ok(pinned);
+            }
+            match rustix::fs::mkdirat(&self.inner.directory, LIVENESS_DIR, directory_mode()) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let pinned =
+                pin_child(&self.inner.directory, LIVENESS_DIR).map_err(std::io::Error::other)?;
+            // A racing first use pinned the same directory, or failed; either
+            // way the stored one is the pin.
+            let _ = self.inner.liveness_dir.set(pinned);
+            self.inner
+                .liveness_dir
+                .get()
+                .ok_or_else(|| std::io::Error::other("stage liveness directory not pinned"))
+        }
+
+        /// The root path's directory as it resolves now, if it is the pinned
+        /// root and its `staged/` entry is the pinned `staged/`.
+        fn current_root(&self) -> Result<fs::File, WriteBehindError> {
             let current = match fs::OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -504,10 +612,91 @@ mod platform {
             if metadata.dev() != self.inner.device || metadata.ino() != self.inner.inode {
                 return Err(WriteBehindError::RootDeviceChanged);
             }
+            // WP-115 drain guard: a symlink, a mount point (a bind mount
+            // included) or another directory now at `staged` would send a
+            // path-based writer elsewhere. Stage I/O goes through the pinned
+            // `staged/`, but the root check refuses the tree anyway.
+            if !child_is(&current, STAGED_DIR, &self.inner.staged_dir) {
+                return Err(WriteBehindError::RootDeviceChanged);
+            }
+            Ok(current)
+        }
+
+        pub(crate) fn verified_root_directory(&self) -> Result<fs::File, WriteBehindError> {
+            self.current_root()?;
             self.inner
                 .directory
                 .try_clone()
                 .map_err(|error| WriteBehindError::io("root descriptor clone", &error))
+        }
+
+        /// WP-115 drain guard: read one stage liveness file, at most `limit`
+        /// bytes, through the pinned `liveness/` descriptor. `None` when there
+        /// is no such file. `name` must be one plain file name.
+        pub(crate) fn liveness_read(
+            &self,
+            name: &str,
+            limit: u64,
+        ) -> std::io::Result<Option<Vec<u8>>> {
+            let name = liveness_name(name)?;
+            let file = match open_beneath(
+                &self.pinned_liveness()?.file,
+                name,
+                rustix::fs::OFlags::RDONLY,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(file) => fs::File::from(file),
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let mut content = Vec::new();
+            file.take(limit).read_to_end(&mut content)?;
+            Ok(Some(content))
+        }
+
+        /// WP-115 drain guard: replace one stage liveness file through the
+        /// pinned `liveness/` descriptor: write `temporary`, fsync, then
+        /// rename it over `name`, so a reader never sees a partial file.
+        pub(crate) fn liveness_replace(
+            &self,
+            name: &str,
+            temporary: &str,
+            content: &[u8],
+        ) -> std::io::Result<()> {
+            let name = liveness_name(name)?;
+            let temporary = liveness_name(temporary)?;
+            let directory = &self.pinned_liveness()?.file;
+            {
+                let mut handle = fs::File::from(open_beneath(
+                    directory,
+                    temporary,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::CREATE
+                        | rustix::fs::OFlags::TRUNC,
+                    rustix::fs::Mode::RUSR
+                        | rustix::fs::Mode::WUSR
+                        | rustix::fs::Mode::RGRP
+                        | rustix::fs::Mode::ROTH,
+                )?);
+                handle.write_all(content)?;
+                handle.sync_all()?;
+            }
+            rustix::fs::renameat(directory, temporary, directory, name)?;
+            Ok(())
+        }
+
+        /// WP-115 drain guard: remove one stage liveness file through the
+        /// pinned `liveness/` descriptor. An absent file is a success.
+        pub(crate) fn liveness_remove(&self, name: &str) -> std::io::Result<()> {
+            let name = liveness_name(name)?;
+            match rustix::fs::unlinkat(
+                &self.pinned_liveness()?.file,
+                name,
+                rustix::fs::AtFlags::empty(),
+            ) {
+                Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
+                Err(error) => Err(error.into()),
+            }
         }
 
         /// Create the fan-out directories for one staged path and make them
@@ -539,22 +728,27 @@ mod platform {
             let (Some(grandparent), Some(leaf_name)) = (parent.parent(), parent.file_name()) else {
                 return Err(WriteBehindError::RootUnresolvable);
             };
-            match fs::create_dir(grandparent) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(WriteBehindError::io("fanout create", &error)),
-            }
-            let upper = open_directory_at(None, grandparent)?;
-            // Every finalizer establishes its own durability barrier. A peer
-            // can pause after mkdir, so observing its entry is not proof that
-            // the peer has synced the parent before this writer acknowledges.
-            sync_directory(&self.inner.staged)?;
-            let mode = rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO;
-            match rustix::fs::mkdirat(&upper, leaf_name, mode) {
+            let Some(upper_name) = grandparent.file_name() else {
+                return Err(WriteBehindError::RootUnresolvable);
+            };
+            // WP-115 drain guard: created and opened beneath the pinned
+            // `staged/` descriptor, never by path, so a symlink or a mount
+            // later placed at `<root>/staged` cannot redirect a stage.
+            let staged = &self.inner.staged_dir.file;
+            match rustix::fs::mkdirat(staged, upper_name, directory_mode()) {
                 Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => return Err(WriteBehindError::io("fanout create", &error.into())),
             }
-            let handle = open_directory_at(Some(&upper), Path::new(leaf_name))?;
+            let upper = open_directory_at(staged, Path::new(upper_name))?;
+            // Every finalizer establishes its own durability barrier. A peer
+            // can pause after mkdir, so observing its entry is not proof that
+            // the peer has synced the parent before this writer acknowledges.
+            sync_directory_handle(staged, &self.inner.staged)?;
+            match rustix::fs::mkdirat(&upper, leaf_name, directory_mode()) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(WriteBehindError::io("fanout create", &error.into())),
+            }
+            let handle = open_directory_at(&upper, Path::new(leaf_name))?;
             sync_directory_handle(&upper, grandparent)?;
             Ok(StagedLeaf { handle })
         }
@@ -618,14 +812,29 @@ mod platform {
             resolved: &ResolvedStagedPath,
         ) -> Result<Option<Bytes>, WriteBehindError> {
             let root = self.clone();
+            #[cfg(test)]
             let path = resolved.path().to_path_buf();
-            let device = self.inner.device;
+            let relative = resolved.relative().to_path_buf();
             join(lore_spawn_blocking!(move || {
                 let _permit = permit;
                 root.verify_device()?;
                 #[cfg(test)]
                 super::durability_tests::before_read(&path);
-                read_regular_blocking(&path, device)
+                #[cfg(all(test, target_os = "linux"))]
+                super::pinned_tree_tests::before_read(&path);
+                let read = read_regular_blocking(
+                    &root.inner.staged_dir.file,
+                    &relative,
+                    root.inner.device,
+                )?;
+                // WP-115 drain guard: a miss counts only while the root path
+                // still names the pinned root and its pinned `staged/`. The
+                // open itself was beneath the pinned `staged/`, so the miss is
+                // in that directory and in no other one.
+                if read.is_none() {
+                    root.verify_device()?;
+                }
+                Ok(read)
             }))
             .await
         }
@@ -700,32 +909,40 @@ mod platform {
                     }
                     return Ok(());
                 }
-                // SAFETY: the parent fd remains live through the call; name
-                // contains exactly one path component. NOFOLLOW rejects
-                // symlink substitution and DIRECTORY rejects non-directories.
-                let fd = unsafe {
-                    libc::openat(
-                        directory.as_raw_fd(),
-                        name.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if fd < 0 {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() == std::io::ErrorKind::NotFound {
+                // One component, confined beneath the parent (no symlink, no
+                // mount point; see `open_beneath`); DIRECTORY rejects
+                // non-directories.
+                let child = match open_beneath(
+                    &directory,
+                    Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())),
+                    rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                    rustix::fs::Mode::empty(),
+                ) {
+                    Ok(child) => fs::File::from(child),
+                    Err(rustix::io::Errno::NOENT) => {
                         // A missing shard does not block temp-only cleanup.
                         // Persist the nearest verified existing ancestor.
                         return sync_directory_handle(&directory, &directory_path);
                     }
-                    return Err(WriteBehindError::io("confined directory open", &error));
-                }
-                // SAFETY: openat returned a new owned fd, transferred exactly
-                // once to File so every error path closes it.
-                let child = unsafe { fs::File::from_raw_fd(fd) };
+                    Err(error) => {
+                        return Err(WriteBehindError::io(
+                            "confined directory open",
+                            &error.into(),
+                        ));
+                    }
+                };
                 let metadata = child
                     .metadata()
                     .map_err(|error| WriteBehindError::io("confined directory stat", &error))?;
                 if metadata.dev() != self.inner.device {
+                    return Err(WriteBehindError::RootDeviceChanged);
+                }
+                // WP-115 drain guard: the top-level `staged` must still be
+                // the directory pinned at open.
+                if chain.is_empty()
+                    && name.as_bytes() == STAGED_DIR.as_bytes()
+                    && metadata.ino() != self.inner.staged_dir.inode
+                {
                     return Err(WriteBehindError::RootDeviceChanged);
                 }
                 directory_path.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
@@ -746,23 +963,135 @@ mod platform {
         }
     }
 
-    /// Open one directory without following a final symlink, by path or as one
-    /// component relative to `parent`.
-    fn open_directory_at(
-        parent: Option<&fs::File>,
-        path: &Path,
-    ) -> Result<fs::File, WriteBehindError> {
-        let flags = rustix::fs::OFlags::RDONLY
-            | rustix::fs::OFlags::DIRECTORY
-            | rustix::fs::OFlags::NOFOLLOW
-            | rustix::fs::OFlags::CLOEXEC;
-        let opened = match parent {
-            Some(parent) => rustix::fs::openat(parent, path, flags, rustix::fs::Mode::empty()),
-            None => rustix::fs::open(path, flags, rustix::fs::Mode::empty()),
-        };
-        opened
-            .map(fs::File::from)
-            .map_err(|error| WriteBehindError::io("fanout open", &error.into()))
+    /// Open one directory as one component confined beneath `parent` (see
+    /// [`open_beneath`]).
+    fn open_directory_at(parent: &fs::File, path: &Path) -> Result<fs::File, WriteBehindError> {
+        open_beneath(
+            parent,
+            path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|error| WriteBehindError::io("fanout open", &error.into()))
+    }
+
+    /// `rwxrwxrwx` before the umask: the mode staging has always created its
+    /// directories with.
+    fn directory_mode() -> rustix::fs::Mode {
+        rustix::fs::Mode::RWXU | rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO
+    }
+
+    /// FORK-LOCAL (Tideshift), WP-115 drain guard: open `relative` beneath
+    /// `parent` without following a symlink anywhere and without crossing a
+    /// mount point. On Linux this is `openat2` with `RESOLVE_BENEATH |
+    /// RESOLVE_NO_XDEV | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, as
+    /// cleanup's inventory walk and the spool writer already use, always
+    /// with `O_NOFOLLOW` added. A symlink at the last component is refused
+    /// by `O_NOFOLLOW` (`ELOOP`, or `ENOTDIR` with `O_DIRECTORY`, as for a
+    /// symlink at `staged`); `RESOLVE_BENEATH` keeps every middle component
+    /// inside `parent`, and `RESOLVE_NO_SYMLINKS` also refuses a symlink
+    /// there (`ELOOP`). So for the drain guard `RESOLVE_NO_SYMLINKS` is
+    /// defence in depth: without it a read still stays in the pinned
+    /// directory. A mount point (a bind mount included) is `EXDEV`, and `..`
+    /// is refused. `openat2` needs Linux 5.6 or later: an `ENOSYS` or
+    /// `EPERM` (an older kernel, or a seccomp filter that blocks it) fails
+    /// the stage open, so the server does not boot. Elsewhere it is
+    /// `openat(O_NOFOLLOW)`, which covers only a final symlink: there,
+    /// nothing it reads is proof for the drain guard
+    /// ([`ConfinedRoot::liveness_tree_intact`] is `false` and the absence
+    /// guard never proves a miss).
+    fn open_beneath(
+        parent: &fs::File,
+        relative: &Path,
+        flags: rustix::fs::OFlags,
+        mode: rustix::fs::Mode,
+    ) -> rustix::io::Result<std::os::fd::OwnedFd> {
+        let flags = flags | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+        #[cfg(target_os = "linux")]
+        {
+            rustix::fs::openat2(
+                parent,
+                relative,
+                flags,
+                mode,
+                rustix::fs::ResolveFlags::BENEATH
+                    | rustix::fs::ResolveFlags::NO_XDEV
+                    | rustix::fs::ResolveFlags::NO_SYMLINKS
+                    | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            rustix::fs::openat(parent, relative, flags, mode)
+        }
+    }
+
+    /// WP-115 drain guard: open `name` confined beneath the root descriptor
+    /// and record its identity. A symlink, a mount point or a non-directory
+    /// there refuses to start.
+    fn pin_child(root: &fs::File, name: &str) -> Result<super::PinnedDir, WriteBehindError> {
+        let file = open_beneath(
+            root,
+            Path::new(name),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .map(fs::File::from)
+        .map_err(|error| match error {
+            // A symlink at the name (`ENOTDIR`: `O_NOFOLLOW` with
+            // `O_DIRECTORY`, measured), a mount point (`EXDEV`) or a
+            // non-directory (`ENOTDIR`). `ELOOP` stays mapped for a kernel
+            // that reports the symlink that way. Any other error, `ENOSYS`
+            // or `EPERM` from a kernel before 5.6 or a seccomp filter
+            // included, is an I/O error that fails boot.
+            rustix::io::Errno::LOOP | rustix::io::Errno::XDEV | rustix::io::Errno::NOTDIR => {
+                WriteBehindError::StageTreeUnconfined
+            }
+            other => WriteBehindError::io("stage subdirectory open", &other.into()),
+        })?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| WriteBehindError::io("stage subdirectory stat", &error))?;
+        if !metadata.is_dir() {
+            return Err(WriteBehindError::StageTreeUnconfined);
+        }
+        Ok(super::PinnedDir {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            file,
+        })
+    }
+
+    /// WP-115 drain guard: whether `name`, opened confined beneath `root` now,
+    /// is the directory `pinned` (same device and inode). Any error is
+    /// `false`.
+    fn child_is(root: &fs::File, name: &str, pinned: &super::PinnedDir) -> bool {
+        open_beneath(
+            root,
+            Path::new(name),
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .ok()
+        .and_then(|child| fs::File::from(child).metadata().ok())
+        .is_some_and(|metadata| metadata.dev() == pinned.device && metadata.ino() == pinned.inode)
+    }
+
+    /// WP-115 drain guard: `name` as one plain file name, or `InvalidInput`.
+    fn liveness_name(name: &str) -> std::io::Result<&Path> {
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\0')
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a stage liveness file name must be one plain file name",
+            ));
+        }
+        Ok(Path::new(name))
     }
 
     /// How many fan-out levels above a purged staged file may be removed once
@@ -801,18 +1130,26 @@ mod platform {
         }
     }
 
-    fn read_regular_blocking(path: &Path, device: u64) -> Result<Option<Bytes>, WriteBehindError> {
-        // O_NOFOLLOW covers the final component: a symlink planted where the
-        // staged file belongs is ELOOP here rather than a read of whatever it
-        // names.
-        let file = match fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(WriteBehindError::io("staged open", &error)),
+    fn read_regular_blocking(
+        staged: &fs::File,
+        relative: &Path,
+        device: u64,
+    ) -> Result<Option<Bytes>, WriteBehindError> {
+        // WP-115 drain guard: opened beneath the pinned `staged/` descriptor,
+        // confined (see `open_beneath`): a symlink at any component (the
+        // final one by `O_NOFOLLOW`, a middle one by `RESOLVE_NO_SYMLINKS`)
+        // or a mount point on the way is a refusal (ELOOP, EXDEV), never a
+        // read of whatever it names and never an `ENOENT` from another
+        // directory.
+        let file = match open_beneath(
+            staged,
+            relative,
+            rustix::fs::OFlags::RDONLY,
+            rustix::fs::Mode::empty(),
+        ) {
+            Ok(file) => fs::File::from(file),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(WriteBehindError::io("staged open", &error.into())),
         };
         let metadata = file
             .metadata()
@@ -937,6 +1274,31 @@ mod platform {
             Err(WriteBehindError::UnsupportedPlatform)
         }
 
+        pub(crate) fn liveness_tree_intact(&self) -> bool {
+            false
+        }
+
+        pub(crate) fn liveness_read(
+            &self,
+            _name: &str,
+            _limit: u64,
+        ) -> std::io::Result<Option<Vec<u8>>> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        pub(crate) fn liveness_replace(
+            &self,
+            _name: &str,
+            _temporary: &str,
+            _content: &[u8],
+        ) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
+        pub(crate) fn liveness_remove(&self, _name: &str) -> std::io::Result<()> {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+
         pub(crate) fn verify_device(&self) -> Result<(), WriteBehindError> {
             Err(WriteBehindError::UnsupportedPlatform)
         }
@@ -1002,6 +1364,10 @@ mod platform {
 #[cfg(all(test, unix))]
 #[path = "durability_tests.rs"]
 mod durability_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "pinned_tree_tests.rs"]
+mod pinned_tree_tests;
 
 #[cfg(test)]
 mod tests {

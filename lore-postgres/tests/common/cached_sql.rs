@@ -188,6 +188,16 @@ pub const PINS: &[Pin] = &[
         indexes: &[],
     },
     Pin {
+        // WP-115 drain guard: in the `begin_stage` transaction, before the
+        // stage usage row lock (review S1). Primary-key insert only.
+        name: "stage_stager_record",
+        needles: &[
+            "INSERT INTO lore_domain_write_behind_stagers (hash, epoch, replica_id, incarnation) VALUES ($1, $2, $3, $4) ON CONFLICT (hash, epoch) DO NOTHING",
+        ],
+        forbidden: &[],
+        indexes: &[],
+    },
+    Pin {
         name: "stage_capacity_reserve",
         needles: &["UPDATE lore_fragment_stage_usage AS u SET live_bytes=u.live_bytes+$1"],
         forbidden: &[],

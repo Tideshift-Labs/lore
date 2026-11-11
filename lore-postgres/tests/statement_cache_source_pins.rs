@@ -340,3 +340,26 @@ fn the_stage_observer_never_runs_a_cached_statement() {
         "the stage observer runs on build_observer_pool, which does not apply the mode"
     );
 }
+
+/// WP-115 drain guard, review S1: the stager row is written in the
+/// `begin_stage` transaction BEFORE the reservation takes the cell-wide stage
+/// usage row lock, and through the statement cache. The order inside one
+/// transaction is not visible from outside it, so it is pinned here.
+#[test]
+fn the_stager_insert_runs_before_the_stage_usage_row_lock_and_is_cached() {
+    let coordinator = code_only(&src("domain/fragments/coordinator.rs"));
+    let begin = function(&coordinator, "async fn begin_publication_once(");
+    let record = begin
+        .find("stage_liveness::record_stager_locked(&tx, hash, epoch, stager)")
+        .expect("the stager insert in begin_publication_once");
+    let reserve = begin
+        .find("stage_custody::reserve_stage_locked(")
+        .expect("the reservation in begin_publication_once");
+    assert!(
+        record < reserve,
+        "the stager insert must run before reserve_stage_locked"
+    );
+    let liveness = code_only(&src("domain/fragments/stage_liveness.rs"));
+    let body = function(&liveness, "async fn record_stager_locked(");
+    assert!(body.contains("tx.execute_cached("), "{body}");
+}
