@@ -735,7 +735,13 @@ mod platform {
             // `staged/` descriptor, never by path, so a symlink or a mount
             // later placed at `<root>/staged` cannot redirect a stage.
             let staged = &self.inner.staged_dir.file;
-            match rustix::fs::mkdirat(staged, upper_name, directory_mode()) {
+            // The pinned `staged/` itself: an ESTALE here means `staged/` was
+            // recreated. It stays an ESTALE `Io` error, which the finalizer
+            // does not retry; the root check fails and admission reports
+            // `RootUnavailable` until every replica restarts.
+            match injected("fanout create", &self.inner.staged)
+                .and_then(|()| rustix::fs::mkdirat(staged, upper_name, directory_mode()))
+            {
                 Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => return Err(WriteBehindError::io("fanout create", &error.into())),
             }
@@ -744,17 +750,42 @@ mod platform {
             // can pause after mkdir, so observing its entry is not proof that
             // the peer has synced the parent before this writer acknowledges.
             sync_directory_handle(staged, &self.inner.staged)?;
-            match rustix::fs::mkdirat(&upper, leaf_name, directory_mode()) {
+            // From here the held directory is a fan-out level a purge can
+            // remove, so an ESTALE is the NFS form of its `NotFound`.
+            match injected("fanout create", grandparent)
+                .and_then(|()| rustix::fs::mkdirat(&upper, leaf_name, directory_mode()))
+            {
                 Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(error) => return Err(WriteBehindError::io("fanout create", &error.into())),
+                Err(error) => {
+                    return Err(WriteBehindError::io(
+                        "fanout create",
+                        &fanout_removed("fanout create", error).into(),
+                    ));
+                }
             }
-            let handle = open_directory_at(&upper, Path::new(leaf_name))?;
+            let handle = injected("fanout open", grandparent)
+                .and_then(|()| {
+                    open_beneath(
+                        &upper,
+                        Path::new(leaf_name),
+                        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                        rustix::fs::Mode::empty(),
+                    )
+                })
+                .map(fs::File::from)
+                .map_err(|error| {
+                    WriteBehindError::io(
+                        "fanout open",
+                        &fanout_removed("fanout open", error).into(),
+                    )
+                })?;
             sync_directory_handle(&upper, grandparent)?;
             Ok(StagedLeaf { handle })
         }
 
         /// Step 4: rename the synced temporary file into the held leaf.
-        /// `NotFound` when the leaf has been removed since `ensure_parent`.
+        /// `NotFound` when the leaf has been removed since `ensure_parent`,
+        /// and on NFS also for the `ESTALE` such a removed leaf gives.
         pub(crate) fn rename_into(
             temporary: &Path,
             resolved: &ResolvedStagedPath,
@@ -767,8 +798,20 @@ mod platform {
             // Only the target side is descriptor-relative. The source is still
             // the absolute path under `incoming/`, a fixed directory no purge
             // removes, so resolving it by path (from CWD) cannot redirect it.
-            rustix::fs::renameat(rustix::fs::CWD, temporary, &leaf.handle, name)
-                .map_err(|error| WriteBehindError::io("staging rename", &error.into()))
+            injected("staging rename", resolved.parent())
+                .and_then(|()| rustix::fs::renameat(rustix::fs::CWD, temporary, &leaf.handle, name))
+                .map_err(|error| {
+                    WriteBehindError::io(
+                        "staging rename",
+                        &fanout_removed("staging rename", error).into(),
+                    )
+                })
+        }
+
+        /// Diagnostic only: take the raw errno (ESTALE or ENOENT) of the last
+        /// fan-out directory this thread found gone, and clear it.
+        pub(crate) fn take_last_fanout_errno() -> Option<i32> {
+            LAST_FANOUT_ERRNO.with(std::cell::Cell::take)
         }
 
         /// Step 5: make the renamed entry durable in the held leaf.
@@ -877,6 +920,31 @@ mod platform {
                     Err(_) => return Err(WriteBehindError::KeyMismatch),
                 }
             };
+            // On NFS a fan-out directory a concurrent purge removed gives
+            // ESTALE on the descriptor this walk holds, where a local disk
+            // gives ENOENT (or nothing, for fstat). ESTALE alone does not
+            // prove the file is gone, so the walk starts again from the root
+            // by name, where a removed directory is a real ENOENT. Bounded:
+            // the last ESTALE is the purge's error.
+            let mut attempt = 1;
+            loop {
+                match self.remove_placement_once(&relative, temporary)? {
+                    PurgeWalk::Done => return Ok(()),
+                    PurgeWalk::FanoutStale(_) if attempt < PURGE_ATTEMPTS => attempt += 1,
+                    PurgeWalk::FanoutStale(error) => return Err(error),
+                }
+            }
+        }
+
+        /// One walk of [`Self::remove_placement_blocking`] from the verified
+        /// root. `FanoutStale` only for an ESTALE on a fan-out level
+        /// (`<aa>` or `<aa>/<bb>` under `staged/`); an ESTALE on the root,
+        /// on `staged/` or on `incoming/` is an error and is not retried.
+        fn remove_placement_once(
+            &self,
+            relative: &Path,
+            temporary: bool,
+        ) -> Result<PurgeWalk, WriteBehindError> {
             let mut components = relative.components().peekable();
             let mut directory = self.verified_root_directory()?;
             let mut directory_path = self.inner.canonical.clone();
@@ -890,16 +958,34 @@ mod platform {
                     Ok(name) => name,
                     Err(_) => return Err(WriteBehindError::KeyMismatch),
                 };
+                // `directory` is `staged/<aa>` or deeper: a purge can remove it.
+                let directory_is_fanout = !temporary && chain.len() >= 2;
                 if components.peek().is_none() {
-                    // SAFETY: directory owns a live directory fd and name is
-                    // one NUL-terminated normal component. flags=0 unlinks the
-                    // entry itself and never follows a final symlink.
-                    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
-                    if result != 0 {
-                        let error = std::io::Error::last_os_error();
-                        if error.kind() != std::io::ErrorKind::NotFound {
-                            return Err(WriteBehindError::io("confined unlink", &error));
+                    let unlinked = injected("confined unlink", &directory_path)
+                        .map_err(std::io::Error::from)
+                        .and_then(|()| {
+                            // SAFETY: directory owns a live directory fd and
+                            // name is one NUL-terminated normal component.
+                            // flags=0 unlinks the entry itself and never
+                            // follows a final symlink.
+                            let result =
+                                unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+                            if result == 0 {
+                                Ok(())
+                            } else {
+                                Err(std::io::Error::last_os_error())
+                            }
+                        });
+                    match unlinked {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) if directory_is_fanout && is_stale(&error) => {
+                            return Ok(PurgeWalk::FanoutStale(WriteBehindError::io(
+                                "confined unlink",
+                                &error,
+                            )));
                         }
+                        Err(error) => return Err(WriteBehindError::io("confined unlink", &error)),
                     }
                     // Even ENOENT needs this barrier: the prior unlink may
                     // have succeeded without its caller completing fsync.
@@ -907,33 +993,58 @@ mod platform {
                     if !temporary {
                         remove_empty_fanout(&chain);
                     }
-                    return Ok(());
+                    return Ok(PurgeWalk::Done);
                 }
                 // One component, confined beneath the parent (no symlink, no
                 // mount point; see `open_beneath`); DIRECTORY rejects
                 // non-directories.
-                let child = match open_beneath(
-                    &directory,
-                    Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())),
-                    rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
-                    rustix::fs::Mode::empty(),
-                ) {
-                    Ok(child) => fs::File::from(child),
-                    Err(rustix::io::Errno::NOENT) => {
-                        // A missing shard does not block temp-only cleanup.
-                        // Persist the nearest verified existing ancestor.
-                        return sync_directory_handle(&directory, &directory_path);
+                let child =
+                    match injected("confined directory open", &directory_path).and_then(|()| {
+                        open_beneath(
+                            &directory,
+                            Path::new(std::ffi::OsStr::from_bytes(name.as_bytes())),
+                            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                            rustix::fs::Mode::empty(),
+                        )
+                    }) {
+                        Ok(child) => fs::File::from(child),
+                        Err(rustix::io::Errno::NOENT) => {
+                            // A missing shard does not block temp-only cleanup.
+                            // Persist the nearest verified existing ancestor.
+                            return sync_directory_handle(&directory, &directory_path)
+                                .map(|()| PurgeWalk::Done);
+                        }
+                        Err(rustix::io::Errno::STALE) if directory_is_fanout => {
+                            return Ok(PurgeWalk::FanoutStale(WriteBehindError::io(
+                                "confined directory open",
+                                &rustix::io::Errno::STALE.into(),
+                            )));
+                        }
+                        Err(error) => {
+                            return Err(WriteBehindError::io(
+                                "confined directory open",
+                                &error.into(),
+                            ));
+                        }
+                    };
+                // `child` is `staged/<aa>` or deeper: a purge can remove it.
+                let child_is_fanout = !temporary && !chain.is_empty();
+                let child_path = directory_path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                let metadata = match injected("confined directory stat", &child_path)
+                    .map_err(std::io::Error::from)
+                    .and_then(|()| child.metadata())
+                {
+                    Ok(metadata) => metadata,
+                    Err(error) if child_is_fanout && is_stale(&error) => {
+                        return Ok(PurgeWalk::FanoutStale(WriteBehindError::io(
+                            "confined directory stat",
+                            &error,
+                        )));
                     }
                     Err(error) => {
-                        return Err(WriteBehindError::io(
-                            "confined directory open",
-                            &error.into(),
-                        ));
+                        return Err(WriteBehindError::io("confined directory stat", &error));
                     }
                 };
-                let metadata = child
-                    .metadata()
-                    .map_err(|error| WriteBehindError::io("confined directory stat", &error))?;
                 if metadata.dev() != self.inner.device {
                     return Err(WriteBehindError::RootDeviceChanged);
                 }
@@ -945,7 +1056,7 @@ mod platform {
                 {
                     return Err(WriteBehindError::RootDeviceChanged);
                 }
-                directory_path.push(std::ffi::OsStr::from_bytes(name.as_bytes()));
+                directory_path = child_path;
                 chain.push((std::mem::replace(&mut directory, child), name));
             }
             Err(WriteBehindError::KeyMismatch)
@@ -1098,6 +1209,70 @@ mod platform {
     /// empty: `staged/<aa>/<bb>` loses `<bb>` then `<aa>`, never `staged`.
     const REMOVABLE_FANOUT_LEVELS: usize = 2;
 
+    /// Bounded walks of one purge when a fan-out level it holds goes stale.
+    const PURGE_ATTEMPTS: usize = 3;
+
+    /// One purge walk's outcome.
+    enum PurgeWalk {
+        Done,
+        /// An ESTALE on a held fan-out directory: on NFS, a concurrent purge
+        /// removed it. Walk again from the root; the error is the last one.
+        FanoutStale(WriteBehindError),
+    }
+
+    fn is_stale(error: &std::io::Error) -> bool {
+        error.raw_os_error() == Some(libc::ESTALE)
+    }
+
+    thread_local! {
+        /// Diagnostic only: the raw errno of the last fan-out ESTALE or ENOENT
+        /// that `fanout_removed` saw on this thread. A finalize runs on one
+        /// blocking thread, so its give-up line reads its own value.
+        static LAST_FANOUT_ERRNO: std::cell::Cell<Option<i32>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// FORK-LOCAL (Tideshift): the error a finalizer reports for an act in a
+    /// held fan-out directory (`<aa>` or `<aa>/<bb>`). On NFS a directory a
+    /// concurrent purge removed gives ESTALE where a local disk gives ENOENT,
+    /// so ESTALE becomes the `NotFound` that makes the finalizer redo step 1
+    /// (bounded by `PLACEMENT_ATTEMPTS`). Never use this for an act on the
+    /// pinned `staged/` or `liveness/` descriptor: ESTALE there means the
+    /// directory was recreated, which must stay a root failure.
+    ///
+    /// The raw errno (ESTALE or ENOENT) goes to a debug line and is kept for
+    /// the finalizer's give-up line, so operators can see NFS staleness.
+    fn fanout_removed(site: &'static str, error: rustix::io::Errno) -> rustix::io::Errno {
+        if error == rustix::io::Errno::STALE || error == rustix::io::Errno::NOENT {
+            let errno = error.raw_os_error();
+            LAST_FANOUT_ERRNO.with(|last| last.set(Some(errno)));
+            tracing::debug!(
+                site,
+                errno,
+                estale = error == rustix::io::Errno::STALE,
+                "write-behind: held fan-out directory is gone, reported as NotFound"
+            );
+        }
+        if error == rustix::io::Errno::STALE {
+            rustix::io::Errno::NOENT
+        } else {
+            error
+        }
+    }
+
+    /// Test seam: an errno the durability tests inject at one named act on
+    /// one directory, in place of the real syscall.
+    #[cfg(test)]
+    fn injected(site: &'static str, path: &Path) -> rustix::io::Result<()> {
+        super::durability_tests::injected_errno(site, path).map_or(Ok(()), Err)
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn injected(_site: &'static str, _path: &Path) -> rustix::io::Result<()> {
+        Ok(())
+    }
+
     /// Remove the purged file's fan-out directories if they are now empty,
     /// deepest first (INV-FT F2: empty directories made every physical walk
     /// slower as the cell aged).
@@ -1141,12 +1316,16 @@ mod platform {
         // or a mount point on the way is a refusal (ELOOP, EXDEV), never a
         // read of whatever it names and never an `ENOENT` from another
         // directory.
-        let file = match open_beneath(
-            staged,
-            relative,
-            rustix::fs::OFlags::RDONLY,
-            rustix::fs::Mode::empty(),
-        ) {
+        // An ESTALE here (the pinned `staged/` was recreated, or a fan-out
+        // level went stale mid-lookup) is never a miss: only ENOENT is.
+        let file = match injected("staged open", relative).and_then(|()| {
+            open_beneath(
+                staged,
+                relative,
+                rustix::fs::OFlags::RDONLY,
+                rustix::fs::Mode::empty(),
+            )
+        }) {
             Ok(file) => fs::File::from(file),
             Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(error) => return Err(WriteBehindError::io("staged open", &error.into())),
@@ -1316,6 +1495,10 @@ mod platform {
             _leaf: &StagedLeaf,
         ) -> Result<(), WriteBehindError> {
             Err(WriteBehindError::UnsupportedPlatform)
+        }
+
+        pub(crate) fn take_last_fanout_errno() -> Option<i32> {
+            None
         }
 
         pub(crate) fn sync_leaf(

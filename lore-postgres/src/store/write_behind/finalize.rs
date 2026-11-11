@@ -113,6 +113,8 @@ pub(super) fn finalize_blocking(
 
     // Step 1, and it must precede the rename. See the module header. The leaf
     // stays held so steps 4 and 5 act on the directory step 1 synced.
+    // Clear the give-up diagnostic a previous finalize on this thread left.
+    let _ = ConfinedRoot::take_last_fanout_errno();
     let mut leaf = ensure_parent_retrying(root, resolved)?;
 
     let key = resolved
@@ -162,7 +164,8 @@ pub(super) fn finalize_blocking(
                     // Purge removes an empty fan-out directory, so the leaf step 1
                     // synced can be gone by now, and a path might name a newer,
                     // unsynced one. Redo step 1, so the rename lands in a directory
-                    // whose entry is durable.
+                    // whose entry is durable. On NFS the removed leaf gives ESTALE,
+                    // which `rename_into` reports as this same `NotFound`.
                     Err(WriteBehindError::Io {
                         kind: std::io::ErrorKind::NotFound,
                         ..
@@ -173,7 +176,18 @@ pub(super) fn finalize_blocking(
                     // Out of attempts, `NotFound` stays an `Io` error, and
                     // `WriteBehindError::store_error` maps every `Io` to `SlowDown`:
                     // the PUT is retryable, not failed hard.
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        if matches!(
+                            error,
+                            WriteBehindError::Io {
+                                kind: std::io::ErrorKind::NotFound,
+                                ..
+                            }
+                        ) {
+                            placement_gave_up("staging rename", &error);
+                        }
+                        return Err(error);
+                    }
                 }
             }
         })();
@@ -301,6 +315,11 @@ pub(crate) mod test_faults {
 
 /// Step 1, retried when a concurrent purge removed a directory it just made or
 /// found. Each attempt syncs every level again, so the durability order holds.
+///
+/// On NFS that removal gives ESTALE on the held fan-out directory, and
+/// `ConfinedRoot::ensure_parent` reports it as `NotFound` for the fan-out
+/// levels only. An ESTALE on the pinned `staged/` (it was recreated) stays an
+/// ESTALE error and is not retried.
 fn ensure_parent_retrying(
     root: &ConfinedRoot,
     resolved: &ResolvedStagedPath,
@@ -312,9 +331,33 @@ fn ensure_parent_retrying(
                 kind: std::io::ErrorKind::NotFound,
                 ..
             }) if attempt < PLACEMENT_ATTEMPTS => attempt += 1,
+            Err(
+                error @ WriteBehindError::Io {
+                    kind: std::io::ErrorKind::NotFound,
+                    ..
+                },
+            ) => {
+                placement_gave_up("staging parent", &error);
+                return Err(error);
+            }
             result => return result,
         }
     }
+}
+
+/// The finalizer ran out of `PLACEMENT_ATTEMPTS` on a removed fan-out
+/// directory. The PUT answers a retryable `SlowDown` and nothing is lost. The
+/// line names the raw errno (ESTALE, 116 on Linux, on NFS; ENOENT on a local disk) so
+/// operators can see NFS staleness, which the `NotFound` error itself hides.
+fn placement_gave_up(step: &'static str, error: &WriteBehindError) {
+    let errno = ConfinedRoot::take_last_fanout_errno();
+    tracing::warn!(
+        step,
+        attempts = PLACEMENT_ATTEMPTS,
+        ?errno,
+        %error,
+        "write-behind: finalize gave up on a removed fan-out directory; the PUT is retryable"
+    );
 }
 
 /// Finalization runs on a retained blocking worker. Its failpoint can wait on

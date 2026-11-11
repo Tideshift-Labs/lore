@@ -32,6 +32,71 @@ pub(super) fn observe_sync(path: &Path, completed: bool) -> Result<(), WriteBehi
 
 struct Hook;
 
+/// One injected errno: `times` more calls of `site` on `path` fail with
+/// ESTALE instead of running the syscall. `hits` counts every call of that
+/// site on that path, injected or not.
+struct Injection {
+    site: &'static str,
+    path: PathBuf,
+    times: usize,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// Global, not thread-local: purge runs on the caller's thread, finalize and
+/// staged reads on blocking workers. Each test injects on its own scratch
+/// path (or, for `staged open`, its own hash), so parallel tests never match.
+static INJECTIONS: std::sync::LazyLock<Mutex<Vec<Injection>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+pub(super) fn injected_errno(site: &'static str, path: &Path) -> Option<rustix::io::Errno> {
+    let mut injections = INJECTIONS.lock().unwrap();
+    let injection = injections
+        .iter_mut()
+        .find(|injection| injection.site == site && injection.path == path)?;
+    injection
+        .hits
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if injection.times == 0 {
+        return None;
+    }
+    injection.times -= 1;
+    Some(rustix::io::Errno::STALE)
+}
+
+/// Removes its injection when dropped, so a failed assertion leaves none.
+struct Estale {
+    site: &'static str,
+    path: PathBuf,
+    hits: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Estale {
+    fn inject(site: &'static str, path: impl Into<PathBuf>, times: usize) -> Self {
+        let path = path.into();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        INJECTIONS.lock().unwrap().push(Injection {
+            site,
+            path: path.clone(),
+            times,
+            hits: hits.clone(),
+        });
+        Self { site, path, hits }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Estale {
+    fn drop(&mut self) {
+        INJECTIONS
+            .lock()
+            .unwrap()
+            .retain(|injection| !(injection.site == self.site && injection.path == self.path));
+    }
+}
+
 type ReadGate = Arc<(mpsc::SyncSender<()>, Mutex<mpsc::Receiver<()>>)>;
 static READ_GATES: std::sync::LazyLock<Mutex<std::collections::BTreeMap<PathBuf, ReadGate>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::BTreeMap::new()));
@@ -654,6 +719,10 @@ async fn purge_keeps_a_fanout_directory_that_still_holds_another_file() {
 
 /// A purge may remove a fan-out directory a concurrent finalizer has just
 /// made and not yet renamed into. The finalizer must redo step 1, not fail.
+///
+/// The name holds on a local disk. On NFS a finalize may still give up after
+/// `PLACEMENT_ATTEMPTS` and answer a retryable `SlowDown`, with no data lost:
+/// measured 8 of 30 runs with `lookupcache=positive`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_purges_in_the_same_fanout_never_fail_a_finalize() {
     let scratch = Scratch::new();
@@ -857,4 +926,227 @@ async fn a_failed_rename_releases_its_claim_so_the_attempt_can_withdraw() {
     );
     assert!(!resolved.path().exists());
     assert!(!temporary_for(&scratch, &resolved).exists());
+}
+
+// --- NFS: ESTALE on a held fan-out directory (wb-estale) ---
+//
+// On NFS a directory another thread removed gives ESTALE for fstat, mkdirat,
+// openat and unlinkat on a descriptor still held to it; a local disk gives
+// ENOENT. These cases inject that ESTALE at each site through `Estale`.
+
+const STALE: std::io::ErrorKind = std::io::ErrorKind::StaleNetworkFileHandle;
+
+async fn staged_with_file(byte: u8) -> (Scratch, ConfinedRoot, PathBuf, super::ResolvedStagedPath) {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let canonical = scratch.0.canonicalize().unwrap();
+    let resolved = staged_file(&root, &[byte; 32], 1);
+    super::super::finalize::finalize(&root, &resolved, &bytes::Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    (scratch, root, canonical, resolved)
+}
+
+#[tokio::test]
+async fn purge_walks_again_after_an_estale_at_each_fanout_site() {
+    for (site, directory) in [
+        ("confined directory open", "staged/ab"),
+        ("confined directory stat", "staged/ab"),
+        ("confined directory stat", "staged/ab/ab"),
+        ("confined unlink", "staged/ab/ab"),
+    ] {
+        let (_scratch, root, canonical, resolved) = staged_with_file(0xab).await;
+        let estale = Estale::inject(site, canonical.join(directory), 1);
+        root.remove_placement_blocking(&resolved, false)
+            .unwrap_or_else(|error| panic!("{site} on {directory}: {error}"));
+        assert_eq!(estale.hits(), 2, "{site} on {directory}: one more walk");
+        assert!(!resolved.path().exists(), "{site} on {directory}: purged");
+        assert!(
+            !canonical.join("staged/ab").exists(),
+            "{site} on {directory}: empty fan-out removed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn purge_gives_up_after_a_bounded_number_of_estale_walks() {
+    let (_scratch, root, canonical, resolved) = staged_with_file(0xab).await;
+    let estale = Estale::inject(
+        "confined directory open",
+        canonical.join("staged/ab"),
+        usize::MAX,
+    );
+    assert_eq!(
+        root.remove_placement_blocking(&resolved, false),
+        Err(WriteBehindError::Io {
+            operation: "confined directory open",
+            kind: STALE
+        })
+    );
+    assert_eq!(estale.hits(), 3, "PURGE_ATTEMPTS walks, then the error");
+    assert!(
+        resolved.path().is_file(),
+        "an ESTALE alone never counts as purged"
+    );
+}
+
+#[tokio::test]
+async fn purge_does_not_retry_an_estale_on_the_root_staged_or_incoming() {
+    for (site, directory, temporary, operation) in [
+        (
+            "confined directory open",
+            "",
+            false,
+            "confined directory open",
+        ),
+        (
+            "confined directory stat",
+            "staged",
+            false,
+            "confined directory stat",
+        ),
+        (
+            "confined directory open",
+            "staged",
+            false,
+            "confined directory open",
+        ),
+        ("confined unlink", "incoming", true, "confined unlink"),
+    ] {
+        let (_scratch, root, canonical, resolved) = staged_with_file(0xab).await;
+        let path = if directory.is_empty() {
+            canonical.clone()
+        } else {
+            canonical.join(directory)
+        };
+        let estale = Estale::inject(site, path, usize::MAX);
+        assert_eq!(
+            root.remove_placement_blocking(&resolved, temporary),
+            Err(WriteBehindError::Io {
+                operation,
+                kind: STALE
+            }),
+            "{site} on {directory:?}"
+        );
+        assert_eq!(estale.hits(), 1, "{site} on {directory:?}: no second walk");
+        assert!(resolved.path().is_file(), "{site} on {directory:?}: kept");
+    }
+}
+
+#[tokio::test]
+async fn finalize_redoes_step_one_after_an_estale_in_a_fanout_directory() {
+    for (site, directory) in [
+        ("fanout create", "staged/ab"),
+        ("fanout open", "staged/ab"),
+        ("staging rename", "staged/ab/ab"),
+    ] {
+        let scratch = Scratch::new();
+        let root = ConfinedRoot::open(&scratch.0).unwrap();
+        let canonical = scratch.0.canonicalize().unwrap();
+        let resolved = staged_file(&root, &[0xab; 32], 1);
+        let estale = Estale::inject(site, canonical.join(directory), 1);
+        super::super::finalize::finalize(&root, &resolved, &bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap_or_else(|error| panic!("{site} on {directory}: {error}"));
+        assert_eq!(estale.hits(), 2, "{site} on {directory}: step 1 ran again");
+        assert_eq!(std::fs::read(resolved.path()).unwrap(), b"x");
+    }
+}
+
+#[tokio::test]
+async fn finalize_retries_a_fanout_estale_a_bounded_number_of_times() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let canonical = scratch.0.canonicalize().unwrap();
+    let resolved = staged_file(&root, &[0xab; 32], 1);
+    let estale = Estale::inject("fanout create", canonical.join("staged/ab"), usize::MAX);
+    let failed =
+        super::super::finalize::finalize(&root, &resolved, &bytes::Bytes::from_static(b"x")).await;
+    assert_eq!(
+        failed,
+        Err(WriteBehindError::Io {
+            operation: "fanout create",
+            kind: std::io::ErrorKind::NotFound
+        })
+    );
+    assert_eq!(estale.hits(), 3, "PLACEMENT_ATTEMPTS, then the error");
+    assert!(matches!(
+        failed.unwrap_err().store_error(),
+        lore_storage::immutable_store::StoreError::SlowDown(_)
+    ));
+    assert!(!resolved.path().exists());
+}
+
+/// Drain guard (9e8e03fe): an ESTALE on the PINNED `staged/` means it was
+/// recreated. That must stay a root failure: no retry, never `NotFound`, and
+/// admission reports `RootUnavailable`.
+#[tokio::test]
+async fn an_estale_on_the_pinned_staged_directory_is_not_retried_and_the_root_is_unavailable() {
+    let scratch = Scratch::new();
+    let root = ConfinedRoot::open(&scratch.0).unwrap();
+    let canonical = scratch.0.canonicalize().unwrap();
+    let resolved = staged_file(&root, &[0xab; 32], 1);
+    {
+        let estale = Estale::inject("fanout create", canonical.join("staged"), usize::MAX);
+        assert_eq!(
+            super::super::finalize::finalize(&root, &resolved, &bytes::Bytes::from_static(b"x"))
+                .await,
+            Err(WriteBehindError::Io {
+                operation: "fanout create",
+                kind: STALE
+            }),
+            "an ESTALE on the pinned staged/ is not a removed fan-out"
+        );
+        assert_eq!(estale.hits(), 1, "no retry on the pinned staged/");
+    }
+
+    // The real thing on a local disk: `staged/` recreated under the pin.
+    std::fs::remove_dir_all(canonical.join("staged")).unwrap();
+    std::fs::create_dir(canonical.join("staged")).unwrap();
+    assert_eq!(root.sample(), super::AdmissionSample::RootUnavailable);
+    assert_eq!(
+        root.verify_device(),
+        Err(WriteBehindError::RootDeviceChanged)
+    );
+    assert_eq!(
+        super::super::finalize::finalize(&root, &resolved, &bytes::Bytes::from_static(b"x")).await,
+        Err(WriteBehindError::RootDeviceChanged)
+    );
+    assert_eq!(
+        root.remove_placement_blocking(&resolved, false),
+        Err(WriteBehindError::RootDeviceChanged)
+    );
+    assert!(
+        root.read_regular(&resolved).await.is_err(),
+        "a read under a recreated staged/ is never Absent"
+    );
+}
+
+#[tokio::test]
+async fn a_staged_read_estale_is_unavailable_never_absent() {
+    for present in [true, false] {
+        let scratch = Scratch::new();
+        let root = ConfinedRoot::open(&scratch.0).unwrap();
+        // A hash no other test uses: `staged open` is keyed by the relative path.
+        let resolved = staged_file(&root, &[0xe5; 32], 1);
+        if present {
+            super::super::finalize::finalize(&root, &resolved, &bytes::Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let estale = Estale::inject("staged open", resolved.relative(), 1);
+        let read = root.read_regular(&resolved).await;
+        assert_eq!(estale.hits(), 1, "present={present}");
+        assert!(
+            matches!(
+                read,
+                Err(WriteBehindError::Io {
+                    operation: "staged open",
+                    kind: STALE
+                })
+            ),
+            "present={present}: got {read:?}"
+        );
+        drop(estale);
+    }
 }
