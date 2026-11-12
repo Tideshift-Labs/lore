@@ -8,6 +8,9 @@
 //! controls is an unbounded time-series axis. CR-033 D1 re-bases the closed enum on the authority's
 //! operations rather than the generated gRPC handler set the removed service shell used.
 
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -97,6 +100,74 @@ pub(crate) fn record_drain_authority_failure(procedure: &'static str, cause: &'s
                 KeyValue::new("cause", cause),
             ],
         );
+}
+
+/// Count one wait for the drain hot-row lock that passed `lock_timeout`, labelled `procedure`
+/// (the closed set of [`crate::drain_policy::drain_procedure_label`]). A steady rise means a
+/// session holds the lock and does not let go; see
+/// [`crate::drain_policy::DRAIN_HOT_ROW_LOCK_KEY`].
+pub(crate) fn record_drain_hot_row_lock_wait_timeout(procedure: &'static str) {
+    static TIMEOUTS: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
+    HOT_ROW_LOCK_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+    TIMEOUTS
+        .get_or_init(|| DispatchInstrumentProvider.counter("drain_hot_row_lock_wait_timeouts"))
+        .add(1, &[KeyValue::new("procedure", procedure)]);
+}
+
+/// Count one hot-row session closed instead of pooled, labelled `reason` (the closed set of
+/// [`crate::drain_policy::HotRowSessionClose::label`]). Each one is a new connection on the
+/// next call.
+pub(crate) fn record_drain_hot_row_session_closed(reason: crate::drain_policy::HotRowSessionClose) {
+    static CLOSED: std::sync::OnceLock<Counter<u64>> = std::sync::OnceLock::new();
+    if let Some(count) = HOT_ROW_SESSIONS_CLOSED.get(reason as usize) {
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+    CLOSED
+        .get_or_init(|| DispatchInstrumentProvider.counter("drain_hot_row_sessions_closed"))
+        .add(1, &[KeyValue::new("reason", reason.label())]);
+}
+
+/// Count one stuck-holder warning that named at least one holder. Local only: the warning itself
+/// is the operator's signal.
+pub(crate) fn record_drain_hot_row_holder_named() {
+    HOT_ROW_HOLDER_WARNINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+static HOT_ROW_LOCK_WAIT_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
+static HOT_ROW_HOLDER_WARNINGS: AtomicU64 = AtomicU64::new(0);
+static HOT_ROW_SESSIONS_CLOSED: [AtomicU64; crate::drain_policy::HotRowSessionClose::ALL.len()] =
+    [const { AtomicU64::new(0) }; crate::drain_policy::HotRowSessionClose::ALL.len()];
+
+/// This process's totals of the two hot-row lock counters above, since it started. The `OTel`
+/// counters carry the same counts; these exist so a test in the same process can read them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotRowLockCounts {
+    pub lock_wait_timeouts: u64,
+    /// Stuck-holder warnings that named a holder.
+    pub holder_warnings: u64,
+    /// Indexed like [`crate::drain_policy::HotRowSessionClose::ALL`].
+    pub sessions_closed: [u64; crate::drain_policy::HotRowSessionClose::ALL.len()],
+}
+
+impl HotRowLockCounts {
+    pub fn closed(&self, reason: crate::drain_policy::HotRowSessionClose) -> u64 {
+        self.sessions_closed
+            .get(reason as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+pub fn hot_row_lock_counts() -> HotRowLockCounts {
+    HotRowLockCounts {
+        lock_wait_timeouts: HOT_ROW_LOCK_WAIT_TIMEOUTS.load(Ordering::Relaxed),
+        holder_warnings: HOT_ROW_HOLDER_WARNINGS.load(Ordering::Relaxed),
+        sessions_closed: std::array::from_fn(|index| {
+            HOT_ROW_SESSIONS_CLOSED
+                .get(index)
+                .map_or(0, |count| count.load(Ordering::Relaxed))
+        }),
+    }
 }
 
 struct BudgetInstrumentProvider;

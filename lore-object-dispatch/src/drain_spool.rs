@@ -136,7 +136,7 @@ impl DrainClient {
     }
 
     async fn release_and_compact(&self, intent: &DrainCleanupIntent) -> Result<(), DrainError> {
-        self.query(
+        self.query_hot(
             "SELECT object_store_retention.drain_cleanup_release_v1($1,$2)",
             &[&intent.spool, &intent.fence],
         )
@@ -145,7 +145,7 @@ impl DrainClient {
         // one lost to another replica is redone on the row's next re-scan, so it must not read as
         // a release that committed nothing.
         match self
-            .query(
+            .query_hot(
                 "SELECT object_store_retention.drain_cleanup_compact_v3($1)",
                 &[&intent.spool],
             )
@@ -165,7 +165,7 @@ impl DrainClient {
         cell: &str,
     ) -> Result<i64, DrainError> {
         let rows = self
-            .query(
+            .query_hot(
                 "SELECT object_store_retention.drain_retired_floor_advance_v1($1,$2)",
                 &[&boundary, &cell],
             )

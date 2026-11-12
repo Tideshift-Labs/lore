@@ -212,6 +212,155 @@ mod drain_walk_tests {
             }
         }
     }
+
+    /// One drain pass with every slot free, driven through `drain_pass`'s own
+    /// page state: [`PassPages::first`] and [`PassPages::refill`] decide when
+    /// to read and how many candidates to ask for, and `next_startable` takes
+    /// each candidate. Only the page reader (`pass`, the candidate query over
+    /// an in-memory keyspace) and the start loop are test code. No promotion
+    /// settles before the pass ends, so every started hash stays in flight.
+    /// Returns the hashes the pass started and the pages it read.
+    async fn run_pass(
+        state: &mut DrainState,
+        keyspace: &BTreeSet<Vec<u8>>,
+        batch: u32,
+        cooling: &BTreeSet<Vec<u8>>,
+        rng: &mut StdRng,
+    ) -> (Vec<Vec<u8>>, u32) {
+        let (first, _) = pass(state, keyspace, batch as usize, rng);
+        let mut pages = PassPages::first(first, batch);
+        let mut reads = 1u32;
+        let mut started = Vec::new();
+        let mut in_flight = BTreeSet::new();
+        loop {
+            while (started.len() as u32) < batch {
+                let Some(hash) =
+                    next_startable(&mut pages.page, Vec::as_slice, &in_flight, |hash| {
+                        cooling.contains(hash)
+                    })
+                else {
+                    break;
+                };
+                in_flight.insert(hash.clone());
+                started.push(hash);
+            }
+            let read = |room: u32| {
+                reads += 1;
+                let (page, _) = pass(state, keyspace, room as usize, rng);
+                std::future::ready(Ok(page))
+            };
+            if !pages.refill(started.len() as u32, true, read).await {
+                return (started, reads);
+            }
+        }
+    }
+
+    /// drain-tput5: a refill page larger than the room left in the pass. The
+    /// first page has two cooling hashes, so the pass starts two and refills.
+    /// The refill must ask only for the two it can still start; a page of
+    /// `batch` would move the cursor past two hashes it never starts, and
+    /// they would wait for a full keyset wrap. The next pass must start the
+    /// hash right after the last one this pass started.
+    #[tokio::test]
+    async fn a_refill_never_moves_the_cursor_past_a_hash_it_cannot_start() {
+        const BATCH: u32 = 4;
+        let keyspace: BTreeSet<Vec<u8>> = (1u8..=40).map(hash).collect();
+        let ordered: Vec<Vec<u8>> = keyspace.iter().cloned().collect();
+        let cooling: BTreeSet<Vec<u8>> = ordered[..2].iter().cloned().collect();
+        for seed in 0..32 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut state = DrainState::with_cursor_seed([0; 32]);
+            let (first, _) = run_pass(&mut state, &keyspace, BATCH, &cooling, &mut rng).await;
+            assert_eq!(first.len(), BATCH as usize, "seed {seed}");
+            let behind: Vec<&Vec<u8>> = ordered
+                .iter()
+                .filter(|hash| **hash <= state.cursor)
+                .filter(|hash| !cooling.contains(*hash) && !first.contains(*hash))
+                .collect();
+            assert!(
+                behind.is_empty(),
+                "seed {seed}: the cursor passed hashes the pass never started: {behind:?}"
+            );
+            let (second, _) = run_pass(&mut state, &keyspace, BATCH, &cooling, &mut rng).await;
+            let mut expected: Vec<Vec<u8>> = ordered[6..10].to_vec();
+            let mut got = second.clone();
+            expected.sort();
+            got.sort();
+            assert_eq!(
+                got, expected,
+                "seed {seed}: the next pass starts the hashes right after the first pass"
+            );
+        }
+        assert_eq!(refill_room(BATCH, 0), BATCH);
+        assert_eq!(refill_room(BATCH, 3), 1);
+        assert_eq!(refill_room(BATCH, BATCH), 0);
+    }
+
+    /// drain-tput6: a short refill page reached the end of the staged keyset,
+    /// so it ends the pass. Five hashes, the first two cooling: the first page
+    /// (four hashes) starts two, the refill asks for two and gets only the
+    /// fifth. The pass must stop there. Reading on would wrap onto the
+    /// cooling hashes, spend the page bound, and move the cursor back to the
+    /// start of the keyspace.
+    #[tokio::test]
+    async fn a_short_refill_page_ends_the_pass() {
+        const BATCH: u32 = 4;
+        let keyspace: BTreeSet<Vec<u8>> = (1u8..=5).map(hash).collect();
+        let ordered: Vec<Vec<u8>> = keyspace.iter().cloned().collect();
+        let cooling: BTreeSet<Vec<u8>> = ordered[..2].iter().cloned().collect();
+        for seed in 0..8 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut state = DrainState::with_cursor_seed([0; 32]);
+            let (mut started, reads) =
+                run_pass(&mut state, &keyspace, BATCH, &cooling, &mut rng).await;
+            started.sort();
+            assert_eq!(started, ordered[2..].to_vec(), "seed {seed}");
+            assert_eq!(reads, 2, "seed {seed}: the short refill page ends the pass");
+            assert_eq!(
+                state.cursor, ordered[4],
+                "seed {seed}: the pass never wrapped past the end of the keyset"
+            );
+        }
+
+        // The same decision in isolation: a short refill page sets
+        // `exhausted`, and an exhausted pass reads no more.
+        let mut pages = PassPages::first(vec![hash(1), hash(2)], 2);
+        assert!(!pages.exhausted, "a full first page is not exhausted");
+        pages.page.clear();
+        assert!(
+            pages
+                .refill(0, true, |room| {
+                    assert_eq!(room, 2);
+                    std::future::ready(Ok(vec![hash(3)]))
+                })
+                .await
+        );
+        assert!(pages.exhausted, "a short refill page exhausts the pass");
+        pages.page.clear();
+        assert!(
+            !pages
+                .refill(
+                    0,
+                    true,
+                    |_| -> std::future::Ready<Result<Vec<Vec<u8>>, StoreError>> {
+                        panic!("an exhausted pass must not read")
+                    }
+                )
+                .await
+        );
+        // A failed refill also ends the pass.
+        let mut pages = PassPages::first(vec![hash(1)], 1);
+        pages.page.clear();
+        pages.exhausted = false;
+        assert!(
+            pages
+                .refill(0, true, |_| std::future::ready(Err(StoreError::from(
+                    SlowDown
+                ))))
+                .await
+        );
+        assert!(pages.exhausted, "a failed refill ends the pass");
+    }
 }
 
 /// Row 80 idea 4, replica decorrelation: replicas that boot with different
@@ -326,6 +475,103 @@ mod drain_walk_replica_tests {
         let set = |page: &[Vec<u8>]| page.iter().cloned().collect::<BTreeSet<_>>();
         assert_eq!(set(&one), set(&two));
         assert_ne!(one, two, "two seeds produced one order");
+    }
+
+    /// drain-tput2: a refilled page that names a hash the pass is still
+    /// promoting must not start it again; the pass takes the next one instead.
+    #[test]
+    fn a_pass_skips_a_hash_it_is_already_promoting() {
+        let hash = |byte: u8| vec![byte; 32];
+        let (running, cooling, next) = (hash(1), hash(2), hash(3));
+        let mut page = std::collections::VecDeque::from([
+            running.clone(),
+            cooling.clone(),
+            next.clone(),
+            running.clone(),
+        ]);
+        let in_flight = BTreeSet::from([running.clone()]);
+        let is_cooling = |candidate: &[u8]| candidate == cooling.as_slice();
+        let taken = next_startable(&mut page, Vec::as_slice, &in_flight, is_cooling);
+        assert_eq!(
+            taken,
+            Some(next),
+            "the in-flight and cooling hashes are skipped"
+        );
+        assert_eq!(
+            page,
+            std::slice::from_ref(&running),
+            "skipped entries leave the page"
+        );
+        assert_eq!(
+            next_startable(&mut page, Vec::as_slice, &in_flight, is_cooling),
+            None,
+            "a page of only in-flight hashes starts nothing"
+        );
+        assert!(page.is_empty());
+
+        // Once it settles (the pass removes it from `in_flight`), it may start.
+        let mut page = std::collections::VecDeque::from([running.clone()]);
+        let settled = BTreeSet::new();
+        assert_eq!(
+            next_startable(&mut page, Vec::as_slice, &settled, |_| false),
+            Some(running)
+        );
+    }
+
+    /// drain-tput4: a staged keyset of only cooling-down hashes, larger than
+    /// one page. Every page starts nothing, every slot stays free and every page
+    /// is full, so only the page bound ends the pass. This replays
+    /// `drain_pass`'s start-then-refill steps with its own two helpers.
+    #[test]
+    fn a_pass_over_only_cooling_hashes_stops_at_the_page_bound() {
+        const BATCH: u32 = 4;
+        // Far more cooling hashes than the bound can read.
+        let keyset: Vec<Vec<u8>> = (0..=u8::MAX).map(|byte| vec![byte; 32]).collect();
+        let mut pages_of_keyset = keyset.chunks(BATCH as usize).cycle();
+        let mut read_page = || {
+            std::collections::VecDeque::from(
+                pages_of_keyset.next().expect("a non-empty keyset").to_vec(),
+            )
+        };
+        let in_flight = BTreeSet::new();
+        let all_cooling = |_: &[u8]| true;
+        let slot_free = true;
+        let mut page = read_page();
+        let mut pages = 1u32;
+        let mut started = 0u32;
+        let exhausted = false;
+        // A bound on this replay, not on the pass: far above any legal page count.
+        for _ in 0..1_000 {
+            if next_startable(&mut page, Vec::as_slice, &in_flight, all_cooling).is_some() {
+                started += 1;
+            }
+            if !reads_another_page(started, BATCH, slot_free, page.is_empty(), exhausted, pages) {
+                break;
+            }
+            pages += 1;
+            page = read_page();
+        }
+        assert_eq!(started, 0, "every candidate is cooling down");
+        assert_eq!(
+            pages, MAX_DRAIN_PAGES_PER_PASS,
+            "the pass reads exactly the bound of pages, then ends"
+        );
+
+        // Each other condition alone also stops the refill.
+        let at_bound = MAX_DRAIN_PAGES_PER_PASS;
+        assert!(reads_another_page(
+            0,
+            BATCH,
+            true,
+            true,
+            false,
+            at_bound - 1
+        ));
+        assert!(!reads_another_page(0, BATCH, true, true, false, at_bound));
+        assert!(!reads_another_page(BATCH, BATCH, true, true, false, 1));
+        assert!(!reads_another_page(0, BATCH, false, true, false, 1));
+        assert!(!reads_another_page(0, BATCH, true, false, false, 1));
+        assert!(!reads_another_page(0, BATCH, true, true, true, 1));
     }
 }
 
@@ -916,6 +1162,129 @@ const RECONCILING_PREDICATES: [&str; 4] = [
 
 /// Most promotions one drain pass runs at once, whatever the configuration.
 pub const MAX_DRAIN_CONCURRENCY: usize = 8;
+
+/// drain-tput2: most candidate pages one drain pass reads. A pass refills free
+/// slots from the next page instead of waiting for its last promotion; this
+/// bounds the reads of a pass whose candidates are all cooling down or running.
+pub const MAX_DRAIN_PAGES_PER_PASS: u32 = 4;
+
+/// drain-tput2: whether a drain pass reads one more candidate page now: it has
+/// started fewer than `batch` promotions, a slot is free, the current page is
+/// spent, the staged keyset is not exhausted, and it has read fewer than
+/// [`MAX_DRAIN_PAGES_PER_PASS`] pages. The page bound is what ends a pass whose
+/// candidates are all cooling down or running: each such page starts nothing,
+/// so without it the pass would read pages without end.
+fn reads_another_page(
+    started: u32,
+    batch: u32,
+    slot_free: bool,
+    page_spent: bool,
+    exhausted: bool,
+    pages: u32,
+) -> bool {
+    started < batch && slot_free && page_spent && !exhausted && pages < MAX_DRAIN_PAGES_PER_PASS
+}
+
+/// drain-tput5: the size of a refill page, which is the number of promotions
+/// the pass may still start. `next_candidate_page` moves the cursor to the
+/// greatest hash of the page it reads. If the page held more startable hashes
+/// than this room, the pass would stop at `batch` and the rest of the page
+/// would sit behind the cursor until a full keyset wrap.
+fn refill_room(batch: u32, started: u32) -> u32 {
+    batch.saturating_sub(started)
+}
+
+/// Whether a page of `len` candidates filled the `asked` size. A short page
+/// reached the end of the staged keyset.
+fn page_full(len: usize, asked: u32) -> bool {
+    u32::try_from(len).is_ok_and(|len| len >= asked)
+}
+
+/// drain-tput6: the candidate pages of one drain pass. `drain_pass` holds one
+/// and takes its refill decision only through [`PassPages::refill`], so the
+/// lib tests run the same decision with an in-memory page reader.
+struct PassPages<C> {
+    /// The current page. The pass takes candidates from it through
+    /// `next_startable`.
+    page: std::collections::VecDeque<C>,
+    batch: u32,
+    /// Pages read so far in this pass, the first page included.
+    pages: u32,
+    /// A short page reached the end of the staged keyset: reading on would
+    /// only wrap onto the hashes this pass already took.
+    exhausted: bool,
+}
+
+impl<C> PassPages<C> {
+    /// The pass state after its first page, which asked for `batch`.
+    fn first(page: Vec<C>, batch: u32) -> Self {
+        Self {
+            exhausted: !page_full(page.len(), batch),
+            page: page.into(),
+            batch,
+            pages: 1,
+        }
+    }
+
+    /// Read the next page through `read` if [`reads_another_page`] allows it.
+    /// Returns whether it read (or tried to read) a page.
+    async fn refill<F, Fut>(&mut self, started: u32, slot_free: bool, read: F) -> bool
+    where
+        F: FnOnce(u32) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<C>, StoreError>>,
+    {
+        if !reads_another_page(
+            started,
+            self.batch,
+            slot_free,
+            self.page.is_empty(),
+            self.exhausted,
+            self.pages,
+        ) {
+            return false;
+        }
+        self.pages += 1;
+        // drain-tput5: read only the room left in this pass. A larger page
+        // would move the cursor past hashes the pass cannot start, and they
+        // would wait for a full keyset wrap.
+        let room = refill_room(self.batch, started);
+        match read(room).await {
+            Ok(next) => {
+                self.exhausted = !page_full(next.len(), room);
+                self.page = next.into();
+            }
+            Err(error) => {
+                // The running promotions still finish; the next pass reads
+                // again.
+                self.exhausted = true;
+                tracing::warn!(%error, "drain candidate refill failed");
+            }
+        }
+        true
+    }
+}
+
+/// drain-tput2: take the next candidate a drain pass may start from `page`,
+/// dropping every candidate before it that the pass is still promoting
+/// (`in_flight`) or that is `cooling` down.
+///
+/// A refilled page can name a hash this pass already started (the cursor
+/// wraps), and one replica must never run two promotions of one fragment.
+fn next_startable<C>(
+    page: &mut std::collections::VecDeque<C>,
+    hash_of: impl Fn(&C) -> &[u8],
+    in_flight: &std::collections::BTreeSet<Vec<u8>>,
+    cooling: impl Fn(&[u8]) -> bool,
+) -> Option<C> {
+    while let Some(candidate) = page.pop_front() {
+        let hash = hash_of(&candidate);
+        if in_flight.contains(hash) || cooling(hash) {
+            continue;
+        }
+        return Some(candidate);
+    }
+    None
+}
 
 /// The default drain concurrency. Row 77 had set it to 1; rows 78 and 79
 /// removed the capacity refusals and the domain pool wait that made parallel
@@ -1734,14 +2103,17 @@ impl FragmentWriteBehindHandle {
         );
     }
 
-    /// Promote up to `batch` staged fragments, at most
+    /// Start up to `batch` promotions of staged fragments, at most
     /// [`Self::drain_concurrency`] at once (row 77).
     ///
     /// Each promotion runs in its own task on its own slot. The cursor and
     /// cooldown lock is taken only for bookkeeping, never across a promotion.
-    /// Candidates in one batch are distinct hashes, and passes never overlap,
-    /// so one replica never runs two promotions of one fragment; across
-    /// replicas the claim barrier and the promotion fence still decide.
+    /// A slot that frees is refilled at once, from the next candidate page when
+    /// the current one is spent (drain-tput2), up to
+    /// [`MAX_DRAIN_PAGES_PER_PASS`] pages. The pass skips a hash it is still
+    /// running, and passes never overlap, so one replica never runs two
+    /// promotions of one fragment; across replicas the claim barrier and the
+    /// promotion fence still decide.
     /// Cancelling the pass aborts its tasks; a slot keeps any file task that
     /// was still running, and the next pass will not reuse that slot until the
     /// task returns.
@@ -1765,6 +2137,83 @@ impl FragmentWriteBehindHandle {
             return Err(StoreError::from(SlowDown));
         }
         let bound = FragmentDrainCandidateBatch::new(batch).map_err(domain_store_err)?;
+        let mut pages = PassPages::first(self.next_candidate_page(bound).await?, batch);
+        let mut started = 0u32;
+        // Hashes this pass started and has not settled. A later page can name
+        // one again after a wrap; one replica never runs two promotions of one
+        // fragment.
+        let mut in_flight = std::collections::BTreeSet::new();
+        let mut promoted = 0;
+        let mut running = tokio::task::JoinSet::new();
+        loop {
+            // drain-tput2: start a promotion in every free slot. A pass starts at
+            // most `batch` promotions, as before.
+            while started < batch && !free.is_empty() {
+                let next = {
+                    let state = self.state.lock().await;
+                    let now = Instant::now();
+                    next_startable(
+                        &mut pages.page,
+                        FragmentDrainCandidate::hash,
+                        &in_flight,
+                        |hash| {
+                            state
+                                .cooldown
+                                .get(hash)
+                                .is_some_and(|(until, _)| *until > now)
+                        },
+                    )
+                };
+                let Some(source) = next else {
+                    break;
+                };
+                let hash = source.hash().to_vec();
+                let Some(slot) = free.pop() else {
+                    break;
+                };
+                in_flight.insert(hash.clone());
+                started += 1;
+                let handle = self.clone();
+                lore_base::lore_spawn!(running, async move {
+                    let mut slot = slot;
+                    let result = handle.promote(source, &mut slot).await;
+                    (hash, result, slot)
+                });
+            }
+            // Continuous refill (drain-tput2): a free slot and a spent page read
+            // the next page now. The pass used to wait for its last promotion
+            // here, with every other slot idle.
+            if pages
+                .refill(started, !free.is_empty(), |room| self.refill_page(room))
+                .await
+            {
+                continue;
+            }
+            let Some(joined) = running.join_next().await else {
+                break;
+            };
+            if let Ok((hash, _, _)) = &joined {
+                in_flight.remove(hash);
+            }
+            self.settle_promotion(joined, &mut promoted, &mut free)
+                .await;
+        }
+        Ok(promoted)
+    }
+
+    /// One refill page of `room` candidates (drain-tput5).
+    async fn refill_page(&self, room: u32) -> Result<Vec<FragmentDrainCandidate>, StoreError> {
+        let refill = FragmentDrainCandidateBatch::new(room).map_err(domain_store_err)?;
+        self.next_candidate_page(refill).await
+    }
+
+    /// Read the next candidate page after the cursor, wrapping once to the
+    /// start of the keyspace when the read past the cursor is empty. The cursor
+    /// jumps to the page's greatest hash, once, and the page is shuffled.
+    async fn next_candidate_page(
+        &self,
+        bound: FragmentDrainCandidateBatch,
+    ) -> Result<Vec<FragmentDrainCandidate>, StoreError> {
         let cursor = self.state.lock().await.cursor.clone();
         let mut candidates = self
             .coordinator
@@ -1779,59 +2228,19 @@ impl FragmentWriteBehindHandle {
                 .await
                 .map_err(domain_store_err)?;
         }
-        {
-            let now = Instant::now();
-            let mut state = self.state.lock().await;
-            state.cooldown.retain(|_, (until, _)| {
-                now.saturating_duration_since(*until) < Duration::from_secs(300)
-            });
-            // The cursor jumps to the page's max hash here, once. If the
-            // no-free-slot break below ends the loop early, the rest of this
-            // page waits for the wrap. That happens only when every slot holds
-            // a timed-out file task.
-            state.begin_batch(
-                &mut candidates,
-                FragmentDrainCandidate::hash,
-                &mut rand::rng(),
-            );
-        }
-        let mut promoted = 0;
-        let mut running = tokio::task::JoinSet::new();
-        for source in candidates {
-            let hash = source.hash().to_vec();
-            {
-                let state = self.state.lock().await;
-                if state
-                    .cooldown
-                    .get(&hash)
-                    .is_some_and(|(until, _)| *until > Instant::now())
-                {
-                    continue;
-                }
-            }
-            while free.is_empty() {
-                let Some(joined) = running.join_next().await else {
-                    break;
-                };
-                self.settle_promotion(joined, &mut promoted, &mut free)
-                    .await;
-            }
-            // Every slot retains a file task that has not returned.
-            let Some(slot) = free.pop() else {
-                break;
-            };
-            let handle = self.clone();
-            lore_base::lore_spawn!(running, async move {
-                let mut slot = slot;
-                let result = handle.promote(source, &mut slot).await;
-                (hash, result, slot)
-            });
-        }
-        while let Some(joined) = running.join_next().await {
-            self.settle_promotion(joined, &mut promoted, &mut free)
-                .await;
-        }
-        Ok(promoted)
+        let now = Instant::now();
+        let mut state = self.state.lock().await;
+        state.cooldown.retain(|_, (until, _)| {
+            now.saturating_duration_since(*until) < Duration::from_secs(300)
+        });
+        // If every slot holds a timed-out file task, the rest of this page
+        // waits for the wrap.
+        state.begin_batch(
+            &mut candidates,
+            FragmentDrainCandidate::hash,
+            &mut rand::rng(),
+        );
+        Ok(candidates)
     }
 
     /// Account for one finished promotion and return its slot to the pass.

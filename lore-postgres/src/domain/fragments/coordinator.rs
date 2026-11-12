@@ -3877,6 +3877,8 @@ impl PostgresFragmentCoordinator {
         // live row bound at an older generation still resolves. Tombstoned
         // keys still recreate and invalidate below.
         if existing_state == Some(schema::ASSOCIATION_LIVE) {
+            // No `allow_association` here: the LIVE row passed it when it was
+            // bound, and this no-op writes nothing for it to admit.
             classify_commit(tx.commit().await, "guarded association live no-op commit")?;
             failpoint!("association.create_guarded.settled")?;
             return Ok(CommitVerdict::Published);

@@ -868,6 +868,38 @@ fn classify_pass_separates_backpressure_from_other_failures() {
     assert_eq!(classify_pass(&not_authorized), PassOutcome::Failed);
 }
 
+/// drain-tput4: only a pass that promoted something starts the next pass at once. An idle drain
+/// (nothing promoted) waits for its tick, or it would query the cell database without pause.
+#[test]
+fn only_a_pass_that_promoted_starts_the_next_pass_at_once() {
+    assert!(starts_next_pass_at_once(&Ok(1)));
+    assert!(starts_next_pass_at_once(&Ok(8)));
+    assert!(
+        !starts_next_pass_at_once(&Ok(0)),
+        "an idle pass waits for the next tick"
+    );
+    for failed in [
+        StoreError::from(lore_storage::errors::SlowDown),
+        StoreError::from(lore_storage::errors::Disconnected),
+    ] {
+        assert!(!starts_next_pass_at_once(&Err(failed)));
+    }
+    // The drain loop decides only through this function: an inline condition at the loop would
+    // bypass the cases above.
+    let source = include_str!("../../src/fragment_write_behind.rs");
+    assert_eq!(
+        source.matches("busy = ").count(),
+        2,
+        "`busy` is set once to false and once per pass"
+    );
+    assert_eq!(
+        source
+            .matches("busy = starts_next_pass_at_once(&result);")
+            .count(),
+        1
+    );
+}
+
 #[test]
 fn a_run_of_backpressure_passes_keeps_the_loop_clock_fresh_for_either_loop() {
     let now = Instant::now();

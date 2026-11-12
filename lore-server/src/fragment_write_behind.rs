@@ -494,6 +494,14 @@ fn classify_pass<T>(result: &Result<T, StoreError>) -> PassOutcome {
     }
 }
 
+/// drain-tput2: whether the drain loop starts its next pass at once instead of waiting for the
+/// next tick. Only a pass that promoted something does: an idle pass (nothing promoted), a failed
+/// one and a backpressured one wait, or an idle drain would query the cell database without pause.
+#[lore_macro::test_pub]
+fn starts_next_pass_at_once(result: &Result<u32, StoreError>) -> bool {
+    matches!(result, Ok(promoted) if *promoted > 0)
+}
+
 /// Fold one pass's outcome into readiness state.
 ///
 /// **Backpressure is not unreadiness.** A loop that is told to slow down is
@@ -1536,16 +1544,24 @@ fn spawn_drain_and_cleanup(
         let _guard = StopGuard(worker_handle.clone(), worker_readiness.clone());
         let mut ticks = tokio::time::interval(settings.worker_interval);
         ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // drain-tput2: a pass that promoted something is followed at once by
+        // the next one; only an idle, failed or backpressured pass waits for
+        // the next tick. Waiting for the tick after a busy pass left every
+        // slot idle for up to one interval.
+        let mut busy = false;
         loop {
-            tokio::select! { biased;
-                _ = worker_shutdown.wait_for(|value| *value) => break,
-                _ = ticks.tick() => {}
+            if !busy {
+                tokio::select! { biased;
+                    _ = worker_shutdown.wait_for(|value| *value) => break,
+                    _ = ticks.tick() => {}
+                }
             }
             // Cancellation leaves the durable claim's late-effect barrier intact.
             let result = tokio::select! { biased;
                 _ = worker_shutdown.wait_for(|value| *value) => break,
                 result = worker_handle.drain_pass(settings.worker_batch) => result,
             };
+            busy = starts_next_pass_at_once(&result);
             let outcome = classify_pass(&result);
             match &result {
                 Ok(promoted) => instruments().promoted.add(u64::from(*promoted), &[]),

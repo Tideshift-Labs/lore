@@ -5886,6 +5886,21 @@ impl DrainCell {
             .get(0)
     }
 
+    /// The cell-scope quota counter's `used_rows` (scope kind 2), one of the hot rows every
+    /// reservation charges.
+    async fn cell_quota_rows(&self) -> i64 {
+        self.fixture
+            .client
+            .query_one(
+                "SELECT used_rows::text::bigint FROM object_store_retention.object_dispatch_quota_usage \
+                 WHERE provider_boundary_id=$1 AND scope_kind=2 AND scope_id=$2 AND quota_class=1",
+                &[&self.policy.boundary, &self.policy.cell],
+            )
+            .await
+            .expect("read the cell quota counter")
+            .get(0)
+    }
+
     async fn spool_object_rows(&self) -> i64 {
         self.fixture
             .client
@@ -7051,4 +7066,508 @@ async fn live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrad
     let observed = client.observe(boundary, cell_id).await.unwrap();
     assert!(!observed.metadata_full);
     assert_eq!((observed.spool_bytes, observed.spool_files), (0, 0));
+}
+
+// drain-tput2: every drain hot-row writer takes the session lock `DRAIN_HOT_ROW_LOCK_KEY` before
+// its SERIALIZABLE transaction begins. Four clients (four pools, so four sessions) race single
+// reserves on the same quota and policy rows: none of them loses to contention, and the ledger and
+// the cell quota counter match custody exactly. A refused reserve on the way releases the lock too.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_racing_reserves_wait_in_turn_under_the_hot_row_lock() {
+    const CLIENTS: u32 = 4;
+    const ROUNDS: u32 = 30;
+    let cell = drain_cell_with_ttl(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_RESERVE_RACE_PG_URL",
+        "r32reserverace",
+        4096,
+        Some(600_000),
+    )
+    .await;
+    let mut clients = vec![cell.client.clone()];
+    for _ in 1..CLIENTS {
+        clients.push(drain_client(&cell.fixture.base_url, cell.identity).await);
+    }
+    let run = |index: u32| {
+        let cell = &cell;
+        let client = clients[usize::try_from(index).unwrap()].clone();
+        async move {
+            let mut outcomes = Vec::new();
+            for round in 0..ROUNDS {
+                let descriptor = cell.descriptor(index * 10_000 + round, &cell.policy).await;
+                let result = client.reserve(&descriptor).await;
+                outcomes.push((descriptor, result));
+            }
+            outcomes
+        }
+    };
+    let (a, b, c, d) = tokio::join!(run(0), run(1), run(2), run(3));
+    let all = [a, b, c, d];
+    let mut committed = 0i64;
+    let mut contended = 0;
+    for (descriptor, result) in all.into_iter().flatten() {
+        match result {
+            Ok(()) => {
+                assert_eq!(
+                    cell.custody_rows_for_attempt(descriptor.attempt_id).await,
+                    1
+                );
+                committed += 1;
+            }
+            Err(DrainError::Contended) => {
+                contended += 1;
+                assert_eq!(
+                    cell.custody_rows_for_attempt(descriptor.attempt_id).await,
+                    0,
+                    "a contended reserve commits nothing"
+                );
+            }
+            Err(other) => panic!("unexpected reserve outcome {other:?}"),
+        }
+    }
+    eprintln!(
+        "racing reserves: {committed} committed, {contended} contended of {}",
+        CLIENTS * ROUNDS
+    );
+    // Each reserve's snapshot is taken after it holds the lock, so it already sees the previous
+    // holder's commit: the writers wait in turn and never abort.
+    assert_eq!(contended, 0, "the hot-row lock orders racing reserves");
+    assert_eq!(committed, i64::from(CLIENTS * ROUNDS));
+    assert_eq!(
+        cell.assert_ledger("after the race").await.custody_rows,
+        committed
+    );
+    assert_eq!(cell.cell_quota_rows().await, committed);
+
+    // A refused reserve (an expired send window) gives the lock back as well.
+    let mut expired = cell.descriptor(99_999, &cell.policy).await;
+    expired.send_not_after_ms = u64::try_from(now_ms(&cell.fixture.client).await - 1_000).unwrap();
+    assert_eq!(
+        cell.client.reserve(&expired).await,
+        Err(DrainError::Refused)
+    );
+    wait_hot_row_lock_free(&cell.fixture.client, "after a refused reserve", 10).await;
+    assert_next_taker_gets_the_lock_at_once(&cell.fixture.base_url).await;
+}
+
+/// Sessions holding or waiting for the drain hot-row lock (granted or not).
+async fn hot_row_lock_sessions(admin: &tokio_postgres::Client) -> (i64, i64) {
+    let row = admin
+        .query_one(
+            "SELECT count(*) FILTER (WHERE granted), count(*) FILTER (WHERE NOT granted)
+               FROM pg_locks
+              WHERE locktype = 'advisory' AND objsubid = 1
+                AND ((classid::bigint << 32) | objid::bigint) = $1",
+            &[&lore_object_dispatch::drain_policy::DRAIN_HOT_ROW_LOCK_KEY],
+        )
+        .await
+        .expect("read pg_locks");
+    (row.get(0), row.get(1))
+}
+
+/// Poll the pinned `reserve` until `pg_locks` shows `state` for the hot-row lock (and, with
+/// `row_wait`, a session waiting on a row lock), leaving it pending there. False if it finished
+/// first, or never reached that state within 5 s.
+async fn drive_until<F: std::future::Future>(
+    mut reserve: std::pin::Pin<&mut F>,
+    admin: &tokio_postgres::Client,
+    state: (i64, i64),
+    row_wait: bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        tokio::select! {
+            _ = &mut reserve => return false,
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        if hot_row_lock_sessions(admin).await == state
+            && (!row_wait || row_lock_waiters(admin).await > 0)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sessions waiting for a row or transaction lock (anything but an advisory lock).
+async fn row_lock_waiters(admin: &tokio_postgres::Client) -> i64 {
+    admin
+        .query_one(
+            "SELECT count(*) FROM pg_locks WHERE NOT granted AND locktype <> 'advisory'",
+            &[],
+        )
+        .await
+        .expect("read pg_locks")
+        .get(0)
+}
+
+/// Poll until no session holds or waits for the lock, for at most `seconds`.
+async fn wait_hot_row_lock_free(admin: &tokio_postgres::Client, when: &str, seconds: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(seconds);
+    loop {
+        if hot_row_lock_sessions(admin).await == (0, 0) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the hot-row lock is still held or awaited {when}: {:?}",
+            hot_row_lock_sessions(admin).await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A fresh session takes the lock without waiting (`pg_try_advisory_lock` never queues), then
+/// gives it back.
+async fn assert_next_taker_gets_the_lock_at_once(base_url: &str) {
+    let key = lore_object_dispatch::drain_policy::DRAIN_HOT_ROW_LOCK_KEY;
+    let (next, _task) = connect_as(base_url, "postgres").await;
+    let taken: bool = next
+        .query_one("SELECT pg_try_advisory_lock($1)", &[&key])
+        .await
+        .expect("try the lock")
+        .get(0);
+    assert!(taken, "the next taker must get the hot-row lock at once");
+    let released: bool = next
+        .query_one("SELECT pg_advisory_unlock($1)", &[&key])
+        .await
+        .expect("give the lock back")
+        .get(0);
+    assert!(released);
+}
+
+/// Hold the cell's drain policy row in an open transaction, so a reserve that holds the hot-row
+/// lock waits inside its own transaction.
+async fn hold_policy_row(holder: &tokio_postgres::Client, cell: &DrainCell) {
+    holder
+        .batch_execute(&format!(
+            "BEGIN; SELECT 1 FROM object_store_retention.drain_policies \
+             WHERE boundary = '{}' AND cell = '{}' FOR UPDATE",
+            cell.policy.boundary, cell.policy.cell
+        ))
+        .await
+        .expect("the test session holds the policy row");
+}
+
+// drain-tput2: the hot-row lock is a SESSION lock on a pooled connection, so it must never go back
+// to the pool held. Each way a holder or waiter can end without a clean unlock is driven here, and
+// after each one `pg_locks` shows no holder and no waiter and a fresh session takes the lock at
+// once:
+// - the reserve future dropped while it WAITS for the lock, and while it HOLDS it (its statement
+//   waiting on the policy row): a dropped lease closes its connection, and the backend ends;
+// - the caller panics while the reserve holds the lock: unwinding drops the future the same way;
+// - the wait passes `lock_timeout`: `Contended`, and the session is closed, not pooled;
+// - the holder stops without closing its socket (the future is kept but never polled again): the
+//   server's `idle_in_transaction_session_timeout`, armed with the lock, ends the session.
+// Refusal and commit paths are covered by the race case above.
+#[tokio::test]
+#[ignore = "requires a fresh disposable PostgreSQL 16 or 18 database"]
+async fn live_r32_the_hot_row_lock_never_returns_to_the_pool_held() {
+    let mut cell = drain_cell_with_ttl(
+        "LORE_TEST_CELL_SCHEMA_UPGRADE_R32_LOCK_DROP_PG_URL",
+        "r32lockdrop",
+        64,
+        Some(600_000),
+    )
+    .await;
+    let admin = &cell.fixture.client;
+    let base_url = &cell.fixture.base_url;
+    let key = lore_object_dispatch::drain_policy::DRAIN_HOT_ROW_LOCK_KEY;
+    let mut descriptors = Vec::new();
+    for i in 1..=7 {
+        descriptors.push(cell.descriptor(i, &cell.policy).await);
+    }
+    let (holder, _holder_task) = connect_as(base_url, "postgres").await;
+
+    // --- Dropped while WAITING for the lock (the test session holds it). ---
+    holder
+        .query_one("SELECT pg_advisory_lock($1)", &[&key])
+        .await
+        .expect("the test session takes the lock");
+    {
+        let reserve = cell.client.reserve(&descriptors[0]);
+        tokio::pin!(reserve);
+        assert!(
+            drive_until(reserve.as_mut(), admin, (1, 1), false).await,
+            "the reserve must be seen waiting for the held lock"
+        );
+    }
+    holder
+        .query_one("SELECT pg_advisory_unlock($1)", &[&key])
+        .await
+        .expect("the test session releases the lock");
+    // The dropped waiter's backend may take the lock as it is freed, then ends on its closed
+    // socket; either way it is gone within moments.
+    wait_hot_row_lock_free(admin, "after a reserve was dropped mid-wait", 10).await;
+    assert_next_taker_gets_the_lock_at_once(base_url).await;
+    assert_eq!(
+        cell.custody_rows_for_attempt(descriptors[0].attempt_id)
+            .await,
+        0
+    );
+
+    // --- Dropped while HOLDING the lock: its transaction waits on the policy row. ---
+    hold_policy_row(&holder, &cell).await;
+    {
+        let reserve = cell.client.reserve(&descriptors[1]);
+        tokio::pin!(reserve);
+        assert!(
+            drive_until(reserve.as_mut(), admin, (1, 0), true).await,
+            "the reserve must be seen holding the lock"
+        );
+    }
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("release the policy row");
+    wait_hot_row_lock_free(admin, "after a reserve was dropped mid-hold", 10).await;
+    assert_next_taker_gets_the_lock_at_once(base_url).await;
+    assert_eq!(
+        cell.custody_rows_for_attempt(descriptors[1].attempt_id)
+            .await,
+        0
+    );
+
+    // --- The caller PANICS while the reserve holds the lock. ---
+    hold_policy_row(&holder, &cell).await;
+    let panic_now = Arc::new(tokio::sync::Notify::new());
+    let task = {
+        let client = cell.client.clone();
+        let descriptor = descriptors[2].clone();
+        let panic_now = panic_now.clone();
+        lore_base::lore_spawn!("hot-row-lock-panic-probe", async move {
+            let reserve = client.reserve(&descriptor);
+            tokio::pin!(reserve);
+            tokio::select! {
+                _ = &mut reserve => {}
+                () = panic_now.notified() => panic!("injected panic while holding the hot-row lock"),
+            }
+        })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !(hot_row_lock_sessions(admin).await == (1, 0) && row_lock_waiters(admin).await > 0) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the spawned reserve must be seen holding the lock"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic_now.notify_one();
+    let joined = task.await;
+    assert!(
+        joined.is_err_and(|error| error.is_panic()),
+        "the caller panicked"
+    );
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("release the policy row");
+    wait_hot_row_lock_free(admin, "after the caller panicked mid-hold", 10).await;
+    assert_next_taker_gets_the_lock_at_once(base_url).await;
+    assert_eq!(
+        cell.custody_rows_for_attempt(descriptors[2].attempt_id)
+            .await,
+        0
+    );
+
+    // --- The wait passes lock_timeout (2 s in this fixture). ---
+    holder
+        .query_one("SELECT pg_advisory_lock($1)", &[&key])
+        .await
+        .expect("the test session takes the lock");
+    let counts_before = lore_object_dispatch::metrics::hot_row_lock_counts();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        cell.client.reserve(&descriptors[3]).await,
+        Err(DrainError::Contended),
+        "a lock wait past lock_timeout reads as contention"
+    );
+    // drain-tput4: the timeout is counted, and so is the session it closed.
+    let counts_after = lore_object_dispatch::metrics::hot_row_lock_counts();
+    let lock_timeout = lore_object_dispatch::drain_policy::HotRowSessionClose::LockTimeout;
+    assert_eq!(
+        counts_after.lock_wait_timeouts - counts_before.lock_wait_timeouts,
+        1,
+        "one lock-wait timeout is counted"
+    );
+    assert_eq!(
+        counts_after.closed(lock_timeout) - counts_before.closed(lock_timeout),
+        1,
+        "the timed-out session is counted as closed"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(1_900) && waited < Duration::from_secs(6),
+        "{waited:?}"
+    );
+    // drain-tput4: the stuck-holder warning's query names the holder's pid, read as the runtime
+    // role (not a superuser), as loreserver reads it.
+    let holder_pid: i32 = holder
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the holder's pid")
+        .get(0);
+    let runtime_before: String = cell
+        .runtime
+        .0
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .expect("the runtime session's statement_timeout")
+        .get(0);
+    let holders = lore_object_dispatch::drain_policy::hot_row_lock_holders(&mut cell.runtime.0)
+        .await
+        .expect("read the hot-row lock holders as the runtime role");
+    assert_eq!(
+        holders.iter().map(|holder| holder.pid).collect::<Vec<_>>(),
+        vec![holder_pid],
+        "exactly the test session holds the lock: {holders:?}"
+    );
+    // drain-tput5: another role's session still shows its role; the read rolled its own
+    // transaction back, so the runtime session is idle with its default timeout again.
+    assert_eq!(holders[0].role.as_deref(), Some("postgres"), "{holders:?}");
+    let runtime_after: String = cell
+        .runtime
+        .0
+        .query_one("SHOW statement_timeout", &[])
+        .await
+        .expect("the runtime session is usable after the holder read")
+        .get(0);
+    assert_eq!(
+        runtime_after, runtime_before,
+        "the holder read's SET LOCAL ended with its transaction"
+    );
+    // While waits keep timing out, the process warns once, naming the holder. This is the
+    // process's first timeout (each live case runs in its own process), so two more reach
+    // `HOT_ROW_STALL_LOG_MIN_TIMEOUTS` (3), and the warning reads the holder on the session
+    // whose wait just timed out.
+    assert_eq!(
+        counts_after.holder_warnings, counts_before.holder_warnings,
+        "one timeout does not warn"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            cell.client.reserve(&descriptors[3]).await,
+            Err(DrainError::Contended)
+        );
+    }
+    let counts_warned = lore_object_dispatch::metrics::hot_row_lock_counts();
+    assert_eq!(
+        counts_warned.lock_wait_timeouts - counts_before.lock_wait_timeouts,
+        3
+    );
+    assert_eq!(
+        counts_warned.holder_warnings - counts_before.holder_warnings,
+        1,
+        "the third timeout warns and names the holder"
+    );
+    assert_eq!(
+        hot_row_lock_sessions(admin).await,
+        (1, 0),
+        "the timed-out waiter left no wait behind; only the test session holds the lock"
+    );
+    holder
+        .query_one("SELECT pg_advisory_unlock($1)", &[&key])
+        .await
+        .expect("the test session releases the lock");
+    wait_hot_row_lock_free(admin, "after a lock timeout", 10).await;
+    assert_next_taker_gets_the_lock_at_once(base_url).await;
+
+    // --- The holder STOPS without closing its socket. ---
+    // The reserve is driven until it holds the lock with its statement waiting on the policy
+    // row, then never polled again. The policy row is freed, the statement finishes, and the
+    // backend sits idle in its transaction holding the lock, as a frozen process would leave it.
+    hold_policy_row(&holder, &cell).await;
+    let frozen = cell.client.reserve(&descriptors[4]);
+    tokio::pin!(frozen);
+    assert!(
+        drive_until(frozen.as_mut(), admin, (1, 0), true).await,
+        "the reserve must be seen holding the lock"
+    );
+    let stopped = std::time::Instant::now();
+    holder
+        .batch_execute("ROLLBACK")
+        .await
+        .expect("release the policy row");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        hot_row_lock_sessions(admin).await,
+        (1, 0),
+        "the stopped holder still has the lock; only the server's idle bound can end it"
+    );
+    // The idle bound is one operation timeout: statement_timeout + lock_timeout = 12 s here.
+    wait_hot_row_lock_free(admin, "after the holder stopped", 25).await;
+    let freed = stopped.elapsed();
+    eprintln!("a stopped holder's lock was freed by the server after {freed:?}");
+    assert!(freed >= Duration::from_secs(10), "{freed:?}");
+    assert_next_taker_gets_the_lock_at_once(base_url).await;
+    // Polled again, the stopped reserve learns its session is gone; nothing committed.
+    let late = tokio::time::timeout(Duration::from_secs(30), frozen.as_mut())
+        .await
+        .expect("the stopped reserve settles");
+    assert!(late.is_err(), "the ended session cannot commit: {late:?}");
+    assert_eq!(
+        cell.custody_rows_for_attempt(descriptors[4].attempt_id)
+            .await,
+        0
+    );
+
+    // The pool still serves on fresh connections, and a committed reserve leaves the lock free.
+    cell.client
+        .reserve(&descriptors[5])
+        .await
+        .expect("the next reserve commits");
+    wait_hot_row_lock_free(admin, "after a committed reserve", 10).await;
+    assert_next_taker_gets_the_lock_at_once(base_url).await;
+    let pooled_after_hot = pooled_runtime_sessions(admin, &cell).await;
+    assert!(
+        !pooled_after_hot.is_empty(),
+        "the committed reserve returned its session to the pool"
+    );
+
+    // --- drain-tput4: a session back in the pool keeps no idle bound. ---
+    // The unlock resets `idle_session_timeout` and `idle_in_transaction_session_timeout`. Left in
+    // the pool for longer than the idle bound (one operation timeout, 12 s here), the session must
+    // still be alive, and the next call must reuse it instead of opening a new one. Without the
+    // reset the server ends the idle pooled session after 12 s.
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    assert_eq!(
+        pooled_runtime_sessions(admin, &cell).await,
+        pooled_after_hot,
+        "an idle pooled session outlived the idle bound"
+    );
+    cell.client
+        .reserve(&descriptors[6])
+        .await
+        .expect("a reserve on the long-idle pooled session commits");
+    assert_eq!(
+        pooled_runtime_sessions(admin, &cell).await,
+        pooled_after_hot,
+        "the reserve reused a pooled session and opened none"
+    );
+    wait_hot_row_lock_free(admin, "after a reserve on a long-idle session", 10).await;
+    cell.assert_ledger("after every abandoned holder").await;
+}
+
+/// The backend pids of the drain client's pooled runtime sessions: every runtime-role session on
+/// the cell database except the fixture's own direct one.
+async fn pooled_runtime_sessions(admin: &tokio_postgres::Client, cell: &DrainCell) -> Vec<i32> {
+    let own: i32 = cell
+        .runtime
+        .0
+        .query_one("SELECT pg_backend_pid()", &[])
+        .await
+        .expect("the fixture's own runtime pid")
+        .get(0);
+    admin
+        .query(
+            "SELECT pid FROM pg_catalog.pg_stat_activity \
+              WHERE usename = 'object_dispatch_retention_runtime' \
+                AND datname = current_database() AND pid <> $1 ORDER BY pid",
+            &[&own],
+        )
+        .await
+        .expect("read pg_stat_activity")
+        .iter()
+        .map(|row| row.get(0))
+        .collect()
 }

@@ -313,31 +313,142 @@ fn staged_read_never_lets_an_unavailable_root_reach_the_missing_publication() {
 /// `begin_batch` call from `drain_pass` or restoring a per-item cursor write
 /// (which would move the cursor backward after the shuffle) would still pass
 /// them. These pins scope to the real function bodies.
+///
+/// drain-tput2: a pass may read more than one page (continuous refill), so the
+/// read, the wrap and the one `begin_batch` per page live in
+/// `next_candidate_page`, and `drain_pass` reaches pages only through it.
 #[test]
 fn drain_pass_takes_one_batch_and_writes_no_per_item_cursor() {
     let source = read_source("src/store/fragment_write_behind.rs");
     let drain_pass = function(&source, "pub async fn drain_pass(");
+    let page = function(&source, "async fn next_candidate_page(");
 
     // Negatives first: a per-item write is the forbidden shape.
+    for body in [drain_pass, page] {
+        assert!(
+            !body.contains("state.cursor = "),
+            "no per-item cursor write; the shuffled page would move it backward"
+        );
+        assert!(
+            !body.contains(".cursor = "),
+            "no direct cursor write; only begin_batch moves it"
+        );
+    }
     assert!(
-        !drain_pass.contains("state.cursor = "),
-        "drain_pass must not assign the cursor per item; the shuffled page would move it backward"
-    );
-    assert!(
-        !drain_pass.contains(".cursor = "),
-        "drain_pass must not assign the cursor directly; only begin_batch moves it"
+        !drain_pass.contains("begin_batch(")
+            && !drain_pass.contains("staged_drain_candidates_after("),
+        "drain_pass reads pages only through next_candidate_page"
     );
     assert_eq!(
-        drain_pass.matches("state.begin_batch(").count(),
+        page.matches("state.begin_batch(").count(),
         1,
-        "drain_pass must move the cursor and shuffle through begin_batch exactly once"
+        "each page moves the cursor and shuffles through begin_batch exactly once"
+    );
+    assert_order(
+        page,
+        &[
+            "staged_drain_candidates_after(",
+            "state.begin_batch(",
+            "Ok(candidates)",
+        ],
     );
     assert_order(
         drain_pass,
         &[
-            "staged_drain_candidates_after(",
-            "state.begin_batch(",
-            "for source in candidates {",
+            "self.next_candidate_page(bound).await?",
+            "next_startable(",
+            "&in_flight,",
+            "in_flight.insert(hash.clone())",
+            "lore_base::lore_spawn!(running,",
+            ".refill(started, !free.is_empty(), |room| self.refill_page(room))",
+            "running.join_next().await",
+            "in_flight.remove(hash)",
+        ],
+    );
+    // drain-tput2: the in-flight skip. Candidates reach a slot only through
+    // `next_startable` (whose own skip `a_pass_skips_a_hash_it_is_already_promoting`
+    // pins), and every started hash is recorded before its task spawns.
+    assert!(
+        !drain_pass.contains("page.pop_front()"),
+        "drain_pass must take candidates only through next_startable"
+    );
+    assert_eq!(
+        drain_pass.matches("in_flight.insert(").count(),
+        1,
+        "exactly one in-flight record, at the one spawn"
+    );
+    // drain-tput4: the one refill decision is `reads_another_page`, whose page
+    // bound `a_pass_over_only_cooling_hashes_stops_at_the_page_bound` pins; an
+    // inline condition here would bypass that test.
+    // drain-tput5: the refill page asks only for the room left in the pass
+    // (`refill_room`). A refill that asks for `bound` moves the cursor past
+    // hashes the pass cannot start.
+    // drain-tput6: the whole refill decision (bound, room, exhausted) lives in
+    // `PassPages::refill`, which the lib tests
+    // `a_refill_never_moves_the_cursor_past_a_hash_it_cannot_start` and
+    // `a_short_refill_page_ends_the_pass` run with an in-memory reader.
+    // `drain_pass` must reach it only through that method, so an inline copy
+    // here would bypass those tests.
+    let refill = function(&source, "async fn refill<");
+    let refill_page = function(&source, "async fn refill_page(");
+    assert_eq!(
+        drain_pass
+            .matches("self.next_candidate_page(bound)")
+            .count(),
+        1,
+        "only the first page asks for the whole batch"
+    );
+    assert_eq!(
+        drain_pass.matches("self.next_candidate_page(").count(),
+        1,
+        "drain_pass reads only its first page directly; refills go through refill_page"
+    );
+    assert_order(
+        drain_pass,
+        &[
+            "PassPages::first(self.next_candidate_page(bound).await?, batch)",
+            "&mut pages.page,",
+        ],
+    );
+    assert_eq!(drain_pass.matches(".refill(").count(), 1, "one refill site");
+    for (needle, why) in [
+        (
+            "reads_another_page(",
+            "the refill bound is decided only in PassPages::refill",
+        ),
+        (
+            "refill_room(",
+            "the refill size is decided only in PassPages::refill",
+        ),
+        ("exhausted", "exhaustion is tracked only in PassPages"),
+        (
+            "MAX_DRAIN_PAGES_PER_PASS",
+            "the page bound is applied only inside reads_another_page",
+        ),
+    ] {
+        assert!(!drain_pass.contains(needle), "{why}");
+    }
+    assert!(
+        !refill.contains("MAX_DRAIN_PAGES_PER_PASS"),
+        "the page bound is applied only inside reads_another_page"
+    );
+    assert_order(
+        refill,
+        &[
+            "if !reads_another_page(",
+            "self.pages += 1;",
+            "let room = refill_room(self.batch, started);",
+            "read(room).await",
+            "self.exhausted = !page_full(next.len(), room);",
+            "self.page = next.into();",
+            "self.exhausted = true;",
+        ],
+    );
+    assert_order(
+        refill_page,
+        &[
+            "FragmentDrainCandidateBatch::new(room)",
+            "self.next_candidate_page(refill).await",
         ],
     );
 }

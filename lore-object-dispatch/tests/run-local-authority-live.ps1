@@ -498,6 +498,8 @@ function Assert-IgnoredTestCatalogMatchesKnownTests {
         'live_r32_compact_v3_deletes_rows_and_markers_for_exactly_their_charge_and_a_deleted_descriptor_stays_refused',
         'live_r32_non_v7_ids_are_refused_and_the_v7_timestamp_function_decodes_exactly',
         'live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrades_unchanged_and_cleans_online',
+        'live_r32_racing_reserves_wait_in_turn_under_the_hot_row_lock',
+        'live_r32_the_hot_row_lock_never_returns_to_the_pool_held',
         # CR-034 budget pin refresh -- run-budget-pin-refresh-live.ps1
         'live_postgres_head_read_function_is_the_only_door_and_is_least_privilege',
         'live_postgres_pinned_writer_renews_across_a_publish_and_debits_only_the_new_fence',

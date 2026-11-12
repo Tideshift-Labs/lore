@@ -179,8 +179,9 @@ macro_rules! drain_failure_causes {
 drain_failure_causes! {
     /// The dispatch pool gave no connection. Reaches the caller as `Unavailable`.
     PoolAcquire => "unavailable_pool",
-    /// The leased session failed before the statement: client, `BEGIN`, or the timeout preamble.
-    /// Reaches the caller as `Unavailable`.
+    /// The leased session failed before the statement: client, `BEGIN`, the timeout preamble, or
+    /// a hot-row lock step that failed other than by contention. Reaches the caller as
+    /// `Unavailable`.
     Session => "unavailable_session",
     /// The whole bounded operation outlived the pool's operation timeout. `Unavailable`.
     OperationTimeout => "unavailable_timeout",
@@ -422,6 +423,377 @@ impl DrainDescriptor {
     }
 }
 
+/// drain-tput2: the session advisory lock that orders the transactions writing the cell's hot
+/// rows (the three quota counters and the drain policy row every reservation, release and
+/// compaction writes).
+///
+/// Under `SERIALIZABLE` two such transactions never wait for each other: the later writer of a
+/// row aborts (40001, "concurrent update"), and measured load lost about 14,000 of them in five
+/// minutes. This lock is taken in its own short transaction BEFORE the `SERIALIZABLE` one begins,
+/// so that transaction's snapshot already sees the previous holder's commit, and is released
+/// after it ends. It only orders the writers; every check stays in the database and a writer
+/// that skips the lock is still serialized there, as before. The wait is bounded by the pool's
+/// `lock_timeout`, and a session that fails is poisoned, which releases its lock.
+///
+/// The pool's `statement_timeout` must be greater than its `lock_timeout`. The lock wait is one
+/// statement, so with `statement_timeout <= lock_timeout` the statement timeout ends the wait
+/// first (57014, not 55P03): the call reads `Unavailable` instead of `Contended`, and the
+/// lock-wait timeout counter and the stuck-holder warning never fire. The deployed values are
+/// 5,000 ms and 1,000 ms.
+///
+/// Why not `pg_advisory_xact_lock` inside the `SERIALIZABLE` transaction: that call is itself a
+/// `SELECT`, and a serializable transaction's snapshot is taken when its first `SELECT` begins,
+/// before the call waits (`PostgreSQL` `LOCK` reference: "A REPEATABLE READ or SERIALIZABLE
+/// transaction's view of data will be frozen when its first SELECT or data modification statement
+/// begins"; `LOCK TABLE` escapes this only because it takes no snapshot). The snapshot would
+/// predate the previous holder's commit, so that commit would still abort this transaction.
+/// Measured: the live race `live_r32_racing_reserves_wait_in_turn_under_the_hot_row_lock` with an
+/// xact lock inside the transaction lost 6 of 120 racing reserves to contention (4 clients); with
+/// this session lock it lost none.
+///
+/// A session lock must never return to the pool held. Every path that does not reach a clean
+/// unlock closes the connection instead (`DispatchLease`'s drop closes, `poison` closes), and the
+/// backend gives the lock back when it ends: a dropped or cancelled future, a panic, the
+/// operation timeout, a failed statement or commit, and a failed unlock.
+///
+/// A closed socket is not enough when the holder stops without closing it (a frozen process, a
+/// lost network). So while the lock is held the session also carries `idle_session_timeout` and
+/// `idle_in_transaction_session_timeout` of one operation timeout, and the server ends a holder
+/// that goes idle for that long. With every statement bounded by `statement_timeout`, the server
+/// holds the lock at most about `statement_timeout` per statement plus one operation timeout of
+/// idle; the unlock resets both settings before the session goes back to the pool. Both settings
+/// need `PostgreSQL` 14 or later (`idle_session_timeout` is new in 14).
+///
+/// One operation timeout covers the lock wait and the transaction together; the lock wait is not
+/// added to the budget. So a slow commit can leave too little time for the unlock: the call then
+/// reads `Unavailable` although the transaction committed, and the session is closed (which frees
+/// the lock). That is safe: `Unavailable` already means "may have committed", and every hot-row
+/// procedure is idempotent on replay (a reserve replay is pinned to its descriptor digest; a
+/// release, compaction or floor advance that already ran changes nothing). Adding `lock_timeout`
+/// to the hot budget instead would lengthen the idle bound, and with it how long a stopped holder
+/// stalls the cell.
+///
+/// The key is per database: `PostgreSQL` advisory locks are scoped to the current database. Two
+/// cells that shared one database would serialize each other's hot-row writers. They do not
+/// today: every dev cell has its own `PostgreSQL` service and every staging cell its own database.
+///
+/// Operators: never take this key by hand (for example `SELECT pg_advisory_lock(...)` from
+/// `psql`). A session outside loreserver has no idle bound, so while it holds the key every
+/// reservation and cleanup release of the cell waits and times out; promotions stop and, under
+/// load, pushes fail with `SlowDown` while `/lb_health` stays 200. Lock-wait timeouts are counted
+/// on `lore.object_dispatch.drain_hot_row_lock_wait_timeouts`, and while they continue a
+/// rate-limited warning names the holder's pid from `pg_locks`.
+pub const DRAIN_HOT_ROW_LOCK_KEY: i64 = 0x6c6f_7265_6472_6e31;
+
+/// Why a hot-row session was closed instead of going back to the pool. A closed label set for
+/// `lore.object_dispatch.drain_hot_row_sessions_closed{reason}`. A dropped or cancelled call also
+/// closes its session; nothing is left to count it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HotRowSessionClose {
+    /// The lock wait passed `lock_timeout` (55P03). The call reads `Contended`.
+    LockTimeout,
+    /// The lock step failed otherwise.
+    LockFailed,
+    /// The transaction, statement or commit failed.
+    Failed,
+    /// The transaction ended but the unlock or the reset of the idle bounds failed.
+    UnlockFailed,
+    /// The whole call outlived the operation timeout.
+    OperationTimeout,
+}
+
+impl HotRowSessionClose {
+    pub const ALL: [Self; 5] = [
+        Self::LockTimeout,
+        Self::LockFailed,
+        Self::Failed,
+        Self::UnlockFailed,
+        Self::OperationTimeout,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LockTimeout => "lock_timeout",
+            Self::LockFailed => "lock_failed",
+            Self::Failed => "failed",
+            Self::UnlockFailed => "unlock_failed",
+            Self::OperationTimeout => "operation_timeout",
+        }
+    }
+}
+
+/// Shortest time between two stuck-holder warnings of one process. Also the window in which
+/// [`HOT_ROW_STALL_LOG_MIN_TIMEOUTS`] timeouts must fall to warn.
+pub const HOT_ROW_STALL_LOG_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Lock-wait timeouts needed inside one [`HOT_ROW_STALL_LOG_PERIOD`] before a warning: one timeout
+/// is a busy moment, more in a short time is a holder that does not let go.
+pub const HOT_ROW_STALL_LOG_MIN_TIMEOUTS: u64 = 3;
+
+/// Rate limit for the stuck-holder warning (see [`DRAIN_HOT_ROW_LOCK_KEY`]).
+#[derive(Debug)]
+pub struct HotRowStallLog {
+    last: Option<std::time::Instant>,
+    /// Timeouts since the last warning; the warning reports it.
+    since_warning: u64,
+    /// The times of the latest timeouts, at most [`HOT_ROW_STALL_LOG_MIN_TIMEOUTS`] of them.
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl HotRowStallLog {
+    pub const fn new() -> Self {
+        Self {
+            last: None,
+            since_warning: 0,
+            recent: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Count one lock-wait timeout at `now`. `Some(timeouts)` when a warning is due: the latest
+    /// [`HOT_ROW_STALL_LOG_MIN_TIMEOUTS`] timeouts all fell inside one
+    /// [`HOT_ROW_STALL_LOG_PERIOD`], and at least that period has passed since the last warning.
+    /// Older timeouts decay: three timeouts spread over hours do not warn. `timeouts` is the count
+    /// since the last warning.
+    pub fn on_timeout(&mut self, now: std::time::Instant) -> Option<u64> {
+        self.since_warning = self.since_warning.saturating_add(1);
+        self.recent.push_back(now);
+        while self.recent.len() as u64 > HOT_ROW_STALL_LOG_MIN_TIMEOUTS {
+            self.recent.pop_front();
+        }
+        let repeated = self.recent.len() as u64 >= HOT_ROW_STALL_LOG_MIN_TIMEOUTS
+            && self.recent.front().is_some_and(|first| {
+                now.saturating_duration_since(*first) <= HOT_ROW_STALL_LOG_PERIOD
+            });
+        let quiet_long_enough = self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= HOT_ROW_STALL_LOG_PERIOD);
+        if !repeated || !quiet_long_enough {
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.since_warning))
+    }
+}
+
+impl Default for HotRowStallLog {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Process-global on purpose (one warning stream per loreserver). A test that counts warnings
+/// therefore depends on every earlier timeout in its process; the live runners run each case in
+/// its own process for that reason.
+static HOT_ROW_STALL_LOG: std::sync::Mutex<HotRowStallLog> =
+    std::sync::Mutex::new(HotRowStallLog::new());
+
+/// The sessions that hold [`DRAIN_HOT_ROW_LOCK_KEY`] now. `pg_locks` is readable by every role.
+/// For another role's session, `pg_stat_activity` still shows `usename` and `application_name`,
+/// but `client_addr`, `state` and `state_change` read NULL unless the runtime role has
+/// `pg_read_all_stats`. `client_addr` is also NULL for a Unix-socket client.
+const HOT_ROW_HOLDER_SQL: &str = "SELECT l.pid, a.usename::text, a.application_name, \
+       host(a.client_addr), a.state, \
+       (EXTRACT(EPOCH FROM (clock_timestamp() - a.state_change)) * 1000)::bigint \
+  FROM pg_catalog.pg_locks l LEFT JOIN pg_catalog.pg_stat_activity a ON a.pid = l.pid \
+ WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 1 \
+   AND ((l.classid::bigint << 32) | l.objid::bigint) = $1";
+
+/// One session that holds [`DRAIN_HOT_ROW_LOCK_KEY`], as `pg_locks` and `pg_stat_activity` show
+/// it. Every field but `pid` can be `None` (see [`hot_row_lock_holders`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HotRowLockHolder {
+    pub pid: i32,
+    pub role: Option<String>,
+    pub application: Option<String>,
+    pub client_address: Option<String>,
+    pub state: Option<String>,
+    pub state_age_ms: Option<i64>,
+}
+
+/// The fields of one holder as the stuck-holder warning prints them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HotRowHolderLogFields {
+    pub role: String,
+    pub application: String,
+    pub client: String,
+    pub state: String,
+    pub state_age_ms: String,
+}
+
+impl HotRowLockHolder {
+    /// The holder as the warning prints it. A NULL reads as what it means: with no
+    /// `pg_stat_activity` row (the session just ended) every field is unknown; when the role
+    /// shows but the state does not, another role's session hid it
+    /// ([`HOT_ROW_HOLDER_HIDDEN`]); a NULL client of a visible session is a Unix socket.
+    pub fn log_fields(&self) -> HotRowHolderLogFields {
+        const ENDED: &str = "unknown (no pg_stat_activity row)";
+        let seen = self.role.is_some();
+        let hidden_or_ended = if seen { HOT_ROW_HOLDER_HIDDEN } else { ENDED };
+        HotRowHolderLogFields {
+            role: self.role.clone().unwrap_or_else(|| ENDED.to_owned()),
+            application: self.application.clone().unwrap_or_else(|| ENDED.to_owned()),
+            client: match (&self.client_address, &self.state) {
+                (Some(address), _) => address.clone(),
+                (None, Some(_)) => "local (Unix socket)".to_owned(),
+                (None, None) => hidden_or_ended.to_owned(),
+            },
+            state: self
+                .state
+                .clone()
+                .unwrap_or_else(|| hidden_or_ended.to_owned()),
+            state_age_ms: self
+                .state_age_ms
+                .map_or_else(|| hidden_or_ended.to_owned(), |age| age.to_string()),
+        }
+    }
+}
+
+/// The server-side bound on the holder read. The read runs in its own transaction, so a
+/// `ROLLBACK` before it has dropped the operation's `SET LOCAL` preamble; without its own bound the
+/// read would run with the role's default `statement_timeout` (often none).
+pub const HOT_ROW_HOLDER_READ_TIMEOUT_MS: u64 = 1_000;
+
+/// What the holder read prints for a `pg_stat_activity` field another role's session hides.
+pub const HOT_ROW_HOLDER_HIDDEN: &str = "hidden (needs pg_read_all_stats)";
+
+/// The sessions that hold [`DRAIN_HOT_ROW_LOCK_KEY`] now, read on `client`'s database. A stuck
+/// holder's pid is what an operator passes to `pg_terminate_backend`. The read runs in its own
+/// transaction with [`HOT_ROW_HOLDER_READ_TIMEOUT_MS`] as its statement and lock timeout, and
+/// rolls back. `client` must not be inside a transaction.
+pub async fn hot_row_lock_holders(
+    client: &mut tokio_postgres::Client,
+) -> Result<Vec<HotRowLockHolder>, tokio_postgres::Error> {
+    let tx = client.transaction().await?;
+    tx.batch_execute(&format!(
+        "SET LOCAL statement_timeout = '{HOT_ROW_HOLDER_READ_TIMEOUT_MS}ms'; \
+         SET LOCAL lock_timeout = '{HOT_ROW_HOLDER_READ_TIMEOUT_MS}ms';"
+    ))
+    .await?;
+    let rows = tx
+        .query(HOT_ROW_HOLDER_SQL, &[&DRAIN_HOT_ROW_LOCK_KEY])
+        .await?;
+    tx.rollback().await?;
+    rows.iter()
+        .map(|row| {
+            Ok(HotRowLockHolder {
+                pid: row.try_get(0)?,
+                role: row.try_get(1)?,
+                application: row.try_get(2)?,
+                client_address: row.try_get(3)?,
+                state: row.try_get(4)?,
+                state_age_ms: row.try_get(5)?,
+            })
+        })
+        .collect()
+}
+
+/// Warn, naming the holder, that this process's waits for [`DRAIN_HOT_ROW_LOCK_KEY`] keep timing
+/// out. Runs on the session whose wait just timed out; the caller closes that session after.
+async fn log_hot_row_holder(
+    client: &mut tokio_postgres::Client,
+    procedure: &'static str,
+    timeouts: u64,
+) {
+    // The failed lock step left its transaction aborted. The ROLLBACK also drops that
+    // transaction's SET LOCAL bounds, so the holder read sets its own.
+    let holders = match client.batch_execute("ROLLBACK").await {
+        Ok(()) => hot_row_lock_holders(client)
+            .await
+            .map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match holders {
+        Ok(holders) if holders.is_empty() => tracing::warn!(
+            procedure,
+            timeouts,
+            "drain hot-row lock waits keep timing out; no session holds the lock now"
+        ),
+        Ok(holders) => {
+            crate::metrics::record_drain_hot_row_holder_named();
+            for holder in holders {
+                let fields = holder.log_fields();
+                tracing::warn!(
+                    procedure,
+                    timeouts,
+                    holder_pid = holder.pid,
+                    holder_role = %fields.role,
+                    holder_application = %fields.application,
+                    holder_client = %fields.client,
+                    holder_state = %fields.state,
+                    holder_state_age_ms = %fields.state_age_ms,
+                    "drain hot-row lock waits keep timing out; this session holds the lock \
+                     (end it with pg_terminate_backend if it is not a loreserver)"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            procedure,
+            timeouts,
+            %error,
+            "drain hot-row lock waits keep timing out; the holder could not be read"
+        ),
+    }
+}
+
+/// Take [`DRAIN_HOT_ROW_LOCK_KEY`] for this session, waiting at most the preamble's lock timeout,
+/// and arm the idle bounds that end a holder which stops (see the key's documentation).
+async fn lock_hot_rows(
+    client: &mut tokio_postgres::Client,
+    preamble: &str,
+    idle_bound: std::time::Duration,
+) -> Result<(), tokio_postgres::Error> {
+    let idle = idle_bound.as_millis().max(1);
+    client
+        .batch_execute(&format!(
+            "BEGIN; {preamble} SELECT pg_advisory_lock({DRAIN_HOT_ROW_LOCK_KEY}); \
+             SET idle_session_timeout = '{idle}ms'; \
+             SET idle_in_transaction_session_timeout = '{idle}ms'; COMMIT;"
+        ))
+        .await
+}
+
+/// How a failed [`lock_hot_rows`] reads. Nothing reached the authority yet, so a lost race is
+/// `Contended` and anything else is the session's failure (`Unavailable`), never an authority
+/// refusal.
+fn lock_step_failure(
+    code: Option<&SqlState>,
+) -> (DrainFailureCause, DrainError, HotRowSessionClose) {
+    match code {
+        Some(code) if *code == SqlState::LOCK_NOT_AVAILABLE => (
+            DrainFailureCause::Contended,
+            DrainError::Contended,
+            HotRowSessionClose::LockTimeout,
+        ),
+        Some(code) if is_contention(code) => (
+            DrainFailureCause::Contended,
+            DrainError::Contended,
+            HotRowSessionClose::LockFailed,
+        ),
+        _ => (
+            DrainFailureCause::Session,
+            DrainError::Unavailable,
+            HotRowSessionClose::LockFailed,
+        ),
+    }
+}
+
+/// Release [`DRAIN_HOT_ROW_LOCK_KEY`] and reset the idle bounds. False when any of it failed or
+/// the lock was not held; the caller then closes the session.
+async fn unlock_hot_rows(client: &mut tokio_postgres::Client) -> bool {
+    let Ok(messages) = client
+        .simple_query(&format!(
+            "SELECT pg_advisory_unlock({DRAIN_HOT_ROW_LOCK_KEY}); \
+             RESET idle_session_timeout; RESET idle_in_transaction_session_timeout;"
+        ))
+        .await
+    else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        matches!(message, tokio_postgres::SimpleQueryMessage::Row(row) if row.get(0) == Some("t"))
+    })
+}
+
 /// Owns only a reference to the existing dispatch pool.
 #[derive(Clone)]
 pub struct DrainClient {
@@ -514,6 +886,27 @@ impl DrainClient {
         sql: &str,
         values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
     ) -> Result<Vec<Row>, DrainError> {
+        self.query_with(isolation, false, sql, values).await
+    }
+
+    /// [`DrainClient::query`] under the cell's hot-row lock ([`DRAIN_HOT_ROW_LOCK_KEY`]): for a
+    /// procedure that writes the quota or policy counters every reservation writes.
+    pub(crate) async fn query_hot(
+        &self,
+        sql: &str,
+        values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<Row>, DrainError> {
+        self.query_with(IsolationLevel::Serializable, true, sql, values)
+            .await
+    }
+
+    async fn query_with(
+        &self,
+        isolation: IsolationLevel,
+        hot: bool,
+        sql: &str,
+        values: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+    ) -> Result<Vec<Row>, DrainError> {
         let failed = |cause: DrainFailureCause, error: DrainError| {
             crate::metrics::record_drain_authority_failure(
                 drain_procedure_label(sql),
@@ -525,9 +918,36 @@ impl DrainClient {
             self.pool.acquire().await.map_err(|_error| {
                 failed(DrainFailureCause::PoolAcquire, DrainError::Unavailable)
             })?;
+        // Why a hot-row session is closed, when the call fails (see `HotRowSessionClose`).
+        let mut close = HotRowSessionClose::Failed;
+        // One operation timeout covers the lock wait and the transaction; see the note on
+        // `DRAIN_HOT_ROW_LOCK_KEY` about a commit that reads `Unavailable`.
         let operation = tokio::time::timeout(self.pool.operation_timeout(), async {
             let session = || failed(DrainFailureCause::Session, DrainError::Unavailable);
             let client = lease.client().map_err(|_error| session())?;
+            if hot
+                && let Err(e) = lock_hot_rows(
+                    client,
+                    &self.pool.bounded_execution_preamble(),
+                    self.pool.operation_timeout(),
+                )
+                .await
+            {
+                let (cause, error, reason) = lock_step_failure(e.code());
+                close = reason;
+                if reason == HotRowSessionClose::LockTimeout {
+                    let procedure = drain_procedure_label(sql);
+                    crate::metrics::record_drain_hot_row_lock_wait_timeout(procedure);
+                    let due = HOT_ROW_STALL_LOG
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .on_timeout(std::time::Instant::now());
+                    if let Some(timeouts) = due {
+                        log_hot_row_holder(client, procedure, timeouts).await;
+                    }
+                }
+                return Err(failed(cause, error));
+            }
             let tx = client
                 .build_transaction()
                 .isolation_level(isolation)
@@ -547,19 +967,36 @@ impl DrainClient {
             tx.commit()
                 .await
                 .map_err(|e| failed(commit_failure_cause(e.code()), commit_error(e.code())))?;
-            Ok(rows)
+            // The commit stands either way; a lock that did not unlock goes with its session.
+            let unlocked = !hot || unlock_hot_rows(client).await;
+            Ok((rows, unlocked))
         })
         .await;
         match operation {
-            Ok(Ok(rows)) => {
+            Ok(Ok((rows, true))) => {
                 lease.release().await;
                 Ok(rows)
             }
+            Ok(Ok((rows, false))) => {
+                crate::metrics::record_drain_hot_row_session_closed(
+                    HotRowSessionClose::UnlockFailed,
+                );
+                lease.poison();
+                Ok(rows)
+            }
             Ok(Err(error)) => {
+                if hot {
+                    crate::metrics::record_drain_hot_row_session_closed(close);
+                }
                 lease.poison();
                 Err(error)
             }
             Err(_) => {
+                if hot {
+                    crate::metrics::record_drain_hot_row_session_closed(
+                        HotRowSessionClose::OperationTimeout,
+                    );
+                }
                 lease.poison();
                 Err(failed(
                     DrainFailureCause::OperationTimeout,
@@ -778,10 +1215,12 @@ impl DrainClient {
         ))
     }
 
+    /// One descriptor, one `SERIALIZABLE` transaction, under the hot-row lock
+    /// ([`DRAIN_HOT_ROW_LOCK_KEY`]).
     pub async fn reserve(&self, descriptor: &DrainDescriptor) -> Result<(), DrainError> {
         let json = serde_json::to_string(descriptor).map_err(|_error| DrainError::Invalid)?;
         let canonical = descriptor.canonical_bytes()?;
-        self.query(
+        self.query_hot(
             "SELECT object_store_retention.drain_reserve_v1($1::text::jsonb,$2,$3)",
             &[&json, &canonical, &&blake3::hash(&canonical).as_bytes()[..]],
         )
@@ -859,6 +1298,134 @@ mod tests {
         }
         assert_eq!(statement_error(None), DrainError::Unavailable);
         assert_eq!(commit_error(None), DrainError::Unavailable);
+    }
+
+    /// drain-tput4: a failed hot-row lock step never reached the authority. A lock timeout and a
+    /// lost race read `Contended`; anything else, a statement timeout or a SQLSTATE-less I/O
+    /// failure included, reads `Unavailable`, never `Refused`.
+    #[test]
+    fn a_failed_hot_row_lock_step_is_contention_or_unavailable_never_a_refusal() {
+        use DrainFailureCause as C;
+        use HotRowSessionClose as R;
+        assert_eq!(
+            lock_step_failure(Some(&SqlState::LOCK_NOT_AVAILABLE)),
+            (C::Contended, DrainError::Contended, R::LockTimeout)
+        );
+        for code in [
+            SqlState::T_R_SERIALIZATION_FAILURE,
+            SqlState::T_R_DEADLOCK_DETECTED,
+        ] {
+            assert_eq!(
+                lock_step_failure(Some(&code)),
+                (C::Contended, DrainError::Contended, R::LockFailed)
+            );
+        }
+        for code in [
+            Some(SqlState::QUERY_CANCELED),
+            Some(SqlState::RAISE_EXCEPTION),
+            Some(SqlState::ADMIN_SHUTDOWN),
+            None,
+        ] {
+            assert_eq!(
+                lock_step_failure(code.as_ref()),
+                (C::Session, DrainError::Unavailable, R::LockFailed),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// drain-tput4: the stuck-holder warning needs repeated timeouts and is rate-limited.
+    #[test]
+    fn the_stuck_holder_warning_needs_repeated_timeouts_and_waits_a_period() {
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + std::time::Duration::from_secs(seconds);
+        let mut log = HotRowStallLog::new();
+        // One or two timeouts are a busy moment.
+        assert_eq!(log.on_timeout(at(0)), None);
+        assert_eq!(log.on_timeout(at(1)), None);
+        // The third is a holder that does not let go.
+        assert_eq!(log.on_timeout(at(2)), Some(3));
+        // Within the period, no second warning however many timeouts follow.
+        for second in 3..32 {
+            assert_eq!(log.on_timeout(at(second)), None, "second {second}");
+        }
+        // A period after the last warning, the next timeout warns with the count since then.
+        assert_eq!(log.on_timeout(at(32)), Some(30));
+        // A period has passed, but one timeout alone does not warn.
+        assert_eq!(log.on_timeout(at(100)), None);
+        assert_eq!(log.on_timeout(at(101)), None);
+        assert_eq!(log.on_timeout(at(102)), Some(3));
+        // drain-tput5: timeouts decay. Three spread wider than one period do not warn, however
+        // long ago the last warning was.
+        assert_eq!(log.on_timeout(at(200)), None);
+        assert_eq!(log.on_timeout(at(240)), None);
+        assert_eq!(log.on_timeout(at(280)), None);
+        assert_eq!(log.on_timeout(at(400)), None);
+        // Three inside one period do, and the warning counts every timeout since the last one.
+        assert_eq!(log.on_timeout(at(401)), None);
+        assert_eq!(log.on_timeout(at(430)), Some(6));
+        assert_eq!(
+            HotRowSessionClose::ALL.map(HotRowSessionClose::label),
+            [
+                "lock_timeout",
+                "lock_failed",
+                "failed",
+                "unlock_failed",
+                "operation_timeout"
+            ]
+        );
+        // The local counts index by discriminant, so `ALL` must list the variants in order.
+        for (index, reason) in HotRowSessionClose::ALL.into_iter().enumerate() {
+            assert_eq!(reason as usize, index);
+        }
+    }
+
+    /// drain-tput5: a NULL `pg_stat_activity` field reads as what it means, never as a bare
+    /// `None`. Another role's session shows its role and application but hides the rest.
+    #[test]
+    fn the_holder_warning_names_hidden_fields_as_hidden() {
+        let holder = |role: Option<&str>, client: Option<&str>, state: Option<&str>| {
+            HotRowLockHolder {
+                pid: 7,
+                role: role.map(str::to_owned),
+                application: role.map(|_| "psql".to_owned()),
+                client_address: client.map(str::to_owned),
+                state: state.map(str::to_owned),
+                state_age_ms: state.map(|_| 1_500),
+            }
+            .log_fields()
+        };
+        // Another role's session, read without pg_read_all_stats.
+        let hidden = holder(Some("other"), None, None);
+        assert_eq!(hidden.role, "other");
+        assert_eq!(hidden.application, "psql");
+        for field in [&hidden.client, &hidden.state, &hidden.state_age_ms] {
+            assert_eq!(field, HOT_ROW_HOLDER_HIDDEN);
+        }
+        // A visible session.
+        let visible = holder(Some("rt"), Some("10.0.0.5"), Some("idle in transaction"));
+        assert_eq!(visible.client, "10.0.0.5");
+        assert_eq!(visible.state, "idle in transaction");
+        assert_eq!(visible.state_age_ms, "1500");
+        // A visible session over a Unix socket has no client address.
+        assert_eq!(
+            holder(Some("rt"), None, Some("active")).client,
+            "local (Unix socket)"
+        );
+        // No pg_stat_activity row: the session just ended; nothing is hidden.
+        let ended = holder(None, None, None);
+        for field in [
+            &ended.role,
+            &ended.application,
+            &ended.client,
+            &ended.state,
+            &ended.state_age_ms,
+        ] {
+            assert_eq!(field, "unknown (no pg_stat_activity row)");
+        }
+        // The address prints without its /32 netmask.
+        assert!(HOT_ROW_HOLDER_SQL.contains("host(a.client_addr)"));
+        assert!(!HOT_ROW_HOLDER_SQL.contains("client_addr::text"));
     }
 
     const PUT_CAPACITY: &str = "DISPATCH_RESERVE_PUT_CAPACITY_EXHAUSTED";

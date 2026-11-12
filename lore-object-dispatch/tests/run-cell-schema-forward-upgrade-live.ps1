@@ -142,7 +142,9 @@ $tests = @(
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_FLOOR_BOUNDS_PG_URL'; Name = 'live_r32_retired_floor_never_lowers_is_capped_at_fifteen_minutes_and_stops_at_the_oldest_row'; Database = 'r32_floor_bounds' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_DELETE_PG_URL'; Name = 'live_r32_compact_v3_deletes_rows_and_markers_for_exactly_their_charge_and_a_deleted_descriptor_stays_refused'; Database = 'r32_delete' },
     @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UUIDV7_PG_URL'; Name = 'live_r32_non_v7_ids_are_refused_and_the_v7_timestamp_function_decodes_exactly'; Database = 'r32_uuidv7' },
-    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UP_PG_URL'; Name = 'live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrades_unchanged_and_cleans_online'; Database = 'r32_up' }
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_UP_PG_URL'; Name = 'live_r31_cell_with_live_released_and_marker_rows_is_refused_then_upgrades_unchanged_and_cleans_online'; Database = 'r32_up' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_RESERVE_RACE_PG_URL'; Name = 'live_r32_racing_reserves_wait_in_turn_under_the_hot_row_lock'; Database = 'r32_reserve_race' },
+    @{ EnvVar = 'LORE_TEST_CELL_SCHEMA_UPGRADE_R32_LOCK_DROP_PG_URL'; Name = 'live_r32_the_hot_row_lock_never_returns_to_the_pool_held'; Database = 'r32_lock_drop' }
 )
 
 $environmentNames = @($tests | ForEach-Object { $_.EnvVar })

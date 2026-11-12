@@ -167,3 +167,111 @@ fn descriptor_rejects_bad_uuid_digest_size_and_deadline() {
         assert!(invalid.canonical_bytes().is_err());
     }
 }
+
+/// drain-tput2: every drain procedure that writes the cell's hot rows (the quota counters and the
+/// drain policy row) takes the hot-row lock first, so racing writers wait instead of aborting.
+/// Held by text: dropping the lock from one caller keeps every functional case green and only
+/// brings back the serialization failures under load. The live race test
+/// (`live_r32_racing_reserves_wait_in_turn_under_the_hot_row_lock`) proves the lock's effect.
+#[test]
+fn every_hot_row_writer_takes_the_hot_row_lock() {
+    let spool = include_str!("../src/drain_spool.rs");
+    let policy = include_str!("../src/drain_policy.rs");
+    let policy = policy.split("#[cfg(test)]").next().unwrap_or(policy);
+    for (source, procedure) in [
+        (spool, "drain_cleanup_release_v1"),
+        (spool, "drain_cleanup_compact_v3"),
+        (spool, "drain_retired_floor_advance_v1"),
+        (policy, "drain_reserve_v1"),
+    ] {
+        let needle = format!("SELECT object_store_retention.{procedure}(");
+        assert_eq!(
+            source.matches(&needle).count(),
+            1,
+            "{procedure} has exactly one call"
+        );
+        let call = source.find(&needle).expect("the call");
+        let receiver = &source[call.saturating_sub(80)..call];
+        assert!(
+            receiver.contains(".query_hot("),
+            "{procedure} must run under the hot-row lock (query_hot)"
+        );
+    }
+    // The one hot path: lock, then the SERIALIZABLE transaction, then unlock; and a commit whose
+    // unlock failed closes its session instead of returning it to the pool.
+    let with = &policy[policy.find("async fn query_with(").expect("query_with")..];
+    let with = &with[..with.find("\n    }\n").expect("end of query_with")];
+    let lock = with.find("lock_hot_rows(").expect("the lock");
+    let begin = with.find(".build_transaction()").expect("the transaction");
+    let commit = with.find("tx.commit()").expect("the commit");
+    let unlock = with.find("unlock_hot_rows(client)").expect("the unlock");
+    assert!(
+        lock < begin && begin < commit && commit < unlock,
+        "lock, then the SERIALIZABLE transaction, then unlock"
+    );
+    assert_eq!(with.matches("lease.release().await").count(), 1);
+    let release = with.find("Ok(Ok((rows, true))) =>").expect("the clean arm");
+    assert!(
+        with[release..]
+            .find("lease.release().await")
+            .is_some_and(|at| at < with[release..].find("Ok(Ok((rows, false)))").unwrap_or(0)),
+        "only the clean unlock returns the session to the pool"
+    );
+    // The lock arms the idle bounds and the unlock resets them.
+    let lock_fn = &policy[policy
+        .find("async fn lock_hot_rows(")
+        .expect("lock_hot_rows")..];
+    let lock_fn = &lock_fn[..lock_fn.find("\n}\n").expect("end")];
+    for setting in [
+        "SET idle_session_timeout",
+        "SET idle_in_transaction_session_timeout",
+    ] {
+        assert!(lock_fn.contains(setting), "the lock arms {setting}");
+    }
+    let unlock_fn = &policy[policy
+        .find("async fn unlock_hot_rows(")
+        .expect("unlock_hot_rows")..];
+    let unlock_fn = &unlock_fn[..unlock_fn.find("\n}\n").expect("end")];
+    for setting in [
+        "RESET idle_session_timeout",
+        "RESET idle_in_transaction_session_timeout",
+    ] {
+        assert!(unlock_fn.contains(setting), "the unlock runs {setting}");
+    }
+}
+
+/// drain-tput5: the stuck-holder read runs after a `ROLLBACK` that dropped the operation's
+/// `SET LOCAL` bounds, so it must open its own transaction, bound it on the server, and roll it
+/// back. Held by text: the live case (`live_r32_the_hot_row_lock_never_returns_to_the_pool_held`)
+/// runs the read but cannot see which `statement_timeout` it ran under.
+#[test]
+fn the_stuck_holder_read_carries_its_own_server_side_timeout() {
+    let policy = include_str!("../src/drain_policy.rs");
+    let policy = policy.split("#[cfg(test)]").next().unwrap_or(policy);
+    let read = &policy[policy
+        .find("pub async fn hot_row_lock_holders(")
+        .expect("hot_row_lock_holders")..];
+    let read = &read[..read.find("\n}\n").expect("end")];
+    let order = [
+        "client.transaction().await?",
+        "SET LOCAL statement_timeout = '{HOT_ROW_HOLDER_READ_TIMEOUT_MS}ms'",
+        "SET LOCAL lock_timeout = '{HOT_ROW_HOLDER_READ_TIMEOUT_MS}ms'",
+        ".query(HOT_ROW_HOLDER_SQL,",
+        "tx.rollback().await?",
+    ];
+    let mut at = 0;
+    for needle in order {
+        let found = read[at..]
+            .find(needle)
+            .unwrap_or_else(|| panic!("hot_row_lock_holders must run `{needle}` in order"));
+        at += found + needle.len();
+    }
+    assert!(
+        !read.contains("client\n        .query(") && !read.contains("client.query("),
+        "the holder read must not run outside its bounded transaction"
+    );
+    assert_eq!(
+        lore_object_dispatch::drain_policy::HOT_ROW_HOLDER_READ_TIMEOUT_MS,
+        1_000
+    );
+}
