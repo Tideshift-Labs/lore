@@ -296,6 +296,49 @@ mod drain_walk_tests {
         assert_eq!(refill_room(BATCH, BATCH), 0);
     }
 
+    /// drain-tput7: a short FIRST page also reached the end of the staged
+    /// keyset. Three hashes, batch four: the pass starts all three and must
+    /// stop after the one read. Reading on would wrap to the start of the
+    /// keyset, spend the page bound, and move the cursor back.
+    #[tokio::test]
+    async fn a_short_first_page_ends_the_pass() {
+        const BATCH: u32 = 4;
+        let keyspace: BTreeSet<Vec<u8>> = (1u8..=3).map(hash).collect();
+        let ordered: Vec<Vec<u8>> = keyspace.iter().cloned().collect();
+        for seed in 0..8 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut state = DrainState::with_cursor_seed([0; 32]);
+            let (mut started, reads) =
+                run_pass(&mut state, &keyspace, BATCH, &BTreeSet::new(), &mut rng).await;
+            started.sort();
+            assert_eq!(started, ordered, "seed {seed}");
+            assert_eq!(reads, 1, "seed {seed}: a short first page ends the pass");
+            assert_eq!(
+                state.cursor, ordered[2],
+                "seed {seed}: the pass never wrapped past the end of the keyset"
+            );
+        }
+
+        // The same decision in isolation.
+        let short = PassPages::first(vec![hash(1), hash(2)], 4);
+        assert!(short.exhausted, "a short first page exhausts the pass");
+        let mut short = short;
+        short.page.clear();
+        assert!(
+            !short
+                .refill(
+                    0,
+                    true,
+                    |_| -> std::future::Ready<Result<Vec<Vec<u8>>, StoreError>> {
+                        panic!("an exhausted pass must not read")
+                    }
+                )
+                .await
+        );
+        let empty = PassPages::<Vec<u8>>::first(Vec::new(), 4);
+        assert!(empty.exhausted, "an empty first page exhausts the pass");
+    }
+
     /// drain-tput6: a short refill page reached the end of the staged keyset,
     /// so it ends the pass. Five hashes, the first two cooling: the first page
     /// (four hashes) starts two, the refill asks for two and gets only the
