@@ -33,12 +33,14 @@ pub(super) fn observe_sync(path: &Path, completed: bool) -> Result<(), WriteBehi
 struct Hook;
 
 /// One injected errno: `times` more calls of `site` on `path` fail with
-/// ESTALE instead of running the syscall. `hits` counts every call of that
-/// site on that path, injected or not.
+/// `errno` (ESTALE unless a case says otherwise) instead of running the
+/// syscall. `hits` counts every call of that site on that path, injected or
+/// not.
 struct Injection {
     site: &'static str,
     path: PathBuf,
     times: usize,
+    errno: rustix::io::Errno,
     hits: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -60,7 +62,7 @@ pub(super) fn injected_errno(site: &'static str, path: &Path) -> Option<rustix::
         return None;
     }
     injection.times -= 1;
-    Some(rustix::io::Errno::STALE)
+    Some(injection.errno)
 }
 
 /// Removes its injection when dropped, so a failed assertion leaves none.
@@ -72,12 +74,22 @@ struct Estale {
 
 impl Estale {
     fn inject(site: &'static str, path: impl Into<PathBuf>, times: usize) -> Self {
+        Self::inject_errno(site, path, times, rustix::io::Errno::STALE)
+    }
+
+    fn inject_errno(
+        site: &'static str,
+        path: impl Into<PathBuf>,
+        times: usize,
+        errno: rustix::io::Errno,
+    ) -> Self {
         let path = path.into();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         INJECTIONS.lock().unwrap().push(Injection {
             site,
             path: path.clone(),
             times,
+            errno,
             hits: hits.clone(),
         });
         Self { site, path, hits }
@@ -1149,4 +1161,237 @@ async fn a_staged_read_estale_is_unavailable_never_absent() {
         );
         drop(estale);
     }
+}
+
+// --- NFS: ESTALE in the stage inventory walk (cleanup.rs, cleanup-estale) ---
+//
+// The walk holds directory descriptors across bounded steps. On NFS a fan-out
+// directory a concurrent purge removed gives ESTALE on them, where a local
+// disk gives ENOENT. Before this change one such ESTALE failed the whole
+// observe() tick. These cases inject it at each act of the walk.
+
+fn inventory_stage(scratch: &Scratch) -> Arc<crate::store::write_behind::WriteBehindStage> {
+    use crate::store::write_behind::WriteBehindSettings;
+    use crate::store::write_behind::WriteBehindStage;
+    use crate::store::write_behind::WriteBehindWatermarks;
+    WriteBehindStage::open(WriteBehindSettings {
+        root: scratch.0.clone(),
+        watermarks: WriteBehindWatermarks {
+            low_bytes: 1 << 30,
+            high_bytes: 1 << 31,
+            hard_bytes: 1 << 32,
+            low_count: 1 << 20,
+            high_count: 1 << 21,
+            hard_count: 1 << 22,
+            min_free_bytes: 0,
+        },
+        drain_stale_after: Duration::from_secs(60),
+        sample_interval: Duration::from_secs(3600),
+        stage_io_wait: crate::store::write_behind::DEFAULT_STAGE_IO_WAIT,
+        stage_read_wait: crate::store::write_behind::DEFAULT_STAGE_READ_WAIT,
+        drain_reserve: Default::default(),
+    })
+    .unwrap()
+}
+
+/// One full walk: every step's result, and the candidate hashes found.
+fn inventory_walk(
+    scanner: &mut crate::store::write_behind::cleanup::StageFileScanner,
+    stage: &crate::store::write_behind::WriteBehindStage,
+) -> Result<Vec<[u8; 32]>, WriteBehindError> {
+    let mut found = Vec::new();
+    for _ in 0..64 {
+        found.extend(scanner.scan(stage, 2)?.into_iter().map(|c| c.hash));
+        if !scanner.walk_in_progress() {
+            return Ok(found);
+        }
+    }
+    panic!("the walk did not complete in 64 steps");
+}
+
+/// A stage with one file under `staged/ab/ab` (the one the cases make stale)
+/// and one under `staged/cd/cd` that every walk must still find.
+async fn inventory_fixture() -> (Scratch, Arc<crate::store::write_behind::WriteBehindStage>) {
+    let scratch = Scratch::new();
+    let stage = inventory_stage(&scratch);
+    for byte in [0xab, 0xcd] {
+        let resolved = staged_file(stage.root(), &[byte; 32], 1);
+        super::super::finalize::finalize(stage.root(), &resolved, &bytes::Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    (scratch, stage)
+}
+
+#[tokio::test]
+async fn inventory_skips_a_stale_fanout_directory_at_each_site_and_finishes_the_walk() {
+    for (site, directory) in [
+        ("stage inventory entry", "staged/ab"),
+        ("stage inventory entry", "staged/ab/ab"),
+        ("stage inventory stat", "staged/ab"),
+        ("stage inventory stat", "staged/ab/ab"),
+        ("stage inventory descend", "staged/ab"),
+        ("stage inventory child stat", "staged/ab"),
+        ("stage inventory child stat", "staged/ab/ab"),
+        ("stage inventory child read", "staged/ab"),
+        ("stage inventory child read", "staged/ab/ab"),
+    ] {
+        let (_scratch, stage) = inventory_fixture().await;
+        let canonical = stage.root().inventory_root().to_path_buf();
+        let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+        let estale = Estale::inject(site, canonical.join(directory), 1);
+        let found = inventory_walk(&mut scanner, &stage)
+            .unwrap_or_else(|error| panic!("{site} on {directory}: {error}"));
+        assert!(estale.hits() >= 1, "{site} on {directory}: injected");
+        assert_eq!(scanner.stale_fanout_skips(), 1, "{site} on {directory}");
+        assert_eq!(
+            found,
+            vec![[0xcd; 32]],
+            "{site} on {directory}: skipped like ENOENT"
+        );
+        let (_, _, skipped_files, skipped_unknown) = scanner
+            .physical_observation()
+            .unwrap_or_else(|| panic!("{site} on {directory}: walk completed"));
+
+        // The next walk sees the directory again: only that pass skipped it.
+        let mut found = inventory_walk(&mut scanner, &stage).unwrap();
+        found.sort_unstable();
+        assert_eq!(found, vec![[0xab; 32], [0xcd; 32]], "{site} on {directory}");
+        let (_, _, files, unknown) = scanner.physical_observation().unwrap();
+        assert_eq!(
+            (skipped_files + 1, skipped_unknown),
+            (files, unknown),
+            "{site} on {directory}: only the stale directory's file was missed"
+        );
+        assert_eq!(scanner.stale_fanout_skips(), 1);
+        assert!(
+            stage
+                .root()
+                .resolve(&[0xab; 32], 1, &derived_staged_key(&[0xab; 32], 1).unwrap())
+                .unwrap()
+                .path()
+                .is_file(),
+            "{site} on {directory}: the walk deletes nothing"
+        );
+    }
+}
+
+/// An ESTALE on the root, on `staged/` or on `incoming/` is not a removed
+/// fan-out (none of them is ever purged; on `staged/` it means it was
+/// recreated). It stays the step's error, and nothing is counted as skipped.
+#[tokio::test]
+async fn inventory_estale_on_the_root_staged_or_incoming_fails_the_step() {
+    for (site, directory) in [
+        ("stage inventory entry", ""),
+        ("stage inventory entry", "staged"),
+        ("stage inventory entry", "incoming"),
+        ("stage inventory stat", ""),
+        ("stage inventory stat", "staged"),
+        ("stage inventory descend", ""),
+        ("stage inventory descend", "staged"),
+        ("stage inventory child stat", "staged"),
+        ("stage inventory child stat", "incoming"),
+        ("stage inventory child read", "staged"),
+        ("stage inventory child read", "incoming"),
+        // Two levels deep, but not under `staged/`: no purge removes it.
+        ("stage inventory entry", "other/ab"),
+        ("stage inventory child stat", "other/ab"),
+        // Under the leaf, deeper than any fan-out level.
+        ("stage inventory entry", "staged/ab/ab/zz"),
+        ("stage inventory child read", "staged/ab/ab/zz"),
+    ] {
+        let (_scratch, stage) = inventory_fixture().await;
+        let canonical = stage.root().inventory_root().to_path_buf();
+        std::fs::create_dir_all(canonical.join("other/ab")).unwrap();
+        std::fs::create_dir(canonical.join("staged/ab/ab/zz")).unwrap();
+        let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+        let estale = Estale::inject(site, canonical.join(directory), usize::MAX);
+        // Reading a child's entries keeps its old error name.
+        let operation = match site {
+            "stage inventory child read" => "stage inventory descend",
+            site => site,
+        };
+        assert_eq!(
+            inventory_walk(&mut scanner, &stage),
+            Err(WriteBehindError::Io {
+                operation,
+                kind: STALE
+            }),
+            "{site} on {directory:?}"
+        );
+        assert!(estale.hits() >= 1, "{site} on {directory:?}: injected");
+        assert_eq!(scanner.stale_fanout_skips(), 0, "{site} on {directory:?}");
+        assert!(
+            !scanner.walk_in_progress(),
+            "{site} on {directory:?}: reset"
+        );
+        assert!(scanner.physical_observation().is_none());
+    }
+}
+
+/// Only ESTALE is the NFS form of a removed fan-out directory. Any other
+/// error on a fan-out level (here EIO) stays the step's error.
+#[tokio::test]
+async fn inventory_other_errors_on_a_fanout_directory_fail_the_step() {
+    for (site, directory, operation) in [
+        (
+            "stage inventory entry",
+            "staged/ab",
+            "stage inventory entry",
+        ),
+        (
+            "stage inventory stat",
+            "staged/ab/ab",
+            "stage inventory stat",
+        ),
+        (
+            "stage inventory descend",
+            "staged/ab",
+            "stage inventory descend",
+        ),
+        (
+            "stage inventory child stat",
+            "staged/ab",
+            "stage inventory child stat",
+        ),
+        (
+            "stage inventory child read",
+            "staged/ab/ab",
+            "stage inventory descend",
+        ),
+    ] {
+        let (_scratch, stage) = inventory_fixture().await;
+        let canonical = stage.root().inventory_root().to_path_buf();
+        let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+        let _eio = Estale::inject_errno(
+            site,
+            canonical.join(directory),
+            usize::MAX,
+            rustix::io::Errno::IO,
+        );
+        assert_eq!(
+            inventory_walk(&mut scanner, &stage),
+            Err(WriteBehindError::Io {
+                operation,
+                kind: std::io::Error::from(rustix::io::Errno::IO).kind()
+            }),
+            "{site} on {directory}"
+        );
+        assert_eq!(scanner.stale_fanout_skips(), 0, "{site} on {directory}");
+    }
+}
+
+/// A `staged/` recreated under the pin still fails the walk, as before.
+#[tokio::test]
+async fn inventory_under_a_recreated_staged_directory_fails() {
+    let (scratch, stage) = inventory_fixture().await;
+    let canonical = scratch.0.canonicalize().unwrap();
+    std::fs::remove_dir_all(canonical.join("staged")).unwrap();
+    std::fs::create_dir(canonical.join("staged")).unwrap();
+    let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+    assert_eq!(
+        inventory_walk(&mut scanner, &stage),
+        Err(WriteBehindError::RootDeviceChanged)
+    );
+    assert_eq!(scanner.stale_fanout_skips(), 0);
 }

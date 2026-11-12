@@ -91,6 +91,11 @@ pub(crate) const STAGED_DIR: &str = "staged";
 /// under `staged/`, so both hold.
 #[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
 pub(crate) const INCOMING_DIR: &str = "incoming";
+/// How many fan-out levels above a purged staged file may be removed once
+/// empty: `staged/<aa>/<bb>` loses `<bb>` then `<aa>`, never `staged`. The
+/// stage inventory walk (`cleanup.rs`) tolerates an ESTALE on exactly these.
+#[cfg_attr(not(unix), expect(dead_code, reason = "staging is Unix-only"))]
+pub(crate) const REMOVABLE_FANOUT_LEVELS: usize = 2;
 /// FORK-LOCAL (Tideshift), WP-115 K11: subdirectory of the stage root where
 /// each `role = "stage"` replica writes its liveness probe file.
 ///
@@ -422,6 +427,7 @@ mod platform {
     use super::ConfinedRoot;
     use super::INCOMING_DIR;
     use super::LIVENESS_DIR;
+    use super::REMOVABLE_FANOUT_LEVELS;
     use super::ResolvedStagedPath;
     use super::RootInner;
     use super::STAGED_DIR;
@@ -1205,10 +1211,6 @@ mod platform {
         Ok(Path::new(name))
     }
 
-    /// How many fan-out levels above a purged staged file may be removed once
-    /// empty: `staged/<aa>/<bb>` loses `<bb>` then `<aa>`, never `staged`.
-    const REMOVABLE_FANOUT_LEVELS: usize = 2;
-
     /// Bounded walks of one purge when a fan-out level it holds goes stale.
     const PURGE_ATTEMPTS: usize = 3;
 
@@ -1547,6 +1549,28 @@ mod platform {
 #[cfg(all(test, unix))]
 #[path = "durability_tests.rs"]
 mod durability_tests;
+
+/// Test seam for the stage inventory walk (`cleanup.rs`): an errno the
+/// durability tests inject at one named act on `root.join(relative)`, in place
+/// of the real syscall.
+#[cfg(all(test, unix))]
+pub(crate) fn inventory_injected(
+    site: &'static str,
+    root: &Path,
+    relative: &Path,
+) -> rustix::io::Result<()> {
+    durability_tests::injected_errno(site, &root.join(relative)).map_or(Ok(()), Err)
+}
+
+#[cfg(all(not(test), unix))]
+#[inline]
+pub(crate) fn inventory_injected(
+    _site: &'static str,
+    _root: &Path,
+    _relative: &Path,
+) -> rustix::io::Result<()> {
+    Ok(())
+}
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "pinned_tree_tests.rs"]

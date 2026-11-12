@@ -83,6 +83,10 @@ pub struct StageFileScanner {
     cycle_files: u64,
     #[cfg(unix)]
     cycle_unknown: u64,
+    /// Fan-out acts skipped because the directory went stale (ESTALE), over
+    /// this scanner's life. Diagnostic only.
+    #[cfg(unix)]
+    stale_fanout_skips: u64,
     physical: Option<(std::time::Instant, u64, u64, u64)>,
 }
 
@@ -100,6 +104,15 @@ impl StageFileScanner {
         return !self.directories.is_empty();
         #[cfg(not(unix))]
         false
+    }
+
+    /// How many fan-out acts this scanner skipped because the directory went
+    /// stale (ESTALE, the NFS form of a removed directory). Diagnostic only.
+    pub fn stale_fanout_skips(&self) -> u64 {
+        #[cfg(unix)]
+        return self.stale_fanout_skips;
+        #[cfg(not(unix))]
+        0
     }
 
     /// Bounded traversal with retained cursors, so late residue and high hashes
@@ -159,21 +172,41 @@ impl StageFileScanner {
             self.directories
                 .push((root_directory.into(), entries, std::path::PathBuf::new()));
         }
+        let inventory_root = root.inventory_root();
         let mut found = Vec::new();
         for _ in 0..limit {
             let Some((directory, entries, relative)) = self.directories.last_mut() else {
                 break;
             };
-            let Some(entry) = entries.next() else {
+            let entry = match super::root::inventory_injected(
+                "stage inventory entry",
+                inventory_root,
+                relative,
+            ) {
+                Ok(()) => entries.next(),
+                Err(error) => Some(Err(error)),
+            };
+            let Some(entry) = entry else {
                 self.directories.pop();
                 continue;
             };
             let entry = match entry {
                 Ok(entry) => entry,
                 // Purge removes empty fan-out directories, and reading a removed
-                // directory is ENOENT. That ends this directory; the root's
-                // device is revalidated below.
+                // directory is ENOENT (ESTALE on NFS). That ends this directory;
+                // the root's device is revalidated below.
                 Err(Errno::NOENT) => {
+                    self.directories.pop();
+                    continue;
+                }
+                Err(error)
+                    if skip_stale_fanout(
+                        &mut self.stale_fanout_skips,
+                        "stage inventory entry",
+                        error,
+                        relative,
+                    ) =>
+                {
                     self.directories.pop();
                     continue;
                 }
@@ -185,9 +218,27 @@ impl StageFileScanner {
             if name.to_bytes() == b"." || name.to_bytes() == b".." {
                 continue;
             }
-            let metadata = match rustix::fs::statat(&*directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+            let metadata = match super::root::inventory_injected(
+                "stage inventory stat",
+                inventory_root,
+                relative,
+            )
+            .and_then(|()| rustix::fs::statat(&*directory, name, AtFlags::SYMLINK_NOFOLLOW))
+            {
                 Ok(metadata) => metadata,
                 Err(Errno::NOENT) => continue,
+                // The held fan-out directory was removed: on NFS the lookup in
+                // it is ESTALE. The entry is absent, as for ENOENT.
+                Err(error)
+                    if skip_stale_fanout(
+                        &mut self.stale_fanout_skips,
+                        "stage inventory stat",
+                        error,
+                        relative,
+                    ) =>
+                {
+                    continue;
+                }
                 Err(error) => {
                     return Err(WriteBehindError::io("stage inventory stat", &error.into()));
                 }
@@ -214,23 +265,42 @@ impl StageFileScanner {
                     });
                 }
                 let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-                #[cfg(target_os = "linux")]
-                let child = rustix::fs::openat2(
-                    &*directory,
-                    name,
-                    flags,
-                    Mode::empty(),
-                    rustix::fs::ResolveFlags::BENEATH
-                        | rustix::fs::ResolveFlags::NO_SYMLINKS
-                        | rustix::fs::ResolveFlags::NO_XDEV,
+                let injected = super::root::inventory_injected(
+                    "stage inventory descend",
+                    inventory_root,
+                    relative,
                 );
+                #[cfg(target_os = "linux")]
+                let child = injected.and_then(|()| {
+                    rustix::fs::openat2(
+                        &*directory,
+                        name,
+                        flags,
+                        Mode::empty(),
+                        rustix::fs::ResolveFlags::BENEATH
+                            | rustix::fs::ResolveFlags::NO_SYMLINKS
+                            | rustix::fs::ResolveFlags::NO_XDEV,
+                    )
+                });
                 #[cfg(not(target_os = "linux"))]
-                let child = rustix::fs::openat(&*directory, name, flags, Mode::empty());
+                let child = injected
+                    .and_then(|()| rustix::fs::openat(&*directory, name, flags, Mode::empty()));
                 // A directory purged between the stat and the open is absent,
-                // exactly like an entry purged before the stat.
+                // exactly like an entry purged before the stat. On NFS, an
+                // open in a held fan-out directory that was removed is ESTALE.
                 let child = match child {
                     Ok(child) => child,
                     Err(Errno::NOENT) => continue,
+                    Err(error)
+                        if skip_stale_fanout(
+                            &mut self.stale_fanout_skips,
+                            "stage inventory descend",
+                            error,
+                            relative,
+                        ) =>
+                    {
+                        continue;
+                    }
                     Err(error) => {
                         return Err(WriteBehindError::io(
                             "stage inventory descend",
@@ -238,9 +308,34 @@ impl StageFileScanner {
                         ));
                     }
                 };
-                let child_stat = rustix::fs::fstat(&child).map_err(|error| {
-                    WriteBehindError::io("stage inventory child stat", &error.into())
-                })?;
+                // From here the act is on `child` itself. On NFS a child
+                // fan-out directory purged since the open is ESTALE; it is
+                // absent, as above. Only a fan-out child is skipped.
+                let child_stat = match super::root::inventory_injected(
+                    "stage inventory child stat",
+                    inventory_root,
+                    &path,
+                )
+                .and_then(|()| rustix::fs::fstat(&child))
+                {
+                    Ok(child_stat) => child_stat,
+                    Err(error)
+                        if skip_stale_fanout(
+                            &mut self.stale_fanout_skips,
+                            "stage inventory child stat",
+                            error,
+                            &path,
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(WriteBehindError::io(
+                            "stage inventory child stat",
+                            &error.into(),
+                        ));
+                    }
+                };
                 if child_stat.st_dev != root_stat.st_dev {
                     return Err(WriteBehindError::RootDeviceChanged);
                 }
@@ -250,9 +345,25 @@ impl StageFileScanner {
                     // one; the next traversal counts it.
                     continue;
                 }
-                let entries = match rustix::fs::Dir::read_from(&child) {
+                let entries = match super::root::inventory_injected(
+                    "stage inventory child read",
+                    inventory_root,
+                    &path,
+                )
+                .and_then(|()| rustix::fs::Dir::read_from(&child))
+                {
                     Ok(entries) => entries,
                     Err(Errno::NOENT) => continue,
+                    Err(error)
+                        if skip_stale_fanout(
+                            &mut self.stale_fanout_skips,
+                            "stage inventory child read",
+                            error,
+                            &path,
+                        ) =>
+                    {
+                        continue;
+                    }
                     Err(error) => {
                         return Err(WriteBehindError::io(
                             "stage inventory descend",
@@ -301,6 +412,47 @@ impl StageFileScanner {
         }
         Ok(found)
     }
+}
+
+/// FORK-LOCAL (Tideshift): an ESTALE on `relative`, a directory the inventory
+/// walk holds or has just opened. True, counted and logged at debug, when
+/// `relative` is a fan-out level (`staged/<aa>` or `staged/<aa>/<bb>`): on NFS
+/// a directory a concurrent purge removed gives ESTALE where a local disk
+/// gives ENOENT, so the caller treats it like that ENOENT. False for the root,
+/// `staged/`, `incoming/` or anything else: an ESTALE there stays an error.
+/// `root.verify_device()` at the end of every step still proves that the root
+/// and the pinned `staged/` are the ones opened.
+#[cfg(unix)]
+fn skip_stale_fanout(
+    skips: &mut u64,
+    site: &'static str,
+    error: rustix::io::Errno,
+    relative: &std::path::Path,
+) -> bool {
+    if error != rustix::io::Errno::STALE || !is_removable_fanout(relative) {
+        return false;
+    }
+    *skips = skips.saturating_add(1);
+    tracing::debug!(
+        site,
+        errno = error.raw_os_error(),
+        directory = %relative.display(),
+        "write-behind: stage inventory skipped a stale fan-out directory, treated as removed"
+    );
+    true
+}
+
+/// Whether `relative` (from the stage root) is a fan-out level a purge can
+/// remove: `staged/<aa>` or `staged/<aa>/<bb>`. Never the root, `staged/`
+/// itself, `incoming/`, or anything deeper or elsewhere.
+#[cfg(unix)]
+fn is_removable_fanout(relative: &std::path::Path) -> bool {
+    let mut components = relative.components();
+    components.next()
+        == Some(std::path::Component::Normal(
+            super::root::STAGED_DIR.as_ref(),
+        ))
+        && (1..=super::root::REMOVABLE_FANOUT_LEVELS).contains(&components.count())
 }
 
 #[cfg(unix)]
