@@ -191,6 +191,13 @@ impl PostgresDomainStore {
         // representation), after the liveness table.
         crate::pool::ensure_schema_online(&pool, crate::domain::fragments::DRAIN_GUARD_SCHEMA)
             .await?;
+        // `stage resolve-lost`: the operator loss rulings the drain carries
+        // out. One new table and one partial index.
+        crate::pool::ensure_schema_online(
+            &pool,
+            crate::domain::fragments::stage_loss::STAGE_LOSS_SCHEMA,
+        )
+        .await?;
 
         let identity = read_database_identity(&pool)
             .await

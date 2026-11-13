@@ -39,6 +39,8 @@ struct Hook;
 struct Injection {
     site: &'static str,
     path: PathBuf,
+    /// Calls that pass through before the first injected one.
+    skip: usize,
     times: usize,
     errno: rustix::io::Errno,
     hits: Arc<std::sync::atomic::AtomicUsize>,
@@ -58,6 +60,10 @@ pub(super) fn injected_errno(site: &'static str, path: &Path) -> Option<rustix::
     injection
         .hits
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if injection.skip > 0 {
+        injection.skip -= 1;
+        return None;
+    }
     if injection.times == 0 {
         return None;
     }
@@ -83,11 +89,22 @@ impl Estale {
         times: usize,
         errno: rustix::io::Errno,
     ) -> Self {
+        Self::inject_after(site, path, 0, times, errno)
+    }
+
+    fn inject_after(
+        site: &'static str,
+        path: impl Into<PathBuf>,
+        skip: usize,
+        times: usize,
+        errno: rustix::io::Errno,
+    ) -> Self {
         let path = path.into();
         let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         INJECTIONS.lock().unwrap().push(Injection {
             site,
             path: path.clone(),
+            skip,
             times,
             errno,
             hits: hits.clone(),
@@ -106,6 +123,28 @@ impl Drop for Estale {
             .lock()
             .unwrap()
             .retain(|injection| !(injection.site == self.site && injection.path == self.path));
+    }
+}
+
+/// An errno injection for tests outside this module (the drain's loss-ruling
+/// tests). Removed when dropped.
+pub(crate) struct InjectedErrno(Estale);
+
+impl InjectedErrno {
+    /// Every call of `site` on `path` counts a hit; the first `skip` pass
+    /// through, the next `times` fail with `errno`.
+    pub(crate) fn after(
+        site: &'static str,
+        path: impl Into<PathBuf>,
+        skip: usize,
+        times: usize,
+        errno: rustix::io::Errno,
+    ) -> Self {
+        Self(Estale::inject_after(site, path, skip, times, errno))
+    }
+
+    pub(crate) fn hits(&self) -> usize {
+        self.0.hits()
     }
 }
 
@@ -1160,6 +1199,34 @@ async fn a_staged_read_estale_is_unavailable_never_absent() {
             "present={present}: got {read:?}"
         );
         drop(estale);
+    }
+}
+
+/// `stage resolve-lost` (review D2): the drain's ruling read decides `absent`
+/// only on ENOENT. ESTALE (NFS) and EIO at the staged open decide nothing
+/// (`None`), so the drain keeps the ruling open; never `Some(true)`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_ruling_read_error_decides_nothing() {
+    let scratch = Scratch::new();
+    let stage = inventory_stage(&scratch);
+    // A hash no other test uses: `staged open` is keyed by the relative path.
+    let hash = [0xe7; 32];
+    let key = derived_staged_key(&hash, 1).unwrap();
+    let resolved = staged_file(stage.root(), &hash, 1);
+    assert_eq!(
+        stage.ruling_read(&hash, 1, &key).await,
+        Some(true),
+        "control: an absent file under the intact pinned tree is a miss"
+    );
+    for errno in [rustix::io::Errno::STALE, rustix::io::Errno::IO] {
+        let injected = Estale::inject_errno("staged open", resolved.relative(), 1, errno);
+        assert_eq!(
+            stage.ruling_read(&hash, 1, &key).await,
+            None,
+            "{errno:?} is undecided, never absent"
+        );
+        assert_eq!(injected.hits(), 1, "{errno:?} reached the staged open");
     }
 }
 

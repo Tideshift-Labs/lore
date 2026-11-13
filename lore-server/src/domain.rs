@@ -3051,6 +3051,9 @@ pub mod read_generation;
 /// `loreserver schema validate-constraints`, the out-of-band `VALIDATE
 /// CONSTRAINT` step for the boot path's `NOT VALID` constraints.
 pub mod schema_operator;
+/// `loreserver stage resolve-lost`, operator loss rulings for staged fragments
+/// the guarded drain keeps.
+pub mod stage_operator;
 
 /// Build the domain coordinator for this cell, when one applies.
 ///

@@ -214,6 +214,42 @@ pub use coordinator::StagerIdentity;
 pub use coordinator::begin_outcome_labels;
 pub use coordinator::prune_in_passes;
 pub use coordinator::read_fragment_write_capability;
+/// WP-115 drain guard follow-up: operator loss rulings
+/// (`loreserver stage resolve-lost`).
+pub mod stage_loss {
+    pub use super::coordinator::AppliedLossRuling;
+    pub use super::coordinator::ClosedLossRuling;
+    pub use super::coordinator::LOSS_CONFIRM_TOKEN_TTL;
+    pub use super::coordinator::LOSS_RULING_TTL;
+    pub use super::coordinator::LossApply;
+    pub use super::coordinator::LossApplyOutcome;
+    pub use super::coordinator::LossApplyRefusal;
+    pub use super::coordinator::LossEvidence;
+    pub use super::coordinator::LossFilter;
+    pub use super::coordinator::LossListing;
+    pub use super::coordinator::LossOutcome;
+    pub use super::coordinator::LossRulingFence;
+    pub use super::coordinator::LossRulingReader;
+    pub use super::coordinator::LossRulingRecord;
+    pub use super::coordinator::LossRulingRefresh;
+    pub use super::coordinator::LossSelection;
+    pub use super::coordinator::LostStagedFile;
+    pub use super::coordinator::MAX_LOSS_ACTOR_BYTES;
+    pub use super::coordinator::MAX_LOSS_REASON_BYTES;
+    pub use super::coordinator::MAX_LOSS_RULING_ROWS;
+    pub use super::coordinator::MIN_LOSS_RULING_AGE;
+    pub use super::coordinator::MarkMissingOutcome;
+    pub use super::coordinator::OpenLossRuling;
+    pub use super::coordinator::STAGE_LOSS_SCHEMA;
+    pub use super::coordinator::TokenRefusal;
+    pub use super::coordinator::apply_loss_rulings;
+    pub use super::coordinator::check_confirm_token;
+    pub use super::coordinator::confirm_token;
+    pub use super::coordinator::list_lost_staged;
+    pub use super::coordinator::loss_rulings;
+    pub use super::coordinator::refuse_contended_apply;
+    pub use super::coordinator::token_issued_ms;
+}
 pub(crate) use failpoint;
 pub use masks::CONTENT_STRUCTURE_MASK;
 pub use masks::DERIVED_TIER_MASK;

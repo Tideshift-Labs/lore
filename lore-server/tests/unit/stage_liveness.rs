@@ -2616,6 +2616,8 @@ struct FakeAttach {
     guard_ages: Mutex<Vec<Duration>>,
     roots: Mutex<Vec<std::path::PathBuf>>,
     refuse_guard: bool,
+    /// The loss ruling hooks each attach got (drain role only).
+    loss_rulings: Mutex<Vec<lore_postgres::store::fragment_write_behind::LossRulingHooks>>,
 }
 
 impl StageAttach for FakeAttach {
@@ -2640,6 +2642,14 @@ impl StageAttach for FakeAttach {
         self.guards.lock().unwrap().push(confirmed);
         self.guard_ages.lock().unwrap().push(min_staged_age);
         Some(Arc::new(DrainAbsenceCounts::default()))
+    }
+
+    fn loss_rulings(
+        &self,
+        hooks: lore_postgres::store::fragment_write_behind::LossRulingHooks,
+    ) -> bool {
+        self.loss_rulings.lock().unwrap().push(hooks);
+        true
     }
 
     fn liveness(&self, root: &std::path::Path) -> (ShareMarkers, RootCheck) {
@@ -2698,6 +2708,48 @@ fn the_drain_role_attaches_the_drain_guard() {
         liveness.snapshot(Instant::now()).absence_counts,
         Some(AbsenceCounts::default()),
         "the guard's counts reach the snapshot"
+    );
+    // `stage resolve-lost`: the drain, and only the drain, gets the loss
+    // ruling hooks. They report this liveness's identity and its own guard
+    // state: healthy once it has a current challenge and no unconfirmed web
+    // replica (none in view here).
+    let hooks = attach
+        .loss_rulings
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("the drain attaches the loss ruling hooks");
+    assert_eq!(hooks.reader.replica_id, "drain-1");
+    assert_eq!(hooks.reader.incarnation, liveness.incarnation());
+    assert_eq!(
+        (hooks.guard_healthy)(),
+        !liveness.absence_unproven(),
+        "the hook is the guard's own state"
+    );
+    assert!(
+        (hooks.guard_healthy)(),
+        "a challenge and no unconfirmed peer"
+    );
+    let web = guarded("web-z");
+    liveness.note_guard_view(&view_of(&liveness, &[&liveness, &web]));
+    assert!(
+        !(hooks.guard_healthy)(),
+        "a fresh web replica the drain has not confirmed makes the guard unhealthy"
+    );
+    assert_eq!(
+        (hooks.stager_echo)(&identity(&web)),
+        Some(false),
+        "no echo file yet"
+    );
+    std::fs::write(
+        root.path().join("liveness").join("web-z.echo"),
+        format!("{}\nother-reader nonce", web.incarnation()),
+    )
+    .unwrap();
+    assert_eq!(
+        (hooks.stager_echo)(&identity(&web)),
+        Some(true),
+        "a crashed stager's echo file in the drain's stage is evidence"
     );
     stop.store(true, Ordering::Relaxed);
 
@@ -2762,6 +2814,53 @@ fn the_stage_role_attaches_the_share_gate_and_its_stager() {
         "the web-side guard gets the production minimum staged age, never zero"
     );
     assert!(liveness.snapshot(Instant::now()).absence_counts.is_some());
+    assert!(
+        attach.loss_rulings.lock().unwrap().is_empty(),
+        "a web replica never carries out loss rulings"
+    );
+}
+
+/// `stage resolve-lost` echo evidence: only an echo file in the reader's own
+/// stage whose FIRST line is the stager's exact incarnation counts, and only
+/// while the root check holds before and after the read.
+#[test]
+fn stager_echo_evidence_needs_the_exact_incarnation_and_an_intact_root() {
+    let root = tempfile::tempdir().unwrap();
+    let markers = ShareMarkers::new(root.path());
+    let intact: RootCheck = Arc::new(|| true);
+    let web = stager("web-a", "inc-a");
+    assert_eq!(stager_echo_evidence(&markers, &intact, &web), Some(false));
+    markers.write_echo("web-a", "inc-b\ninc-r nonce").unwrap();
+    assert_eq!(
+        stager_echo_evidence(&markers, &intact, &web),
+        Some(false),
+        "a restart under the same replica id replaced the old incarnation's echo"
+    );
+    markers.write_echo("web-a", "inc-r nonce\ninc-a").unwrap();
+    assert_eq!(
+        stager_echo_evidence(&markers, &intact, &web),
+        Some(false),
+        "the incarnation must be the first line, not a reader line"
+    );
+    markers.write_echo("web-a", "inc-a\ninc-r nonce").unwrap();
+    assert_eq!(stager_echo_evidence(&markers, &intact, &web), Some(true));
+    let moved: RootCheck = Arc::new(|| false);
+    assert_eq!(
+        stager_echo_evidence(&markers, &moved, &web),
+        None,
+        "a failed root check decides nothing"
+    );
+    // The root check runs before AND after: fail only the second call.
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    let after: RootCheck = Arc::new(move || counter.fetch_add(1, Ordering::SeqCst) == 0);
+    assert_eq!(stager_echo_evidence(&markers, &after, &web), None);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        stager_echo_evidence(&markers, &intact, &stager("../web-a", "inc-a")),
+        Some(false),
+        "an id unsafe as a file name is never read"
+    );
 }
 
 /// Review B S1 (round 5): the production `StageAttach` forwards the age

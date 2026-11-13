@@ -222,7 +222,13 @@ impl Fixture {
         let root = std::env::temp_dir().join(format!("lore-adapter-{}", Uuid::now_v7()));
         std::fs::create_dir(&root).unwrap();
         let stage_root = root.join("stage");
-        let spool_root = root.join("spool");
+        // The loopback NFS harness puts the stage on NFS and the spool on a
+        // local disk, as production does: the spool needs RENAME_NOREPLACE,
+        // which NFS refuses.
+        let spool_root = match std::env::var_os("LORE_TEST_ADAPTER_SPOOL_BASE") {
+            Some(base) => PathBuf::from(base).join(format!("spool-{}", Uuid::now_v7())),
+            None => root.join("spool"),
+        };
         std::fs::create_dir(&stage_root).unwrap();
         std::fs::create_dir(&spool_root).unwrap();
         let mut settings = WriteBehindSettings {
@@ -1264,6 +1270,9 @@ mod withdraw_tests;
 
 #[path = "fragment_write_behind_cleanup_pass_tests.rs"]
 mod cleanup_pass_tests;
+
+#[path = "fragment_write_behind_loss_ruling_tests.rs"]
+mod loss_ruling_tests;
 
 #[tokio::test]
 #[ignore = "requires owned PostgreSQL BLAKE3 fixture, setup example, and Linux roots"]

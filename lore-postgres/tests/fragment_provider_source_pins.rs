@@ -151,7 +151,7 @@ fn dispatch_dependency_guard_rejects_regular_build_target_and_workspace_aliases(
 /// deliberately absent, and it is the ONLY exemption: it holds
 /// only re-exports and the `DomainError` conversion, and it cannot reach a
 /// provider because this crate cannot name the types that would let it.
-const SCANNED_FILES: [&str; 16] = [
+const SCANNED_FILES: [&str; 17] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -164,6 +164,7 @@ const SCANNED_FILES: [&str; 16] = [
     "stage_charge_schema.rs",
     "stage_custody.rs",
     "stage_liveness.rs",
+    "stage_loss.rs",
     "stage_rotation_schema.rs",
     "stage_schema.rs",
     "states.rs",
@@ -172,7 +173,7 @@ const SCANNED_FILES: [&str; 16] = [
 
 /// Every `.rs` file expected in the package, so a new one cannot appear and
 /// escape the scan by not being listed.
-const PACKAGE_FILES: [&str; 17] = [
+const PACKAGE_FILES: [&str; 18] = [
     "coordinator.rs",
     "creation.rs",
     "failpoints.rs",
@@ -186,6 +187,7 @@ const PACKAGE_FILES: [&str; 17] = [
     "stage_charge_schema.rs",
     "stage_custody.rs",
     "stage_liveness.rs",
+    "stage_loss.rs",
     "stage_rotation_schema.rs",
     "stage_schema.rs",
     "states.rs",
@@ -343,6 +345,7 @@ fn the_scanned_file_list_is_what_the_package_compiles() {
         "resolve_batch",
         "stage_custody",
         "stage_liveness",
+        "stage_loss",
     ] {
         let declaration = format!("mod {sibling};");
         assert_eq!(
@@ -632,6 +635,7 @@ fn the_package_splices_in_no_source_from_outside_itself() {
                 "resolve_batch.rs",
                 "stage_custody.rs",
                 "stage_liveness.rs",
+                "stage_loss.rs",
             ] {
                 let local_module = format!("#[path = \"{sibling}\"]");
                 assert_eq!(source.matches(&local_module).count(), 1);
@@ -644,4 +648,138 @@ fn the_package_splices_in_no_source_from_outside_itself() {
             "{file} names {found:?}, which compiles source this guard never reads",
         );
     }
+}
+
+/// The SQL text of the first string literal after `signature` up to its
+/// `ORDER BY`, with Rust line continuations removed and whitespace collapsed.
+fn sql_until_order_by(source: &str, signature: &str) -> String {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("{signature} must exist"));
+    let body = &source[start..];
+    let end = body
+        .find("ORDER BY")
+        .unwrap_or_else(|| panic!("{signature} must have an ORDER BY"));
+    body[..end]
+        .replace("\\\n", " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Split `clause` on its top-level whitespace-delimited `keyword`
+/// (case-insensitive), outside parentheses and quotes.
+fn top_level_split(clause: &str, keyword: &str) -> Vec<String> {
+    let (mut depth, mut quoted, mut start) = (0_i32, false, 0);
+    let mut parts = Vec::new();
+    let bytes = clause.as_bytes();
+    let width = keyword.len();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\'' => quoted = !quoted,
+            b'(' if !quoted => depth += 1,
+            b')' if !quoted => depth -= 1,
+            _ => {}
+        }
+        if depth == 0
+            && !quoted
+            && bytes[index].is_ascii_whitespace()
+            && index + width + 1 < bytes.len()
+            && bytes[index + 1..index + 1 + width].eq_ignore_ascii_case(keyword.as_bytes())
+            && bytes[index + 1 + width].is_ascii_whitespace()
+        {
+            parts.push(clause[start..index].trim().to_owned());
+            index += width + 2;
+            start = index;
+            continue;
+        }
+        index += 1;
+    }
+    parts.push(clause[start..].trim().to_owned());
+    parts
+}
+
+/// Split `clause` on its top-level ` AND `, outside parentheses and quotes.
+fn top_level_conjuncts(clause: &str) -> Vec<String> {
+    top_level_split(clause, "AND")
+}
+
+/// Split `clause` on its top-level ` OR `, outside parentheses and quotes.
+/// `AND` binds tighter than `OR`, so one top-level `OR` rewrites the whole
+/// `WHERE` into alternatives and the conjunct split no longer describes it.
+fn top_level_disjuncts(clause: &str) -> Vec<String> {
+    top_level_split(clause, "OR")
+}
+
+/// Review O5 (`stage resolve-lost`): the operator's list must never show a
+/// file the drain never picks up, so it carries every condition of the
+/// drain candidate query: each joined relation's join text, and each
+/// top-level `WHERE` conjunct but the keyset cursor. A filter added to the
+/// drain query alone fails here until the list carries it too.
+#[test]
+fn the_loss_list_carries_every_drain_candidate_condition() {
+    let drain = sql_until_order_by(
+        &read("coordinator.rs"),
+        "pub async fn staged_drain_candidates_after(",
+    );
+    let list = sql_until_order_by(&read("stage_loss.rs"), "pub async fn list_lost_staged(");
+    for join in [
+        "JOIN lore_fragment_epochs AS e ON e.hash = l.hash AND e.epoch = l.current_epoch \
+         AND e.manifest_id = l.manifest_id",
+        "JOIN lore_fragment_stage_custody AS c ON c.hash=l.hash AND c.epoch=l.current_epoch \
+         AND c.state=1",
+    ] {
+        assert!(drain.contains(join), "the drain query joins `{join}`");
+        assert!(list.contains(join), "the loss list must join `{join}`");
+    }
+    let where_at = drain
+        .find(" WHERE l.state")
+        .expect("the drain query has its outer WHERE");
+    let drain_where = &drain[where_at + " WHERE ".len()..];
+    assert_eq!(
+        top_level_disjuncts(drain_where).len(),
+        1,
+        "the drain WHERE must have no top-level OR: {drain_where}"
+    );
+    let conjuncts = top_level_conjuncts(drain_where);
+    assert!(
+        conjuncts.len() >= 5,
+        "the drain WHERE split into {conjuncts:?}"
+    );
+    // Membership, not substring: a list conjunct widened in place
+    // (`(e.disposition = 0 OR TRUE)`, `TRUE OR NOT EXISTS (...)`) still
+    // contains the drain text but is no longer the same top-level condition.
+    let list_where_at = list
+        .find(" WHERE l.state")
+        .expect("the loss list has its outer WHERE");
+    let list_where = &list[list_where_at + " WHERE ".len()..];
+    // A top-level OR (`... AND x OR TRUE`) makes the whole WHERE true while
+    // every conjunct above still matches, so it must be absent.
+    assert_eq!(
+        top_level_disjuncts(list_where).len(),
+        1,
+        "the loss list WHERE must have no top-level OR: {list_where}"
+    );
+    let list_conjuncts = top_level_conjuncts(list_where);
+    let mut carried = 0;
+    for conjunct in &conjuncts {
+        if conjunct == "l.hash > $2" {
+            continue;
+        }
+        assert!(
+            list_conjuncts.contains(conjunct),
+            "the loss list must carry the drain condition `{conjunct}` as its own top-level \
+             conjunct; it has {list_conjuncts:?}"
+        );
+        carried += 1;
+    }
+    assert_eq!(carried, conjuncts.len() - 1, "only the cursor is exempt");
+    // Discrimination: the write-claim barrier is one of the carried
+    // conditions, so a list without it fails above.
+    assert!(
+        conjuncts
+            .iter()
+            .any(|conjunct| conjunct.contains("lore_fragment_write_claims"))
+    );
 }

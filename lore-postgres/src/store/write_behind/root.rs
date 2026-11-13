@@ -1548,7 +1548,7 @@ mod platform {
 
 #[cfg(all(test, unix))]
 #[path = "durability_tests.rs"]
-mod durability_tests;
+pub(crate) mod durability_tests;
 
 /// Test seam for the stage inventory walk (`cleanup.rs`): an errno the
 /// durability tests inject at one named act on `root.join(relative)`, in place

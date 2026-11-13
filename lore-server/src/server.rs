@@ -223,6 +223,12 @@ pub enum MaintenanceOperation {
         #[command(subcommand)]
         command: crate::domain::schema_operator::SchemaCommand,
     },
+    /// The write-behind stage: resolve staged fragments the drain keeps.
+    Stage {
+        /// The operation to run.
+        #[command(subcommand)]
+        command: crate::domain::stage_operator::StageCommand,
+    },
 }
 
 #[lore_macro::test_pub]
@@ -374,6 +380,11 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
                     })?,
                     MaintenanceOperation::Schema { command } => {
                         crate::domain::schema_operator::run(&command, &settings).await
+                    }
+                    // `stage resolve-lost`: operator loss rulings. Records
+                    // only; the running drain carries them out.
+                    MaintenanceOperation::Stage { command } => {
+                        crate::domain::stage_operator::run(&command, &settings).await
                     }
                 }
             } else {

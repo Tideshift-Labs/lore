@@ -387,13 +387,21 @@
 //! every web host (the usual cause is a wrong or stale mount; fix it, and the
 //! files are found and promoted). A file that is truly gone and whose stager
 //! has left stays `Staged` after a drain restart: each pass retries it, and a
-//! GET of it answers `SlowDown`. No command marks it `Missing` today; a GET
-//! on a web replica that confirmed the stager before it left does. Each kept
-//! log line names one sample file (`hash`, `epoch`), not every kept file.
-//! The full list is in the database: the staged heads with a live custody
-//! row whose stager is absent or not fresh. A coming
-//! `loreserver stage resolve-lost list` command will print it. Record that
-//! list and escalate.
+//! GET of it answers `SlowDown`. A GET on a web replica that confirmed the
+//! stager before it left marks it `Missing`. Each kept log line names one
+//! sample file (`hash`, `epoch`), not every kept file. The full list is in
+//! the database: `loreserver stage resolve-lost list` prints the staged heads
+//! with a live custody row, at least an hour old, whose stager is absent or
+//! not fresh, and a confirm token for that exact set. After the mount check,
+//! `loreserver stage resolve-lost apply --confirm <token> --actor .. --reason
+//! ..` records an operator loss ruling per file (`--attest-mounts-checked`
+//! when a file has no stager or its stager left no echo file; `--multi-repository`
+//! when a file belongs to more than one repository). The running drain
+//! carries a ruling out on its next passes: only with a healthy guard, a
+//! fresh pinned miss, and echo evidence or the attestation; then the
+//! fragment is `Missing` and the ruling closed in one transaction.
+//! `resolve-lost status` shows each ruling's outcome. A new upload of the
+//! same bytes repairs a `Missing` fragment into a new epoch.
 //!
 //! **Web replicas run the same guard.** A web replica proven against one
 //! drain keeps that proof for its life, so in the same split (web-a latched
@@ -1082,6 +1090,44 @@ pub fn echoed_challenge<'a>(
         .filter_map(parse_marker)
         .find(|(incarnation, _)| *incarnation == reader_incarnation)
         .and_then(|(_, challenge)| challenge)
+}
+
+/// `stage resolve-lost`: whether `stager`'s echo file in this reader's own
+/// stage names `stager`'s incarnation on its first line. A crashed process's
+/// echo file stays; a clean stop removes it, and a restart under the same
+/// replica id replaces it with the new incarnation. So `Some(true)` means
+/// that incarnation once wrote this `liveness/` directory, and a directory has
+/// one parent: it staged into this reader's `staged/` too. No challenge is
+/// needed: a process never changes its pinned tree.
+///
+/// `None` when the root check fails before or after the read, or the read
+/// fails; `Some(false)` when there is no such file, the id is not safe as a
+/// file name, or the file names another incarnation. Blocking.
+pub fn stager_echo_evidence(
+    markers: &ShareMarkers,
+    root_ok: &RootCheck,
+    stager: &StagerIdentity,
+) -> Option<bool> {
+    if !is_marker_safe_id(&stager.replica_id) {
+        return Some(false);
+    }
+    if !root_ok() {
+        return None;
+    }
+    let read = markers.read_echo(&stager.replica_id);
+    if !root_ok() {
+        return None;
+    }
+    match read {
+        Ok(None) => Some(false),
+        Ok(Some(content)) => Some(
+            content
+                .lines()
+                .next()
+                .is_some_and(|first| first.trim() == stager.incarnation),
+        ),
+        Err(_) => None,
+    }
 }
 
 /// The trimmed content of the file at `path`, at most `limit` bytes, or

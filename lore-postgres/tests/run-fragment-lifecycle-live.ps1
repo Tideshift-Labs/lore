@@ -424,6 +424,30 @@ $inventory = @(
             'a_real_lifecycle_prepares_only_statements_that_are_literal_at_a_pinned_call_site',
             'every_cached_statement_has_a_safe_generic_plan_on_a_skewed_population'
         )
+    },
+    # `stage resolve-lost`: the operator loss ruling's selection, token, apply refusals,
+    # and the drain's one-transaction carry-out, refresh and close. NOT Unix-gated (pure
+    # SQL); the drain's file half runs in run-write-behind-linux.ps1.
+    [pscustomobject]@{
+        Package       = 'lore-postgres'
+        Kind          = 'test'
+        Target        = 'stage_loss_rulings_live'
+        Exact         = $true
+        ExactPrefixes = @()
+        Cases         = @(
+            'list_selects_only_old_kept_heads_whose_stager_is_absent_or_not_fresh',
+            'apply_records_rulings_and_refuses_without_attestation_or_multi_repository',
+            'apply_refuses_a_changed_set_an_expired_token_and_a_malformed_one',
+            'a_carried_out_ruling_marks_missing_and_closes_in_one_transaction',
+            'a_ruling_without_evidence_age_or_a_matching_head_writes_nothing',
+            'attestation_expiry_and_found_close_rulings_as_recorded',
+            'a_missing_fragment_is_repaired_into_a_new_epoch',
+            'list_reads_stager_freshness_under_any_cell_id',
+            'list_skips_a_head_the_drain_candidate_query_skips',
+            'an_expired_undecided_ruling_is_not_open_and_a_new_apply_replaces_it',
+            'the_ruling_table_refuses_delete_and_every_rewrite',
+            'a_stale_candidate_never_fences_a_ruling_whose_head_still_matches'
+        )
     }
 )
 

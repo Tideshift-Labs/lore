@@ -65,6 +65,8 @@ mod resolve_batch;
 mod stage_custody;
 #[path = "stage_liveness.rs"]
 mod stage_liveness;
+#[path = "stage_loss.rs"]
+mod stage_loss;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,6 +98,38 @@ pub use stage_liveness::StageProgressRecord;
 pub use stage_liveness::StagerAbsence;
 pub use stage_liveness::StagerIdentity;
 pub use stage_liveness::prune_in_passes;
+pub use stage_loss::AppliedLossRuling;
+pub use stage_loss::ClosedLossRuling;
+pub use stage_loss::LOSS_CONFIRM_TOKEN_TTL;
+pub use stage_loss::LOSS_RULING_TTL;
+pub use stage_loss::LossApply;
+pub use stage_loss::LossApplyOutcome;
+pub use stage_loss::LossApplyRefusal;
+pub use stage_loss::LossEvidence;
+pub use stage_loss::LossFilter;
+pub use stage_loss::LossListing;
+pub use stage_loss::LossOutcome;
+pub use stage_loss::LossRulingFence;
+pub use stage_loss::LossRulingReader;
+pub use stage_loss::LossRulingRecord;
+pub use stage_loss::LossRulingRefresh;
+pub use stage_loss::LossSelection;
+pub use stage_loss::LostStagedFile;
+pub use stage_loss::MAX_LOSS_ACTOR_BYTES;
+pub use stage_loss::MAX_LOSS_REASON_BYTES;
+pub use stage_loss::MAX_LOSS_RULING_ROWS;
+pub use stage_loss::MIN_LOSS_RULING_AGE;
+pub use stage_loss::MarkMissingOutcome;
+pub use stage_loss::OpenLossRuling;
+pub use stage_loss::STAGE_LOSS_SCHEMA;
+pub use stage_loss::TokenRefusal;
+pub use stage_loss::apply_loss_rulings;
+pub use stage_loss::check_confirm_token;
+pub use stage_loss::confirm_token;
+pub use stage_loss::list_lost_staged;
+pub use stage_loss::loss_rulings;
+pub use stage_loss::refuse_contended_apply;
+pub use stage_loss::token_issued_ms;
 
 use crate::domain::PostgresDomainStore;
 use crate::domain::coordinator::CommittedVersions;
@@ -3685,6 +3719,33 @@ impl PostgresFragmentCoordinator {
         witness: &EpochWitness,
         diagnostic: MissingDiagnostic,
     ) -> Result<CommitVerdict, DomainError> {
+        Ok(
+            match self.mark_missing_with(witness, diagnostic, None).await? {
+                stage_loss::MarkMissingOutcome::Published => CommitVerdict::Published,
+                // Without a ruling there is no ruling to refuse.
+                stage_loss::MarkMissingOutcome::HeadMoved
+                | stage_loss::MarkMissingOutcome::RulingNotEligible => CommitVerdict::Fenced,
+            },
+        )
+    }
+
+    /// [`Self::mark_missing`], optionally closing an operator loss ruling in
+    /// the same transaction (`stage resolve-lost`). With a ruling, the ruling
+    /// row is updated to `marked_missing` after the head is locked and matched
+    /// and before the head moves; if that update matches no row (the ruling is
+    /// closed, expired, for another manifest, too young by the database
+    /// clock, or lacks evidence and attestation), nothing is written and the
+    /// outcome is [`stage_loss::MarkMissingOutcome::RulingNotEligible`].
+    ///
+    /// The ruling table holds no lock-order class: no other transaction takes
+    /// a domain row and then a ruling row, and the drain's ruling refresh
+    /// locks ruling rows only, so taking it after the head cannot invert.
+    async fn mark_missing_with(
+        &self,
+        witness: &EpochWitness,
+        diagnostic: MissingDiagnostic,
+        ruling: Option<&stage_loss::RulingCarryOut<'_>>,
+    ) -> Result<stage_loss::MarkMissingOutcome, DomainError> {
         let mut client = self.checkout().await?;
         let tx = client
             .transaction()
@@ -3697,11 +3758,16 @@ impl PostgresFragmentCoordinator {
         let fanout = plan_lifecycle_fanout(&tx, &witness.hash).await?;
         lock_lifecycle_fanout(&tx, &mut sequence, &fanout).await?;
         let Some(head) = lock_fragment_head(&tx, &mut sequence, &witness.hash).await? else {
-            return Ok(CommitVerdict::Fenced);
+            return Ok(stage_loss::MarkMissingOutcome::HeadMoved);
         };
         failpoint!("lifecycle.mark_missing.locked")?;
         if !head.matches(witness) {
-            return Ok(CommitVerdict::Fenced);
+            return Ok(stage_loss::MarkMissingOutcome::HeadMoved);
+        }
+        if let Some(ruling) = ruling
+            && !stage_loss::claim_ruling_locked(&tx, witness, ruling).await?
+        {
+            return Ok(stage_loss::MarkMissingOutcome::RulingNotEligible);
         }
         let was_readable = head.state.is_readable();
         let fence = next_fence(&tx).await?;
@@ -3745,7 +3811,7 @@ impl PostgresFragmentCoordinator {
         }
         classify_commit(tx.commit().await, "mark missing commit")?;
         failpoint!("lifecycle.mark_missing.settled")?;
-        Ok(CommitVerdict::Published)
+        Ok(stage_loss::MarkMissingOutcome::Published)
     }
 
     /// Bind `(FragmentId, repository, context)` and move the repository's

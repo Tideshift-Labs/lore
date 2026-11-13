@@ -1542,7 +1542,7 @@ impl DrainAbsenceCounts {
                 epoch,
                 error = error.map(tracing::field::display),
                 "a staged file was not found and is not proven gone; the file stays Staged \
-                 and is retried, never marked Missing"
+                 and is retried. `loreserver stage resolve-lost list` prints every such file"
             );
         }
     }
@@ -1633,6 +1633,143 @@ impl crate::store::write_behind::StagedAbsenceGuard for DrainAbsenceGuard {
         })
     }
 }
+
+/// `stage resolve-lost`: what the drain process supplies so its passes can
+/// carry out operator loss rulings. Attached on the drain role only (see
+/// [`FragmentWriteBehindHandle::attach_loss_rulings`]).
+#[derive(Clone)]
+pub struct LossRulingHooks {
+    /// The drain guard is healthy now: this reader has a current challenge
+    /// and every fresh web replica in its last view is confirmed. That proves
+    /// every live web replica writes this drain's directory.
+    pub guard_healthy: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Blocking. Whether the stager's `.echo` file in this drain's pinned
+    /// `liveness/` names the stager's incarnation: `Some(true)` evidence,
+    /// `Some(false)` none, `None` could not tell (a root check failed or the
+    /// read failed).
+    pub stager_echo: StagerEcho,
+    /// This drain process, recorded on each ruling it decides.
+    pub reader: crate::domain::fragments::stage_loss::LossRulingReader,
+}
+
+/// See [`LossRulingHooks::stager_echo`].
+pub type StagerEcho =
+    Arc<dyn Fn(&crate::domain::fragments::StagerIdentity) -> Option<bool> + Send + Sync>;
+
+impl std::fmt::Debug for LossRulingHooks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LossRulingHooks")
+            .field("reader", &self.reader)
+            .finish_non_exhaustive()
+    }
+}
+
+/// How often a drain pass reads the open rulings again, at most.
+pub const LOSS_RULING_REFRESH_EVERY: Duration = Duration::from_secs(10);
+
+/// The open rulings as the last refresh read them.
+#[derive(Debug, Default)]
+struct OpenLossRulings {
+    /// Hash to the ruled epochs of that hash (almost always one). Keyed by
+    /// hash so a candidate's lookup borrows its hash and allocates nothing.
+    keys: std::collections::HashMap<Vec<u8>, Vec<i64>>,
+    refreshed: Option<Instant>,
+    /// Rulings kept open because the guard was unhealthy or a read could not
+    /// decide, since boot. Logged at each power of two.
+    deferred: u64,
+}
+
+impl OpenLossRulings {
+    fn replace(&mut self, open: Vec<(Vec<u8>, i64)>) {
+        self.keys.clear();
+        for (hash, epoch) in open {
+            self.keys.entry(hash).or_default().push(epoch);
+        }
+    }
+
+    fn holds(&self, hash: &[u8], epoch: i64) -> bool {
+        self.keys
+            .get(hash)
+            .is_some_and(|epochs| epochs.contains(&epoch))
+    }
+
+    fn forget(&mut self, hash: &[u8], epoch: i64) {
+        if let Some(epochs) = self.keys.get_mut(hash) {
+            epochs.retain(|held| *held != epoch);
+            if epochs.is_empty() {
+                self.keys.remove(hash);
+            }
+        }
+    }
+}
+
+/// One candidate's ruling context, handed to its reader task.
+#[derive(Clone)]
+struct RulingContext {
+    hooks: LossRulingHooks,
+    open: Arc<std::sync::Mutex<OpenLossRulings>>,
+}
+
+impl RulingContext {
+    fn forget(&self, hash: &[u8], epoch: i64) {
+        self.open
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .forget(hash, epoch);
+    }
+
+    fn note_deferred(&self, hash: &[u8], epoch: i64, why: &'static str) {
+        let count = {
+            let mut open = self.open.lock().unwrap_or_else(|error| error.into_inner());
+            open.deferred = open.deferred.saturating_add(1);
+            open.deferred
+        };
+        if count.is_power_of_two() {
+            tracing::warn!(
+                why,
+                count,
+                hash = %hex::encode(hash),
+                epoch,
+                "a loss ruling was not carried out on this pass; it stays open"
+            );
+        }
+    }
+}
+
+/// Log one decided ruling. One line per terminal outcome, with the hash.
+fn log_ruling_outcome(
+    hash: &[u8],
+    epoch: i64,
+    ruling_id: Option<i64>,
+    outcome: crate::domain::fragments::stage_loss::LossOutcome,
+    evidence: Option<crate::domain::fragments::stage_loss::LossEvidence>,
+) {
+    use crate::domain::fragments::stage_loss::LossOutcome;
+    let outcome_name = outcome.as_str();
+    let evidence = evidence.map(|evidence| evidence.as_str());
+    let hash = hex::encode(hash);
+    if outcome == LossOutcome::MarkedMissing {
+        tracing::warn!(
+            outcome = outcome_name,
+            evidence,
+            ruling_id,
+            hash = %hash,
+            epoch,
+            "an operator loss ruling marked a staged fragment Missing"
+        );
+    } else {
+        tracing::info!(
+            outcome = outcome_name,
+            evidence,
+            ruling_id,
+            hash = %hash,
+            epoch,
+            "an operator loss ruling was closed without marking the fragment Missing"
+        );
+    }
+}
+
 pub struct FragmentWriteBehindHandle {
     coordinator: PostgresFragmentCoordinator,
     /// The observer's two reads, on the domain connection reserved for it
@@ -1661,6 +1798,12 @@ pub struct FragmentWriteBehindHandle {
     activity: std::sync::Mutex<WriteBehindActivity>,
     observe_trace: std::sync::Mutex<ObserveTrace>,
     cleanup_skips: CleanupSkipCounters,
+    /// `stage resolve-lost`: set only on the drain role. See
+    /// [`FragmentWriteBehindHandle::attach_loss_rulings`].
+    loss_rulings: std::sync::OnceLock<LossRulingHooks>,
+    /// The open rulings the last refresh read. Shared with each pass's reader
+    /// tasks.
+    open_rulings: Arc<std::sync::Mutex<OpenLossRulings>>,
 }
 
 /// The least time between two successful spool retired-floor steps (WP-115 f2). The floor itself
@@ -1789,6 +1932,8 @@ impl PostgresImmutableStore {
             activity: std::sync::Mutex::new(WriteBehindActivity::default()),
             observe_trace: std::sync::Mutex::new(ObserveTrace::default()),
             cleanup_skips: CleanupSkipCounters::default(),
+            loss_rulings: std::sync::OnceLock::new(),
+            open_rulings: Arc::new(std::sync::Mutex::new(OpenLossRulings::default())),
         }))
     }
 }
@@ -1990,6 +2135,86 @@ impl FragmentWriteBehindHandle {
     /// was already attached.
     pub fn attach_stager(&self, stager: crate::domain::fragments::StagerIdentity) -> bool {
         self.stage.attach_stager(stager)
+    }
+
+    /// FORK-LOCAL (Tideshift), `stage resolve-lost`: on the drain role, let
+    /// this handle's passes carry out operator loss rulings. A pass reads the
+    /// open rulings at most every [`LOSS_RULING_REFRESH_EVERY`] (one bounded
+    /// statement that also closes expired and moved rulings). A candidate
+    /// with an open ruling whose guarded read was kept is then carried out:
+    /// the guard must be healthy, a fresh pinned read must miss, the ruling
+    /// must have echo evidence or an attestation, and the fragment is marked
+    /// `Missing` with the ruling closed in one transaction. A found file
+    /// closes its ruling `found` and is promoted as usual. `false` if hooks
+    /// were already attached.
+    pub fn attach_loss_rulings(&self, hooks: LossRulingHooks) -> bool {
+        self.loss_rulings.set(hooks).is_ok()
+    }
+
+    /// Read the open rulings again when the last read is older than
+    /// [`LOSS_RULING_REFRESH_EVERY`]. A failure is logged and keeps the last
+    /// set; it never fails the pass.
+    async fn refresh_loss_rulings(&self) {
+        let Some(hooks) = self.loss_rulings.get() else {
+            return;
+        };
+        let due = self
+            .open_rulings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .refreshed
+            .is_none_or(|at| at.elapsed() >= LOSS_RULING_REFRESH_EVERY);
+        if !due {
+            return;
+        }
+        match self
+            .coordinator
+            .refresh_loss_rulings(
+                crate::domain::fragments::stage_loss::MAX_LOSS_RULING_ROWS,
+                &hooks.reader,
+            )
+            .await
+        {
+            Ok(refresh) => {
+                for closed in &refresh.closed {
+                    log_ruling_outcome(
+                        &closed.hash,
+                        closed.epoch,
+                        Some(closed.ruling_id),
+                        closed.outcome,
+                        None,
+                    );
+                }
+                let mut open = self
+                    .open_rulings
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                open.replace(refresh.open);
+                open.refreshed = Some(Instant::now());
+            }
+            Err(error) => {
+                // Retry at the next interval, not on every pass.
+                self.open_rulings
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .refreshed = Some(Instant::now());
+                tracing::warn!(%error, "loss ruling refresh failed; it runs again later");
+            }
+        }
+    }
+
+    /// The ruling context for `source`, when hooks are attached and the last
+    /// refresh saw an open ruling for its `(hash, epoch)`. An in-memory check.
+    fn ruling_context(&self, source: &FragmentDrainCandidate) -> Option<RulingContext> {
+        let hooks = self.loss_rulings.get()?;
+        self.open_rulings
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .holds(source.hash(), source.epoch())
+            .then(|| RulingContext {
+                hooks: hooks.clone(),
+                open: self.open_rulings.clone(),
+            })
     }
 
     /// FORK-LOCAL (Tideshift), WP-115 drain guard: a check that the stage
@@ -2210,6 +2435,7 @@ impl FragmentWriteBehindHandle {
         if free.is_empty() {
             return Err(StoreError::from(SlowDown));
         }
+        self.refresh_loss_rulings().await;
         let bound = FragmentDrainCandidateBatch::new(batch).map_err(domain_store_err)?;
         let mut pages = PassPages::first(self.next_candidate_page(bound).await?, batch);
         let mut started = 0u32;
@@ -2370,8 +2596,9 @@ impl FragmentWriteBehindHandle {
     ) -> Result<VerifiedStagedBody, StoreError> {
         let coordinator = self.coordinator.clone();
         let stage = self.stage.clone();
+        let ruling = self.ruling_context(&source);
         slot.reader = Some(lore_base::lore_spawn!("fragment-drain-read", async move {
-            Self::verify_staged_source(&coordinator, &stage, source).await
+            Self::verify_staged_source_ruled(&coordinator, &stage, source, ruling).await
         }));
         let reader = slot
             .reader
@@ -2386,16 +2613,43 @@ impl FragmentWriteBehindHandle {
         }
     }
 
+    /// The unruled read, for the source tests.
+    #[cfg(all(test, unix))]
     async fn verify_staged_source(
         coordinator: &PostgresFragmentCoordinator,
         stage: &WriteBehindStage,
         source: FragmentDrainCandidate,
     ) -> Result<VerifiedStagedBody, StoreError> {
+        Self::verify_staged_source_ruled(coordinator, stage, source, None).await
+    }
+
+    /// [`Self::verify_staged_source`] with the candidate's open loss ruling,
+    /// if any. Only a guarded miss the guard kept (`RootShareUnproven`) is
+    /// carried out; a found file closes the ruling `found`.
+    async fn verify_staged_source_ruled(
+        coordinator: &PostgresFragmentCoordinator,
+        stage: &WriteBehindStage,
+        source: FragmentDrainCandidate,
+        ruling: Option<RulingContext>,
+    ) -> Result<VerifiedStagedBody, StoreError> {
         let bytes = match stage
             .read_staged(source.hash(), source.epoch(), source.object_key())
             .await
         {
-            StagedRead::Found(bytes) => bytes,
+            StagedRead::Found(bytes) => {
+                if let Some(ruling) = ruling.as_ref() {
+                    Self::close_ruling_found(coordinator, &source, ruling).await;
+                }
+                bytes
+            }
+            StagedRead::Unavailable(WriteBehindError::RootShareUnproven) if ruling.is_some() => {
+                if let Some(ruling) = ruling.as_ref() {
+                    Self::carry_out_ruling(coordinator, stage, &source, ruling).await;
+                }
+                // Marked or kept, this pass promotes nothing for it: a
+                // `Missing` head is never a candidate again.
+                return Err(WriteBehindError::RootShareUnproven.store_error());
+            }
             StagedRead::Unavailable(error) => return Err(error.store_error()),
             StagedRead::Absent => {
                 Self::diagnose(coordinator, &source, MissingDiagnostic::Absent).await?;
@@ -2461,6 +2715,225 @@ impl FragmentWriteBehindHandle {
             .await
             .map_err(domain_store_err)?;
         Ok(())
+    }
+
+    /// Close `source`'s open ruling with `outcome` and log it. A failure or a
+    /// ruling already closed is logged at debug: the next refresh settles it.
+    async fn close_ruling(
+        coordinator: &PostgresFragmentCoordinator,
+        source: &FragmentDrainCandidate,
+        ruling: &RulingContext,
+        ruling_id: i64,
+        outcome: crate::domain::fragments::stage_loss::LossOutcome,
+    ) {
+        match coordinator
+            .close_loss_ruling(ruling_id, outcome, &ruling.hooks.reader)
+            .await
+        {
+            Ok(true) => {
+                ruling.forget(source.hash(), source.epoch());
+                log_ruling_outcome(
+                    source.hash(),
+                    source.epoch(),
+                    Some(ruling_id),
+                    outcome,
+                    None,
+                );
+            }
+            Ok(false) => ruling.forget(source.hash(), source.epoch()),
+            Err(error) => {
+                tracing::debug!(%error, ruling_id, "loss ruling close failed; the refresh retries");
+            }
+        }
+    }
+
+    /// The drain's pinned read found a ruled file: close the ruling `found`.
+    async fn close_ruling_found(
+        coordinator: &PostgresFragmentCoordinator,
+        source: &FragmentDrainCandidate,
+        ruling: &RulingContext,
+    ) {
+        match coordinator
+            .open_loss_ruling(source.hash(), source.epoch())
+            .await
+        {
+            Ok(Some(open)) => {
+                Self::close_ruling(
+                    coordinator,
+                    source,
+                    ruling,
+                    open.ruling_id,
+                    crate::domain::fragments::stage_loss::LossOutcome::Found,
+                )
+                .await;
+            }
+            Ok(None) => ruling.forget(source.hash(), source.epoch()),
+            Err(error) => {
+                tracing::debug!(%error, "loss ruling read failed; the refresh retries");
+            }
+        }
+    }
+
+    /// Carry out `source`'s open loss ruling after the guarded read kept it
+    /// (design: `stage resolve-lost`, section 2). In order, each step keeping
+    /// the ruling open (logged at each power of two) on any doubt:
+    ///
+    /// 1. the guard is healthy (current challenge, every fresh web replica
+    ///    confirmed: every live web replica writes this directory);
+    /// 2. the ruling is open, names this candidate's manifest (else it closes
+    ///    `fenced` only if the locked head left the ruled representation),
+    ///    and the epoch is old enough by the database clock;
+    /// 3. a fresh pinned read misses with the pinned tree intact before and
+    ///    after (a found file closes it `found`);
+    /// 4. evidence: the stager's echo naming its incarnation in this drain's
+    ///    pinned `liveness/`, else the ruling's attestation (neither closes it
+    ///    `no_evidence`; an echo check that could not decide always defers);
+    /// 5. the guard is still healthy;
+    /// 6. `Missing` and `marked_missing` commit together, the head witness
+    ///    and every ruling condition re-checked under the head lock.
+    async fn carry_out_ruling(
+        coordinator: &PostgresFragmentCoordinator,
+        stage: &WriteBehindStage,
+        source: &FragmentDrainCandidate,
+        ruling: &RulingContext,
+    ) {
+        use crate::domain::fragments::stage_loss::LossEvidence;
+        use crate::domain::fragments::stage_loss::LossOutcome;
+        use crate::domain::fragments::stage_loss::LossRulingFence;
+        use crate::domain::fragments::stage_loss::MarkMissingOutcome;
+        let (hash, epoch) = (source.hash(), source.epoch());
+        if !(ruling.hooks.guard_healthy)() {
+            ruling.note_deferred(hash, epoch, "guard_unhealthy");
+            return;
+        }
+        let open = match coordinator.open_loss_ruling(hash, epoch).await {
+            Ok(Some(open)) => open,
+            Ok(None) => {
+                ruling.forget(hash, epoch);
+                return;
+            }
+            Err(_error) => {
+                ruling.note_deferred(hash, epoch, "ruling_read_failed");
+                return;
+            }
+        };
+        if open.manifest_id.as_slice() != source.manifest_id() {
+            // The candidate was read before this pass and may be stale. Only
+            // the locked head decides: `fenced` if it left the ruled
+            // representation, else the ruling stays open for a fresh read.
+            match coordinator
+                .fence_loss_ruling_if_head_moved(open.ruling_id, &ruling.hooks.reader)
+                .await
+            {
+                Ok(LossRulingFence::Fenced) => {
+                    ruling.forget(hash, epoch);
+                    log_ruling_outcome(
+                        hash,
+                        epoch,
+                        Some(open.ruling_id),
+                        LossOutcome::Fenced,
+                        None,
+                    );
+                }
+                Ok(LossRulingFence::NotOpen) => ruling.forget(hash, epoch),
+                Ok(LossRulingFence::StillStaged) => {
+                    ruling.note_deferred(hash, epoch, "candidate_stale");
+                }
+                Err(_error) => ruling.note_deferred(hash, epoch, "fence_check_failed"),
+            }
+            return;
+        }
+        if !open.old_enough {
+            ruling.note_deferred(hash, epoch, "too_young");
+            return;
+        }
+        match stage.ruling_read(hash, epoch, source.object_key()).await {
+            Some(true) => {}
+            Some(false) => {
+                Self::close_ruling(
+                    coordinator,
+                    source,
+                    ruling,
+                    open.ruling_id,
+                    LossOutcome::Found,
+                )
+                .await;
+                return;
+            }
+            None => {
+                ruling.note_deferred(hash, epoch, "read_undecided");
+                return;
+            }
+        }
+        let echoed = match open.stager.clone() {
+            Some(stager) => {
+                let echo = ruling.hooks.stager_echo.clone();
+                lore_base::lore_spawn_blocking!("stage-ruling-echo", move || echo(&stager))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            None => Some(false),
+        };
+        // `None` (a root check failed, the read failed, or the echo task
+        // panicked) always defers, attested or not: an attestation stands in
+        // for missing evidence, never for a check that could not run.
+        let evidence = match echoed {
+            Some(true) => LossEvidence::Echo,
+            Some(false) if open.attested => LossEvidence::None,
+            Some(false) => {
+                Self::close_ruling(
+                    coordinator,
+                    source,
+                    ruling,
+                    open.ruling_id,
+                    LossOutcome::NoEvidence,
+                )
+                .await;
+                return;
+            }
+            None => {
+                ruling.note_deferred(hash, epoch, "echo_undecided");
+                return;
+            }
+        };
+        if !(ruling.hooks.guard_healthy)() {
+            ruling.note_deferred(hash, epoch, "guard_unhealthy");
+            return;
+        }
+        let witness = EpochWitness {
+            hash: hash.to_vec(),
+            epoch,
+            state: FragmentLifecycleState::Staged,
+            manifest_id: Some(source.manifest_id().to_vec()),
+            fence: source.last_fence(),
+        };
+        match coordinator
+            .carry_out_loss_ruling(&witness, open.ruling_id, evidence, &ruling.hooks.reader)
+            .await
+        {
+            Ok(MarkMissingOutcome::Published) => {
+                ruling.forget(hash, epoch);
+                log_ruling_outcome(
+                    hash,
+                    epoch,
+                    Some(open.ruling_id),
+                    LossOutcome::MarkedMissing,
+                    Some(evidence),
+                );
+            }
+            // A new fence on the same Staged epoch (an abandoned promotion)
+            // leaves the ruling valid: the next pass reads a fresh candidate.
+            // A head that left the epoch or manifest is closed `fenced` by
+            // the next refresh.
+            Ok(MarkMissingOutcome::HeadMoved) => {
+                ruling.note_deferred(hash, epoch, "head_moved");
+            }
+            Ok(MarkMissingOutcome::RulingNotEligible) => {
+                ruling.note_deferred(hash, epoch, "ruling_not_eligible");
+            }
+            Err(_error) => ruling.note_deferred(hash, epoch, "mark_failed"),
+        }
     }
 
     async fn promote(

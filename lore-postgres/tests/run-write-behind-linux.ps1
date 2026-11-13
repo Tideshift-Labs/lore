@@ -213,7 +213,9 @@ $libUnixOnlyOffline = @(
     'durability_tests::each_writer_syncs_both_ancestors_even_when_creator_has_not_synced_them',
     'durability_tests::existing_fanout_parent_fsync_failure_refuses_the_second_writer',
     'durability_tests::a_withdrawn_attempt_refuses_its_rename_and_places_nothing',
-    'durability_tests::a_failed_rename_releases_its_claim_so_the_attempt_can_withdraw'
+    'durability_tests::a_failed_rename_releases_its_claim_so_the_attempt_can_withdraw',
+    # `stage resolve-lost` (review D2): a ruling read error is undecided, never absent.
+    'durability_tests::a_ruling_read_error_decides_nothing'
 )
 $libUnixOnlyLive = @(
         'store::immutable_store::fragment_write_behind::adapter_tests::adapter_valid_bytes_with_conflicting_content_flags_cannot_replace_staged_authority',
@@ -232,6 +234,16 @@ $libUnixOnlyLive = @(
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_reservation_over_the_stage_policy_is_internal_not_slow_down',
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::admission_unproven_share_writes_directly_and_an_in_flight_staged_put_refuses',
     'store::immutable_store::fragment_write_behind::adapter_tests::admission_tests::drain_guard_keeps_a_departed_writers_file_staged_and_marks_it_missing_only_where_confirmed',
+    # `stage resolve-lost`: the drain carries out an operator loss ruling.
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_ruling_marks_a_pinned_miss_missing_only_with_a_healthy_guard_and_echo_evidence',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_clean_stop_without_attestation_is_refused_and_an_attested_ruling_marks_it',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_found_file_closes_its_ruling_and_is_promoted',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_split_directory_stager_without_evidence_or_attestation_stays_staged',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::the_ruling_read_misses_only_under_the_intact_pinned_tree',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_guard_that_turns_unhealthy_before_the_mark_keeps_the_ruling_open',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_ruling_read_estale_keeps_the_ruling_open_and_marks_nothing',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::a_ruling_read_eio_keeps_the_ruling_open_and_marks_nothing',
+    'store::immutable_store::fragment_write_behind::adapter_tests::loss_ruling_tests::an_undecided_echo_defers_even_an_attested_ruling',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_observer_completes_inventory_across_more_than_one_bounded_scan',
     'store::immutable_store::fragment_write_behind::adapter_tests::adapter_stalled_put_releases_the_single_domain_connection_and_survives_task_abort',
     'store::immutable_store::fragment_write_behind::adapter_tests::progress_tests::small_worker_batches_advance_past_blocked_and_repeatedly_failing_lower_hashes',

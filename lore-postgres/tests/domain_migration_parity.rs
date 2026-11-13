@@ -61,6 +61,10 @@ const MIGRATIONS_0010: &str = include_str!("../migrations/0010_write_behind_stag
 /// The WP-115 drain guard's stager table. The boot path applies the same file
 /// through `DRAIN_GUARD_SCHEMA`.
 const MIGRATIONS_0011: &str = include_str!("../migrations/0011_write_behind_drain_guard.sql");
+/// `stage resolve-lost`'s operator loss rulings. The boot path applies the same
+/// file through `STAGE_LOSS_SCHEMA`.
+const MIGRATIONS_0012: &str =
+    include_str!("../migrations/0012_write_behind_stage_loss_rulings.sql");
 
 /// The relations that prove `migrations/0001_init.sql` (or the isolated test
 /// fixture) ran here. `lore_locks` is excluded because it also pre-dates
@@ -377,6 +381,10 @@ async fn migration_file_and_boot_time_ensure_schema_produce_identical_domain_cat
         .batch_execute(MIGRATIONS_0011)
         .await
         .expect("apply drain guard migration");
+    migration_client
+        .batch_execute(MIGRATIONS_0012)
+        .await
+        .expect("apply stage loss ruling migration");
 
     // Production boot order: the domain coordinator is built before the lock
     // store plugin connects (`server.rs`), so nothing has created `lore_locks`

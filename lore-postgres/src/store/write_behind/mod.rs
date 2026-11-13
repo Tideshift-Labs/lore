@@ -801,6 +801,42 @@ impl WriteBehindStage {
         Self::staged_read(read, unproven)
     }
 
+    /// `stage resolve-lost`: the drain's own read of one staged file before it
+    /// carries out an operator loss ruling. No absence guard: the ruling is
+    /// what the guard could not decide. `Some(true)` only on Linux, for an
+    /// `ENOENT` beneath the pinned `staged/` with the pinned tree intact (root
+    /// path, `staged/`, `liveness/`) both before and after the read.
+    /// `Some(false)` when the file is there. `None` for anything else, which
+    /// keeps the ruling open.
+    pub async fn ruling_read(&self, hash: &[u8], epoch: i64, object_key: &str) -> Option<bool> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        let resolved = self.root.resolve(hash, epoch, object_key).ok()?;
+        if !self.tree_intact_blocking().await {
+            return None;
+        }
+        let read = self.root.read_regular(&resolved).await;
+        if !self.tree_intact_blocking().await {
+            return None;
+        }
+        match read {
+            Ok(None) => Some(true),
+            Ok(Some(_)) => Some(false),
+            Err(_) => None,
+        }
+    }
+
+    /// [`Self::pinned_tree_intact`] off the async worker. A join failure is
+    /// `false`.
+    async fn tree_intact_blocking(&self) -> bool {
+        let root = self.root.clone();
+        lore_base::lore_spawn_blocking!("stage-ruling-tree-check", move || root
+            .liveness_tree_intact())
+        .await
+        .unwrap_or(false)
+    }
+
     /// [`Self::read_staged`] for a foreground GET.
     ///
     /// Takes a slot from the GET pool, waiting up to

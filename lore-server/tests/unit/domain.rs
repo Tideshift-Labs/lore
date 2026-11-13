@@ -10,6 +10,7 @@ mod p12_tests;
 mod remote_mutable_store;
 mod require_domain_enforcement;
 mod schema_operator;
+mod stage_operator;
 
 use std::sync::Arc;
 use std::time::SystemTime;

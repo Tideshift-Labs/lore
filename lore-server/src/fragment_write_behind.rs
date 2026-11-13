@@ -19,6 +19,7 @@ use lore_postgres::store::fragment_write_behind::CleanupSkips;
 use lore_postgres::store::fragment_write_behind::ConfirmedStagers;
 use lore_postgres::store::fragment_write_behind::DrainAbsenceCounts;
 use lore_postgres::store::fragment_write_behind::FragmentWriteBehindHandle;
+use lore_postgres::store::fragment_write_behind::LossRulingHooks;
 use lore_postgres::store::fragment_write_behind::MAX_DRAIN_CONCURRENCY;
 use lore_postgres::store::fragment_write_behind::ObserveStep;
 use lore_postgres::store::fragment_write_behind::ObserveTrace;
@@ -1388,6 +1389,10 @@ pub(crate) trait StageAttach {
         confirmed: ConfirmedStagers,
         min_staged_age: Duration,
     ) -> Option<Arc<DrainAbsenceCounts>>;
+    /// `stage resolve-lost`: on the drain only, the hooks its passes need to
+    /// carry out operator loss rulings. `false` if hooks were already
+    /// attached.
+    fn loss_rulings(&self, hooks: LossRulingHooks) -> bool;
     /// The liveness files of the stage under `root` and a check that the
     /// stage tree is still the one pinned at open: the pinned `liveness/`
     /// directory and `WriteBehindStage::pinned_tree_intact` in production.
@@ -1417,6 +1422,10 @@ impl StageAttach for FragmentWriteBehindHandle {
         min_staged_age: Duration,
     ) -> Option<Arc<DrainAbsenceCounts>> {
         self.attach_drain_absence_guard(confirmed, min_staged_age)
+    }
+
+    fn loss_rulings(&self, hooks: LossRulingHooks) -> bool {
+        self.attach_loss_rulings(hooks)
     }
 
     fn liveness(
@@ -1466,7 +1475,7 @@ pub(crate) fn stage_liveness_for_role(
         let liveness = Arc::new(
             StageLiveness::new(replica_id)
                 .with_role(lore_postgres::domain::fragments::StageLivenessRole::Drain)
-                .with_root_check(root_check),
+                .with_root_check(root_check.clone()),
         );
         let reader = liveness.clone();
         let Some(counts) = attach.drain_absence_guard(
@@ -1476,6 +1485,30 @@ pub(crate) fn stage_liveness_for_role(
             bail!("the drain absence guard was already attached");
         };
         liveness.set_absence_counts(counts);
+        // `stage resolve-lost`: the drain alone carries out operator loss
+        // rulings, with its own guard state and its own pinned `liveness/`
+        // for echo evidence. Web replicas never get these hooks.
+        let healthy = liveness.clone();
+        let echo_markers = markers.clone();
+        let echo_root = root_check.clone();
+        let Some(reader) = lore_postgres::domain::fragments::StagerIdentity::new(
+            liveness.replica_id(),
+            liveness.incarnation(),
+        ) else {
+            bail!("the stage liveness identity does not fit the ruling table");
+        };
+        if !attach.loss_rulings(LossRulingHooks {
+            guard_healthy: Arc::new(move || !healthy.absence_unproven()),
+            stager_echo: Arc::new(move |stager| {
+                crate::stage_liveness::stager_echo_evidence(&echo_markers, &echo_root, stager)
+            }),
+            reader: lore_postgres::domain::fragments::stage_loss::LossRulingReader {
+                replica_id: reader.replica_id,
+                incarnation: reader.incarnation,
+            },
+        }) {
+            bail!("the loss ruling hooks were already attached");
+        }
         crate::stage_liveness::spawn_marker_thread(
             &liveness,
             markers,
