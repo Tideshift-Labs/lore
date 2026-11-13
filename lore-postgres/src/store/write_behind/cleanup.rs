@@ -75,8 +75,11 @@ impl StageFileCandidate {
 
 #[derive(Default)]
 pub struct StageFileScanner {
+    /// Retained cursors. Each stream's own descriptor is also the directory
+    /// the walk stats and opens in: a child is the confined descriptor itself,
+    /// the root a fresh open of `.` so its read offset is not shared.
     #[cfg(unix)]
-    directories: Vec<(std::os::fd::OwnedFd, rustix::fs::Dir, std::path::PathBuf)>,
+    directories: Vec<(rustix::fs::Dir, std::path::PathBuf)>,
     #[cfg(unix)]
     cycle_bytes: u64,
     #[cfg(unix)]
@@ -167,15 +170,16 @@ impl StageFileScanner {
             self.cycle_files = 0;
             self.cycle_unknown = 0;
             // Include unknown files beside the two normal entry points too.
+            // `read_from` opens `.` again: the root descriptor is a duplicate
+            // of the pinned one, and a stream on it would share its offset.
             let entries = rustix::fs::Dir::read_from(&root_directory)
                 .map_err(|error| WriteBehindError::io("stage inventory", &error.into()))?;
-            self.directories
-                .push((root_directory.into(), entries, std::path::PathBuf::new()));
+            self.directories.push((entries, std::path::PathBuf::new()));
         }
         let inventory_root = root.inventory_root();
         let mut found = Vec::new();
         for _ in 0..limit {
-            let Some((directory, entries, relative)) = self.directories.last_mut() else {
+            let Some((entries, relative)) = self.directories.last_mut() else {
                 break;
             };
             let entry = match super::root::inventory_injected(
@@ -223,7 +227,8 @@ impl StageFileScanner {
                 inventory_root,
                 relative,
             )
-            .and_then(|()| rustix::fs::statat(&*directory, name, AtFlags::SYMLINK_NOFOLLOW))
+            .and_then(|()| entries.fd())
+            .and_then(|directory| rustix::fs::statat(directory, name, AtFlags::SYMLINK_NOFOLLOW))
             {
                 Ok(metadata) => metadata,
                 Err(Errno::NOENT) => continue,
@@ -271,9 +276,9 @@ impl StageFileScanner {
                     relative,
                 );
                 #[cfg(target_os = "linux")]
-                let child = injected.and_then(|()| {
+                let child = injected.and_then(|()| entries.fd()).and_then(|directory| {
                     rustix::fs::openat2(
-                        &*directory,
+                        directory,
                         name,
                         flags,
                         Mode::empty(),
@@ -283,8 +288,9 @@ impl StageFileScanner {
                     )
                 });
                 #[cfg(not(target_os = "linux"))]
-                let child = injected
-                    .and_then(|()| rustix::fs::openat(&*directory, name, flags, Mode::empty()));
+                let child = injected.and_then(|()| entries.fd()).and_then(|directory| {
+                    rustix::fs::openat(directory, name, flags, Mode::empty())
+                });
                 // A directory purged between the stat and the open is absent,
                 // exactly like an entry purged before the stat. On NFS, an
                 // open in a held fan-out directory that was removed is ESTALE.
@@ -345,12 +351,16 @@ impl StageFileScanner {
                     // one; the next traversal counts it.
                     continue;
                 }
+                // The stream takes the confined descriptor itself: no second
+                // open of `.`. Only this walk reads it, so no offset is shared.
+                // A child removed since the open reads as empty or ESTALE at
+                // the next entry, handled there like this site.
                 let entries = match super::root::inventory_injected(
                     "stage inventory child read",
                     inventory_root,
                     &path,
                 )
-                .and_then(|()| rustix::fs::Dir::read_from(&child))
+                .and_then(|()| rustix::fs::Dir::new(child))
                 {
                     Ok(entries) => entries,
                     Err(Errno::NOENT) => continue,
@@ -371,7 +381,7 @@ impl StageFileScanner {
                         ));
                     }
                 };
-                self.directories.push((child, entries, path));
+                self.directories.push((entries, path));
                 continue;
             }
             if !kind.is_file() {

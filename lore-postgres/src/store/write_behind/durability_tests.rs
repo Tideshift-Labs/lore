@@ -1381,6 +1381,172 @@ async fn inventory_other_errors_on_a_fanout_directory_fail_the_step() {
     }
 }
 
+/// Steps of a full walk at a limit of one, which is its number of passes.
+fn inventory_passes(stage: &crate::store::write_behind::WriteBehindStage) -> (usize, u64) {
+    let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        scanner.scan(stage, 1).unwrap();
+        if !scanner.walk_in_progress() {
+            break;
+        }
+        assert!(steps < 1000, "the walk did not complete");
+    }
+    let (_, _, files, _) = scanner.physical_observation().unwrap();
+    (steps, files)
+}
+
+/// The walk charges every pass: each entry (`.` and `..` included), each end
+/// of a directory, and an entry that is gone by its stat or its open. With a
+/// limit of one, the number of steps in a full walk is exactly that count.
+#[tokio::test]
+async fn inventory_charges_every_pass_including_dot_and_removed_entries() {
+    let (_scratch, stage) = inventory_fixture().await;
+    let canonical = stage.root().inventory_root().to_path_buf();
+    // An empty fan-out directory, a second leaf, and a stray file at the root.
+    std::fs::create_dir_all(canonical.join("staged/ee/ee")).unwrap();
+    std::fs::create_dir_all(canonical.join("staged/ab/cd")).unwrap();
+    std::fs::write(canonical.join("staged/ab/cd/stray"), b"x").unwrap();
+    std::fs::write(canonical.join("stray"), b"x").unwrap();
+    let (mut entries, mut directories) = (0usize, 0usize);
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative) = stack.pop() {
+        directories += 1;
+        for entry in std::fs::read_dir(canonical.join(&relative)).unwrap() {
+            let entry = entry.unwrap();
+            entries += 1;
+            let child = relative.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() && child != Path::new(super::LIVENESS_DIR) {
+                stack.push(child);
+            }
+        }
+    }
+    let passes = entries + 3 * directories;
+    let (steps, files) = inventory_passes(&stage);
+    assert_eq!(
+        steps, passes,
+        "{entries} entries, and per directory `.`, `..` and its end ({directories})"
+    );
+
+    // `stray` is gone by its stat: still one pass, and not counted as a file.
+    let removed = Estale::inject_errno(
+        "stage inventory stat",
+        canonical.join("staged/ab/cd"),
+        1,
+        rustix::io::Errno::NOENT,
+    );
+    let (steps, removed_files) = inventory_passes(&stage);
+    assert_eq!(removed.hits(), 1, "the stat was reached");
+    assert_eq!(removed_files, files - 1, "the entry was skipped");
+    assert_eq!(steps, passes, "a removed entry is still charged");
+    drop(removed);
+
+    // `staged/ee/ee` is gone by its open: its entry is charged, and its own
+    // `.`, `..` and end are never read.
+    let removed = Estale::inject_errno(
+        "stage inventory descend",
+        canonical.join("staged/ee"),
+        1,
+        rustix::io::Errno::NOENT,
+    );
+    let (steps, _) = inventory_passes(&stage);
+    assert_eq!(removed.hits(), 1, "the open was reached");
+    assert_eq!(
+        steps,
+        passes - 3,
+        "a directory removed by its open is still charged"
+    );
+}
+
+/// Descriptors the walk holds under `staged/`, read from `/proc/self/fd`.
+/// Path-scoped to this case's own scratch root, so parallel cases never count.
+#[cfg(target_os = "linux")]
+fn inventory_fds_under(staged: &Path) -> Vec<PathBuf> {
+    let prefix = staged.join("");
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| {
+            target
+                .as_os_str()
+                .as_encoded_bytes()
+                .starts_with(prefix.as_os_str().as_encoded_bytes())
+        })
+        .collect()
+}
+
+/// The walk owns each child's descriptor through its read stream. No path
+/// leaks one: a fan-out skipped as stale, a step error, or a walk dropped
+/// part-way. The positive control proves the probe sees held descriptors.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn inventory_releases_every_child_descriptor_on_skip_error_and_drop() {
+    for (site, directory, errno, fails) in [
+        (
+            "stage inventory child stat",
+            "staged/ab",
+            rustix::io::Errno::STALE,
+            false,
+        ),
+        (
+            "stage inventory child stat",
+            "staged/ab/ab",
+            rustix::io::Errno::STALE,
+            false,
+        ),
+        (
+            "stage inventory child read",
+            "staged/ab/ab",
+            rustix::io::Errno::STALE,
+            false,
+        ),
+        (
+            "stage inventory child stat",
+            "staged/ab",
+            rustix::io::Errno::IO,
+            true,
+        ),
+        (
+            "stage inventory child read",
+            "staged/ab/ab",
+            rustix::io::Errno::IO,
+            true,
+        ),
+    ] {
+        let (_scratch, stage) = inventory_fixture().await;
+        let canonical = stage.root().inventory_root().to_path_buf();
+        let staged = canonical.join("staged");
+        let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+        let injected = Estale::inject_errno(site, canonical.join(directory), 1, errno);
+        let result = inventory_walk(&mut scanner, &stage);
+        assert!(injected.hits() >= 1, "{site} on {directory}: injected");
+        assert_eq!(result.is_err(), fails, "{site} on {directory}: {result:?}");
+        assert_eq!(
+            inventory_fds_under(&staged),
+            Vec::<PathBuf>::new(),
+            "{site} on {directory}: no child descriptor leaked"
+        );
+    }
+
+    // Dropped part-way, while it holds `staged/` and a fan-out child.
+    let (_scratch, stage) = inventory_fixture().await;
+    let staged = stage.root().inventory_root().join("staged");
+    let mut scanner = crate::store::write_behind::cleanup::StageFileScanner::default();
+    let mut held = Vec::new();
+    for _ in 0..64 {
+        scanner.scan(&stage, 1).unwrap();
+        held = inventory_fds_under(&staged);
+        if !held.is_empty() {
+            break;
+        }
+    }
+    assert!(scanner.walk_in_progress());
+    assert!(!held.is_empty(), "the probe sees a held child descriptor");
+    drop(scanner);
+    assert_eq!(inventory_fds_under(&staged), Vec::<PathBuf>::new());
+}
+
 /// A `staged/` recreated under the pin still fails the walk, as before.
 #[tokio::test]
 async fn inventory_under_a_recreated_staged_directory_fails() {
