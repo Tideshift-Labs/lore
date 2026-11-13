@@ -1522,11 +1522,15 @@ impl DrainAbsenceCounts {
 
     /// Count one decision. A kept file logs the first time and then at each
     /// power of two, so a lasting cause stays visible without a line per
-    /// pass. `error` is the cause of a failed stager read, if any.
+    /// pass. Each line names the file of that decision (`hash`, `epoch`) as
+    /// one sample; it is not the full list of kept files. `error` is the
+    /// cause of a failed stager read, if any.
     fn note(
         counter: &std::sync::atomic::AtomicU64,
         cause: &'static str,
         kept: bool,
+        hash: &[u8],
+        epoch: i64,
         error: Option<&crate::domain::errors::DomainError>,
     ) {
         let count = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1534,6 +1538,8 @@ impl DrainAbsenceCounts {
             tracing::warn!(
                 cause,
                 count,
+                hash = %hex::encode(hash),
+                epoch,
                 error = error.map(tracing::field::display),
                 "a staged file was not found and is not proven gone; the file stays Staged \
                  and is retried, never marked Missing"
@@ -1569,11 +1575,25 @@ impl crate::store::write_behind::StagedAbsenceGuard for DrainAbsenceGuard {
                 .await
             {
                 Ok(StagerAbsence::Confirmed) => {
-                    DrainAbsenceCounts::note(&self.counts.proven, "proven", false, None);
+                    DrainAbsenceCounts::note(
+                        &self.counts.proven,
+                        "proven",
+                        false,
+                        hash,
+                        epoch,
+                        None,
+                    );
                     true
                 }
                 Ok(StagerAbsence::TooRecent) => {
-                    DrainAbsenceCounts::note(&self.counts.too_recent, "too_recent", true, None);
+                    DrainAbsenceCounts::note(
+                        &self.counts.too_recent,
+                        "too_recent",
+                        true,
+                        hash,
+                        epoch,
+                        None,
+                    );
                     false
                 }
                 Ok(StagerAbsence::Unconfirmed) => {
@@ -1581,12 +1601,21 @@ impl crate::store::write_behind::StagedAbsenceGuard for DrainAbsenceGuard {
                         &self.counts.unconfirmed,
                         "stager_unconfirmed",
                         true,
+                        hash,
+                        epoch,
                         None,
                     );
                     false
                 }
                 Ok(StagerAbsence::NoStager) => {
-                    DrainAbsenceCounts::note(&self.counts.no_stager, "no_stager", true, None);
+                    DrainAbsenceCounts::note(
+                        &self.counts.no_stager,
+                        "no_stager",
+                        true,
+                        hash,
+                        epoch,
+                        None,
+                    );
                     false
                 }
                 Err(error) => {
@@ -1594,6 +1623,8 @@ impl crate::store::write_behind::StagedAbsenceGuard for DrainAbsenceGuard {
                         &self.counts.failed,
                         "stager_read_failed",
                         true,
+                        hash,
+                        epoch,
                         Some(&error),
                     );
                     false

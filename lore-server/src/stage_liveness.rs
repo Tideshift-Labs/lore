@@ -388,8 +388,12 @@
 //! files are found and promoted). A file that is truly gone and whose stager
 //! has left stays `Staged` after a drain restart: each pass retries it, and a
 //! GET of it answers `SlowDown`. No command marks it `Missing` today; a GET
-//! on a web replica that confirmed the stager before it left does. Record
-//! the hashes from the log line and escalate.
+//! on a web replica that confirmed the stager before it left does. Each kept
+//! log line names one sample file (`hash`, `epoch`), not every kept file.
+//! The full list is in the database: the staged heads with a live custody
+//! row whose stager is absent or not fresh. A coming
+//! `loreserver stage resolve-lost list` command will print it. Record that
+//! list and escalate.
 //!
 //! **Web replicas run the same guard.** A web replica proven against one
 //! drain keeps that proof for its life, so in the same split (web-a latched
