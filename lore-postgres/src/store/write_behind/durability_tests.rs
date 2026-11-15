@@ -769,13 +769,19 @@ async fn purge_keeps_a_fanout_directory_that_still_holds_another_file() {
 }
 
 /// A purge may remove a fan-out directory a concurrent finalizer has just
-/// made and not yet renamed into. The finalizer must redo step 1, not fail.
+/// made and not yet renamed into. The finalizer redoes step 1, bounded by
+/// `PLACEMENT_ATTEMPTS`, so a finalize fails only with the retryable give-up,
+/// and never once no purge runs beside it.
 ///
-/// The name holds on a local disk. On NFS a finalize may still give up after
-/// `PLACEMENT_ATTEMPTS` and answer a retryable `SlowDown`, with no data lost:
-/// measured 8 of 30 runs with `lookupcache=positive`.
+/// "Never fails" does not hold even on a local disk: this purger is a tight
+/// loop on one leaf, and it can remove the leaf in all three windows between
+/// step 1 and the rename. Measured in the Linux runner's container (overlay
+/// `/tmp`, rename `ENOENT`): 1 of 100 runs idle, 12 of 50 under CPU load.
+/// The bound and its `SlowDown` are the contract (`finalize_blocking`;
+/// `finalize_retries_a_fanout_estale_a_bounded_number_of_times`), so the test
+/// retries a give-up the way the PUT's caller does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn concurrent_purges_in_the_same_fanout_never_fail_a_finalize() {
+async fn concurrent_purges_in_the_same_fanout_fail_a_finalize_only_retryably() {
     let scratch = Scratch::new();
     let root = ConfinedRoot::open(&scratch.0).unwrap();
     let hash = [0xab; 32];
@@ -791,13 +797,44 @@ async fn concurrent_purges_in_the_same_fanout_never_fail_a_finalize() {
     });
     for epoch in 0..400 {
         let resolved = staged_file(&root, &hash, epoch);
-        crate::store::write_behind::finalize::finalize(
-            &root,
-            &resolved,
-            &bytes::Bytes::from_static(b"x"),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("finalize {epoch} failed: {error}"));
+        loop {
+            // Read before the attempt: a purger finished by then cannot race it.
+            let purger_done = purger.is_finished();
+            let attempt = crate::store::write_behind::finalize::finalize(
+                &root,
+                &resolved,
+                &bytes::Bytes::from_static(b"x"),
+            )
+            .await;
+            let Err(error) = attempt else { break };
+            assert!(
+                !purger_done,
+                "finalize {epoch} failed with no purge running: {error}"
+            );
+            assert!(
+                matches!(
+                    error,
+                    WriteBehindError::Io {
+                        operation: "staging rename" | "fanout create" | "fanout open",
+                        kind: std::io::ErrorKind::NotFound,
+                    }
+                ),
+                "finalize {epoch}: only the fan-out give-up is allowed, got {error:?}"
+            );
+            assert!(
+                error.store_error().is_slow_down(),
+                "finalize {epoch}: the give-up is retryable"
+            );
+            assert!(
+                !resolved.path().exists(),
+                "finalize {epoch}: a give-up places nothing"
+            );
+            assert!(
+                !temporary_for(&scratch, &resolved).exists(),
+                "finalize {epoch}: a give-up removes its temporary file"
+            );
+        }
+        assert_eq!(std::fs::read(resolved.path()).unwrap(), b"x");
         root.remove_placement_blocking(&resolved, false).unwrap();
     }
     purger.join().unwrap();
