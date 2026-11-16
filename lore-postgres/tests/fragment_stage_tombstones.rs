@@ -967,11 +967,17 @@ async fn two_replicas_racing_one_headless_orphan_make_one_charge() {
 ///
 /// Each round holds the rival's insert open, queues the reclaim's reserve behind
 /// it (`pg_stat_activity` shows the Lock wait), then sends the rival's commit and
-/// its cleanup (delete plus refund) in ONE round trip. The reclaim wakes on the
-/// commit and meets a deleted row as often as the scheduler allows; the
-/// interleaving between the two backends cannot be pinned further without
-/// production hooks, so every round asserts the classification, which must hold
-/// whichever backend is first.
+/// its cleanup (delete plus refund) in ONE round trip.
+///
+/// Two outcomes are legal. The reserve is `INSERT ... ON CONFLICT DO NOTHING`,
+/// and Postgres makes that waiter re-check the unique index after the rival's
+/// transaction ends. If the re-check sees the committed row, the reclaim loses
+/// and must be told the key is taken (the regression this test guards). If the
+/// rival's delete has already committed, there is no conflict: the reclaim holds
+/// its own fresh reservation, which is a correct serialization. Every round
+/// accepts either outcome; the loop asserts the loser path ran at least once.
+/// The won branch is rare (about 0.2-1% of rounds), so its checks run in only
+/// some runs.
 #[tokio::test]
 #[ignore = "requires owned live PostgreSQL"]
 async fn a_loser_whose_winner_already_deleted_its_row_is_still_told_the_key_is_taken() {
@@ -984,6 +990,7 @@ async fn a_loser_whose_winner_already_deleted_its_row_is_still_told_the_key_is_t
             eprintln!("rival postgres connection error: {error}");
         }
     });
+    let (mut taken, mut won) = (0u32, 0u32);
     for round in 0..25u8 {
         let hash = [0xE0 + (round % 16); 32];
         let epoch = 9300 + i64::from(round);
@@ -1000,6 +1007,11 @@ async fn a_loser_whose_winner_already_deleted_its_row_is_still_told_the_key_is_t
             ))
             .await
             .unwrap();
+        let rival_fence: i64 = rival
+            .query_one("SELECT currval('lore_fragment_fence_seq')", &[])
+            .await
+            .unwrap()
+            .get(0);
         let release = async {
             tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -1036,13 +1048,60 @@ async fn a_loser_whose_winner_already_deleted_its_row_is_still_told_the_key_is_t
                 .unwrap();
         };
         let (result, ()) = tokio::join!(env.coordinator.begin_stage_cleanup(&hash, epoch), release);
-        let error = result.expect_err("the loser holds no reservation");
-        assert!(
-            is_stage_custody_key_taken(&error),
-            "round {round}: the loser is told the key is taken, not {error:?}"
-        );
+        match result {
+            Err(error) => {
+                assert!(
+                    is_stage_custody_key_taken(&error),
+                    "round {round}: the loser is told the key is taken, not {error:?}"
+                );
+                assert_eq!(
+                    custody_rows(&env.direct, &hash, epoch).await,
+                    0,
+                    "round {round}: the loser holds no reservation"
+                );
+                taken += 1;
+            }
+            Ok(Some(intent)) => {
+                // The rival's delete committed before the re-check: the key was
+                // free, so the reclaim must hold its OWN fresh reservation.
+                let (rows, own): (i64, i64) = {
+                    let row = env
+                        .direct
+                        .query_one(
+                            "SELECT count(*), count(*) FILTER (WHERE operation_fence <> $3) \
+                             FROM lore_fragment_stage_custody WHERE hash=$1 AND epoch=$2",
+                            &[&hash.as_slice(), &epoch, &rival_fence],
+                        )
+                        .await
+                        .unwrap();
+                    (row.get(0), row.get(1))
+                };
+                assert_eq!(
+                    (rows, own),
+                    (1, 1),
+                    "round {round}: the reclaim holds one row with a fence other than the rival's {rival_fence}"
+                );
+                let held = usage(&env.coordinator).await;
+                assert_eq!(
+                    (held.0, held.1),
+                    (ORPHAN_CHARGE, 1),
+                    "round {round}: one live reservation at the full orphan charge"
+                );
+                stage_invariant::assert_stage_ledger_matches_custody(&env.url).await;
+                env.coordinator.commit_stage_cleanup(&intent).await.unwrap();
+                won += 1;
+            }
+            Ok(None) => panic!("round {round}: a headless orphan reclaim is never refused"),
+        }
         assert_eq!(custody_rows(&env.direct, &hash, epoch).await, 0);
         assert_eq!(usage(&env.coordinator).await, (0, 0, 0, 0), "round {round}");
         stage_invariant::assert_stage_ledger_matches_custody(&env.url).await;
     }
+    eprintln!(
+        "reclaim told the key was taken: {taken}; reclaim won a freed key: {won}; of 25 rounds"
+    );
+    assert!(
+        taken > 0,
+        "the loser path never ran in 25 rounds (won {won}); the race is not exercised"
+    );
 }
