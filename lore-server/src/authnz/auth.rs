@@ -21,6 +21,7 @@ use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
+use lore_telemetry::METRICS_SUCCESS_ATTRIBUTE_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_transport::auth::ucs_auth::grpc_endpoint;
@@ -441,20 +442,71 @@ impl AuthChannel {
 /// [`AUTH_DEADLINE`]. A timeout becomes an [`auth_unavailable_status`], which
 /// [`is_connection_failure`] matches (it has a source), and which every
 /// caller's error mapping passes on as a failure, never an allow.
+///
+/// FORK-LOCAL (Tideshift): a timeout drops `call` before its `timed!` records,
+/// so `on_timeout` gets the time the call ran instead (production passes
+/// [`record_auth_timeout`]). It is not called when `call` finishes. The time
+/// is wall-clock (`std::time::Instant`), as `timed!` measures it.
+#[lore_macro::test_pub]
 async fn within_deadline<T>(
     rpc: &str,
     started: tokio::time::Instant,
     allowance: Duration,
+    on_timeout: impl FnOnce(Duration),
     call: impl Future<Output = LoreAuthApiResult<T>>,
 ) -> LoreAuthApiResult<T> {
+    let call_started = Instant::now();
     tokio::time::timeout_at(started + allowance, call)
         .await
         .unwrap_or_else(|_elapsed| {
             debug!("lore auth {rpc} did not answer within {allowance:?}");
+            on_timeout(call_started.elapsed());
             Err(auth_unavailable_status(format!(
                 "lore auth service did not answer {rpc} within {allowance:?}"
             )))
         })
+}
+
+/// FORK-LOCAL (Tideshift): the `operation_duration` label that tells an auth
+/// RPC this module timed out (`true`, beside `success=false`) from one that
+/// finished (`false`, beside `timed!`'s own `success`).
+pub const AUTH_TIMED_OUT_ATTRIBUTE_NAME: &str = "timed_out";
+
+const AUTH_METRICS_NAMESPACE: &str = "urc.authnz.urc_auth";
+
+/// The auth RPC instruments, without a client: what a timeout records through.
+struct AuthRpcInstruments;
+
+impl InstrumentProvider for AuthRpcInstruments {
+    fn namespace(&self) -> &'static str {
+        AUTH_METRICS_NAMESPACE
+    }
+}
+
+/// The labels `timed!` gets for an auth RPC that finished; it adds `success`.
+#[lore_macro::test_pub]
+fn answered_labels(rpc: &'static str) -> LabelArray {
+    let mut labels = AuthRpcInstruments.get_labels_for_operation_context(rpc);
+    labels.push(KeyValue::new(AUTH_TIMED_OUT_ATTRIBUTE_NAME, false));
+    labels
+}
+
+/// The labels for an auth RPC this module timed out: the same keys as
+/// [`answered_labels`] plus `success`, so one series set holds both.
+#[lore_macro::test_pub]
+fn timed_out_labels(rpc: &'static str) -> LabelArray {
+    let mut labels = AuthRpcInstruments.get_labels_for_operation_context(rpc);
+    labels.push(KeyValue::new(AUTH_TIMED_OUT_ATTRIBUTE_NAME, true));
+    labels.push(KeyValue::new(METRICS_SUCCESS_ATTRIBUTE_NAME, false));
+    labels
+}
+
+/// Records a timed-out auth RPC in the `operation_duration` histogram its
+/// answered calls go to.
+fn record_auth_timeout(rpc: &'static str, elapsed: Duration) {
+    AuthRpcInstruments
+        .latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME)
+        .record(elapsed.as_millis() as f64, &timed_out_labels(rpc));
 }
 
 /// One caller's handle on an [`AuthChannel`]'s connection, for one call: the
@@ -511,6 +563,7 @@ impl AuthClient<'_> {
             "check_user_permission",
             self.started,
             self.allowance,
+            |elapsed| record_auth_timeout("check_user_permission", elapsed),
             self.helper.check_user_permission(request),
         )
         .await;
@@ -525,6 +578,7 @@ impl AuthClient<'_> {
             "lookup_user_permissions",
             self.started,
             self.allowance,
+            |elapsed| record_auth_timeout("lookup_user_permissions", elapsed),
             self.helper.lookup_user_permissions(request),
         )
         .await;
@@ -543,7 +597,7 @@ impl LoreAuthClientHelper {
     ) -> LoreAuthApiResult<LookupUserPermissionsResponse> {
         timed!(
             self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
-            &self.get_labels_for_operation_context("lookup_user_permissions"),
+            &answered_labels("lookup_user_permissions"),
             self.client.lookup_user_permissions(request).await
         )
         .result
@@ -555,7 +609,7 @@ impl LoreAuthClientHelper {
     ) -> LoreAuthApiResult<CheckUserPermissionResponse> {
         timed!(
             self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
-            &self.get_labels_for_operation_context("check_user_permission"),
+            &answered_labels("check_user_permission"),
             self.client.check_user_permission(request).await
         )
         .result
@@ -564,6 +618,6 @@ impl LoreAuthClientHelper {
 
 impl InstrumentProvider for LoreAuthClientHelper {
     fn namespace(&self) -> &'static str {
-        "urc.authnz.urc_auth"
+        AUTH_METRICS_NAMESPACE
     }
 }

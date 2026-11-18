@@ -25,11 +25,16 @@ use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::authnz::auth::AUTH_CONNECT_TIMEOUT;
 use lore_server::authnz::auth::AUTH_DEADLINE;
 use lore_server::authnz::auth::AUTH_OUTAGE_HOLD;
+use lore_server::authnz::auth::AUTH_TIMED_OUT_ATTRIBUTE_NAME;
 use lore_server::authnz::auth::AuthChannel;
+use lore_server::authnz::auth::answered_labels;
 use lore_server::authnz::auth::is_auth_unavailable;
+use lore_server::authnz::auth::timed_out_labels;
+use lore_server::authnz::auth::within_deadline;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::VerifiedToken;
+use opentelemetry::KeyValue;
 use tokio::sync::oneshot;
 use tokio_stream::StreamExt;
 use tonic::codegen::*;
@@ -766,4 +771,117 @@ fn the_auth_deadline_fits_under_the_desktop_budget_and_over_the_dial_ceiling() {
         "{AUTH_DEADLINE:?}"
     );
     assert!(AUTH_DEADLINE > AUTH_CONNECT_TIMEOUT, "{AUTH_DEADLINE:?}");
+}
+
+// FORK-LOCAL (Tideshift): a timed-out auth RPC is recorded in `operation_duration`.
+// The histogram itself is process-global, so these pin the recorder wiring of
+// `within_deadline` and the label builders. `within_deadline` measures the call
+// with `std::time::Instant`, which paused tokio time does not move, so the
+// timeout test runs in real time with a short allowance.
+
+fn answered<T>(value: T) -> Result<tonic::Response<T>, tonic::Status> {
+    Ok(tonic::Response::new(value))
+}
+
+#[tokio::test]
+async fn within_deadline_records_a_timeout_once_with_the_time_the_call_ran() {
+    let allowance = Duration::from_millis(150);
+    let recorded = std::sync::Mutex::new(Vec::new());
+    let result = within_deadline(
+        "check_user_permission",
+        tokio::time::Instant::now(),
+        allowance,
+        |elapsed| recorded.lock().unwrap().push(elapsed),
+        std::future::pending::<Result<tonic::Response<()>, tonic::Status>>(),
+    )
+    .await;
+    let status = result.unwrap_err();
+    assert!(is_auth_unavailable(&status), "{status:?}");
+    let recorded = recorded.into_inner().unwrap();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert!(
+        recorded[0] >= allowance - Duration::from_millis(20),
+        "{:?}",
+        recorded[0]
+    );
+    assert!(
+        recorded[0] < allowance + Duration::from_secs(5),
+        "{:?}",
+        recorded[0]
+    );
+}
+
+#[tokio::test]
+async fn within_deadline_does_not_record_a_call_that_finishes() {
+    let calls = AtomicUsize::new(0);
+    let allowance = Duration::from_secs(30);
+
+    let ok = within_deadline(
+        "check_user_permission",
+        tokio::time::Instant::now(),
+        allowance,
+        |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        },
+        async { answered(7_u8) },
+    )
+    .await;
+    assert_eq!(ok.unwrap().into_inner(), 7);
+
+    let err = within_deadline(
+        "check_user_permission",
+        tokio::time::Instant::now(),
+        allowance,
+        |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+        },
+        async { Err::<tonic::Response<()>, _>(tonic::Status::permission_denied("no")) },
+    )
+    .await;
+    let status = err.unwrap_err();
+    assert_eq!(status.code(), tonic::Code::PermissionDenied);
+    assert!(!is_auth_unavailable(&status), "{status:?}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+fn key_set(labels: &[KeyValue]) -> std::collections::BTreeSet<String> {
+    labels.iter().map(|label| label.key.to_string()).collect()
+}
+
+#[test]
+fn the_auth_label_builders_mark_timeouts_and_share_one_key_set() {
+    assert_eq!(AUTH_TIMED_OUT_ATTRIBUTE_NAME, "timed_out");
+    let answered = answered_labels("check_user_permission");
+    let timed_out = timed_out_labels("check_user_permission");
+
+    let value = |labels: &[KeyValue], key: &str| {
+        labels
+            .iter()
+            .find(|label| label.key.as_str() == key)
+            .map(|label| label.value.clone())
+    };
+    for labels in [&answered[..], &timed_out[..]] {
+        assert_eq!(
+            value(labels, "context"),
+            Some(opentelemetry::Value::from("check_user_permission"))
+        );
+    }
+    assert_eq!(
+        value(&answered, "timed_out"),
+        Some(opentelemetry::Value::from(false))
+    );
+    assert_eq!(value(&answered, "success"), None, "timed! adds success");
+    assert_eq!(
+        value(&timed_out, "timed_out"),
+        Some(opentelemetry::Value::from(true))
+    );
+    assert_eq!(
+        value(&timed_out, "success"),
+        Some(opentelemetry::Value::from(false))
+    );
+
+    // Once `timed!` adds `success` to an answered call, both land in one series set.
+    let mut answered_keys = key_set(&answered);
+    assert!(answered_keys.insert("success".to_string()));
+    assert_eq!(answered_keys, key_set(&timed_out));
 }
