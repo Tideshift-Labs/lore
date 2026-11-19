@@ -90,6 +90,12 @@ pub struct BranchPushArgs {
     /// Allow the server to fast-forward merge if the target branch head has moved
     #[clap(long)]
     fast_forward_merge: bool,
+
+    /// Push even when another user holds a lock on a file the push changes. Without it, such a
+    /// push is refused before anything is sent, naming each file and its holder. Locks are
+    /// advisory: when the lock lookup cannot answer, the push goes ahead with a warning.
+    #[clap(long)]
+    ignore_locks: bool,
 }
 
 #[derive(Args)]
@@ -960,7 +966,13 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             .with_defaults(),
     ));
 
-    return runtime().block_on(branch::push_managed(globals, push_args, callback, None)) as u8;
+    return runtime().block_on(branch::push_managed_refusing_others_locks(
+        globals,
+        push_args,
+        callback,
+        None,
+        !args.ignore_locks,
+    )) as u8;
 }
 
 fn handle_branch_merge_unresolve(globals: LoreGlobalArgs, args: &BranchMergeUnresolveArgs) -> u8 {

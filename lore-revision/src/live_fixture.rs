@@ -403,6 +403,8 @@ struct ServerState {
     minted: Mutex<u64>,
     /// Where [`RpcOutcome::ApplyThenLoseTheAnswer`] files the receipt the lost answer leaves.
     receipts: Arc<receipt::ReceiptProbe>,
+    /// What `Status` reports as held, as `(description, owner)` pairs.
+    status_locks: Mutex<Vec<(String, String)>>,
 }
 
 /// A running in-process lock server, plus everything a test needs to interrogate it.
@@ -453,6 +455,7 @@ impl LockServer {
             revision_policy: Mutex::new(revision),
             minted: Mutex::new(0),
             receipts: receipts.clone(),
+            status_locks: Mutex::new(Vec::new()),
         });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -538,6 +541,12 @@ impl LockServer {
     /// Change how the server answers, mid-test.
     pub fn set_policy(&self, policy: LockPolicy) {
         *self.state.policy.lock() = policy;
+    }
+
+    /// The locks `Status` reports as held, as `(description, owner)` pairs. Only the rows whose
+    /// description the request names are answered. Empty by default.
+    pub fn set_status_locks(&self, locks: Vec<(String, String)>) {
+        *self.state.status_locks.lock() = locks;
     }
 
     /// Change how the revision service answers, mid-test.
@@ -782,7 +791,27 @@ impl LockService for StubLockService {
     ) -> Result<Response<StatusResponse>, Status> {
         let resources = request.get_ref().resources.clone();
         self.record(LockRpc::Status, &request, &resources, "");
-        Ok(Response::new(StatusResponse { locks: Vec::new() }))
+        let locks = self
+            .state
+            .status_locks
+            .lock()
+            .iter()
+            .filter(|(description, _)| {
+                resources
+                    .iter()
+                    .any(|resource| &resource.description == description)
+            })
+            .map(|(description, owner)| lore_proto::lock::Lock {
+                resource: Some(lore_proto::lock::Resource {
+                    description: description.clone(),
+                    ..lore_proto::lock::Resource::default()
+                }),
+                owner: owner.clone(),
+                locked_at: None,
+                ownership_token: Vec::new().into(),
+            })
+            .collect();
+        Ok(Response::new(StatusResponse { locks }))
     }
 
     async fn unlock(

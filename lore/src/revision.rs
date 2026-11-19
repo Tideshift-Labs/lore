@@ -73,6 +73,12 @@ pub struct LoreRevisionCommitArgs {
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
     #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
+    /// FORK-LOCAL (Tideshift): refuse the commit, before it is made, when another user holds a
+    /// lock on a file in it (`LockNotOwned`, naming each file and holder). Zero commits as before.
+    /// When the lock lookup cannot answer (offline, `--local`, lock service unavailable, identity
+    /// unknown), the commit goes ahead with a warning.
+    #[serde(default)]
+    pub refuse_locked_by_others: u8,
 }
 
 /// Commits all staged changes to the current branch as a new revision.
@@ -135,12 +141,28 @@ pub async fn commit_exact_selection(
     options: ExactSelectionOptions,
     callback: LoreEventCallback,
 ) -> Result<ExactSelectionResult, ExactSelectionError> {
+    commit_exact_selection_refusing_others_locks(globals, options, callback, false).await
+}
+
+/// FORK-LOCAL (Tideshift): [`commit_exact_selection`] that, when `refuse_locked_by_others` is
+/// set, first refuses with `InvalidInput` (naming each selected path another user holds a lock
+/// on, and its holder) before anything is staged. When the lock lookup cannot answer, the commit
+/// goes ahead with a warning. See [`lore_revision::lock::file::held`].
+pub async fn commit_exact_selection_refusing_others_locks(
+    globals: LoreGlobalArgs,
+    options: ExactSelectionOptions,
+    callback: LoreEventCallback,
+    refuse_locked_by_others: bool,
+) -> Result<ExactSelectionResult, ExactSelectionError> {
     repository_call_write_result(
         globals,
         callback,
         options,
         commit_exact_selection,
         move |repository, token, options| async move {
+            if refuse_locked_by_others {
+                refuse_exact_selection_over_others_locks(&repository, &options).await?;
+            }
             let ctx = lore_revision::lore::execution_context();
             if !ctx.globals().local() && !ctx.globals().offline() {
                 repository.set_disable_upload(false);
@@ -345,6 +367,10 @@ fn commit_local(
                 layer_messages,
             };
 
+            if args.refuse_locked_by_others != 0 {
+                refuse_commit_over_others_locks(&repository).await?;
+            }
+
             // Enable upload to remote during commit unless offline or local
             let ctx = lore_revision::lore::execution_context();
             if !ctx.globals().local() && !ctx.globals().offline() {
@@ -356,6 +382,52 @@ fn commit_local(
             lore_revision::commit::commit_boxed(repository, &token, options).await
         },
     )
+}
+
+/// FORK-LOCAL (Tideshift): refuse an exact-selection commit when another user holds a lock on one
+/// of its selected paths.
+async fn refuse_exact_selection_over_others_locks(
+    repository: &Arc<RepositoryContext>,
+    options: &ExactSelectionOptions,
+) -> Result<(), ExactSelectionError> {
+    use lore_revision::exact_selection::ExactSelectionErrorKind;
+    use lore_revision::lock::file::held;
+    let selected = options
+        .files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let change = async {
+        held::selection_change_paths(repository, &selected)
+            .await
+            .map(|(branch, paths)| (branch, Some(paths)))
+    };
+    match held::find_held_by_others(repository, change, "commit").await {
+        None => Ok(()),
+        Some(locks) => Err(ExactSelectionError::new(
+            ExactSelectionErrorKind::InvalidInput {
+                reason: held::HeldLocks::refusal_message(&locks, "--ignore-locks"),
+                paths: locks
+                    .iter()
+                    .map(|lock| lock.resource.description.clone())
+                    .collect(),
+            },
+        )),
+    }
+}
+
+/// FORK-LOCAL (Tideshift): refuse a commit of the staged change when another user holds a lock on
+/// one of its files. See [`lore_revision::lock::file::held`].
+async fn refuse_commit_over_others_locks(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(), lore_revision::commit::CommitError> {
+    use lore_revision::lock::file::held;
+    let change = async {
+        held::staged_change_paths(repository)
+            .await
+            .map(|(branch, paths)| (branch, Some(paths)))
+    };
+    held::refuse_if_held_by_others(repository, change, "commit", "--ignore-locks").await
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

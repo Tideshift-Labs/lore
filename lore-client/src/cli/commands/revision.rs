@@ -178,6 +178,12 @@ pub struct RevisionCommitArgs {
     /// Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times.
     #[clap(long = "layer-message", num_args = 2, value_names = ["PATH", "MESSAGE"])]
     pub layer_messages: Vec<String>,
+    /// Commit even when another user holds a lock on a file in the commit. Without it, such a
+    /// commit is refused before it is made, naming each file and its holder. Locks are advisory:
+    /// when the lock lookup cannot answer (for example offline), the commit goes ahead with a
+    /// warning.
+    #[clap(long)]
+    pub ignore_locks: bool,
 }
 
 #[derive(Args)]
@@ -1221,6 +1227,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
         layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
         layer_paths: LoreArray::from_vec(layer_paths),
         layer_messages: LoreArray::from_vec(layer_msgs),
+        refuse_locked_by_others: u8::from(!args.ignore_locks),
     };
 
     let commit_entry_data: Arc<Mutex<Vec<RevisionEntryData>>> =

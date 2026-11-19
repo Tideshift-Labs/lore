@@ -935,6 +935,9 @@ pub async fn push_with_attempt_store(
 #[handler(push_managed_service_local)]
 pub struct LoreManagedBranchPushArgs {
     pub args: LoreBranchPushArgs,
+    /// FORK-LOCAL (Tideshift): see [`push_managed_refusing_others_locks`].
+    #[serde(default)]
+    pub refuse_locked_by_others: bool,
 }
 
 #[lore_macro::test_pub]
@@ -943,7 +946,14 @@ async fn push_managed_service_local(
     args: LoreManagedBranchPushArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    push_managed_local(globals, args.args, callback, None).await
+    push_managed_local(
+        globals,
+        args.args,
+        callback,
+        None,
+        args.refuse_locked_by_others,
+    )
+    .await
 }
 
 /// Managed push adoption for CLI and embedders: one fence, sequential repository stages.
@@ -952,6 +962,21 @@ pub async fn push_managed(
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
     observer: Option<Arc<dyn lore_revision::managed_push::ManagedPushObserver>>,
+) -> i32 {
+    push_managed_refusing_others_locks(globals, args, callback, observer, false).await
+}
+
+/// FORK-LOCAL (Tideshift): [`push_managed`] that, when `refuse_locked_by_others` is set, first
+/// refuses with `LockNotOwned` (naming each file and holder) if another user holds a lock on a
+/// file the push changes on the remote branch. Nothing is sent when it refuses. Locks stay
+/// advisory on the server, so this is the client's own check; when the lookup cannot answer, the
+/// push goes ahead with a warning. Layers and links are not checked.
+pub async fn push_managed_refusing_others_locks(
+    globals: LoreGlobalArgs,
+    args: LoreBranchPushArgs,
+    callback: LoreEventCallback,
+    observer: Option<Arc<dyn lore_revision::managed_push::ManagedPushObserver>>,
+    refuse_locked_by_others: bool,
 ) -> i32 {
     if lore_transport::has_managed_caller()
         || lore_transport::current_caller_operation().is_some()
@@ -970,12 +995,16 @@ pub async fn push_managed(
         // workflow; no caller-side observer, journal or fence is discarded.
         return crate::remote::call::service_call(
             globals,
-            LoreManagedBranchPushArgs { args }.into(),
+            LoreManagedBranchPushArgs {
+                args,
+                refuse_locked_by_others,
+            }
+            .into(),
             callback,
         )
         .await;
     }
-    push_managed_local(globals, args, callback, observer).await
+    push_managed_local(globals, args, callback, observer, refuse_locked_by_others).await
 }
 
 async fn push_managed_local(
@@ -983,6 +1012,7 @@ async fn push_managed_local(
     args: LoreBranchPushArgs,
     callback: LoreEventCallback,
     observer: Option<Arc<dyn lore_revision::managed_push::ManagedPushObserver>>,
+    refuse_locked_by_others: bool,
 ) -> i32 {
     if lore_transport::has_managed_caller() || lore_transport::current_caller_operation().is_some()
     {
@@ -1020,7 +1050,15 @@ async fn push_managed_local(
                 args,
                 push,
                 move |repository, token, args| async move {
-                    push_impl_with_runner(repository, &token, args, None, Some(runner)).await
+                    push_impl_with_runner(
+                        repository,
+                        &token,
+                        args,
+                        None,
+                        Some(runner),
+                        refuse_locked_by_others,
+                    )
+                    .await
                 },
             ),
         ))
@@ -1058,7 +1096,24 @@ async fn push_impl(
     args: LoreBranchPushArgs,
     attempts: Option<Arc<dyn AttemptStore>>,
 ) -> Result<(), branch::push::PushError> {
-    push_impl_with_runner(repository, token, args, attempts, None).await
+    push_impl_with_runner(repository, token, args, attempts, None, false).await
+}
+
+/// FORK-LOCAL (Tideshift): refuse a push when another user holds a lock on a file it changes on
+/// the remote branch. See [`lore_revision::lock::file::held`].
+async fn refuse_push_over_others_locks(
+    repository: &Arc<RepositoryContext>,
+    branch: &str,
+) -> Result<(), branch::push::PushError> {
+    use lore_revision::lock::file::held;
+    let branch = (!branch.is_empty()).then_some(branch);
+    let change = async {
+        let (branch, local_latest) = held::push_target(repository, branch).await?;
+        held::push_change_paths(repository, branch, local_latest)
+            .await
+            .map(|paths| (branch, paths))
+    };
+    held::refuse_if_held_by_others(repository, change, "push", "--ignore-locks").await
 }
 
 async fn push_impl_with_runner(
@@ -1067,6 +1122,7 @@ async fn push_impl_with_runner(
     args: LoreBranchPushArgs,
     attempts: Option<Arc<dyn AttemptStore>>,
     runner: Option<Arc<lore_revision::managed_push::ManagedPushRunner>>,
+    refuse_locked_by_others: bool,
 ) -> Result<(), branch::push::PushError> {
     // FORK-LOCAL (Tideshift, WP-124): a managed caller's wait for the remote ends at the managed
     // bound with a not-sent marker; report it as `Disconnected`, as the push itself does.
@@ -1075,6 +1131,10 @@ async fn push_impl_with_runner(
         .await
         .forward::<branch::push::PushError>("acquiring remote")
         .map_err(branch::push::not_sent_reads_disconnected)?;
+
+    if refuse_locked_by_others {
+        refuse_push_over_others_locks(&repository, args.branch.as_str()).await?;
+    }
 
     let options = PushOptions {
         branch: args.branch.into(),

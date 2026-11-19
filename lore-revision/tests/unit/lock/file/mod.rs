@@ -3,4 +3,6 @@
 
 mod acquire;
 #[cfg(feature = "test_seams")]
+mod held;
+#[cfg(feature = "test_seams")]
 mod release;

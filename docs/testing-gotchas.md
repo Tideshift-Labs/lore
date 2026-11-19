@@ -51,6 +51,18 @@ Durable, recurring testing lessons grouped by topic.
   `LockPolicy.query_ignores_owner` to model a server that ignores the filter. Tests of
   no-paths `--force` release: `lore/tests/release_owner_scope.rs`.
 
+- **Two identities / another user's lock without a real server**: caller = repo config identity
+  (`create_with_files_and_identity`), holder = an owner string in `LockServer::set_status_locks`
+  (the stub's `Status` answer; `Query` has `query_result`). Recipe: `lore/tests/lock_refusal.rs`,
+  `lore-revision/tests/unit/lock/file/held.rs`. The stub has no storage service, so a commit's
+  upload is best effort (commit still lands) but a push past the check fails with -1: assert
+  "status != 45" and the server's call log, not push success. `BranchAnswer::NotFound` makes
+  `push_change_paths` return `Err` (lookup error); a zero `latest` gives `Ok(None)`.
+- **Hang in a live-fixture test that stages**: `load_and_connect(.., ReadWrite)` already holds the
+  per-path write token, so a second `RepositoryWriteToken::acquire` deadlocks. Acquire once, then
+  `load_and_connect_with_token(.., Some(token.share()))`, stage with `&token`, and `flush(true)` before
+  reading the staged anchor from another context.
+
 ## Deterministic async tests
 
 - **Time pausing**: `#[tokio::test(start_paused = true)]` doesn't work well with cross-thread I/O (`lore_io::IoDriver`) or tasks spawned on the global `lore_base::runtime::runtime()`. Use unpaused clocks with real margins for these.

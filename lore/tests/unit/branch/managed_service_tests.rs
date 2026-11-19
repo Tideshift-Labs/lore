@@ -57,11 +57,17 @@ fn rejected() -> i32 {
 
 #[test]
 fn managed_service_command_roundtrips_and_old_reader_refuses_it() {
-    let command = LoreCommand::ManagedBranchPush(LoreManagedBranchPushArgs { args: args() });
+    let command = LoreCommand::ManagedBranchPush(LoreManagedBranchPushArgs {
+        args: args(),
+        refuse_locked_by_others: false,
+    });
     let value = serde_json::to_value(&command).expect("serialize managed command");
     assert_eq!(
         value,
-        serde_json::json!({"ManagedBranchPush":{"args":{"branch":"feature","fast_forward_merge":1}}})
+        serde_json::json!({"ManagedBranchPush":{
+            "args":{"branch":"feature","fast_forward_merge":1},
+            "refuse_locked_by_others":false
+        }})
     );
     for encoding in [SerializationType::Json, SerializationType::Bincode] {
         let bytes = serialize_message(command.clone(), encoding).expect("encode command");
@@ -125,7 +131,10 @@ fn managed_push_refuses_inherited_adoption_before_repository_access() {
             context,
             push_managed_service_local(
                 globals(),
-                LoreManagedBranchPushArgs { args: args() },
+                LoreManagedBranchPushArgs {
+                    args: args(),
+                    refuse_locked_by_others: false,
+                },
                 callback(),
             ),
         )

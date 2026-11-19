@@ -4946,6 +4946,11 @@ typedef struct lore_revision_commit_args_t {
   struct lore_string_array_t layer_paths;
   // Array of messages corresponding to each layer path (parallel array with `layer_paths`)
   struct lore_string_array_t layer_messages;
+  // FORK-LOCAL (Tideshift): refuse the commit, before it is made, when another user holds a
+  // lock on a file in it (`LockNotOwned`, naming each file and holder). Zero commits as before.
+  // When the lock lookup cannot answer (offline, `--local`, lock service unavailable, identity
+  // unknown), the commit goes ahead with a warning.
+  uint8_t refuse_locked_by_others;
 } lore_revision_commit_args_t;
 
 // Arguments for amending the most recent revision's commit message.

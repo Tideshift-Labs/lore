@@ -330,6 +330,7 @@ mod hang {
                     layer_paths: Default::default(),
                     link_messages: Default::default(),
                     layer_messages: Default::default(),
+                    refuse_locked_by_others: 0,
                 },
                 None,
             )
@@ -658,6 +659,7 @@ mod hang {
                         layer_paths: Default::default(),
                         link_messages: Default::default(),
                         layer_messages: Default::default(),
+                        refuse_locked_by_others: 0,
                     },
                     None,
                 ),
@@ -800,6 +802,7 @@ mod hang {
                 layer_paths: Default::default(),
                 link_messages: Default::default(),
                 layer_messages: Default::default(),
+                refuse_locked_by_others: 0,
             }
         }
 

@@ -7781,6 +7781,7 @@ mod storage_remote_tests {
                 layer_paths: Default::default(),
                 link_messages: Default::default(),
                 layer_messages: Default::default(),
+                refuse_locked_by_others: 0,
             },
             Some(Box::new(move |event: &LoreEvent| {
                 if let LoreEvent::RevisionCommitRevision(data) = event {
@@ -8111,6 +8112,7 @@ mod storage_remote_tests {
                     layer_paths: Default::default(),
                     link_messages: Default::default(),
                     layer_messages: Default::default(),
+                    refuse_locked_by_others: 0,
                 },
                 Some(Box::new(move |event: &LoreEvent| {
                     if let LoreEvent::RevisionCommitRevision(data) = event {
