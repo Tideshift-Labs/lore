@@ -16,6 +16,7 @@ use lore::interface::FragmentFlags;
 use lore::interface::Hash;
 use lore::interface::LoreArray;
 use lore::interface::LoreBranchInfoArgs;
+use lore::interface::LoreError;
 use lore::interface::LoreEvent;
 use lore::interface::LoreEventCallback;
 use lore::interface::LoreFragmentWriteEventData;
@@ -47,6 +48,7 @@ use lore::interface::metadata;
 use lore::remote::command::LoreCommand;
 use lore::revision;
 use lore::revision::LoreRevisionFindArgs;
+use lore_revision::event::EventError;
 use parking_lot::Mutex;
 
 use super::file::print_metadata;
@@ -55,6 +57,7 @@ use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
 use crate::config::config;
+use crate::eprintln;
 use crate::pager::Pager;
 use crate::print;
 use crate::println;
@@ -184,6 +187,20 @@ pub struct RevisionCommitArgs {
     /// warning.
     #[clap(long)]
     pub ignore_locks: bool,
+    /// Commit exactly the files a JSON selection file names, staging and committing them in one
+    /// transaction, and print the result as JSON (after any progress log lines). The file holds
+    /// `files`, each with `path`, `expectedEffectiveAction` (`add`, `modify` or `delete`),
+    /// `sourceHash` (the MD5 hex of the file's content, required for `add` and `modify`, null for
+    /// `delete`) and a `fileMetadata` policy (`{"kind": "unchanged"}`), plus optional
+    /// `revisionMetadata`. The commit message is the message argument. A file outside the
+    /// selection is left as it is. The lock check runs on the selected paths, as for a plain
+    /// commit.
+    #[clap(
+        long,
+        value_name = "file",
+        conflicts_with_all = ["link", "layer", "link_messages", "layer_messages"]
+    )]
+    pub exact_selection: Option<String>,
 }
 
 #[derive(Args)]
@@ -1205,7 +1222,89 @@ fn resolve_layer_messages(
     Ok((layer_paths, layer_msgs))
 }
 
+/// FORK-LOCAL (Tideshift): `lore commit --exact-selection <file>`, the CLI form of
+/// [`lore::revision::commit_exact_selection`]. Exits with the Lore error code of a refused
+/// commit, and with `InvalidArguments` (3) for a selection file it cannot read.
+fn handle_revision_commit_exact_selection(
+    globals: LoreGlobalArgs,
+    args: &RevisionCommitArgs,
+    selection_file: &str,
+) -> u8 {
+    const INVALID_ARGUMENTS: u8 = LoreError::InvalidArguments as i32 as u8;
+    let text = match std::fs::read_to_string(selection_file) {
+        Ok(text) => text,
+        Err(error) => {
+            eprintln!("Unable to read the selection file {selection_file}: {error}");
+            return INVALID_ARGUMENTS;
+        }
+    };
+    let mut value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("The selection file {selection_file} is not valid JSON: {error}");
+            return INVALID_ARGUMENTS;
+        }
+    };
+    let Some(object) = value.as_object_mut() else {
+        eprintln!("The selection file {selection_file} must hold a JSON object");
+        return INVALID_ARGUMENTS;
+    };
+    object.insert("message".to_string(), args.message.as_str().into());
+    let options: lore_revision::exact_selection::ExactSelectionOptions =
+        match serde_json::from_value(value) {
+            Ok(options) => options,
+            Err(error) => {
+                eprintln!("The selection file {selection_file} is not a valid selection: {error}");
+                return INVALID_ARGUMENTS;
+            }
+        };
+
+    let json_output = config().json;
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(|_: &LoreEvent| ()) as EventCallbackFn).with_defaults(),
+    ));
+    match lore::runtime().block_on(revision::commit_exact_selection_refusing_others_locks(
+        globals,
+        options,
+        callback,
+        !args.ignore_locks,
+    )) {
+        Ok(result) => {
+            if let Some(json) = selection_json(&result, json_output) {
+                println!("{json}");
+            } else {
+                eprintln!(
+                    "Committed revision {}, but could not print the result",
+                    result.revision
+                );
+            }
+            0
+        }
+        Err(error) => {
+            if let Some(json) = selection_json(error.kind(), json_output) {
+                eprintln!("Exact-selection commit refused:\n{json}");
+            } else {
+                eprintln!("Exact-selection commit refused: {error}");
+            }
+            error.translated() as i32 as u8
+        }
+    }
+}
+
+/// One compact line under `--json`, so a caller reading the event lines can parse it; indented
+/// otherwise.
+fn selection_json<T: serde::Serialize + ?Sized>(value: &T, compact: bool) -> Option<String> {
+    if compact {
+        serde_json::to_string(value).ok()
+    } else {
+        serde_json::to_string_pretty(value).ok()
+    }
+}
+
 pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs) -> u8 {
+    if let Some(selection_file) = args.exact_selection.as_deref() {
+        return handle_revision_commit_exact_selection(globals, args, selection_file);
+    }
     let dry_run = globals.dry_run();
     let histogram = Arc::new(Mutex::new(ChunkSizeHistogram::default()));
 
