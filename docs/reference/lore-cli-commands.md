@@ -17,6 +17,9 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 **Command Overview:**
 
 * [`lore`↴](#lore)
+* [`lore operation`↴](#lore-operation)
+* [`lore operation status`↴](#lore-operation-status)
+* [`lore operation reconcile`↴](#lore-operation-reconcile)
 * [`lore repository`↴](#lore-repository)
 * [`lore repository status`↴](#lore-repository-status)
 * [`lore repository info`↴](#lore-repository-info)
@@ -181,6 +184,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 
 ###### **Subcommands:**
 
+* `operation` — Inspect and reconcile managed write workflows
 * `repository` — Repository commands
 * `branch` — Branch commands
 * `revision` — Revision commands
@@ -235,6 +239,35 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 
   Default value: `0`
 * `--event-interval <milliseconds>` — How often to emit progress events, in milliseconds
+
+
+
+## `lore operation`
+
+Inspect and reconcile managed write workflows
+
+**Usage:** `lore operation <COMMAND>`
+
+###### **Subcommands:**
+
+* `status` — List durable workflow identities and unresolved children
+* `reconcile` — Query exact receipts without sending stored mutation requests
+
+
+
+## `lore operation status`
+
+List durable workflow identities and unresolved children
+
+**Usage:** `lore operation status`
+
+
+
+## `lore operation reconcile`
+
+Query exact receipts without sending stored mutation requests
+
+**Usage:** `lore operation reconcile`
 
 
 
@@ -389,6 +422,7 @@ Clone a remote repository into the given path
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+* `--allow-non-empty` — Clone into a folder that already holds files. Without it, a clone that would write the repository's files into a non-empty folder is refused before anything changes. Files the repository does not track stay in place; with --force, files it does track are replaced
 
 
 
@@ -578,7 +612,7 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 
 
@@ -592,7 +626,7 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
+Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not mounted
 
 **Usage:** `lore repository instance prune`
 
@@ -727,6 +761,7 @@ Push commits to remote
 ###### **Options:**
 
 * `--fast-forward-merge` — Allow the server to fast-forward merge if the target branch head has moved
+* `--ignore-locks` — Push even when another user holds a lock on a file the push changes. Without it, such a push is refused before anything is sent, naming each file and its holder. Locks are advisory: when the lock lookup cannot answer, the push goes ahead with a warning
 
 
 
@@ -1142,6 +1177,8 @@ Commit the staged state
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
 * `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times
+* `--ignore-locks` — Commit even when another user holds a lock on a file in the commit. Without it, such a commit is refused before it is made, naming each file and its holder. Locks are advisory: when the lock lookup cannot answer (for example offline), the commit goes ahead with a warning
+* `--exact-selection <file>` — Commit exactly the files a JSON selection file names, staging and committing them in one transaction, and print the result as JSON (after any progress log lines). The file holds `files`, each with `path`, `expectedEffectiveAction` (`add`, `modify` or `delete`), `sourceHash` (the MD5 hex of the file's content, required for `add` and `modify`, null for `delete`) and a `fileMetadata` policy (`{"kind": "unchanged"}`), plus optional `revisionMetadata`. The commit message is the message argument. A file outside the selection is left as it is. The lock check runs on the selected paths, as for a plain commit
 
 
 
@@ -2318,6 +2355,7 @@ Clone a remote repository into the given path
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
 
   Default value: `0`
+* `--allow-non-empty` — Clone into a folder that already holds files. Without it, a clone that would write the repository's files into a non-empty folder is refused before anything changes. Files the repository does not track stay in place; with --force, files it does track are replaced
 
 
 
@@ -2538,6 +2576,8 @@ Commit the staged revision
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
 * `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times
+* `--ignore-locks` — Commit even when another user holds a lock on a file in the commit. Without it, such a commit is refused before it is made, naming each file and its holder. Locks are advisory: when the lock lookup cannot answer (for example offline), the commit goes ahead with a warning
+* `--exact-selection <file>` — Commit exactly the files a JSON selection file names, staging and committing them in one transaction, and print the result as JSON (after any progress log lines). The file holds `files`, each with `path`, `expectedEffectiveAction` (`add`, `modify` or `delete`), `sourceHash` (the MD5 hex of the file's content, required for `add` and `modify`, null for `delete`) and a `fileMetadata` policy (`{"kind": "unchanged"}`), plus optional `revisionMetadata`. The commit message is the message argument. A file outside the selection is left as it is. The lock check runs on the selected paths, as for a plain commit
 
 
 
@@ -2580,6 +2620,7 @@ Push commits to remote
 ###### **Options:**
 
 * `--fast-forward-merge` — Allow the server to fast-forward merge if the target branch head has moved
+* `--ignore-locks` — Push even when another user holds a lock on a file the push changes. Without it, such a push is refused before anything is sent, naming each file and its holder. Locks are advisory: when the lock lookup cannot answer, the push goes ahead with a warning
 
 
 
@@ -2852,3 +2893,4 @@ Set whether new clones use a shared store without being asked to
     This document was generated automatically by
     <a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
 </i></small>
+
