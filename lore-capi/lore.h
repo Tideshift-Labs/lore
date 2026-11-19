@@ -4777,6 +4777,11 @@ typedef struct lore_repository_clone_args_t {
   uint8_t dependency_recursive;
   // Maximum dependency traversal depth. 0 means unlimited.
   uint32_t dependency_depth_limit;
+  // FORK-LOCAL (Tideshift): clone into a folder that already holds files other than `.lore`.
+  // Zero refuses, before anything changes, a clone that would write the repository's files
+  // into such a folder. Cloning a repository without revisions, or a bare clone, writes no
+  // files and is never refused.
+  uint8_t allow_non_empty;
 } lore_repository_clone_args_t;
 
 // Arguments for retrieving metadata about a remote repository.

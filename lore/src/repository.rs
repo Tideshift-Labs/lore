@@ -116,6 +116,12 @@ pub struct LoreRepositoryCloneArgs {
     pub dependency_recursive: u8,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// FORK-LOCAL (Tideshift): clone into a folder that already holds files other than `.lore`.
+    /// Zero refuses, before anything changes, a clone that would write the repository's files
+    /// into such a folder. Cloning a repository without revisions, or a bare clone, writes no
+    /// files and is never refused.
+    #[serde(default)]
+    pub allow_non_empty: u8,
 }
 
 /// Clones a remote repository to the local path specified in the global arguments.
@@ -224,6 +230,7 @@ async fn clone_impl(
     let options = CloneOptions {
         bare,
         ignore_existing,
+        allow_non_empty: args.allow_non_empty != 0,
         direct_file_write,
         prefetch,
         shared_store_options,

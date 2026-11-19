@@ -185,6 +185,42 @@ impl Drop for RepositoryCloneGuard {
     }
 }
 
+/// FORK-LOCAL (Tideshift): whether `path` holds any entry other than a control directory (`.lore`
+/// or the legacy `.urc`, in any letter case, as [`repository::is_reserved_node_name`] reads them).
+/// A missing `path` holds nothing. `dot_dir` is kept for callers that resolved an external one.
+#[lore_macro::test_pub]
+async fn holds_entries_besides_dot_dir(path: &Path, dot_dir: &Path) -> std::io::Result<bool> {
+    let mut entries = match lore_io::IoDriver::global().read_dir(path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let dot_dir_name = dot_dir.file_name();
+    while let Some(entry) = entries.next().await {
+        let entry = entry?;
+        let name = entry.file_name.as_os_str();
+        if Some(name) == dot_dir_name
+            || name.to_str().is_some_and(repository::is_reserved_node_name)
+        {
+            continue;
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// FORK-LOCAL (Tideshift): the refusal for a clone that would write files into a populated folder.
+fn populated_target_error(path: &Path) -> CloneError {
+    CloneError::from(InvalidArguments {
+        reason: format!(
+            "the folder {} is not empty, and this clone would write the repository's files into \
+             it. Clone into an empty or new folder, or pass --allow-non-empty (allow_non_empty \
+             in the API) to keep the existing files and clone into the folder anyway",
+            path.display()
+        ),
+    })
+}
+
 /// Data for the event emitted when a clone starts.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -312,6 +348,10 @@ pub struct CloneOptions {
     pub bare: bool,
     /// Ignore existing files
     pub ignore_existing: bool,
+    /// FORK-LOCAL (Tideshift): clone into a folder that already holds files. Without it, a clone
+    /// that would write the remote's files into a populated folder is refused before anything
+    /// changes.
+    pub allow_non_empty: bool,
     /// Use direct file write
     pub direct_file_write: bool,
     /// File containing list of files to prefetch
@@ -857,21 +897,19 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
+    // FORK-LOCAL (Tideshift): an existing working copy is only replaced under `--force`, and only
+    // once the remote has answered. Removing it before the remote resolves left an unreachable
+    // server costing the folder its binding.
     let existing_dot_dir = get_dot_lore_path(path)?;
-    if existing_dot_dir.exists() {
-        if call.force() {
-            lore_io::IoDriver::global()
-                .remove_dir_all(existing_dot_dir.as_path())
-                .await
-                .internal_with(|| {
-                    format!("removing previous repository in path {}", path.display())
-                })?;
-        } else {
-            return Err(CloneError::from(RepositoryAlreadyExists {
-                path: path.display().to_string(),
-            }));
-        }
+    let replace_existing = existing_dot_dir.exists();
+    if replace_existing && !call.force() {
+        return Err(CloneError::from(RepositoryAlreadyExists {
+            path: path.display().to_string(),
+        }));
     }
+    let holds_other_entries = holds_entries_besides_dot_dir(path, existing_dot_dir.as_path())
+        .await
+        .internal_with(|| format!("listing clone target {}", path.display()))?;
 
     // Parse the URL
     let (remote_url, name) = repository::parse_url(repository_url, false)
@@ -960,11 +998,121 @@ pub async fn clone(
         RepositoryAccess::ReadWrite
     };
 
+    // FORK-LOCAL (Tideshift): a clone that would write the remote's files into a folder that
+    // already holds other files needs `allow_non_empty`. Cloning a remote without revisions writes
+    // only the control directory, which is how a populated folder is bound in place, so that case
+    // stays open. The decision is made, and the branch read, before anything on disk changes.
+    let guard_populated_target = holds_other_entries && !options.bare && !options.allow_non_empty;
+    let mut early_branch = None;
+    if guard_populated_target {
+        if revision.is_some() || layer.is_some() {
+            return Err(populated_target_error(path));
+        }
+        let status = branch::load_remote(remote.clone(), repository_id, default_branch_id)
+            .await
+            .forward::<CloneError>("Failed to load repository state from remote")?;
+        if !status.latest.is_zero() {
+            return Err(populated_target_error(path));
+        }
+        early_branch = Some(status);
+    } else if replace_existing && revision.is_none() {
+        // Read the branch before the existing working copy goes, so a remote that answers the
+        // resolve but fails the branch read still leaves the folder bound.
+        let status = branch::load_remote(remote.clone(), repository_id, default_branch_id)
+            .await
+            .forward::<CloneError>("Failed to load repository state from remote")?;
+        early_branch = Some(status);
+    }
+
+    // The replaced working copy's control directory is moved aside, not deleted, until the clone
+    // has succeeded: a pinned revision or a layer is only checked later, and a failure there (or a
+    // dry run) must leave the folder bound as it was.
+    let set_aside = if replace_existing {
+        Some(SetAsideDotDir::move_aside(path, existing_dot_dir.as_path()).await?)
+    } else {
+        None
+    };
+
+    // Boxed: the bound clone's future is large, and inline it would sit in this one's every state.
+    let result = Box::pin(clone_bound(
+        CloneBound {
+            remote,
+            repository_metadata,
+            repository_config,
+            early_branch,
+            write_token,
+            repository_id,
+            default_branch_id,
+            default_branch_name,
+            no_tracking,
+            access,
+            path,
+            revision,
+            view,
+            layer,
+            options,
+        },
+        &mut repository_path_guard,
+    ))
+    .await;
+
+    match set_aside {
+        Some(set_aside) if result.is_err() || call.dry_run() => set_aside.restore().await,
+        Some(set_aside) => set_aside.discard().await,
+        None => {}
+    }
+    result
+}
+
+/// FORK-LOCAL (Tideshift): the part of [`clone`] that runs once the remote has answered, gathered
+/// so the caller can put a set-aside working copy back when it fails.
+struct CloneBound<'a> {
+    remote: Arc<lore_transport::Connection>,
+    repository_metadata: repository::RepositoryMetadata,
+    repository_config: RepositoryConfig,
+    early_branch: Option<branch::BranchStatus>,
+    write_token: RepositoryWriteToken,
+    repository_id: RepositoryId,
+    default_branch_id: crate::lore::BranchId,
+    default_branch_name: String,
+    no_tracking: bool,
+    access: RepositoryAccess,
+    path: &'a Path,
+    revision: Option<String>,
+    view: Option<&'a Path>,
+    layer: Option<CloneLayer>,
+    options: CloneOptions,
+}
+
+async fn clone_bound(
+    bound: CloneBound<'_>,
+    repository_path_guard: &mut RepositoryCloneGuard,
+) -> Result<(), CloneError> {
+    let CloneBound {
+        remote,
+        repository_metadata,
+        repository_config,
+        early_branch,
+        write_token,
+        repository_id,
+        default_branch_id,
+        default_branch_name,
+        no_tracking,
+        access,
+        path,
+        revision,
+        view,
+        layer,
+        options,
+    } = bound;
+
     let prefetch_branch_fut = {
         let remote = remote.clone();
         let revision_pinned = revision.is_some();
         async move {
-            if revision_pinned {
+            if let Some(status) = early_branch {
+                Ok::<_, CloneError>(Some(status))
+            } else if revision_pinned {
                 Ok::<_, CloneError>(None)
             } else {
                 let status = branch::load_remote(remote, repository_id, default_branch_id)
@@ -1017,9 +1165,129 @@ pub async fn clone(
         view,
         layer,
         options,
-        &mut repository_path_guard,
+        repository_path_guard,
     )
     .await
+}
+
+/// FORK-LOCAL (Tideshift): an existing control directory moved aside while `--force` clones over
+/// it. [`SetAsideDotDir::restore`] puts it back; [`SetAsideDotDir::discard`] removes it once the
+/// new one is in place.
+struct SetAsideDotDir {
+    original: PathBuf,
+    written: PathBuf,
+    aside: PathBuf,
+}
+
+impl SetAsideDotDir {
+    /// The set-aside copy goes next to the working copy root `path`, not inside it, so a scan or a
+    /// `lore stage .` of the working copy can never take it for content.
+    async fn move_aside(path: &Path, original: &Path) -> Result<Self, CloneError> {
+        let (Some(parent), Some(root_name)) = (path.parent(), path.file_name()) else {
+            return Err(CloneError::from(InvalidArguments {
+                reason: format!(
+                    "cannot replace the repository at {} with --force: it has no parent folder \
+                     to set the previous one aside in",
+                    path.display()
+                ),
+            }));
+        };
+        // A control directory kept outside the working copy (a mount manager's) is set aside next
+        // to itself, so the rename stays on its volume.
+        let aside = if original.parent() == Some(path) {
+            let mut name = std::ffi::OsString::from(".");
+            name.push(root_name);
+            name.push(".lore-replaced-by-clone");
+            parent.join(name)
+        } else {
+            let mut name = original.file_name().unwrap_or_default().to_os_string();
+            name.push(".replaced-by-clone");
+            original.with_file_name(name)
+        };
+        if aside.exists() {
+            return Err(CloneError::from(InvalidArguments {
+                reason: format!(
+                    "{} exists, left by an earlier clone that did not finish. It may hold the \
+                     only copy of a working copy's control directory: move it back to {}, or \
+                     remove it, before cloning again",
+                    aside.display(),
+                    original.display()
+                ),
+            }));
+        }
+        lore_io::IoDriver::global()
+            .rename(original, aside.as_path())
+            .await
+            .internal_with(|| {
+                format!(
+                    "moving the previous repository at {} aside",
+                    original.display()
+                )
+            })?;
+        // Where the clone writes its own control directory, which differs from `original` when
+        // that was a legacy `.urc`.
+        let written = get_dot_lore_path(path).unwrap_or_else(|_| path.join(repository::DOT_LORE));
+        Ok(Self {
+            original: original.to_path_buf(),
+            written,
+            aside,
+        })
+    }
+
+    /// Puts the set-aside directory back, replacing whatever the clone wrote there. A failure is
+    /// logged with both paths: the set-aside copy is then left in place for the user to recover.
+    async fn restore(self) {
+        let io = lore_io::IoDriver::global();
+        let mut written = vec![self.written.as_path()];
+        if self.original != self.written {
+            written.push(self.original.as_path());
+        }
+        for dot_dir in written {
+            if !dot_dir.exists() {
+                continue;
+            }
+            // Retried: on Windows a store task of the failed clone can still hold a file open
+            // in the new control directory for a moment after the clone returns.
+            let mut retry = util::fs::file_unlink_retry();
+            while let Err(error) = io.remove_dir_all(dot_dir).await {
+                if !retry.wait().await {
+                    lore_error!(
+                        "Could not remove {} to restore the previous repository from {}: \
+                         {error}. Remove {} and move {} back to {} by hand",
+                        dot_dir.display(),
+                        self.aside.display(),
+                        dot_dir.display(),
+                        self.aside.display(),
+                        self.original.display()
+                    );
+                    return;
+                }
+            }
+        }
+        if let Err(error) = io
+            .rename(self.aside.as_path(), self.original.as_path())
+            .await
+        {
+            lore_error!(
+                "Could not restore the previous repository from {} to {}: {error}",
+                self.aside.display(),
+                self.original.display()
+            );
+        }
+    }
+
+    /// Removes the set-aside directory after a successful clone. A failure only leaves it behind.
+    async fn discard(self) {
+        if let Err(error) = lore_io::IoDriver::global()
+            .remove_dir_all(self.aside.as_path())
+            .await
+        {
+            lore_warn!(
+                "Could not remove the replaced repository at {}: {error}",
+                self.aside.display()
+            );
+        }
+    }
 }
 
 /// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the

@@ -239,3 +239,109 @@ async fn adversarial_concurrent_calls_same_parent() {
     assert!(on_disk(&temp, &parent).is_dir());
     assert_eq!(stats.created_parents.len(), 1);
 }
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_missing_path_holds_nothing() {
+    let temp = TempDir::new("lore-clone-holds-missing-");
+    let path = temp.path().join("absent");
+    let dot_dir = path.join(".lore");
+
+    let holds = holds_entries_besides_dot_dir(&path, &dot_dir)
+        .await
+        .expect("a missing path is not an error");
+
+    assert!(!holds);
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_empty_dir_holds_nothing() {
+    let temp = TempDir::new("lore-clone-holds-empty-");
+    let dot_dir = temp.path().join(".lore");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing an empty folder");
+
+    assert!(!holds);
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_only_dot_dir_holds_nothing() {
+    let temp = TempDir::new("lore-clone-holds-dot-");
+    let dot_dir = temp.path().join(".lore");
+    std::fs::create_dir(&dot_dir).expect("creating the control dir");
+    std::fs::write(dot_dir.join("marker"), b"x").expect("writing inside the control dir");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing a folder with only the control dir");
+
+    assert!(!holds, "the control dir and its contents must not count");
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_file_holds_entries() {
+    let temp = TempDir::new("lore-clone-holds-file-");
+    let dot_dir = temp.path().join(".lore");
+    std::fs::write(temp.path().join("user.txt"), b"mine").expect("writing a user file");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing a folder with a file");
+
+    assert!(holds);
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_file_beside_dot_dir_holds_entries() {
+    let temp = TempDir::new("lore-clone-holds-both-");
+    let dot_dir = temp.path().join(".lore");
+    std::fs::create_dir(&dot_dir).expect("creating the control dir");
+    std::fs::write(temp.path().join("user.txt"), b"mine").expect("writing a user file");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing a populated working copy");
+
+    assert!(holds);
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_subdir_holds_entries() {
+    let temp = TempDir::new("lore-clone-holds-subdir-");
+    let dot_dir = temp.path().join(".lore");
+    std::fs::create_dir(temp.path().join("Content")).expect("creating a user folder");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing a folder with a subfolder");
+
+    assert!(holds);
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_legacy_urc_dir_holds_nothing() {
+    let temp = TempDir::new("lore-clone-holds-urc-");
+    let dot_dir = temp.path().join(".lore");
+    std::fs::create_dir(temp.path().join(".urc")).expect("creating the legacy control dir");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing a folder with a legacy control dir");
+
+    assert!(!holds, "the legacy .urc dir must not count");
+}
+
+#[tokio::test]
+async fn holds_entries_besides_dot_dir_mixed_case_control_dirs_hold_nothing() {
+    let temp = TempDir::new("lore-clone-holds-case-");
+    let dot_dir = temp.path().join(".lore");
+    std::fs::create_dir(temp.path().join(".Lore")).expect("creating .Lore");
+    std::fs::create_dir(temp.path().join(".URC")).expect("creating .URC");
+
+    let holds = holds_entries_besides_dot_dir(temp.path(), &dot_dir)
+        .await
+        .expect("listing a folder with mixed-case control dirs");
+
+    assert!(!holds, "control dirs count in any letter case");
+}

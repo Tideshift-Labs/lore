@@ -8028,4 +8028,458 @@ mod storage_remote_tests {
         );
         Ok(())
     }
+
+    // ---- FORK-LOCAL (Tideshift): clone into a populated folder / `--force` keeps the binding ----
+
+    /// Status code of `LoreError::InvalidArguments`.
+    const STATUS_INVALID_ARGUMENTS: i32 = 3;
+    /// Status code of `RepositoryAlreadyExists`.
+    const STATUS_REPOSITORY_ALREADY_EXISTS: i32 = 58;
+
+    /// A served repository, optionally holding one pushed revision, plus a scratch tree to clone
+    /// into.
+    struct CloneTarget {
+        _server: TestServer,
+        temp: lore_base::test_util::TempDir,
+        url: String,
+        /// The pushed revision. `None` for an empty (zero-revision) remote.
+        revision: Option<lore_base::types::Hash>,
+    }
+
+    fn clone_globals(path: &std::path::Path, force: bool) -> LoreGlobalArgs {
+        LoreGlobalArgs {
+            repository_path: path.into(),
+            identity: "test-user".into(),
+            force: u8::from(force),
+            ..Default::default()
+        }
+    }
+
+    /// Serve a repository. With `with_revision` it holds one pushed commit adding `held.txt`.
+    async fn clone_target(with_revision: bool) -> Result<CloneTarget, Box<dyn Error>> {
+        use lore::file;
+        use lore::repository;
+        use lore::revision;
+        use lore_revision::interface::LoreArray;
+        use lore_revision::repository::LoreSharedStoreMode;
+
+        let server = start_test_server().await;
+        let temp = lore_base::test_util::TempDir::new("lore-clone-populated-");
+        let source_path = temp.join("source");
+        std::fs::create_dir_all(&source_path)?;
+        let url = format!("{}/clone-populated", server.url);
+
+        let status = repository::create(
+            clone_globals(&source_path, false),
+            repository::LoreRepositoryCreateArgs {
+                repository_url: url.as_str().into(),
+                description: LoreString::default(),
+                id: LoreString::default(),
+                use_shared_store: LoreSharedStoreMode::Disabled,
+                shared_store_path: LoreString::default(),
+                vfs: Default::default(),
+            },
+            None,
+        )
+        .await;
+        assert_eq!(status, 0, "repository create failed");
+
+        let mut revision_hash = None;
+        if with_revision {
+            std::fs::write(source_path.join("held.txt"), "remote content")?;
+            let status = file::stage(
+                clone_globals(&source_path, false),
+                file::LoreFileStageArgs {
+                    paths: LoreArray::from_vec(vec![LoreString::from(".")]),
+                    case_change: 0,
+                    scan: 1,
+                },
+                None,
+            )
+            .await;
+            assert_eq!(status, 0, "stage failed");
+
+            let committed: Arc<Mutex<Option<lore_base::types::Hash>>> = Arc::default();
+            let committed_for_callback = committed.clone();
+            let status = revision::commit(
+                clone_globals(&source_path, false),
+                revision::LoreRevisionCommitArgs {
+                    message: "Initial commit".into(),
+                    link: Default::default(),
+                    link_paths: Default::default(),
+                    layer: Default::default(),
+                    layer_paths: Default::default(),
+                    link_messages: Default::default(),
+                    layer_messages: Default::default(),
+                },
+                Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::RevisionCommitRevision(data) = event {
+                        *committed_for_callback.lock().unwrap() = Some(data.revision);
+                    }
+                })),
+            )
+            .await;
+            assert_eq!(status, 0, "commit failed");
+            revision_hash = Some(committed.lock().unwrap().take().ok_or("no revision")?);
+
+            let status = lore::branch::push(
+                clone_globals(&source_path, false),
+                lore::branch::LoreBranchPushArgs {
+                    branch: LoreString::default(),
+                    fast_forward_merge: 0,
+                },
+                None,
+            )
+            .await;
+            assert_eq!(status, 0, "push failed");
+        }
+
+        Ok(CloneTarget {
+            _server: server,
+            temp,
+            url,
+            revision: revision_hash,
+        })
+    }
+
+    /// Runs a clone, returning its status and every error message it reported.
+    async fn run_clone(
+        path: &std::path::Path,
+        force: bool,
+        args: lore::repository::LoreRepositoryCloneArgs,
+    ) -> (i32, String) {
+        run_clone_with(clone_globals(path, force), args).await
+    }
+
+    async fn run_clone_with(
+        globals: LoreGlobalArgs,
+        args: lore::repository::LoreRepositoryCloneArgs,
+    ) -> (i32, String) {
+        let errors: Arc<Mutex<Vec<String>>> = Arc::default();
+        let errors_for_callback = errors.clone();
+        let status = lore::repository::clone(
+            globals,
+            args,
+            Some(Box::new(move |event: &LoreEvent| match event {
+                LoreEvent::Error(data) => errors_for_callback
+                    .lock()
+                    .unwrap()
+                    .push(data.error_inner.to_string()),
+                LoreEvent::Complete(data) => errors_for_callback
+                    .lock()
+                    .unwrap()
+                    .push(data.error.message.to_string()),
+                _ => {}
+            })),
+        )
+        .await;
+        let errors = errors.lock().unwrap().join(" | ");
+        (status, errors)
+    }
+
+    fn clone_args(url: &str) -> lore::repository::LoreRepositoryCloneArgs {
+        lore::repository::LoreRepositoryCloneArgs {
+            repository_url: url.into(),
+            use_shared_store: lore_revision::repository::LoreSharedStoreMode::Disabled,
+            ..Default::default()
+        }
+    }
+
+    /// Where a forced clone sets the old control dir aside: a sibling of the working-copy root.
+    fn aside_of(path: &std::path::Path) -> std::path::PathBuf {
+        let name = path.file_name().unwrap().to_string_lossy();
+        path.with_file_name(format!(".{name}.lore-replaced-by-clone"))
+    }
+
+    fn assert_refused_not_empty(status: i32, errors: &str) {
+        assert_eq!(
+            status, STATUS_INVALID_ARGUMENTS,
+            "expected InvalidArguments: {errors}"
+        );
+        assert!(errors.contains("is not empty"), "message: {errors}");
+        assert!(errors.contains("--allow-non-empty"), "message: {errors}");
+    }
+
+    /// `--force` must not remove the existing `.lore` until the remote has answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_force_to_unreachable_remote_keeps_existing_dot_lore() -> TestResult {
+        let temp = lore_base::test_util::TempDir::new("lore-clone-unreachable-");
+        let path = temp.join("work");
+        std::fs::create_dir_all(path.join(".lore"))?;
+        std::fs::write(path.join(".lore").join("marker"), "keep me")?;
+
+        let (status, errors) = run_clone(&path, true, clone_args("http://127.0.0.1:1/x")).await;
+
+        assert_ne!(status, 0, "an unreachable remote must fail the clone");
+        assert_eq!(
+            std::fs::read_to_string(path.join(".lore").join("marker"))?,
+            "keep me",
+            "the existing .lore must survive a failed connect: {errors}"
+        );
+        Ok(())
+    }
+
+    /// Without `--force`, an existing `.lore` still refuses.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_without_force_over_existing_dot_lore_refuses() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(path.join(".lore"))?;
+        std::fs::write(path.join(".lore").join("marker"), "keep me")?;
+
+        let (status, errors) = run_clone(&path, false, clone_args(&target.url)).await;
+
+        assert_eq!(status, STATUS_REPOSITORY_ALREADY_EXISTS, "{errors}");
+        assert!(path.join(".lore").join("marker").exists());
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_with_revisions_into_populated_folder_is_refused() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("mine.txt"), "user bytes")?;
+
+        let (status, errors) = run_clone(&path, false, clone_args(&target.url)).await;
+
+        assert_refused_not_empty(status, &errors);
+        assert!(!path.join(".lore").exists(), "nothing may be written");
+        assert!(!path.join("held.txt").exists());
+        assert_eq!(std::fs::read(path.join("mine.txt"))?, b"user bytes");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_with_revisions_into_populated_folder_allowed_keeps_user_file() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("mine.txt"), "user bytes")?;
+
+        let (status, errors) = run_clone(
+            &path,
+            false,
+            lore::repository::LoreRepositoryCloneArgs {
+                allow_non_empty: 1,
+                ..clone_args(&target.url)
+            },
+        )
+        .await;
+
+        assert_eq!(status, 0, "clone failed: {errors}");
+        assert!(path.join(".lore").exists());
+        assert_eq!(std::fs::read(path.join("mine.txt"))?, b"user bytes");
+        assert_eq!(std::fs::read(path.join("held.txt"))?, b"remote content");
+        Ok(())
+    }
+
+    /// The desktop "adopt" bind: an empty remote into a populated folder needs no flag.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_empty_remote_into_populated_folder_succeeds() -> TestResult {
+        let target = clone_target(false).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("mine.txt"), "user bytes")?;
+
+        let (status, errors) = run_clone(&path, false, clone_args(&target.url)).await;
+
+        assert_eq!(status, 0, "adopt clone failed: {errors}");
+        assert!(path.join(".lore").exists());
+        assert_eq!(std::fs::read(path.join("mine.txt"))?, b"user bytes");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_bare_into_populated_folder_succeeds() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("mine.txt"), "user bytes")?;
+
+        let (status, errors) = run_clone(
+            &path,
+            false,
+            lore::repository::LoreRepositoryCloneArgs {
+                bare: 1,
+                ..clone_args(&target.url)
+            },
+        )
+        .await;
+
+        assert_eq!(status, 0, "bare clone failed: {errors}");
+        assert!(path.join(".lore").exists());
+        assert_eq!(std::fs::read(path.join("mine.txt"))?, b"user bytes");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_into_empty_or_missing_folder_succeeds() -> TestResult {
+        let target = clone_target(true).await?;
+
+        let empty = target.temp.join("empty");
+        std::fs::create_dir_all(&empty)?;
+        let (status, errors) = run_clone(&empty, false, clone_args(&target.url)).await;
+        assert_eq!(status, 0, "clone into an empty folder failed: {errors}");
+        assert_eq!(std::fs::read(empty.join("held.txt"))?, b"remote content");
+
+        let missing = target.temp.join("missing");
+        let (status, errors) = run_clone(&missing, false, clone_args(&target.url)).await;
+        assert_eq!(status, 0, "clone into a missing folder failed: {errors}");
+        assert_eq!(std::fs::read(missing.join("held.txt"))?, b"remote content");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_pinned_revision_into_populated_folder_is_refused() -> TestResult {
+        let target = clone_target(true).await?;
+        let revision = target.revision.ok_or("no revision")?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join("mine.txt"), "user bytes")?;
+
+        let (status, errors) = run_clone(
+            &path,
+            false,
+            lore::repository::LoreRepositoryCloneArgs {
+                revision: revision.to_string().as_str().into(),
+                ..clone_args(&target.url)
+            },
+        )
+        .await;
+
+        assert_refused_not_empty(status, &errors);
+        assert!(!path.join(".lore").exists());
+        assert_eq!(std::fs::read(path.join("mine.txt"))?, b"user bytes");
+        Ok(())
+    }
+
+    /// `--force` replaces a working copy only when the clone itself is allowed: over a populated
+    /// working copy it is refused and the existing `.lore` is kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_force_over_populated_working_copy_without_flag_keeps_dot_lore() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        let (status, errors) = run_clone(&path, false, clone_args(&target.url)).await;
+        assert_eq!(status, 0, "first clone failed: {errors}");
+        std::fs::write(path.join(".lore").join("marker"), "keep me")?;
+
+        let (status, errors) = run_clone(&path, true, clone_args(&target.url)).await;
+
+        assert_refused_not_empty(status, &errors);
+        assert_eq!(
+            std::fs::read_to_string(path.join(".lore").join("marker"))?,
+            "keep me"
+        );
+        assert_eq!(std::fs::read(path.join("held.txt"))?, b"remote content");
+        Ok(())
+    }
+
+    /// With the flag, `--force` replaces the control directory once the remote has answered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_force_with_allow_non_empty_replaces_dot_lore() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        let (status, errors) = run_clone(&path, false, clone_args(&target.url)).await;
+        assert_eq!(status, 0, "first clone failed: {errors}");
+        std::fs::write(path.join(".lore").join("marker"), "stale")?;
+
+        let (status, errors) = run_clone(
+            &path,
+            true,
+            lore::repository::LoreRepositoryCloneArgs {
+                allow_non_empty: 1,
+                ..clone_args(&target.url)
+            },
+        )
+        .await;
+
+        assert_eq!(status, 0, "forced re-clone failed: {errors}");
+        assert!(
+            !path.join(".lore").join("marker").exists(),
+            "the previous .lore must be replaced"
+        );
+        assert!(path.join(".lore").exists());
+        assert!(
+            !aside_of(&path).exists(),
+            "a successful replace must remove the set-aside copy"
+        );
+        Ok(())
+    }
+
+    /// A failed forced clone (nonexistent pinned revision) restores the set-aside `.lore`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_force_failure_restores_dot_lore() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(path.join(".lore"))?;
+        std::fs::write(path.join(".lore").join("marker"), "keep me")?;
+
+        let (status, errors) = run_clone(
+            &path,
+            true,
+            lore::repository::LoreRepositoryCloneArgs {
+                revision: "0000000000000000000000000000000000000000000000000000000000000abc".into(),
+                ..clone_args(&target.url)
+            },
+        )
+        .await;
+
+        assert_ne!(status, 0, "a bogus revision must fail: {errors}");
+        assert_eq!(
+            std::fs::read_to_string(path.join(".lore").join("marker"))?,
+            "keep me",
+            "the original .lore must be restored: {errors}"
+        );
+        assert!(!aside_of(&path).exists());
+        Ok(())
+    }
+
+    /// A forced dry-run clone leaves the existing `.lore` in place and no set-aside copy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_force_dry_run_keeps_dot_lore() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(path.join(".lore"))?;
+        std::fs::write(path.join(".lore").join("marker"), "keep me")?;
+
+        let globals = LoreGlobalArgs {
+            dry_run: 1,
+            ..clone_globals(&path, true)
+        };
+        let (_status, errors) = run_clone_with(globals, clone_args(&target.url)).await;
+
+        assert_eq!(
+            std::fs::read_to_string(path.join(".lore").join("marker"))?,
+            "keep me",
+            "a dry run must keep the .lore: {errors}"
+        );
+        assert!(!aside_of(&path).exists());
+        Ok(())
+    }
+
+    /// A set-aside copy left by an earlier unfinished clone refuses a forced clone untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn clone_force_with_leftover_set_aside_is_refused() -> TestResult {
+        let target = clone_target(true).await?;
+        let path = target.temp.join("work");
+        std::fs::create_dir_all(path.join(".lore"))?;
+        std::fs::write(path.join(".lore").join("marker"), "current")?;
+        std::fs::create_dir_all(aside_of(&path))?;
+        std::fs::write(aside_of(&path).join("marker"), "older")?;
+
+        let (status, errors) = run_clone(&path, true, clone_args(&target.url)).await;
+
+        assert_eq!(status, STATUS_INVALID_ARGUMENTS, "{errors}");
+        assert!(errors.contains("did not finish"), "message: {errors}");
+        assert_eq!(
+            std::fs::read_to_string(path.join(".lore").join("marker"))?,
+            "current"
+        );
+        assert_eq!(
+            std::fs::read_to_string(aside_of(&path).join("marker"))?,
+            "older"
+        );
+        Ok(())
+    }
 }

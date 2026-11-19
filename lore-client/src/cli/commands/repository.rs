@@ -232,6 +232,12 @@ pub struct RepositoryCloneArgs {
     /// Maximum dependency traversal depth (0 means unlimited)
     #[clap(long, value_name = "depth", default_value = "0")]
     dependency_depth_limit: u32,
+
+    /// Clone into a folder that already holds files. Without it, a clone that would write the
+    /// repository's files into a non-empty folder is refused before anything changes. Files the
+    /// repository does not track stay in place; with --force, files it does track are replaced.
+    #[clap(long, action)]
+    allow_non_empty: bool,
 }
 
 #[derive(Args)]
@@ -1039,6 +1045,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        allow_non_empty: args.allow_non_empty.into(),
     };
 
     let start = std::time::Instant::now();
