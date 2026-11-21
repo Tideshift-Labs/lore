@@ -355,6 +355,11 @@ fn refusal_text(result: Result<RepositoryMutationGuard, lore_transport::Protocol
     }
 }
 
+/// Held locks survive a re-clone; every refusal says how to release them.
+const LOCK_LINE: &str = "Locks you hold stay held after you clone again. To release them, run \
+                         `lore lock release --force` in the new folder (add `--branch <name>` for \
+                         another branch).";
+
 /// The refusal names each blocker, says whether Lore can settle it, and the way out.
 #[tokio::test]
 async fn refusal_text_names_blockers_and_the_exit() {
@@ -412,6 +417,7 @@ async fn refusal_text_names_blockers_and_the_exit() {
         text.ends_with("Run `lore operation status` for detail."),
         "{text}"
     );
+    assert_eq!(text.lines().nth_back(1), Some(LOCK_LINE), "{text}");
 
     // A receiptless child, acknowledged: no-receipt sentence, acknowledged sentence, hard clone
     // line. Legacy store, so the headline differs.
@@ -444,6 +450,11 @@ async fn refusal_text_names_blockers_and_the_exit() {
         "{text}"
     );
     assert!(!text.contains("If it stays blocked"), "{text}");
+    assert!(
+        text.ends_with("Run `lore operation status` for detail."),
+        "{text}"
+    );
+    assert_eq!(text.lines().nth_back(1), Some(LOCK_LINE), "{text}");
 }
 
 /// An open parent with no unresolved child (a settled child, body never proved) is named, and

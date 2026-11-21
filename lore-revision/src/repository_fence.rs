@@ -149,6 +149,14 @@ async fn admission_refusal_text(store: &RepositoryAttemptStore, headline: &str) 
         }
         .to_owned(),
     );
+    // A fresh clone holds no lock tokens, but `lock release --force` with no paths queries the
+    // caller's own locks and, on a fenced cell, escalates to the self force-release the server
+    // admits for a caller's own rows (`is_self_force_unlock`).
+    lines.push(
+        "Locks you hold stay held after you clone again. To release them, run `lore lock \
+         release --force` in the new folder (add `--branch <name>` for another branch)."
+            .to_owned(),
+    );
     lines.push("Run `lore operation status` for detail.".to_owned());
     lines.join("\n")
 }
