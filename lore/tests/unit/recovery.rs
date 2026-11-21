@@ -365,3 +365,36 @@ async fn a_nested_admit_with_admits_without_lookup_and_leaves_the_open_parent() 
     guard.store().complete_parent_body(parent).await.unwrap();
     guard.finish(parent).await.unwrap();
 }
+
+/// A receiptless child (no receipt reader) stays blocked: the refusal carries the reconcile detail
+/// after the fence's own text, and the lookup is never called for it.
+#[tokio::test]
+async fn a_receiptless_child_refuses_with_the_reconcile_detail_and_no_lookup() {
+    let dir = worktree();
+    let (_, child) = crash_with_child(dir.path(), "StorageService.MutableStore").await;
+
+    let calls = AtomicUsize::new(0);
+    let error = admit_with(dir.path(), |_, _| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        async {
+            Err(lore_transport::ProtocolError::internal(
+                "lookup must not run",
+            ))
+        }
+    })
+    .await
+    .err()
+    .expect("a receiptless child keeps admission refused");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let message = error.to_string();
+    let (_, detail) = message
+        .split_once("\nAutomatic reconcile ran first and reported:\n")
+        .unwrap_or_else(|| panic!("missing reconcile detail: {message}"));
+    assert!(
+        detail.contains(&format!(
+            "{} StorageService.MutableStore has no supported receipt reader; remains blocked",
+            child.attempt_id
+        )),
+        "{message}"
+    );
+}
