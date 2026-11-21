@@ -1,6 +1,7 @@
 // Copyright 2026 Khurram Virani
 // SPDX-License-Identifier: MIT
 use lore_transport::caller_operation::canonical_endpoint;
+use lore_transport::caller_operation::has_receipt_reader;
 use lore_transport::caller_operation::is_legacy_unjournaled_write;
 use lore_transport::caller_operation::recovery_dial_url;
 use lore_transport::caller_operation::recovery_receipt_method_matches;
@@ -37,6 +38,31 @@ fn only_the_exact_put_copy_and_put_resolved_are_legacy_unjournaled_children() {
         "PutResolved",
     ] {
         assert!(!is_legacy_unjournaled_write(other), "{other:?}");
+    }
+}
+
+/// Exactly the five RPCs `lore operation reconcile` can read a receipt for.
+#[test]
+fn only_the_five_receipt_rpcs_have_a_receipt_reader() {
+    for rpc in [
+        "RevisionService.BranchPush",
+        "RevisionService.BranchCreate",
+        "LockService.Lock",
+        "LockService.Unlock",
+        "LockService.ForceUnlock",
+    ] {
+        assert!(has_receipt_reader(rpc), "{rpc:?}");
+    }
+    for other in [
+        "",
+        "StorageService.Put",
+        "StorageService.PutResolved",
+        "StorageService.MutableStore",
+        "StorageService.MutableCompareAndSwap",
+        "LockService.Lock ",
+        "lockservice.lock",
+    ] {
+        assert!(!has_receipt_reader(other), "{other:?}");
     }
 }
 

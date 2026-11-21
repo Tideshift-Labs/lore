@@ -150,6 +150,20 @@ pub fn is_legacy_unjournaled_write(recorded_rpc: &str) -> bool {
     .any(|rpc| recorded_rpc == rpc.wire_name())
 }
 
+/// Whether recovery has a receipt reader for a recorded child's RPC, so `lore operation
+/// reconcile` can settle it from the server's answer. Any other unresolved child can never settle:
+/// it has no attributable receipt rail, and recovery never infers a result from content.
+pub fn has_receipt_reader(recorded_rpc: &str) -> bool {
+    matches!(
+        recorded_rpc,
+        "RevisionService.BranchPush"
+            | "RevisionService.BranchCreate"
+            | "LockService.Lock"
+            | "LockService.Unlock"
+            | "LockService.ForceUnlock"
+    )
+}
+
 /// Read the exact repository credential selection without declaring or dispatching a mutation.
 /// The signature remains verified by the peer; this snapshot binds subsequent dispatches.
 pub async fn selected_caller_namespace(

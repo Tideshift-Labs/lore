@@ -70,7 +70,9 @@ where
     RepositoryMutationGuard::acquire(root)
         .await
         .map_err(|error| match detail {
-            Some(detail) => ProtocolError::internal(format!("{error}\n{detail}")),
+            Some(detail) => ProtocolError::internal(format!(
+                "{error}\nAutomatic reconcile ran first and reported:\n{detail}"
+            )),
             None => error,
         })
 }
@@ -94,14 +96,7 @@ where
         })? {
             // Other storage mutations have no attributable receipt rail. Never infer their
             // result from content.
-            if !matches!(
-                child.operation.as_str(),
-                "RevisionService.BranchPush"
-                    | "RevisionService.BranchCreate"
-                    | "LockService.Lock"
-                    | "LockService.Unlock"
-                    | "LockService.ForceUnlock"
-            ) {
+            if !lore_transport::caller_operation::has_receipt_reader(&child.operation) {
                 blockers.push(format!(
                     "{source}: {} {} has no supported receipt reader; remains blocked",
                     child.attempt_id, child.operation

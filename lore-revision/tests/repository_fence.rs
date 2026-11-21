@@ -348,6 +348,202 @@ async fn put_only_parent_with_an_unfinished_body_is_closed_by_acquire() {
     }
 }
 
+fn refusal_text(result: Result<RepositoryMutationGuard, lore_transport::ProtocolError>) -> String {
+    match result {
+        Ok(_) => panic!("admission must be refused"),
+        Err(error) => error.to_string(),
+    }
+}
+
+/// The refusal names each blocker, says whether Lore can settle it, and the way out.
+#[tokio::test]
+async fn refusal_text_names_blockers_and_the_exit() {
+    // A settleable child (a receipt reader exists): reconcile sentence and the soft clone line.
+    let dir = worktree();
+    let parent = Uuid::now_v7();
+    let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+    let store = guard
+        .begin(parent, "push".into(), "branch".into())
+        .await
+        .unwrap();
+    let (lock, lock_intent) = record_for(parent, "LockService.Lock");
+    // Settleable needs a recoverable namespace and a parent that proved its body finished.
+    let binding = lore_transport::CallerRecoveryContext {
+        repository: lock_intent.repository,
+        endpoint: lock_intent.endpoint.clone(),
+        verified_issuer: lock_intent.verified_issuer.clone(),
+        authenticated_subject: lock_intent.authenticated_subject.clone(),
+        caller_capabilities: lock_intent.caller_capabilities.clone(),
+    };
+    store.bind_parent_namespace(parent, &binding).await.unwrap();
+    store.record_managed(&lock, &lock_intent).await.unwrap();
+    store.complete_parent_body(parent).await.unwrap();
+    drop(store);
+    drop(guard);
+    let text = refusal_text(RepositoryMutationGuard::acquire(dir.path()).await);
+    assert!(text.contains("unresolved workflow"), "{text}");
+    assert!(
+        text.contains("writes to this working copy are blocked."),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Attempt {} (LockService.Lock): the outcome is unknown.",
+            lock.attempt_id
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "It can settle only if the server holds a receipt for it: run `lore operation \
+             reconcile`, or retry later."
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("Lore cannot settle it"), "{text}");
+    assert!(!text.contains("cannot finish"), "{text}");
+    assert!(
+        text.contains(
+            "If it stays blocked, clone the repository again into a new folder to keep writing."
+        ),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("Run `lore operation status` for detail."),
+        "{text}"
+    );
+
+    // A receiptless child, acknowledged: no-receipt sentence, acknowledged sentence, hard clone
+    // line. Legacy store, so the headline differs.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".urc")).unwrap();
+    let legacy =
+        lore_revision::attempt_store::RepositoryAttemptStore::in_directory(dir.path().join(".urc"));
+    let (mut child, _) = record(Uuid::now_v7());
+    child.state = AttemptState::AdjudicatedUnknown;
+    legacy.record(&child).await.unwrap();
+    let text = refusal_text(RepositoryMutationGuard::acquire(dir.path()).await);
+    assert!(text.contains("unresolved legacy attempts"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Attempt {} (StorageService.MutableStore): the outcome is unknown.",
+            child.attempt_id
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("Lore cannot settle it: this operation has no receipt to read."),
+        "{text}"
+    );
+    assert!(
+        text.contains("It was acknowledged; acknowledging does not unblock writes."),
+        "{text}"
+    );
+    assert!(
+        text.contains("To keep writing, clone the repository again into a new folder."),
+        "{text}"
+    );
+    assert!(!text.contains("If it stays blocked"), "{text}");
+}
+
+/// An open parent with no unresolved child (a settled child, body never proved) is named, and
+/// since it can never complete the hard clone line shows.
+#[tokio::test]
+async fn refusal_text_names_an_unfinished_parent_with_no_unresolved_child() {
+    let dir = worktree();
+    let parent = Uuid::now_v7();
+    let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+    let store = guard
+        .begin(parent, "push".into(), "branch".into())
+        .await
+        .unwrap();
+    let local = AttemptId::new();
+    store
+        .record_workflow_child(parent, local, "local commit".into(), b"intent".to_vec())
+        .await
+        .unwrap();
+    store
+        .resolve(&local, AttemptResolution::Applied)
+        .await
+        .unwrap();
+    drop(store);
+    drop(guard);
+    let text = refusal_text(RepositoryMutationGuard::acquire(dir.path()).await);
+    assert!(text.contains("unresolved workflow"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "Workflow {parent} (push) cannot finish: it never recorded that its steps completed."
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Attempt "), "{text}");
+    assert!(
+        text.contains("To keep writing, clone the repository again into a new folder."),
+        "{text}"
+    );
+}
+
+/// A settleable child does not hide a parent that can never finish: the parent line and the hard
+/// clone line both show.
+#[tokio::test]
+async fn refusal_text_names_a_parent_that_cannot_finish_beside_a_settleable_child() {
+    let dir = worktree();
+    let parent = Uuid::now_v7();
+    let guard = RepositoryMutationGuard::acquire(dir.path()).await.unwrap();
+    let store = guard
+        .begin(parent, "push".into(), "branch".into())
+        .await
+        .unwrap();
+    let (lock, intent) = record_for(parent, "LockService.Lock");
+    let binding = lore_transport::CallerRecoveryContext {
+        repository: intent.repository,
+        endpoint: intent.endpoint.clone(),
+        verified_issuer: intent.verified_issuer.clone(),
+        authenticated_subject: intent.authenticated_subject.clone(),
+        caller_capabilities: intent.caller_capabilities.clone(),
+    };
+    store.bind_parent_namespace(parent, &binding).await.unwrap();
+    store.record_managed(&lock, &intent).await.unwrap();
+    drop(store);
+    drop(guard);
+    let text = refusal_text(RepositoryMutationGuard::acquire(dir.path()).await);
+    assert!(
+        text.contains("It can settle only if the server holds a receipt for it"),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "Workflow {parent} (push) cannot finish: it never recorded that its steps completed."
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("To keep writing, clone the repository again into a new folder."),
+        "{text}"
+    );
+}
+
+/// A receipt-capable child whose journal has no recoverable server namespace cannot be settled.
+#[tokio::test]
+async fn refusal_text_names_a_receipt_capable_child_with_no_recorded_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".urc")).unwrap();
+    let legacy =
+        lore_revision::attempt_store::RepositoryAttemptStore::in_directory(dir.path().join(".urc"));
+    let (mut child, _) = record(Uuid::now_v7());
+    child.operation = "LockService.Lock".into();
+    legacy.record(&child).await.unwrap();
+    let text = refusal_text(RepositoryMutationGuard::acquire(dir.path()).await);
+    assert!(
+        text.contains("Lore cannot settle it: its recorded server namespace cannot be recovered."),
+        "{text}"
+    );
+    assert!(
+        text.contains("To keep writing, clone the repository again into a new folder."),
+        "{text}"
+    );
+}
+
 /// A Put beside an unresolved `BranchPush`: the Put settles but the parent still waits on the
 /// push receipt, so acquire refuses.
 #[tokio::test]

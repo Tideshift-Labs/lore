@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_base::fs::lock::FSLock;
+use lore_transport::AttemptState;
 use lore_transport::AttemptStore;
 use lore_transport::ProtocolError;
 use uuid::Uuid;
@@ -47,6 +48,109 @@ async fn blocks_admission(store: &RepositoryAttemptStore) -> Result<bool, Protoc
         return Ok(true);
     }
     blocked(store).await
+}
+
+/// The refusal for a blocked admission. It keeps the internal error code and names each blocker,
+/// whether Lore can still settle it, and the only exit when it cannot. Acknowledging an attempt
+/// (`AdjudicatedUnknown`) is not an exit: correctness stays unresolved and the latch, keyed on
+/// this working copy's path, stays in place.
+async fn admission_refusal(store: &RepositoryAttemptStore, headline: &str) -> ProtocolError {
+    ProtocolError::internal(admission_refusal_text(store, headline).await)
+}
+
+#[lore_macro::test_pub]
+async fn admission_refusal_text(store: &RepositoryAttemptStore, headline: &str) -> String {
+    let mut lines = vec![format!(
+        "{headline}; writes to this working copy are blocked."
+    )];
+    let mut unsettleable = false;
+    // An open parent that recorded an uncertainty code, or never proved its body finished, can
+    // never complete: `reconcile_parent` refuses it even after every child settles. Admission ran
+    // `settle_receiptless` first, so any such parent still open here is one of those.
+    let open_parents = match store.admission_parents().await {
+        Ok(parents) => {
+            let open: Vec<_> = parents
+                .into_iter()
+                .filter(|parent| !parent.complete)
+                .collect();
+            unsettleable |= open
+                .iter()
+                .any(|parent| parent.parent_uncertainty_code.is_some() || !parent.body_completed);
+            open
+        }
+        Err(error) => {
+            lines.push(format!("Cannot list the blocking workflows: {error}"));
+            Vec::new()
+        }
+    };
+    let mut has_children = false;
+    match store.unresolved().await {
+        Ok(children) => {
+            has_children = !children.is_empty();
+            for child in children {
+                // Reconcile can settle a child only through a receipt reader, and only when the
+                // child's recorded namespace can be recovered to ask the server.
+                let reason =
+                    if !lore_transport::caller_operation::has_receipt_reader(&child.operation) {
+                        Some(" Lore cannot settle it: this operation has no receipt to read.")
+                    } else if store.recovery_context(&child.attempt_id).await.is_err() {
+                        Some(
+                            " Lore cannot settle it: its recorded server namespace cannot be \
+                             recovered.",
+                        )
+                    } else {
+                        None
+                    };
+                unsettleable |= reason.is_some();
+                let mut line = format!(
+                    "Attempt {} ({}): the outcome is unknown.",
+                    child.attempt_id, child.operation
+                );
+                line.push_str(reason.unwrap_or(
+                    " It can settle only if the server holds a receipt for it: run `lore \
+                     operation reconcile`, or retry later.",
+                ));
+                if child.state == AttemptState::AdjudicatedUnknown {
+                    line.push_str(" It was acknowledged; acknowledging does not unblock writes.");
+                }
+                lines.push(line);
+            }
+        }
+        Err(error) => lines.push(format!("Cannot list the blocking attempts: {error}")),
+    }
+    // Name every open parent that can never finish, even beside settleable children: settling
+    // them would still leave this parent, and so the block, in place.
+    for parent in &open_parents {
+        let line = if parent.parent_uncertainty_code.is_some() {
+            format!(
+                "Workflow {} ({}) cannot finish: it recorded an uncertain outcome.",
+                parent.id, parent.operation
+            )
+        } else if !parent.body_completed {
+            format!(
+                "Workflow {} ({}) cannot finish: it never recorded that its steps completed.",
+                parent.id, parent.operation
+            )
+        } else if !has_children {
+            format!(
+                "Workflow {} ({}) did not finish.",
+                parent.id, parent.operation
+            )
+        } else {
+            continue;
+        };
+        lines.push(line);
+    }
+    lines.push(
+        if unsettleable {
+            "To keep writing, clone the repository again into a new folder."
+        } else {
+            "If it stays blocked, clone the repository again into a new folder to keep writing."
+        }
+        .to_owned(),
+    );
+    lines.push("Run `lore operation status` for detail.".to_owned());
+    lines.join("\n")
 }
 
 /// Owns exclusion until all nested calls and durable settlement have ended.
@@ -100,16 +204,16 @@ impl RepositoryMutationGuard {
             })
             .collect();
         if !nested && !recovery && blocks_admission(&store).await? {
-            return Err(ProtocolError::internal(
-                "repository has an unresolved workflow; inspect operation status",
-            ));
+            return Err(admission_refusal(&store, "repository has an unresolved workflow").await);
         }
         if !nested && !recovery {
             for (_, legacy) in &legacy_stores {
                 if blocks_admission(legacy).await? {
-                    return Err(ProtocolError::internal(
-                        "repository has unresolved legacy attempts; inspect operation status",
-                    ));
+                    return Err(admission_refusal(
+                        legacy,
+                        "repository has unresolved legacy attempts",
+                    )
+                    .await);
                 }
             }
         }
