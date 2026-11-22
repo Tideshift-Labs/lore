@@ -130,6 +130,26 @@ pub async fn branch_get_implementation(
         .await
 }
 
+/// FORK-LOCAL (Tideshift): only a missing key answers `NotFound`.
+///
+/// A client reads `NotFound` as "this branch does not exist" (`lore sync_settled` treats it as
+/// an empty remote branch). A store read that failed for another reason is not that answer, so
+/// it is `internal`. `SlowDown` is filtered before this runs.
+#[lore_macro::test_pub]
+fn lookup_status(err: &branch::BranchError, not_found: impl FnOnce() -> String) -> Status {
+    if err.is_branch_not_found() {
+        Status::not_found(not_found())
+    } else {
+        read_failed(err)
+    }
+}
+
+/// FORK-LOCAL (Tideshift): a store read that failed for a reason other than a missing key.
+fn read_failed(err: &branch::BranchError) -> Status {
+    tracing::warn!("BranchGet store read failed: {err}");
+    Status::internal(format!("Failed to read branch: {err}"))
+}
+
 async fn get_by_id(
     repository: Arc<RepositoryContext>,
     branch_id: BranchId,
@@ -138,7 +158,7 @@ async fn get_by_id(
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
         .filter_slow_down()?
-        .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
+        .map_err(|err| lookup_status(&err, || format!("Branch {branch_id} not found")))?;
     let metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
         .filter_slow_down()?
@@ -146,17 +166,26 @@ async fn get_by_id(
 
     // Delete leaves metadata intact but clears the name → id mapping.
     let deleted = match branch::name(&metadata) {
-        Ok(name) if !name.is_empty() => !branch::load_name_to_id_local(repository.clone(), name)
-            .await
-            .filter_slow_down()?
-            .is_ok_and(|id| id == branch_id),
+        Ok(name) if !name.is_empty() => {
+            match branch::load_name_to_id_local(repository.clone(), name)
+                .await
+                .filter_slow_down()?
+            {
+                Ok(id) => id != branch_id,
+                Err(err) if err.is_branch_not_found() => true,
+                // A failed read must not report a live branch as deleted.
+                Err(err) => return Err(read_failed(&err)),
+            }
+        }
         _ => false,
     };
 
+    // `load_latest` already answers zero for a branch with no pushed revision. Any error
+    // left is a failed read, and a zero tip would claim an empty branch.
     let latest = branch::load_latest(repository, branch_id)
         .await
         .filter_slow_down()?
-        .unwrap_or_default();
+        .map_err(|err| read_failed(&err))?;
     let response_branch = build_branch(branch_id, &metadata, metadata_hash, deleted, latest);
     debug!({BRANCH_ID} = %branch_id, {METADATA} = %metadata_hash, deleted, "Branch get by id response");
     Ok(Response::new(BranchGetResponse {
@@ -194,13 +223,13 @@ async fn get_by_name(
     let branch_id_ctx = branch::load_name_to_id_local(repository.clone(), name)
         .await
         .filter_slow_down()?
-        .map_err(|_err| Status::not_found(format!("Branch named '{name}' not found")))?;
+        .map_err(|err| lookup_status(&err, || format!("Branch named '{name}' not found")))?;
     let branch_id = BranchId::from(branch_id_ctx);
 
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
         .filter_slow_down()?
-        .map_err(|_err| Status::not_found(format!("Branch named '{name}' not found")))?;
+        .map_err(|err| lookup_status(&err, || format!("Branch named '{name}' not found")))?;
     let metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
         .filter_slow_down()?
@@ -209,7 +238,7 @@ async fn get_by_name(
     let latest = branch::load_latest(repository, branch_id)
         .await
         .filter_slow_down()?
-        .unwrap_or_default();
+        .map_err(|err| read_failed(&err))?;
     let response_branch = build_branch(branch_id, &metadata, metadata_hash, false, latest);
     debug!({BRANCH_ID} = %branch_id, {METADATA} = %metadata_hash, "Branch get by name response");
     let branch_generation = generation

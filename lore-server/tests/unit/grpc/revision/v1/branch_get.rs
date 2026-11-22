@@ -1047,3 +1047,256 @@ mod refresh_generation {
         .await;
     }
 }
+
+/// FORK-LOCAL (Tideshift): only a missing key answers `NotFound`; any other store failure is
+/// `Internal`.
+mod store_read_failures {
+    use async_trait::async_trait;
+    use lore_base::error::BranchNotFound;
+    use lore_base::types::KeyType;
+    use lore_revision::branch::BranchError;
+    use lore_storage::KeyValueStream;
+    use lore_storage::MutableStore;
+    use lore_storage::Partition;
+    use lore_storage::StoreError;
+    use tonic::Code;
+
+    use super::*;
+
+    /// Delegates to a real store, but every `load` of one key type fails with a store error that
+    /// is not a missing key.
+    struct FailLoadsOfKeyType {
+        inner: Arc<dyn MutableStore>,
+        failing: KeyType,
+    }
+
+    impl FailLoadsOfKeyType {
+        fn wrap(inner: Arc<dyn MutableStore>, failing: KeyType) -> Arc<dyn MutableStore> {
+            Arc::new(Self { inner, failing })
+        }
+    }
+
+    #[async_trait]
+    impl MutableStore for FailLoadsOfKeyType {
+        async fn load(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            if key_type == self.failing {
+                return Err(StoreError::internal("simulated mutable store failure"));
+            }
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .store(partition, key, value, key_type)
+                .await
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: KeyType,
+        ) -> Result<Hash, StoreError> {
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: Partition,
+            key_type: KeyType,
+        ) -> Result<KeyValueStream, StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    #[test]
+    fn lookup_status_maps_only_branch_not_found_to_not_found() {
+        let not_found = BranchError::from(BranchNotFound {
+            branch: "gone".to_string(),
+        });
+        let status = lookup_status(&not_found, || "custom missing message".to_string());
+        assert_eq!(status.code(), Code::NotFound);
+        assert_eq!(status.message(), "custom missing message");
+
+        let other = BranchError::internal("store exploded");
+        let status = lookup_status(&other, || unreachable!("not_found must not be built"));
+        assert_eq!(status.code(), Code::Internal);
+        assert!(status.message().contains("store exploded"), "{status:?}");
+    }
+
+    /// Creates a branch with metadata and a name mapping but no pushed revision.
+    async fn create_unpushed_branch(repository_context: Arc<RepositoryContext>, branch: BranchId) {
+        lore_revision::branch::create(
+            repository_context,
+            &get_write_token(),
+            branch,
+            "test-name",
+            branch::personal_category(),
+            "BranchCreator",
+            12345,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("Could not create unpushed branch");
+    }
+
+    /// Runs `handler` against a branch whose `failing` key type cannot be loaded.
+    async fn get_with_failing_key_type(
+        failing: KeyType,
+        by_id: bool,
+    ) -> Result<BranchGetResponse, tonic::Status> {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_test_branch(repository_context, branch_id).await;
+
+            let failing_store = FailLoadsOfKeyType::wrap(mutable_store, failing);
+            let request = if by_id {
+                make_request_id(repository, branch_id)
+            } else {
+                make_request_name(repository, "test-name")
+            };
+            handler(request, immutable_store, failing_store, &None, None)
+                .await
+                .map(tonic::Response::into_inner)
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn missing_branch_is_not_found_by_id_and_by_name() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            for (label, request) in [
+                (
+                    "id",
+                    make_request_id(repository, BranchId::from(uuid::Uuid::now_v7())),
+                ),
+                ("name", make_request_name(repository, "no-such-branch")),
+            ] {
+                let err = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None,
+                    None,
+                )
+                .await
+                .expect_err("missing branch should fail");
+                assert_eq!(err.code(), Code::NotFound, "by {label}: {err:?}");
+            }
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn metadata_store_failure_is_internal_by_id_and_by_name() {
+        for (label, by_id) in [("id", true), ("name", false)] {
+            let err = get_with_failing_key_type(KeyType::BranchMetadata, by_id)
+                .await
+                .expect_err("metadata read failure should fail the request");
+            assert_eq!(err.code(), Code::Internal, "by {label}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn name_lookup_store_failure_is_internal_by_name() {
+        let err = get_with_failing_key_type(KeyType::BranchId, false)
+            .await
+            .expect_err("name lookup failure should fail the request");
+        assert_eq!(err.code(), Code::Internal, "{err:?}");
+    }
+
+    /// The deleted check must not read a failed name lookup as "deleted".
+    #[tokio::test]
+    async fn name_lookup_store_failure_is_internal_not_deleted_by_id() {
+        let result = get_with_failing_key_type(KeyType::BranchId, true).await;
+        let err = result.expect_err("a failed name lookup must not answer a deleted record");
+        assert_eq!(err.code(), Code::Internal, "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn latest_store_failure_is_internal_not_a_zero_tip() {
+        for (label, by_id) in [("id", true), ("name", false)] {
+            let result = get_with_failing_key_type(KeyType::BranchLatestPointer, by_id).await;
+            let err = result.expect_err("a failed tip read must not answer a zero tip");
+            assert_eq!(err.code(), Code::Internal, "by {label}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn branch_without_pushed_revision_returns_zero_latest() {
+        let repository = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            create_unpushed_branch(repository_context, branch_id).await;
+
+            for (label, request) in [
+                ("id", make_request_id(repository, branch_id)),
+                ("name", make_request_name(repository, "test-name")),
+            ] {
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|err| panic!("by {label}: unpushed branch must succeed: {err:?}"))
+                .into_inner();
+                let branch = response.branch.expect("response should include Branch");
+                assert_eq!(branch.name, "test-name", "by {label}");
+                assert!(!branch.deleted, "by {label}");
+                assert_eq!(
+                    branch.latest,
+                    bytes::Bytes::from(Hash::default()),
+                    "by {label}: zero tip"
+                );
+            }
+        }))
+        .await;
+    }
+}
