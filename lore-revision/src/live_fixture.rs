@@ -366,6 +366,9 @@ pub struct RevisionCall {
 pub enum BranchAnswer {
     /// No such branch. The push then treats the branch as absent on the remote.
     NotFound,
+    /// The lookup fails with something other than `NotFound` (a transient or server fault, denied
+    /// access). A push reads this as "no remote branch"; a direct `BranchGet` sees the error.
+    Fail(Refusal),
     /// A branch record. `latest` equal to the local tip is what makes a push idempotent, and
     /// `deleted` is what makes it restore the branch rather than return immediately.
     Present {
@@ -948,7 +951,9 @@ impl RevisionService for StubRevisionService {
                 // deterministic synthetic hash; this transport fixture has no metadata store.
                 let metadata = match policy.branch_get {
                     BranchAnswer::Present { metadata, .. } => metadata,
-                    BranchAnswer::NotFound => blake3::hash(&body.id).as_bytes().to_vec(),
+                    BranchAnswer::NotFound | BranchAnswer::Fail(_) => {
+                        blake3::hash(&body.id).as_bytes().to_vec()
+                    }
                 };
                 Ok(Response::new(BranchCreateResponse {
                     branch: Some(model_v1::Branch {
@@ -981,6 +986,7 @@ impl RevisionService for StubRevisionService {
         let answer = self.state.revision_policy.lock().branch_get.clone();
         match answer {
             BranchAnswer::NotFound => Err(Status::not_found("no such branch")),
+            BranchAnswer::Fail(refusal) => Err(refusal.status()),
             BranchAnswer::Present {
                 latest,
                 metadata,

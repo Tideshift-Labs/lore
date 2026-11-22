@@ -9,6 +9,8 @@ pub mod info;
 pub mod restore;
 pub mod revert;
 pub mod sync;
+// FORK-LOCAL (Tideshift): sync and clone settlement rule.
+pub mod sync_settled;
 
 use std::str::FromStr;
 use std::sync::Arc;

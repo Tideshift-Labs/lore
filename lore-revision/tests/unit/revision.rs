@@ -4,6 +4,7 @@ use lore_revision::util::path::RelativePath;
 
 mod diff;
 mod sync;
+mod sync_settled;
 
 use lore_revision::revision::*;
 

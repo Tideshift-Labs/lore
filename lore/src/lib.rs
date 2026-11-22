@@ -25,6 +25,8 @@ pub mod revision_tree;
 pub mod service;
 pub mod shared_store;
 pub mod storage;
+// FORK-LOCAL (Tideshift): sync and clone settlement read.
+pub mod sync_settled;
 mod util;
 
 use interface::LoreString;
