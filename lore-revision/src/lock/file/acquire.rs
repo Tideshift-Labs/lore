@@ -14,7 +14,6 @@ use lore_transport::attempt_store::FencedLockResource;
 use lore_transport::attempt_store::LockOwnership;
 use lore_transport::outcome::AttemptId;
 use lore_transport::outcome::GrpcRpc;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -165,7 +164,7 @@ const ACQUIRE_SET_LABELS: BatchSetLabels = BatchSetLabels {
 
 /// Data for an event that marks the start of a lock acquire report.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireBeginEventData {
     /// Number of acquire entries that follow.
@@ -176,7 +175,7 @@ pub struct LoreLockFileAcquireBeginEventData {
 
 /// Data for an event reporting a path whose lock is being acquired.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireEventData {
     /// The path whose lock is being acquired.

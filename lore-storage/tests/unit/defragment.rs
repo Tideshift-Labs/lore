@@ -491,7 +491,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -532,7 +532,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -553,6 +553,7 @@ mod defragment_integration {
             0..offset,
             DefragmentSink::Stream { sender },
             options,
+            None,
             None,
         );
         let consumer = async move {
@@ -593,7 +594,8 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -689,7 +691,8 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -821,7 +824,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -850,6 +853,7 @@ mod defragment_integration {
             },
             options,
             None,
+            None,
         )
         .await
         .expect_err("a write past the end of the sink fails the read");
@@ -871,6 +875,16 @@ mod defragment_integration {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingGetStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,
@@ -1044,7 +1058,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1068,6 +1082,7 @@ mod defragment_integration {
             0..total,
             leaf_tx,
             options,
+            None,
             None,
         )
         .await
@@ -1103,7 +1118,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1125,6 +1140,7 @@ mod defragment_integration {
             0..total,
             leaf_tx,
             options,
+            None,
             None,
         ));
 
@@ -1175,7 +1191,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1261,7 +1277,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1328,7 +1344,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1372,7 +1388,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1415,7 +1431,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1459,7 +1475,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1493,21 +1509,19 @@ mod defragment_integration {
             hash: hash::hash_slice(stub.as_ref()),
             context,
         };
-        store
-            .clone()
-            .put(
-                partition,
-                sub_empty,
-                Fragment {
-                    flags: FragmentFlags::PayloadFragmented.bits(),
-                    size_payload: stub.len() as u32,
-                    size_content: 100,
-                },
-                Some(stub),
-                false,
-            )
-            .await
-            .expect("put empty sublist");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            sub_empty,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: stub.len() as u32,
+                size_content: 100,
+            },
+            Some(stub),
+            false,
+        ))
+        .await
+        .expect("put empty sublist");
         let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 100)]), 100).await;
         let root = put_list(
             &store,
@@ -1526,7 +1540,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1555,7 +1569,14 @@ mod defragment_integration {
         // The root's own entries are strictly increasing, so the only fault in this tree is
         // the one under test. A root placing both sublists at the same offset would be
         // rejected for that instead, before either is ever loaded.
-        let sub_zero = put_list(&store, partition, context, &refs_at(&[(leaf_b, 0)]), 0).await;
+        let sub_zero = lore_storage::test_util::accepting_unvalidated_puts(put_list(
+            &store,
+            partition,
+            context,
+            &refs_at(&[(leaf_b, 0)]),
+            0,
+        ))
+        .await;
         let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 100)]), 100).await;
         let root = put_list(
             &store,
@@ -1574,7 +1595,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1617,7 +1638,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1663,7 +1684,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1671,7 +1692,7 @@ mod defragment_integration {
 
         assert!(
             err.to_string()
-                .contains("entry at content offset 100 has a zero hash"),
+                .contains("entry 1 at content offset 100 has a zero hash"),
             "unexpected error: {err}"
         );
     }
@@ -1709,7 +1730,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1735,21 +1756,19 @@ mod defragment_integration {
             hash: hash::hash_slice(stub.as_ref()),
             context,
         };
-        store
-            .clone()
-            .put(
-                partition,
-                root,
-                Fragment {
-                    flags: FragmentFlags::PayloadFragmented.bits(),
-                    size_payload: stub.len() as u32,
-                    size_content: 100,
-                },
-                Some(stub),
-                false,
-            )
-            .await
-            .expect("put empty root list");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            root,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: stub.len() as u32,
+                size_content: 100,
+            },
+            Some(stub),
+            false,
+        ))
+        .await
+        .expect("put empty root list");
 
         let out_path = dir.join("empty-root.bin");
         let err = lore_storage::read::read_into_file(
@@ -1759,7 +1778,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1803,7 +1822,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1863,7 +1882,8 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -1910,5 +1930,268 @@ mod defragment_integration {
             charged,
             "every permit must come back once the payloads are delivered"
         );
+    }
+
+    /// Stores `part` in `mode` under the hash of its content, returning the fragment and payload
+    /// stored; `NoCompression` stores it as it is.
+    async fn put_stored_leaf(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        context: Context,
+        part: &[u8],
+        mode: lore_storage::CompressionMode,
+    ) -> (Address, Fragment, Bytes) {
+        let raw = Fragment {
+            flags: 0,
+            size_payload: part.len() as u32,
+            size_content: part.len() as u64,
+        };
+        let (fragment, payload) = match mode {
+            lore_storage::CompressionMode::NoCompression => (raw, Bytes::copy_from_slice(part)),
+            mode => lore_storage::compress(raw, part, mode).expect("compress leaf"),
+        };
+        let address = Address {
+            hash: hash::hash_slice(part),
+            context,
+        };
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("put leaf");
+        (address, fragment, payload)
+    }
+
+    /// The root list over `entries` for `size_content` bytes, as the leaf pipeline takes it.
+    fn list_over(entries: &[(Address, u64)], size_content: u64) -> (Fragment, Bytes) {
+        let list = Bytes::copy_from_slice(refs_at(entries).as_bytes());
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadFragmented.bits(),
+            size_payload: list.len() as u32,
+            size_content,
+        };
+        (fragment, list)
+    }
+
+    /// The leaf pipeline delivers every leaf whole and in content order with its fragment: as stored
+    /// without `decompress`, whatever its codec, and expanded with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leaf_pipeline_delivers_leaves_as_the_options_ask() {
+        use lore_storage::CompressionMode;
+
+        let (_dir, store) = make_store().await;
+        let partition = Partition::from([0x0C; 16]);
+        let context = Context::from([0x0C; 16]);
+        let content: Vec<u8> = (0..3 * 4096u32).map(|i| (i % 7) as u8).collect();
+
+        let mut entries = Vec::new();
+        let mut leaves = Vec::new();
+        for (index, mode) in [
+            CompressionMode::Zstd,
+            CompressionMode::Lz4,
+            CompressionMode::NoCompression,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let part = &content[index * 4096..(index + 1) * 4096];
+            let (address, fragment, payload) =
+                put_stored_leaf(&store, partition, context, part, mode).await;
+            entries.push((address, (index * 4096) as u64));
+            // Read back local, as the store holds the payload.
+            let held = Fragment {
+                flags: fragment.flags | FragmentFlags::PayloadStoredLocal.bits(),
+                ..fragment
+            };
+            leaves.push((held, payload));
+        }
+        assert_ne!(leaves[0].0.flags & FragmentFlags::PayloadCompressed, 0);
+        assert_ne!(leaves[1].0.flags & FragmentFlags::PayloadCompressed, 0);
+
+        for options in [
+            ReadOptions::default().no_decompress(),
+            ReadOptions::default(),
+        ] {
+            let (fragment, list) = list_over(&entries, content.len() as u64);
+            let (tx, mut rx) = channel(entries.len());
+            defragment_pipeline_leaves(
+                store.clone(),
+                partition,
+                Address::default(),
+                fragment,
+                list,
+                tx,
+                options,
+                None,
+                None,
+            )
+            .await
+            .expect("leaf pipeline");
+
+            let mut delivered = Vec::new();
+            while let Ok(leaf) = rx.try_recv() {
+                delivered.push(leaf.expect("leaf"));
+            }
+            assert_eq!(delivered.len(), 3);
+            for (index, (fragment, payload)) in delivered.into_iter().enumerate() {
+                if options.decompress {
+                    assert_eq!(fragment.flags & FragmentFlags::PayloadCompressed, 0);
+                    assert_eq!(payload, content[index * 4096..(index + 1) * 4096]);
+                } else {
+                    assert_eq!((fragment, payload), leaves[index], "leaf {index} as stored");
+                }
+            }
+        }
+    }
+
+    /// A leaf the store does not hold fails the leaf pipeline rather than ending it short.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leaf_pipeline_fails_on_a_missing_leaf() {
+        let (_dir, store) = make_store().await;
+        let partition = Partition::from([0x0D; 16]);
+        let context = Context::from([0x0D; 16]);
+        let (present, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+        let missing = Address {
+            hash: hash::hash_slice(&[0xBB; 100]),
+            context,
+        };
+
+        let (fragment, list) = list_over(&[(present, 0), (missing, 100)], 200);
+        let (tx, _rx) = channel(2);
+        let result = defragment_pipeline_leaves(
+            store,
+            partition,
+            Address::default(),
+            fragment,
+            list,
+            tx,
+            ReadOptions::default().no_decompress(),
+            None,
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+}
+
+mod whole_leaf {
+    use super::*;
+
+    fn zstd(size_payload: u32, size_content: u64) -> Fragment {
+        Fragment {
+            flags: FragmentFlags::PayloadCompressedZstd.bits(),
+            size_payload,
+            size_content,
+        }
+    }
+
+    /// A whole leaf whose fragment agrees with its parent list and its payload goes out as loaded.
+    #[test]
+    fn a_whole_leaf_goes_out_as_loaded() {
+        let payload = Bytes::from_static(&[7u8; 10]);
+        let leaf = whole_leaf(zstd(10, 64), payload.clone(), 64, 0..64).unwrap();
+        assert_eq!(leaf, (zstd(10, 64), payload));
+    }
+
+    /// A leaf is refused when its fragment states another content size than its parent list, when
+    /// only part of it was asked for, when its payload is not the size its fragment states, or when
+    /// it is uncompressed and its fragment's sizes disagree.
+    #[test]
+    fn a_leaf_that_cannot_go_out_whole_and_as_described_is_refused() {
+        let payload = Bytes::from_static(&[7u8; 10]);
+        let uncompressed = Fragment {
+            flags: 0,
+            size_payload: 10,
+            size_content: 64,
+        };
+        assert!(whole_leaf(zstd(10, 63), payload.clone(), 64, 0..64).is_err());
+        assert!(whole_leaf(zstd(10, 64), payload.clone(), 64, 8..64).is_err());
+        assert!(whole_leaf(zstd(10, 64), payload.clone(), 64, 0..32).is_err());
+        assert!(whole_leaf(zstd(11, 64), payload.clone(), 64, 0..64).is_err());
+        assert!(whole_leaf(uncompressed, payload, 64, 0..64).is_err());
+    }
+}
+
+mod list_checks {
+    use super::*;
+
+    /// An entry at `offset` with a distinct, non-zero hash.
+    fn entry(offset: u64) -> FragmentReference {
+        FragmentReference {
+            hash: lore_storage::hash::hash_slice(&offset.to_le_bytes()),
+            offset_content: offset,
+        }
+    }
+
+    /// The entries a window reaches form one range; a window past the level reaches none.
+    #[test]
+    fn wanted_entries_answers_the_entries_a_window_reaches() {
+        let list = [entry(0), entry(100), entry(200)];
+
+        assert_eq!(
+            wanted_entries(&list, 300, &(50..150)).expect("a valid list"),
+            Some(0..2)
+        );
+        assert_eq!(
+            wanted_entries(&list, 300, &(300..400)).expect("a valid list"),
+            None
+        );
+    }
+
+    /// An entry the window does not reach is checked all the same: a zero hash there fails the
+    /// call, whichever part of the content the caller asked for.
+    #[test]
+    fn wanted_entries_rejects_a_zero_hash_outside_the_window() {
+        let list = [
+            entry(0),
+            FragmentReference {
+                hash: Hash::default(),
+                offset_content: 100,
+            },
+        ];
+
+        let err = wanted_entries(&list, 200, &(0..50)).expect_err("a zero hash is no entry");
+
+        assert!(
+            err.to_string()
+                .contains("entry 1 at content offset 100 has a zero hash"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A sublist covers exactly the window its parent's list gives it: one that starts at the
+    /// parent's offset and expands to the window passes, and one that falls short fails, as do an
+    /// empty sublist, a window that starts elsewhere than the parent, a reversed window and a
+    /// zero-hash parent.
+    #[test]
+    fn sublist_coverage_requires_the_parents_window() {
+        let parent = entry(100);
+        let sub_list = [entry(100), entry(150)];
+
+        sublist_coverage(&parent, &sub_list, 100, &(100..200)).expect("an exact sublist");
+        let err = sublist_coverage(&parent, &sub_list, 90, &(100..200))
+            .expect_err("a sublist that falls short");
+        assert!(
+            err.to_string().contains("expands to 90 bytes"),
+            "unexpected error: {err}"
+        );
+
+        assert!(sublist_coverage(&parent, &[], 100, &(100..200)).is_err());
+        let reversed = Range {
+            start: 100,
+            end: 50,
+        };
+        assert!(sublist_coverage(&parent, &sub_list, 100, &reversed).is_err());
+        let err = sublist_coverage(&parent, &sub_list, 100, &(50..200))
+            .expect_err("a window that starts before the parent's offset");
+        assert!(
+            err.to_string().contains("given the window 50..200"),
+            "unexpected error: {err}"
+        );
+        let zero = FragmentReference {
+            hash: Hash::default(),
+            offset_content: 100,
+        };
+        assert!(sublist_coverage(&zero, &sub_list, 100, &(100..200)).is_err());
     }
 }

@@ -49,8 +49,6 @@ use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::StorageError;
 use lore_storage::read::read;
 use lore_storage::read::read_stream;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
@@ -64,7 +62,7 @@ use crate::storage::store::StoreInternal;
 
 /// One get item — the `(partition, address)` to read, and the range of it to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, Deserialize, Serialize, ValidateText)]
+#[derive(Copy, Clone, Default, PartialEq, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageGetItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,
@@ -92,7 +90,7 @@ pub struct LoreStorageGetItem {
     /// `Oversized` rather than truncating. `GET_HEADER` reports the whole
     /// content's size, which with `offset` and `length` gives the bytes written; no `GET_DATA`
     /// follows, and `streaming` is ignored. The buffer holds unspecified bytes when the item fails.
-    #[serde(skip)]
+    #[bitcode(skip)]
     pub data_out: LoreBytesMut,
 }
 
@@ -111,7 +109,7 @@ impl core::fmt::Debug for LoreStorageGetItem {
 
 /// Arguments for `lore_storage_get`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(get_local)]
 pub struct LoreStorageGetArgs {
     /// Open storage handle
@@ -149,25 +147,30 @@ async fn get_local(
             }
             let effective = store.effective_flags(per_call)?;
             let mut reuse = crate::storage::store::SessionReuse::default();
+            let mut lent = crate::storage::lent::LentBuffers::default();
 
-            crate::storage::fan_out_items!(items, "get", |item| {
+            let result = crate::storage::fan_out_items!(items, "get", |item| {
                 let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                async move { get_item(store, &item, effective, session).await }
-            })
+                let lender = lent.lender(&item.data_out);
+                async move { get_item(store, &item, effective, session, lender).await }
+            });
+            lent.returned().await;
+            result
         },
     )
     .await
 }
 
 /// Read one item and emit its `HEADER` / `DATA…` / `ITEM_COMPLETE`
-/// sequence. Returns the item's own error so the call-level reduction can pick the dominant
-/// failure.
+/// sequence, into the item's `data_out` through `lender` when it supplies one. Returns the item's
+/// own error so the call-level reduction can pick the dominant failure.
 async fn get_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: Option<crate::storage::lent::ItemLender>,
 ) -> Result<(), StorageError> {
     if item.partition == Partition::default() {
         return emit_item_complete(item, Err(invalid_item("item names the default partition")));
@@ -182,8 +185,8 @@ async fn get_item(
         return emit_item_complete(item, Ok(()));
     }
 
-    if item.data_out.is_supplied() {
-        return get_item_into(store, item, effective, remote_session).await;
+    if let Some(lender) = lender {
+        return get_item_into(store, item, effective, remote_session, lender).await;
     }
 
     if item.streaming != 0 {
@@ -230,17 +233,13 @@ async fn get_item_into(
     item: &LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
+    lender: crate::storage::lent::ItemLender,
 ) -> Result<(), StorageError> {
+    let mut dst = lender.lend(&item.data_out);
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
     }
-
-    // SAFETY: `data_out` names caller memory that stays valid, and untouched by anyone else, for
-    // the duration of the call this future is wholly within. `len` bounds the read.
-    let mut dst = unsafe {
-        lore_storage::CallerBuffer::new(item.data_out.ptr.cast::<u8>(), item.data_out.len)
-    };
 
     match lore_storage::read_into_buffer(
         store.immutable.clone(),

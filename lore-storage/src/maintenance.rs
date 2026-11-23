@@ -38,6 +38,10 @@ pub fn spawn_gc(store: &Arc<dyn ImmutableStore>, options: &ImmutableStoreCreateO
     }
 }
 
+/// The fewest fragments the periodic evictor enforces a capacity down to: a lower capacity is raised
+/// to it, so that its passes leave small stores alone.
+const EVICTOR_FLOOR: usize = 1024 * 1024;
+
 /// Evictor task: enforces max capacity at regular intervals.
 pub async fn evictor(
     store: Weak<dyn ImmutableStore>,
@@ -47,7 +51,11 @@ pub async fn evictor(
 ) {
     use std::cmp::max;
 
-    let max_capacity = max(max_capacity, 1024 * 1024);
+    #[cfg(feature = "test-util")]
+    let floor = crate::test_util::evictor_floor(EVICTOR_FLOOR);
+    #[cfg(not(feature = "test-util"))]
+    let floor = EVICTOR_FLOOR;
+    let max_capacity = max(max_capacity, floor);
     let eviction_delay = eviction_delay.unwrap_or(Duration::from_secs(10));
     lore_base::lore_debug!("Store evictor enforcing max capacity of {max_capacity}");
     // No startup pass: sleep first so short-lived processes exit before the first scan.
@@ -58,6 +66,8 @@ pub async fn evictor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            #[cfg(feature = "test-util")]
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Evictor);
             // Background maintenance is silent — not tied to any command's event stream.
             if let Err(err) = real_store.evict(max_capacity, sync_data, None).await {
                 lore_base::lore_warn!("Store evictor failed: {err}");
@@ -67,7 +77,8 @@ pub async fn evictor(
     lore_base::lore_debug!("Store evictor exiting");
 }
 
-/// Compactor task: enforces max size at regular intervals.
+/// Compactor task: enforces max size at regular intervals. A step that fails is reported and
+/// ends the pass, and the next interval resumes past the groups it covered.
 pub async fn compactor(
     store: Weak<dyn ImmutableStore>,
     max_size: usize,
@@ -92,6 +103,8 @@ pub async fn compactor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            #[cfg(feature = "test-util")]
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Compactor);
             // A pass that was stopped rather than finished leaves its resume point behind,
             // so re-reading after the wait picks that group back up instead of restarting.
             if at.is_none() {
@@ -111,8 +124,8 @@ pub async fn compactor(
                     lore_base::lore_debug!("Store compactor finished");
                 }
                 Err(err) => {
+                    at = None;
                     lore_base::lore_warn!("Store compactor failed: {err}");
-                    break;
                 }
             }
         }
@@ -120,7 +133,8 @@ pub async fn compactor(
     lore_base::lore_debug!("Store compactor exiting");
 }
 
-/// Run compaction and eviction in a single pass.
+/// Run eviction, then compaction, in a single pass, so that compaction reclaims the payloads of the
+/// entries eviction removes.
 pub async fn gc(
     store: Arc<dyn ImmutableStore>,
     max_size: usize,
@@ -128,11 +142,19 @@ pub async fn gc(
     sync_data: bool,
     sink: Option<GcEventSinkRef>,
 ) {
-    let mut at = store.clone().compact_resume_at().await;
+    #[cfg(feature = "test-util")]
+    let _task = crate::test_util::store_task(crate::test_util::StoreTask::GcPass);
+    if max_capacity > 0 {
+        let _ = store
+            .clone()
+            .evict(max_capacity, sync_data, sink.clone())
+            .await;
+        lore_base::lore_debug!("Store evictor done");
+    }
 
     if max_size > 0 {
+        let mut at = store.clone().compact_resume_at().await;
         loop {
-            let store = store.clone();
             match store
                 .clone()
                 .compact(max_size, at, sync_data, sink.clone())
@@ -156,11 +178,6 @@ pub async fn gc(
             }
         }
         lore_base::lore_debug!("Store compactor done");
-    }
-
-    if max_capacity > 0 {
-        let _ = store.evict(max_capacity, sync_data, sink).await;
-        lore_base::lore_debug!("Store evictor done");
     }
 }
 
@@ -228,6 +245,28 @@ impl GcCounters {
         let _ = self.store.set(Arc::downgrade(store));
     }
 
+    /// Forget everything loaded so far, so a store that is reloading from disk does
+    /// not count the same bytes twice.
+    ///
+    /// Both totals are cumulative `fetch_add`s fed by [`Self::add_loaded_size`] and
+    /// [`Self::add_loaded_fragments`], which are reached only from a packstore
+    /// `resume()` and a bucket deserialize. A store that discards its in-memory state
+    /// and re-reads the directory calls each of those a second time for the same
+    /// files, so without this the totals climb on every reload and the compaction and
+    /// eviction triggers fire against a number that describes no store.
+    ///
+    /// Zero is the right value rather than a subtraction because a reload discards
+    /// *all* of it: the caller has just invalidated every group, so the correct total
+    /// is the one a freshly constructed store has, and each group re-adds its own as
+    /// it is next touched.
+    ///
+    /// The fired-once latches are deliberately left alone. They exist to keep one
+    /// process from firing a pass per crossing, and a reload is not a new process.
+    pub fn reset_loaded(&self) {
+        self.total_size.store(0, Ordering::Relaxed);
+        self.fragment_count.store(0, Ordering::Relaxed);
+    }
+
     /// Account for `bytes` of just-loaded packstore data; fire one compaction pass if
     /// the running total crosses `max_size` (once per process).
     pub fn add_loaded_size(self: &Arc<Self>, bytes: u64) {
@@ -244,6 +283,30 @@ impl GcCounters {
         {
             self.clone().fire(true);
         }
+    }
+
+    /// Take `bytes` of packstore data back out of the running total, for a packstore
+    /// closing the files it had counted, so that loading them again is not counted on
+    /// top. The fired-once latch is left alone, as in [`Self::reset_loaded`].
+    pub fn remove_loaded_size(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut total = self.total_size.load(Ordering::Relaxed);
+        while let Err(current) = self.total_size.compare_exchange_weak(
+            total,
+            total.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            total = current;
+        }
+    }
+
+    /// The bytes of packstore data counted as loaded. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub fn loaded_size(&self) -> u64 {
+        self.total_size.load(Ordering::Relaxed)
     }
 
     /// Account for `count` just-deserialized bucket fragments; fire one eviction pass

@@ -142,6 +142,16 @@ struct StatsStubStore {
 #[allow(clippy::unimplemented)]
 #[async_trait]
 impl ImmutableStore for StatsStubStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: lore_storage::Partition,

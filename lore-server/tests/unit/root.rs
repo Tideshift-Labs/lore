@@ -22,6 +22,16 @@ struct SlowDownImmutableStore;
 
 #[async_trait]
 impl ImmutableStore for SlowDownImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         _partition: Partition,
@@ -128,7 +138,7 @@ async fn slow_down_store_exhausts_retries_with_server_policy() {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        lore_storage::read_raw(store, Partition::default(), address, false),
+        lore_storage::read_raw(store, Partition::default(), address),
     )
     .await
     .expect("read_raw did not return within 10s — server retry policy may not be active");

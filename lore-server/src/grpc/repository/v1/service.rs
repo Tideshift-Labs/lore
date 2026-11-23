@@ -35,6 +35,7 @@ use super::repository_metadata_set;
 use super::repository_storage_stats;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::domain::DomainContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
@@ -60,7 +61,7 @@ impl InstrumentProvider for RepositoryServiceInstrumentProvider {
 /// only holds the dependencies the handlers need.
 #[derive(Clone)]
 pub struct LoreRepositoryV1Service {
-    environment: EnvironmentConfig,
+    registry: RepositoryRegistry,
     authorizer: Arc<dyn RepositoryAuthorizer>,
     repository_catalog: Arc<dyn RepositoryCatalog>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
@@ -88,7 +89,7 @@ impl LoreRepositoryV1Service {
         domain_context: Option<Arc<DomainContext>>,
     ) -> Self {
         Self {
-            environment,
+            registry: RepositoryRegistry::of(&environment),
             authorizer,
             repository_catalog,
             immutable_store,
@@ -99,14 +100,6 @@ impl LoreRepositoryV1Service {
             instrument_provider: RepositoryServiceInstrumentProvider,
             domain_context,
         }
-    }
-
-    /// Auth-service URL extracted from the environment, if configured.
-    fn auth_url(&self) -> Option<String> {
-        self.environment
-            .endpoint
-            .clone()
-            .and_then(|endpoint| endpoint.auth_url)
     }
 }
 
@@ -120,7 +113,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_create::handler(
                 request,
-                self.auth_url(),
+                &self.registry,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.forwarded_requests,
@@ -140,7 +133,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_delete::handler(
                 request,
-                self.auth_url(),
+                &self.registry,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.instrument_provider,

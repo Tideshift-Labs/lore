@@ -7,6 +7,7 @@ mod stream_deadline_tests;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -21,6 +22,7 @@ use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::storage::v1 as storage_v1;
 use lore_proto::lore::storage::v1::storage_service_server::StorageService as StorageServiceV1;
 use lore_proto::lore::storage::v1::storage_service_server::StorageServiceServer;
+use lore_transport::auth::AuthEndpoint;
 use lore_transport::error::ProtocolError;
 use lore_transport::grpc::storage_client::*;
 use tokio_stream::Stream;
@@ -56,12 +58,18 @@ enum KillMode {
     ErrorBesidePayloadCancelled,
 }
 
-/// Kills the first `Get` stream it accepts, then serves every later stream normally.
+/// Kills the first `Get` stream it accepts, then serves every later stream normally. Records the
+/// target context of each copy it reads, and answers a copy after [`COPY_DELAY`].
 struct StreamKillingServer {
     accepted: Arc<AtomicUsize>,
     requests_read: Arc<AtomicUsize>,
     kill_mode: KillMode,
+    copied: Arc<Mutex<Vec<Bytes>>>,
 }
+
+/// How long the test server holds a copy before answering it, long enough for a concurrent
+/// copy to be requested while the first is on the wire.
+const COPY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
 
 type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
@@ -191,9 +199,22 @@ impl StorageServiceV1 for StreamKillingServer {
 
     async fn copy(
         &self,
-        _request: Request<Streaming<storage_v1::CopyRequest>>,
+        request: Request<Streaming<storage_v1::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
-        Err(Status::unimplemented("not used by this test"))
+        let copied = self.copied.clone();
+        let mut requests = request.into_inner();
+        let stream = async_stream::stream! {
+            while let Some(Ok(req)) = requests.next().await {
+                copied.lock().unwrap().push(req.target_context.clone());
+                tokio::time::sleep(COPY_DELAY).await;
+                yield Ok(storage_v1::CopyResponse {
+                    source_repository_id: req.source_repository_id,
+                    source_address: req.source_address,
+                    status: None,
+                });
+            }
+        };
+        Ok(Response::new(Box::pin(stream) as Self::CopyStream))
     }
 
     async fn query(
@@ -245,8 +266,15 @@ fn test_context() -> GrpcSessionContext {
 async fn start_test_service(
     kill_mode: KillMode,
 ) -> (StorageService, Arc<AtomicUsize>, Arc<AtomicUsize>) {
-    let (connection, accepted, requests_read) = start_test_connection(kill_mode).await;
+    let (connection, accepted, requests_read, _) = start_test_connection(kill_mode).await;
     (StorageService::new(connection), accepted, requests_read)
+}
+
+/// Stand up a `StorageService` over the test server, and hand back the target contexts of the
+/// copies the server reads.
+async fn start_copy_service() -> (StorageService, Arc<Mutex<Vec<Bytes>>>) {
+    let (connection, _, _, copied) = start_test_connection(KillMode::CleanEnd).await;
+    (StorageService::new(connection), copied)
 }
 
 /// The same server and a connection over it, for tests that drive the connection directly
@@ -257,9 +285,11 @@ async fn start_test_connection(
     Arc<lore_transport::grpc::GRPCConnection>,
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
+    Arc<Mutex<Vec<Bytes>>>,
 ) {
     let accepted = Arc::new(AtomicUsize::new(0));
     let requests_read = Arc::new(AtomicUsize::new(0));
+    let copied = Arc::new(Mutex::new(vec![]));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
@@ -267,6 +297,7 @@ async fn start_test_connection(
         accepted: accepted.clone(),
         requests_read: requests_read.clone(),
         kill_mode,
+        copied: copied.clone(),
     };
 
     #[allow(clippy::disallowed_methods)] // Test-local server task.
@@ -291,7 +322,7 @@ async fn start_test_connection(
         format!("http://{addr}").parse().expect("test url"),
         channel,
     ));
-    (connection, accepted, requests_read)
+    (connection, accepted, requests_read, copied)
 }
 
 /// Drive one `get` against a server that kills its first stream, and report how many
@@ -419,7 +450,7 @@ async fn concurrent_requests_for_one_address_coalesce() {
 /// rebuilt would leave it N higher.
 #[tokio::test]
 async fn concurrent_reconnects_rebuild_the_channel_once() {
-    let (connection, _, _) = start_test_connection(KillMode::CleanEnd).await;
+    let (connection, _, _, _) = start_test_connection(KillMode::CleanEnd).await;
     let epoch_before = connection.reconnect.load(Ordering::Relaxed);
 
     let results = futures::future::join_all((0..8).map(|_| {
@@ -541,13 +572,13 @@ async fn a_refused_open_does_not_poison_the_cached_stream() {
 async fn a_storage_operation_recovers_across_a_reconnect() {
     use lore_transport::traits::Storage;
 
-    let (connection, accepted, _) = start_test_connection(KillMode::RefuseFirstOpen).await;
+    let (connection, accepted, _, _) = start_test_connection(KillMode::RefuseFirstOpen).await;
     let epoch_before = connection.reconnect.load(Ordering::SeqCst);
 
     let storage = lore_transport::grpc::GRPCStorage {
         connection: connection.clone(),
         client: StorageService::new(connection.clone()),
-        auth_url: String::new(),
+        auth_endpoint: AuthEndpoint::none(),
         identity: String::new(),
         credentials: Arc::new(lore_transport::connection::SuppliedCredentials::default()),
         session_counter: std::sync::atomic::AtomicU32::new(1),
@@ -582,11 +613,11 @@ async fn a_storage_operation_recovers_across_a_reconnect() {
 async fn grpc_sessions_are_never_due_for_a_proactive_rebind() {
     use lore_transport::traits::Storage;
 
-    let (connection, _, _) = start_test_connection(KillMode::CleanEnd).await;
+    let (connection, _, _, _) = start_test_connection(KillMode::CleanEnd).await;
     let storage = lore_transport::grpc::GRPCStorage {
         connection: connection.clone(),
         client: StorageService::new(connection.clone()),
-        auth_url: String::new(),
+        auth_endpoint: lore_transport::auth::AuthEndpoint::none(),
         identity: String::new(),
         credentials: Arc::new(lore_transport::connection::SuppliedCredentials::default()),
         session_counter: std::sync::atomic::AtomicU32::new(1),
@@ -653,4 +684,51 @@ async fn get_gives_up_once_the_stream_will_not_open() {
         opens, 1,
         "a refused open must hand off immediately, not reissue",
     );
+}
+
+/// Concurrent copies of one source to two target contexts each reach the server. A copy response
+/// names only the source, so the second waits for the first to be answered rather than riding
+/// on its round trip and reporting a copy the server never made.
+#[tokio::test]
+async fn copies_of_one_source_to_two_targets_each_reach_the_server() {
+    let (service, copied) = start_copy_service().await;
+    let ctx = test_context();
+    let source = Address::zero_context_hash(Hash::from([0x55u8; 32]));
+    let first = Context::from([0x01u8; 16]);
+    let second = Context::from([0x02u8; 16]);
+
+    let (first_copy, second_copy) = tokio::join!(
+        service.copy(0, &ctx, ctx.partition, source, first),
+        service.copy(0, &ctx, ctx.partition, source, second)
+    );
+
+    first_copy.expect("first copy");
+    second_copy.expect("second copy");
+    let mut copied = copied.lock().unwrap().clone();
+    copied.sort();
+    assert_eq!(
+        copied,
+        vec![
+            Bytes::copy_from_slice(first.as_ref()),
+            Bytes::copy_from_slice(second.as_ref())
+        ]
+    );
+}
+
+/// Concurrent copies to one target ride a single round trip.
+#[tokio::test]
+async fn copies_to_one_target_coalesce() {
+    let (service, copied) = start_copy_service().await;
+    let ctx = test_context();
+    let source = Address::zero_context_hash(Hash::from([0x56u8; 32]));
+    let target = Context::from([0x03u8; 16]);
+
+    let (first_copy, second_copy) = tokio::join!(
+        service.copy(0, &ctx, ctx.partition, source, target),
+        service.copy(0, &ctx, ctx.partition, source, target)
+    );
+
+    first_copy.expect("first copy");
+    second_copy.expect("second copy");
+    assert_eq!(copied.lock().unwrap().len(), 1);
 }

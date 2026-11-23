@@ -122,6 +122,8 @@ pub enum MessageHandleError {
     /// not reach the client as "not authorized".
     #[error("{0}")]
     AuthUnavailable(String),
+    #[error("Invalid argument ({0})")]
+    InvalidArgument(String),
 }
 
 impl MessageHandleError {

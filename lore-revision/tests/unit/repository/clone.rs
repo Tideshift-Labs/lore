@@ -6,14 +6,30 @@
 #![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
+use lore_base::error::AddressNotFound;
 use lore_base::lore_spawn;
+use lore_base::runtime::LORE_CONTEXT;
 use lore_base::test_util::TempDir;
+use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::node::BLOCK_NODE_COUNT;
+use lore_revision::node::Node;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::clone::*;
+use lore_revision::repository::prefetch::StopWhen;
+use lore_revision::stage::stage_single_node;
+use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
+use zerocopy::FromZeros;
+
+use crate::fs::filesystem_provider::setup_test_execution;
+use crate::repository::test_helpers::file_node;
+use crate::repository::test_helpers::working_tree_repository;
 
 async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
     let temp = TempDir::new("lore-clone-temp-path-");
@@ -344,4 +360,208 @@ async fn holds_entries_besides_dot_dir_mixed_case_control_dirs_hold_nothing() {
         .expect("listing a folder with mixed-case control dirs");
 
     assert!(!holds, "control dirs count in any letter case");
+}
+
+/// A node with neither the file nor the link flag, which makes it a directory, and no children. A
+/// `stop` that never answers true.
+fn never() -> StopWhen {
+    Arc::new(|| false)
+}
+
+fn empty_directory_node() -> Node {
+    Node::new_zeroed()
+}
+
+/// A state holding at its root `count` empty directories and as many files whose content no store
+/// holds, named so that directories and files alternate in any order of names. Discovery creates
+/// each empty directory as it reaches it, which keeps it walking the tree while writing the files
+/// fails.
+async fn state_of_unwritable_files(
+    repository: &Arc<RepositoryContext>,
+    count: usize,
+) -> Arc<State> {
+    let state = State::new();
+    for index in 0..count {
+        let entries = [
+            (format!("{index:04}-directory"), empty_directory_node()),
+            (
+                format!("{index:04}-file"),
+                file_node(index.to_string().as_bytes()),
+            ),
+        ];
+        for (name, node) in entries {
+            stage_single_node(
+                repository.clone(),
+                state.clone(),
+                relative_path(&name),
+                node,
+                Arc::default(),
+                None,
+                FilterMode::Full,
+            )
+            .await
+            .expect("stage the node");
+        }
+    }
+    state
+}
+
+/// Whether `error`, or an error among its sources, is a `T`.
+fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| error.is::<T>())
+}
+
+/// A clone that fails to write a file reports that failure. Discovery is still walking the tree
+/// when writing stops, and then fails because it cannot pass on the files it finds next. The clone
+/// does not report that second failure.
+#[tokio::test]
+async fn a_clone_reports_a_failed_file_write_rather_than_the_stopped_discovery() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new("lore-clone-unwritable-files-");
+            let repository = working_tree_repository(temp.path()).await;
+            let state = state_of_unwritable_files(&repository, 2_000).await;
+            let ctx = CloneContext {
+                operation: repository
+                    .file_system()
+                    .begin_operation()
+                    .await
+                    .expect("Starting test operation"),
+                repository,
+                state,
+                options: Arc::default(),
+                stats: Arc::default(),
+                modified_times: Arc::default(),
+            };
+
+            let error = clone_in_path(ctx)
+                .await
+                .expect_err("no file can be written");
+
+            assert!(
+                caused_by::<AddressNotFound>(&error),
+                "the clone reported {error:?} rather than the content it could not fetch"
+            );
+        })
+        .await;
+}
+
+/// The directories `a` and `a/b`, and the files `a/b/f` and `g`.
+fn nested_entries() -> Vec<(String, Node)> {
+    vec![
+        ("a".to_string(), empty_directory_node()),
+        ("a/b".to_string(), empty_directory_node()),
+        ("a/b/f".to_string(), file_node(b"f")),
+        ("g".to_string(), file_node(b"g")),
+    ]
+}
+
+/// Files at the root of [`entries_spanning_blocks`].
+const SPANNING_ROOT_FILES: usize = BLOCK_NODE_COUNT + 8;
+
+/// The directories `a` and `a/b` and the file `a/b/f`, then [`SPANNING_ROOT_FILES`] files at the
+/// root, then the directories `z` and `z/y` and the file `z/y/g`. Staged in this order, the root's
+/// entries fill its node block and continue in the next, with a directory tree in each block.
+fn entries_spanning_blocks() -> Vec<(String, Node)> {
+    let mut entries = vec![
+        ("a".to_string(), empty_directory_node()),
+        ("a/b".to_string(), empty_directory_node()),
+        ("a/b/f".to_string(), file_node(b"f")),
+    ];
+    entries.extend((0..SPANNING_ROOT_FILES).map(|index| {
+        let name = format!("r{index:04}");
+        let node = file_node(name.as_bytes());
+        (name, node)
+    }));
+    entries.extend([
+        ("z".to_string(), empty_directory_node()),
+        ("z/y".to_string(), empty_directory_node()),
+        ("z/y/g".to_string(), file_node(b"g")),
+    ]);
+    entries
+}
+
+/// What a warm-up of a state holding `entries` walks down to `levels`, stopping once `stop` answers
+/// true, in a repository named after `test`.
+async fn warmed(
+    test: &str,
+    entries: Vec<(String, Node)>,
+    levels: u32,
+    stop: StopWhen,
+) -> WarmedTree {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let temp = TempDir::new(test);
+            let repository = working_tree_repository(temp.path()).await;
+            let state = State::new();
+            for (name, node) in entries {
+                stage_single_node(
+                    repository.clone(),
+                    state.clone(),
+                    relative_path(&name),
+                    node,
+                    Arc::default(),
+                    None,
+                    FilterMode::Full,
+                )
+                .await
+                .expect("stage the node");
+            }
+            warm_tree(repository, state, levels, stop)
+                .await
+                .expect("warm the tree")
+        })
+        .await
+}
+
+/// A warm-up enters directories down to the levels it is given: one level counts the root's
+/// directory without entering it, every level counts the whole tree, and no level walks nothing.
+/// The nodes share one block.
+#[tokio::test]
+async fn a_tree_warm_up_walks_the_levels_it_is_given() {
+    let test = "a_tree_warm_up_walks_the_levels_it_is_given-";
+    let one = warmed(test, nested_entries(), 1, never()).await;
+    assert_eq!((one.directories, one.blocks), (1, 1));
+
+    let all = warmed(test, nested_entries(), u32::MAX, never()).await;
+    assert_eq!((all.directories, all.blocks), (2, 1));
+
+    let none = warmed(test, nested_entries(), 0, never()).await;
+    assert_eq!((none.directories, none.blocks), (0, 0));
+}
+
+/// A directory the walk reaches after the root's entries continue into another node block keeps its
+/// level there: one level loads both blocks the root's entries span and enters neither directory,
+/// and two levels enter both.
+#[tokio::test]
+async fn a_tree_warm_up_keeps_the_level_across_blocks() {
+    let test = "a_tree_warm_up_keeps_the_level_across_blocks-";
+    let one = warmed(test, entries_spanning_blocks(), 1, never()).await;
+    assert_eq!((one.directories, one.blocks), (2, 2));
+
+    let two = warmed(test, entries_spanning_blocks(), 2, never()).await;
+    assert_eq!((two.directories, two.blocks), (4, 2));
+}
+
+/// A warm-up that stops midway returns with what it reached. Over the root's entries spanning two
+/// blocks, `stop` is asked before the root is read, at the dispatch of the root's entries, by the
+/// task loading their first block, and at the dispatch crossing into the second block: answering
+/// true on that fourth call, the walk has counted one directory and loaded one block, and returns.
+#[tokio::test]
+async fn a_tree_warm_up_stopped_midway_returns_what_it_reached() {
+    let test = "a_tree_warm_up_stopped_midway_returns_what_it_reached-";
+    let asked = Arc::new(AtomicUsize::new(0));
+    let stop: StopWhen = Arc::new(move || asked.fetch_add(1, Ordering::Relaxed) >= 3);
+
+    let stopped = warmed(test, entries_spanning_blocks(), 1, stop).await;
+    assert_eq!((stopped.directories, stopped.blocks), (1, 1));
+}
+
+/// A warm-up told to stop walks and loads nothing.
+#[tokio::test]
+async fn a_tree_warm_up_told_to_stop_walks_nothing() {
+    let test = "a_tree_warm_up_told_to_stop_walks_nothing-";
+    let stopped = warmed(test, nested_entries(), u32::MAX, Arc::new(|| true)).await;
+
+    assert_eq!((stopped.directories, stopped.blocks), (0, 0));
 }

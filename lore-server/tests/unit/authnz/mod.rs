@@ -10,4 +10,5 @@ mod global_grants_authorizer;
 mod rebac;
 mod repository_authorizer;
 mod repository_catalog;
+mod repository_registry;
 mod resource_grants_authorizer;

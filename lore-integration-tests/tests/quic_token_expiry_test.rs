@@ -158,7 +158,6 @@ mod quic_token_expiry_tests {
             jwt_issuer: None,
             jwt_audience: Some(vec![AUDIENCE.to_string()]),
             jwt_typ: None,
-            identity_claim: lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
         }
     }
 
@@ -225,6 +224,15 @@ mod quic_token_expiry_tests {
 
     #[async_trait]
     impl ImmutableStore for RecordingImmutableStore {
+        async fn hold_for_command(
+            self: Arc<Self>,
+        ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+            self.inner.clone().hold_for_command().await
+        }
+
+        fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+            self.inner.try_join_claim()
+        }
         async fn get(
             self: Arc<Self>,
             partition: Partition,
@@ -594,6 +602,7 @@ mod quic_token_expiry_tests {
             1,
             "",
             access_token,
+            lore_transport::auth::AuthMode::Auto,
         )
         .await?;
         Ok((connection, identity))
@@ -661,6 +670,7 @@ mod quic_token_expiry_tests {
                     1,
                     "",
                     &token(partition, now_secs() + 3600),
+                    lore_transport::auth::AuthMode::Auto,
                 )
                 .await?;
                 assert!(Arc::ptr_eq(&renewed, &connection));

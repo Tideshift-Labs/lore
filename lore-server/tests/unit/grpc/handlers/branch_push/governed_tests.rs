@@ -1718,6 +1718,7 @@ async fn committed_governed_push_fires_exactly_one_lorehub_notify_hook_post_and_
     .await;
     let response = handler(
         request,
+        crate::grpc::push_protected::allow_all(),
         immutable_store.clone(),
         mutable_store.clone(),
         notification_sender.clone(),
@@ -1783,6 +1784,7 @@ async fn committed_governed_push_fires_exactly_one_lorehub_notify_hook_post_and_
     .await;
     let repeated = handler(
         repeat_request,
+        crate::grpc::push_protected::allow_all(),
         immutable_store,
         mutable_store,
         notification_sender,
@@ -1885,6 +1887,7 @@ async fn hint_sender_queue_exhaustion_does_not_change_a_committed_governed_pushs
     .await;
     let response = handler(
         request,
+        crate::grpc::push_protected::allow_all(),
         immutable_store,
         mutable_store,
         notification,

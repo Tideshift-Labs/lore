@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::time::Duration;
+
 use bytes::Bytes;
 use lore_base::types::*;
 use serde::Deserialize;
@@ -101,15 +103,6 @@ impl EnvironmentConfig {
             fallback,
         )
     }
-
-    /// User directory endpoint: resolves user IDs to display names and back.
-    /// Falls back to `auth_url` if empty.
-    pub fn user_url<'a>(&'a self, fallback: &'a str) -> &'a str {
-        service_url_or(
-            self.endpoint.as_ref().and_then(|e| e.user_url.as_deref()),
-            fallback,
-        )
-    }
 }
 
 fn service_url_or<'a>(override_url: Option<&'a str>, fallback: &'a str) -> &'a str {
@@ -152,20 +145,6 @@ pub struct Oidc {
     pub scope_template: Option<String>,
     /// The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens.
     pub token_exchange_issuer: Option<String>,
-    pub identity_claim: Option<String>,
-}
-
-impl Oidc {
-    pub const DEFAULT_IDENTITY_CLAIM: &'static str = "sub";
-
-    /// The claim recorded as the user identity: the advertised one, or `sub` when the server
-    /// names none.
-    pub fn identity_claim(&self) -> &str {
-        match self.identity_claim.as_deref() {
-            Some(claim) if !claim.is_empty() => claim,
-            _ => Self::DEFAULT_IDENTITY_CLAIM,
-        }
-    }
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec
@@ -318,10 +297,32 @@ pub struct MetadataSetResult {
 /// Result of an interactive login session initiation.
 #[derive(Clone, Debug)]
 pub struct AuthSession {
-    /// Opaque session identifier for polling.
+    /// Opaque session identifier for polling. The device grant's
+    /// `device_code`.
     pub session_code: String,
-    /// URL the user should visit to authenticate.
+    /// URL the user should visit to authenticate. The device grant's
+    /// `verification_uri_complete`.
     pub login_url: String,
+    /// Code the user types at `login_url` from another machine. Empty when
+    /// the backend embeds it in `login_url` and offers no other entry.
+    pub user_code: String,
+    /// Minimum time between two polls of the session.
+    pub interval: Duration,
+    /// How long the session stays open for approval, counted from when it
+    /// was started.
+    pub expires_in: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub enum AuthSessionPoll {
+    /// The user has not approved the login yet. Poll again after the
+    /// session's `interval`.
+    Pending,
+    /// The user has not approved the login yet, and the backend wants a
+    /// longer gap before the next poll than the session's `interval`.
+    SlowDown,
+    /// The user approved the login and the backend issued a token.
+    Complete(AuthenticationToken),
 }
 
 /// Authentication token with user identity metadata.
@@ -346,6 +347,9 @@ pub struct AuthenticationToken {
     /// token without re-authenticating. `None` if the auth backend does not
     /// support refresh. A backend may return the same value or rotate it.
     pub refresh_token: Option<String>,
+    /// The scope the backend granted, space-delimited as RFC 6749 §3.3 has
+    /// it. `None` when the backend reports no scope.
+    pub scope: Option<String>,
 }
 
 /// Authorization token scoped to a specific resource.

@@ -68,6 +68,7 @@ impl FilesystemProvider for OsFilesystem {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Os(OsFilesystem::begin_operation(self)),
+            self.holds_state(),
         )))
     }
 }
@@ -164,8 +165,11 @@ impl InstanceOperation for OsOperation {
         )))
     }
 
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
-        lore_storage::ContentSource::owned_file(self.absolute(path))
+    async fn content_source(
+        &self,
+        path: &RelativePath,
+    ) -> Result<lore_storage::ContentSource<'static>, FsError> {
+        Ok(lore_storage::ContentSource::owned_file(self.absolute(path)))
     }
 
     /// Measures the file the operation's root holds at `path` against the stored object's own

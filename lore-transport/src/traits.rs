@@ -10,6 +10,7 @@ use lore_base::types::*;
 
 use crate::attempt_store::AcquiredLock;
 use crate::attempt_store::FencedLockResource;
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::domain_receipt::DomainAttemptReceipt;
@@ -29,7 +30,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         partition: Partition,
         index: usize,
@@ -42,7 +43,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -53,7 +54,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError>;
@@ -64,7 +65,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -76,7 +77,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -101,7 +102,7 @@ pub trait Protocol: Send + Sync {
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         repository: RepositoryId,
         credentials: &Arc<SuppliedCredentials>,
@@ -109,7 +110,7 @@ pub trait Protocol: Send + Sync {
         crate::grpc::domain_operations(
             connection,
             remote_url,
-            auth_url,
+            auth_endpoint,
             identity,
             repository,
             credentials,
@@ -769,14 +770,22 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthSession, ProtocolError>;
 
-    /// Polls for completion of an interactive auth session.
+    /// Polls an interactive auth session once.
+    ///
+    /// Answers [`AuthSessionPoll::Pending`] while the user has yet to
+    /// approve, [`AuthSessionPoll::SlowDown`] when the backend wants the
+    /// caller to poll less often, and [`AuthSessionPoll::Complete`] with the
+    /// token once approved.
+    ///
+    /// The caller takes care of the cadence: it waits the session's `interval`
+    /// between polls, widens it on `SlowDown`, and gives up at `expires_in`.
     async fn poll_auth_session(
         &self,
         auth_url: &str,
         client_state: &str,
         session_code: &str,
         correlation_id: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError>;
+    ) -> Result<AuthSessionPoll, ProtocolError>;
 
     /// Exchanges an external token for a URC authentication token.
     async fn exchange_external_token(

@@ -486,27 +486,38 @@ fn a_push_to_a_branch_with_no_remote_revisions_is_not_checked() {
     );
 }
 
-/// The service relay path carries the flag: `LoreManagedBranchPushArgs` defaults it to false when
-/// absent, and round-trips it when set.
+/// The service relay path carries the flag on both relayed argument structs, set and unset.
+/// Since v0.11.0 (`f301c323`) the relay is positional bitcode with no field defaults: client and
+/// service are one build, so every field is always encoded and "absent" has no wire form.
 #[test]
 fn the_relay_args_carry_the_flag_and_default_it_off() {
-    let with: lore::branch::LoreManagedBranchPushArgs = serde_json::from_str(
-        r#"{"args":{"branch":"","fast_forward_merge":0},"refuse_locked_by_others":true}"#,
-    )
-    .expect("parsing relay args with the flag");
-    assert!(with.refuse_locked_by_others);
+    for flag in [false, true] {
+        let push = lore::branch::LoreManagedBranchPushArgs {
+            args: lore::branch::LoreBranchPushArgs {
+                branch: LoreString::default(),
+                fast_forward_merge: 0,
+            },
+            refuse_locked_by_others: flag,
+        };
+        let read: lore::branch::LoreManagedBranchPushArgs =
+            bitcode::decode(&bitcode::encode(&push)).expect("decoding relay push args");
+        assert_eq!(read.refuse_locked_by_others, flag);
 
-    let without: lore::branch::LoreManagedBranchPushArgs =
-        serde_json::from_str(r#"{"args":{"branch":"","fast_forward_merge":0}}"#)
-            .expect("parsing relay args without the flag");
-    assert!(!without.refuse_locked_by_others);
-
-    let commit: lore::revision::LoreRevisionCommitArgs =
-        serde_json::from_str(r#"{"message":"m","link":""}"#)
-            .expect("parsing commit args without the flag");
-    assert_eq!(commit.refuse_locked_by_others, 0);
+        let commit = lore::revision::LoreRevisionCommitArgs {
+            message: LoreString::from_str("m"),
+            refuse_locked_by_others: u8::from(flag),
+            ..Default::default()
+        };
+        let read: lore::revision::LoreRevisionCommitArgs =
+            bitcode::decode(&bitcode::encode(&commit)).expect("decoding relay commit args");
+        assert_eq!(read.refuse_locked_by_others, u8::from(flag));
+    }
+    assert_eq!(
+        lore::revision::LoreRevisionCommitArgs::default().refuse_locked_by_others,
+        0,
+        "a zeroed commit leaves the refusal off"
+    );
 }
-
 /// Exact selection takes repository-relative paths (an absolute one is a `PathNormalization` error).
 fn exact_options(_rig: &Rig) -> lore_revision::exact_selection::ExactSelectionOptions {
     use lore_revision::exact_selection::ExactSelectionOptions;

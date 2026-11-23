@@ -447,6 +447,16 @@ mod fork_tests {
 
     #[async_trait::async_trait]
     impl MutableStore for FailStoreWritesMutableStore {
+        /// Nothing on disk to claim.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            Ok(None)
+        }
+
         async fn load(
             self: Arc<Self>,
             partition: Partition,

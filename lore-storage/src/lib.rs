@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod caller_buffer;
 pub mod chunker;
 pub mod compress;
 pub mod concurrency;
@@ -27,13 +28,22 @@ pub mod mutable_store;
 pub mod options;
 pub mod packstore;
 pub mod read;
+#[cfg(not(feature = "test-util"))]
+mod read_flight;
+#[cfg(feature = "test-util")]
+pub mod read_flight;
 pub mod store_types;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub(crate) mod typed_bytes;
 pub(crate) mod types;
 pub mod write;
 pub mod write_stats;
 pub mod write_tracker;
 
+pub use caller_buffer::CallerBuffer;
+pub use caller_buffer::Lender;
+pub use caller_buffer::Loan;
 // Re-export compress types
 pub use compress::COMPRESSION_MODE;
 pub use compress::CompressionMode;
@@ -119,14 +129,14 @@ pub use mutable_store::MutableStore;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore
-pub use packstore::CallerBuffer;
 pub use packstore::PackStore;
 pub use packstore::PackStoreRef;
 pub use packstore::PackfileError;
+pub use packstore::PackfileSize;
 pub use read::REMOTE_FETCH_INFLIGHT;
-pub use read::decompress_and_verify;
+pub use read::check_payload_sizes;
+pub use read::expand_payload;
 pub use read::load_fragment;
-pub use read::load_raw_local;
 pub use read::read;
 pub use read::read_into;
 pub use read::read_into_buffer;
@@ -137,6 +147,7 @@ pub use read::read_resolved_into_buffer;
 pub use read::read_resolved_into_file;
 pub use read::read_resolved_stream;
 pub use read::read_stream;
+pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
 pub use read::remote_get_retry;
 pub use read::write_all_to_file;

@@ -45,6 +45,7 @@ fn service_with(
         mutable_store,
         Arc::new(MockNotificationSender::new()),
         Arc::new(HookDispatcher::empty()),
+        Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
         None,

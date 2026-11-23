@@ -18,6 +18,8 @@ pub struct OpenOptions {
     create: bool,
     create_new: bool,
     truncate: bool,
+    #[cfg(not(target_family = "windows"))]
+    custom_flags: i32,
     #[cfg(target_family = "windows")]
     share_mode: Option<u32>,
 }
@@ -49,6 +51,15 @@ impl OpenOptions {
 
     pub fn truncate(mut self, truncate: bool) -> OpenOptions {
         self.truncate = truncate;
+        self
+    }
+
+    /// Adds `flags` to the flags of the `open(2)` call, mirroring
+    /// `std::os::unix::fs::OpenOptionsExt::custom_flags`. For a caller that must not follow a
+    /// link at the path, or wait on a FIFO there, while it holds other locks.
+    #[cfg(not(target_family = "windows"))]
+    pub fn custom_flags(mut self, flags: i32) -> OpenOptions {
+        self.custom_flags |= flags;
         self
     }
 
@@ -93,6 +104,12 @@ impl OpenOptions {
             .create(self.create)
             .create_new(self.create_new)
             .truncate(self.truncate);
+        #[cfg(not(target_family = "windows"))]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.custom_flags(self.custom_flags);
+        }
         #[cfg(target_family = "windows")]
         {
             use std::os::windows::fs::OpenOptionsExt;
@@ -141,6 +158,22 @@ impl std::fmt::Debug for IoFile {
 impl IoFile {
     pub(crate) fn new(driver: IoDriver, file: Arc<File>) -> IoFile {
         IoFile { driver, file }
+    }
+
+    /// Wraps `file`, which the caller opened, so that `driver` runs its positional operations and
+    /// syncs as it runs those of a file [`IoDriver::open`] opened. On Windows, `file` must be
+    /// opened with `FILE_FLAG_OVERLAPPED`. The `iocp` backend binds it to the driver's completion
+    /// port, which fails for a handle already bound to one.
+    ///
+    /// # Safety
+    ///
+    /// On the `iocp` backend, from this call on and whether or not it succeeds, the file takes I/O
+    /// only through `IoFile`s of `driver`, both through `file` and through any handle sharing its
+    /// file object. The driver takes every completion its port receives for one of its own
+    /// operations. The other backends require nothing.
+    pub unsafe fn from_std(driver: &IoDriver, file: Arc<File>) -> std::io::Result<IoFile> {
+        driver.register(&file)?;
+        Ok(IoFile::new(driver.clone(), file))
     }
 
     pub fn driver(&self) -> &IoDriver {
@@ -263,7 +296,12 @@ impl IoFile {
     }
 
     /// Sets the file length, extending it with a hole that reads as zeros or truncating it.
-    pub async fn set_len(&self, len: u64) -> std::io::Result<()> {
-        self.driver.set_len_raw(Arc::clone(&self.file), len).await
+    ///
+    /// `completion` is dropped once the length is set, whether or not the call is still awaited,
+    /// as [`crate::IoDriver::write_file_segments_atomic`] drops its own.
+    pub async fn set_len<C: Send + 'static>(&self, len: u64, completion: C) -> std::io::Result<()> {
+        self.driver
+            .set_len_raw(Arc::clone(&self.file), len, completion)
+            .await
     }
 }

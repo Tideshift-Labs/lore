@@ -226,6 +226,77 @@ pub fn test_filter_context(
     ))
 }
 
+/// An OS filesystem that holds its state in a `State` as far as a command asks it
+/// ([`lore_revision::fs::filesystem_provider::FilesystemProvider::holds_state`]), as its
+/// operations do, while they read and write the files themselves. Counts the operations begun on
+/// it.
+#[allow(dead_code)]
+pub struct HoldingFilesystem {
+    pub inner: lore_revision::fs::os::OsFilesystem,
+    pub begins: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl lore_revision::fs::filesystem_provider::FilesystemProvider for HoldingFilesystem {
+    async fn begin_operation(
+        &self,
+    ) -> Result<
+        std::sync::Arc<lore_revision::fs::filesystem_provider::InstanceOperationImpl>,
+        lore_revision::fs::filesystem_provider::FsError,
+    > {
+        self.begins
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(std::sync::Arc::new(
+            lore_revision::fs::filesystem_provider::InstanceOperationImpl::new(
+                lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation::Os(
+                    self.inner.begin_operation(),
+                ),
+                self.holds_state(),
+            ),
+        ))
+    }
+
+    fn holds_state(&self) -> bool {
+        true
+    }
+}
+
+/// `repository`, with its stores, filter and write token, reading its working tree through the
+/// [`HoldingFilesystem`] answered beside it.
+#[allow(dead_code)]
+pub fn test_holding_context(
+    repository: &lore_revision::repository::RepositoryContext,
+) -> (
+    std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    std::sync::Arc<HoldingFilesystem>,
+) {
+    let path = repository.require_path().expect("A repository on disk");
+    let filesystem = std::sync::Arc::new(HoldingFilesystem {
+        inner: lore_revision::fs::os::OsFilesystem::new(path),
+        begins: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let context = std::sync::Arc::new(
+        lore_revision::repository::RepositoryContext::new(
+            default_repository_creation_args(
+                repository.immutable_store(),
+                repository.mutable_store.clone(),
+            )
+            .with_path(path)
+            .with_id(repository.id)
+            .with_instance_id(repository.instance_id)
+            .with_filter(repository.filter.clone())
+            .with_filesystem_provider(filesystem.clone()),
+        )
+        .with_write_token(
+            repository
+                .try_write_token()
+                .expect("A repository opened for writing")
+                .share(),
+        ),
+    );
+    (context, filesystem)
+}
+
 /// Stages the whole working tree of `instance` and commits it, answering the state of the
 /// revision that produced.
 ///
@@ -449,4 +520,165 @@ pub fn test_reported(changes: &[lore_revision::change::NodeChange]) -> Vec<(Stri
             )
         })
         .collect()
+}
+
+/// The children of `parent` in `state` named `name`.
+#[allow(dead_code)]
+pub async fn children_named(
+    repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state: &std::sync::Arc<lore_revision::state::State>,
+    parent: lore_revision::node::NodeID,
+    name: &str,
+) -> Vec<lore_revision::node::NodeID> {
+    let name_hash = lore_storage::hash::hash_string(name);
+    let mut named = Vec::new();
+    for child in state
+        .node_children(repository.clone(), parent)
+        .await
+        .expect("Failed to list the children")
+    {
+        let node = state
+            .node(repository.clone(), child)
+            .await
+            .expect("Failed to read a child");
+        if node.name_hash == name_hash {
+            named.push(child);
+        }
+    }
+    named
+}
+
+/// Fixtures for revisions built in memory, on a path-less repository writing through an in-memory
+/// token, which is the shape the memory-based revision tree handle runs on.
+#[allow(dead_code)]
+pub mod in_memory {
+    use std::sync::Arc;
+
+    use lore_base::types::Address;
+    use lore_base::types::BranchId;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use lore_revision::commit::commit_in_memory_revision;
+    use lore_revision::metadata::Metadata;
+    use lore_revision::node::Node;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::node::NodeID;
+    use lore_revision::repository::InMemoryContext;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::State;
+    use lore_storage::hash::hash_string;
+
+    struct Marker;
+    impl InMemoryContext for Marker {}
+    const MARKER: Marker = Marker;
+
+    pub fn token() -> RepositoryWriteToken {
+        RepositoryWriteToken::in_memory(&MARKER)
+    }
+
+    /// A path-less repository on the stores, writing through [`token`].
+    pub fn repository(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> Arc<RepositoryContext> {
+        Arc::new(
+            RepositoryContext::new(super::default_repository_creation_args(immutable, mutable))
+                .with_write_token(token()),
+        )
+    }
+
+    pub fn file(name: &str) -> Node {
+        Node {
+            flags: NodeFlags::File.bits(),
+            mode: 0o644,
+            size: 10,
+            address: Address {
+                hash: Hash::from_u64(0x5a),
+                context: Context::from(uuid::Uuid::now_v7()),
+            },
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    pub fn directory(name: &str) -> Node {
+        Node {
+            flags: NodeFlags::NoFlags.bits(),
+            mode: 0o755,
+            name_hash: hash_string(name),
+            ..Default::default()
+        }
+    }
+
+    pub fn branch_id() -> BranchId {
+        Context::from(uuid::Uuid::now_v7())
+    }
+
+    /// Adds `node` as `name` under `parent`, staged as an add. Every write verb marks its staged
+    /// action and dirties the ancestors, which is what the freeze walks; `node_add` alone leaves
+    /// neither.
+    pub async fn add(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+    ) -> NodeID {
+        add_staged(state, repository, parent, node, name, NodeFlags::StagedAdd).await
+    }
+
+    /// Adds `node` as `name` under `parent`, staged with `staged`, such as an add a merge takes
+    /// from its other side.
+    pub async fn add_staged(
+        state: &State,
+        repository: Arc<RepositoryContext>,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+        staged: NodeFlags,
+    ) -> NodeID {
+        let node_id = state
+            .node_add(repository.clone(), parent, node, name)
+            .await
+            .expect("adding the node must succeed");
+        state
+            .node_mark_staged(repository, node_id, staged, NodeFlags::DirtyAdd)
+            .await
+            .expect("marking the addition must succeed");
+        node_id
+    }
+
+    pub fn metadata_on(branch: BranchId) -> Metadata {
+        let mut metadata = Metadata::new();
+        metadata
+            .set_branch(branch)
+            .expect("setting the branch must succeed");
+        metadata
+    }
+
+    /// Commits `state` on top of `current` on `branch`.
+    pub async fn commit(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        current: Hash,
+        branch: BranchId,
+    ) -> Hash {
+        commit_in_memory_revision(
+            repository.clone(),
+            &token(),
+            state.clone(),
+            metadata_on(branch),
+            current,
+            branch,
+        )
+        .await
+        .expect("committing the revision must succeed")
+    }
+
+    pub async fn revision_state(repository: &Arc<RepositoryContext>, revision: Hash) -> Arc<State> {
+        State::deserialize(repository.clone(), revision)
+            .await
+            .expect("deserializing the revision must succeed")
+    }
 }

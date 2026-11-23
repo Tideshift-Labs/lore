@@ -84,6 +84,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for YieldingStore {
+        /// Claims what the wrapped store claims.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            self.inner.clone().hold_for_command().await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.is_local()
         }

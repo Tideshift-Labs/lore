@@ -23,6 +23,7 @@ use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::protocol::storage::messages::Response;
+use crate::protocol::storage::mutable_store_handler::check_generic_write_key_type;
 use crate::util::setup_execution;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,7 +66,11 @@ pub async fn handle_mutable_cas(
     user_id: String,
     mutable_store: Arc<dyn MutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
+    // FORK-LOCAL (Tideshift): CR-029 domain-owned refusal first (superset); upstream's check
+    // stays as a second guard.
     crate::protocol::storage::mutable_store_handler::refuse_domain_key(key_type)?;
+    check_generic_write_key_type(key_type)?;
+
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(

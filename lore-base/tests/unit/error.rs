@@ -193,6 +193,11 @@ fn registry() -> Vec<(&'static str, Group, i32)> {
             DeleteDefault { branch: text() }.ffi_code(),
         ),
         (
+            "MountsBusy",
+            Group::RepositoryState,
+            MountsBusy { paths: text() }.ffi_code(),
+        ),
+        (
             "AlreadyLinked",
             Group::AlreadyExists,
             AlreadyLinked.ffi_code(),

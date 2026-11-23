@@ -84,6 +84,7 @@ async fn missing_carriage(v1: bool) {
             );
             lore_server::grpc::revision::v1::branch_push::handler(
                 request,
+                crate::grpc::push_protected::allow_all(),
                 fixture.immutable.clone(),
                 fixture.mutable.clone(),
                 notifications,
@@ -99,6 +100,7 @@ async fn missing_carriage(v1: bool) {
         } else {
             handler(
                 request,
+                crate::grpc::push_protected::allow_all(),
                 fixture.immutable.clone(),
                 fixture.mutable.clone(),
                 notifications,

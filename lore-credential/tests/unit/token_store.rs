@@ -14,6 +14,8 @@ use lore_credential::token_store::TokenMap;
 use lore_credential::token_store::acquire_authentication_refresh;
 use lore_credential::token_store::load_refresh_token;
 use lore_credential::token_store::load_user_token;
+use lore_credential::token_store::load_user_token_from_store;
+use lore_credential::token_store::remove_user_token_if;
 use lore_credential::token_store::reset_tokens;
 use lore_credential::token_store::store_authentication_token;
 use lore_credential::token_store::store_refresh_token;
@@ -27,6 +29,7 @@ use lore_credential::token_store::test_util::seal_token;
 use lore_credential::token_store::test_util::single_nonce_sequence;
 use lore_credential::token_store::test_util::split_remote_resource;
 use lore_credential::token_store::test_util::store_cached_token_map;
+use lore_credential::token_store::test_util::store_file;
 use lore_credential::token_store::test_util::token_map_path;
 use lore_credential::token_store::tokens_only_for_recipient_domain;
 use lore_credential::token_store::vulnerable_all_tokens;
@@ -799,7 +802,9 @@ async fn authentication_refresh_lease_releases_after_process_exit() {
             .arg("--exact")
             .arg("token_store::authentication_refresh_lease_child_process_holder")
             .arg("--nocapture")
-            .env("LORE_AUTH_PATH", auth_path)
+            // The unit binary's constructor points LORE_AUTH_PATH at a sandbox of the child's own
+            // (upstream 750dba41), so the parent's store travels under another name.
+            .env("CR020_REFRESH_AUTH_PATH", auth_path)
             .env("LORE_AUTH_STORE", "fallback")
             .env("CR020_REFRESH_CHILD", "1")
             .status()
@@ -824,6 +829,12 @@ async fn authentication_refresh_lease_child_process_holder() {
     if std::env::var("CR020_REFRESH_CHILD").as_deref() != Ok("1") {
         return;
     }
+    let auth_path = std::env::var("CR020_REFRESH_AUTH_PATH").expect("the parent's store path");
+    // SAFETY: the child process runs this one test, before any thread reads the environment.
+    unsafe {
+        std::env::set_var("LORE_AUTH_PATH", auth_path);
+        std::env::set_var("LORE_AUTH_STORE", "fallback");
+    }
 
     let _lease = acquire_authentication_refresh(REFRESH_AUTH_ENDPOINT, "alice")
         .await
@@ -831,4 +842,37 @@ async fn authentication_refresh_lease_child_process_holder() {
     // The child process exits while holding the lease, so the parent observes its release by exit.
     #[allow(clippy::exit)]
     std::process::exit(0);
+}
+
+/// A token removed only where it is a given one is compared with the store as its file holds it,
+/// so a token another process stored in its place after this process cached the store is left
+/// alone, and the given one is removed. The test stands in for the other process by writing the
+/// store's file back as it was before this process stored the given token.
+#[tokio::test]
+async fn a_conditional_removal_leaves_a_token_another_process_stored() {
+    // FORK-LOCAL (Tideshift): the CR-020 tests above repoint the store's environment; hold their
+    // guard so the store this test reads is not switched under it.
+    let _guard = refresh_test_guard().await;
+    const ENDPOINT: &str = "https://auth.conditional-removal.test.invalid/repository";
+    let file = store_file().expect("the token store's file");
+    store_user_token(ENDPOINT, "alice", "newer", Vec::new())
+        .await
+        .expect("store the newer token");
+    let newer = std::fs::read(&file).expect("read the store holding the newer token");
+    store_user_token(ENDPOINT, "alice", "refused", Vec::new())
+        .await
+        .expect("store the refused token");
+    std::fs::write(&file, newer).expect("store the newer token from another process");
+
+    remove_user_token_if(ENDPOINT, "alice", "refused")
+        .await
+        .expect("remove the refused token");
+    let kept = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert_eq!(kept.ok().as_deref(), Some("newer"));
+
+    remove_user_token_if(ENDPOINT, "alice", "newer")
+        .await
+        .expect("remove the newer token");
+    let removed = load_user_token_from_store(ENDPOINT, "alice", vulnerable_all_tokens()).await;
+    assert!(removed.is_err(), "the given token was left in the store");
 }

@@ -962,6 +962,7 @@ mod get {
                                 match_made: lore_storage::StoreMatch::MatchFull,
                                 partition,
                                 payload: Some(payload.clone()),
+                                content: None,
                             })
                         });
                 }
@@ -1238,6 +1239,7 @@ mod get_metadata {
                             match_made: lore_storage::StoreMatch::MatchFull,
                             partition,
                             payload: None,
+                            content: None,
                         })
                     });
 
@@ -1294,6 +1296,7 @@ mod get_metadata {
                             match_made: lore_storage::StoreMatch::MatchPartition,
                             partition,
                             payload: None,
+                            content: None,
                         })
                     });
 

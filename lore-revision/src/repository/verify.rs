@@ -8,7 +8,6 @@ use std::sync::Arc;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
@@ -41,7 +40,7 @@ use crate::util::path::RelativePath;
 
 /// Data for the event emitted when state verification starts.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyStateBeginEventData {
     /// Placeholder field. The event carries no data.
@@ -50,7 +49,7 @@ pub struct LoreRepositoryVerifyStateBeginEventData {
 
 /// Data for the event emitted when state verification finishes.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyStateEndEventData {
     /// Identifier of the staged state after healing. Zero when nothing was healed.
@@ -59,7 +58,7 @@ pub struct LoreRepositoryVerifyStateEndEventData {
 
 /// One stored copy of a fragment found during fragment verification.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentMatchEventData {
     /// Slot the match was found in.
@@ -88,7 +87,7 @@ pub struct LoreRepositoryVerifyFragmentMatchEventData {
 
 /// Result of verifying a single fragment, including every stored copy found.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentEventData {
     /// Hash of the fragment that was verified.
@@ -113,7 +112,7 @@ pub struct LoreRepositoryVerifyFragmentEventData {
 
 /// Result of verifying a single fragment on the remote.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryVerifyFragmentRemoteEventData {
     /// Hash part of the fragment address.
@@ -355,14 +354,7 @@ pub(crate) async fn verify(
         // Healed, serialize new staged state
         lore_info!("Serializing healed state as new staged state");
 
-        state.set_parent_self(state_current.revision());
-        state.set_revision_number(0);
-
-        if !is_staged {
-            // Force commit same revision, reset metadata
-            state.set_parent_other(Hash::default());
-            state.set_metadata_hash(Hash::default());
-        }
+        state.reparent_onto(state_current.revision());
 
         let signature = state
             .serialize(repository.clone(), token)

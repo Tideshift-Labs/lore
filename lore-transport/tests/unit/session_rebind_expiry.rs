@@ -180,7 +180,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: Partition,
         _: usize,
@@ -193,7 +193,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: RepositoryId,
         _: &Arc<SuppliedCredentials>,
@@ -205,7 +205,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError> {
@@ -216,7 +216,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: RepositoryId,
         _: &Arc<SuppliedCredentials>,
@@ -228,7 +228,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: RepositoryId,
         _: &Arc<SuppliedCredentials>,
@@ -257,6 +257,7 @@ async fn stale_session(scheme: &str, peer: &Arc<Peer>) -> Arc<StorageSession> {
         1,
         "",
         "",
+        lore_transport::auth::AuthMode::Auto,
     )
     .await
     .expect("connect builds a connection without reaching any service");

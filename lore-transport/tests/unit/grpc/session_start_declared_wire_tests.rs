@@ -228,7 +228,7 @@ async fn storage(addr: SocketAddr) -> GRPCStorage {
     GRPCStorage {
         connection: connection.clone(),
         client: StorageService::new(connection),
-        auth_url: String::new(),
+        auth_endpoint: lore_transport::auth::AuthEndpoint::none(),
         identity: String::new(),
         credentials: Arc::new(lore_transport::connection::SuppliedCredentials::default()),
         session_counter: std::sync::atomic::AtomicU32::new(1),

@@ -9,7 +9,6 @@ use lore_base::error::OutcomeUnknown;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::bitflagsops;
@@ -33,8 +32,10 @@ use crate::lore_debug;
 use crate::lore_info;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::is_reserved_node_name;
@@ -241,7 +242,7 @@ impl LinkTracker {
 
 /// Data for an event reporting a change to a link.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkChangeEventData {
     /// Path of the link within the parent repository.
@@ -288,7 +289,7 @@ impl LoreLinkChangeEventData {
 /// repository. A repository can be linked at more than one mount path, so a
 /// consumer must key on `link_path` together with `link_repository`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLinkBranchCreateEventData {
     /// Path of the link within the parent repository.
@@ -677,13 +678,124 @@ pub async fn update_link_pin_by_node(
         .await
 }
 
+/// [`update_link_pin_by_node`], then `mark` on the link node and up to the root.
+pub async fn repin_link_node(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_repo_id: RepositoryId,
+    branch: BranchId,
+    new_signature: Hash,
+    node_id: NodeID,
+    mark: NodeFlags,
+) -> Result<(), StateError> {
+    update_link_pin_by_node(
+        state,
+        repository.clone(),
+        link_repo_id,
+        branch,
+        new_signature,
+        node_id,
+    )
+    .await?;
+    if mark.intersects(NodeFlags::StagedBits) {
+        state.node_mark(repository, node_id, mark, true).await
+    } else {
+        state.node_mark_dirty(repository, node_id, mark, true).await
+    }
+}
+
+/// A linked repository's state, with the context reaching it.
+pub type LinkedState = (Arc<RepositoryContext>, Arc<State>);
+
+/// What a linked staged state holds below its root, which decides how
+/// [`settle_linked_staged_state`] pins its link.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LinkedStagedContent {
+    /// At least one dirty marker, with or without staged nodes.
+    Dirty,
+    /// Staged nodes and no dirty marker.
+    Staged,
+    /// Neither.
+    Empty,
+}
+
+impl LinkedStagedContent {
+    /// What `state` holds below its root. A node that cannot be read counts as holding a marker,
+    /// so the link keeps its pin.
+    pub async fn of(state: &Arc<State>, repository: &Arc<RepositoryContext>) -> Self {
+        if state
+            .node_has_dirty_children(repository.clone(), ROOT_NODE)
+            .await
+            .unwrap_or(true)
+        {
+            LinkedStagedContent::Dirty
+        } else if state
+            .node_has_staged_children(repository.clone(), ROOT_NODE)
+            .await
+            .unwrap_or(true)
+        {
+            LinkedStagedContent::Staged
+        } else {
+            LinkedStagedContent::Empty
+        }
+    }
+}
+
+/// Pin the link at `link_node` in `state` by what `linked` holds.
+///
+/// A state holding anything is serialized on the committed revision it derives from, so a commit
+/// can restore that revision from the pin alone, and the link keeps its dirty flag only while a
+/// marker remains. An empty state has nothing to pin, so the link goes back to that revision.
+pub async fn settle_linked_staged_state(
+    state: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+    link_node: NodeID,
+    branch: BranchId,
+    (linked_repository, linked_state): &LinkedState,
+    content: LinkedStagedContent,
+    token: &RepositoryWriteToken,
+) -> Result<(), StateError> {
+    let committed = linked_state.committed_revision();
+    let signature = if content == LinkedStagedContent::Empty {
+        committed
+    } else {
+        linked_state.reparent_onto(committed);
+        linked_state
+            .serialize(linked_repository.clone(), token)
+            .await?
+    };
+
+    if content == LinkedStagedContent::Dirty {
+        return repin_link_node(
+            state,
+            repository,
+            linked_repository.id,
+            branch,
+            signature,
+            link_node,
+            NodeFlags::Dirty,
+        )
+        .await;
+    }
+    update_link_pin_by_node(
+        state,
+        repository.clone(),
+        linked_repository.id,
+        branch,
+        signature,
+        link_node,
+    )
+    .await?;
+    state.node_clear_dirty(repository, link_node).await
+}
+
 /// Reserializes a tracked link's state and updates the parent repository's
 /// block tree and link registry.
 ///
 /// This is the shared workflow between `process_link_updates` (stage) and
 /// `process_link_unstage_updates` (unstage):
 /// 1. Get linked repository context via `to_link_context`
-/// 2. Set parent on linked state and reset revision number
+/// 2. Reparent the linked state onto `parent_signature` ([`State::reparent_onto`])
 /// 3. Serialize the linked state
 /// 4. Update the block tree hash and link registry via `update_link_pin_by_node`
 ///
@@ -701,8 +813,7 @@ pub async fn reserialize_tracked_link(
         .await;
 
     let linked_state = link_context.link_state.clone();
-    linked_state.set_parent_self(parent_signature);
-    linked_state.set_revision_number(0);
+    linked_state.reparent_onto(parent_signature);
 
     let new_signature = linked_state.serialize(linked_repository, token).await?;
 
@@ -938,34 +1049,23 @@ pub async fn propagate_link_chain(
         let level = &chain.levels[i];
         let (child_state, child_repository) = chain.child_at(i);
 
-        child_state.set_parent_self(level.old_signature);
-        child_state.set_revision_number(0);
+        child_state.reparent_onto(level.old_signature);
         let new_signature = child_state
             .serialize(child_repository, token)
             .await
             .forward::<LinkError>("Failed to serialize linked state")?;
 
-        update_link_pin_by_node(
+        repin_link_node(
             &level.state,
             level.repository.clone(),
             level.child_repository_id,
             level.branch,
             new_signature,
             level.link_node_id,
+            NodeFlags::Staged,
         )
         .await
         .forward::<LinkError>("Failed to update link pin")?;
-
-        level
-            .state
-            .node_mark(
-                level.repository.clone(),
-                level.link_node_id,
-                crate::node::NodeFlags::Staged,
-                true,
-            )
-            .await
-            .forward::<LinkError>("Failed to mark link node staged")?;
     }
 
     Ok(())
@@ -1094,7 +1194,7 @@ pub async fn drain_link_tracker(
                 .node_mark(
                     parent_repository,
                     link_context.link_node_id,
-                    crate::node::NodeFlags::Staged,
+                    NodeFlags::Staged,
                     true,
                 )
                 .await?;
@@ -1818,6 +1918,34 @@ pub async fn resolve_link_at_path(
         parent_state,
         local_node,
     })
+}
+
+pub async fn validate_link_message_paths(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    paths: impl IntoIterator<Item = &String>,
+) -> Result<(), LinkError> {
+    futures::future::try_join_all(paths.into_iter().map(|path| async move {
+        match resolve_link_at_path(state, repository.clone(), path).await {
+            Ok(_) => Ok(()),
+            Err(error)
+                if error.is_node_not_found()
+                    || error.is_invalid_path()
+                    || error.is_not_a_link() =>
+            {
+                Err(InvalidArguments {
+                    reason: format!(
+                        "Link message path '{path}' does not match any linked repository"
+                    ),
+                }
+                .into())
+            }
+            Err(error) => Err(error)
+                .forward_with::<LinkError, _>(|| format!("resolving link message path {path}")),
+        }
+    }))
+    .await?;
+    Ok(())
 }
 
 /// Updates a link pin when only the mount path is known.

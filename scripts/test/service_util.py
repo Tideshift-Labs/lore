@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import subprocess
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -41,23 +42,45 @@ def name_service_executable(
 # runs could not proceed at once.
 LORE_SERVICE_SOCKET_VAR = "LORE_SERVICE_SOCKET"
 
+# Names the socket of a service started before the run, which then carries out
+# every command of every test that neither manages a service of its own nor is
+# marked `runs_in_process`. See `docs/developing/code-standards/testing.md`.
+LORE_TEST_SERVICE_SOCKET_VAR = "LORE_TEST_SERVICE_SOCKET"
+
+# Set to have the suite start that service itself, from the build under test,
+# and stop it when the run ends.
+LORE_TEST_SHARED_SERVICE_VAR = "LORE_TEST_SHARED_SERVICE"
+
 # Lines the client prints about the service. They are matched rather than
 # parsed, so they are kept here next to each other: each one pairs with a string
 # in the Rust sources and has to be changed with it.
 #
 # `lore service run` prints this once it has bound its socket.
 LORE_SERVICE_LISTENING_MESSAGE = "Lore service listening"
+# `lore service run` exits with this when another service has claimed the socket.
+LORE_SERVICE_CLAIM_REFUSED_MESSAGE = "Another Lore service has claimed the socket"
 # `lore service stop` prints this when there was no service to stop.
 LORE_NO_SERVICE_MESSAGE = "No Lore service is running"
 # `lore service start` prints this once a service is reachable.
 LORE_SERVICE_RUNNING_MESSAGE = "Lore service is running"
-# Printed by the `service` setters when relaying is on but no executable is set.
-# Commands can use a running service, but cannot start one without an executable.
+# Printed by the `service` setters when the two settings relaying needs are left
+# in a state that will not relay.
 LORE_NO_SERVICE_EXECUTABLE_MESSAGE = "No service executable is set"
+# Headings `lore service status` prints for the metadata it reports. Only the
+# labels, because the values are the machine's rather than the suite's.
+LORE_SERVICE_STATUS_LABELS = ("Executable:", "Uptime:", "Connections:", "SWFS mounts:")
 
 
 def service_supported():
     return platform.system() in ("Windows", "Linux", "Darwin")
+
+
+def service_claim_path(socket_name: str) -> Path:
+    """The lock file a service claims `socket_name` with, beside the socket, on
+    systems with Unix sockets. Paired with `uds_sock_dir` in
+    `lore/src/remote/network/unix.rs`."""
+    base = os.environ.get("XDG_RUNTIME_DIR") or os.environ.get("TMPDIR") or "/tmp"
+    return Path(base) / f"lore-{os.getuid()}" / f"{socket_name}.lock"
 
 
 def stop_lore_service(lore_executable_path: str, global_dir_name: str) -> str:

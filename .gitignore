@@ -10,6 +10,7 @@ target-*/
 # Local files
 lore-server/config/local*.toml
 **/.grafana.local.yaml
+contrib/bazel/.rbe-state/
 
 #################
 ## Visual Studio

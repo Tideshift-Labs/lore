@@ -4,6 +4,10 @@
 //! `LocalMutableStore`. Verifies the headline file-count win for client stores: cloning a 100k-file
 //! repository keeps every group at level 1, so the on-disk artifact count is bounded by 256
 //! per-group bucket files + 256 marker files (mutable) or +256 packfiles (immutable).
+//!
+//! A test holds a span over a store it writes through or runs many operations on, as a command
+//! does: `LocalImmutableStore::store` takes no claim of its own, and an operation outside any span
+//! claims the store afresh, reloading it, whenever nothing unflushed kept the flock.
 
 #[cfg(test)]
 mod tests {
@@ -13,6 +17,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use lore_base::test_util::TempDir;
+    use lore_storage::ImmutableStore;
     use lore_storage::ImmutableStoreSettings;
     use lore_storage::MutableStoreSettings;
     use lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT;
@@ -77,6 +82,11 @@ mod tests {
 
         let mutable = Arc::new(mutable);
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xDEADBEEFCAFEBABE);
@@ -142,6 +152,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xDEADBEEFCAFEBABE);
@@ -186,7 +201,11 @@ mod tests {
         // All 100k addresses must be findable.
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -333,6 +352,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, written, fragment, Some(payload.clone()), false)
@@ -351,6 +375,11 @@ mod tests {
             let count = group.bucket_count.load(Ordering::Relaxed);
             assert_eq!(count, 1, "Group {idx} must reopen at the initial level 1");
         }
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, untouched, fragment, Some(payload.clone()), false)
@@ -372,7 +401,11 @@ mod tests {
         );
         for address in [written, untouched] {
             let result = store
-                .find(partition, address)
+                .find(
+                    partition,
+                    address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -513,8 +546,10 @@ mod tests {
     /// actual `bucket_count` (not a hard-coded `BUCKET_COUNT`) and leaves the store consistent.
     /// We force three groups to levels 1, 32, and 256 by setting `bucket_count` directly, populate
     /// each, then exercise (a) `flush`, (b) `evict_oldest`, and (c) `compact` — the last
-    /// dispatches to `compact_packfiles` → `compact_group_packfiles` → `evict_group_sized`,
-    /// covering the four maintenance ops the plan named.
+    /// dispatches to `compact_packfiles` → `compact_group_packfiles` → `evict_group_sized`.
+    /// Two of each group's fragments are durable, so compaction run step by step over every
+    /// group evicts them and rewrites each forced group's packfile down to its three local
+    /// fragments.
     #[tokio::test]
     async fn mixed_level_maintenance_is_consistent() {
         let store_path = temp_dir();
@@ -527,6 +562,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         // Force specific groups to specific levels by setting bucket_count directly.
         store.group[0].bucket_count.store(1, Ordering::Relaxed);
@@ -537,7 +577,7 @@ mod tests {
         // under that group's level. This validates `bucket_index_for` consistency.
         let mut rng = StdRng::seed_from_u64(0xCAFE);
         for &group_idx in &[0usize, 1usize, 100usize] {
-            for _ in 0..5 {
+            for index in 0..5 {
                 let mut hash = make_hash(&mut rng);
                 hash.data_mut()[0] = group_idx as u8;
                 // Force key.data()[1] = 0 so it routes to bucket 0 under any level.
@@ -548,7 +588,11 @@ mod tests {
                 };
                 let payload = bytes::Bytes::from_static(b"test payload data");
                 let fragment = lore_storage::Fragment {
-                    flags: 0,
+                    flags: if index < 2 {
+                        lore_storage::FragmentFlags::PayloadStoredDurable.bits()
+                    } else {
+                        0
+                    },
                     size_payload: payload.len() as u32,
                     size_content: payload.len() as u64,
                 };
@@ -570,14 +614,27 @@ mod tests {
         store_dyn.clone().flush(true).await.unwrap();
 
         // evict_oldest with generous capacity: no actual eviction, but the bucket-iteration path runs at every level.
-        let _evicted = store.evict_oldest(1_000_000_000, None).await;
+        let (_evicted, _) = store.evict_oldest(1_000_000_000, None).await;
 
-        // compact with small max_size: forces compact_packfiles → compact_group_packfiles → evict_group_sized to iterate per-group bucket arrays at the actual bucket_count. We don't care whether it evicts anything; we only care that all three paths complete without error or panic at every group level.
-        let _compact_step = store_dyn
-            .clone()
-            .compact(1, None, false, None)
-            .await
-            .expect("compact must complete without error at mixed bucket levels");
+        let mut at = None;
+        for _ in 0..=lore_storage::local::immutable_store::GROUP_COUNT {
+            at = store_dyn
+                .clone()
+                .compact(1, at, false, None)
+                .await
+                .expect("compact must complete without error at mixed bucket levels");
+            if at.is_none() {
+                break;
+            }
+        }
+        assert_eq!(at, None, "compaction finishes within one step per group");
+        for &group_idx in &[0usize, 1usize, 100usize] {
+            assert_eq!(
+                store.group[group_idx].packstore.total_size().await.unwrap(),
+                3 * b"test payload data".len(),
+                "group {group_idx} is rewritten down to its three local fragments"
+            );
+        }
 
         // Maintenance ops never alter bucket_count (only fan-out does). All three forced levels survive.
         assert_eq!(store.group[0].bucket_count.load(Ordering::Relaxed), 1);
@@ -910,6 +967,11 @@ mod tests {
         .unwrap();
         let mutable = Arc::new(mutable);
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         // Pin every write to group 0x10 by fixing the first hash byte.
         let group_index: u8 = 0x10;
@@ -983,6 +1045,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let group_index: u8 = 0x10;
         let n = 5000;
@@ -1031,7 +1098,14 @@ mod tests {
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
 
         for address in &addresses {
-            let result = store.find(partition, *address).await.unwrap();
+            let result = store
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 result.matching,
                 lore_storage::StoreMatch::MatchFull,
@@ -1131,6 +1205,11 @@ mod tests {
                 .unwrap(),
             );
             let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+            let _span = store
+                .clone()
+                .hold_for_command()
+                .await
+                .expect("claims the store");
             assert_eq!(
                 mutable.group[group_index as usize]
                     .bucket_count
@@ -1216,6 +1295,11 @@ mod tests {
             .unwrap(),
         );
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         let group_index: u8 = 0x10;
         let partition = lore_storage::Partition::default();
 
@@ -1611,7 +1695,7 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1661,7 +1745,7 @@ mod tests {
                 }
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1698,7 +1782,7 @@ mod tests {
         let (store_path, group_dir, keys) = setup_post_fan_out_to_level_32(0xAA04, 200).await;
 
         // Construct: write pending=32, leave everything else alone (final files at level-32, marker=32).
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1797,7 +1881,7 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false, None)
             .await
             .unwrap();
 
@@ -1824,6 +1908,11 @@ mod tests {
         )
         .await;
         let store: Arc<dyn lore_storage::MutableStore> = mutable.clone();
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         let partition = lore_storage::Partition::default();
         let mut rng = StdRng::seed_from_u64(0xFA0_0002);
         let mut keys = Vec::with_capacity(5000);
@@ -1896,6 +1985,11 @@ mod tests {
         )
         .await
         .expect("Failed to create immutable store");
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
 
         let partition = lore_storage::Partition::default();
         let payload = bytes::Bytes::from_static(b"test fragment payload data 30!");
@@ -1927,7 +2021,13 @@ mod tests {
         let reader = lore_base::lore_spawn!(async move {
             for _ in 0..40 {
                 for address in &reader_addresses {
-                    let _ = reader_store.find(partition, *address).await;
+                    let _ = reader_store
+                        .find(
+                            partition,
+                            *address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
+                        .await;
                 }
             }
         });
@@ -1948,7 +2048,11 @@ mod tests {
         let mut missing = 0usize;
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             if result.matching != lore_storage::StoreMatch::MatchFull {
@@ -2002,6 +2106,11 @@ mod tests {
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             "Untouched group of a legacy store must open at the legacy level"
         );
+        let _span = store
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the store");
         store
             .clone()
             .store(partition, address, fragment, Some(payload.clone()), false)
@@ -2027,7 +2136,11 @@ mod tests {
         .await
         .expect("Failed to reopen immutable store");
         let result = store
-            .find(partition, address)
+            .find(
+                partition,
+                address,
+                lore_storage::local::immutable_store::Lookup::Read,
+            )
             .await
             .expect("find returned an error");
         assert_eq!(

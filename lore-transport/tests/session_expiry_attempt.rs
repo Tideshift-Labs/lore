@@ -172,14 +172,29 @@ struct Fixture {
 /// A connection whose session starts present `token`, and a session on it. Its own peer,
 /// environment, URL and identity, so nothing is shared with a parallel test.
 async fn fixture(token: &str) -> Fixture {
+    // The environment advertises an auth URL under this scheme. Since upstream v0.11 a connect
+    // selects the authentication path up front and needs the scheme registered; the supplied
+    // access token means nothing is ever exchanged with it. A second registration is refused,
+    // which is fine.
+    let _ = lore_transport::auth::authentication::add(
+        "session-expiry-unused",
+        lore_transport::auth::AuthEndpoint::none().auth,
+    );
     let peer = Arc::new(Peer::start());
     let addr = serve_environment(&peer).await;
     let url = format!("lore://{addr}");
     let identity = format!("session-expiry-{}", Uuid::new_v4());
-    let connection =
-        lore_transport::connect(&url, &identity, RepositoryId::default(), 1, "", token)
-            .await
-            .expect("connect builds its storage connection to the scripted peer");
+    let connection = lore_transport::connect(
+        &url,
+        &identity,
+        RepositoryId::default(),
+        1,
+        "",
+        token,
+        lore_transport::auth::AuthMode::Auto,
+    )
+    .await
+    .expect("connect builds its storage connection to the scripted peer");
     let session = connection
         .session(partition(), "session-expiry")
         .await
@@ -203,6 +218,7 @@ impl Fixture {
             1,
             "",
             token,
+            lore_transport::auth::AuthMode::Auto,
         )
         .await
         .expect("reconnect to the same remote");

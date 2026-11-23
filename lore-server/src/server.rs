@@ -48,6 +48,7 @@ use lore_storage::assume_server_policies;
 use lore_storage::compress::COMPRESSION_MODE;
 use lore_storage::hash::StringHash;
 use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
+use lore_storage::local::store_lock::StoreHold;
 use lore_telemetry::execution_state::ServerExecutionState;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use lore_transport::make_user_agent_with_component;
@@ -351,11 +352,12 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
                 // Maintenance CLI contract: stdout contains only the raw rebuilt-hash count so
                 // deployment scripts can parse it without depending on the tracing format.
                 println!("{associated_hash_count}");
-                Ok(())
+                // A fork maintenance command holds no store span past its run.
+                Ok(StoreHold::default())
             } else if let Some(operation) = maintenance {
                 // One bounded operation against the configured cell, then exit;
                 // no endpoint is bound and no relay worker starts.
-                match operation {
+                let outcome: Result<()> = match operation {
                     // CR-032's operator recovery surface (WP-119 Phase 8).
                     MaintenanceOperation::Outbox(command) => {
                         crate::event_relay::operator::run(&command, &settings).await
@@ -386,7 +388,8 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
                     MaintenanceOperation::Stage { command } => {
                         crate::domain::stage_operator::run(&command, &settings).await
                     }
-                }
+                };
+                outcome.map(|()| StoreHold::default())
             } else {
                 async_main((settings, settings_hash), config).await
             }
@@ -400,7 +403,9 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
         runtime_shutdown_timeout as u64,
     ));
 
-    result
+    // Released only now that the runtime has dropped every request task and what it spawned:
+    // until then one could still be using the store files.
+    result.map(drop)
 }
 
 /// Waits for a shutdown signal, then drains all endpoints within the given timeout.
@@ -954,6 +959,7 @@ fn build_lore_http_settings(
 ) -> LoreHttpServerSettings {
     LoreHttpServerSettings {
         caller_capability_policy: Default::default(),
+        health_only: http_settings.health_only,
         port: http_settings.port,
         host: http_settings.host.clone(),
         max_file_size: http_settings.max_file_size,
@@ -1954,6 +1960,7 @@ async fn create_local_store(
             atime: true,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
         },
     )
     .await
@@ -1998,6 +2005,7 @@ async fn configure_local_mutable_store(
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
             authoritative: true, /* Server local store is the source of truth, not a cache */
+            reuse_state_across_holds: true, /* Server mode, claimed for its life once configured: keeps what it loaded before the claim */
         },
         immutable_store,
     )
@@ -2561,7 +2569,10 @@ impl ResourceDetectorProvider for PluginResourceDetectorProvider<'_> {
     }
 }
 
-async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<()> {
+/// Serves until shutdown, and returns the hold on the stores it served, for the caller to release
+/// once the runtime has shut down. Request work runs in tasks of its own that closing the
+/// endpoints does not stop, so the stores stay claimed until the runtime has dropped them.
+async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> Result<StoreHold> {
     // Initialize metrics and tracing telemetry, returns a guard that will cleanup when it falls out
     // of scope
     let (mut settings, settings_hash) = settings;
@@ -2899,6 +2910,29 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         crate::quic::faults::control_address_from_env(&settings)?
     };
 
+    // **Claimed for as long as the server serves them.** The claim says which process is
+    // using a store, and a server uses its stores for its whole life; without one, every
+    // request that finds no other in flight would take and release the flock and read
+    // the epoch file on its own. Taken before anything serves, and released once the
+    // runtime has shut down, see `server_main`. A server in maintenance mode serves no
+    // store, so it claims none, and leaves the stores free for the maintenance it is
+    // running for.
+    let hold = if is_maintenance {
+        StoreHold::default()
+    } else {
+        let immutable_span = immutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mutable_span = mutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        StoreHold::new(immutable_span.into_iter().chain(mutable_span).collect())
+    };
+
     let jwt_verifier = match settings.server.auth.as_ref() {
         Some(auth) => {
             let jwk = auth.jwk.clone().unwrap_or_default();
@@ -2911,7 +2945,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 jwt_issuer: Some(auth.jwt_issuer.clone()),
                 jwt_audience: Some(auth.jwt_audience.clone()),
                 jwt_typ: auth.jwt_typ.clone(),
-                identity_claim: auth.identity_claim.clone(),
             })
         }
         None => None,
@@ -2947,12 +2980,25 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         settings.server.auth.as_ref(),
         auth_url.clone(),
     )?;
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
         settings.server.auth.as_ref(),
         auth_url.as_deref(),
+        user_url,
         immutable_store.clone(),
         mutable_store.clone(),
     )?;
+    info!(
+        "Repository registry: {}",
+        crate::authnz::repository_registry::RepositoryRegistry::select(
+            auth_url.as_deref(),
+            user_url
+        )
+    );
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
         if let Some(forwarded_requests_settings) =
@@ -3472,17 +3518,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
-    lore_spawn!(async move {
-        if let Some(store) = local_store() {
-            crate::store::memory_stats_reporter(
-                Arc::downgrade(&store),
-                telemetry
-                    .metrics
-                    .map(|m| Duration::from_millis(m.sample_interval_millis)),
-            )
-            .await;
-        }
-    });
+    // Not in maintenance mode, which claims no store: each count would claim it, and reload
+    // what the maintenance changed.
+    if !is_maintenance {
+        lore_spawn!(async move {
+            if let Some(store) = local_store() {
+                crate::store::memory_stats_reporter(
+                    Arc::downgrade(&store),
+                    telemetry
+                        .metrics
+                        .map(|m| Duration::from_millis(m.sample_interval_millis)),
+                )
+                .await;
+            }
+        });
+    }
 
     spawn_drain_metrics(drain_state.clone(), frequency);
 
@@ -3494,7 +3544,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let _ = immutable_store.flush(true).await;
     let _ = mutable_store.flush(true).await;
 
-    Ok(())
+    Ok(hold)
 }
 
 fn server_log_dispatch(level: lore_base::log::LoreLogLevel, location: &str, message: &str) {

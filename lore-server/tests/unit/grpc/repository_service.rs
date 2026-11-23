@@ -23,7 +23,7 @@ async fn service() -> (
     Arc<lore_revision::interface::ExecutionContext>,
 ) {
     let (immutable, mutable, execution) = test_store_create().await.expect("test stores");
-    let catalog = repository_catalog(None, None, immutable.clone(), mutable.clone())
+    let catalog = repository_catalog(None, None, None, immutable.clone(), mutable.clone())
         .expect("baseline catalog");
     let service = LoreRepositoryService::new(
         EnvironmentConfig::default(),

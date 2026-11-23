@@ -7,6 +7,7 @@ use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::FragmentFlags;
 use lore_revision::fragment;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::client_identify::ClientIdentify;
@@ -353,7 +354,10 @@ async fn immutable_get_works_end_to_end() {
         .expect("handler failed");
     let response_parsed =
         get::parse_response(collapse_bytes(&handle_output)).expect("response parse should work");
-    assert_eq!(response_parsed.fragment, fragment);
+    // The store that served it holds the payload, and says so.
+    let mut held = fragment;
+    held.flags |= FragmentFlags::PayloadStoredLocal.bits();
+    assert_eq!(response_parsed.fragment, held);
     assert_eq!(response_parsed.payload, Some(payload));
 }
 
@@ -781,7 +785,10 @@ async fn immutable_local_get_routes_to_local_store() {
         .expect("handler failed");
     let response_parsed =
         get::parse_response(collapse_bytes(&handle_output)).expect("response parse should work");
-    assert_eq!(response_parsed.fragment, fragment);
+    // The store that served it holds the payload, and says so.
+    let mut held = fragment;
+    held.flags |= FragmentFlags::PayloadStoredLocal.bits();
+    assert_eq!(response_parsed.fragment, held);
     assert_eq!(response_parsed.payload, Some(payload));
 
     // Regular ImmutableGet should NOT find it (main store is empty)
@@ -1001,6 +1008,9 @@ async fn immutable_opcodes_still_work_without_a_local_store() {
         .expect("ImmutableGet must reach the main store");
     let response =
         get::parse_response(collapse_bytes(&handle_output)).expect("response parse should work");
-    assert_eq!(response.fragment, fragment);
+    // The store that served it holds the payload, and says so (upstream 0cad5663).
+    let mut held = fragment;
+    held.flags |= FragmentFlags::PayloadStoredLocal.bits();
+    assert_eq!(response.fragment, held);
     assert_eq!(response.payload, Some(payload));
 }

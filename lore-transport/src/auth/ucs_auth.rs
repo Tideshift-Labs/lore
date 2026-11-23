@@ -21,12 +21,19 @@ use crate::traits::Authentication;
 use crate::traits::UserService;
 use crate::types::*;
 
-/// The auth URL schemes [`UcsAuthentication`] is registered under, for
-/// authentication and the user service alike. `https` is the transition
+/// The auth URL schemes [`UcsAuthentication`] is registered under. `https` is the transition
 /// fallback. `http` serves local test auth services; The implementation only
 /// honours plaintext for loopback hosts and upgrades any other http URL to
 /// https (see [`grpc_endpoint`]).
 pub const SCHEMES: [&str; 3] = ["ucs-auth", "https", "http"];
+
+/// The polling cadence the UCS Auth API expects. The API does not report
+/// one, so the client supplies the default cadence.
+pub const SESSION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a UCS Auth login session is polled before the client gives up.
+/// The API does not report a lifetime, so returns the default.
+pub const SESSION_LIFETIME: Duration = Duration::from_secs(150);
 
 /// Strips the custom scheme from an auth URL and returns a URL suitable for
 /// gRPC connection.
@@ -68,16 +75,15 @@ const AUTH_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const AUTH_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const AUTH_KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Creates a gRPC client with correlation ID interceptor, connected to the
-/// auth endpoint.
-async fn connect_client(
+/// Connects a channel to a UCS Auth API endpoint.
+///
+/// FORK-LOCAL (Tideshift): bounded by the timeouts above, and trusting the OS/native root store
+/// for TLS, matching the data channel (`grpc::connect_to_endpoint`) and loreserver's own auth
+/// client (lore-server/src/authnz/auth.rs). Without the TLS config, tonic establishes no TLS
+/// for an https:// endpoint and the exchange handshake fails.
+pub(super) async fn connect_channel(
     auth_url: &str,
-) -> Result<
-    UrcAuthApiClient<
-        tonic::codegen::InterceptedService<tonic::transport::Channel, CorrelationInterceptor>,
-    >,
-    ProtocolError,
-> {
+) -> Result<tonic::transport::Channel, ProtocolError> {
     let endpoint = grpc_endpoint(auth_url);
     let mut endpoint_config = tonic::transport::Endpoint::new(endpoint.clone())
         .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?
@@ -85,10 +91,6 @@ async fn connect_client(
         .timeout(AUTH_RPC_TIMEOUT)
         .http2_keep_alive_interval(AUTH_KEEP_ALIVE_INTERVAL)
         .keep_alive_timeout(AUTH_KEEP_ALIVE_TIMEOUT);
-    // Trust the OS/native root store for TLS, matching the data channel
-    // (`grpc::connect_to_endpoint`) and loreserver's own auth client
-    // (`lore-server/src/authnz/auth.rs`). Without this, tonic establishes no
-    // TLS for an `https://` endpoint and the exchange handshake fails.
     if endpoint.starts_with("https://") {
         endpoint_config = endpoint_config
             .tls_config(
@@ -100,19 +102,34 @@ async fn connect_client(
     }
     // Connect from a net-runtime task so the channel's driver tasks are
     // bound to the net runtime.
-    let channel = lore_base::lore_spawn_net!(async move { endpoint_config.connect().await })
+    lore_base::lore_spawn_net!(async move { endpoint_config.connect().await })
         .await
         .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
-        .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))?;
+        .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))
+}
+
+/// Creates a gRPC client with correlation ID interceptor, connected to the
+/// auth endpoint.
+async fn connect_client(
+    auth_url: &str,
+) -> Result<
+    UrcAuthApiClient<
+        tonic::codegen::InterceptedService<tonic::transport::Channel, CorrelationInterceptor>,
+    >,
+    ProtocolError,
+> {
     Ok(UrcAuthApiClient::with_interceptor(
-        channel,
+        connect_channel(auth_url).await?,
         CorrelationInterceptor,
     ))
 }
 
 /// Sets the authorization header on a gRPC request.
 #[lore_macro::test_pub]
-fn set_auth_header<T>(request: &mut tonic::Request<T>, token: &str) -> Result<(), ProtocolError> {
+pub(super) fn set_auth_header<T>(
+    request: &mut tonic::Request<T>,
+    token: &str,
+) -> Result<(), ProtocolError> {
     let mut header: tonic::metadata::MetadataValue<_> = format!("Bearer {token}")
         .parse()
         .map_err(|e| ProtocolError::internal(format!("invalid metadata value: {e}")))?;
@@ -132,6 +149,7 @@ fn authentication_token(token: lore_proto::auth::UserToken) -> AuthenticationTok
         // Populated by the orchestration layer via JWT decode, not the proto response.
         acceptable_root_domains: Vec::new(),
         refresh_token: token.refresh_token.filter(|value| !value.is_empty()),
+        scope: None,
     }
 }
 
@@ -147,8 +165,7 @@ fn required_authentication_token(
 
 /// Authentication and user service over the UCS Auth API gRPC service.
 ///
-/// Registered under [`SCHEMES`] in both registries. All `lore_proto::auth`
-/// imports are confined to this module.
+/// All `lore_proto::auth` imports are confined to this module.
 ///
 /// The `correlation_id` parameter on trait methods is not used directly --
 /// correlation IDs are injected into gRPC requests by `CorrelationInterceptor`,
@@ -179,6 +196,9 @@ impl Authentication for UcsAuthentication {
         Ok(AuthSession {
             session_code: inner.session_code,
             login_url: inner.login_url,
+            user_code: String::new(),
+            interval: SESSION_POLL_INTERVAL,
+            expires_in: SESSION_LIFETIME,
         })
     }
 
@@ -188,7 +208,7 @@ impl Authentication for UcsAuthentication {
         client_state: &str,
         session_code: &str,
         _correlation_id: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+    ) -> Result<AuthSessionPoll, ProtocolError> {
         let mut client = connect_client(auth_url).await?;
 
         let request = GetAuthSessionRequest {
@@ -200,7 +220,10 @@ impl Authentication for UcsAuthentication {
             .await
             .map_err(ProtocolError::from)?;
 
-        Ok(res.into_inner().user_token.map(authentication_token))
+        Ok(match res.into_inner().user_token {
+            Some(token) => AuthSessionPoll::Complete(authentication_token(token)),
+            None => AuthSessionPoll::Pending,
+        })
     }
 
     async fn exchange_external_token(

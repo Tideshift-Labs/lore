@@ -15,9 +15,9 @@ use lore_transport::AttemptId;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use lore_transport::resolve;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::mpsc::Sender;
+use tokio::task::JoinError;
 use tokio::task::JoinSet;
 use zerocopy::FromZeros;
 
@@ -65,10 +65,11 @@ pub enum ImmutableError {
 
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
+use lore_storage::read::Flown;
 
 /// Event data reporting a single fragment written or deduplicated.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFragmentWriteEventData {
     /// The fragment that was written
@@ -143,14 +144,18 @@ pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> Writ
     }
 }
 
-/// Construct [`ReadOptions`] from a repository context.
+/// Construct [`ReadOptions`] from a repository context and the command's globals.
 pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptions {
-    let sync_data = crate::runtime::try_execution_context()
-        .is_some_and(|context| context.globals().sync_data());
+    let (sync_data, trust_remote) =
+        crate::runtime::try_execution_context().map_or((false, false), |context| {
+            let globals = context.globals();
+            (globals.sync_data(), globals.trust_remote())
+        });
     ReadOptions {
         cache: !repository.disable_cache(),
         direct_write: repository.direct_file_write(),
         sync_data,
+        trust_remote,
         ..Default::default()
     }
 }
@@ -171,23 +176,23 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 ///
 /// The correlation id is read here rather than inside the resolver because the
 /// resolver runs wherever the read or write ends up, which is not necessarily
-/// under this command's execution context.
+/// under this command's execution context. The context holds one session per
+/// correlation id at a time, so a call never takes a session another call's id
+/// started.
 ///
 /// The context holds the session it is handed, so the resolver holds the context
 /// weakly: a strong reference there is a cycle neither end can free, and a context
-/// gone by the time a session resolves has no pool left to pick from. A call that
+/// gone by the time a session resolves has no pool left to take sessions from. A call that
 /// takes the session holds the context until it completes.
 #[lore_macro::test_pub]
-fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
+pub(crate) fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
     if repository.is_offline() {
         return None;
     }
-    Some(repository.lazy_session(|| {
+    let execution = crate::lore::execution_context();
+    let correlation_id = execution.globals().correlation_id.as_str();
+    Some(repository.lazy_session(correlation_id, |correlation_id| {
         let repository = Arc::downgrade(repository);
-        let correlation_id = crate::lore::execution_context()
-            .globals()
-            .correlation_id
-            .to_string();
         Arc::new(StorageSession::pending(move || {
             let repository = repository.clone();
             let correlation_id = correlation_id.clone();
@@ -201,18 +206,23 @@ fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSes
     }))
 }
 
-/// A pick from the pool the repository context holds, resolving it on first use.
+/// A session over the pool the repository context holds, resolving the pool on first use.
+///
+/// Each operation takes the next session of the pool, so the reads of a command spread over
+/// every storage connection.
 ///
 /// Going through [`RepositoryContext::session_pool`] rather than the connection is
-/// the point: the connection's own lookup owns a key and re-pins the pool, and
-/// every call in a command carries the same key, so all of them land on the one
-/// shard it hashes to.
+/// the point: the context holds the pool it resolved, so a command's operations take it
+/// without a lookup on the connection, and the context decides whether the connection pins
+/// it as well.
 #[lore_macro::test_pub]
 async fn pooled_session(
     repository: &Arc<RepositoryContext>,
     correlation_id: &str,
 ) -> Result<Arc<StorageSession>, ProtocolError> {
-    Ok(repository.session_pool(correlation_id).await?.pick())
+    Ok(Arc::new(StorageSession::pooled(
+        repository.session_pool(correlation_id).await?,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -228,8 +238,11 @@ pub fn load_raw_store_retry(
     repository: Partition,
     address: Address,
 ) -> impl Future<Output = Result<(Fragment, Bytes), ImmutableError>> {
-    lore_storage::read::read_raw(store, repository, address, false)
-        .map(|loaded| loaded.forward::<ImmutableError>("loading raw fragment from store"))
+    lore_storage::read::read_raw(store, repository, address).map(|loaded| {
+        loaded
+            .map(|loaded| loaded.raw)
+            .forward::<ImmutableError>("loading raw fragment from store")
+    })
 }
 
 /// Write a single raw fragment to local store with retry backoff.
@@ -293,9 +306,9 @@ pub async fn store_raw_remote_retry(
 // load_raw -- thin wrapper that resolves session and delegates to lore-storage
 // ---------------------------------------------------------------------------
 
-/// Load a single raw fragment, optionally decompressing and verifying the data.
+/// Load a single raw fragment, optionally decompressing the data.
 /// Resolves the remote session from the repository and delegates to
-/// [`lore_storage::load_fragment`] which handles remote fetch and heal.
+/// [`lore_storage::load_fragment`] which handles remote fetch, check and heal.
 ///
 /// Returns that future with its error forwarded, holding `repository` until it completes, without
 /// a future of its own.
@@ -661,12 +674,14 @@ pub fn file_matches(
     established: &lore_storage::ContentHashes,
 ) -> impl Future<Output = Result<lore_storage::FileMatch, ImmutableError>> {
     let remote_session = resolve_session(&repository);
+    let trust_remote = read_options_from_repository(&repository).trust_remote;
     lore_storage::file_matches(
         repository.immutable_store(),
         repository.id,
         previous,
         previous_size,
         remote_session,
+        trust_remote,
         source,
         established,
     )
@@ -680,37 +695,311 @@ pub fn file_matches(
 // Cache and query helpers
 // ---------------------------------------------------------------------------
 
+/// Default cap on the gets [`cache`] calls have in flight on one connection to a remote together, so
+/// they put no unbounded backlog of gets ahead of a demand read's priority get, at the server and on
+/// the link.
+#[lore_macro::test_pub]
+const CACHE_GETS: usize = 512;
+
+/// The cap on cache gets in flight on one connection to a remote, from `LORE_CACHE_GETS`, read and
+/// logged once ([`cache_gets_from`]). Zero means no cap.
+fn cache_gets() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = cache_gets_from(std::env::var("LORE_CACHE_GETS").ok());
+        if cap == 0 {
+            lore_debug!("Cache gets are not capped");
+        } else {
+            lore_debug!("Cache gets are capped at {cap} per connection");
+        }
+        cap
+    })
+}
+
+/// The cap a `LORE_CACHE_GETS` of `value` sets: the count; [`CACHE_GETS`] where it is
+/// unset or, with a warning, not a count.
+#[lore_macro::test_pub]
+fn cache_gets_from(value: Option<String>) -> usize {
+    let Some(value) = value else {
+        return CACHE_GETS;
+    };
+    let Ok(cap) = value.trim().parse::<usize>() else {
+        lore_warn!(
+            "LORE_CACHE_GETS={value} is not a count; cache gets take the default cap \
+             of {CACHE_GETS}"
+        );
+        return CACHE_GETS;
+    };
+    cap
+}
+
+/// The connection's cache get permits, which every [`cache_through`] fetch takes; `None` with no
+/// cap.
+pub(crate) type CacheGets = Option<Arc<tokio::sync::Semaphore>>;
+
+/// What one [`cache_through`] fetch came to.
+#[lore_macro::test_pub]
+enum Fetch {
+    /// A payload fetched: its fragment, marked durable as the remote holds it, the payload as
+    /// fetched, for a fragment list the list it expands to, and whether it overwrites a corrupt
+    /// local copy.
+    Fetched {
+        address: Address,
+        fragment: Fragment,
+        payload: Bytes,
+        list: Option<Bytes>,
+        replace: bool,
+    },
+    /// The fragment at this address turned local while the get waited for its permit, so nothing
+    /// was fetched. With `cache_fragmented` the next round queries it again, which walks a list
+    /// stored meanwhile, as a demand read stores a root alone.
+    Local(Address),
+    /// The fetch failed, or a payload it checked failed its check.
+    Failed(Box<ImmutableError>),
+}
+
+/// What the local store holds at an address [`cache_through`] looks up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LocalCopy {
+    /// A payload, which for a fragment list reads and expands.
+    Held,
+    /// No entry, or an entry without its payload, as eviction leaves one: nothing to serve or walk.
+    Lacking,
+    /// A fragment list that does not read or expand, fetched again to overwrite it.
+    Corrupt,
+}
+
+/// Whether `resolved` holds a payload locally. An entry without its payload, as eviction leaves
+/// one, holds nothing to serve or walk, so it counts as lacking.
+fn held_locally(resolved: &StoreMatchResult) -> bool {
+    resolved.match_made != StoreMatch::MatchNone && resolved.stored_local
+}
+
+/// The flags of the fragment the local store holds a payload for at `address`, in one lookup:
+/// zero where it holds none, so an entry without its payload counts as lacking.
+async fn held_flags(
+    repository: &Arc<RepositoryContext>,
+    address: Address,
+) -> Result<u32, StoreError> {
+    let metadata = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await?;
+    let held = metadata.match_made != StoreMatch::MatchNone
+        && metadata.fragment.flags & FragmentFlags::PayloadStoredLocal != 0;
+    Ok(if held { metadata.fragment.flags } else { 0 })
+}
+
+/// Pushes the address of every fragment `list` references, in `context`, onto `into`.
+fn push_subfragments(list: Bytes, context: Context, into: &mut Vec<Address>) {
+    let list = list.to_aligned::<FragmentReference>();
+    into.extend(
+        list.as_type_slice::<FragmentReference>()
+            .iter()
+            .map(|reference| Address {
+                context,
+                hash: reference.hash,
+            }),
+    );
+}
+
+/// Fetches `address` through `remote_storage` ([`lore_storage::read::fetch_remote`]) in the read
+/// flight for its content ([`lore_storage::read::fetch_single_flight`]), so a read or a fetch of the
+/// same content in flight shares one get, checked on receipt and healed once as a read's fetch is,
+/// unless the command trusts the remote ([`read_options_from_repository`]), and never decompressed
+/// beyond what that check or a fragment list's walk needs. It joins with the local probe off, as
+/// the cache looked locally already.
+///
+/// The fetch holds one of `permits`, taken before it joins, so a read following it never waits for
+/// one, and gives it back on joining as a follower, which makes no get of its own; a follower whose
+/// leader fails on another address fetches without it. A fetch that had to wait asks the local store
+/// first, since a demand read may have stored the fragment meanwhile, unless it is to `replace` a
+/// corrupt local copy, which that store holds.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn fetch_to_cache(
+    repository: Arc<RepositoryContext>,
+    remote_storage: Arc<StorageSession>,
+    permits: CacheGets,
+    address: Address,
+    replace: bool,
+) -> impl Future<Output = Fetch> {
+    async move {
+        let fetched = {
+            let mut permit = match &permits {
+                None => None,
+                Some(permits) => {
+                    if let Ok(permit) = permits.try_acquire() {
+                        Some(permit)
+                    } else {
+                        let permit = permits.acquire().await.ok();
+                        if !replace && is_stored_local(repository.clone(), address).await {
+                            return Fetch::Local(address);
+                        }
+                        permit
+                    }
+                }
+            };
+            let options = ReadOptions {
+                local: false,
+                decompress: false,
+                ..read_options_from_repository(&repository)
+            };
+            match lore_storage::read::fetch_single_flight(
+                repository.immutable_store(),
+                repository.id,
+                address,
+                options,
+                || lore_storage::read::fetch_remote(&remote_storage, address, options),
+                || drop(permit.take()),
+            )
+            .await
+            {
+                Ok(Flown::Local(_)) => return Fetch::Local(address),
+                Ok(Flown::Fetched(fetched)) => {
+                    if fetched.raw.0.flags & FragmentFlags::PayloadFragmented == 0 {
+                        Ok((fetched.raw, None))
+                    } else {
+                        let raw = fetched.raw.clone();
+                        fetched.take(true).map(|(_, list)| (raw, Some(list)))
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        };
+        match fetched {
+            Ok(((fragment, payload), list)) => Fetch::Fetched {
+                address,
+                fragment,
+                payload,
+                list,
+                replace,
+            },
+            Err(error) => Fetch::Failed(Box::new(error.forward("fetching fragment to cache"))),
+        }
+    }
+}
+
+/// One batch [`cache_through`] looked up locally: its addresses, what the store holds of each, and
+/// the subfragments of those it holds locally as fragment lists.
+type QueriedBatch = Result<(Bytes, Vec<LocalCopy>, Vec<Address>), StoreError>;
+
+/// Pushes the subfragments of the fragment list the local store holds at `address` onto
+/// `children`, answering whether the list read and expanded; one that does not pushes nothing. The
+/// list is read raw, as a list read is no reason to join a read flight.
+async fn push_local_list_children(
+    repository: &Arc<RepositoryContext>,
+    address: Address,
+    children: &mut Vec<Address>,
+) -> bool {
+    let Ok((_, list)) =
+        lore_storage::read::read_raw(repository.immutable_store(), repository.id, address)
+            .await
+            .and_then(|loaded| loaded.take(true))
+    else {
+        return false;
+    };
+    push_subfragments(list, address.context, children);
+    true
+}
+
+/// Fetches every fragment at `address` the local store lacks from the remote and stores it, then,
+/// when `cache_fragmented` is set, the subfragments of fragment lists, fetched or held locally. A
+/// fragment the store indexes without a local payload counts as lacking, and a local list it
+/// cannot read or expand is fetched again and overwritten, as a read replaces a corrupt fragment,
+/// and the fetched list walked. Every fetched payload is checked on receipt as a read's is
+/// ([`fetch_to_cache`]). Once connected, every fragment that can be cached is, and the answer is
+/// the failure to connect, the first failure to query, fetch, check or store a fragment, or else
+/// how many fragments it fetched, by its own get or one it joined: a fragment found local after
+/// waiting for a cache get permit is not fetched.
 pub async fn cache(
     repository: Arc<RepositoryContext>,
     address: Vec<Address>,
     cache_fragmented: bool,
 ) -> Result<usize, ImmutableError> {
+    cache_counted(repository, address, cache_fragmented)
+        .await?
+        .into_result()
+}
+
+/// What [`cache_counted`] came to.
+#[derive(Debug, Default)]
+pub struct Cached {
+    /// Fragments gone to the remote for, by its own get or one it joined, whether or not the fetch
+    /// succeeded.
+    pub fragments: usize,
+    /// Payload bytes of the fragments fetched.
+    pub bytes: u64,
+    /// Fragments found local after waiting for a cache get permit, and so not fetched.
+    pub already_local: usize,
+    /// Fragments looked up locally, at every level the walk reached.
+    pub queried: usize,
+    /// The first failure to query, fetch, check or store a fragment.
+    pub failure: Option<Box<ImmutableError>>,
+}
+
+impl Cached {
+    /// The fragments fetched, or the first failure, as [`cache`] answers.
+    pub fn into_result(self) -> Result<usize, ImmutableError> {
+        self.failure
+            .map_or(Ok(self.fragments), |failure| Err(*failure))
+    }
+}
+
+/// [`cache`], answering everything it fetched ([`Cached`]) rather than its first failure; only a
+/// failure to connect to the remote is an error, and a session that cannot be started fails each
+/// fetch.
+pub async fn cache_counted(
+    repository: Arc<RepositoryContext>,
+    address: Vec<Address>,
+    cache_fragmented: bool,
+) -> Result<Cached, ImmutableError> {
+    let (remote_storage, permits) = match cache_session(&repository).await {
+        Ok(session) => session,
+        // FORK-LOCAL (Tideshift, 4a2d7859): nothing to fetch is no failure, whether or not the
+        // remote can be reached.
+        Err(_) if stored_local(&repository, &address).await => return Ok(Cached::default()),
+        Err(err) => return Err(err),
+    };
+    let start = Instant::now();
+    let cached = cache_through(
+        repository,
+        remote_storage,
+        permits,
+        address,
+        cache_fragmented,
+    )
+    .await;
+    lore_debug!(
+        "Fetched {} / {} immutable fragments in {:.3}s",
+        cached.fragments,
+        cached.queried,
+        start.elapsed().as_secs_f64()
+    );
+    Ok(cached)
+}
+
+/// The session `repository`'s cache fetches go through, its lazy one ([`resolve_session`]), which
+/// starts its server-side sessions again once a fetch invalidates them, and the connection's cache
+/// get permits they take ([`cache_through`]).
+pub(crate) async fn cache_session(
+    repository: &Arc<RepositoryContext>,
+) -> Result<(Arc<StorageSession>, CacheGets), ImmutableError> {
     let remote_result: Result<_, ImmutableError> = repository
         .remote()
         .await
         .forward("connecting to remote for cache");
-    let correlation_id = crate::lore::execution_context()
-        .globals()
-        .correlation_id
-        .to_string();
-    let storage_result: Result<_, ImmutableError> = match remote_result {
-        Ok(remote) => remote
-            .session(repository.id, &correlation_id)
-            .await
-            .forward("connecting to remote storage for cache"),
-        Err(err) => Err(err),
+    let remote = remote_result?;
+    let Some(session) = resolve_session(repository) else {
+        return Err(ImmutableError::from(NoRemote));
     };
-    let remote_storage = match storage_result {
-        Ok(remote_storage) => remote_storage,
-        // Nothing to fetch is no failure, whether or not the remote can be reached.
-        Err(_) if stored_local(&repository, &address).await => return Ok(0),
-        Err(err) => return Err(err),
-    };
-
-    cache_through(repository, remote_storage, address, cache_fragmented).await
+    Ok((session, remote.cache_get_permits(cache_gets())))
 }
 
-/// Whether the local store holds every non-zero address in `address`.
+/// FORK-LOCAL (Tideshift, 4a2d7859/33eeba51): whether the local store holds every non-zero
+/// address in `address`, by local lookups only.
 pub(crate) async fn stored_local(repository: &RepositoryContext, address: &[Address]) -> bool {
     let address: Vec<Address> = address
         .iter()
@@ -735,24 +1024,29 @@ pub(crate) async fn stored_local(repository: &RepositoryContext, address: &[Addr
     true
 }
 
-/// [`cache`] once connected: fetches every fragment at `address` the local store lacks
-/// through `remote_storage` and stores it, then the subfragments of fragmented ones when
-/// `cache_fragmented` is set.
+/// [`cache_counted`] once connected, fetching through `remote_storage`, each get holding one of
+/// `permits`.
 ///
-/// Each fetch backs off on `SlowDown` as a read does ([`lore_storage::remote_get_retry`]).
-/// A fragment that still fails to query, fetch or store is logged at warn and the others are
-/// still cached; the call then returns an error naming how many failed, so a caller that
-/// needs the set (sync, for offline commits) can tell.
+/// The walk descends one level of the tree a round, and queries a fragment found local after
+/// waiting for its permit once more the round after, so a tree no deeper than a read walks, lists
+/// down to [`MAX_FRAGMENT_TREE_DEPTH`] below the root and their subfragments, is cached within
+/// twice its levels in rounds. A walk that takes more, as one through a list naming itself or an
+/// ancestor would, fails.
 ///
-/// A function of its own because its batches live across several awaits: kept in [`cache`]
-/// they would take space in its future while the remote is connected as well.
-async fn cache_through(
+/// A function of its own because its batches live across several awaits: kept in
+/// [`cache_counted`] they would take space in its future while the remote is connected as well.
+///
+/// [`MAX_FRAGMENT_TREE_DEPTH`]: lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH
+#[lore_macro::test_pub]
+pub(crate) async fn cache_through(
     repository: Arc<RepositoryContext>,
     remote_storage: Arc<StorageSession>,
+    permits: CacheGets,
     address: Vec<Address>,
     cache_fragmented: bool,
-) -> Result<usize, ImmutableError> {
+) -> Cached {
     const MAX_REQUEST_COUNT: usize = 1000;
+    const MAX_ROUNDS: usize = 2 * (lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH + 2);
 
     let mut query_address = address;
     query_address.sort_unstable();
@@ -763,17 +1057,28 @@ async fn cache_through(
         let _ = query_address.split_to(size_of::<Address>());
     }
 
-    let start = Instant::now();
-    let mut total_store_count = 0;
+    let mut total_fetches = 0;
+    let mut total_already_local = 0;
+    let mut total_bytes = 0;
     let mut total_query_count = 0;
-    let mut total_failed_count = 0;
+    let mut failure = None;
+    let mut rounds = 0;
 
     while !query_address.is_empty() {
+        if rounds == MAX_ROUNDS {
+            failure.get_or_insert_with(|| {
+                Box::new(ImmutableError::internal(format!(
+                    "fragment tree deeper than {MAX_ROUNDS} cache rounds reach"
+                )))
+            });
+            break;
+        }
+        rounds += 1;
         let query_count = query_address.count::<Address>();
         total_query_count += query_count;
         lore_trace!("Query and cache {query_count} immutable fragments from remote");
 
-        let mut query_tasks: JoinSet<CacheQueryResult> = JoinSet::new();
+        let mut query_tasks: JoinSet<QueriedBatch> = JoinSet::new();
         while !query_address.is_empty() {
             // Cap number of tasks to a reasonable batch size
             const BATCH_COUNT: usize = 100;
@@ -790,13 +1095,40 @@ async fn cache_through(
             let repository = repository.clone();
             lore_spawn!(query_tasks, async move {
                 let addresses = slice.as_type_slice::<Address>();
-                let mut matches = vec![StoreMatchResult::default(); addresses.len()];
-                repository
-                    .immutable_store()
-                    .query(repository.id, addresses, &mut matches)
-                    .await
-                    .map_err(|err| (addresses.len(), err))?;
-                Ok((slice, matches))
+                let mut children = Vec::new();
+                let held = if cache_fragmented {
+                    let mut held = Vec::with_capacity(addresses.len());
+                    for address in addresses {
+                        let flags = held_flags(&repository, *address).await?;
+                        held.push(if flags == 0 {
+                            LocalCopy::Lacking
+                        } else if flags & FragmentFlags::PayloadFragmented == 0
+                            || push_local_list_children(&repository, *address, &mut children).await
+                        {
+                            LocalCopy::Held
+                        } else {
+                            LocalCopy::Corrupt
+                        });
+                    }
+                    held
+                } else {
+                    let mut matches = vec![StoreMatchResult::default(); addresses.len()];
+                    repository
+                        .immutable_store()
+                        .query(repository.id, addresses, &mut matches)
+                        .await?;
+                    matches
+                        .iter()
+                        .map(|resolved| {
+                            if held_locally(resolved) {
+                                LocalCopy::Held
+                            } else {
+                                LocalCopy::Lacking
+                            }
+                        })
+                        .collect()
+                };
+                Ok((slice, held, children))
             });
         }
 
@@ -807,102 +1139,124 @@ async fn cache_through(
 
         // False when the fetch failed; the failure is logged here.
         let mut process_fetch =
-            |result: Result<CacheFetchResult, tokio::task::JoinError>,
-             store_tasks: &mut JoinSet<Result<(), StoreError>>| {
-                let (address, fragment, mut buffer) = match result {
-                    Ok(Ok(fetched)) => fetched,
-                    Ok(Err((address, err))) => {
-                        lore_warn!("Failed to cache fragment {address} from remote: {err}");
-                        return false;
+            |result: Result<Fetch, JoinError>,
+             store_tasks: &mut JoinSet<Result<(), StoreError>>,
+             additional_address: &mut Vec<Address>,
+             failure: &mut Option<Box<ImmutableError>>| {
+                let (address, fragment, payload, list, replace) = match result {
+                    Ok(Fetch::Fetched {
+                        address,
+                        fragment,
+                        payload,
+                        list,
+                        replace,
+                    }) => {
+                        total_bytes += payload.len() as u64;
+                        (address, fragment, payload, list, replace)
                     }
-                    Err(err) => {
-                        lore_warn!("Failed to cache a fragment from remote: {err}");
-                        return false;
+                    Ok(Fetch::Local(address)) => {
+                        total_already_local += 1;
+                        if cache_fragmented {
+                            additional_address.push(address);
+                        }
+                        return;
+                    }
+                    Ok(Fetch::Failed(error)) => {
+                        failure.get_or_insert(error);
+                        return;
+                    }
+                    Err(error) => {
+                        failure.get_or_insert_with(|| {
+                            Box::new(ImmutableError::internal_with_context(
+                                error,
+                                "fetching fragment to cache",
+                            ))
+                        });
+                        return;
                     }
                 };
 
-                // If the data is fragmented and we should cache subfragments, queue additional fragments
-                if cache_fragmented && (fragment.flags & FragmentFlags::PayloadFragmented) != 0 {
-                    // Fragment lists are always uncompressed
-                    buffer = buffer.to_aligned::<FragmentReference>();
-                    let fragment_list = buffer.as_type_slice::<FragmentReference>();
-                    for fragment_ref in fragment_list {
-                        additional_address.push(Address {
-                            context: address.context,
-                            hash: fragment_ref.hash,
-                        });
-                    }
+                if cache_fragmented && let Some(list) = list {
+                    push_subfragments(list, address.context, additional_address);
                 }
 
                 let repository = repository.clone();
                 lore_spawn!(store_tasks, async move {
                     repository
                         .immutable_store()
-                        .put(repository.id, address, fragment, Some(buffer), false)
+                        .put(repository.id, address, fragment, Some(payload), replace)
                         .await
                         .inspect_err(|err| {
                             lore_warn!("Failed to store cached fragment {address}: {err}");
                         })
                 });
-                true
             };
 
         while let Some(result) = query_tasks.join_next().await {
-            let (address, matches) = match result {
-                Ok(Ok((address, matches))) if address.count::<Address>() == matches.len() => {
-                    (address, matches)
-                }
-                Ok(Ok((address, _))) => {
-                    lore_warn!("Local store query answered a cache batch with the wrong count");
-                    total_failed_count += address.count::<Address>();
+            let (address, held, children) = match result {
+                Ok(Ok(queried)) => queried,
+                Ok(Err(error)) => {
+                    failure.get_or_insert_with(|| {
+                        Box::new(error.forward("querying fragments to cache"))
+                    });
                     continue;
                 }
-                Ok(Err((count, err))) => {
-                    lore_warn!("Failed to query {count} fragments to cache in local store: {err}");
-                    total_failed_count += count;
-                    continue;
-                }
-                Err(err) => {
-                    lore_warn!("Failed to query fragments to cache in local store: {err}");
-                    total_failed_count += 1;
+                Err(error) => {
+                    failure.get_or_insert_with(|| {
+                        Box::new(ImmutableError::internal_with_context(
+                            error,
+                            "querying fragments to cache",
+                        ))
+                    });
                     continue;
                 }
             };
+            additional_address.extend(children);
             let address = address.as_type_slice::<Address>();
-            for (index, resolved) in matches.iter().enumerate() {
-                if resolved.match_made != StoreMatch::MatchNone {
+            for (index, &local) in held.iter().enumerate() {
+                if local == LocalCopy::Held {
                     continue;
                 }
 
                 fetch_count += 1;
 
-                let remote_storage = remote_storage.clone();
-                let address = address[index];
-                lore_spawn!(fetch_tasks, async move {
-                    lore_storage::remote_get_retry(&remote_storage, address, false)
-                        .await
-                        .map(|(fragment, buffer)| (address, fragment, buffer))
-                        .map_err(|err| (address, err))
-                });
+                lore_spawn!(
+                    fetch_tasks,
+                    fetch_to_cache(
+                        repository.clone(),
+                        remote_storage.clone(),
+                        permits.clone(),
+                        address[index],
+                        local == LocalCopy::Corrupt,
+                    )
+                );
 
                 {
                     while let Some(result) = fetch_tasks.try_join_next() {
-                        if !process_fetch(result, &mut store_tasks) {
-                            total_failed_count += 1;
-                        }
+                        process_fetch(
+                            result,
+                            &mut store_tasks,
+                            &mut additional_address,
+                            &mut failure,
+                        );
                     }
 
                     while fetch_tasks.len() > MAX_REQUEST_COUNT
                         && let Some(result) = fetch_tasks.join_next().await
                     {
-                        if !process_fetch(result, &mut store_tasks) {
-                            total_failed_count += 1;
-                        }
+                        process_fetch(
+                            result,
+                            &mut store_tasks,
+                            &mut additional_address,
+                            &mut failure,
+                        );
                     }
                 }
 
-                while store_tasks.len() > MAX_REQUEST_COUNT {
-                    total_failed_count += store_failed(store_tasks.join_next().await);
+                while store_tasks.len() > MAX_REQUEST_COUNT
+                    && let Some(result) = store_tasks.join_next().await
+                {
+                    keep_store_failure(&mut failure, result);
                 }
             }
         }
@@ -913,12 +1267,17 @@ async fn cache_through(
             );
         }
         while let Some(result) = fetch_tasks.join_next().await {
-            if !process_fetch(result, &mut store_tasks) {
-                total_failed_count += 1;
-            }
+            process_fetch(
+                result,
+                &mut store_tasks,
+                &mut additional_address,
+                &mut failure,
+            );
 
-            while store_tasks.len() > MAX_REQUEST_COUNT {
-                total_failed_count += store_failed(store_tasks.join_next().await);
+            while store_tasks.len() > MAX_REQUEST_COUNT
+                && let Some(result) = store_tasks.join_next().await
+            {
+                keep_store_failure(&mut failure, result);
             }
         }
 
@@ -928,11 +1287,11 @@ async fn cache_through(
                 store_tasks.len(),
             );
         }
-        while let Some(stored) = store_tasks.join_next().await {
-            total_failed_count += store_failed(Some(stored));
+        while let Some(result) = store_tasks.join_next().await {
+            keep_store_failure(&mut failure, result);
         }
 
-        total_store_count += fetch_count;
+        total_fetches += fetch_count;
 
         additional_address.sort_unstable();
         additional_address.dedup();
@@ -943,35 +1302,33 @@ async fn cache_through(
         }
     }
 
-    lore_debug!(
-        "Cached {total_store_count} / {total_query_count} immutable fragments from remote in {:.3}s",
-        start.elapsed().as_secs_f64()
-    );
-
-    if total_failed_count > 0 {
-        return Err(ImmutableError::internal(format!(
-            "Failed to cache {total_failed_count} / {total_query_count} immutable fragments from remote"
-        )));
+    Cached {
+        fragments: total_fetches - total_already_local,
+        bytes: total_bytes,
+        already_local: total_already_local,
+        queried: total_query_count,
+        failure,
     }
-
-    Ok(total_store_count)
 }
 
-/// A local query batch in [`cache_through`], or how many addresses it held when it failed.
-type CacheQueryResult = Result<(Bytes, Vec<StoreMatchResult>), (usize, StoreError)>;
-
-/// A remote fetch in [`cache_through`], with the address on either side.
-type CacheFetchResult = Result<(Address, Fragment, Bytes), (Address, lore_storage::StorageError)>;
-
-/// 1 when a joined cache store task failed, else 0. The task logs its own store error.
-fn store_failed(joined: Option<Result<Result<(), StoreError>, tokio::task::JoinError>>) -> usize {
-    match joined {
-        Some(Ok(Err(_))) => 1,
-        Some(Err(err)) => {
-            lore_warn!("Failed to store a cached fragment: {err}");
-            1
+/// Keeps the failure of a [`cache_through`] store task in `failure`, unless it holds an earlier one.
+fn keep_store_failure(
+    failure: &mut Option<Box<ImmutableError>>,
+    result: Result<Result<(), StoreError>, JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            failure.get_or_insert_with(|| Box::new(error.forward("storing cached fragment")));
         }
-        _ => 0,
+        Err(error) => {
+            failure.get_or_insert_with(|| {
+                Box::new(ImmutableError::internal_with_context(
+                    error,
+                    "storing cached fragment",
+                ))
+            });
+        }
     }
 }
 
@@ -979,7 +1336,7 @@ pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Addres
     lore_trace!("Check if {} is cached in local store", address);
     if let Ok(resolved) = query_one(&repository.immutable_store(), repository.id, address).await {
         lore_trace!("Resolve result {:?}", resolved);
-        resolved.stored_local
+        held_locally(&resolved)
     } else {
         false
     }

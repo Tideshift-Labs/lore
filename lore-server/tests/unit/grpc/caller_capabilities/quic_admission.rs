@@ -29,7 +29,6 @@ use lore_revision::fragment;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
-use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::grpc::caller_capabilities::ADMISSION_HEADER;
@@ -228,6 +227,16 @@ impl CountingImmutableStore {
 
 #[async_trait]
 impl ImmutableStore for CountingImmutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn get(
         self: Arc<Self>,
         partition: Partition,
@@ -362,6 +371,16 @@ struct CountingMutableStore {
 
 #[async_trait]
 impl MutableStore for CountingMutableStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -483,7 +502,6 @@ fn verifier_present() -> Arc<Option<JwtVerifier>> {
         jwt_issuer: None,
         jwt_audience: None,
         jwt_typ: None,
-        identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
     }))
 }
 

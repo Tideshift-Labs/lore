@@ -24,6 +24,16 @@ struct OverloadedMutable {
 
 #[async_trait]
 impl MutableStore for OverloadedMutable {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -128,6 +138,7 @@ async fn both_push_handlers_terminalize_actual_early_store_slowdown_without_publ
             );
             lore_server::grpc::revision::v1::branch_push::handler(
                 request,
+                crate::grpc::push_protected::allow_all(),
                 immutable,
                 mutable.clone(),
                 notification,
@@ -143,6 +154,7 @@ async fn both_push_handlers_terminalize_actual_early_store_slowdown_without_publ
         } else {
             handler(
                 request,
+                crate::grpc::push_protected::allow_all(),
                 immutable,
                 mutable.clone(),
                 notification,

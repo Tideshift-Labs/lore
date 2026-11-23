@@ -88,6 +88,7 @@ use super::super::storage_service;
 use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
+use crate::auth::AuthEndpoint;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
@@ -116,7 +117,7 @@ pub struct StorageClient {
     remote_url: String,
     transport_config: TransportConfig,
     auth_adapter: Arc<dyn AuthAdapter<ErrorType = ProtocolError>>,
-    auth_url: String,
+    auth_endpoint: AuthEndpoint,
     recipient_domain: String,
     identity: String,
     credentials: Arc<SuppliedCredentials>,
@@ -157,20 +158,20 @@ impl StorageClient {
         remote_url: &str,
         transport_config: TransportConfig,
         auth_adapter: Arc<dyn AuthAdapter<ErrorType = ProtocolError>>,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         recipient_domain: &str,
         identity: &str,
         partition: Partition,
         quinn: quinn::Connection,
         credentials: &Arc<SuppliedCredentials>,
-    ) -> Self {
+    ) -> Arc<Self> {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
-        StorageClient {
+        Arc::new(StorageClient {
             connection,
             remote_url: remote_url.to_string(),
             transport_config,
             auth_adapter,
-            auth_url: auth_url.to_string(),
+            auth_endpoint: auth_endpoint.clone(),
             recipient_domain: recipient_domain.to_string(),
             identity: identity.to_string(),
             credentials: credentials.clone(),
@@ -182,7 +183,7 @@ impl StorageClient {
             session_partitions: dashmap::DashMap::new(),
             session_token_expiry: dashmap::DashMap::new(),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
-        }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -190,16 +191,16 @@ impl StorageClient {
         connection: Weak<Connection>,
         remote_url: &str,
         remote_domain: String,
-        auth_url: &str,
+        auth_endpoint: &AuthEndpoint,
         identity: &str,
         partition: Partition,
         credentials: &Arc<SuppliedCredentials>,
         user_agent: Option<String>,
-    ) -> Result<Self, ProtocolError> {
+    ) -> Result<Arc<Self>, ProtocolError> {
         let user_agent = user_agent.unwrap_or_else(|| crate::user_agent().to_string());
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
-            auth_url: auth_url.to_string(),
+            auth_url: auth_endpoint.url.clone(),
             identity: identity.to_string(),
             partition,
             user_agent,
@@ -233,7 +234,7 @@ impl StorageClient {
             remote_url,
             transport_config,
             auth_adapter.clone(),
-            auth_url,
+            auth_endpoint,
             &remote_domain,
             identity,
             partition,
@@ -307,19 +308,18 @@ impl StorageClient {
         }
     }
 
-    /// The token a session start presents for `partition`: exchanged, and cached by the
-    /// exchange. Empty when the remote has no auth service.
-    ///
-    /// The credentials are read here, not at construction: the server checks storage
-    /// authorization at each session start, so a session opened later must present whatever the
-    /// newest call supplied.
-    async fn authorization(&self, partition: Partition) -> String {
-        if self.auth_url.is_empty() {
-            return String::new();
+    /// The authorization a session start for `partition` presents, read at each start because the
+    /// server checks storage authorization there: an access token the newest call supplied, as it
+    /// is, or the authorization the newest credentials exchange for, which the cache or the token
+    /// store may serve. Empty when there is none, as for a server without authentication or after
+    /// a failed exchange.
+    async fn authorization(&self, partition: Partition) -> Authorization {
+        if self.auth_endpoint.is_none() {
+            return Authorization::default();
         }
         let (identity_token, access_token) = self.credentials.tokens();
-        let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
-            &self.auth_url,
+        let (_, token, _) = crate::auth::exchange::auth_exchange(
+            &self.auth_endpoint,
             &self.recipient_domain,
             &self.identity,
             partition,
@@ -327,7 +327,10 @@ impl StorageClient {
             &access_token,
         )
         .await;
-        authorization_token
+        Authorization {
+            token,
+            exchanged_with: access_token.is_empty().then_some(identity_token),
+        }
     }
 
     async fn send_put(
@@ -513,7 +516,7 @@ impl StorageClient {
             heal: true,
         };
         let endpoint = crate::grpc::grpc_endpoint(&self.remote_url)?.to_string();
-        let authorization = self.authorization(repository).await;
+        let authorization = self.authorization(repository).await.token;
         crate::caller_operation::dispatch(
             repository,
             crate::outcome::GrpcRpc::StorageVerify,
@@ -569,6 +572,18 @@ impl StorageClient {
     }
 }
 
+/// The authorization a session start presents, with the identity token it was exchanged with,
+/// both from one reading of the credentials, so a refusal is judged by what produced the
+/// authorization and not by credentials a later call supplied meanwhile (upstream 750dba41).
+#[derive(Default)]
+struct Authorization {
+    token: String,
+    /// The identity token `token` was exchanged with, empty where the token store supplied the
+    /// credentials. `None` where there is nothing to exchange again, whose refusal is final:
+    /// `token` is an access token the caller supplied, or the server has no authentication.
+    exchanged_with: Option<String>,
+}
+
 /// The `AuthorizeStart` payload: `action(1) | partition(16) | corr_len(1) | corr(N) |
 /// token_len(2, u16 LE) | token(M)`, then, for action 2 only, `caps_len(2, u16 LE) | caps(K)`.
 ///
@@ -615,9 +630,82 @@ impl StorageClient {
         capabilities: Option<&'static str>,
     ) -> Result<(u32, u32), ProtocolError> {
         // Fetch auth token via token exchange (cached if already exchanged).
-        let token = self.authorization(partition).await;
+        let Authorization {
+            token,
+            exchanged_with,
+        } = self.authorization(partition).await;
+        match (
+            self.send_authorize_start(partition, correlation_id, &token, capabilities)
+                .await,
+            exchanged_with,
+        ) {
+            (Err(refusal), Some(identity_token))
+                if refusal.is_not_authorized() && !token.is_empty() =>
+            {
+                Box::pin(self.authorize_start_reauthorized(
+                    partition,
+                    correlation_id,
+                    capabilities,
+                    token,
+                    identity_token,
+                    refusal,
+                ))
+                .await
+            }
+            (started, _) => started,
+        }
+    }
 
-        let payload = authorize_start_payload(partition, correlation_id, &token, capabilities)?;
+    /// Starts the session the server refused once more, with a new authorization in place of
+    /// `refused`, which was exchanged with `identity_token` (upstream 750dba41). Cold: only after
+    /// the server refused an exchanged authorization.
+    ///
+    /// The cache would serve `refused` until it expires, so it is forgotten first, and the
+    /// exchange then serves an authorization another caller put in its place, or asks the auth
+    /// service for another. A refusal of the new authorization is final, and so is `refusal` when
+    /// the exchange yields none, or `refused` again.
+    async fn authorize_start_reauthorized(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        capabilities: Option<&'static str>,
+        refused: String,
+        identity_token: String,
+        refusal: ProtocolError,
+    ) -> Result<(u32, u32), ProtocolError> {
+        lore_debug!("Session start for {partition} refused its authorization; exchanging another");
+        crate::auth::exchange::forget_refused_authorization(
+            &self.auth_endpoint,
+            &self.identity,
+            partition,
+            &self.recipient_domain,
+            &identity_token,
+            &refused,
+        )
+        .await;
+        let authorization = self.authorization(partition).await;
+        if authorization.token.is_empty() || authorization.token == refused {
+            return Err(refusal);
+        }
+        self.send_authorize_start(
+            partition,
+            correlation_id,
+            &authorization.token,
+            capabilities,
+        )
+        .await
+    }
+
+    /// Sends one `AuthorizeStart` presenting `token`, and registers the id the server answers on
+    /// the generation the request was framed on.
+    async fn send_authorize_start(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        token: &str,
+        capabilities: Option<&'static str>,
+    ) -> Result<(u32, u32), ProtocolError> {
+        let payload = authorize_start_payload(partition, correlation_id, token, capabilities)?;
 
         // FORK-LOCAL (Tideshift, WP-124): the id belongs to the generation the answered request
         // was framed on, reported by the send path at its write boundary. Not one sampled before
@@ -648,7 +736,7 @@ impl StorageClient {
         self.session_partitions.insert(session_id, partition);
         // FORK-LOCAL (Tideshift, WP-124): an opaque token has no `exp` to read, so its session is
         // never rebound early; the server's expired-session answer still covers it.
-        if let Some(info) = lore_credential::user_info_from_token(token) {
+        if let Some(info) = lore_credential::user_info_from_token(token.to_string()) {
             self.session_token_expiry.insert(session_id, info.expires);
         }
         Ok((session_id, generation))

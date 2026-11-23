@@ -606,6 +606,16 @@ struct NullMutable;
 
 #[async_trait]
 impl ImmutableStore for NullImmutable {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn get(
         self: Arc<Self>,
         _partition: Partition,
@@ -689,6 +699,16 @@ impl ImmutableStore for NullImmutable {
 
 #[async_trait]
 impl MutableStore for NullMutable {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn load(
         self: Arc<Self>,
         _partition: Partition,
@@ -1369,7 +1389,6 @@ mod urc_0_2 {
                 jwt_issuer: None,
                 jwt_audience: Some(vec![AUDIENCE.to_string()]),
                 jwt_typ: None,
-                identity_claim: lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
             })),
             Arc::new(AllowAllRepositoryAuthorizer),
             stores.immutable.clone(),

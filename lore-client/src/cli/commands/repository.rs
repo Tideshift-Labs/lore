@@ -368,6 +368,12 @@ pub enum RepositoryCommands {
     Create(RepositoryCreateArgs),
 
     /// Clone a remote repository into the given path
+    ///
+    /// A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the
+    /// clone for working offline instead. With it, as with `--cache`, a clone that writes its files
+    /// caches every file metadata block of the cloned revision, which staging and committing write
+    /// to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+    /// and reads them from the remote when a command needs them.
     Clone(RepositoryCloneArgs),
 
     /// Delete a repository
@@ -646,6 +652,12 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
         .unwrap_or_else(|_| std::path::PathBuf::from(globals.repository_path()));
 
     let result = run_command(globals, args.into(), callback) as u8;
+
+    for files in [&staged, &unmerged, &unstaged] {
+        files
+            .lock()
+            .sort_unstable_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    }
 
     // CLI process, so this is the user's terminal directory.
     #[allow(clippy::disallowed_methods)]

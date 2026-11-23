@@ -44,7 +44,7 @@ use lore_revision::live_fixture::fixture_execution_context;
 use lore_revision::lock::file::acquire::AcquireOptions;
 use lore_revision::lock::file::release::ReleaseOptions;
 use lore_revision::lore::RepositoryId;
-use lore_revision::repository::RemoteFuture;
+use lore_revision::protocol::RemoteFuture;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
@@ -255,14 +255,14 @@ async fn a_carried_spawned_reconnect_from_an_unmanaged_task_is_unbounded() {
 
 /// A QUIC client whose server is gone: the connection is closed and the port is dead, with the
 /// managed reconnect deadline shortened to [`BOUND`].
-async fn dead_quic_client() -> (Peer, StorageClient, u32) {
+async fn dead_quic_client() -> (Peer, Arc<StorageClient>, u32) {
     let partition = Partition::from(Context::from([0x31u8; 16]));
     let peer = Peer::start();
     let client = StorageClient::connect(
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "",
+        &lore_transport::auth::AuthEndpoint::none(),
         "managed-remote-scope",
         partition,
         &Arc::new(SuppliedCredentials::default()),
@@ -288,7 +288,7 @@ type ConnectTask = tokio::task::JoinHandle<Result<Arc<lore_transport::Connection
 
 /// An unmanaged read on the dead connection, spawned the way `connect()` spawns its task,
 /// optionally carrying the spawner's managed scope.
-fn spawn_get(client: StorageClient, session: u32, carry: bool) -> ConnectTask {
+fn spawn_get(client: Arc<StorageClient>, session: u32, carry: bool) -> ConnectTask {
     let read = async move {
         let address = Address::zero_context_hash(Hash::from([0x5Au8; 32]));
         match client.get(session, &address).await {

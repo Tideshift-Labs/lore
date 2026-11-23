@@ -99,7 +99,7 @@ mod tests {
                     .await
                     .expect("Failed to store entry");
                 let entry = store
-                    .find(repository, address)
+                    .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                     .await
                     .expect("Failed query after store");
                 assert_eq!(
@@ -125,6 +125,8 @@ mod tests {
                     .expect("Failed to create store");
 
                 let repository = random::<RepositoryId>();
+                // Every entry holds a payload the store has, and the store says so.
+                let local = FragmentFlags::PayloadStoredLocal.bits();
 
                 // Stress test, put 10000 items in the same bucket
                 for i in 0..10000 {
@@ -162,7 +164,7 @@ mod tests {
                         .expect("Failed to store entry");
 
                     let entry = store
-                        .find(repository, address)
+                        .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -179,7 +181,7 @@ mod tests {
                         "Store unique did not return same fragment details"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Store unique did not return same fragment details"
                     );
 
@@ -195,7 +197,7 @@ mod tests {
                         .await
                         .expect("Failed to store entry");
                     let entry = store
-                        .find(repository, address)
+                        .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after second store");
                     assert_eq!(
@@ -212,7 +214,7 @@ mod tests {
                         "Store repeated did not return same fragment details"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Store repeated did not return same fragment details"
                     );
 
@@ -248,7 +250,7 @@ mod tests {
                         size_content: (1000 + i) as u64,
                     };
                     let entry = store
-                        .find(repository, address)
+                        .find(repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -265,7 +267,7 @@ mod tests {
                         "Partial deduplicate did not return identical fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Partial deduplicate did not return identical fragment details as expected"
                     );
 
@@ -294,7 +296,7 @@ mod tests {
                     "Repeated store with different repository and no payload should succeed");
 
                     let entry = store
-                        .find(other_repository, address)
+                        .find(other_repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -310,7 +312,7 @@ mod tests {
                         "Repository deduplication did not return identical fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Repository deduplication did not return identical fragment details as expected"
                     );
 
@@ -334,7 +336,7 @@ mod tests {
                     };
 
                     let entry = store
-                        .find(other_repository, address)
+                        .find(other_repository, address, lore_storage::local::immutable_store::Lookup::Read)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -350,7 +352,7 @@ mod tests {
                         "Repository deduplication with new fragment representation did not return previous fragment details as expected"
                     );
                     assert_eq!(
-                        entry.data.flags, fragment.flags,
+                        entry.data.flags, fragment.flags | local,
                         "Repository deduplication with new fragment representation did not return previous fragment details as expected"
                     );
 
@@ -448,7 +450,11 @@ mod tests {
                     hash: rand::random::<Hash>(),
                 };
                 let entry = store
-                    .find(repository, address)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -462,7 +468,11 @@ mod tests {
                     hash: hash[8],
                 };
                 let entry = store
-                    .find(repository, address)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -481,7 +491,11 @@ mod tests {
                     hash: hash[0],
                 };
                 let entry = store
-                    .find(repository, address)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -495,7 +509,11 @@ mod tests {
                     hash: hash[1],
                 };
                 let entry = store
-                    .find(repository, address)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -509,7 +527,11 @@ mod tests {
                     hash: hash[7],
                 };
                 let entry = store
-                    .find(repository_other, address)
+                    .find(
+                        repository_other,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -523,7 +545,11 @@ mod tests {
                     hash: hash[1],
                 };
                 let entry = store
-                    .find(repository, address)
+                    .find(
+                        repository,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -533,7 +559,11 @@ mod tests {
                 );
 
                 let entry = store
-                    .find(repository_other, address)
+                    .find(
+                        repository_other,
+                        address,
+                        lore_storage::local::immutable_store::Lookup::Read,
+                    )
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -606,12 +636,16 @@ mod tests {
                         hash: hash[i],
                     };
                     let entry = store
-                        .find(repository, address)
+                        .find(
+                            repository,
+                            address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
                         .await
                         .expect("Failed to query store entry");
 
                     let read_buffer =
-                        LocalImmutableStore::load(store.packstore(entry.group), entry.data)
+                        LocalImmutableStore::load(&store.group[entry.group].packstore, entry.data)
                             .await
                             .expect("Failed to load store entry");
                     assert_eq!(
@@ -632,12 +666,16 @@ mod tests {
                     };
                     let repository = random::<RepositoryId>();
                     let entry = store
-                        .find(repository, address)
+                        .find(
+                            repository,
+                            address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
                         .await
                         .expect("Failed to query store entry");
 
                     let read_buffer =
-                        LocalImmutableStore::load(store.packstore(entry.group), entry.data)
+                        LocalImmutableStore::load(&store.group[entry.group].packstore, entry.data)
                             .await
                             .expect("Failed to load store entry");
                     assert_eq!(
@@ -653,7 +691,11 @@ mod tests {
 
                     // Should fail, repository don't match
                     let entry = store
-                        .find(repository, address)
+                        .find(
+                            repository,
+                            address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
                         .await
                         .expect("Failed to query store entry");
                     assert_eq!(
@@ -742,7 +784,11 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address)
+                            .find(
+                                repository,
+                                address,
+                                lore_storage::local::immutable_store::Lookup::Read,
+                            )
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -750,10 +796,12 @@ mod tests {
                             StoreMatch::MatchFull,
                             "Query did not match expected entry"
                         );
-                        let buffer =
-                            LocalImmutableStore::load(store.packstore(entry.group), entry.data)
-                                .await
-                                .expect("Failed to load store entry");
+                        let buffer = LocalImmutableStore::load(
+                            &store.group[entry.group].packstore,
+                            entry.data,
+                        )
+                        .await
+                        .expect("Failed to load store entry");
                         assert_eq!(
                             buffer.len(),
                             entry.data.size_payload as usize,
@@ -842,7 +890,11 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address)
+                            .find(
+                                repository,
+                                address,
+                                lore_storage::local::immutable_store::Lookup::Read,
+                            )
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -888,7 +940,11 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address)
+                            .find(
+                                repository,
+                                address,
+                                lore_storage::local::immutable_store::Lookup::Read,
+                            )
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -896,10 +952,12 @@ mod tests {
                             StoreMatch::MatchFull,
                             "Query did not match expected entry"
                         );
-                        let buffer =
-                            LocalImmutableStore::load(store.packstore(entry.group), entry.data)
-                                .await
-                                .expect("Failed to load store entry");
+                        let buffer = LocalImmutableStore::load(
+                            &store.group[entry.group].packstore,
+                            entry.data,
+                        )
+                        .await
+                        .expect("Failed to load store entry");
                         assert_eq!(
                             buffer.len(),
                             entry.data.size_payload as usize,

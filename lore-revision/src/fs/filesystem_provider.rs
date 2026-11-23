@@ -12,7 +12,9 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
+use lore_base::error::LocalModifications;
 use lore_base::types::Fragment;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
@@ -26,6 +28,8 @@ use crate::fs::swfs::filesystem::SwfsOperation;
 use crate::hash::hash_string;
 use crate::lore::Address;
 use crate::lore::Context;
+use crate::lore::execution_context;
+use crate::lore_debug;
 use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeFileMode;
@@ -43,7 +47,9 @@ use crate::util::path::RelativePath;
 
 #[error_set]
 pub enum FsError {
+    FileNotFound,
     InvalidArguments,
+    LocalModifications,
 }
 
 impl From<std::io::Error> for FsError {
@@ -269,6 +275,10 @@ pub struct FilesystemDiffContext {
     /// Every link mount in the compared tree, so a mount is told from a directory only
     /// the filesystem holds. Read from the trees, which is why the caller supplies it.
     pub link_mounts: Arc<Vec<LinkMountInfo>>,
+    /// Where a marking walk holds the nodes it finds stale. `None` has the walk hold them itself
+    /// and discard them once it has drained; a caller running several walks over one tree hands
+    /// each the same queue and discards it once all of them have drained.
+    pub discards: Option<Arc<crate::state::WalkDiscards>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -320,6 +330,16 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     /// - **`SWFS`**: Freezes the filesystem, creates a snapshot, returns operations that work
     ///   against the snapshot.
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError>;
+
+    /// Whether the provider holds the working tree's current state as a `State` it serves reads
+    /// from, rather than as files on a filesystem. Its
+    /// [`InstanceOperation::changes_from_filesystem_to_state`] then answers every change the
+    /// working tree holds without reading it. Every operation it begins answers the same
+    /// ([`InstanceOperationImpl::holds_state`]), so a provider handing out another provider's
+    /// operations answers as that provider does.
+    fn holds_state(&self) -> bool {
+        false
+    }
 }
 
 /// Runs `work` inside one filesystem operation, finalizing it whether or not the work
@@ -555,8 +575,14 @@ pub trait InstanceOperation: Send + Sync {
     /// which a provider keeping its own record answers without reading at all.
     ///
     /// A caller that needs the bytes — to address content matching nothing stored — takes its
-    /// source from here rather than naming a host path the provider may not read through.
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static>;
+    /// source from here rather than naming a host path the provider may not read through. A path
+    /// holding no file, nothing or a directory, has no content: a provider that resolves the path
+    /// to name a source reports `FileNotFound`, and one that names a host path without reading it
+    /// leaves the read to fail. A provider that cannot name the content of a file reports why.
+    fn content_source(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<lore_storage::ContentSource<'static>, FsError>> + Send;
 
     /// Whether the file at `path` holds the content `previous` addresses, and `previous_size`
     /// bytes of it.
@@ -684,7 +710,9 @@ pub trait InstanceOperation: Send + Sync {
     /// Whether the content at `path` can be diffed, or must only be compared opaquely.
     ///
     /// Reads the head of the content, which is what telling text from an opaque format takes.
-    /// Content that cannot be read is not diffable, there being nothing to diff.
+    /// Content that cannot be read is not diffable, there being nothing to diff, and neither is a
+    /// path holding no file. A provider that cannot name the content of a file reports why
+    /// ([`content_source`](Self::content_source)).
     ///
     /// Derived from [`content_source`](Self::content_source). A provider that answers without
     /// reading overrides this.
@@ -693,10 +721,81 @@ pub trait InstanceOperation: Send + Sync {
         path: &RelativePath,
     ) -> impl Future<Output = Result<bool, FsError>> + Send {
         async move {
-            Ok(crate::infer::infer_is_diffable(&self.content_source(path))
+            let source = match self.content_source(path).await {
+                Ok(source) => source,
+                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(err) => return Err(err),
+            };
+            Ok(crate::infer::infer_is_diffable(&source)
                 .await
                 .unwrap_or(false))
         }
+    }
+
+    /// Whether the content at `path` holds conflict markers.
+    ///
+    /// Content that cannot be opened or read holds none, a failed read logged at debug, and neither
+    /// does a path holding no file. A provider that cannot name the content of a file reports why
+    /// ([`content_source`](Self::content_source)).
+    ///
+    /// Derived from [`content_source`](Self::content_source). A provider that answers without
+    /// reading overrides this.
+    fn infer_is_conflicted(
+        &self,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<bool, FsError>> + Send {
+        async move {
+            let source = match self.content_source(path).await {
+                Ok(source) => source,
+                Err(FsError::FileNotFound(_)) => return Ok(false),
+                Err(err) => return Err(err),
+            };
+            Ok(crate::infer::infer_is_conflicted(&source)
+                .await
+                .unwrap_or_else(|err| {
+                    lore_debug!("Conflict check cannot read {path}: {err}");
+                    false
+                }))
+        }
+    }
+
+    /// Takes that a commit of the instance's repository stored the content read at `path` through
+    /// this operation as `address`, `size` bytes long, with `mode`. The commit tells it of each
+    /// file it reads from the working tree, before it hands over the revision holding them
+    /// ([`committed`](Self::committed)), and of no view-excluded file, whose content it takes
+    /// from the staged node. A dry run, and a commit that fails, tells of the content it stored
+    /// and hands nothing over. [`InstanceOperationImpl`] passes it on only where the provider
+    /// holds its state in a `State` ([`FilesystemProvider::holds_state`]).
+    ///
+    /// # Implementation notes
+    ///
+    /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
+    /// - A provider that holds its state keeps what each file it served was stored as, which
+    ///   `committed` serves the file from without resolving its path again.
+    fn stored(&self, _path: &RelativePath, _address: Address, _size: u64, _mode: u16) {}
+
+    /// Takes `committed`, the revision a commit of the instance's repository stored, made current
+    /// and flushed, as the revision the working tree stands at, from the files read through this
+    /// operation. [`InstanceOperationImpl`] passes it on only where the provider holds its state in
+    /// a `State` ([`FilesystemProvider::holds_state`]), outside a dry run, and counts it as a change.
+    /// A failure is logged as a warning and the commit stands. Such a provider is refused a commit
+    /// of a link alone or of a layer, which would make a revision current that it is not handed.
+    ///
+    /// `committed` is the State the commit stored, not a copy. Holding on to it past the call is
+    /// not recommended: the commit may go on to modify it, reusing it as the staged anchor of the
+    /// local changes it left uncommitted.
+    ///
+    /// # Implementation notes
+    ///
+    /// - **`OsFilesystem`**, **`SWFS`**: nothing, the default.
+    /// - A provider that holds its state serves each file the commit read from `committed` rather
+    ///   than from the copy it kept.
+    fn committed(
+        &self,
+        _repository: Arc<RepositoryContext>,
+        _committed: Arc<State>,
+    ) -> impl Future<Output = Result<(), FsError>> + Send {
+        async { Ok(()) }
     }
 }
 
@@ -710,21 +809,52 @@ pub enum StaticDispatchInstanceOperation {
     Test(test_util::TestOperation),
 }
 
+/// What holding a target revision does to the local changes at the paths it changes
+/// ([`InstanceOperationImpl::hold_state`]). Without `overwrite_local` or `keep_local`, a local
+/// change at such a path refuses the hold, as it refuses a sync.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HoldOptions {
+    /// Give a local file the target's content, or remove it where the target removes it, as a
+    /// forced sync does, whatever `keep_local` asks.
+    pub overwrite_local: bool,
+    /// Keep each local change, a local deletion included, as a sync forwarding local changes
+    /// does.
+    pub keep_local: bool,
+    /// Check and report what holding the target changes, changing nothing.
+    pub dry_run: bool,
+}
+
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
+    /// What the provider that began the operation answers for [`FilesystemProvider::holds_state`].
+    holds_state: bool,
     finalized: AtomicBool,
     changed: AtomicBool,
     modified_times: RecordedModifiedTimes,
+    /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
+    clock_floor: tokio::sync::OnceCell<u64>,
 }
 
 impl InstanceOperationImpl {
-    pub fn new(dispatch: StaticDispatchInstanceOperation) -> Self {
+    pub fn new(dispatch: StaticDispatchInstanceOperation, holds_state: bool) -> Self {
         Self {
             dispatch,
+            holds_state,
             finalized: AtomicBool::new(false),
             changed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
+            clock_floor: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// The filesystem clock of `repository`'s working copy as the operation first asked for it,
+    /// read then ([`crate::state::read_clock_floor`]): a file the operation reads after asking
+    /// may record its time only where it is older, so no write after the read shares it.
+    pub async fn clock_floor(&self, repository: &RepositoryContext) -> u64 {
+        *self
+            .clock_floor
+            .get_or_init(|| crate::state::read_clock_floor(repository))
+            .await
     }
 
     /// Collects that `path` holds the content of the node written there, for a caller that
@@ -776,6 +906,39 @@ impl InstanceOperationImpl {
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
             StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
         }
+    }
+
+    /// Whether the provider that began this operation holds its state in a `State`
+    /// ([`FilesystemProvider::holds_state`]).
+    pub fn holds_state(&self) -> bool {
+        self.holds_state
+    }
+
+    /// Hands `target`, under `repository`, its context, to a provider that holds its state in a
+    /// `State` ([`FilesystemProvider::holds_state`]) to hold as the revision the working tree
+    /// stands at, its local changes refused, kept or overwritten as `options` asks
+    /// ([`crate::fs::hold`]). Outside a dry run the hold counts as a change. An operation that
+    /// holds no `State` refuses, changing nothing.
+    #[allow(clippy::unused_async)]
+    pub async fn hold_state(
+        &self,
+        repository: Arc<RepositoryContext>,
+        target: Arc<State>,
+        options: HoldOptions,
+    ) -> Result<(), FsError> {
+        #[cfg(feature = "test-util")]
+        if let StaticDispatchInstanceOperation::Test(this) = &self.dispatch
+            && self.holds_state
+        {
+            if !options.dry_run {
+                self.record_change();
+            }
+            return this.hold_state(&target, options);
+        }
+        let _ = (repository, target, options);
+        Err(FsError::internal(
+            "Unable to hold a revision through an operation that holds no State",
+        ))
     }
 }
 
@@ -847,12 +1010,15 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    fn content_source(&self, path: &RelativePath) -> lore_storage::ContentSource<'static> {
+    async fn content_source(
+        &self,
+        path: &RelativePath,
+    ) -> Result<lore_storage::ContentSource<'static>, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => this.content_source(path),
-            StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path),
+            StaticDispatchInstanceOperation::Test(this) => this.content_source(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.content_source(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.content_source(path).await,
         }
     }
 
@@ -1003,9 +1169,53 @@ impl InstanceOperation for InstanceOperationImpl {
     async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(feature = "test-util")]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_diffable(path).await,
+        }
+    }
+
+    async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<bool, FsError> {
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.infer_is_conflicted(path).await,
+            StaticDispatchInstanceOperation::Swfs(this) => this.infer_is_conflicted(path).await,
+        }
+    }
+
+    fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+        if !self.holds_state {
+            return;
+        }
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Os(this) => this.stored(path, address, size, mode),
+            StaticDispatchInstanceOperation::Swfs(this) => this.stored(path, address, size, mode),
+        }
+    }
+
+    async fn committed(
+        &self,
+        repository: Arc<RepositoryContext>,
+        committed: Arc<State>,
+    ) -> Result<(), FsError> {
+        if !self.holds_state || execution_context().globals().dry_run() {
+            return Ok(());
+        }
+        self.record_change();
+        match &self.dispatch {
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(this) => {
+                this.committed(repository, committed).await
+            }
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.committed(repository, committed).await
+            }
+            StaticDispatchInstanceOperation::Swfs(this) => {
+                this.committed(repository, committed).await
+            }
         }
     }
 }
@@ -1019,24 +1229,43 @@ pub mod test_util {
     use std::sync::atomic::Ordering;
 
     use bytes::Bytes;
+    use lore_base::error::FileNotFound;
+    use lore_base::error::LocalModifications;
     use lore_base::types::Fragment;
+    use lore_error_set::prelude::*;
     use parking_lot::Mutex;
 
     use crate::fs::filesystem_provider::DirectoryListing;
     use crate::fs::filesystem_provider::FileInfo;
     use crate::fs::filesystem_provider::FilesystemDiffContext;
     use crate::fs::filesystem_provider::FsError;
+    use crate::fs::filesystem_provider::HoldOptions;
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::lore::Address;
+    use crate::lore::Hash;
     use crate::node::Node;
+    use crate::node::NodeID;
     use crate::repository::RepositoryContext;
     use crate::state::ChangeStream;
     use crate::state::FilesystemDiffStats;
     use crate::state::NodeComparison;
+    use crate::state::State;
+    use crate::state::StateError;
     use crate::util::path::RelativePath;
 
-    /// Answers the reads and the directory create these tests make, and records each finalize.
-    /// Every other member panics.
+    /// Each `hold_state` call recorded as `(target revision, options)`.
+    pub type HoldCalls = Arc<Mutex<Vec<(Hash, HoldOptions)>>>;
+
+    /// Each `committed` call recorded as `(revision handed over, current revision at the call,
+    /// whether the State handed over holds no staged or dirty node)`.
+    pub type CommittedCalls = Arc<Mutex<Vec<(Hash, Hash, bool)>>>;
+
+    /// Each `stored` call recorded as `(path, address, size, mode, whether a revision had been
+    /// handed over before the call)`.
+    pub type StoredCalls = Arc<Mutex<Vec<(String, Address, u64, u16, bool)>>>;
+
+    /// Answers the reads and the directory create these tests make, and records each finalize,
+    /// `stored` and `committed` call and hold. Every other member panics.
     pub struct TestOperation {
         pub file_info_count: Arc<AtomicUsize>,
         pub holds_name_count: Arc<AtomicUsize>,
@@ -1045,6 +1274,24 @@ pub mod test_util {
         pub finalize_fails: bool,
         pub write_fails: bool,
         pub holds_paths: bool,
+        /// Whether the provider cannot name the content at any path.
+        pub content_source_fails: bool,
+        /// Whether the provider holds no file at any path.
+        pub content_source_missing: bool,
+        pub hold_calls: HoldCalls,
+        pub stored_calls: StoredCalls,
+        pub committed_calls: CommittedCalls,
+        /// Whether each `committed` call fails.
+        pub committed_fails: bool,
+        /// The operation file information and content are read through, where given.
+        pub reads: Option<crate::fs::os::OsOperation>,
+        /// Whether each hold is refused for local changes.
+        pub hold_refuses: bool,
+        /// Paths whose scan fails, as one over a working tree that cannot be read does.
+        pub failing_scans: Arc<Mutex<Vec<String>>>,
+        /// Paths whose scan finds the named node of the tree it walks stale, and queues it for
+        /// discarding where it is handed a queue.
+        pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     }
 
     impl TestOperation {
@@ -1070,23 +1317,62 @@ pub mod test_util {
                 FileInfo::NotExist
             }
         }
+
+        /// Records the target revision and the options it was given, rather than acting on
+        /// either, having no State to hold, then refuses for local changes where told to.
+        pub(super) fn hold_state(
+            &self,
+            target: &State,
+            options: HoldOptions,
+        ) -> Result<(), FsError> {
+            self.hold_calls.lock().push((target.revision(), options));
+            if self.hold_refuses {
+                return Err(LocalModifications.into());
+            }
+            Ok(())
+        }
     }
 
     impl InstanceOperation for TestOperation {
         /// Reports a working tree holding exactly what the state does, which is what a walk over a
-        /// tree with nothing to reconcile answers.
+        /// tree with nothing to reconcile answers, except where the provider was told the path's
+        /// scan fails or finds a node stale.
         fn changes_from_filesystem_to_state(
             &self,
-            _diff: FilesystemDiffContext,
+            diff: FilesystemDiffContext,
         ) -> ChangeStream<FilesystemDiffStats> {
+            let path = diff.filesystem_path.as_str();
+            if let Some(discards) = diff.discards.as_ref() {
+                let stale: Vec<NodeID> = self
+                    .stale_on_scan
+                    .lock()
+                    .iter()
+                    .filter(|(stale_path, _)| stale_path == path)
+                    .map(|(_, node)| *node)
+                    .collect();
+                discards.queue(diff.from.state.clone(), diff.from.repository.clone(), stale);
+            }
+            if self
+                .failing_scans
+                .lock()
+                .iter()
+                .any(|failing| failing == path)
+            {
+                return ChangeStream::spawn(|_changes| async {
+                    Err(StateError::internal("The working tree cannot be read"))
+                });
+            }
             ChangeStream::nothing()
         }
 
-        /// Counts the lookup and reports what the provider was told to hold — what a caller
-        /// acts on without needing content behind it.
-        async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
+        /// Counts the lookup, and reports what the directory it reads from holds where given and
+        /// otherwise what the provider was told to hold.
+        async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
-            Ok(self.held())
+            match &self.reads {
+                Some(reads) => reads.file_info(path).await,
+                None => Ok(self.held()),
+            }
         }
 
         /// Reports what the provider was told to hold, without counting: the lookup counts
@@ -1119,8 +1405,26 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        fn content_source(&self, _path: &RelativePath) -> lore_storage::ContentSource<'static> {
-            panic!("Test operation unimplemented except finalize")
+        /// The file under the directory the provider reads from. Reports no file where the
+        /// provider was told it holds none, fails where it was told it cannot name content, and
+        /// panics where it reads from no directory.
+        async fn content_source(
+            &self,
+            path: &RelativePath,
+        ) -> Result<lore_storage::ContentSource<'static>, FsError> {
+            if self.content_source_missing {
+                return Err(FileNotFound {
+                    resource: path.to_string(),
+                }
+                .into());
+            }
+            if self.content_source_fails {
+                return Err(FsError::internal("Content source failed"));
+            }
+            match &self.reads {
+                Some(reads) => reads.content_source(path).await,
+                None => panic!("Test operation unimplemented except finalize"),
+            }
         }
 
         async fn file_holds_content(
@@ -1192,8 +1496,39 @@ pub mod test_util {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn infer_is_diffable(&self, _path: &RelativePath) -> Result<bool, FsError> {
-            panic!("Test operation unimplemented except finalize")
+        /// Records what was stored, and whether a revision had been handed over before.
+        fn stored(&self, path: &RelativePath, address: Address, size: u64, mode: u16) {
+            let handed_over = !self.committed_calls.lock().is_empty();
+            self.stored_calls.lock().push((
+                path.as_str().to_owned(),
+                address,
+                size,
+                mode,
+                handed_over,
+            ));
+        }
+
+        /// Records the revision it was given, the current revision at the call and whether the
+        /// State is clean, and fails where the provider was told to.
+        async fn committed(
+            &self,
+            repository: Arc<RepositoryContext>,
+            committed: Arc<State>,
+        ) -> Result<(), FsError> {
+            let (current, _) = crate::instance::load_current_anchor(&repository)
+                .await
+                .forward_any::<FsError>("loading the current anchor")?;
+            let staged_or_dirty = committed
+                .node_has_staged_or_dirty_children(repository, crate::node::ROOT_NODE)
+                .await
+                .forward_any::<FsError>("reading the committed State")?;
+            self.committed_calls
+                .lock()
+                .push((committed.revision(), current, !staged_or_dirty));
+            if self.committed_fails {
+                return Err(FsError::internal("Taking the committed revision failed"));
+            }
+            Ok(())
         }
     }
 }

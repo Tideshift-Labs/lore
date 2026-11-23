@@ -13,10 +13,12 @@ bitcode = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 dashmap = { workspace = true }
+futures = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
+smallvec = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
@@ -48,6 +50,7 @@ test-util = []
 # The unit-test binary's process sandbox, set up before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-storage = { workspace = true, features = ["test-util"] }
 rand = { workspace = true }
 serial_test = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }

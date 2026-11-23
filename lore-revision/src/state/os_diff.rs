@@ -56,18 +56,21 @@ use crate::state::stream::emit;
 use crate::util::path::EntryPath;
 use crate::util::path::RelativePath;
 
-/// Find-or-create the directory node chain from `ROOT_NODE` down to `path`,
-/// marking newly created segments as dirty-add. A path-filtered scan can enter
-/// a directory (or a file's parent) present on disk but absent from `state_from`;
-/// creating the chain lets adds discovered inside resolve their parent node.
-/// Returns the node for the final path segment.
-async fn ensure_scan_dir_chain(
+/// Find-or-create the directory node chain from `start` down to `path`, relative
+/// to it, marking newly created segments as dirty-add. A path-filtered scan can
+/// enter a directory (or a file's parent) present on disk but absent from
+/// `state_from`; creating the chain lets adds discovered inside resolve their
+/// parent node. Returns the node for the final path segment.
+///
+/// `path` is generic so a caller spawning this future can hand over an owned path.
+pub(crate) async fn ensure_scan_dir_chain(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    path: &str,
+    start: NodeID,
+    path: impl AsRef<str>,
 ) -> Result<NodeID, StateError> {
-    let mut current_node = ROOT_NODE;
-    for segment in path.split('/').filter(|s| !s.is_empty()) {
+    let mut current_node = start;
+    for segment in path.as_ref().split('/').filter(|s| !s.is_empty()) {
         if is_reserved_node_name(segment) {
             return Err(NodeNotFound.into());
         }
@@ -115,6 +118,7 @@ async fn diff_filesystem_subtree_impl(
                 let entry_node = ensure_scan_dir_chain(
                     ctx.from.repository.clone(),
                     ctx.from.state.clone(),
+                    ROOT_NODE,
                     ctx.filesystem_path.as_str(),
                 )
                 .await?;
@@ -131,8 +135,13 @@ async fn diff_filesystem_subtree_impl(
                 && let Some(parent) = ctx.filesystem_path.parent()
                 && !parent.is_empty()
             {
-                ensure_scan_dir_chain(ctx.from.repository.clone(), ctx.from.state.clone(), parent)
-                    .await?;
+                ensure_scan_dir_chain(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    ROOT_NODE,
+                    parent,
+                )
+                .await?;
             }
             diff_filesystem_single_file(ctx, item, changes).await
         }
@@ -344,7 +353,7 @@ async fn settle_insisted_directory(
 /// which is how a commit drops the old content and records the new.
 ///
 /// Returns the replacement node, [`INVALID_NODE`] where the intent minted none, so a walk
-/// descends into a directory it created.
+/// knows whether to descend against the node or against an empty listing.
 async fn emit_type_replacement(
     ctx: &FileDiffContext,
     file_path: &RelativePath,
@@ -867,12 +876,13 @@ async fn diff_filesystem_directory(
     let drain_result = lore_drain_tasks!(tasks, StateError::internal("Task failure"));
     work_result?;
     drain_result?;
-    apply_pending_discards(
-        node_list.state.clone(),
-        node_list.repository.clone(),
-        pending_discards,
-    )
-    .await?;
+    if let Some(discards) = &ctx.discards {
+        discards.queue(
+            node_list.state.clone(),
+            node_list.repository.clone(),
+            pending_discards,
+        );
+    }
     Ok(stats)
 }
 
@@ -1446,6 +1456,8 @@ async fn diff_filesystem_directory_walk(
                 item_states,
                 is_file,
                 is_directory,
+                &mut nested_probe,
+                repository_root,
                 tasks,
                 changes,
                 stats,
@@ -1573,6 +1585,7 @@ async fn diff_filesystem_linked_directory(
             from_states: from_item_states,
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
+            discards: ctx.discards.clone(),
             layer_mounts: ctx.layer_mounts.clone(),
             link_mounts: Arc::new(linked_mounts),
         },
@@ -1750,6 +1763,7 @@ async fn diff_filesystem_matched_directory(
             from_states: from_item_states,
             filter_mode: ctx.filter_mode,
             intent: ctx.intent,
+            discards: ctx.discards.clone(),
             layer_mounts: ctx.layer_mounts.clone(),
             link_mounts: link_mounts_recurse,
         },
@@ -1775,6 +1789,8 @@ async fn diff_filesystem_type_change(
     item_states: FilterStates,
     is_file: bool,
     is_directory: bool,
+    nested_probe: &mut Option<std::path::PathBuf>,
+    repository_root: &std::path::Path,
     tasks: &mut SubtreeTasks,
     changes: &ChangeSender,
     stats: &mut FilesystemDiffStats,
@@ -1818,9 +1834,27 @@ async fn diff_filesystem_type_change(
     .await?;
 
     // A directory that replaced a file is walked against the node the replacement
-    // minted, so the content it holds is staged with it. A file that replaced a
+    // minted, so the content it holds is staged with it. A walk that only reports
+    // mints no node and walks it against an empty listing, so the content is reported
+    // as added and a reversed diff deletes it before the directory itself. A marking
+    // walk without a minted node stays out: its chain would resolve the path to the
+    // old file node and queue that node for discard. A nested repository root stays
+    // out too, as it does everywhere else in the walk: reported as added, a reversed
+    // diff would delete another repository's working files. A file that replaced a
     // directory holds none.
-    if is_directory && replacement.is_valid_node_id() {
+    let reports_without_node = !replacement.is_valid_node_id() && !ctx.intent.marks_dirty();
+    let nested_root = is_directory && reports_without_node && {
+        let probe = nested_probe
+            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
+        is_nested_repository_root(probe, item.name.as_str()).await
+    };
+    if nested_root {
+        lore_trace!(
+            "Not descending into nested repository root {} that replaced a file",
+            entry.path()
+        );
+    }
+    if is_directory && (replacement.is_valid_node_id() || (reports_without_node && !nested_root)) {
         let item_path = entry.to_path();
         diff_filesystem_subtree_dispatch(
             FilesystemDiffContext {
@@ -1842,6 +1876,7 @@ async fn diff_filesystem_type_change(
                 from_states: item_states,
                 filter_mode: ctx.filter_mode,
                 intent: ctx.intent,
+                discards: ctx.discards.clone(),
                 layer_mounts: ctx.layer_mounts.clone(),
                 link_mounts: ctx.link_mounts.clone(),
             },
@@ -2111,6 +2146,7 @@ async fn diff_filesystem_new_entries(
                         from_states: child_states,
                         filter_mode: ctx.filter_mode,
                         intent: ctx.intent,
+                        discards: ctx.discards.clone(),
                         // Non-overlapping layers: no nested mounts inside a layer.
                         layer_mounts: Arc::new(vec![]),
                         // Crossing into the layer state; parent's link mounts
@@ -2209,6 +2245,7 @@ async fn diff_filesystem_new_entries(
                     from_states: dir_from_states,
                     filter_mode: ctx.filter_mode,
                     intent: ctx.intent,
+                    discards: ctx.discards.clone(),
                     layer_mounts: ctx.layer_mounts.clone(),
                     // Same parent state; deeper paths may still match a link.
                     link_mounts: ctx.link_mounts.clone(),
@@ -2555,9 +2592,27 @@ fn diff_filesystem_subtree_recurse<'a>(
 /// The module's entry, and what
 /// [`OsOperation`](crate::fs::os::OsOperation)'s
 /// `changes_from_filesystem_to_state` answers with.
-pub(crate) async fn diff_os_filesystem(
-    diff: FilesystemDiffContext,
+///
+/// A marking walk handed no queue for what it finds stale holds it on one of its own and
+/// discards it once the whole walk has drained, so no directory discards while another is
+/// still marking. Discarding is boxed as the cold path: most walks find nothing stale.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn diff_os_filesystem(
+    mut diff: FilesystemDiffContext,
     changes: &ChangeSender,
-) -> Result<FilesystemDiffStats, StateError> {
-    diff_filesystem_subtree_recurse(diff, changes).await
+) -> impl Future<Output = Result<FilesystemDiffStats, StateError>> + Send + '_ {
+    let owned = (diff.discards.is_none() && diff.intent.marks_dirty()).then(|| {
+        let discards = Arc::new(WalkDiscards::default());
+        diff.discards = Some(discards.clone());
+        discards
+    });
+    async move {
+        let stats = diff_filesystem_subtree_recurse(diff, changes).await?;
+        if let Some(discards) = owned.filter(|discards| !discards.is_empty()) {
+            Box::pin(discards.apply()).await?;
+        }
+        Ok(stats)
+    }
 }

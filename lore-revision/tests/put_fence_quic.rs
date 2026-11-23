@@ -98,7 +98,7 @@ fn applied(outcome: MutableOutcome<()>) -> Result<(), ProtocolError> {
 /// A peer, a QUIC client on it, and a declared session, as a managed push holds them.
 struct Fixture {
     peer: Peer,
-    client: StorageClient,
+    client: Arc<StorageClient>,
     session: u32,
 }
 
@@ -119,7 +119,7 @@ impl Fixture {
             Weak::new(),
             &peer.url(),
             "127.0.0.1".to_string(),
-            "",
+            &lore_transport::auth::AuthEndpoint::none(),
             "put-fence-quic",
             partition(),
             &Arc::new(SuppliedCredentials::default()),

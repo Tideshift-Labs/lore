@@ -223,9 +223,16 @@ mod quic_strict_live_cell_probe_tests {
         // Unique per call: the transport's connection cache is process-global and keyed by url
         // plus identity.
         let identity = format!("g8-live-probe-{}", random::<u32>());
-        let connection =
-            lore_transport::connect(url, &identity, partition, 1, identity_token, access_token)
-                .await?;
+        let connection = lore_transport::connect(
+            url,
+            &identity,
+            partition,
+            1,
+            identity_token,
+            access_token,
+            lore_transport::auth::AuthMode::Auto,
+        )
+        .await?;
         connection.session(partition, "g8-live-probe").await
     }
 

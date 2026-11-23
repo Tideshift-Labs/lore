@@ -584,6 +584,7 @@ mod tests {
                 source_branch,
                 branch::merge::MergeStartOptions {
                     message: "merge source".to_string(),
+                    link_messages: std::collections::HashMap::new(),
                     no_commit: true,
                     scope: branch::merge::MergeScope::MainOnly,
                     inherit_metadata: lore_revision::metadata::MetadataInherit::default(),

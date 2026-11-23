@@ -17,7 +17,6 @@ use futures::FutureExt;
 use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::sync::OwnedSemaphorePermit;
@@ -34,6 +33,7 @@ use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
+use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::dependency;
@@ -43,11 +43,13 @@ use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::create_empty_directory;
 use crate::fs::filesystem_provider::match_node_executable;
 use crate::fs::filesystem_provider::set_file_to_node;
+use crate::fs::hold;
 use crate::hash::hash_string_bytes;
 use crate::instance::InstanceId;
 use crate::interface::LoreArray;
@@ -71,6 +73,7 @@ use crate::repository;
 use crate::repository::FileConfig;
 use crate::repository::RepositoryConfig;
 use crate::repository::StoreConfig;
+use crate::repository::prefetch;
 use crate::revision;
 use crate::state;
 use crate::state::FileModification;
@@ -223,7 +226,7 @@ fn populated_target_error(path: &Path) -> CloneError {
 
 /// Data for the event emitted when a clone starts.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneBeginEventData {
     /// Identifier of the repository being cloned.
@@ -238,7 +241,7 @@ pub struct LoreRepositoryCloneBeginEventData {
 
 /// Progress counts for a clone operation.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneCountData {
     /// Number of files finished.
@@ -281,16 +284,17 @@ impl LoreRepositoryCloneCountData {
 
 /// Data for the event emitted to report clone progress.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneProgressEventData {
     /// Current progress counts.
     pub count: LoreRepositoryCloneCountData,
 }
 
-/// Data for the event emitted when a clone finishes.
+/// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+/// reports its outcome on the complete event as every clone does.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryCloneEndEventData {
     /// Name of the branch that was cloned.
@@ -371,6 +375,10 @@ pub struct CloneOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// Where the clone writes its files, cache every file metadata block of the cloned revision,
+    /// which staging and committing write to, so both work without the remote, and fail the clone
+    /// if that fails.
+    pub cache_file_metadata: bool,
 }
 
 pub struct CloneWorkItem {
@@ -411,12 +419,37 @@ struct BlockDiscoverItem {
     /// Whether this item should have its dependencies loaded. Always true for
     /// root items. For non-root items, true only when recursive is enabled.
     follow_deps: bool,
-    /// Current traversal depth (0 for root items, incremented per level).
+    /// In tree walk mode, the level below the walk's root of the nodes this item reaches (1 for the
+    /// root's children). In dependency mode, the dependency hops from a root file.
     depth: u32,
     /// Cycle detector state, carried across block boundaries.
     cycle: SiblingCycleGuard,
     /// Whether any child has been visited, carried across block boundaries.
     visited_child: bool,
+}
+
+impl BlockDiscoverItem {
+    /// The item walking the children of directory `parent` from `first_child`, at `path`, with the
+    /// view filter's verdict `states` for it, one level below `depth`.
+    fn children(
+        first_child: NodeID,
+        parent: NodeID,
+        path: RelativePath,
+        states: FilterStates,
+        depth: u32,
+    ) -> Self {
+        Self {
+            node_id: first_child,
+            expected_parent: parent,
+            repository_path: path,
+            states,
+            dep_context: None,
+            follow_deps: false,
+            depth: depth.saturating_add(1),
+            cycle: SiblingCycleGuard::new(parent),
+            visited_child: false,
+        }
+    }
 }
 
 const BLOCK_DISCOVER_CHANNEL_CAPACITY: usize = 100;
@@ -428,22 +461,79 @@ struct BlockDiscoverInner {
     error: parking_lot::Mutex<Option<CloneError>>,
 }
 
-/// Coordinates per-block discovery tasks for clone operations.
-/// Each block index gets a dedicated task that loads the block once and
-/// processes all nodes belonging to that block from an unbounded channel.
+/// What a discovery walk is for.
+enum Walk {
+    /// A clone's: the walk discovers the files the view keeps for it.
+    Clone(CloneSink),
+    /// A tree warm-up's: the walk loads the blocks it reaches and discovers nothing. It follows
+    /// every node's sibling link, and reads and filters the names of directories alone, as they
+    /// decide what it enters.
+    Warm(Arc<WarmUp>),
+}
+
+/// Where a clone's discovery walk sends what the view keeps.
+struct CloneSink {
+    options: Arc<CloneOptions>,
+    operation: Arc<InstanceOperationImpl>,
+    stats: Arc<CloneStats>,
+    file_tx: mpsc::Sender<CloneWorkItem>,
+}
+
+/// Block loads a warm-up walk keeps in flight.
+const WARM_BLOCK_LOADS: usize = 64;
+
+/// A tree warm-up's walk: how deep it enters, its loads in flight, when it stops, and what it
+/// reached.
+struct WarmUp {
+    /// Levels below the walk's root it enters directories at.
+    levels: u32,
+    /// Holds the block loads in flight to [`WARM_BLOCK_LOADS`].
+    loads: Semaphore,
+    /// Answers whether the warm-up is to stop ([`BlockDiscoverDispatcher::stopped`]).
+    stop: prefetch::StopWhen,
+    /// Blocks loaded.
+    blocks: AtomicU64,
+    /// Directories the view keeps.
+    directories: AtomicU64,
+}
+
+/// Shuts a warm-up walk down when its caller stops waiting for it
+/// ([`BlockDiscoverDispatcher::shut_down`]).
+struct ShutDownOnDrop(Arc<BlockDiscoverDispatcher>);
+
+impl Drop for ShutDownOnDrop {
+    fn drop(&mut self) {
+        self.0.shut_down();
+    }
+}
+
+/// Coordinates per-block discovery tasks for clone operations and tree warm-ups. Each block index
+/// gets a dedicated task that loads the block once and processes all nodes belonging to that block
+/// from a channel of [`BLOCK_DISCOVER_CHANNEL_CAPACITY`] items; a send to a full channel waits in a
+/// task of its own.
 struct BlockDiscoverDispatcher {
     inner: Arc<BlockDiscoverInner>,
     done: Notify,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
-    options: Arc<CloneOptions>,
-    stats: Arc<CloneStats>,
-    operation: Arc<InstanceOperationImpl>,
-    file_tx: mpsc::Sender<CloneWorkItem>,
+    walk: Walk,
 }
 
 impl BlockDiscoverDispatcher {
     fn new(ctx: CloneContext, file_tx: mpsc::Sender<CloneWorkItem>) -> Self {
+        Self::walking(
+            ctx.repository,
+            ctx.state,
+            Walk::Clone(CloneSink {
+                options: ctx.options,
+                operation: ctx.operation,
+                stats: ctx.stats,
+                file_tx,
+            }),
+        )
+    }
+
+    fn walking(repository: Arc<RepositoryContext>, state: Arc<State>, walk: Walk) -> Self {
         Self {
             inner: Arc::new(BlockDiscoverInner {
                 pending: AtomicUsize::new(0),
@@ -452,17 +542,14 @@ impl BlockDiscoverDispatcher {
                 error: parking_lot::Mutex::new(None),
             }),
             done: Notify::new(),
-            repository: ctx.repository,
-            state: ctx.state,
-            options: ctx.options,
-            stats: ctx.stats,
-            operation: ctx.operation,
-            file_tx,
+            repository,
+            state,
+            walk,
         }
     }
 
     fn dispatch(self: &Arc<Self>, item: BlockDiscoverItem) {
-        if self.inner.shutdown.load(Ordering::Acquire) {
+        if self.is_shutdown() || self.stopped() {
             return;
         }
         self.inner.pending.fetch_add(1, Ordering::AcqRel);
@@ -538,6 +625,27 @@ impl BlockDiscoverDispatcher {
         self.inner.shutdown.load(Ordering::Acquire)
     }
 
+    /// Stops the walk: nothing more is dispatched, no queued item is processed, no block task
+    /// waiting for a load permit loads its block, and [`Self::join`] returns. Loads that hold a
+    /// permit and the item in hand complete.
+    fn shut_down(&self) {
+        self.inner.shutdown.store(true, Ordering::Release);
+        self.inner.channels.clear();
+        if let Walk::Warm(warm) = &self.walk {
+            warm.loads.close();
+        }
+        self.done.notify_one();
+    }
+
+    /// Whether a warm-up's `stop` answers true, shutting the walk down where it does.
+    fn stopped(&self) -> bool {
+        let stopped = matches!(&self.walk, Walk::Warm(warm) if (warm.stop)());
+        if stopped {
+            self.shut_down();
+        }
+        stopped
+    }
+
     async fn join(&self) -> Result<(), CloneError> {
         loop {
             let notified = self.done.notified();
@@ -561,16 +669,30 @@ async fn block_discover_task(
     block_index: usize,
     mut rx: mpsc::Receiver<BlockDiscoverItem>,
 ) {
-    let Ok(block) = dispatcher
-        .state
-        .block_with_nametable(dispatcher.repository.clone(), block_index)
-        .await
-    else {
-        dispatcher.set_error(CloneError::internal(
-            "Failed to deserialize revision state node block",
-        ));
-        return;
+    let loaded = {
+        let _permit = match &dispatcher.walk {
+            Walk::Warm(warm) => warm.loads.acquire().await.ok(),
+            Walk::Clone(_) => None,
+        };
+        if dispatcher.is_shutdown() || dispatcher.stopped() {
+            return;
+        }
+        dispatcher
+            .state
+            .block_with_nametable(dispatcher.repository.clone(), block_index)
+            .await
     };
+    let block =
+        match loaded.forward::<CloneError>("Failed to deserialize revision state node block") {
+            Ok(block) => block,
+            Err(error) => {
+                dispatcher.set_error(error);
+                return;
+            }
+        };
+    if let Walk::Warm(warm) = &dispatcher.walk {
+        warm.blocks.fetch_add(1, Ordering::Relaxed);
+    }
 
     while let Some(item) = rx.recv().await {
         if dispatcher.is_shutdown() {
@@ -592,7 +714,12 @@ async fn process_block_item(
     item: BlockDiscoverItem,
 ) -> Result<(), CloneError> {
     if let Some(dep_ctx) = item.dep_context.clone() {
-        return process_block_item_dependency(dispatcher, block, item, dep_ctx).await;
+        let Walk::Clone(clone) = &dispatcher.walk else {
+            return Err(CloneError::internal(
+                "Dependency discovery runs only for a clone",
+            ));
+        };
+        return process_block_item_dependency(dispatcher, clone, block, item, dep_ctx).await;
     }
 
     let mut current_node_id = item.node_id;
@@ -607,9 +734,11 @@ async fn process_block_item(
         node.walk_step(current_node_id, expected_parent, &mut cycle)
             .forward::<CloneError>("invalid node hierarchy in revision state")?;
 
-        if let Some(node_name) = block
-            .node_name_ref_or_skip(node_index, current_node_id)
-            .forward::<CloneError>("Failed to deserialize node name")?
+        let reads_name = matches!(dispatcher.walk, Walk::Clone(_)) || node.is_directory();
+        if reads_name
+            && let Some(node_name) = block
+                .node_name_ref_or_skip(node_index, current_node_id)
+                .forward::<CloneError>("Failed to deserialize node name")?
         {
             let node_name = node_name.freeze();
             if node_name.is_empty() {
@@ -626,74 +755,90 @@ async fn process_block_item(
             );
             if !excluded {
                 visited_child = true;
-                if node.is_file() {
-                    dispatcher
-                        .stats
-                        .discovery
-                        .total_files
-                        .fetch_add(1, Ordering::Relaxed);
-                    dispatcher
-                        .stats
-                        .discovery
-                        .total_bytes
-                        .fetch_add(node.size, Ordering::Relaxed);
-
-                    let Ok(permit) = dispatcher.file_tx.reserve().await else {
-                        // Receiver dropped, consumer encountered an error
-                        return Err(CloneError::internal("Recursion task failed"));
-                    };
-                    permit.send(CloneWorkItem {
-                        repository: dispatcher.repository.clone(),
-                        node,
-                        repository_path: node_path,
-                    });
-                } else if node.is_link() {
-                    if dispatcher.is_shutdown() {
-                        dispatcher.item_complete();
-                        return Ok(());
-                    }
-                    dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
-
-                    let d = Arc::clone(dispatcher);
-                    let link_node = node;
-                    let link_ctx = CloneContext {
-                        repository: dispatcher.repository.clone(),
-                        state: dispatcher.state.clone(),
-                        operation: dispatcher.operation.clone(),
-                        options: dispatcher.options.clone(),
-                        stats: dispatcher.stats.clone(),
-                        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-                    };
-                    let link_tx = dispatcher.file_tx.clone();
-                    lore_spawn!(async move {
-                        let result =
-                            clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
-                        if let Err(err) = result {
-                            d.set_error(err);
+                match &dispatcher.walk {
+                    Walk::Warm(warm) => {
+                        warm.directories.fetch_add(1, Ordering::Relaxed);
+                        if item.depth < warm.levels
+                            && let Some(first_child) = node.child()
+                        {
+                            dispatcher.dispatch(BlockDiscoverItem::children(
+                                first_child,
+                                current_node_id,
+                                node_path,
+                                node_states,
+                                item.depth,
+                            ));
                         }
-                        d.item_complete();
-                    });
-                } else if node.is_directory() {
-                    if execution_context().globals().dry_run() {
-                        lore_info!("{}", node_path);
                     }
+                    Walk::Clone(clone) if node.is_file() => {
+                        clone
+                            .stats
+                            .discovery
+                            .total_files
+                            .fetch_add(1, Ordering::Relaxed);
+                        clone
+                            .stats
+                            .discovery
+                            .total_bytes
+                            .fetch_add(node.size, Ordering::Relaxed);
 
-                    if let Some(first_child) = node.child() {
-                        dispatcher.dispatch(BlockDiscoverItem {
-                            node_id: first_child,
-                            expected_parent: current_node_id,
+                        let Ok(permit) = clone.file_tx.reserve().await else {
+                            // Receiver dropped, consumer encountered an error
+                            return Err(CloneError::internal("Recursion task failed"));
+                        };
+                        permit.send(CloneWorkItem {
+                            repository: dispatcher.repository.clone(),
+                            node,
                             repository_path: node_path,
-                            states: node_states,
-                            dep_context: None,
-                            follow_deps: false,
-                            depth: 0,
-                            cycle: SiblingCycleGuard::new(current_node_id),
-                            visited_child: false,
                         });
-                    } else if !execution_context().globals().dry_run() {
-                        create_empty_directory::<CloneError>(&dispatcher.operation, &node_path)
-                            .await?;
                     }
+                    Walk::Clone(clone) if node.is_link() => {
+                        if dispatcher.is_shutdown() {
+                            dispatcher.item_complete();
+                            return Ok(());
+                        }
+                        dispatcher.inner.pending.fetch_add(1, Ordering::AcqRel);
+
+                        let d = Arc::clone(dispatcher);
+                        let link_node = node;
+                        let link_ctx = CloneContext {
+                            repository: dispatcher.repository.clone(),
+                            state: dispatcher.state.clone(),
+                            operation: clone.operation.clone(),
+                            options: clone.options.clone(),
+                            stats: clone.stats.clone(),
+                            modified_times: Arc::new(state::RecordedModifiedTimes::default()),
+                        };
+                        let link_tx = clone.file_tx.clone();
+                        lore_spawn!(async move {
+                            let result =
+                                clone_discover_link(link_ctx, link_node, node_path, link_tx).await;
+                            if let Err(err) = result {
+                                d.set_error(err);
+                            }
+                            d.item_complete();
+                        });
+                    }
+                    Walk::Clone(clone) if node.is_directory() => {
+                        let dry_run = execution_context().globals().dry_run();
+                        if dry_run {
+                            lore_info!("{}", node_path);
+                        }
+
+                        if let Some(first_child) = node.child() {
+                            dispatcher.dispatch(BlockDiscoverItem::children(
+                                first_child,
+                                current_node_id,
+                                node_path,
+                                node_states,
+                                item.depth,
+                            ));
+                        } else if !dry_run {
+                            create_empty_directory::<CloneError>(&clone.operation, &node_path)
+                                .await?;
+                        }
+                    }
+                    Walk::Clone(_) => {}
                 }
             }
         }
@@ -713,22 +858,20 @@ async fn process_block_item(
                     states: item.states,
                     dep_context: None,
                     follow_deps: false,
-                    depth: 0,
+                    depth: item.depth,
                     cycle,
                     visited_child,
                 });
                 break;
             }
             None => {
-                if !visited_child
+                if let Walk::Clone(clone) = &dispatcher.walk
+                    && !visited_child
                     && !item.repository_path.is_empty()
                     && !execution_context().globals().dry_run()
                 {
-                    create_empty_directory::<CloneError>(
-                        &dispatcher.operation,
-                        &item.repository_path,
-                    )
-                    .await?;
+                    create_empty_directory::<CloneError>(&clone.operation, &item.repository_path)
+                        .await?;
                 }
                 break;
             }
@@ -741,6 +884,7 @@ async fn process_block_item(
 
 async fn process_block_item_dependency(
     dispatcher: &Arc<BlockDiscoverDispatcher>,
+    clone: &CloneSink,
     block: &Arc<NodeBlock>,
     item: BlockDiscoverItem,
     dep_ctx: Arc<DependencyDiscoverContext>,
@@ -755,18 +899,18 @@ async fn process_block_item_dependency(
         FilterMode::View,
     ) && node.is_file()
     {
-        dispatcher
+        clone
             .stats
             .discovery
             .total_files
             .fetch_add(1, Ordering::Relaxed);
-        dispatcher
+        clone
             .stats
             .discovery
             .total_bytes
             .fetch_add(node.size, Ordering::Relaxed);
 
-        let Ok(permit) = dispatcher.file_tx.reserve().await else {
+        let Ok(permit) = clone.file_tx.reserve().await else {
             return Err(CloneError::internal("Recursion task failed"));
         };
         permit.send(CloneWorkItem {
@@ -834,7 +978,7 @@ async fn process_block_item_dependency(
             let dep_path = dep_relative;
             let parent = dep_path.parent_path();
             if !parent.is_empty() {
-                dispatcher
+                clone
                     .operation
                     .create_dir_all(&parent)
                     .await
@@ -902,10 +1046,17 @@ pub async fn clone(
     // server costing the folder its binding.
     let existing_dot_dir = get_dot_lore_path(path)?;
     let replace_existing = existing_dot_dir.exists();
-    if replace_existing && !call.force() {
-        return Err(CloneError::from(RepositoryAlreadyExists {
-            path: path.display().to_string(),
-        }));
+    if replace_existing {
+        // A working copy over a provider-held (SWFS) repository is never replaced, `--force` or
+        // not.
+        let existing_repository_is_swfs =
+            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
+                .is_ok_and(|config| config.is_swfs());
+        if !call.force() || existing_repository_is_swfs {
+            return Err(CloneError::from(RepositoryAlreadyExists {
+                path: path.display().to_string(),
+            }));
+        }
     }
     let holds_other_entries = holds_entries_besides_dot_dir(path, existing_dot_dir.as_path())
         .await
@@ -1124,19 +1275,17 @@ async fn clone_bound(
     };
 
     let local_init_fut = async move {
-        {
-            let _repository = repository::create_local(
-                path,
-                &write_token,
-                repository_id,
-                default_branch_id,
-                default_branch_name,
-                repository_config,
-                no_tracking,
-            )
-            .await
-            .forward::<CloneError>("Failed to initialize repository on disk")?;
-        }
+        let created = repository::create_local(
+            path,
+            &write_token,
+            repository_id,
+            default_branch_id,
+            default_branch_name,
+            repository_config,
+            no_tracking,
+        )
+        .await
+        .forward::<CloneError>("Failed to initialize repository on disk")?;
         lore_debug!("Initialized repository on disk in {}", path.display());
 
         // Share the outer write token to whichever context we load. The Client
@@ -1148,9 +1297,13 @@ async fn clone_bound(
         // `store_latest`) see a context with write capability and can populate
         // the (in-memory or on-disk) mutable store.
         let load_token = Some(write_token.share());
-        repository::load_and_connect_with_token(path, access, load_token)
+        let loaded = repository::load_and_connect_with_token(path, access, load_token)
             .await
-            .forward::<CloneError>("Failed to load revision state")
+            .forward::<CloneError>("Failed to load revision state");
+        // Kept until the loaded context has claimed the stores, so it joins the created
+        // context's claims and finds the stores current rather than reading them again.
+        drop(created);
+        loaded
     };
 
     let (repository, prefetched_branch) = tokio::try_join!(local_init_fut, prefetch_branch_fut)?;
@@ -1293,6 +1446,9 @@ impl SetAsideDotDir {
 /// Completes [`clone`] once the repository exists locally and its branch is fetched: applies the
 /// view, resolves the revision and layer, records the branch and materializes the tree.
 ///
+/// Sends the clone end event only for a clone that succeeded. A failure to materialize the tree
+/// is reported ahead of a failure to record the branch or to finish the operation.
+///
 /// A function of its own because its locals live across several awaits: kept in [`clone`] they
 /// would take space in its future while the repository is created as well.
 #[allow(clippy::too_many_arguments)]
@@ -1423,7 +1579,7 @@ async fn clone_into(
         );
 
         lore_info!("Resolving layer revisions");
-        let module = Arc::new(repository.to_layer_context(repository_id).await);
+        let module = repository.to_layer_context(repository_id).await;
         let layer_latest = layer::latest_revision(module.clone(), branch_id)
             .await
             .forward::<CloneError>("Failed to get layer latest revision")?;
@@ -1452,6 +1608,7 @@ async fn clone_into(
             );
         }
     }
+    refuse_on_held_state(&repository, &options, revision)?;
 
     let (state, metadata) = tokio::try_join!(
         async {
@@ -1553,6 +1710,8 @@ async fn clone_into(
         let _ = task.await;
     }
 
+    materialize_result.and(store_result).and(operation_result)?;
+
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),
         revision,
@@ -1560,7 +1719,7 @@ async fn clone_into(
     })
     .send();
 
-    operation_result.and(materialize_result.and(store_result))
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1574,6 +1733,52 @@ pub struct CloneContext {
     pub modified_times: Arc<state::RecordedModifiedTimes>,
 }
 
+/// Refuses a clone of `revision` restricted to a dependency set onto a provider that holds its
+/// state in a `State` ([`FilesystemProvider::holds_state`](crate::fs::filesystem_provider::FilesystemProvider::holds_state)),
+/// which holds whole revisions. A bare clone, or one of an empty repository, writes no tree, so it
+/// is refused nothing.
+#[lore_macro::test_pub]
+fn refuse_on_held_state(
+    repository: &RepositoryContext,
+    options: &CloneOptions,
+    revision: Hash,
+) -> Result<(), CloneError> {
+    if options.bare
+        || revision.is_zero()
+        || options.root_files.is_empty()
+        || !repository.file_system().holds_state()
+    {
+        return Ok(());
+    }
+    Err(hold::refused("restrict a clone to a dependency set").into())
+}
+
+/// Hands `ctx.state` to the operation to hold ([`InstanceOperationImpl::hold_state`]), for a
+/// provider that holds its state in a `State` ([`InstanceOperationImpl::holds_state`]).
+///
+/// A bare clone, or one of an empty repository, hands it nothing, as either writes no tree, and
+/// so does a dry run.
+#[lore_macro::test_pub]
+async fn clone_materialize_hold(ctx: &CloneContext) -> Result<(), CloneError> {
+    if ctx.options.bare || ctx.state.revision().is_zero() {
+        return Ok(());
+    }
+    if execution_context().globals().dry_run() {
+        return Ok(());
+    }
+    ctx.operation
+        .hold_state(
+            ctx.repository.clone(),
+            ctx.state.clone(),
+            HoldOptions::default(),
+        )
+        .await
+        .forward::<CloneError>("Holding the cloned revision")
+}
+
+/// Materializes `revision` in the working tree and records it, and `branch_id`, as the instance's
+/// current state, which it records whether or not materializing succeeded. A failure to
+/// materialize is reported ahead of a failure to record the state.
 async fn clone_materialize(
     ctx: CloneContext,
     remote: Arc<lore_transport::Connection>,
@@ -1590,7 +1795,9 @@ async fn clone_materialize(
     let mut clone_result = Ok(());
     let mut cache_task = None;
 
-    if !options.bare && !revision.is_zero() {
+    if ctx.operation.holds_state() {
+        clone_materialize_hold(&ctx).await?;
+    } else if !options.bare && !revision.is_zero() {
         lore_info!("Pull state {revision}");
         let correlation_id = execution_context().globals().correlation_id.to_string();
         let _storage = remote
@@ -1616,8 +1823,11 @@ async fn clone_materialize(
 
         let cache_repository = repository.clone();
         let cache_state = state.clone();
+        let cache_file_metadata = options.cache_file_metadata;
         cache_task = Some(lore_spawn!(async move {
-            cache_state.cache_fragments(cache_repository).await
+            cache_state
+                .cache_fragments(cache_repository, cache_file_metadata)
+                .await
         }));
 
         clone_result = clone_in_path(ctx).await;
@@ -1643,26 +1853,33 @@ async fn clone_materialize(
         if let Err(err) = cached {
             if clone_result.is_ok() && !execution_context().globals().dry_run() {
                 lore_warn!("Retrying the cache of the cloned state's fragments: {err}");
-                clone_result = Box::pin(state.cache_fragments(repository.clone()))
-                    .await
-                    .forward::<CloneError>("Failed to cache the cloned state's fragments");
+                clone_result = Box::pin(
+                    state.cache_fragments(repository.clone(), options.cache_file_metadata),
+                )
+                .await
+                .forward::<CloneError>("Failed to cache the cloned state's fragments");
             } else {
                 lore_debug!("Caching the cloned state's fragments failed: {err}");
             }
         }
     }
 
-    crate::instance::store_current_anchor_branch(&repository, branch_id)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
-    crate::instance::store_current_anchor(&repository, revision)
-        .await
-        .forward::<CloneError>("Failed to write current state anchor to repository")?;
+    let anchor_result = async {
+        crate::instance::store_current_anchor_branch(&repository, branch_id).await?;
+        crate::instance::store_current_anchor(&repository, revision).await
+    }
+    .await
+    .forward::<CloneError>("Failed to write current state anchor to repository");
 
-    clone_result
+    clone_result.and(anchor_result)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Writes the files of `ctx.state` to the working tree, discovering them in one task and writing
+/// them in another.
+///
+/// A failure to write a file is reported ahead of a failure in discovery. Discovery fails once
+/// writing stops taking files, so its error is then a result of the failure to write.
+#[lore_macro::test_pub]
 async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
@@ -1684,17 +1901,13 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
             .forward::<CloneError>("Failed to deserialize revision state node block")?;
 
         if let Some(first_child) = root_node.child() {
-            dispatcher.dispatch(BlockDiscoverItem {
-                node_id: first_child,
-                expected_parent: ROOT_NODE,
-                repository_path: RelativePath::new(),
-                states: FilterStates::ROOT,
-                dep_context: None,
-                follow_deps: false,
-                depth: 0,
-                cycle: SiblingCycleGuard::new(ROOT_NODE),
-                visited_child: false,
-            });
+            dispatcher.dispatch(BlockDiscoverItem::children(
+                first_child,
+                ROOT_NODE,
+                RelativePath::new(),
+                FilterStates::ROOT,
+                0,
+            ));
         }
     } else {
         // Dependency discovery mode
@@ -1773,10 +1986,71 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let consumer = lore_spawn!(async move { clone_execute(file_rx, ctx).await });
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
-    producer_result.internal("Recursion task failed")??;
-    consumer_result.internal("Recursion task failed")??;
+    let producer_result = producer_result.internal("Recursion task failed")?;
+    let consumer_result = consumer_result.internal("Recursion task failed")?;
+    consumer_result?;
+    producer_result?;
 
     Ok(())
+}
+
+/// What a tree warm-up walked.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WarmedTree {
+    /// Directories the view keeps, entered or not.
+    pub directories: u64,
+    /// Node blocks loaded, each with its name table.
+    pub blocks: u64,
+}
+
+/// Loads, with its name table and through the block loads a listing makes, every node block holding
+/// entries of a directory the view keeps fewer than `levels` levels below the root, the root
+/// included; linked trees are not entered. `u32::MAX` walks the whole view and zero loads nothing.
+/// The clone's discovery walk does the walking, one task per block and at most [`WARM_BLOCK_LOADS`]
+/// blocks loading at a time. Its loads are a listing's: at demand priority, and each block taken
+/// into the state's ring of recently loaded blocks, where a warm-up of more blocks than the ring
+/// holds displaces blocks demand reads loaded. The walk shuts down once `stop` answers true,
+/// reading nothing where it does at the start, and when its future is dropped
+/// ([`BlockDiscoverDispatcher::shut_down`]).
+pub async fn warm_tree(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    levels: u32,
+    stop: prefetch::StopWhen,
+) -> Result<WarmedTree, CloneError> {
+    let warm = Arc::new(WarmUp {
+        levels,
+        loads: Semaphore::new(WARM_BLOCK_LOADS),
+        stop,
+        blocks: AtomicU64::new(0),
+        directories: AtomicU64::new(0),
+    });
+    let dispatcher = Arc::new(BlockDiscoverDispatcher::walking(
+        repository.clone(),
+        state.clone(),
+        Walk::Warm(warm.clone()),
+    ));
+    let _shut_down = ShutDownOnDrop(dispatcher.clone());
+    if levels > 0 && !dispatcher.stopped() {
+        let root = state
+            .node(repository, ROOT_NODE)
+            .await
+            .forward::<CloneError>("Failed to deserialize revision state node block")?;
+        if let Some(first_child) = root.child() {
+            dispatcher.dispatch(BlockDiscoverItem::children(
+                first_child,
+                ROOT_NODE,
+                RelativePath::new(),
+                FilterStates::ROOT,
+                0,
+            ));
+        }
+    }
+    dispatcher.join().await?;
+    Ok(WarmedTree {
+        directories: warm.directories.load(Ordering::Relaxed),
+        blocks: warm.blocks.load(Ordering::Relaxed),
+    })
 }
 
 async fn clone_discover_link(
@@ -1833,17 +2107,13 @@ async fn clone_discover_link(
 
             if let Some(first_child) = root_node.child() {
                 let link_states = linked_repository.filter.mount_states(&link_path);
-                link_dispatcher.dispatch(BlockDiscoverItem {
-                    node_id: first_child,
-                    expected_parent: link_node,
-                    repository_path: link_path,
-                    states: link_states,
-                    dep_context: None,
-                    follow_deps: false,
-                    depth: 0,
-                    cycle: SiblingCycleGuard::new(link_node),
-                    visited_child: false,
-                });
+                link_dispatcher.dispatch(BlockDiscoverItem::children(
+                    first_child,
+                    link_node,
+                    link_path,
+                    link_states,
+                    0,
+                ));
             }
 
             link_dispatcher.join().await?;
@@ -2062,10 +2332,12 @@ async fn ensure_parent_dir(
 
 /// Writes `node` to `repository_path`, or retains the file there when it holds the node.
 ///
-/// Returns the modified time entry of a file written or retained, and `None` for one a dry run
-/// would write or `ignore_existing` leaves in place. Counts the file as in flight, and holds
-/// `permit`, until it is done. Not an `async fn`, which would hold a second copy of its
-/// arguments.
+/// Returns the modified time entry of a file written, or retained with a time older than the
+/// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads before
+/// reading the file; `None`
+/// for any other retained file, one a dry run would write, or one `ignore_existing` leaves in
+/// place. Counts the file as in flight, and holds `permit`, until it is done. Not an `async fn`,
+/// which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn clone_file(
     ctx: CloneContext,
@@ -2127,11 +2399,14 @@ fn clone_file(
                 lore_trace!("Retain {}", repository_path);
                 stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
                 stats.complete.file_complete.fetch_add(1, Ordering::Relaxed);
-                return Ok(Some(state::file_modified_time_entry(
-                    &repository,
-                    &repository_path,
-                    file_info.mtime(),
-                )));
+                let floor = operation.clock_floor(&repository).await;
+                return Ok((file_info.mtime() < floor).then(|| {
+                    state::file_modified_time_entry(
+                        &repository,
+                        &repository_path,
+                        file_info.mtime(),
+                    )
+                }));
             }
             if !force {
                 lore_error!(

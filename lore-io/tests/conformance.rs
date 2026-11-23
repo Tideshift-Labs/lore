@@ -54,6 +54,31 @@ async fn write_read_roundtrip() {
     }
 }
 
+/// A file opened with `std` writes, syncs its data and syncs it all through every backend.
+#[tokio::test]
+async fn an_open_std_file_writes_and_syncs_through_every_backend() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-from-std-");
+        let std_file = lore_io::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .to_std()
+            .open(dir.child("f"))
+            .expect("std open");
+        // Safety: the file moves into the wrap, and nothing else holds a handle to it.
+        let file = unsafe { lore_io::IoFile::from_std(&driver, std::sync::Arc::new(std_file)) }
+            .expect("from_std");
+        let data = pattern(4096, 5);
+        file.write_all_at(data.clone(), 0).await.expect("write");
+        file.sync_data().await.expect("sync_data");
+        file.sync_all().await.expect("sync_all");
+        let read = file.read_exact_at(data.len(), 0).await.expect("read");
+        assert_eq!(&read[..], &data[..], "{}", driver.backend_name());
+    }
+}
+
 #[tokio::test]
 async fn positional_reads_have_no_cursor() {
     for driver in drivers() {
@@ -655,17 +680,66 @@ async fn concurrent_disjoint_writes_share_one_handle() {
     }
 }
 
+/// The completion of a resize is dropped once the length is set, whether or not the call is still
+/// awaited, as an atomic write's is. Observed through a completion that reads the file's length as
+/// it is dropped.
+#[tokio::test]
+async fn the_completion_of_a_resize_is_dropped_once_the_length_is_set() {
+    struct Sized {
+        path: std::path::PathBuf,
+        len: std::sync::mpsc::Sender<Option<u64>>,
+    }
+
+    impl Drop for Sized {
+        fn drop(&mut self) {
+            let _ = self
+                .len
+                .send(std::fs::metadata(&self.path).ok().map(|meta| meta.len()));
+        }
+    }
+
+    for driver in drivers() {
+        for awaited in [true, false] {
+            let dir = TempDir::new("lore-io-resize-completion-");
+            let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
+            let (len, sized) = std::sync::mpsc::channel();
+            let resize = file.set_len(
+                4096,
+                Sized {
+                    path: dir.child("data"),
+                    len,
+                },
+            );
+            if awaited {
+                resize.await.unwrap();
+            } else {
+                // Polled once, which dispatches the resize, and dropped.
+                let _ = tokio::time::timeout(std::time::Duration::ZERO, resize).await;
+            }
+            let len = sized
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the completion is dropped");
+            assert_eq!(
+                len,
+                Some(4096),
+                "{} awaited {awaited}: the completion was dropped before the length was set",
+                driver.backend_name()
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn set_len_resizes_the_file() {
     for driver in drivers() {
         let dir = TempDir::new("lore-io-sizing-");
         let file = driver.open(dir.child("data"), &rw_create()).await.unwrap();
 
-        file.set_len(4096).await.unwrap();
+        file.set_len(4096, ()).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 4096);
 
         // Extending leaves a hole that reads as zeros rather than a short file.
-        file.set_len(2 * 1024 * 1024).await.unwrap();
+        file.set_len(2 * 1024 * 1024, ()).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 2 * 1024 * 1024);
         let tail = file
             .read_exact_at(4096, 2 * 1024 * 1024 - 4096)
@@ -673,7 +747,7 @@ async fn set_len_resizes_the_file() {
             .unwrap();
         assert_eq!(&tail[..], &[0u8; 4096][..]);
 
-        file.set_len(1024).await.unwrap();
+        file.set_len(1024, ()).await.unwrap();
         assert_eq!(file.metadata().await.unwrap().len(), 1024);
         file.sync_all().await.unwrap();
     }
@@ -879,6 +953,8 @@ async fn write_file_segments_atomic_replaces_target() {
                 dir.child("data"),
                 &OpenOptions::new().write(true).create(true).truncate(true),
                 segments,
+                true,
+                (),
             )
             .await
             .unwrap();
@@ -888,6 +964,90 @@ async fn write_file_segments_atomic_replaces_target() {
         );
         let read = driver.read_file_bytes(dir.child("data")).await.unwrap();
         assert_eq!(&read[..], &flat[..]);
+    }
+}
+
+/// An atomic write that fails removes its temporary file, here one whose rename meets a directory.
+#[tokio::test]
+async fn a_failed_atomic_write_leaves_no_temporary_file() {
+    for driver in drivers() {
+        let dir = TempDir::new("lore-io-write-atomic-failed-");
+        std::fs::create_dir_all(dir.child("data").join("blocker")).unwrap();
+
+        let written = driver
+            .write_file_segments_atomic(
+                dir.child("data.tmp"),
+                dir.child("data"),
+                &OpenOptions::new().write(true).create(true).truncate(true),
+                vec![pattern(64, 51)],
+                false,
+                (),
+            )
+            .await;
+
+        assert!(
+            written.is_err(),
+            "{}: the rename succeeded",
+            driver.backend_name()
+        );
+        assert!(
+            !dir.child("data.tmp").exists(),
+            "{}: the temporary file is left behind",
+            driver.backend_name()
+        );
+        assert!(dir.child("data").join("blocker").is_dir());
+    }
+}
+
+/// The completion is dropped once the write has landed, the rename included, whether or not the
+/// call is still awaited, so a caller that drops the call part way learns from it when the write
+/// it abandoned is on disk. Observed through a completion that reads the file as it is dropped.
+#[tokio::test]
+async fn the_completion_is_dropped_once_the_write_has_landed() {
+    struct Landed {
+        path: std::path::PathBuf,
+        read: std::sync::mpsc::Sender<Option<Vec<u8>>>,
+    }
+
+    impl Drop for Landed {
+        fn drop(&mut self) {
+            let _ = self.read.send(std::fs::read(&self.path).ok());
+        }
+    }
+
+    for driver in drivers() {
+        for awaited in [true, false] {
+            let dir = TempDir::new("lore-io-completion-");
+            let data = pattern(4096, 61);
+            let (read, landed) = std::sync::mpsc::channel();
+            let options = OpenOptions::new().write(true).create(true).truncate(true);
+            let write = driver.write_file_segments_atomic(
+                dir.child("data.tmp"),
+                dir.child("data"),
+                &options,
+                vec![data.clone()],
+                true,
+                Landed {
+                    path: dir.child("data"),
+                    read,
+                },
+            );
+            if awaited {
+                write.await.unwrap();
+            } else {
+                // Polled once, which dispatches the write, and dropped.
+                let _ = tokio::time::timeout(std::time::Duration::ZERO, write).await;
+            }
+            let read = landed
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("the completion is dropped");
+            assert_eq!(
+                read.as_deref(),
+                Some(&data[..]),
+                "{} awaited {awaited}: the completion was dropped before the write landed",
+                driver.backend_name()
+            );
+        }
     }
 }
 
@@ -931,6 +1091,8 @@ async fn segments_are_released_before_the_call_returns() {
                     data: data.clone(),
                     released: Arc::clone(&released),
                 },
+                true,
+                (),
             )
             .await
             .unwrap();

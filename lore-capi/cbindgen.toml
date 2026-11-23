@@ -43,7 +43,22 @@ header = '''// LORE C API
 //
 // The library copies argument data before it starts the call. The caller may
 // free or reuse the argument memory once the call returns. This holds for
-// synchronous and asynchronous calls.
+// synchronous and asynchronous calls, except for the memory a lore_bytes_mut_t
+// names, which the library writes while the call runs: see lore_bytes_mut_t.
+//
+// Call lore_shutdown only once every call has completed: a synchronous call has
+// returned, and an asynchronous one has delivered END. The library makes a best
+// effort to cancel calls still executing safely, but a call it does not stop in
+// time may still use the library and the memory passed to it after
+// lore_shutdown returns.
+//
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
 //
 // See lore_event_callback_config_t for how callbacks work.'''
 
@@ -102,6 +117,7 @@ include = [
 
 [export.rename]
 "Address" = "lore_address_t"
+"AuthMode" = "lore_auth_mode_t"
 "BranchId" = "lore_branch_id_t"
 "CompressionMode" = "lore_compression_mode_t"
 "Context" = "lore_context_t"
@@ -114,6 +130,7 @@ include = [
 "LoreAuthUserInfoArgs" = "lore_auth_user_info_args_t"
 "LoreAuthLoginWithTokenArgs" = "lore_auth_login_with_token_args_t"
 "LoreAuthUrlEventData" = "lore_auth_url_event_data_t"
+"LoreAuthPendingEventData" = "lore_auth_pending_event_data_t"
 "LoreAuthLoginInteractiveArgs" = "lore_auth_login_interactive_args_t"
 "LoreAuthUserInfoEventData" = "lore_auth_user_info_event_data_t"
 "LoreAuthUserTokenEventData" = "lore_auth_user_token_event_data_t"
@@ -252,6 +269,9 @@ include = [
 "LoreFileHashEventData" = "lore_file_hash_event_data_t"
 "LoreFileHistoryArgs" = "lore_file_history_args_t"
 "LoreFileHistoryEventData" = "lore_file_history_event_data_t"
+"LoreFileAuditArgs" = "lore_file_audit_args_t"
+"LoreFileAuditEventData" = "lore_file_audit_event_data_t"
+"LoreFileAuditOutcome" = "lore_file_audit_outcome_t"
 "LoreFileDirtyArgs" = "lore_file_dirty_args_t"
 "LoreFileDirtyMoveArgs" = "lore_file_dirty_move_args_t"
 "LoreFileDirtyCopyArgs" = "lore_file_dirty_copy_args_t"
@@ -454,6 +474,9 @@ include = [
 "LoreServiceStopArgs" = "lore_service_stop_args_t"
 "LoreServiceSetExecutableArgs" = "lore_service_set_executable_args_t"
 "LoreServiceSetUseAutomaticallyArgs" = "lore_service_set_use_automatically_args_t"
+"LoreServiceStatusArgs" = "lore_service_status_args_t"
+"LoreServiceStatusEventData" = "lore_service_status_event_data_t"
+"LoreServiceMessageEventData" = "lore_service_message_event_data_t"
 "LoreStore" = "lore_store_t"
 "LoreStorageCloseArgs" = "lore_storage_close_args_t"
 "LoreStorageFlushArgs" = "lore_storage_flush_args_t"
@@ -511,6 +534,7 @@ include = [
 "LoreStoragePutItemCompleteEventData" = "lore_storage_put_item_complete_event_data_t"
 "LoreStorageGetHeaderEventData" = "lore_storage_get_header_event_data_t"
 "LoreStorageGetDataEventData" = "lore_storage_get_data_event_data_t"
+"LoreStorageGetFragmentEventData" = "lore_storage_get_fragment_event_data_t"
 "LoreStorageGetItemCompleteEventData" = "lore_storage_get_item_complete_event_data_t"
 "LoreStorageCopyItemCompleteEventData" = "lore_storage_copy_item_complete_event_data_t"
 "LoreStorageObliterateItemCompleteEventData" = "lore_storage_obliterate_item_complete_event_data_t"

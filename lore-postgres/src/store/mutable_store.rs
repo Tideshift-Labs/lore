@@ -145,6 +145,15 @@ async fn lock_key(
 
 #[async_trait]
 impl MutableStore for PostgresMutableStore {
+    /// Nothing on this host's disk to claim, as for `lore-aws`'s remote store: the rows are
+    /// shared by every replica in the cell, and the CAS in the database is the one serialization
+    /// point. A local flock would order nothing another replica respects.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     #[tracing::instrument(level = "debug", skip_all)]
     async fn load(
         self: Arc<Self>,

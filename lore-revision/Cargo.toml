@@ -12,6 +12,7 @@ test = false
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
@@ -81,7 +82,7 @@ ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 # `test_seams` for the fork's `live_fixture` tests in tests/unit (WP-120).
 lore-revision = { workspace = true, features = ["test-util", "test_seams"] }
-lore-storage = { workspace = true }
+lore-storage = { workspace = true, features = ["test-util"] }
 # `VolatileAttemptStore` (CR-030, WP-120), for tests exercising `lock::file::acquire`/`release`'s
 # ownership-token threading without a durable `RepositoryAttemptStore`. Unifies with the plain
 # `lore-transport` dependency above for `cargo test`, the same way `lore` and `loreserver` already
@@ -98,6 +99,8 @@ serde = { workspace = true }
 # `tempfile::tempdir()`; upstream dropped this dev-dependency when it unified its own tests on
 # `lore_base`'s `test-util` helper.
 tempfile = { workspace = true }
+# `start_paused` for the tests that drive a polling loop on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 
 [features]

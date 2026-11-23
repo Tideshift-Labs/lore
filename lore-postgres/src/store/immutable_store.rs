@@ -2776,6 +2776,18 @@ fn stored_durable(mut fragment: Fragment) -> Fragment {
 
 #[async_trait]
 impl ImmutableStore for PostgresImmutableStore {
+    /// Nothing on this host's disk to claim, as for `lore-aws`'s remote store: the bytes live in
+    /// S3 and the lifecycle state in Postgres, both shared by every replica in the cell. A store
+    /// flock would serialize nothing another replica respects; cross-replica ordering is the
+    /// database's job (row CAS, advisory locks, the fragment coordinator's epochs). The staged
+    /// write-behind directory is process-owned server state with its own custody rows, not a
+    /// client store a command claims.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     /// This process serves every tenant in the cell. Reads therefore require the exact
     /// repository/context association even though the object bytes are globally deduplicated.
     fn isolates_partitions(&self) -> bool {
@@ -2979,6 +2991,7 @@ impl ImmutableStore for PostgresImmutableStore {
                 match_made: StoreMatch::MatchFull,
                 partition,
                 payload: Some(payload),
+                content: None,
             });
         }
         let (associated, state) = tokio::join!(
@@ -3004,6 +3017,7 @@ impl ImmutableStore for PostgresImmutableStore {
             match_made: StoreMatch::MatchFull,
             partition,
             payload: Some(payload),
+            content: None,
         })
     }
 

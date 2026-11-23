@@ -946,19 +946,10 @@ fn resolve_link_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
 ) -> Result<(Vec<LoreString>, Vec<LoreString>), u8> {
-    let mut link_paths: Vec<LoreString> = Vec::new();
-    let mut link_msgs: Vec<LoreString> = Vec::new();
-
-    let link_message_values = &args.link_messages;
-    for pair in link_message_values.chunks(2) {
-        if pair.len() == 2 {
-            link_paths.push(LoreString::from(pair[0].as_str()));
-            link_msgs.push(LoreString::from(pair[1].as_str()));
-        }
-    }
+    let (mut link_paths, mut link_msgs) = util::split_path_messages(&args.link_messages);
 
     let is_interactive = !config().non_interactive && !config().json;
-    let has_explicit_flags = !link_message_values.is_empty();
+    let has_explicit_flags = !args.link_messages.is_empty();
     let is_link_scoped = args.link.is_some();
 
     if is_interactive && !has_explicit_flags && !is_link_scoped {
@@ -1047,38 +1038,6 @@ fn resolve_link_messages(
         }
     }
 
-    if !link_paths.is_empty() {
-        let discovered_paths: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::default()));
-        let discovered_paths_clone = discovered_paths.clone();
-        let validation_callback: LoreEventCallback = Some(
-            (Box::new(move |event: &LoreEvent| {
-                if let LoreEvent::LinkStagedEntry(data) = event {
-                    discovered_paths_clone.lock().push(data.path.to_string());
-                }
-            }) as EventCallbackFn)
-                .with_defaults(),
-        );
-
-        run_listing(
-            globals,
-            lore::link::LoreLinkListStagedArgs {},
-            validation_callback,
-        )?;
-
-        let valid_paths = discovered_paths.lock().clone();
-        for path in link_paths.iter() {
-            if !valid_paths.iter().any(|p| p == path.as_str()) {
-                println!(
-                    "{}Error: --link-message path '{}' does not match any linked repository with staged changes{}",
-                    CommonStyles::FAILURE,
-                    path.as_str(),
-                    anstyle::Reset
-                );
-                return Err(1);
-            }
-        }
-    }
-
     Ok((link_paths, link_msgs))
 }
 
@@ -1086,15 +1045,7 @@ fn resolve_layer_messages(
     globals: &LoreGlobalArgs,
     args: &RevisionCommitArgs,
 ) -> Result<(Vec<LoreString>, Vec<LoreString>), u8> {
-    let mut layer_paths: Vec<LoreString> = Vec::new();
-    let mut layer_msgs: Vec<LoreString> = Vec::new();
-
-    for pair in args.layer_messages.chunks(2) {
-        if pair.len() == 2 {
-            layer_paths.push(LoreString::from(pair[0].as_str()));
-            layer_msgs.push(LoreString::from(pair[1].as_str()));
-        }
-    }
+    let (mut layer_paths, mut layer_msgs) = util::split_path_messages(&args.layer_messages);
 
     let is_interactive = !config().non_interactive && !config().json;
     let has_explicit_flags = !args.layer_messages.is_empty();

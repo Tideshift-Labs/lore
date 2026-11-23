@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::InvalidArguments;
@@ -37,7 +36,7 @@ impl EventError for HashError {
 
 /// Data for the event reporting the hash of a single file.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileHashEventData {
     /// Path of the file.
@@ -70,7 +69,11 @@ pub async fn hash(
                     .await
                     .forward_any::<HashError>("reading file information")?,
             )?;
-            let hash = immutable::hash_file(repository.clone(), &operation.content_source(tracked))
+            let source = operation
+                .content_source(tracked)
+                .await
+                .forward_any::<HashError>("naming the content of the file")?;
+            let hash = immutable::hash_file(repository.clone(), &source)
                 .await
                 .forward_any::<HashError>("hashing file")?;
             Ok((size, hash))

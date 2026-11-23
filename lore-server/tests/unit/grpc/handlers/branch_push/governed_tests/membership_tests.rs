@@ -180,6 +180,7 @@ impl Fixture {
             );
             lore_server::grpc::revision::v1::branch_push::handler(
                 request,
+                crate::grpc::push_protected::allow_all(),
                 self.immutable.clone(),
                 self.mutable.clone(),
                 notifications,
@@ -194,6 +195,7 @@ impl Fixture {
         } else {
             let response = handler(
                 request,
+                crate::grpc::push_protected::allow_all(),
                 self.immutable.clone(),
                 self.mutable.clone(),
                 notifications,

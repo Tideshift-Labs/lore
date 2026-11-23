@@ -33,6 +33,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
 use lore_revision::state::State;
+use lore_revision::util::request_tracker::StoreRequestTracker;
 use lore_server::domain::DomainContext;
 use lore_server::grpc::domain_operation_metadata::DomainOperationMetadata;
 use lore_server::grpc::get_write_token;
@@ -350,6 +351,7 @@ async fn enforcing_cell_rejects_before_legacy_branch_push_body() {
     let instruments = RecordingInstrumentProvider::new();
     let error = handler(
         make_request(repository, BranchId::default(), Hash::default()),
+        crate::grpc::push_protected::allow_all(),
         immutable_store,
         mutable_store,
         notification,
@@ -1206,6 +1208,7 @@ async fn no_op_push_does_not_repeat_notification_or_post_hook() {
 
         let first = handler(
             make_request(repository, main, revision),
+            crate::grpc::push_protected::allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -1230,6 +1233,7 @@ async fn no_op_push_does_not_repeat_notification_or_post_hook() {
 
         let repeated = handler(
             make_request(repository, main, revision),
+            crate::grpc::push_protected::allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -1299,6 +1303,16 @@ impl SlowDownQueryStore {
 
 #[async_trait]
 impl ImmutableStore for SlowDownQueryStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn query(
         self: Arc<Self>,
         partition: Partition,
@@ -1497,7 +1511,14 @@ async fn verify_fragments_maps_slow_down_to_resource_exhausted() {
 
             fault_store.arm();
 
-            verify_fragments(repository, parent_state, None, state).await
+            verify_fragments(
+                repository,
+                parent_state,
+                None,
+                state,
+                &mut lore_server::grpc::handlers::branch_push::PushStoreRequests::default(),
+            )
+            .await
         })
         .await
         .expect_err("Expected verify_fragments to surface a SlowDown as an error status");
@@ -1563,7 +1584,14 @@ async fn verify_fragments_maps_a_collect_walk_slow_down_to_resource_exhausted() 
 
             fault_store.arm_metadata();
 
-            verify_fragments(repository, parent_state, None, state).await
+            verify_fragments(
+                repository,
+                parent_state,
+                None,
+                state,
+                &mut lore_server::grpc::handlers::branch_push::PushStoreRequests::default(),
+            )
+            .await
         })
         .await
         .expect_err("Expected verify_fragments to surface a walk SlowDown as an error status");
@@ -1619,6 +1647,7 @@ mod collect_new_addresses {
                 parent.clone(),
                 merge.clone(),
                 true,
+                Arc::new(StoreRequestTracker::default()),
             )
             .await
             .expect("collect against the first parent");
@@ -1627,6 +1656,7 @@ mod collect_new_addresses {
                 other.clone(),
                 merge.clone(),
                 true,
+                Arc::new(StoreRequestTracker::default()),
             )
             .await
             .expect("collect against the second parent");
@@ -1641,6 +1671,7 @@ mod collect_new_addresses {
                 parent,
                 Some(other.clone()),
                 merge.clone(),
+                Arc::new(StoreRequestTracker::default()),
             )
             .await
             .expect("collect against both parents");
@@ -1713,12 +1744,24 @@ mod collect_new_addresses {
 
             // The walk against the first parent reads only what is here, so its
             // success is what leaves the failure beside it the only one to report.
-            state::collect_new_fragments(repository.clone(), parent.clone(), merge.clone(), true)
-                .await
-                .expect("the first parent has to be walkable");
+            state::collect_new_fragments(
+                repository.clone(),
+                parent.clone(),
+                merge.clone(),
+                true,
+                Arc::new(StoreRequestTracker::default()),
+            )
+            .await
+            .expect("the first parent has to be walkable");
 
-            let Err(status) =
-                collect_new_addresses(repository.clone(), parent, Some(other), merge).await
+            let Err(status) = collect_new_addresses(
+                repository.clone(),
+                parent,
+                Some(other),
+                merge,
+                Arc::new(StoreRequestTracker::default()),
+            )
+            .await
             else {
                 panic!("a parent whose tree cannot be read cannot be collected against");
             };
@@ -1735,5 +1778,129 @@ mod collect_new_addresses {
             assert!(error.is_address_not_found(), "{error:?}");
         }))
         .await;
+    }
+}
+
+mod push_protected_action {
+    use lore_base::types::Hash;
+    use lore_server::hooks::HookDispatcher;
+    use lore_telemetry::InstrumentProvider;
+    use lore_transport::grpc::REPOSITORY_ID_KEY;
+    use opentelemetry::KeyValue;
+
+    use super::*;
+    use crate::grpc::push_protected::PUSH_PROTECTED;
+    use crate::grpc::push_protected::TIERS;
+    use crate::grpc::push_protected::Tier;
+    use crate::notification::testing::MockNotificationSender;
+
+    struct TestInstrumentProvider;
+
+    impl InstrumentProvider for TestInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+        fn labels(&self) -> &[KeyValue] {
+            &[]
+        }
+    }
+
+    async fn push_to_protected_branch(
+        tier: Tier,
+        actions: &'static [&'static str],
+        service_account: bool,
+    ) -> Result<(), tonic::Status> {
+        let repository_id = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .returning(|_, _, _, _, _| ());
+        let notification_sender = Arc::new(notification_sender);
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let main = create_test_branch(&repository).await;
+            branch::protect(repository.clone(), main)
+                .await
+                .expect("should protect");
+            let state =
+                serialize_revision(&repository, main, Hash::default(), Hash::default(), 1).await;
+
+            let mut request = tonic::Request::new(lore_proto::BranchPushRequest {
+                branch: main.into(),
+                revision: state.revision().into(),
+                force: false,
+                fast_forward_merge: false,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository_id.data()),
+            );
+            let mut request = tier.with_token(request, repository_id, actions);
+            if service_account {
+                // Replaces the claims with a token whose only privilege is the removed claim.
+                request
+                    .extensions_mut()
+                    .insert(lore_server::auth::jwt::AuthorizationToken {
+                        user_id: "service-bot".into(),
+                        is_service_account: Some(true),
+                        ..Default::default()
+                    });
+            }
+
+            let hook_dispatcher = HookDispatcher::empty();
+            handler(
+                request,
+                tier.authorizer(),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+                &TestInstrumentProvider,
+                None,
+                None,
+            )
+            .await
+            .map(|_| ())
+        }))
+        .await
+    }
+
+    #[tokio::test]
+    async fn the_action_bypasses_protection() {
+        for tier in TIERS {
+            push_to_protected_branch(tier, &[PUSH_PROTECTED], false)
+                .await
+                .unwrap_or_else(|err| panic!("{tier:?}: holder of the action should push: {err}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn without_the_action_a_protected_branch_is_denied() {
+        for tier in TIERS {
+            let err = push_to_protected_branch(tier, &["read", "write"], false)
+                .await
+                .expect_err("a caller without the action must not push");
+            assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_service_account_claim_no_longer_bypasses_protection() {
+        for tier in TIERS {
+            let err = push_to_protected_branch(tier, &[], true)
+                .await
+                .expect_err("the claim alone must not waive protection");
+            assert_eq!(err.code(), Code::PermissionDenied, "{tier:?}");
+        }
     }
 }

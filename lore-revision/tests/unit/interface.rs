@@ -3,9 +3,12 @@
 use lore_base::text::ValidateText;
 
 mod binary_tests;
+mod call_environment_tests;
+mod encoding_tests;
 mod event_interval_tests;
 mod metadata_repr_tests;
 
+use lore_revision::auth::AuthMode;
 use lore_revision::interface::*;
 
 /// An empty array holds a null pointer whichever constructor built it. `Drop` frees only a
@@ -61,15 +64,15 @@ fn a_zero_sized_element_type_still_drops_every_element() {
     );
 }
 
-/// Deserializing an empty sequence routes through `from_vec`.
+/// Decoding an empty array routes through the boxed slice it takes over.
 #[test]
-fn a_deserialized_empty_array_holds_no_buffer() {
-    let decoded: LoreArray<u32> =
-        serde_json::from_str("[]").expect("an empty sequence deserializes");
+fn a_decoded_empty_array_holds_no_buffer() {
+    let decoded: LoreArray<u32> = bitcode::decode(&bitcode::encode(&LoreArray::<u32>::default()))
+        .expect("an empty array decodes");
 
     assert!(
         decoded.ptr.is_null(),
-        "deserializing an empty array allocated a buffer Drop will not free"
+        "decoding an empty array allocated a buffer Drop will not free"
     );
 }
 
@@ -120,6 +123,13 @@ fn a_token_that_is_not_utf8_is_reported_by_field() {
             .field(),
         "access_token"
     );
+}
+
+#[test]
+fn an_unset_auth_mode_is_auto() {
+    let mut globals = LoreGlobalArgs::default();
+    assert!(globals.validate().is_ok());
+    assert_eq!(globals.auth_mode, AuthMode::Auto);
 }
 
 #[test]
@@ -230,9 +240,8 @@ fn lore_string_renders_invalid_utf8_as_replacement_characters() {
     assert_eq!(format!("{value:?}"), "a\u{fffd}\u{fffd}b");
 }
 
-/// Unlike formatting, serialization must not substitute: it carries the
-/// command to the service, where a replacement-character name would be
-/// accepted as valid text that the in-process path would have rejected.
+/// Unlike formatting, serialization must not substitute: a replacement-character
+/// name reads as text that was never stored.
 #[test]
 fn lore_string_serialization_rejects_invalid_utf8() {
     let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);

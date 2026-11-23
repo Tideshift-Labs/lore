@@ -16,14 +16,20 @@ use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
 use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::FsError;
+use lore_revision::fs::filesystem_provider::HoldOptions;
 use lore_revision::fs::filesystem_provider::InstanceOperation;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
 use lore_revision::fs::filesystem_provider::create_empty_directory;
+use lore_revision::fs::filesystem_provider::test_util::CommittedCalls;
+use lore_revision::fs::filesystem_provider::test_util::HoldCalls;
+use lore_revision::fs::filesystem_provider::test_util::StoredCalls;
 use lore_revision::fs::filesystem_provider::test_util::TestOperation;
 use lore_revision::fs::filesystem_provider::with_operation;
 use lore_revision::fs::filesystem_provider::with_operation_if;
+use lore_revision::fs::os::OsFilesystem;
 use lore_revision::lore::RepositoryId;
+use lore_revision::node::NodeID;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
 use lore_revision::util::path::RelativePath;
@@ -39,9 +45,23 @@ pub struct TestFilesystemProvider {
     pub holds_name_count: Arc<AtomicUsize>,
     pub names_folding_count: Arc<AtomicUsize>,
     pub finalize_events: Arc<Mutex<Vec<bool>>>,
+    pub hold_calls: HoldCalls,
+    pub stored_calls: StoredCalls,
+    pub committed_calls: CommittedCalls,
+    /// The directory file information and content are read from, where given.
+    reads: Option<OsFilesystem>,
+    /// Paths whose scan fails.
+    pub failing_scans: Arc<Mutex<Vec<String>>>,
+    /// Paths whose scan finds the named node stale.
+    pub stale_on_scan: Arc<Mutex<Vec<(String, NodeID)>>>,
     finalize_fails: bool,
+    committed_fails: bool,
     write_fails: bool,
+    content_source_fails: bool,
+    content_source_missing: bool,
     holds_paths: bool,
+    holds_state: bool,
+    hold_refuses: bool,
 }
 
 impl TestFilesystemProvider {
@@ -53,6 +73,22 @@ impl TestFilesystemProvider {
     pub fn failing_finalize() -> TestFilesystemProvider {
         Self {
             finalize_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations cannot name the content at any path.
+    pub fn failing_content_sources() -> TestFilesystemProvider {
+        Self {
+            content_source_fails: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations hold no file at any path, which they report naming no source.
+    pub fn missing_content_sources() -> TestFilesystemProvider {
+        Self {
+            content_source_missing: true,
             ..Self::new()
         }
     }
@@ -71,6 +107,48 @@ impl TestFilesystemProvider {
         Self {
             holds_paths: true,
             ..Self::new()
+        }
+    }
+
+    /// A provider that holds its state in a `State`.
+    pub fn holding_state() -> TestFilesystemProvider {
+        Self {
+            holds_state: true,
+            ..Self::new()
+        }
+    }
+
+    /// A provider whose operations read file information and content from the directory
+    /// `root`.
+    pub fn reading(root: &Path) -> TestFilesystemProvider {
+        Self {
+            reads: Some(OsFilesystem::new(root)),
+            ..Self::new()
+        }
+    }
+
+    /// A provider holding its state whose operations read from `root`, as [`Self::reading`]'s do.
+    pub fn holding_state_reading(root: &Path) -> TestFilesystemProvider {
+        Self {
+            holds_state: true,
+            ..Self::reading(root)
+        }
+    }
+
+    /// A provider holding its state, reading from `root`, whose operations report each
+    /// `committed` call failed.
+    pub fn holding_state_failing_committed(root: &Path) -> TestFilesystemProvider {
+        Self {
+            committed_fails: true,
+            ..Self::holding_state_reading(root)
+        }
+    }
+
+    /// A provider that holds its state, whose operations refuse each hold for local changes.
+    pub fn refusing_holds() -> TestFilesystemProvider {
+        Self {
+            hold_refuses: true,
+            ..Self::holding_state()
         }
     }
 
@@ -97,6 +175,16 @@ impl TestFilesystemProvider {
 pub async fn test_repository(filesystem: Arc<TestFilesystemProvider>) -> Arc<RepositoryContext> {
     let (immutable_store, mutable_store, _context) =
         test_store_create().await.expect("Making test stores");
+    test_repository_over(immutable_store, mutable_store, filesystem)
+}
+
+/// A repository over `immutable_store` and `mutable_store` whose filesystem provider is
+/// `filesystem`.
+pub fn test_repository_over(
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    filesystem: Arc<TestFilesystemProvider>,
+) -> Arc<RepositoryContext> {
     Arc::new(RepositoryContext::new(
         default_repository_creation_args(immutable_store, mutable_store)
             .with_filesystem_provider(filesystem),
@@ -115,9 +203,24 @@ impl FilesystemProvider for TestFilesystemProvider {
                 finalize_events: self.finalize_events.clone(),
                 finalize_fails: self.finalize_fails,
                 write_fails: self.write_fails,
+                content_source_fails: self.content_source_fails,
+                content_source_missing: self.content_source_missing,
                 holds_paths: self.holds_paths,
+                hold_calls: self.hold_calls.clone(),
+                stored_calls: self.stored_calls.clone(),
+                committed_calls: self.committed_calls.clone(),
+                committed_fails: self.committed_fails,
+                reads: self.reads.as_ref().map(OsFilesystem::begin_operation),
+                hold_refuses: self.hold_refuses,
+                failing_scans: self.failing_scans.clone(),
+                stale_on_scan: self.stale_on_scan.clone(),
             }),
+            self.holds_state,
         )))
+    }
+
+    fn holds_state(&self) -> bool {
+        self.holds_state
     }
 }
 
@@ -300,6 +403,107 @@ async fn an_operation_whose_write_failed_finalizes_as_changed() {
     assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
 }
 
+/// Holding a revision changes what the provider serves, as a write does.
+#[tokio::test]
+async fn an_operation_that_held_a_revision_finalizes_as_changed() {
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state());
+    let repository = test_repository(filesystem.clone()).await;
+
+    with_operation(repository.file_system(), async |operation| {
+        operation
+            .hold_state(repository.clone(), State::new(), HoldOptions::default())
+            .await
+    })
+    .await
+    .expect("The hold succeeded");
+
+    assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+}
+
+/// A dry run changes nothing the provider serves.
+#[tokio::test]
+async fn an_operation_that_held_a_revision_in_a_dry_run_finalizes_unchanged() {
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state());
+    let repository = test_repository(filesystem.clone()).await;
+
+    with_operation(repository.file_system(), async |operation| {
+        operation
+            .hold_state(
+                repository.clone(),
+                State::new(),
+                HoldOptions {
+                    dry_run: true,
+                    ..Default::default()
+                },
+            )
+            .await
+    })
+    .await
+    .expect("The hold succeeded");
+
+    assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+}
+
+/// An OS operation holds no `State`, and refuses to hold a revision.
+#[tokio::test]
+async fn an_os_operation_refuses_to_hold_a_revision() {
+    let dir = lore_base::test_util::TempDir::new("lore-fs-provider-hold-state-");
+    let operation = os_operation(dir.path()).await;
+    assert!(!operation.holds_state());
+
+    let repository = test_repository(Arc::new(TestFilesystemProvider::new())).await;
+    let refused = operation
+        .hold_state(repository, State::new(), HoldOptions::default())
+        .await;
+    assert!(matches!(refused, Err(FsError::Internal(_))), "{refused:?}");
+}
+
+/// A provider that holds no `State` refuses to hold a revision, records nothing, and its
+/// operation finalizes unchanged.
+#[tokio::test]
+async fn a_refused_hold_finalizes_unchanged() {
+    let filesystem = Arc::new(TestFilesystemProvider::new());
+    let repository = test_repository(filesystem.clone()).await;
+
+    let refused = with_operation(repository.file_system(), async |operation| {
+        operation
+            .hold_state(repository.clone(), State::new(), HoldOptions::default())
+            .await
+    })
+    .await;
+
+    assert!(matches!(refused, Err(FsError::Internal(_))), "{refused:?}");
+    assert!(filesystem.hold_calls.lock().is_empty());
+    assert_eq!(vec![false], *(filesystem.finalize_events.lock()));
+}
+
+/// A provider built with `holding_state()` reports it holds its state, and its operation records
+/// the target revision and the options it was given.
+#[tokio::test]
+async fn a_holding_test_operation_records_the_target_and_options() {
+    let filesystem = Arc::new(TestFilesystemProvider::holding_state());
+    let repository = test_repository(filesystem.clone()).await;
+    let operation = filesystem.begin_operation().await.expect("an operation");
+    assert!(operation.holds_state());
+
+    let target = State::new();
+    target.set_revision(lore_base::types::Hash::from_u64(2));
+    let options = HoldOptions {
+        keep_local: true,
+        ..Default::default()
+    };
+
+    operation
+        .hold_state(repository, target.clone(), options)
+        .await
+        .expect("a holding test operation always succeeds");
+
+    assert_eq!(
+        vec![(target.revision(), options)],
+        *filesystem.hold_calls.lock()
+    );
+}
+
 #[tokio::test]
 async fn a_finalize_failure_is_reported_where_the_work_succeeded() {
     let filesystem = Arc::new(TestFilesystemProvider::failing_finalize());
@@ -473,6 +677,70 @@ async fn a_lookup_through_an_operation_is_counted() {
 
     assert!(!info.exists());
     assert_eq!(1, filesystem.file_infos());
+}
+
+/// Whether content is diffable is derived from its source, so a provider that cannot name the
+/// content reports its error rather than answering.
+#[tokio::test]
+async fn diffability_of_content_that_cannot_be_named_reports_the_error() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::failing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+
+            let diffable = operation.infer_is_diffable(&relative("unnamed")).await;
+
+            assert!(
+                matches!(diffable, Err(FsError::Internal(_))),
+                "{diffable:?}"
+            );
+        })
+        .await;
+}
+
+/// Whether content holds conflict markers is derived from its source, so a provider that cannot
+/// name the content reports its error rather than answering.
+#[tokio::test]
+async fn conflict_markers_in_content_that_cannot_be_named_report_the_error() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::failing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+
+            let conflicted = operation.infer_is_conflicted(&relative("unnamed")).await;
+
+            assert!(
+                matches!(conflicted, Err(FsError::Internal(_))),
+                "{conflicted:?}"
+            );
+        })
+        .await;
+}
+
+/// A path holding no file is neither diffable nor conflicted: content a provider reports not found
+/// is answered rather than failing the caller.
+#[tokio::test]
+async fn content_reported_not_found_is_neither_diffable_nor_conflicted() {
+    lore_base::runtime::LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let filesystem = TestFilesystemProvider::missing_content_sources();
+            let operation = filesystem.begin_operation().await.expect("an operation");
+            let path = relative("absent");
+
+            assert!(
+                !operation
+                    .infer_is_diffable(&path)
+                    .await
+                    .expect("a path holding no file is an answer")
+            );
+            assert!(
+                !operation
+                    .infer_is_conflicted(&path)
+                    .await
+                    .expect("a path holding no file is an answer")
+            );
+        })
+        .await;
 }
 
 /// An operation rooted at `root`, which is what a caller names its paths against.
@@ -714,9 +982,16 @@ pub async fn test_store_create() -> Result<
 }
 
 pub fn setup_test_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+    test_execution_with(lore_revision::interface::LoreGlobalArgs::default())
+}
+
+/// An execution whose global arguments are `args`.
+pub fn test_execution_with(
+    args: lore_revision::interface::LoreGlobalArgs,
+) -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
     std::sync::Arc::new(
         lore_revision::interface::ExecutionContext::new_client_with_user_id(
-            lore_revision::interface::LoreGlobalArgs::default(),
+            args,
             lore_revision::relay::EventDispatcher::no_dispatch(),
             "test-user".to_string(),
         ),

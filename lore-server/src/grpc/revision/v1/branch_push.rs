@@ -26,13 +26,13 @@ use tracing::debug;
 use tracing::info;
 use tracing::span;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::domain::DomainContext;
 use crate::domain::GovernedScope;
 use crate::domain::admit_at_entry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::branch_push::PushResult;
@@ -68,6 +68,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "BranchPush::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchPushRequest>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     notification: Arc<dyn NotificationSender>,
@@ -80,18 +81,14 @@ pub async fn handler(
 ) -> Result<Response<BranchPushResponse>, Status> {
     let request_metadata = request.metadata().clone();
     let request_authorization = crate::grpc::get_authorization_optional(request.extensions());
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
 
-    // Service accounts bypass branch-protection (mirroring path).
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    // The `push-protected` action waives branch protection, which is how mirroring pushes.
+    let bypass_protection = authorizer
+        .permits(request.extensions(), repository_id, "push-protected")
+        .await;
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
     let req = request.into_inner();

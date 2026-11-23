@@ -58,12 +58,12 @@ fn partition() -> Partition {
     Partition::from([0x24u8; 16])
 }
 
-async fn connect(peer: &Peer) -> StorageClient {
+async fn connect(peer: &Peer) -> Arc<StorageClient> {
     StorageClient::connect(
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "",
+        &lore_transport::auth::AuthEndpoint::none(),
         "managed-send-bound",
         partition(),
         &Arc::new(SuppliedCredentials::default()),
@@ -777,7 +777,7 @@ async fn queue_behind_a_stalled_writer(
 #[tokio::test]
 async fn a_managed_put_queued_behind_a_stalled_writer_is_not_dispatched() {
     let peer = Arc::new(Peer::start());
-    let client = Arc::new(connect(&peer).await);
+    let client = connect(&peer).await;
     let (session, stream) = warm_up(&peer, &client).await;
     client.quic().set_managed_idle_for_test(BOUND);
     let writer = queue_behind_a_stalled_writer(
@@ -832,7 +832,7 @@ async fn a_managed_put_queued_behind_a_managed_writer_that_keeps_writing_is_not_
 
 async fn a_waiter_behind_a_trickling_writer_is_served(managed_writer: bool) {
     let peer = Arc::new(Peer::start());
-    let client = Arc::new(connect(&peer).await);
+    let client = connect(&peer).await;
     let (session, stream) = warm_up(&peer, &client).await;
     client.quic().set_managed_idle_for_test(BOUND);
     // Trickle: the peer reads 2 KiB every 50 ms, and quinn grants more credit each 2 KiB, so the
@@ -939,7 +939,7 @@ impl Authentication for GrantingAuthentication {
         _: &str,
         _: &str,
         _: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+    ) -> Result<lore_transport::types::AuthSessionPoll, ProtocolError> {
         Err(ProtocolError::internal("repository exchanges only"))
     }
 
@@ -987,14 +987,15 @@ impl Authentication for GrantingAuthentication {
     }
 }
 
-async fn authenticated_client(peer: &Peer) -> StorageClient {
+async fn authenticated_client(peer: &Peer) -> Arc<StorageClient> {
     // Process-global registry: a second registration of the same scheme is an error we ignore.
     let _ = authentication::add(HEAL_SCHEME, Arc::new(GrantingAuthentication));
     StorageClient::connect(
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        &format!("{HEAL_SCHEME}://auth.example.com"),
+        &lore_transport::auth::AuthEndpoint::resolve(&format!("{HEAL_SCHEME}://auth.example.com"))
+            .expect("the heal scheme is registered"),
         HEAL_IDENTITY,
         partition(),
         &Arc::new(SuppliedCredentials::new(&unsigned_jwt(HEAL_IDENTITY), "")),
@@ -1173,7 +1174,7 @@ async fn a_healing_verify_that_cannot_bind_a_namespace_sends_nothing() {
 #[tokio::test]
 async fn other_answers_on_the_connection_keep_a_waiting_managed_put_alive() {
     let peer = Arc::new(Peer::start());
-    let client = Arc::new(connect(&peer).await);
+    let client = connect(&peer).await;
     let session = declared_session(&peer, &client).await;
     client.quic().set_managed_idle_for_test(BOUND);
     peer.rule(PUT, Reply::Hold(Vec::new()));
@@ -1220,7 +1221,7 @@ async fn other_answers_on_the_connection_keep_a_waiting_managed_put_alive() {
 #[tokio::test]
 async fn a_sibling_that_wrote_nothing_before_a_phase_two_close_is_not_a_lost_answer() {
     let peer = Arc::new(Peer::start());
-    let client = Arc::new(connect(&peer).await);
+    let client = connect(&peer).await;
     let (session, stream) = warm_up(&peer, &client).await;
     client.quic().set_managed_idle_for_test(BOUND);
     // A managed writer stalls after a partial write and will close the connection.

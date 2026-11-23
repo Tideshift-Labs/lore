@@ -32,6 +32,7 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::domain::DomainContext;
 use crate::domain::GovernedCreateWitness;
 use crate::domain::GovernedRepositoryCreate;
@@ -59,7 +60,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -167,7 +168,7 @@ pub async fn handler(
                         repository_creator.as_str(),
                         req.creator.as_str(),
                         req.created,
-                        auth_url,
+                        registry,
                         authorization,
                     )
                     .await
@@ -187,7 +188,7 @@ pub async fn handler(
                     req.default_branch_name.as_str(),
                     req.creator.as_str(),
                     req.created,
-                    auth_url,
+                    registry,
                     authorization,
                 )
                 .await
@@ -254,7 +255,7 @@ async fn repository_create(
     default_branch_name: &str,
     creator: &str,
     created: u64,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     authorization: Option<String>,
 ) -> Result<RepositoryData, Status> {
     validate_create_input(name, description, default_branch_name, creator)?;
@@ -344,10 +345,7 @@ async fn repository_create(
         };
     }
 
-    if let Some(auth_url) = auth_url {
-        let client = Box::new(grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name, None).await?;
-    }
+    registry.add(authorization, repository.id, name).await?;
 
     // Set up the repository metadata
     let metadata = RepositoryMetadata {
@@ -494,7 +492,7 @@ pub(crate) async fn governed_repository_create(
     repository_creator: &str,
     branch_creator: &str,
     created: u64,
-    auth_url: Option<String>,
+    registry: &RepositoryRegistry,
     authorization: Option<String>,
 ) -> Result<(RepositoryMetadata, lore_storage::Hash), Status> {
     // `branch_creator` rather than `repository_creator` is the value the legacy
@@ -528,22 +526,30 @@ pub(crate) async fn governed_repository_create(
     // An attached claim with nowhere to acknowledge it. `auth_url` and JWT
     // authentication are separate settings, so a cell can verify a principal,
     // enforce the domain, and still have no ReBAC endpoint configured — and on
-    // that cell the `if let` below would skip the callback entirely and commit a
+    // that cell the registry would skip the callback entirely and commit a
     // claimed create that nothing ever acknowledged. The acknowledgement is the
     // one ordering this callback exists to establish, so its absence is a cell
     // misconfiguration and refused, not a step quietly omitted.
+    //
+    // FORK-LOCAL (Tideshift, v0.11 merge): upstream's `RepositoryRegistry` may
+    // also register through `lore.user.v1` `PartitionAdd` at `user_url`. That
+    // RPC has no claim fields, so a claimed create cannot be acknowledged there
+    // either and is refused the same way. Only the `RebacApi` registry carries
+    // the claim.
     let create_witness = governed.create_witness();
-    if create_witness.is_some() && auth_url.is_none() {
-        return Err(Status::failed_precondition(
-            "Governed repository create requires a configured authorization service to \
-             acknowledge its claim",
-        ));
-    }
-
-    if let Some(auth_url) = auth_url {
-        let client = Box::new(grpc_get_rebac_client(auth_url).await?);
-        repository_create_auth_resource(client, authorization, repository.id, name, create_witness)
-            .await?;
+    match (registry, create_witness) {
+        (RepositoryRegistry::AuthService(auth_url), witness) => {
+            let client = Box::new(grpc_get_rebac_client(auth_url.clone()).await?);
+            repository_create_auth_resource(client, authorization, repository.id, name, witness)
+                .await?;
+        }
+        (_, Some(_)) => {
+            return Err(Status::failed_precondition(
+                "Governed repository create requires a configured authorization service to \
+                 acknowledge its claim",
+            ));
+        }
+        (registry, None) => registry.add(authorization, repository.id, name).await?,
     }
 
     let creation_metadata = governed.metadata_upload_context(&repository)?;

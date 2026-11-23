@@ -12,8 +12,6 @@ use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use lore_revision::interface::LoreError;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -24,7 +22,7 @@ use crate::revision_tree::handle::LoreRevisionTree;
 
 /// Arguments for `lore_revision_tree_close`.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(close_impl)]
 pub struct LoreRevisionTreeCloseArgs {
     /// Per-call correlation id echoed back in events
@@ -89,6 +87,25 @@ fn close_impl(
         };
 
         internal.mark_invalid_and_await().await;
+
+        // A tree closed after its storage handle has writes nothing else will flush: the
+        // handle's close flushed what had been written by then. Left flagged, they would keep
+        // the store's flock past this tree — which may be the last thing claiming it — for as
+        // long as the process runs. Flushed under claims joined while the tree still holds the
+        // handle's.
+        let store = &internal.store_internal;
+        if store.invalid.load(std::sync::atomic::Ordering::Acquire) {
+            let sync_data = lore_revision::lore::execution_context()
+                .globals()
+                .sync_data();
+            let claims = crate::storage::close::claims_for_flush(store);
+            crate::storage::close::spawn_flush_for_closed_tree(
+                store.immutable.clone(),
+                store.mutable.clone(),
+                claims,
+                sync_data,
+            );
+        }
 
         LoreEvent::RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData {
             id: args.id,

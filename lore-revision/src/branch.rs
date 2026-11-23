@@ -27,7 +27,6 @@ use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::MatchedProtocolError;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
 use serde::Serialize;
 use tokio::join;
 use tokio::sync::RwLock;
@@ -93,7 +92,7 @@ use crate::util::serde::u8_as_bool;
 
 /// Event data reported when a branch is created.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchCreateEventData {
     /// Name of the created branch.
@@ -107,7 +106,7 @@ pub struct LoreBranchCreateEventData {
 
 /// Event data reported when a branch is archived.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchArchiveEventData {
     /// Name of the archived branch.
@@ -116,7 +115,7 @@ pub struct LoreBranchArchiveEventData {
 
 /// Event data reported at the start of a branch listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchListBeginEventData {
     /// Location the listed branches come from.
@@ -125,7 +124,7 @@ pub struct LoreBranchListBeginEventData {
 
 /// Event data reported for each branch in a branch listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchListEntryEventData {
     /// Location this branch comes from.
@@ -154,7 +153,7 @@ pub struct LoreBranchListEntryEventData {
 
 /// Event data reported at the end of a branch listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchListEndEventData {
     /// Location the listed branches came from.
@@ -165,7 +164,7 @@ pub struct LoreBranchListEndEventData {
 
 /// Event data reported at the start of a branch diff.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffBeginEventData {
     /// Identifier of the source branch of the diff.
@@ -186,7 +185,7 @@ pub struct LoreBranchDiffBeginEventData {
 
 /// Event data describing a single changed node in a branch diff.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffNodeData {
     /// File action applied to the node.
@@ -229,7 +228,7 @@ impl LoreBranchDiffNodeData {
 
 /// Event data reported at the start of the change section of a branch diff.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffChangeBeginEventData {
     /// Number of changes that follow.
@@ -238,7 +237,7 @@ pub struct LoreBranchDiffChangeBeginEventData {
 
 /// Event data reporting a single change in a branch diff.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffChangeEventData {
     /// The changed node.
@@ -247,7 +246,7 @@ pub struct LoreBranchDiffChangeEventData {
 
 /// Event data reported at the end of the change section of a branch diff.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffChangeEndEventData {
     /// Unused placeholder field.
@@ -256,7 +255,7 @@ pub struct LoreBranchDiffChangeEndEventData {
 
 /// Event data reported at the start of the conflict section of a branch diff.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffConflictBeginEventData {
     /// Number of conflicts that follow.
@@ -265,7 +264,7 @@ pub struct LoreBranchDiffConflictBeginEventData {
 
 /// Event data reporting a single conflict in a branch diff.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffConflictEventData {
     /// The change on the source side of the conflict.
@@ -276,7 +275,7 @@ pub struct LoreBranchDiffConflictEventData {
 
 /// Event data reported at the end of the conflict section of a branch diff.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffConflictEndEventData {
     /// Unused placeholder field.
@@ -285,7 +284,7 @@ pub struct LoreBranchDiffConflictEndEventData {
 
 /// Event data reported at the end of a branch diff.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffEndEventData {
     /// Unused placeholder field.
@@ -294,7 +293,7 @@ pub struct LoreBranchDiffEndEventData {
 
 /// Event data reported when a branch is protected.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchProtectEventData {
     /// Name of the protected branch.
@@ -303,7 +302,7 @@ pub struct LoreBranchProtectEventData {
 
 /// Event data reported when a branch is unprotected.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchUnprotectEventData {
     /// Name of the unprotected branch.
@@ -1960,9 +1959,13 @@ async fn create_linked_branches(
             .forward::<BranchError>("Failed to write revision metadata")?,
     );
 
-    commit::weave_history(repository.clone(), state.clone())
-        .await
-        .forward::<BranchError>("Failed to weave history")?;
+    commit::weave_history(
+        repository.clone(),
+        state.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<BranchError>("Failed to weave history")?;
 
     let signature = state
         .serialize(repository.clone(), token)

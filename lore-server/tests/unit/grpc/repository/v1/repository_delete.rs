@@ -10,6 +10,7 @@ use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
 use lore_server::auth::jwt::AuthorizationToken;
+use lore_server::authnz::repository_registry::RepositoryRegistry;
 use lore_server::grpc::repository::v1::repository_delete::*;
 use lore_telemetry::InstrumentProvider;
 use rand::random;
@@ -63,13 +64,12 @@ fn delete_request(id: RepositoryId, token: AuthorizationToken) -> Request<Reposi
     request
 }
 
-/// The creator check compares the recorded creator against the token's
-/// `identity_claim` value, so a deployment recording
-/// `preferred_username` lets the same user, presenting the same claim,
-/// delete — while the subject the provider minted alongside is not what
-/// is compared.
+/// The creator check compares the recorded creator against the identity the
+/// verifier resolved, so an issuer minting `preferred_username` into the
+/// `identity` claim lets the same user delete, while the subject minted
+/// alongside is not what is compared.
 #[tokio::test]
-async fn the_creator_check_compares_the_identity_claim() {
+async fn the_creator_check_compares_the_resolved_identity() {
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
 
@@ -84,7 +84,7 @@ async fn the_creator_check_compares_the_identity_claim() {
         };
         let status = handler(
             delete_request(id, by_subject.clone()),
-            None,
+            &RepositoryRegistry::Unregistered,
             immutable_store.clone(),
             mutable_store.clone(),
             &TestInstrumentProvider,
@@ -100,7 +100,7 @@ async fn the_creator_check_compares_the_identity_claim() {
         };
         handler(
             delete_request(id, by_username),
-            None,
+            &RepositoryRegistry::Unregistered,
             immutable_store,
             mutable_store,
             &TestInstrumentProvider,
@@ -142,7 +142,7 @@ async fn no_domain_coordinator_reaches_the_legacy_repository_lookup_not_blocked_
         .scope(execution, async move {
             handler(
                 make_request(repository_id),
-                None, /* no auth_url */
+                &RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &TestInstrumentProvider,
@@ -159,4 +159,53 @@ async fn no_domain_coordinator_reaches_the_legacy_repository_lookup_not_blocked_
             .message()
             .contains(&format!("Repository {repository_id} not found"))
     );
+}
+
+/// With a `user_url` registry `PartitionRemove` authorizes the delete, so
+/// a non-creator's delete is not refused locally but asks the directory, and
+/// a failed `PartitionRemove` leaves the repository in place. Nothing listens
+/// at the directory's address.
+#[tokio::test]
+async fn the_user_service_registry_authorizes_the_delete() {
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let id = random::<RepositoryId>();
+        seed_repository(immutable_store.clone(), mutable_store.clone(), id, "alice").await;
+        let registry = RepositoryRegistry::UserService("http://127.0.0.1:1".to_string());
+        let by_non_creator = AuthorizationToken {
+            identity: Some("mallory".to_string()),
+            ..Default::default()
+        };
+
+        let status = handler(
+            delete_request(id, by_non_creator),
+            &registry,
+            immutable_store.clone(),
+            mutable_store.clone(),
+            &TestInstrumentProvider,
+            None, /* no domain coordinator */
+        )
+        .await
+        .expect_err("the unreachable directory fails the delete");
+        assert_eq!(
+            status.code(),
+            tonic::Code::Internal,
+            "the directory, not the creator check, decides"
+        );
+
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            id,
+        ));
+        assert_eq!(
+            repository::id_from_name(repository, "the-repository")
+                .await
+                .expect("the name mapping survives a failed delete"),
+            id
+        );
+    }))
+    .await;
 }

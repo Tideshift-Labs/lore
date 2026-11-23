@@ -572,6 +572,13 @@ pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
     false
 }
 
+impl ProtocolError {
+    /// Whether the remote refused the credentials presented, as unauthenticated or unauthorized.
+    pub fn is_refusal(&self) -> bool {
+        self.is_not_authorized() || self.is_not_authenticated()
+    }
+}
+
 impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
         if is_unsupported_client_status(&value) {

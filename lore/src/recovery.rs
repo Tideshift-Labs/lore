@@ -27,6 +27,9 @@ pub async fn receipt_get(
             lore_transport::connection::MAX_STORAGE_CONNECTIONS,
             "",
             "",
+            // A receipt read has no caller globals; follow the server's preference, as a call
+            // that leaves `auth_mode` zeroed does.
+            lore_transport::auth::AuthMode::Auto,
         )
         .await?;
         connection

@@ -67,12 +67,12 @@ fn managed_context() -> CallerOperationContext {
     )
 }
 
-async fn connect(peer: &Peer) -> StorageClient {
+async fn connect(peer: &Peer) -> Arc<StorageClient> {
     StorageClient::connect(
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "",
+        &lore_transport::auth::AuthEndpoint::none(),
         "managed-reconnect-bound",
         partition(),
         &Arc::new(SuppliedCredentials::default()),
@@ -83,7 +83,7 @@ async fn connect(peer: &Peer) -> StorageClient {
 }
 
 /// A client with an open declared session, the connection live, and the managed bound shortened.
-async fn client_with_session(peer: &Peer) -> (StorageClient, u32) {
+async fn client_with_session(peer: &Peer) -> (Arc<StorageClient>, u32) {
     let client = connect(peer).await;
     client.quic().set_managed_idle_for_test(BOUND);
     let session = client
@@ -447,7 +447,7 @@ async fn deadline_outcome(
     let result = tokio::time::timeout(
         BOUND + Duration::from_secs(40),
         lore_transport::with_managed_workflow(reconnect_and_retry::<_, _, 1, false, true>(
-            &client,
+            &*client,
             request,
             session,
             || [Bytes::from_static(b"payload")],
@@ -616,7 +616,6 @@ async fn recover_lost_put(
 ) {
     let peer = Peer::start();
     let (client, session) = client_with_session(&peer).await;
-    let client = Arc::new(client);
     dispatch_silent_put(&peer, &client, session).await;
     assert_eq!(
         peer.seen_opcode(PUT).len(),
@@ -729,7 +728,7 @@ async fn send_with_reconnect_dispatches_a_silent_put_once_and_reports_unknown() 
     let result = tokio::time::timeout(
         BOUND + Duration::from_secs(40),
         lore_transport::with_managed_workflow(send_with_reconnect::<_, _, 1, false, true>(
-            &client,
+            &*client,
             Command::Put,
             session,
             raw_put,
@@ -762,7 +761,7 @@ async fn send_with_reconnect_without_a_session_dispatches_a_silent_put_once() {
     let result = tokio::time::timeout(
         BOUND + Duration::from_secs(40),
         lore_transport::with_managed_workflow(send_with_reconnect::<_, _, 1, false, true>(
-            &client,
+            &*client,
             Command::Put,
             0,
             raw_put,
@@ -818,7 +817,7 @@ async fn the_deadline_arm_sends_nothing_for_a_not_dispatched_put_on_a_live_conne
     let result = tokio::time::timeout(
         BOUND + Duration::from_secs(40),
         lore_transport::with_managed_workflow(reconnect_and_retry::<_, _, 1, false, true>(
-            &client,
+            &*client,
             Command::Put,
             session,
             raw_put,
@@ -852,7 +851,6 @@ async fn the_deadline_arm_sends_nothing_for_a_not_dispatched_put_on_a_live_conne
 async fn the_deadline_arm_sends_nothing_for_a_dispatched_put_on_a_live_connection() {
     let peer = Peer::start();
     let (client, session) = client_with_session(&peer).await;
-    let client = Arc::new(client);
     dispatch_silent_put(&peer, &client, session).await;
     let guard = client.quic().hold_reconnect_guard_for_test().await;
 

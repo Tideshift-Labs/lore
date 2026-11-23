@@ -219,6 +219,10 @@ pub fn map_message_handle_error_to_status(
             Code::Unauthenticated,
             message.unwrap_or_else(|| error.to_string()),
         ),
+        MessageHandleError::InvalidArgument(err) => (
+            Code::InvalidArgument,
+            message.unwrap_or_else(|| format!("Invalid argument: {err}")),
+        ),
     };
 
     let mut status = Status::with_details(code, message, details.unwrap_or_default());

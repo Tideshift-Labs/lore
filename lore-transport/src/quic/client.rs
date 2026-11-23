@@ -27,6 +27,7 @@ use lore_base::error::NotAuthorized;
 use lore_base::lore_debug;
 use lore_base::lore_error;
 use lore_base::lore_info;
+use lore_base::lore_spawn_net_nocontext;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_error_set::prelude::*;
@@ -81,12 +82,41 @@ pub struct EndpointConfig {
 }
 
 const IDLE_TIMEOUT_MS: u32 = 30000;
+/// How long the remainder of a dropped frame may take to write before its stream is reset: as long
+/// as the connection may go without hearing from its peer.
+const FINISH_FRAME_TIMEOUT: Duration = Duration::from_millis(IDLE_TIMEOUT_MS as u64);
+/// A test's [`FINISH_FRAME_TIMEOUT`] in milliseconds, or `0` for none.
+#[cfg(feature = "test-util")]
+static FINISH_FRAME_TIMEOUT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Makes the remainder of every dropped frame wait at most `timeout` before its stream is reset,
+/// in place of [`FINISH_FRAME_TIMEOUT`], or the default again with `None`.
+#[cfg(feature = "test-util")]
+pub fn set_finish_frame_timeout(timeout: Option<Duration>) {
+    FINISH_FRAME_TIMEOUT_MS.store(
+        timeout.map_or(0, |timeout| timeout.as_millis() as u64),
+        Ordering::Relaxed,
+    );
+}
+
+fn finish_frame_timeout() -> Duration {
+    #[cfg(feature = "test-util")]
+    if let ms @ 1.. = FINISH_FRAME_TIMEOUT_MS.load(Ordering::Relaxed) {
+        return Duration::from_millis(ms);
+    }
+    FINISH_FRAME_TIMEOUT
+}
 const KEEP_ALIVE_MS: u64 = 500;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
 #[lore_macro::test_pub]
 const HAPPY_EYEBALLS_MAX_IN_FLIGHT: usize = 10;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
+/// The UDP receive buffer a client socket asks for. Linux allocates twice the request, 1 MiB, which is
+/// intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s transfer, and every
+/// datagram that arrives while it is full is lost.
+#[lore_macro::test_pub]
+const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientCerts {
@@ -759,6 +789,24 @@ impl QuicConnection {
     pub async fn connection_stats(&self) -> ConnectionStats {
         self.connection.read().await.connection.stats().into()
     }
+
+    /// Requests outstanding on each stream, as the stream selection sees them.
+    pub fn stream_inflight(&self) -> [u64; STREAM_COUNT as usize] {
+        std::array::from_fn(|stream| self.stream_inflight[stream].load(Ordering::Relaxed))
+    }
+
+    /// How many of the connection's streams have a reader that has stopped, or 0 while the
+    /// connection is locked.
+    #[cfg(feature = "test-util")]
+    pub fn streams_ended(&self) -> usize {
+        self.connection.try_read().map_or(0, |connection| {
+            connection
+                .reader
+                .iter()
+                .filter(|reader| reader.task.is_finished())
+                .count()
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -898,6 +946,11 @@ pub enum ReconnectError {
 /// the response. On transient errors (`Terminated`, `StreamOpen`), triggers a reconnect
 /// and retries. On ambiguous errors, checks whether a concurrent reconnect already
 /// occurred (via the epoch counter) and retries if so, otherwise propagates the error.
+///
+/// FORK-LOCAL (Tideshift, CR-026/WP-108, merge D-QS1): a session id refused at the write boundary
+/// is not re-issued here, as upstream 5c88e6e7 does; the session layer
+/// (`session::StorageSession::attempt`) rebinds and resends once. The retry is bounded by
+/// `ATTEMPT_BUDGET` and governed by the replay class of the command (see [`classify`]).
 ///
 /// `HIGH_PRIORITY` is a const generic rather than a runtime parameter to keep it out of
 /// the async future state. Because this function contains a retry loop with multiple await
@@ -1623,6 +1676,9 @@ pub async fn connect(
                 if let Some(cwnd) = transport.initial_cwnd {
                     bbr.initial_window(cwnd);
                 }
+                // quinn never has more than the send window unacknowledged, so a larger
+                // congestion window would only raise the pacing rate.
+                bbr.max_window(send_window);
                 Arc::new(bbr)
             }
             CongestionAlgorithm::Cubic => {
@@ -1750,6 +1806,22 @@ where
     }
 }
 
+/// Raises `socket`'s receive buffer to `bytes` when it is smaller, and leaves a buffer of at least
+/// that size alone. The OS may grant less than asked: Linux caps the request at
+/// `net.core.rmem_max`, and allocates and reports twice what it grants.
+#[lore_macro::test_pub]
+fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
+    let socket = socket2::SockRef::from(socket);
+    if socket.recv_buffer_size().is_ok_and(|size| size >= bytes) {
+        return;
+    }
+    let result = socket.set_recv_buffer_size(bytes);
+    lore_debug!(
+        "QUIC socket receive buffer {:?} after asking for {bytes} bytes: {result:?}",
+        socket.recv_buffer_size()
+    );
+}
+
 async fn connect_to_addr(
     client_config: quinn::ClientConfig,
     host: String,
@@ -1773,6 +1845,7 @@ async fn connect_to_addr(
     let endpoint = {
         let _guard = lore_base::runtime::net_runtime().enter();
         std::net::UdpSocket::bind(bind).and_then(|socket| {
+            raise_receive_buffer(&socket, RECEIVE_BUFFER_BYTES);
             quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 None,
@@ -1907,8 +1980,8 @@ where
             "QUIC lost connection {connection_id} to {remote_url} after {:.2}s: {:?} (last send: {:.2}s, last recv: {:.2}s)",
             elapsed as f64 / 1000.0,
             quinn.connection.close_reason(),
-            (elapsed - connection.last_send.load(Ordering::Relaxed)) as f64 / 1000.0,
-            (elapsed - connection.last_recv.load(Ordering::Relaxed)) as f64 / 1000.0
+            elapsed.saturating_sub(connection.last_send.load(Ordering::Relaxed)) as f64 / 1000.0,
+            elapsed.saturating_sub(connection.last_recv.load(Ordering::Relaxed)) as f64 / 1000.0
         );
 
         lore_debug!(
@@ -2459,8 +2532,8 @@ async fn send_command_tracked<
         }
     }
 
-    let (writer, rx, _inflight) = {
-        let (command_id, writer, rx, inflight) = {
+    let (writer, rx, stream_index, _inflight) = {
+        let (command_id, writer, rx, stream_index, inflight) = {
             let connection_lock = connection.connection.read().await;
             if connection_lock.reader.is_empty() {
                 lore_debug!("No quic stream available when sending command");
@@ -2515,7 +2588,7 @@ async fn send_command_tracked<
                 .wait_for(tx)
                 .map_err(SendFailure::not_dispatched)?;
             let writer = connection_lock.writer[stream_index].clone();
-            (command_id, writer, rx, inflight)
+            (command_id, writer, rx, stream_index as u32, inflight)
         };
 
         {
@@ -2554,25 +2627,31 @@ async fn send_command_tracked<
         if MANAGED || (AWAIT_RESPONSE && crate::caller_operation::in_managed_wait_scope()) {
             return Box::pin(send_bounded(&connection, &writer, chunks, rx)).await;
         }
-        (writer.send.clone(), rx, inflight)
+        (writer.send.clone(), rx, stream_index, inflight)
     };
 
     {
-        let mut send = writer.lock_owned().await;
-        // The loop `write_all_chunks` runs, written out so the stream records its progress for
-        // a managed send waiting on this writer (see [`send_bounded`]). Nothing else differs.
-        let mut bufs: &mut [Bytes] = chunks;
-        while !bufs.is_empty() {
-            let written = send
-                .stream
-                .write_chunks(bufs)
-                .await
-                .map_err(write_failure)?;
-            if written.bytes > 0 {
-                send.mark_progress(connection.created);
+        // Through a [`FrameWrite`], which records the stream's progress for a managed send waiting
+        // on this writer (see [`send_bounded`]) and finishes the frame should this future be
+        // dropped part way. `write_chunks` either takes bytes or fails, never both, so a failure
+        // before the frame's first byte proves none of it left: not dispatched, as the managed
+        // send already treats it. Once any byte was taken, a failure is a lost answer.
+        let send = writer.lock_owned().await;
+        let mut frame = FrameWrite::new(
+            send,
+            chunks,
+            &connection.stream_inflight,
+            stream_index,
+            connection.created,
+        );
+        frame.write().await.map_err(|(err, started)| {
+            let failure = write_failure(err);
+            if started {
+                failure
+            } else {
+                SendFailure::not_dispatched(failure.error)
             }
-            bufs = &mut bufs[written.chunks..];
-        }
+        })?;
     }
 
     if !AWAIT_RESPONSE {
@@ -2588,13 +2667,151 @@ async fn send_command_tracked<
 /// A failed write. A failed write may still have flushed earlier chunks to the peer, so it counts
 /// as dispatched. Treating a partial write as harmless is the assumption that would let a mutable
 /// command be sent twice.
+///
+/// A stream reset, or stopped by the server, takes no further frame, so a write to one fails as a
+/// lost connection does (upstream 16bfdaaa, 680a7622), and `send_with_reconnect` reconnects.
 fn write_failure(err: quinn::WriteError) -> SendFailure {
-    if let quinn::WriteError::ConnectionLost(_) = err {
-        SendFailure::response_lost(QuicClientError::Terminated)
-    } else {
-        lore_warn!("{}: {err}", QuicClientError::WriteChunks);
-        SendFailure::response_lost(QuicClientError::WriteChunks)
+    match err {
+        quinn::WriteError::ConnectionLost(_) | quinn::WriteError::ClosedStream => {
+            SendFailure::response_lost(QuicClientError::Terminated)
+        }
+        quinn::WriteError::Stopped(_) => {
+            lore_warn!("QUIC write: {err}");
+            SendFailure::response_lost(QuicClientError::Terminated)
+        }
+        err @ quinn::WriteError::ZeroRttRejected => {
+            lore_warn!("{}: {err}", QuicClientError::WriteChunks);
+            SendFailure::response_lost(QuicClientError::WriteChunks)
+        }
     }
+}
+
+/// A frame being written to a stream, with the stream's writer held while it is. A stream carries
+/// one frame after another, so a frame cut short would put the next frame's header inside its
+/// payload, and the server would read the two as one request. Dropped part way through its write,
+/// as when the command's future is dropped, it hands a copy of the rest of the frame and the writer
+/// to [`finish_frame`], spawned without the command's context as it serves every later command on
+/// the stream, and counts the finish as a request outstanding on the stream, which
+/// [`select_stream`] balances on, until the finish releases the writer; dropped before any of the
+/// frame was written, it sends nothing. The rest is copied as the finish outlives the command, and
+/// a chunk may be memory its caller lends only until the command is done.
+///
+/// FORK-LOCAL (Tideshift): holds the fork's [`StreamSend`] guard, records the stream's progress for
+/// a managed send waiting on the writer (see [`send_bounded`]), and its failure says whether any
+/// byte of the frame left, which the replay contract branches on.
+struct FrameWrite<'a> {
+    /// The stream's writer while the write is under way; `None` once it has returned.
+    send: Option<tokio::sync::OwnedMutexGuard<StreamSend>>,
+    chunks: &'a mut [Bytes],
+    /// The requests outstanding on each of the connection's streams.
+    stream_inflight: &'a Arc<[AtomicU64; STREAM_COUNT as usize]>,
+    /// The index of the frame's stream.
+    stream_index: u32,
+    /// The length of the frame's header, its first chunk, which keeps that length until the write
+    /// takes some of the frame.
+    header_size: u32,
+    /// When the connection was created, the base of the stream's progress stamps.
+    created: Instant,
+}
+
+impl<'a> FrameWrite<'a> {
+    /// The frame `chunks` hold, to be written to the stream at `stream_index` whose writer
+    /// `send` holds.
+    fn new(
+        send: tokio::sync::OwnedMutexGuard<StreamSend>,
+        chunks: &'a mut [Bytes],
+        stream_inflight: &'a Arc<[AtomicU64; STREAM_COUNT as usize]>,
+        stream_index: u32,
+        created: Instant,
+    ) -> Self {
+        Self {
+            send: Some(send),
+            header_size: chunks[0].len() as u32,
+            chunks,
+            stream_inflight,
+            stream_index,
+            created,
+        }
+    }
+
+    /// Whether any byte of the frame has been taken by the stream.
+    fn started(&self) -> bool {
+        self.chunks[0].len() != self.header_size as usize
+    }
+
+    /// Writes the frame, then releases the stream's writer. Each `write_chunks` is cancel safe and
+    /// empties or shortens in place the chunks it takes, so `chunks` hold what is left to write at
+    /// every await. A failure carries whether any byte of the frame had left before it.
+    async fn write(&mut self) -> Result<(), (quinn::WriteError, bool)> {
+        while let Some(send) = self.send.as_mut()
+            && self.chunks.iter().any(|chunk| !chunk.is_empty())
+        {
+            match send.stream.write_chunks(self.chunks).await {
+                Ok(written) => {
+                    if written.bytes > 0 {
+                        send.mark_progress(self.created);
+                    }
+                }
+                Err(err) => {
+                    self.send = None;
+                    return Err((err, self.started()));
+                }
+            }
+        }
+        self.send = None;
+        Ok(())
+    }
+}
+
+impl Drop for FrameWrite<'_> {
+    fn drop(&mut self) {
+        let Some(send) = self.send.take() else {
+            return;
+        };
+        if !self.started() {
+            return;
+        }
+        let mut rest = Vec::with_capacity(self.chunks.iter().map(Bytes::len).sum());
+        for chunk in self.chunks.iter() {
+            rest.extend_from_slice(chunk);
+        }
+        self.stream_inflight[self.stream_index as usize].fetch_add(1, Ordering::Relaxed);
+        lore_spawn_net_nocontext!(finish_frame(
+            send,
+            Bytes::from(rest),
+            self.stream_inflight.clone(),
+            self.stream_index
+        ));
+    }
+}
+
+/// Writes `rest`, the remainder of a dropped frame, to the stream whose writer `send` holds, and
+/// resets the stream when the write does not finish within [`FINISH_FRAME_TIMEOUT`]. The request
+/// [`FrameWrite`] counted for it on the stream at `stream_index` of `stream_inflight` is taken off
+/// once the writer is released.
+async fn finish_frame(
+    mut send: tokio::sync::OwnedMutexGuard<StreamSend>,
+    mut rest: Bytes,
+    stream_inflight: Arc<[AtomicU64; STREAM_COUNT as usize]>,
+    stream_index: u32,
+) {
+    if tokio::time::timeout(
+        finish_frame_timeout(),
+        send.stream
+            .write_all_chunks(std::slice::from_mut(&mut rest)),
+    )
+    .await
+    .is_err()
+    {
+        lore_warn!(
+            "QUIC stream {} reset: the rest of a dropped frame was not written within {:?}",
+            send.stream.id(),
+            finish_frame_timeout()
+        );
+        let _ = send.stream.reset(VarInt::from_u32(0));
+    }
+    drop(send);
+    stream_inflight[stream_index as usize].fetch_sub(1, Ordering::Relaxed);
 }
 
 /// What a received answer, or a closed answer channel, means to the replay contract.

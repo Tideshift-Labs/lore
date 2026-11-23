@@ -78,6 +78,28 @@ pub fn refuse_domain_key(key_type: KeyType) -> Result<(), MessageHandleError> {
     Ok(())
 }
 
+/// Key types written only through a dedicated request that validates the write:
+/// `RepositoryMetadataSet` and `BranchMetadataSet` for metadata, and revision
+/// requests such as `BranchPush` for a branch's latest pointer. The generic mutable store write paths, store
+/// and compare-and-swap, must not become a way to write them directly and
+/// bypass that validation.
+const DISALLOWED_KEY_TYPES: &[KeyType] = &[
+    KeyType::RepositoryMetadata,
+    KeyType::BranchMetadata,
+    KeyType::BranchLatestPointer,
+];
+
+/// Refuses a generic mutable store write to a key type that has its own
+/// dedicated write API.
+pub fn check_generic_write_key_type(key_type: KeyType) -> Result<(), MessageHandleError> {
+    if DISALLOWED_KEY_TYPES.contains(&key_type) {
+        return Err(MessageHandleError::InvalidArgument(format!(
+            "key_type {key_type:?} must be written through its dedicated API, not the generic mutable store"
+        )));
+    }
+    Ok(())
+}
+
 pub async fn handle_mutable_store(
     key: Hash,
     value: Hash,
@@ -87,7 +109,12 @@ pub async fn handle_mutable_store(
     user_id: String,
     mutable_store: Arc<dyn MutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
+    // FORK-LOCAL (Tideshift): the CR-029 domain-owned set is a superset of upstream's
+    // `DISALLOWED_KEY_TYPES`, so the fork refusal answers first; upstream's check stays as a
+    // second guard.
     refuse_domain_key(key_type)?;
+    check_generic_write_key_type(key_type)?;
+
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(

@@ -132,7 +132,7 @@ async fn put_v4(
         Weak::new(),
         &format!("lore://127.0.0.1:{port}"),
         "127.0.0.1".to_string(),
-        "",
+        &lore_transport::auth::AuthEndpoint::none(),
         "wp120-wiring",
         partition,
         &Arc::new(SuppliedCredentials::default()),

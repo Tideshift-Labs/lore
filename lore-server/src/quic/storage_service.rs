@@ -425,6 +425,7 @@ pub fn message_handle_error_to_label(value: &MessageHandleError) -> &'static str
         MessageHandleError::DomainKeyRefused(_) => "DomainKeyRefused",
         MessageHandleError::SessionExpired => "SessionExpired",
         MessageHandleError::AuthUnavailable(_) => "AuthUnavailable",
+        MessageHandleError::InvalidArgument(_) => "InvalidArgument",
     }
 }
 
@@ -452,7 +453,8 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
         | MessageHandleError::DomainKeyRefused(_)
         | MessageHandleError::SessionExpired
         | MessageHandleError::AuthUnavailable(_)
-        | MessageHandleError::OutcomeUnknown => false,
+        | MessageHandleError::OutcomeUnknown
+        | MessageHandleError::InvalidArgument(_) => false,
         MessageHandleError::HandlerTimeout
         | MessageHandleError::InternalError
         | MessageHandleError::NotImplemented

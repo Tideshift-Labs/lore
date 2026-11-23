@@ -5,7 +5,6 @@ use std::sync::Arc;
 use lore_base::error::OutcomeUnknown;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::branch;
@@ -37,11 +36,12 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
 use crate::state;
+use crate::util::request_tracker::StoreRequestTracker;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileBeginEventData {
     /// Number of files to process.
@@ -50,7 +50,7 @@ pub struct LoreRevisionRestoreFileBeginEventData {
 
 /// Event data reported for a single file during a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileEventData {
     /// Path of the file.
@@ -72,7 +72,7 @@ pub struct LoreRevisionRestoreFileEventData {
 
 /// Event data reported at the end of the file phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFileEndEventData {
     /// Number of files processed.
@@ -81,7 +81,7 @@ pub struct LoreRevisionRestoreFileEndEventData {
 
 /// Event data reported at the start of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentBeginEventData {
     /// Number of fragments to transfer.
@@ -90,7 +90,7 @@ pub struct LoreRevisionRestoreFragmentBeginEventData {
 
 /// Event data reported on progress of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentProgressEventData {
     /// Number of fragments completed.
@@ -101,7 +101,7 @@ pub struct LoreRevisionRestoreFragmentProgressEventData {
 
 /// Event data reported at the end of the fragment phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreFragmentEndEventData {
     /// Number of fragments transferred.
@@ -110,7 +110,7 @@ pub struct LoreRevisionRestoreFragmentEndEventData {
 
 /// Event data reported with the resulting revision of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreRevisionEventData {
     /// Resulting revision hash signature.
@@ -121,7 +121,7 @@ pub struct LoreRevisionRestoreRevisionEventData {
 
 /// Event data reported at the start of the sync phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreSyncBeginEventData {
     /// Number of changes to apply.
@@ -130,7 +130,7 @@ pub struct LoreRevisionRestoreSyncBeginEventData {
 
 /// Event data reported at the end of the sync phase of a restore.
 #[repr(C)]
-#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionRestoreSyncEndEventData {
     /// Number of changes applied.
@@ -472,9 +472,13 @@ pub(crate) async fn restore(
             .forward::<RestoreError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), new_state.clone())
-        .await
-        .forward::<RestoreError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        new_state.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<RestoreError>("weaving history")?;
 
     let signature = new_state
         .serialize(repository.clone(), token)
@@ -492,6 +496,7 @@ pub(crate) async fn restore(
         head_state.clone(),
         new_state.clone(),
         true, /* Ignore already durably stored fragments */
+        Arc::new(StoreRequestTracker::default()),
     )
     .await
     .forward::<RestoreError>("collecting new fragments")?;

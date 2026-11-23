@@ -35,8 +35,6 @@ use lore_revision::repository::RepositoryContextCreationArgs;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
-use serde::Deserialize;
-use serde::Serialize;
 use tokio::sync::Notify;
 
 use crate::storage::store::StoreInternal;
@@ -46,7 +44,7 @@ use crate::storage::store::StoreInternal;
 /// Treat this as an opaque value; never cast it directly to or from raw
 /// pointers.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreRevisionTree {
     /// Registry key; `0` is the reserved invalid/unregistered sentinel (zero-init = null handle)
     pub handle_id: u64,
@@ -329,7 +327,7 @@ pub(crate) async fn synth_repository_context(
     repository: Partition,
 ) -> Arc<RepositoryContext> {
     let remote_result = match store.remote.as_ref() {
-        Some(endpoint) => endpoint.session_connection(repository).await,
+        Some(endpoint) => endpoint.connection(repository).await,
         None => Err(ProtocolError::from(NoRemote)),
     };
     Arc::new(
@@ -343,7 +341,8 @@ pub(crate) async fn synth_repository_context(
             filter: Arc::new(Filter::default()),
             filesystem_provider: None,
         })
-        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
+        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER))
+        .holding_its_sessions(),
     )
 }
 

@@ -194,11 +194,16 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.as_deref());
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     // Run the authorizer and catalog selection at load, so a refused pairing
     // bails here, before any initialization, instead of at server startup.
     let authorizer = select_repository_authorizer(auth, auth_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
-    select_repository_catalog(auth, auth_url)
+    select_repository_catalog(auth, auth_url, user_url)
         .map_err(|err| config::ConfigError::Message(err.to_string()))?;
     let Some(auth) = auth else {
         return Ok(());
@@ -230,6 +235,12 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
             ));
         }
     }
+    if !auth.resource_id_template.contains(PARTITION_PLACEHOLDER) {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.resource_id_template must contain {PARTITION_PLACEHOLDER}, which stands \
+             for the partition ID"
+        )));
+    }
     validate_oidc_config(auth, authorizer)?;
     // FORK-LOCAL (Tideshift): GlobalGrants is refused here, at load, and again
     // at startup. Checked after upstream's OIDC rules, so a config those rules
@@ -237,6 +248,9 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
     // GlobalGrants.
     refuse_global_grants(authorizer).map_err(|err| config::ConfigError::Message(err.to_string()))
 }
+
+/// Where a partition template puts the partition ID.
+const PARTITION_PLACEHOLDER: &str = "{id}";
 
 /// Tier 1 and Tier 2 have no login path besides OIDC, so upstream requires
 /// `[server.auth.oidc]` for both. If grpc auth service is configured, it is optional.
@@ -289,6 +303,23 @@ fn validate_oidc_config(
         }
         (resource, scope) => resource || scope,
     };
+    for (setting, template) in [
+        (
+            "server.auth.oidc.resource_template",
+            &oidc.resource_template,
+        ),
+        ("server.auth.oidc.scope_template", &oidc.scope_template),
+    ] {
+        if is_set(template)
+            && !template
+                .as_deref()
+                .is_some_and(|template| template.contains(PARTITION_PLACEHOLDER))
+        {
+            return error(&format!(
+                "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
+            ));
+        }
+    }
     if is_set(&oidc.token_exchange_issuer) && !has_template {
         return error(
             "server.auth.oidc.token_exchange_issuer is set without \
@@ -395,9 +426,6 @@ pub struct AuthSettings {
     /// The resource name that matches every repository.
     #[serde(default = "AuthSettings::default_resource_wildcard")]
     pub resource_wildcard: String,
-    /// The claim recorded and compared as the caller's identity.
-    #[serde(default = "AuthSettings::default_identity_claim")]
-    pub identity_claim: String,
     /// What the repository listing answers for an authenticated caller with
     /// no explicit grant. Gates listing of the IDs only, never grants
     /// access to the contents. Consulted by the `baseline` catalog only.
@@ -409,8 +437,9 @@ pub struct AuthSettings {
     /// there is no inert window; the flag exists purely as an instant rollback.
     #[serde(default = "default_enforce_write_permission")]
     pub enforce_write_permission: bool,
-    /// Which catalog answers the repository listing. Absent: `auth_service`
-    /// when `[environment.endpoint] auth_url` is set, `baseline` otherwise.
+    /// Which catalog answers the repository listing. Absent: `user_service`
+    /// when `[environment.endpoint] user_url` is set, else `auth_service`
+    /// when `auth_url` is set, `baseline` otherwise.
     pub repository_catalog: Option<RepositoryCatalogMode>,
     /// The `UrcAuthApi` endpoint the `auth_service` catalog asks. Absent:
     /// `[environment.endpoint] auth_url`.
@@ -460,10 +489,6 @@ impl AuthSettings {
     fn default_resource_wildcard() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
     }
-
-    fn default_identity_claim() -> String {
-        "sub".to_string()
-    }
 }
 
 /// What `list_repositories` answers for an authenticated caller holding no
@@ -489,6 +514,9 @@ pub enum RepositoryCatalogMode {
     /// Ask a `UrcAuthApi` service's `LookupUserPermissions`, forwarding the
     /// caller's token.
     AuthService,
+    /// Ask `PartitionList` on the `lore.user.v1.UserService` at
+    /// `[environment.endpoint] user_url`, forwarding the caller's token.
+    UserService,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -534,6 +562,9 @@ pub struct HttpSettings {
     #[allow(dead_code)]
     pub certificate: Option<CertificateSettings>,
     pub enabled: bool,
+    /// Serve only the health route, without repository HTTP endpoints.
+    #[serde(default)]
+    pub health_only: bool,
     pub host: String,
     pub max_file_size: u64,
     pub port: i32,

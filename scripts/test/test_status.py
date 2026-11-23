@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: MIT
 import logging
 import os
+import shutil
 import stat
 import sys
+from pathlib import Path
 
 import pytest
 from test_utils import posix_join, to_posix
@@ -22,6 +24,20 @@ def _status_files_by_path(repo: Lore, **kwargs) -> dict[str, dict]:
     """
     entries = parse_status_json(repo.status(json=True, offline=True, **kwargs))
     return {to_posix(e.get("path", "")): e for e in entries if e.get("type") == "file"}
+
+
+def _status_sections(output: str) -> dict[str, list[str]]:
+    """The paths each section of plain `status` output lists, in the order listed."""
+    sections: dict[str, list[str]] = {}
+    current = None
+    for line in output.splitlines():
+        if line.endswith(":"):
+            current = sections.setdefault(line, [])
+        elif current is not None and line[:1] in "AMDVC!" and line[1:2] == " ":
+            current.append(line[2:].split(" ")[0].rstrip("/"))
+        else:
+            current = None
+    return sections
 
 
 @pytest.mark.smoke
@@ -1016,6 +1032,42 @@ def test_status_check_dirty_rehashes_same_size(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_status_scan_lists_each_section_in_path_order(new_lore_repo):
+    """A scan of several paths walks them at once and reports changes in
+    whatever order the walks find them. The client lists each section in path
+    order regardless.
+    """
+    repo: Lore = new_lore_repo()
+    directories = [f"d{i}" for i in range(8)]
+    for directory in directories:
+        repo.make_dirs(directory)
+        for j in range(8):
+            with repo.open_file(
+                posix_join(directory, f"f{j}.txt"), "w+b"
+            ) as output_file:
+                output_file.write(os.urandom(64))
+    repo.stage(scan=True)
+    repo.commit()
+
+    for directory in directories:
+        for j in range(8):
+            with repo.open_file(
+                posix_join(directory, f"f{j}.txt"), "w+b"
+            ) as output_file:
+                output_file.write(os.urandom(65))
+            with repo.open_file(
+                posix_join(directory, f"new{j}.txt"), "w+b"
+            ) as output_file:
+                output_file.write(os.urandom(64))
+
+    sections = _status_sections(repo.status(directories, scan=True, offline=True))
+    for header in ("Changes not staged for commit:", "Untracked files:"):
+        paths = sections.get(header, [])
+        assert len(paths) == 64, f"{header} lists {len(paths)} paths, not 64: {paths}"
+        assert paths == sorted(paths), f"{header} lists paths out of order: {paths}"
+
+
+@pytest.mark.smoke
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
 def test_status_scan_reports_a_mode_only_change(new_lore_repo):
     """The executable bit is part of what a file is, so a chmod alone is a
@@ -1057,3 +1109,24 @@ def test_status_scan_reports_a_mode_only_change(new_lore_repo):
     assert cloned_mode & stat.S_IXUSR, (
         f"the revision must carry the executable bit to a clone: {cloned_mode:o}"
     )
+
+
+@pytest.mark.smoke
+def test_status_scan_over_a_file_replaced_by_a_directory_keeps_the_file(new_lore_repo):
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(None, {"entry": b"file"})
+    file_id = repo.file_info("entry", offline=True)[0].context
+
+    os.remove(repo._fix_path("entry"))
+    os.makedirs(repo._fix_path("entry/sub"))
+    Path(repo._fix_path("entry/inner")).write_bytes(b"inner")
+    Path(repo._fix_path("entry/sub/deep")).write_bytes(b"deep")
+    repo.status(scan=True, offline=True)
+
+    shutil.rmtree(repo._fix_path("entry"))
+    Path(repo._fix_path("entry")).write_bytes(b"changed")
+    assert _status_files_by_path(repo, scan=True)["entry"]["action"] == "keep"
+
+    repo.stage(".", offline=True)
+    repo.commit("Change the file", offline=True)
+    assert repo.file_info("entry", offline=True)[0].context == file_id

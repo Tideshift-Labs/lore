@@ -73,6 +73,17 @@ fn unsupported() -> StoreError {
 
 #[async_trait::async_trait]
 impl ImmutableStore for CreationMetadataStore {
+    /// Delegates to the wrapped store, as a wrapper must, which has nothing on disk to claim.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        self.store.clone().hold_for_command().await
+    }
+
+    fn try_join_claim(&self) -> Option<lore_storage::local::store_lock::StoreGuard> {
+        self.store.try_join_claim()
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }

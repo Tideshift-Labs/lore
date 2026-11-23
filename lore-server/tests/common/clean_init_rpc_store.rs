@@ -103,11 +103,22 @@ impl RpcStore {
             match_made: StoreMatch::MatchFull,
             partition,
             payload: (!metadata).then_some(result.payload),
+            content: None,
         }
     }
 }
 #[async_trait::async_trait]
 impl ImmutableStore for RpcStore {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
     async fn get(self: Arc<Self>, p: Partition, a: Address) -> Result<StoreGetData, StoreError> {
         Ok(self.read(p, a, false).await)
     }

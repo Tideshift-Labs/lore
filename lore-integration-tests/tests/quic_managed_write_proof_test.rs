@@ -352,7 +352,9 @@ mod quic_managed_write_proof_tests {
             assert_eq!(replacement.live(), 1, "{wire:?}");
 
             drop(session);
-            connection.release_session(partition, correlation);
+            // v0.11.0 (60953490) keeps a pool pinned until the correlation id changes; dropping the
+            // pinned pool is what `release_session` used to do.
+            connection.invalidate_all_sessions();
             eventually("the pool's session to be stopped", || {
                 replacement.live() == 0
             })

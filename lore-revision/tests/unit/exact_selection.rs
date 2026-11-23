@@ -112,6 +112,15 @@ struct FaultInjectingMutableStore {
 
 #[async_trait]
 impl MutableStore for FaultInjectingMutableStore {
+    /// Claims what the wrapped store claims.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        self.inner.clone().hold_for_command().await
+    }
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -183,6 +192,9 @@ async fn exercise_real_store_publication_failure(
     let store_path = tempdir.path().join("store");
     let repository_path = tempdir.path().join("repository");
     std::fs::create_dir_all(&repository_path).expect("create repository fixture path");
+    // The dot directory is where the commit stamps its clock probe (upstream 83a359fd); without
+    // it the floor reads 0 and no modified time is ever recorded.
+    std::fs::create_dir_all(repository_path.join(DOT_LORE)).expect("create dot directory");
 
     let immutable = lore_storage::LocalImmutableStore::new(
         Some(store_path.clone()),
@@ -830,6 +842,15 @@ struct FailKeyMutableStore {
 
 #[async_trait]
 impl MutableStore for FailKeyMutableStore {
+    /// Claims what the wrapped store claims.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        self.inner.clone().hold_for_command().await
+    }
     async fn load(
         self: Arc<Self>,
         partition: Partition,
@@ -915,6 +936,9 @@ async fn build_exact_selection_store_order_fixture() -> (
     let store_path = tempdir.path().join("store");
     let repository_path = tempdir.path().join("repository");
     std::fs::create_dir_all(&repository_path).expect("create repository fixture path");
+    // The dot directory is where the commit stamps its clock probe (upstream 83a359fd); without
+    // it the floor reads 0 and no modified time is ever recorded.
+    std::fs::create_dir_all(repository_path.join(DOT_LORE)).expect("create dot directory");
 
     let immutable = lore_storage::LocalImmutableStore::new(
         Some(store_path.clone()),

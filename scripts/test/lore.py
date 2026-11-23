@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import filecmp
+import json
 import logging
 import os
 import pathlib
@@ -175,6 +176,14 @@ def _inherit_metadata_args(keys: list[str] | None) -> list[str]:
     return [arg for key in keys or [] for arg in ("--inherit-metadata", key)]
 
 
+def _link_message_args(link_messages: dict[str, str] | None) -> list[str]:
+    return [
+        arg
+        for path, message in (link_messages or {}).items()
+        for arg in ("--link-message", path, message)
+    ]
+
+
 class Lore:
     def __init__(
         self,
@@ -296,6 +305,7 @@ class Lore:
         offline: bool = False,
         remote: bool = False,
         local: bool = False,
+        cache: bool = False,
         identity: str | None = None,
         identity_token: str | None = None,
         access_token: str | None = None,
@@ -330,6 +340,7 @@ class Lore:
             + (["--offline"] if offline else [])
             + (["--remote"] if remote else [])
             + (["--local"] if local else [])
+            + (["--cache"] if cache else [])
             + (["--identity", identity] if identity else [])
             + (["--identity-token", identity_token] if identity_token else [])
             + (["--access-token", access_token] if access_token else [])
@@ -646,6 +657,7 @@ class Lore:
         repo_id: str | None = None,
         message: str | None = None,
         inherit_metadata: list[str] | None = None,
+        link_messages: dict[str, str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
@@ -653,7 +665,8 @@ class Lore:
             + ([name] if name else [])
             + (["--id", repo_id] if repo_id else [])
             + (["--message", message] if message else [])
-            + _inherit_metadata_args(inherit_metadata),
+            + _inherit_metadata_args(inherit_metadata)
+            + _link_message_args(link_messages),
             **kwargs,
         )
 
@@ -705,6 +718,7 @@ class Lore:
         link: str | None = None,
         dry_run: bool = False,
         ignore_links: bool = False,
+        link_messages: dict[str, str] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
         return self.run(
@@ -715,7 +729,8 @@ class Lore:
             + (["--no-commit"] if no_commit else [])
             + (["--link", link] if link else [])
             + (["--dry-run"] if dry_run else [])
-            + (["--ignore-links"] if ignore_links else []),
+            + (["--ignore-links"] if ignore_links else [])
+            + _link_message_args(link_messages),
             **kwargs,
         )
 
@@ -1584,6 +1599,29 @@ class Lore:
             **kwargs,
         )
 
+    def file_audit(
+        self,
+        path: str | None = None,
+        revision: str | None = None,
+        max_revisions: int | None = None,
+        no_ignore_space_at_eol: bool = False,
+        ignore_space_change: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["file", "audit"]
+            + ([self._fix_path(path)] if path else [])
+            + (["--revision", revision] if revision else [])
+            + (
+                ["--max-revisions", str(max_revisions)]
+                if max_revisions is not None
+                else []
+            )
+            + (["--no-ignore-space-at-eol"] if no_ignore_space_at_eol else [])
+            + (["--ignore-space-change"] if ignore_space_change else []),
+            **kwargs,
+        )
+
     def file_diff(
         self,
         paths: str | list[str] | Path | list[Path] | None = None,
@@ -1736,9 +1774,11 @@ class Lore:
             **kwargs,
         )
 
-    def _capi_driver(self, library_path: str, command: str, *args: str) -> int:
+    def _capi_driver_output(
+        self, library_path: str, command: str, *args: str
+    ) -> tuple[int, str]:
         """Runs `lore_ffi.py` as a subprocess, returning the FFI code the call it
-        drives answered: 0 on success, the failing error's code otherwise.
+        drives answered and whatever the driver printed.
 
         Out of process so the call reads this repository's isolated auth and
         global directories, and so a crash in the library fails one test rather
@@ -1769,7 +1809,37 @@ class Lore:
             result.returncode,
             result.stdout + result.stderr,
         )
-        return result.returncode
+        return result.returncode, result.stdout
+
+    def _capi_driver(self, library_path: str, command: str, *args: str) -> int:
+        """The FFI code a driven call answered, for a call whose events a test
+        does not read."""
+        code, _output = self._capi_driver_output(library_path, command, *args)
+        return code
+
+    def file_audit_capi(
+        self,
+        library_path: str,
+        path: str,
+        stop_after: int | None = None,
+    ) -> tuple[int, list[dict]]:
+        """Attribute a file's lines through the public C API, returning the FFI
+        code and the records the event callback received.
+
+        The CLI prints a text summary from the same events, so driving it covers
+        the formatting rather than the structured records an editor integration
+        reads. `stop_after` ends the process from inside the callback once that
+        many range events have arrived.
+        """
+        options: list[str] = []
+        if stop_after is not None:
+            options += ["--stop-after", str(stop_after)]
+
+        code, output = self._capi_driver_output(
+            library_path, "file-audit", self.path, path, *options
+        )
+        events = [json.loads(line) for line in output.splitlines() if line.strip()]
+        return code, events
 
     def auth_user_info_capi(
         self, library_path: str, user_ids: str | list[str] | None = None
@@ -1801,10 +1871,11 @@ class Lore:
         )
 
     def service_capi(self, library_path: str, command: str) -> int:
-        """Start or stop the service through the public C API, returning the FFI
-        code. `command` is `service-start` or `service-stop`.
+        """Start, stop or query the service through the public C API, returning
+        the FFI code. `command` is `service-start`, `service-stop` or
+        `service-status`.
 
-        The CLI's `service start`/`stop` wrap these, so a test driving the CLI
+        The CLI's `service start`/`stop`/`status` wrap these, so a test driving the CLI
         covers the wrapper rather than the entry point an SDK consumer calls.
         Running out of process matters twice over here: the library records a
         service running in its own process, which no later test could undo.
@@ -2068,6 +2139,7 @@ class Lore:
             name=new_repo_name,
             create_repo=False,
             created_paths=self.created_paths,
+            environment_vars=self.environment_vars,
         )
         new_repo._ensure_test_identity_in_config()
         return new_repo
@@ -2263,10 +2335,6 @@ class Lore:
         if message is None:
             message = f"Test commit {self.test_commit_id}"
             self.test_commit_id += 1
-        link_args = []
-        if link_messages:
-            for path, msg in link_messages.items():
-                link_args.extend(["--link-message", path, msg])
         layer_args = []
         if layer_messages:
             for path, msg in layer_messages.items():
@@ -2274,7 +2342,7 @@ class Lore:
         return self.run(
             ["commit", message if message else ""]
             + (["--link", link] if link else [])
-            + link_args
+            + _link_message_args(link_messages)
             + (["--layer", layer] if layer else [])
             + layer_args,
             **kwargs,
@@ -2285,6 +2353,7 @@ class Lore:
         revision: str | None = None,
         forward_changes: bool = False,
         reset: bool = False,
+        force: bool = False,
         root_files: list[str] | None = None,
         dependency_tags: list[str] | None = None,
         dependency_recursive: bool = False,
@@ -2304,6 +2373,7 @@ class Lore:
             + (["--view", self._fix_path(view)] if view else [])
             + (["--forward-changes"] if forward_changes else [])
             + (["--reset"] if reset else [])
+            + (["--force"] if force else [])
             + root_file_args
             + dep_tag_args
             + (["--dependency-recursive"] if dependency_recursive else [])
@@ -2540,6 +2610,9 @@ class Lore:
     def service_stop(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "stop"], **kwargs)
 
+    def service_status(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "status"], **kwargs)
+
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]
     ):
@@ -2557,7 +2630,9 @@ class Lore:
         )
 
     def write_files(
-        self, files_and_contents: TypedDict[str | Path, bytes | str | Iterable[str]]
+        self,
+        files_and_contents: TypedDict[str | Path, bytes | str | Iterable[str]],
+        flush_writes: bool = False,
     ):
         for file_name, contents in files_and_contents.items():
             self.make_dirs(os.path.dirname(file_name))
@@ -2567,6 +2642,12 @@ class Lore:
                     output_file.write(contents)
                 else:
                     output_file.writelines(contents)
+                if flush_writes:
+                    # Closing leaves the bytes in the OS file cache, which hands them to the
+                    # filesystem later. Lore operations that use SWFS need to have the OS write
+                    # flushed before they see it.
+                    output_file.flush()
+                    os.fsync(output_file.fileno())
 
     def write_commit_push(
         self,
@@ -2588,6 +2669,7 @@ class Lore:
         other_file_repo: Lore | None,
         file_path: str | Path,
         other_file_path: str | Path | None = None,
+        only_file_contents: bool = False,
     ):
         if other_file_path is None:
             other_file_path = file_path
@@ -2598,8 +2680,45 @@ class Lore:
         else:
             dest_path = self._fix_path(other_file_path)
 
-        filecmp.clear_cache()
-        return filecmp.cmp(source_path, dest_path, shallow=False)
+        if only_file_contents:
+            with (
+                open(source_path, "rb") as source_contents,
+                open(dest_path, "rb") as dest_contents,
+            ):
+                return source_contents.read() == dest_contents.read()
+        else:
+            filecmp.clear_cache()
+            return filecmp.cmp(source_path, dest_path, shallow=False)
+
+    def compare_file2(
+        self,
+        other_file_repo: Lore | None,
+        file_path: str | Path,
+        other_file_path: str | Path | None = None,
+        only_file_contents: bool = False,
+    ):
+        if other_file_path is None:
+            other_file_path = file_path
+
+        source_path = self._fix_path(file_path)
+        if other_file_repo:
+            dest_path = other_file_repo._fix_path(other_file_path)
+        else:
+            dest_path = self._fix_path(other_file_path)
+
+        if only_file_contents:
+            with (
+                open(source_path, "rb") as source_contents,
+                open(dest_path, "rb") as dest_contents,
+            ):
+                source_contents = source_contents.read()
+                dest_contents = dest_contents.read()
+                assert source_contents == dest_contents, (
+                    f"Source: {source_contents}\nDest: {dest_contents}"
+                )
+        else:
+            filecmp.clear_cache()
+            assert filecmp.cmp(source_path, dest_path, shallow=False)
 
     def open_file(self, path, mode="r", encoding=None):
         return open(self._fix_path(path), mode, encoding=encoding)
@@ -2742,6 +2861,7 @@ class GlobalOptionsParseable(TypedDict, total=False):
     offline: bool
     remote: bool
     local: bool
+    cache: bool
     identity: str
     max_connections: int
     file_count_limit: int
@@ -2766,6 +2886,7 @@ class GlobalOptions(TypedDict, total=False):
     offline: bool
     remote: bool
     local: bool
+    cache: bool
     identity: str
     identity_token: str
     access_token: str
@@ -2777,3 +2898,4 @@ class GlobalOptions(TypedDict, total=False):
     search_nearest: bool
     no_gc: bool
     non_interactive: bool
+    event_interval: int

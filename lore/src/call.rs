@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use lore_base::env::CallEnvironment;
 use lore_base::error::InvalidArguments;
 use lore_base::error::RepositoryNotFound;
 use lore_base::runtime::LORE_CONTEXT;
@@ -106,14 +107,29 @@ where
     })
 }
 
+tokio::task_local! {
+    /// The environment of the process a call running in this task was relayed from.
+    static RELAYED_ENVIRONMENT: CallEnvironment;
+}
+
+/// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
+/// up reads that environment in place of this process's.
+pub(crate) fn with_relayed_environment<F: Future>(
+    environment: CallEnvironment,
+    call: F,
+) -> impl Future<Output = F::Output> {
+    RELAYED_ENVIRONMENT.scope(environment, call)
+}
+
 pub fn setup_execution(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Arc<ExecutionContext> {
-    Arc::new(ExecutionContext::new_client(
-        globals,
-        EventDispatcher::new(callback),
-    ))
+    let execution = ExecutionContext::new_client(globals, EventDispatcher::new(callback));
+    Arc::new(match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
+        Ok(environment) => execution.with_environment(environment),
+        Err(_) => execution,
+    })
 }
 
 /// Remote mutations such as lock operations need worktree admission but no local write token.
@@ -216,7 +232,7 @@ where
                         )
                         .await,
                     );
-                    (detail, Some(post_command_cleanup(repository).await))
+                    (detail, Some(post_command_cleanup(repository)))
                 };
 
                 check_no_lingering_repository(weak_repository);
@@ -233,8 +249,8 @@ where
 /// leaf-fetch writes (mtime cache, status flush) still see it.
 ///
 /// Acquiring the token serializes writes in-process on a per-path
-/// `tokio::sync::Mutex`; reads skip this. Cross-process exclusion is the
-/// `FSLock` in `load_and_connect`.
+/// `tokio::sync::Mutex`; reads skip this. Cross-process exclusion is the store
+/// claims `load_and_connect` takes, and the repository `FSLock` it takes inside them.
 pub async fn repository_call_write<Arg, T, F, Fut, ResT, ErrT>(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
@@ -297,7 +313,7 @@ where
                         )
                         .await,
                     );
-                    (detail, Some(post_command_cleanup(repository).await))
+                    (detail, Some(post_command_cleanup(repository)))
                 };
 
                 check_no_lingering_repository(weak_repository);
@@ -377,7 +393,7 @@ where
                             command(repository.clone(), token, args),
                         )
                         .await;
-                        weak_repository = Some(post_command_cleanup(repository).await);
+                        weak_repository = Some(post_command_cleanup(repository));
                         result
                     }
                     Err(err) => Err(ErrT::from(err)),
@@ -444,7 +460,7 @@ where
                         )
                         .await,
                     );
-                    (detail, Some(post_command_cleanup(repository).await))
+                    (detail, Some(post_command_cleanup(repository)))
                 };
 
                 check_no_lingering_repository(weak_repository);
@@ -585,19 +601,7 @@ where
     Ok((repository_path, execution, attempt))
 }
 
-async fn post_command_cleanup(
-    repository: Arc<RepositoryContext>,
-) -> std::sync::Weak<RepositoryContext> {
-    // Snapshot the state so we don't force a pending connect to resolve
-    // just for teardown. session_stop fires when the last Arc ref drops;
-    // local-only commands never connect and have nothing to release.
-    if let lore_revision::repository::RemoteStatus::Connected(remote) =
-        repository.remote_status().await
-    {
-        let correlation_id = execution_context().globals().correlation_id.to_string();
-        remote.release_session(repository.id, &correlation_id);
-    }
-
+fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {
     let sync_data = execution_context().globals().sync_data();
     repository.try_spawn_post_command_flush(sync_data);
 

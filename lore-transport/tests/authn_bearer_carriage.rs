@@ -484,6 +484,7 @@ impl TestServer {
             1,
             identity_token,
             access_token,
+            lore_transport::auth::AuthMode::Auto,
         )
         .await
         .expect("connect must succeed against the in-process test server")

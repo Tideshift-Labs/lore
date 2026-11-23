@@ -4,8 +4,9 @@
 //!
 //! Two modes:
 //! - **Disk-backed** (`repository_path` non-empty, `in_memory == 0`): constructs backend Arcs
-//!   via `lore_revision::repository::create_client_immutable_store` / `create_client_mutable_store`,
-//!   routing through the path-keyed cache in `lore_revision`. Two handles on the same path
+//!   via `lore_revision::repository::create_client_immutable_store` and `claim_opened_stores`,
+//!   routing through the path-keyed cache in `lore_revision`, and claims them for the handle's
+//!   lifetime. Two handles on the same path
 //!   share one underlying `Arc<dyn ImmutableStore>` and its evictor.
 //! - **In-memory** (`repository_path` empty, `in_memory == 1`): calls
 //!   `LocalImmutableStore::new(None, ...)` + `LocalMutableStore::new(None, ...)` directly. Each
@@ -39,8 +40,7 @@ use lore_storage::local::immutable_store::ImmutableStoreSettings;
 use lore_storage::local::immutable_store::create as create_immutable;
 use lore_storage::local::mutable_store::LocalMutableStore;
 use lore_storage::local::mutable_store::MutableStoreSettings;
-use serde::Deserialize;
-use serde::Serialize;
+use lore_storage::local::store_lock::StoreHold;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
@@ -53,7 +53,7 @@ use crate::storage::store::StoreInternal;
 
 /// Remote endpoint configuration for a storage handle.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
+#[derive(Debug, Clone, PartialEq, Default, ValidateText, bitcode::Encode, bitcode::Decode)]
 pub struct LoreStorageRemoteConfig {
     /// gRPC endpoint of the peer storage service; authenticated with the open call's `globals.identity`
     pub remote_url: LoreString,
@@ -61,7 +61,7 @@ pub struct LoreStorageRemoteConfig {
 
 /// Arguments for `lore_storage_open`.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(open_local)]
 pub struct LoreStorageOpenArgs {
     /// Path to an existing lore repository; must be empty when `in_memory` is set
@@ -72,14 +72,9 @@ pub struct LoreStorageOpenArgs {
     pub remote_config: LoreStorageRemoteConfig,
     /// Activate `remote_config`; otherwise the handle has no remote
     pub has_remote_config: u8,
-    /// Skip re-hashing a loaded payload and checking it against the address it was read from.
-    ///
-    /// Zero keeps the check, which is the default: a store handing back bytes under a content
-    /// address should be able to say they are the bytes that address names. A caller whose own
-    /// layer already assures integrity - one that scrubs its store on a schedule, say - pays for
-    /// the check on every byte of every read and learns nothing new from it, and can set this.
-    ///
-    /// Applies to every read on the handle.
+    /// Alias of `globals.trust_remote` for this handle: the handle trusts its remote when either is
+    /// set, so payloads fetched from it have only their sizes checked against their length and are
+    /// never hashed. Payloads the local store holds are never hashed either way.
     pub skip_verify: u8,
     /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
     /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
@@ -201,7 +196,12 @@ fn open_local(
             .unwrap_or("")
             .to_owned();
 
-        let (immutable, mutable) = match (path.is_empty(), in_memory) {
+        // Claim the stores for as long as this handle is open. An open store is one
+        // this process is using, and the flock is how other processes are told; the
+        // claim therefore belongs to the handle's lifetime, not to each call made
+        // through it. Every operation through the handle then joins this claim instead of
+        // taking a lock and reading the epoch of its own. A store in memory takes no claim.
+        let (immutable, mutable, stores) = match (path.is_empty(), in_memory) {
             (true, true) => {
                 let immutable = create_immutable(
                     Option::<PathBuf>::None,
@@ -221,11 +221,12 @@ fn open_local(
                     .await
                     .forward::<StorageError>("creating in-memory mutable store")?,
                 );
-                (immutable, mutable)
+                (immutable, mutable, StoreHold::default())
             }
             (false, false) => {
-                // Canonicalize for cache-key consistency, but fall back to the raw path on
-                // canonicalize failure so the dotpath check below surfaces the real error.
+                // Made absolute against the call's working directory, falling back to the raw
+                // path on failure so the dotpath check below surfaces the real error. The store
+                // caches resolve whichever spelling arrives to the directory it names.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
                 let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
                     StorageError::from(InvalidArguments {
@@ -249,7 +250,7 @@ fn open_local(
                 }
                 let config = repository::load_repository_config(&absolute)
                     .forward_any::<StorageError>("loading repository config")?;
-                let immutable = repository::create_client_immutable_store(
+                let (immutable, opening) = repository::create_client_immutable_store(
                     &config,
                     &dotpath,
                     create_options,
@@ -257,11 +258,13 @@ fn open_local(
                 )
                 .await
                 .forward_any::<StorageError>("opening immutable store")?;
-                let mutable: Arc<dyn MutableStore> =
-                    repository::create_client_mutable_store(&config, &dotpath, immutable.clone())
-                        .await
-                        .forward_any::<StorageError>("opening mutable store")?;
-                (immutable, mutable)
+                let (immutable, mutable, stores) =
+                    repository::claim_opened_stores(immutable, opening, |immutable| {
+                        repository::create_client_mutable_store(&config, &dotpath, immutable)
+                    })
+                    .await
+                    .forward_any::<StorageError>("opening the mutable store and claiming both")?;
+                (immutable, mutable as Arc<dyn MutableStore>, stores)
             }
             _ => {
                 return Err(StorageError::from(InvalidArguments {
@@ -297,7 +300,8 @@ fn open_local(
             mutable,
             remote,
             bound_flags,
-            args.skip_verify != 0,
+            args.skip_verify != 0 || execution_context().globals().trust_remote(),
+            stores,
         ));
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {

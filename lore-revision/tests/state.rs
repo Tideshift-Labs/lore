@@ -34,6 +34,7 @@ mod tests {
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
+    use lore_revision::util::request_tracker::StoreRequestTracker;
     use lore_storage::Fragment;
     use lore_storage::FragmentFlags;
     use lore_storage::FragmentReference;
@@ -391,6 +392,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -424,6 +426,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -449,6 +452,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -469,6 +473,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -550,6 +555,15 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for FaultInjectingStore {
+        /// Claims what the wrapped store claims.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            self.inner.clone().hold_for_command().await
+        }
         async fn query(
             self: Arc<Self>,
             partition: Partition,
@@ -785,7 +799,8 @@ mod tests {
         with_slow_down_fixture(|repository, state_from, state_to, fault_store| async move {
             fault_store.arm_slow_down_all_metadata_reads();
 
-            let result = collect_new_fragments(repository, state_from, state_to, true).await;
+            let result =
+                collect_new_fragments(repository, state_from, state_to, true, Arc::default()).await;
 
             let err = result.expect_err(
                 "Expected collect_new_fragments to propagate a SlowDown rather than \
@@ -817,12 +832,13 @@ mod tests {
 
             fault_store.arm_generic_fail_all_metadata_reads();
 
-            let fragments = collect_new_fragments(repository, state_from, state_to, true)
-                .await
-                .expect(
-                    "A non-SlowDown metadata error must not fail collect_new_fragments \
+            let fragments =
+                collect_new_fragments(repository, state_from, state_to, true, Arc::default())
+                    .await
+                    .expect(
+                        "A non-SlowDown metadata error must not fail collect_new_fragments \
                      (the pre-existing conservative fallback must be preserved)",
-                );
+                    );
 
             assert!(
                 fragments.contains(&name_address),
@@ -894,12 +910,13 @@ mod tests {
                     .await
                     .expect("Failed to deserialize state");
 
-                let fragments = collect_new_fragments(repository, state_from, state_to, true)
-                    .await
-                    .expect(
-                        "Genuine absence must not surface as an error from \
+                let fragments =
+                    collect_new_fragments(repository, state_from, state_to, true, Arc::default())
+                        .await
+                        .expect(
+                            "Genuine absence must not surface as an error from \
                              collect_new_fragments",
-                    );
+                        );
 
                 assert!(
                     !fragments.is_empty(),
@@ -1107,7 +1124,9 @@ mod tests {
              chunk_two_address| async move {
                 fault_store.arm_slow_down_metadata_for(chunk_two_address);
 
-                let result = collect_new_fragments(repository, state_from, state_to, true).await;
+                let result =
+                    collect_new_fragments(repository, state_from, state_to, true, Arc::default())
+                        .await;
 
                 let err = result.expect_err(
                     "Expected collect_new_fragments to propagate a SlowDown hit on a \
@@ -1142,9 +1161,10 @@ mod tests {
              root_address,
              chunk_one_address,
              chunk_two_address| async move {
-                let fragments = collect_new_fragments(repository, state_from, state_to, true)
-                    .await
-                    .expect("Unarmed fragmented-payload walk must not itself return an error");
+                let fragments =
+                    collect_new_fragments(repository, state_from, state_to, true, Arc::default())
+                        .await
+                        .expect("Unarmed fragmented-payload walk must not itself return an error");
 
                 assert!(
                     fragments.contains(&root_address),
@@ -1183,12 +1203,13 @@ mod tests {
              _chunk_two_address| async move {
                 fault_store.arm_slow_down_get_for(root_address);
 
-                let err = collect_new_fragments(repository, state_from, state_to, true)
-                    .await
-                    .expect_err(
-                        "A SlowDown while loading a fragmented payload's own content must \
+                let err =
+                    collect_new_fragments(repository, state_from, state_to, true, Arc::default())
+                        .await
+                        .expect_err(
+                            "A SlowDown while loading a fragmented payload's own content must \
                          propagate instead of silently dropping its child addresses",
-                    );
+                        );
 
                 assert!(
                     err.is_slow_down(),
@@ -1247,6 +1268,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -1276,6 +1298,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -1387,6 +1410,7 @@ mod tests {
                     state_from.clone(),
                     state_to.clone(),
                     true,
+                    Arc::new(StoreRequestTracker::default()),
                 )
                 .await
                 .expect("Failed to collect fragments");
@@ -1403,6 +1427,74 @@ mod tests {
                         "Content of file-{index:03} was collected, which the old revision already names"
                     );
                 }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every content fragment a collection looks up in the store is counted by the tracker it
+    /// is given, so each added file adds at least one request.
+    #[tokio::test]
+    async fn collect_new_fragments_counts_its_store_reads() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                let state_from = State::new();
+                let signature_from = state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = State::deserialize(repository.clone(), signature_from)
+                    .await
+                    .expect("Failed to deserialize state");
+                const ADDED: u64 = 8;
+                for index in 0..ADDED {
+                    let name = format!("added-{index}");
+                    state_to
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            file_node(&name, file_content(4000 + index)),
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a file");
+                }
+                let signature_to = state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+                let state_to = State::deserialize(repository.clone(), signature_to)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let tracker = Arc::new(StoreRequestTracker::default());
+                collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                    tracker.clone(),
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    tracker.requests() >= ADDED,
+                    "{} requests counted for {ADDED} added files",
+                    tracker.requests()
+                );
+                assert!(tracker.peak_in_flight() >= 1);
             }))
             .await
             .expect("Test task failed");
@@ -3298,6 +3390,7 @@ mod block_single_flight {
     use lore_revision::immutable::ReadFromImmutable;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::nametable::NameTable;
+    use lore_revision::node::BLOCK_NODE_COUNT;
     use lore_revision::node::Node;
     use lore_revision::node::NodeBlock;
     use lore_revision::node::NodeFileMetadata;
@@ -3306,6 +3399,7 @@ mod block_single_flight {
     use lore_revision::node::node_to_file_metadata;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::MAX_CHECKED_FILE_METADATA_BLOCKS;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::Tree;
@@ -3360,6 +3454,16 @@ mod block_single_flight {
 
     #[async_trait]
     impl ImmutableStore for CountingStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,
@@ -3497,6 +3601,8 @@ mod block_single_flight {
         node_block: Address,
         /// Store address of the file metadata block.
         metadata_block: Address,
+        /// Store address of the file metadata block address list.
+        metadata_list: Address,
     }
 
     /// Store address of block `block_index` in the address list rooted at `list`.
@@ -3581,6 +3687,7 @@ mod block_single_flight {
         Seed {
             node_block: block_address(&repository, tree.hash_node, block_index).await,
             metadata_block: block_address(&repository, tree.hash_file_metadata, block_index).await,
+            metadata_list: Address::zero_context_hash(tree.hash_file_metadata),
             _tempdir: tempdir,
             store,
             repository,
@@ -3676,6 +3783,11 @@ mod block_single_flight {
                     reads.values().all(|&count| count == 1),
                     "the burst must read nothing twice, got {reads:?}"
                 );
+                assert!(
+                    !reads.contains_key(&seed.metadata_list)
+                        && !reads.contains_key(&seed.metadata_block),
+                    "a node block load reads no file metadata, got {reads:?}"
+                );
             }))
             .await
             .expect("Test task failed");
@@ -3715,6 +3827,266 @@ mod block_single_flight {
                 assert!(
                     reads.values().all(|&count| count == 1),
                     "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Every add asks for its block's file metadata block, to clear what a recycled slot may
+    /// still carry, and lets go of it when the slot is clear. A run of adds into one block must
+    /// still cost the store one read of it.
+    #[tokio::test]
+    async fn adds_into_a_block_with_stored_metadata_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store.take_reads();
+
+                for index in 0..BURST {
+                    let name = format!("added{index}");
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    assert_eq!(
+                        NodeFileMetadataBlock::index(node_to_file_metadata(node)),
+                        seed.block_index,
+                        "every add lands in the block whose file metadata is stored"
+                    );
+                }
+
+                let reads = seed.store.take_reads();
+                assert_eq!(
+                    reads.get(&seed.metadata_block).copied(),
+                    Some(1),
+                    "{BURST} adds into one block must read its file metadata block once"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An add into a block with no file metadata stored is answered by the address list once
+    /// it is read. Keeping the zeroed block the first such add is handed would hold 65,568 bytes
+    /// for nothing.
+    #[tokio::test]
+    async fn a_state_keeps_no_metadata_block_with_nothing_stored() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+
+                let mut appended = None;
+                for index in 0..=BLOCK_NODE_COUNT {
+                    let name = format!("added{index}");
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(node));
+                    if block_index != seed.block_index {
+                        appended = Some(block_index);
+                        break;
+                    }
+                }
+                let block_index = appended.expect("The adds fill the seeded block");
+
+                let kept = state
+                    .try_block_file_metadata_existing(seed.repository.clone(), block_index)
+                    .await
+                    .expect("Failed to check the file metadata block");
+                assert!(
+                    kept.is_none(),
+                    "a block with nothing stored stays out of memory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The stored file metadata blocks a state checks are kept, but no more of them than the
+    /// limit: past it, the block kept longest is let go of first. The tree holds a node carrying
+    /// metadata in each of one block more than the limit.
+    #[tokio::test]
+    async fn a_state_keeps_the_metadata_blocks_it_checks_up_to_a_limit() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let blocks = MAX_CHECKED_FILE_METADATA_BLOCKS + 1;
+                let state = State::new();
+                let mut stored = Vec::with_capacity(blocks);
+                let mut index = 0;
+                while stored.len() < blocks {
+                    let name = format!("node{index}");
+                    index += 1;
+                    let node = state
+                        .node_add(
+                            repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let metadata_node = node_to_file_metadata(node);
+                    let block_index = NodeFileMetadataBlock::index(metadata_node);
+                    if stored.last() == Some(&block_index) {
+                        continue;
+                    }
+                    let metadata_block = state
+                        .block_file_metadata(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                    {
+                        let mut writer = metadata_block.write();
+                        writer.node(NodeFileMetadata::index(metadata_node)).metadata =
+                            Hash::from_u64(9);
+                        writer.mark_dirty();
+                    }
+                    state.block_file_metadata_modified(metadata_block, block_index);
+                    stored.push(block_index);
+                }
+                state.mark_dirty();
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let state = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                let mut read = Vec::with_capacity(blocks);
+                for &block_index in &stored {
+                    let metadata_block = state
+                        .try_block_file_metadata_existing(repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block")
+                        .expect("Every block has metadata stored");
+                    read.push(Arc::downgrade(&metadata_block));
+                }
+
+                assert!(
+                    read[0].upgrade().is_none(),
+                    "the block read first is let go of once {blocks} have been read"
+                );
+                assert!(
+                    read[1..].iter().all(|block| block.upgrade().is_some()),
+                    "the {MAX_CHECKED_FILE_METADATA_BLOCKS} blocks read last stay in memory"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A block added since the file metadata address list was read stores nothing, which the
+    /// list read already answers: adds spilling into two new blocks, and lookups of those
+    /// blocks, read the list once and find nothing to clear in them. The seeded block is held
+    /// throughout, so the adds into it read nothing.
+    #[tokio::test]
+    async fn new_blocks_read_the_file_metadata_address_list_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store.take_reads();
+                let _seeded = state
+                    .block_file_metadata(seed.repository.clone(), seed.block_index)
+                    .await
+                    .expect("Failed to read the file metadata block");
+
+                let mut added = Vec::with_capacity(2);
+                let mut index = 0;
+                while added.len() < 2 {
+                    let name = format!("added{index}");
+                    index += 1;
+                    let node = state
+                        .node_add(
+                            seed.repository.clone(),
+                            ROOT_NODE,
+                            Node {
+                                name_hash: hash_string(&name),
+                                ..Default::default()
+                            },
+                            &name,
+                        )
+                        .await
+                        .expect("Failed to add a node");
+                    let block_index = NodeFileMetadataBlock::index(node_to_file_metadata(node));
+                    if block_index != seed.block_index && added.last() != Some(&block_index) {
+                        added.push(block_index);
+                    }
+                }
+
+                for &block_index in &added {
+                    let existing = state
+                        .try_block_file_metadata_existing(seed.repository.clone(), block_index)
+                        .await
+                        .expect("Failed to check the file metadata block");
+                    assert!(existing.is_none(), "block {block_index} stores nothing");
+                    state
+                        .block_file_metadata(seed.repository.clone(), block_index)
+                        .await
+                        .expect("Failed to read the file metadata block");
+                }
+
+                let reads = seed.store.take_reads();
+                assert_eq!(
+                    reads.get(&seed.metadata_list).copied(),
+                    Some(1),
+                    "the address list is read once, got {reads:?}"
                 );
             }))
             .await
@@ -3824,5 +4196,130 @@ mod block_single_flight {
                 );
             })
             .await;
+    }
+
+    /// An add into a recycled slot whose name the name table refuses fails before it clears the
+    /// metadata the slot still carries; the next add that takes the slot clears it.
+    #[tokio::test]
+    async fn an_add_refusing_its_name_leaves_the_recycled_slots_metadata() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let repository = seed.repository.clone();
+                let state = State::deserialize(repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                let first = state
+                    .find_subnode(repository.clone(), ROOT_NODE, hash_string("first"))
+                    .await
+                    .expect("the seeded node");
+                lore_revision::state::node_discard_patch(
+                    state.clone(),
+                    repository.clone(),
+                    first,
+                    |_, _| {},
+                )
+                .await
+                .expect("Failed to discard the seeded node");
+                let slot_metadata = || {
+                    let state = state.clone();
+                    let repository = repository.clone();
+                    async move {
+                        let metadata_node = node_to_file_metadata(first);
+                        let block = state
+                            .block_file_metadata(
+                                repository,
+                                NodeFileMetadataBlock::index(metadata_node),
+                            )
+                            .await
+                            .expect("Failed to read the file metadata block");
+                        block
+                            .read()
+                            .node(NodeFileMetadata::index(metadata_node))
+                            .metadata
+                    }
+                };
+                let add = |name: &'static str| {
+                    state.node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string(name),
+                            ..Default::default()
+                        },
+                        name,
+                    )
+                };
+
+                assert!(add("..").await.is_err(), "the name table refuses `..`");
+                assert_eq!(
+                    slot_metadata().await,
+                    Hash::from_u64(9),
+                    "the refused add cleared the recycled slot's metadata"
+                );
+
+                let added = add("second").await.expect("Failed to add a node");
+                assert_eq!(added, first, "the add takes the recycled slot");
+                assert!(
+                    slot_metadata().await.is_zero(),
+                    "the add that took the slot cleared its metadata"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An add whose slot's file metadata block cannot be read fails before the node is
+    /// published: the parent's chain keeps only the children it had.
+    #[tokio::test]
+    async fn an_add_that_cannot_clear_its_slots_metadata_publishes_nothing() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution, async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let state = State::deserialize(seed.repository.clone(), seed.signature)
+                    .await
+                    .expect("Failed to deserialize state");
+                seed.store
+                    .clone()
+                    .obliterate(seed.repository.id, seed.metadata_block, Arc::default())
+                    .await
+                    .expect("Failed to obliterate the file metadata block");
+
+                let added = state
+                    .node_add(
+                        seed.repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("second"),
+                            ..Default::default()
+                        },
+                        "second",
+                    )
+                    .await;
+
+                assert!(
+                    added.is_err(),
+                    "the add cannot clear the slot's file metadata"
+                );
+                let children = state
+                    .node_children(seed.repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("the root's children");
+                assert_eq!(
+                    children.len(),
+                    1,
+                    "the root holds only the node it held: {children:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 }

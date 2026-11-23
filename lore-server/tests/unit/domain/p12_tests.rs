@@ -2141,7 +2141,7 @@ async fn governed_repository_create_refuses_a_claim_witness_with_no_configured_a
                 "alice",
                 "alice",
                 0,
-                None, /* no auth_url */
+                &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
                 None, /* no authorization */
             )
             .await
@@ -2428,7 +2428,7 @@ async fn both_repository_delete_handlers_refuse_internal_admission_before_lookup
                                 id: bytes::Bytes::from_static(&[8; 16]),
                             },
                         ),
-                        None,
+                        &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
                         immutable,
                         mutable,
                         &DeleteTestInstruments,
@@ -2441,7 +2441,7 @@ async fn both_repository_delete_handlers_refuse_internal_admission_before_lookup
                         internal_delete_request(lore_proto::RepositoryDeleteRequest {
                             id: bytes::Bytes::from_static(&[8; 16]),
                         }),
-                        None,
+                        &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
                         immutable,
                         mutable,
                         &DeleteTestInstruments,

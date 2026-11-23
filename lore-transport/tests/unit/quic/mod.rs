@@ -11,4 +11,4 @@ mod response_reader;
 mod scripted_storage_peer;
 mod session_expiry;
 mod session_start_bound;
-mod storage_service;
+pub(crate) mod storage_service;

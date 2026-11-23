@@ -16,7 +16,7 @@ from error_types import (
     ProtectedError,
     UnknownLoreError,
 )
-from lore_parsers import parse_status_json, parse_status_summary_json
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 from test_utils import to_posix
 
 from lore import Lore
@@ -601,7 +601,7 @@ def test_sync_far_behind_through_local_merge_tip(new_lore_repo):
 
     # A second clone races ahead with > MAX_DIVERGENT_HISTORY_LENGTH
     # linear commits on main.
-    clone = repo.clone()
+    clone = repo.clone(offline=True)
     bulk_file = "bulk.txt"
     for i in range(_FAR_BEHIND_REMOTE_COMMITS):
         with clone.open_file(bulk_file, "w+") as f:
@@ -649,7 +649,7 @@ def test_sync_far_behind_with_local_merge_tip_and_remote_merges(new_lore_repo):
     repo.push()
 
     # Clone races ahead with cycles of linear commits + merges.
-    clone = repo.clone()
+    clone = repo.clone(offline=True)
     bulk_file = "bulk.txt"
     remote_side_file = "remote-side.txt"
 
@@ -1292,3 +1292,349 @@ def test_sync_remote_revision_merged_from_divergence_keeps_latest(new_lore_repo)
     after = other.branch_info("main")
     assert after.local_latest == merge_revision
     assert after.remote_latest == merge_revision
+
+
+def _edit_then_dirty(repo: Lore) -> None:
+    with repo.open_file("other.txt", "w") as f:
+        f.write("edited during the merge")
+    repo.dirty("other.txt")
+
+
+def _edit_then_stage(repo: Lore) -> None:
+    with repo.open_file("other.txt", "w") as f:
+        f.write("edited during the merge")
+    repo.stage("other.txt")
+
+
+def _move_then_dirty(repo: Lore) -> None:
+    repo.move("other.txt", "moved.txt")
+    repo.dirty_move("other.txt", "moved.txt")
+
+
+def _move_then_stage(repo: Lore) -> None:
+    repo.move("other.txt", "moved.txt")
+    repo.file_stage_move("other.txt", "moved.txt")
+
+
+def _set_revision_metadata(repo: Lore) -> None:
+    repo.revision_metadata_set(["co-author", "Co Author <co.author@example.com>"])
+
+
+def _add_file_dependency(repo: Lore) -> None:
+    repo.file_dependency_add("other.txt", "conflict.txt")
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    ("edit", "force"),
+    [
+        pytest.param(None, False, id="resolve-only"),
+        pytest.param(_edit_then_dirty, False, id="dirty"),
+        pytest.param(_edit_then_stage, False, id="stage"),
+        pytest.param(_move_then_dirty, False, id="dirty-move"),
+        pytest.param(_move_then_stage, False, id="stage-move"),
+        pytest.param(_set_revision_metadata, False, id="revision-metadata"),
+        pytest.param(_add_file_dependency, False, id="file-dependency"),
+        pytest.param(None, True, id="forced-commit"),
+    ],
+)
+def test_sync_merge_of_divergent_history_keeps_the_remote_latest_first(
+    new_lore_repo, edit, force
+):
+    """
+    A sync that merges divergent history takes the remote latest as the merge's first
+    parent and the local latest as its second. Whatever is changed on top of the merge
+    before it is committed keeps both, so the merge revision descends from the remote
+    latest and pushes.
+    """
+    repo = new_lore_repo()
+
+    for name in ("conflict.txt", "other.txt"):
+        with repo.open_file(name, "w+") as f:
+            f.write("base")
+    repo.stage(["conflict.txt", "other.txt"])
+    repo.commit("Base")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("conflict.txt", "w") as f:
+        f.write("remote")
+    repo.stage("conflict.txt")
+    repo.commit("Remote change")
+    repo.push()
+    remote_latest = repo.branch_info("main").local_latest
+
+    with clone.open_file("conflict.txt", "w") as f:
+        f.write("local")
+    clone.stage("conflict.txt")
+    clone.commit("Local change", local=True)
+    local_latest = clone.branch_info("main").local_latest
+
+    # The conflict stops the sync before it commits the merge, which leaves the merge
+    # staged for the change below.
+    clone.sync()
+    with clone.open_file("conflict.txt", "w") as f:
+        f.write("resolved")
+    clone.branch_merge_resolve("conflict.txt")
+
+    if edit:
+        edit(clone)
+    clone.commit("Merge", force=force)
+
+    merge_revision = clone.branch_info("main").local_latest
+    merge_parents = clone.revision_info(merge_revision).merge.split()
+    assert merge_parents == [remote_latest, local_latest]
+
+    clone.push()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "conflict", [False, True], ids=["sync-commit", "resolved-conflict"]
+)
+def test_sync_merge_of_divergent_history_leaves_the_branch_ahead_of_the_remote(
+    new_lore_repo, conflict
+):
+    """
+    A committed merge of divergent history holds the remote latest, so until it is pushed the
+    branch is ahead of the remote and not behind it.
+    """
+    repo = new_lore_repo()
+
+    for name in ("conflict.txt", "other.txt"):
+        with repo.open_file(name, "w+") as f:
+            f.write("base")
+    repo.stage(["conflict.txt", "other.txt"])
+    repo.commit("Base")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("conflict.txt", "w") as f:
+        f.write("remote")
+    repo.stage("conflict.txt")
+    repo.commit("Remote change")
+    repo.push()
+
+    local_file = "conflict.txt" if conflict else "local.txt"
+    with clone.open_file(local_file, "w") as f:
+        f.write("local")
+    clone.stage(local_file)
+    clone.commit("Local change", local=True)
+
+    clone.sync()
+    if conflict:
+        with clone.open_file("conflict.txt", "w") as f:
+            f.write("resolved")
+        clone.branch_merge_resolve("conflict.txt")
+        clone.commit("Merge")
+
+    [status] = parse_jsonl(clone.status(json=True), "repositoryStatusRevision")
+    assert status["isLocalAhead"] == 1
+    assert status["isRemoteAhead"] == 0
+
+
+@pytest.mark.smoke
+def test_sync_records_the_time_of_a_file_holding_the_incoming_content_only_before_its_clock(
+    new_lore_repo,
+):
+    """A sync that finds a file already holding the incoming content records its time only where
+    that time is older than the filesystem clock the sync read before reading the file: a write
+    after the read may share a later one. The scan after the sync answers for the older file by
+    its recorded time and reads the other."""
+    repo: Lore = new_lore_repo()
+    names = ("older.bin", "ahead.bin")
+    for name in names:
+        with repo.open_file(name, "w+b") as output_file:
+            output_file.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("First content")
+    repo.push()
+    first = repo.revision_info().signature
+
+    # The same size, so only the recorded time or the content can tell the files apart.
+    incoming = {name: os.urandom(4096) for name in names}
+    for name, content in incoming.items():
+        with repo.open_file(name, "w+b") as output_file:
+            output_file.write(content)
+    repo.stage(scan=True)
+    repo.commit("Second content")
+    repo.push()
+
+    repo.sync(first)
+    for name, content in incoming.items():
+        with repo.open_file(name, "w+b") as output_file:
+            output_file.write(content)
+    now = time.time()
+    os.utime(os.path.join(repo.path, "older.bin"), (now - 3600, now - 3600))
+    os.utime(os.path.join(repo.path, "ahead.bin"), (now + 3600, now + 3600))
+    repo.sync()
+
+    output = repo.status(scan=True, json=True)
+    assert [
+        entry for entry in parse_status_json(output) if to_posix(entry["path"]) in names
+    ] == [], "the files hold the synced content"
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert (summary["hashChecks"], summary["mtimeMatches"]) == (1, 1), (
+        f"the sync must record the older time and not the one ahead, got {summary}"
+    )
+
+
+def _file_history(repo: Lore, path: str) -> list[dict]:
+    """The entries of the history of `path`, newest first."""
+    return parse_jsonl(repo.file_history(path, json=True), "fileHistory")
+
+
+@pytest.mark.smoke
+def test_sync_merge_of_divergent_history_keeps_the_remote_history_off_a_local_file(
+    new_lore_repo,
+):
+    """
+    A sync that merges divergent history builds the merge from the local latest. A file
+    the remote latest added and a file the local latest added can have the same node ID
+    in the two, and the remote's addition is not recorded on the local file, whose history
+    is its own addition.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base")
+    repo.stage("base.txt")
+    repo.commit("Base")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("remote.txt", "w+") as f:
+        f.write("remote")
+    repo.stage("remote.txt")
+    repo.commit("Add a remote file")
+    repo.push()
+    remote_latest = repo.branch_info("main").local_latest
+
+    with clone.open_file("local.txt", "w+") as f:
+        f.write("local")
+    clone.stage("local.txt")
+    clone.commit("Add a local file", local=True)
+    local_latest = clone.branch_info("main").local_latest
+
+    # Neither side changed what the other did, so the sync commits the merge.
+    clone.sync()
+    merge_revision = clone.branch_info("main").local_latest
+    assert clone.revision_info(merge_revision).merge.split() == [
+        remote_latest,
+        local_latest,
+    ]
+
+    history = _file_history(clone, "local.txt")
+    assert [
+        (entry["revision"], entry["path"], entry["action"]) for entry in history
+    ] == [(local_latest, "local.txt", "add")]
+
+
+@pytest.mark.smoke
+def test_sync_merge_of_divergent_history_records_the_remote_add_of_a_file_both_sides_add(
+    new_lore_repo,
+):
+    """
+    Both sides add the same path after they diverge, and the remote latest gives the file
+    another node ID than the local latest does, having added a file before it. The merge
+    records the remote's addition on the file, so its history reaches the remote latest
+    at the path the remote added it at.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base")
+    repo.stage("base.txt")
+    repo.commit("Base")
+    repo.push()
+
+    clone = repo.clone()
+
+    with repo.open_file("earlier.txt", "w+") as f:
+        f.write("earlier")
+    repo.stage("earlier.txt")
+    repo.commit("Add an earlier remote file")
+    repo.push()
+    with repo.open_file("shared.txt", "w+") as f:
+        f.write("remote")
+    repo.stage("shared.txt")
+    repo.commit("Add the shared file remotely")
+    repo.push()
+    remote_latest = repo.branch_info("main").local_latest
+
+    with clone.open_file("shared.txt", "w+") as f:
+        f.write("local")
+    clone.stage("shared.txt")
+    clone.commit("Add the shared file locally", local=True)
+    local_latest = clone.branch_info("main").local_latest
+
+    # Both sides added the file, which stops the sync on a conflict.
+    clone.sync()
+    with clone.open_file("shared.txt", "w") as f:
+        f.write("resolved")
+    clone.branch_merge_resolve("shared.txt")
+    clone.commit("Merge")
+    merge_revision = clone.branch_info("main").local_latest
+    assert clone.revision_info(merge_revision).merge.split() == [
+        remote_latest,
+        local_latest,
+    ]
+
+    history = _file_history(clone, "shared.txt")
+    assert [(entry["revision"], entry["path"]) for entry in history] == [
+        (merge_revision, "shared.txt"),
+        (remote_latest, "shared.txt"),
+    ]
+    assert history[-1]["action"] == "add"
+
+
+@pytest.mark.smoke
+def test_sync_merge_of_divergent_history_keeps_the_remote_change_before_its_latest(
+    new_lore_repo,
+):
+    """
+    A sync merges divergent history where the remote changed a file in a revision before
+    its latest. The history of the file names that revision, as it does on the remote.
+    """
+    repo = new_lore_repo()
+
+    with repo.open_file("changed.txt", "w+") as f:
+        f.write("base")
+    repo.stage("changed.txt")
+    repo.commit("Base")
+    repo.push()
+    base = repo.branch_info("main").local_latest
+
+    clone = repo.clone()
+
+    with repo.open_file("changed.txt", "w") as f:
+        f.write("remote")
+    repo.stage("changed.txt")
+    repo.commit("Change the file remotely")
+    repo.push()
+    remote_change = repo.branch_info("main").local_latest
+    with repo.open_file("added.txt", "w+") as f:
+        f.write("remote")
+    repo.stage("added.txt")
+    repo.commit("Add a remote file")
+    repo.push()
+
+    with clone.open_file("local.txt", "w+") as f:
+        f.write("local")
+    clone.stage("local.txt")
+    clone.commit("Add a local file", local=True)
+
+    # Neither side changed what the other did, so the sync commits the merge.
+    clone.sync()
+    merge_revision = clone.branch_info("main").local_latest
+
+    history = _file_history(clone, "changed.txt")
+    assert [entry["revision"] for entry in history] == [
+        merge_revision,
+        remote_change,
+        base,
+    ]

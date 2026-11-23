@@ -45,7 +45,7 @@ async fn client_with_session(peer: &Peer) -> (Arc<StorageClient>, u32) {
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "",
+        &lore_transport::auth::AuthEndpoint::none(),
         "managed-wait-scope",
         partition(),
         &Arc::new(SuppliedCredentials::default()),
@@ -59,7 +59,7 @@ async fn client_with_session(peer: &Peer) -> (Arc<StorageClient>, u32) {
         .await
         .expect("declared session")
         .0;
-    (Arc::new(client), session)
+    (client, session)
 }
 
 /// Close every connection and the endpoint, and wait until the client's connection is gone.

@@ -61,6 +61,10 @@ pub mod get_file_resolved;
 pub mod get_metadata;
 pub mod get_resolved;
 pub mod handle;
+#[cfg(not(feature = "test-util"))]
+pub(crate) mod lent;
+#[cfg(feature = "test-util")]
+pub mod lent;
 pub mod mutable_compare_and_swap;
 pub mod mutable_list;
 pub mod mutable_load;
@@ -71,7 +75,10 @@ pub mod put;
 pub mod put_file;
 pub mod put_file_resolved;
 pub mod put_resolved;
+#[cfg(not(feature = "test-util"))]
 pub(crate) mod remote;
+#[cfg(feature = "test-util")]
+pub mod remote;
 #[cfg(not(feature = "test-util"))]
 pub(crate) mod store;
 #[cfg(feature = "test-util")]
@@ -111,19 +118,10 @@ pub async fn close_all_handles() {
 /// and running the close sequence on each. Client-mode handles (no connection id recorded)
 /// are unaffected. Per-handle drains run in parallel.
 ///
-/// IPC buffer-bearing args policy: `lore_storage_put` and `lore_storage_put_resolved` carry a
-/// `LoreBytes` view into caller memory in their *args*, which has no natural cross-process
-/// representation. `LoreBytes::deserialize` always errors, so those args cannot be reconstructed
-/// on the server side of the IPC boundary. `lore_storage_put_file` and
-/// `lore_storage_put_file_resolved` name a path instead, so they carry across it unchanged and are
-/// the delegable way to write content a service holds on disk.
-///
-/// Two caveats worth knowing before relying on this. Nothing enforces it: every op goes through
-/// `dispatch_call` and is delegated whenever service mode is active, and the failure surfaces as
-/// a message that fails to read — dropping the connection — rather than as the `InvalidArguments`
-/// a caller would expect. And the read ops (`lore_storage_get`, `lore_storage_get_resolved`) are
-/// *not* in this family despite emitting `LoreBytes`: they carry it only in events, whose
-/// lifetime is the callback, so their args round-trip fine.
+/// Buffers across the IPC boundary: the `LoreBytes` a `lore_storage_put` or
+/// `lore_storage_put_resolved` item views crosses as its bytes, which the service reads in the
+/// message they arrived in. A get item's `data_out` names memory the service cannot write, so it
+/// does not cross, and a relayed get answers with `GET_DATA` events instead.
 ///
 /// Revision tree handles loaded against a drained storage handle are closed too, and this
 /// is the only path that closes one for its caller: elsewhere a tree outlives its parent by
@@ -138,8 +136,9 @@ pub async fn close_for_connection(connection_id: u64) {
 }
 
 /// Run the close sequence for each entry concurrently: every drain fires its own task so the
-/// total wall time is bounded by the slowest drain, not the sum. The flush spawn inside is
-/// already fire-and-forget; only the in-flight-counter await is parallelized here.
+/// total wall time is bounded by the slowest drain, not the sum. The flush spawned inside is
+/// fire-and-forget; what runs in parallel here is the in-flight-counter await and the join of
+/// the claims each flush holds.
 ///
 /// Exposed at `pub(crate)` so the unit tests can exercise the close logic on an explicit
 /// entry list rather than the process-global registry — running the test against the live
@@ -151,7 +150,13 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
     for (_, store) in entries {
         lore_base::lore_spawn!(tasks, async move {
             store.mark_invalid_and_await().await;
-            close::spawn_flush_stores(store.immutable.clone(), store.mutable.clone(), false);
+            let claims = close::claims_for_flush(&store);
+            close::spawn_flush_stores(
+                store.immutable.clone(),
+                store.mutable.clone(),
+                claims,
+                false,
+            );
         });
     }
     while tasks.join_next().await.is_some() {}

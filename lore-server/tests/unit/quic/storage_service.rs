@@ -9,7 +9,6 @@ use lore_base::types::KeyType;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwk::JWKService;
 use lore_server::auth::jwk::JWKServiceError;
-use lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM;
 use lore_server::auth::jwt::JwtVerifier;
 use lore_server::protocol::attribute_map::AttributeMap;
 use lore_server::protocol::storage::messages::MessageHandleError;
@@ -56,7 +55,6 @@ fn verifier_present() -> Arc<Option<JwtVerifier>> {
         jwt_issuer: None,
         jwt_audience: None,
         jwt_typ: None,
-        identity_claim: DEFAULT_IDENTITY_CLAIM.to_string(),
     }))
 }
 

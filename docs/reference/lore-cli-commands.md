@@ -1,16 +1,22 @@
 # Lore CLI command reference
 
-The `lore` command-line client drives every local and remote Lore operation: creating and cloning repositories, staging and committing revisions, branching, merging, and syncing with a Lore Server. This page catalogs every `lore` command and subcommand, with its arguments and flags.
+The `lore` command-line client drives every local and remote Lore operation: creating and cloning repositories, staging
+and committing revisions, branching, merging, and syncing with a Lore Server. This page catalogs every `lore` command
+and subcommand, with its arguments and flags.
 
-This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
+This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md);
+to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.10.1-nightly+1203`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.10.1-nightly+1281`). Everything below the marker is
+generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository
+root:
 
 ```bash
 printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
 ```
 
-`clap-markdown` ends its output with a blank line, which the quoted expansion strips. A subcommand carrying no help text renders as a trailing separator, which the whitespace hook rejects — write the help text rather than trimming the line.
+`clap-markdown` ends its output with a blank line, which the quoted expansion strips. A subcommand carrying no help text
+renders as a trailing separator, which the whitespace hook rejects — write the help text rather than trimming the line.
 
 <!-- BEGIN generated: lore --markdown-help -->
 
@@ -121,6 +127,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * [`lore file reset`↴](#lore-file-reset)
 * [`lore file obliterate`↴](#lore-file-obliterate)
 * [`lore file history`↴](#lore-file-history)
+* [`lore file audit`↴](#lore-file-audit)
 * [`lore file diff`↴](#lore-file-diff)
 * [`lore file write`↴](#lore-file-write)
 * [`lore file hash`↴](#lore-file-hash)
@@ -167,6 +174,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service status`↴](#lore-service-status)
 * [`lore service set-executable`↴](#lore-service-set-executable)
 * [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
 * [`lore notification`↴](#lore-notification)
@@ -225,7 +233,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * `--identity <IDENTITY>` — Use given identity
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
-* `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
@@ -234,6 +242,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
 * `--cache` — Cache fragment payloads fetched from remote in the local store
+* `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash verified. For machines where performance comes first, such as a build server streaming from a server in its own backend
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 * `--stats <level>` — Report what the operation cost: `--stats` for totals, `--stats=2` to add per-fragment detail
 
@@ -383,6 +392,8 @@ Create a repository in the given directory
 ## `lore repository clone`
 
 Clone a remote repository into the given path
+
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -790,6 +801,7 @@ Merge two branches
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
 * `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
+* `--link-message <PATH>` — Per-link auto commit message. Takes two values: <path> <message>. Can be specified multiple times
 
 
 
@@ -848,6 +860,7 @@ Start a merge process
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
 * `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
+* `--link-message <PATH>` — Per-link auto commit message. Takes two values: <path> <message>. Can be specified multiple times
 
 
 
@@ -1611,6 +1624,7 @@ File commands
 * `reset` — Reset changes to a path or file to the current revision, discarding your local changes
 * `obliterate` — Obliterate a file or fragment
 * `history` — List revisions of a file
+* `audit` — Attribute each line of a file to the revision that last changed it
 * `diff` — Show differences between two revisions of a file
 * `write` — Write data to a specific location
 * `hash` — Hash a local file
@@ -1955,6 +1969,34 @@ List revisions of a file
 * `--branch <branch>` — Show branch revisions
 * `--depth <depth>` — Number of revisions to search initially
 * `--oneline` — Output each revision on one line only
+
+
+
+## `lore file audit`
+
+Attribute each line of a file to the revision that last changed it
+
+**Usage:** `lore file audit [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — File path to attribute
+
+###### **Options:**
+
+* `--revision <revision>` — Revision to read the file at: a revision signature, `[branch]@<number>`, `[branch]@LATEST` or `<branch>@<hash>`, optionally followed by `~<count>` to step back that many parents. Without it the file is read at the revision the instance is synced to, and the file on disk is accounted for
+* `--max-revisions <n>` — Comparisons of the file's predecessor chain to make, 0 for no limit.
+
+   This bounds the work, not the number of revisions the answer can name. A comparison against the revision that added the file resolves that revision too, and a comparison at a revision that left the file alone resolves none, so the rows reported can be one more or one fewer than the bound allows.
+
+  Default value: `100`
+* `--ignore-space-at-eol` — Treat lines that differ only in trailing whitespace as unchanged
+
+   On by default, unlike `lore file diff`: attribution asks who wrote a line, and trailing-space or line-ending churn does not answer that. Turn it off with --no-ignore-space-at-eol.
+* `--no-ignore-space-at-eol` — Count a line that differs only in trailing whitespace as changed
+* `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
+
+   Leaves a reindented line with the revision that wrote its text.
 
 
 
@@ -2316,6 +2358,8 @@ Pass `--scan` to walk the filesystem under the given paths, reconcile every file
 ## `lore clone`
 
 Clone a remote repository into the given path
+
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2716,6 +2760,7 @@ Manage the repository in a service process
 * `run` — Run this process as the service
 * `start` — Start the service, unless one is already running
 * `stop` — Stop the running service
+* `status` — Report whether the service is running, and what it is doing
 * `set-executable` — Set which executable is started as the service
 * `set-use-automatically` — Set whether commands are carried out by the service
 
@@ -2742,6 +2787,14 @@ Start the service, unless one is already running
 Stop the running service
 
 **Usage:** `lore service stop`
+
+
+
+## `lore service status`
+
+Report whether the service is running, and what it is doing
+
+**Usage:** `lore service status`
 
 
 
@@ -2893,4 +2946,3 @@ Set whether new clones use a shared store without being asked to
     This document was generated automatically by
     <a href="https://crates.io/crates/clap-markdown"><code>clap-markdown</code></a>.
 </i></small>
-

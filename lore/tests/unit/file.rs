@@ -3,14 +3,17 @@
 use lore::file::*;
 
 #[test]
-fn reset_to_last_merged_args_old_payload_missing_merge_side_uses_default() {
-    // Old IPC client payload with no merge_side field. The new field must be
-    // `#[serde(default)]` so old clients keep working.
-    let payload = r#"{ "paths": [], "branch": "main", "purge": 0 }"#;
+fn a_zero_bound_is_the_default_rather_than_no_bound() {
+    assert_eq!(audit_bound(0), Some(DEFAULT_MAX_REVISIONS));
+}
 
-    let args: LoreFileResetToLastMergedArgs =
-        serde_json::from_str(payload).expect("old payload must deserialise");
+#[test]
+fn the_largest_bound_is_no_bound() {
+    assert_eq!(audit_bound(u32::MAX), None);
+}
 
-    assert_eq!(args.branch.as_str(), "main");
-    assert_eq!(args.merge_side, 0);
+#[test]
+fn a_named_number_is_the_bound() {
+    assert_eq!(audit_bound(1), Some(1));
+    assert_eq!(audit_bound(250), Some(250));
 }

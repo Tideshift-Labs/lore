@@ -1162,7 +1162,9 @@ mod quic_declared_session_tests {
             assert_eq!(cell.probe.declared_of(id), Some(false));
 
             drop(session);
-            connection.release_session(partition, "decl-one-stop");
+            // v0.11.0 (60953490) keeps a pool pinned until the correlation id changes; dropping the
+            // pinned pool is what `release_session` used to do.
+            connection.invalidate_all_sessions();
             eventually("the undeclared session to stop", || {
                 cell.probe.declared_of(id).is_none()
             })
@@ -1199,7 +1201,9 @@ mod quic_declared_session_tests {
             })
             .await;
             drop(session);
-            connection.release_session(partition, "decl-two-stops");
+            // v0.11.0 (60953490) keeps a pool pinned until the correlation id changes; dropping the
+            // pinned pool is what `release_session` used to do.
+            connection.invalidate_all_sessions();
             eventually("both sessions to stop", || cell.probe.live() == 0).await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert_eq!(

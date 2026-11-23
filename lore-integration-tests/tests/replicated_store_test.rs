@@ -160,13 +160,13 @@ mod replicated_store_tests {
     async fn connect_storage_client(
         addr: SocketAddr,
         partition: Partition,
-    ) -> (StorageClient, u32) {
+    ) -> (Arc<StorageClient>, u32) {
         let credentials = Arc::new(SuppliedCredentials::default());
         let client = StorageClient::connect(
             Weak::<Connection>::new(),
             &format!("quic://127.0.0.1:{}", addr.port()),
             String::new(),
-            "",
+            &lore_transport::auth::AuthEndpoint::none(),
             "",
             partition,
             &credentials,
@@ -398,6 +398,12 @@ mod replicated_store_tests {
 
     #[async_trait]
     impl MutableStore for OutcomeUnknownMutableStore {
+        async fn hold_for_command(
+            self: Arc<Self>,
+        ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+            // Nothing on disk to claim.
+            Ok(None)
+        }
         async fn load(
             self: Arc<Self>,
             _partition: Partition,

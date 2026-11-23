@@ -39,7 +39,25 @@ impl FSLock {
         path: impl AsRef<Path>,
         create_directory_if_necessary: bool,
     ) -> std::io::Result<FSLock> {
-        let mut path = path.as_ref().to_path_buf();
+        let path = Self::file_lock_path(path.as_ref(), create_directory_if_necessary)?;
+        Self::acquire_exact_path(&path).await.map_err(|_err| {
+            std::io::Error::other(format!("Failed to acquire lock file \"{path:?}\""))
+        })
+    }
+
+    /// Takes the lock [`acquire_file_lock`](Self::acquire_file_lock) takes if no other holder
+    /// has it, without waiting: `None` while it is held.
+    pub fn try_acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<Option<FSLock>> {
+        let path = Self::file_lock_path(path.as_ref(), false)?;
+        Self::try_take(Self::open_lock_file(&path)?)
+    }
+
+    /// The lock file guarding `path`: `path` with `.lock` appended, in its canonical directory.
+    fn file_lock_path(
+        path: &Path,
+        create_directory_if_necessary: bool,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let mut path = path.to_path_buf();
         let mut file_name = path
             .file_name()
             .ok_or(std::io::Error::other(
@@ -53,9 +71,7 @@ impl FSLock {
         let mut path = path.canonicalize()?;
         file_name.push(".lock");
         path.push(file_name);
-        Self::acquire_exact_path(&path).await.map_err(|_err| {
-            std::io::Error::other(format!("Failed to acquire lock file \"{path:?}\""))
-        })
+        Ok(path)
     }
 
     /// Directory twin of [`acquire_file_lock`](Self::acquire_file_lock).
@@ -94,20 +110,8 @@ impl FSLock {
     /// sustained contention. And the wait stays unbounded, matching the blocking lock callers had
     /// before, which means a peer that never releases would otherwise look exactly like a hang —
     /// hence the warning once the wait passes [`LOCK_WAIT_WARN`].
-    async fn acquire_exact_path(path: &Path) -> std::io::Result<FSLock> {
-        let mut retry = 2;
-        let file = loop {
-            match Self::open_lock_file(path) {
-                Ok(file) => break file,
-                Err(err) => {
-                    retry -= 1;
-                    if retry == 0 {
-                        return Err(err);
-                    }
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-            }
-        };
+    pub async fn acquire_exact_path(path: &Path) -> std::io::Result<FSLock> {
+        let file = Self::open_with_retry(path).await?;
 
         let started = std::time::Instant::now();
         let mut delay = LOCK_RETRY_START;
@@ -128,6 +132,46 @@ impl FSLock {
                     delay = std::cmp::min(delay * 2, LOCK_RETRY_MAX);
                 }
                 Err(err) => return Err(err),
+            }
+        }
+    }
+
+    /// Takes the OS lock guarding `path` only if no other holder has it, without waiting.
+    ///
+    /// For work that can be put off: a caller that finds the lock held tries again later,
+    /// rather than queueing behind a holder whose hold has no bound.
+    ///
+    /// # Errors
+    ///
+    /// [`std::io::Error`] if the lock file cannot be opened, or if the lock cannot be
+    /// attempted for a reason other than another holder having it.
+    pub async fn try_acquire_exact_path(path: &Path) -> std::io::Result<Option<FSLock>> {
+        Self::try_take(Self::open_with_retry(path).await?)
+    }
+
+    /// Takes the OS lock on `file` if no other holder has it: `None` while it is held.
+    fn try_take(file: std::fs::File) -> std::io::Result<Option<FSLock>> {
+        match Self::try_lock(&file) {
+            Ok(()) => Ok(Some(FSLock { file })),
+            Err(err) if is_lock_contended(&err) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Opens the lock file at `path`, trying once more after [`RETRY_DELAY`] if the first
+    /// open fails.
+    async fn open_with_retry(path: &Path) -> std::io::Result<std::fs::File> {
+        let mut retry = 2;
+        loop {
+            match Self::open_lock_file(path) {
+                Ok(file) => return Ok(file),
+                Err(err) => {
+                    retry -= 1;
+                    if retry == 0 {
+                        return Err(err);
+                    }
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
             }
         }
     }

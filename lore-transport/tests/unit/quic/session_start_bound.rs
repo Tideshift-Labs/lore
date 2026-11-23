@@ -37,12 +37,12 @@ fn partition() -> Partition {
     Partition::from([0x24u8; 16])
 }
 
-async fn connect(peer: &Peer) -> StorageClient {
+async fn connect(peer: &Peer) -> Arc<StorageClient> {
     StorageClient::connect(
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "",
+        &lore_transport::auth::AuthEndpoint::none(),
         "session-start-bound",
         partition(),
         &Arc::new(SuppliedCredentials::default()),
@@ -55,11 +55,11 @@ async fn connect(peer: &Peer) -> StorageClient {
 /// Close the client's only connection from the peer's side and wait for it. The client sees it die
 /// with nothing in flight; the next command reconnects.
 async fn kill_the_connection(peer: &Peer) {
-    assert_eq!(
-        peer.accepted_connections(),
-        1,
-        "one live connection to kill"
-    );
+    // The client's connect can return before the peer's accept loop records the connection.
+    peer.wait_until("one live connection to kill", |peer| {
+        peer.accepted_connections() == 1
+    })
+    .await;
     peer.close_connections();
     peer.wait_until("the connection to close", |peer| {
         peer.closed_connections() == 1

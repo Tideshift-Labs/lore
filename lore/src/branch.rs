@@ -31,8 +31,6 @@ use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_transport::attempt_store::AttemptStore;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -41,9 +39,10 @@ use crate::call_delegation::reject_undelegatable;
 use crate::interface::Context;
 use crate::interface::LoreString;
 use crate::remote::service_process::service_in_use;
+use crate::util::path_messages;
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(create_local)]
 /// Arguments for creating a new branch with the given name and category.
 pub struct LoreBranchCreateArgs {
@@ -119,7 +118,7 @@ fn create_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 /// Arguments for retrieving branch metadata (name, id, category, protection status).
 pub struct LoreBranchInfoArgs {
@@ -181,7 +180,7 @@ fn info_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(diff_local)]
 /// Arguments for diffing two branches, reporting changed and conflicting files.
 pub struct LoreBranchDiffArgs {
@@ -247,7 +246,7 @@ fn diff_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(list_local)]
 /// Arguments for listing all branches in the repository.
 pub struct LoreBranchListArgs {
@@ -301,7 +300,7 @@ fn list_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_start_local)]
 /// Arguments for merging a source branch into the current branch.
 pub struct LoreBranchMergeStartArgs {
@@ -318,8 +317,11 @@ pub struct LoreBranchMergeStartArgs {
     /// Metadata keys to carry from the source revision onto the merge
     /// revision. Empty carries nothing; the single entry `*` carries every
     /// key that is not reserved to the merge itself.
-    #[serde(default)]
     pub inherit_metadata: LoreArray<LoreString>,
+    /// Array of link relative paths that have specific auto commit messages
+    pub link_paths: LoreArray<LoreString>,
+    /// Array of messages corresponding to each link path (parallel array with `link_paths`)
+    pub link_messages: LoreArray<LoreString>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -381,19 +383,21 @@ fn merge_start_local(
                 MergeScope::Link(link_str)
             };
 
-            let options = MergeStartOptions {
-                message: args.message.to_string(),
-                no_commit: args.no_commit != 0,
-                scope,
-                inherit_metadata: MetadataInherit::from_keys(
-                    args.inherit_metadata
-                        .as_slice()
-                        .iter()
-                        .map(LoreString::as_str),
-                ),
-            };
-
             async move {
+                let options = MergeStartOptions {
+                    message: args.message.to_string(),
+                    link_messages: path_messages("link", &args.link_paths, &args.link_messages)
+                        .forward::<MergeError>("Invalid link message path")?,
+                    no_commit: args.no_commit != 0,
+                    scope,
+                    inherit_metadata: MetadataInherit::from_keys(
+                        args.inherit_metadata
+                            .as_slice()
+                            .iter()
+                            .map(LoreString::as_str),
+                    ),
+                };
+
                 let branch = branch::resolve(repository.clone(), args.branch.as_str())
                     .await
                     .forward::<MergeError>("resolving branch")?;
@@ -405,7 +409,7 @@ fn merge_start_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_abort_local)]
 /// Arguments for aborting an in-progress branch merge.
 pub struct LoreBranchMergeAbortArgs {
@@ -471,7 +475,7 @@ fn merge_abort_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_unresolve_local)]
 /// Arguments for marking resolved merge paths as unresolved again.
 pub struct LoreBranchMergeUnresolveArgs {
@@ -525,7 +529,7 @@ fn merge_unresolve_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_into_local)]
 /// Arguments for merging the current branch's staged changes into a target branch.
 pub struct LoreBranchMergeIntoArgs {
@@ -542,7 +546,6 @@ pub struct LoreBranchMergeIntoArgs {
     /// Metadata keys to carry from the current branch onto the revision
     /// created on the target branch. Empty carries nothing; the single entry
     /// `*` carries every key that is not reserved to the merge itself.
-    #[serde(default)]
     pub inherit_metadata: LoreArray<LoreString>,
 }
 
@@ -627,7 +630,7 @@ fn merge_into_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_restart_local)]
 /// Arguments for re-applying merge conflict resolution for the given paths.
 pub struct LoreBranchMergeRestartArgs {
@@ -682,7 +685,7 @@ fn merge_restart_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_resolve_local)]
 /// Arguments for marking conflicted paths as resolved.
 pub struct LoreBranchMergeResolveArgs {
@@ -736,7 +739,7 @@ fn merge_resolve_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_resolve_mine_local)]
 /// Arguments for resolving conflicts by accepting the local ("mine") version.
 pub struct LoreBranchMergeResolveMineArgs {
@@ -790,7 +793,7 @@ fn merge_resolve_mine_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(merge_resolve_theirs_local)]
 /// Arguments for resolving conflicts by accepting the incoming ("theirs") version.
 pub struct LoreBranchMergeResolveTheirsArgs {
@@ -844,7 +847,7 @@ fn merge_resolve_theirs_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(push_local)]
 /// Arguments for pushing a branch and its revisions to the remote.
 pub struct LoreBranchPushArgs {
@@ -931,12 +934,11 @@ pub async fn push_with_attempt_store(
 
 /// Managed push adoption for CLI and embedders: one fence, sequential repository stages.
 #[doc(hidden)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(push_managed_service_local)]
 pub struct LoreManagedBranchPushArgs {
     pub args: LoreBranchPushArgs,
     /// FORK-LOCAL (Tideshift): see [`push_managed_refusing_others_locks`].
-    #[serde(default)]
     pub refuse_locked_by_others: bool,
 }
 
@@ -1159,7 +1161,7 @@ async fn push_impl_with_runner(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(switch_local)]
 /// Arguments for switching the working directory to a different branch or revision.
 pub struct LoreBranchSwitchArgs {
@@ -1237,7 +1239,7 @@ fn switch_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(protect_local)]
 /// Arguments for applying write protection to a branch.
 pub struct LoreBranchProtectArgs {
@@ -1292,7 +1294,7 @@ fn protect_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(unprotect_local)]
 /// Arguments for removing write protection from a branch.
 pub struct LoreBranchUnprotectArgs {
@@ -1347,23 +1349,19 @@ fn unprotect_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(archive_local)]
 /// Arguments for archiving a branch locally and (unless local mode) on the remote.
 pub struct LoreBranchArchiveArgs {
     /// Name of the branch
     pub branch: LoreString,
     /// If set, archive only in this layer (mount path relative to repo root)
-    #[serde(default)]
     pub layer: LoreString,
     /// Also archive the branch in every configured layer
-    #[serde(default)]
     pub include_layers: u8,
     /// If set, archive only in this link (mount path relative to repo root)
-    #[serde(default)]
     pub link: LoreString,
     /// Also archive the branch in every configured link
-    #[serde(default)]
     pub include_links: u8,
 }
 
@@ -1549,9 +1547,7 @@ async fn archive_layers(
                 .into_iter()
                 .find(|layer| layer.target_path == path)
                 .ok_or_else(|| -> BranchError { lore_base::error::NotALayer { path }.into() })?;
-            vec![Arc::new(
-                repository.to_layer_context(layer.repository).await,
-            )]
+            vec![repository.to_layer_context(layer.repository).await]
         }
     };
 
@@ -1612,7 +1608,7 @@ async fn archive_in_repositories(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_local)]
 /// Arguments for resetting a branch's local LATEST pointer to a specific revision.
 pub struct LoreBranchResetArgs {
@@ -1679,7 +1675,7 @@ async fn reset_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(latest_list_local)]
 /// Arguments for listing a branch's LATEST revision history.
 pub struct LoreBranchLatestListArgs {
@@ -1746,7 +1742,7 @@ async fn latest_list_impl(
 // --- Branch metadata commands ---
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_get_local)]
 /// Arguments for retrieving branch metadata (one key or all).
 pub struct LoreBranchMetadataGetArgs {
@@ -1825,7 +1821,7 @@ fn metadata_get_local(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_set_local)]
 /// Arguments for setting one or more key-value pairs on branch metadata.
 pub struct LoreBranchMetadataSetArgs {
@@ -1903,7 +1899,7 @@ async fn metadata_set_impl(
 }
 
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, Default, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_clear_local)]
 /// Arguments for removing keys from branch metadata.
 pub struct LoreBranchMetadataClearArgs {

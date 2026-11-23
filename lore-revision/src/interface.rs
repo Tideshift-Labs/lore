@@ -12,6 +12,7 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use lore_base::env::CallEnvironment;
 use lore_base::error::InvalidArguments;
 use lore_base::runtime::runtime_shutdown_timeout;
 use lore_base::text::TextNotUtf8;
@@ -21,11 +22,11 @@ pub use lore_credential::user_info;
 pub use lore_transport::drop_connections;
 use serde::Deserialize;
 use serde::Serialize;
-use serde::de;
 use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
 use zerocopy::IntoBytes;
 
+use crate::auth::AuthMode;
 use crate::change::FileAction;
 use crate::event::LoreBytes;
 use crate::event::LoreBytesMut;
@@ -38,7 +39,8 @@ use crate::lore::Hash;
 use crate::relay::EventDispatcher;
 use crate::revision::ResolveSearchLocation;
 use crate::util::path::RelativePath;
-use crate::util::serde::u8_as_bool;
+
+mod encoding;
 
 /// A block of raw bytes described by a pointer and a length.
 ///
@@ -161,22 +163,6 @@ impl Serialize for LoreBinary {
             serializer.serialize_str(&BASE64.encode(self.as_bytes()))
         } else {
             serializer.serialize_bytes(self.as_bytes())
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for LoreBinary {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            let text = String::deserialize(deserializer)?;
-            let value = BASE64.decode(text.as_bytes()).map_err(de::Error::custom)?;
-            Ok(LoreBinary::from_bytes(&value))
-        } else {
-            let value: Vec<u8> = serde_bytes::deserialize(deserializer)?;
-            Ok(LoreBinary::from_bytes(&value))
         }
     }
 }
@@ -447,12 +433,9 @@ impl From<RelativePath> for LoreString {
     }
 }
 
-/// Serializes as a string, failing on bytes that are not UTF-8.
-///
-/// Serialization is how a command reaches the Lore service, so substituting
-/// replacement characters here would let the service accept text the in-process
-/// path rejects, storing a mangled name instead of reporting a bad argument.
-/// Failing keeps both paths refusing the same input.
+/// Serializes as a string, failing on bytes that are not UTF-8 rather than
+/// substituting replacement characters, which would report a name that was
+/// never stored.
 impl Serialize for LoreString {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -460,16 +443,6 @@ impl Serialize for LoreString {
     {
         let text = std::str::from_utf8(self.as_bytes()).map_err(serde::ser::Error::custom)?;
         serializer.serialize_str(text)
-    }
-}
-
-impl<'de> Deserialize<'de> for LoreString {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value: String = Deserialize::deserialize(deserializer)?;
-        Ok(LoreString::from_str(&value))
     }
 }
 
@@ -572,7 +545,7 @@ where
 
 impl<T> LoreArray<T> {
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: ptr is always valid, either from a clone, or from `from_vec`
+        // SAFETY: ptr addresses count elements, of a boxed slice or of an array a caller lent
         unsafe {
             if !self.ptr.is_null() && self.count > 0 {
                 std::slice::from_raw_parts(self.ptr, self.count)
@@ -582,27 +555,9 @@ impl<T> LoreArray<T> {
         }
     }
 
-    /// Moves the strings from the vec in the string array
+    /// Takes over the vec's elements, and its allocation unless it has spare capacity.
     pub fn from_vec(vec: Vec<T>) -> Self {
-        // `from_raw_parts_mut` below requires a non-null pointer even for a zero length, and
-        // `new` returns null for a zero count.
-        if vec.is_empty() {
-            return Self::default();
-        }
-        let target = LoreArray::<T>::new(vec.len());
-
-        // SAFETY: target is created to the same count as the vec and we're going to initialise
-        // every element.
-        unsafe {
-            let to_slice = std::slice::from_raw_parts_mut(target.ptr.cast_mut(), target.count);
-
-            for (from, to) in vec.into_iter().zip(to_slice.iter_mut()) {
-                // Needed to ensure drop is not called on *to, which is uninitialised right now
-                std::ptr::write(to, from);
-            }
-        }
-
-        target
+        vec.into_boxed_slice().into()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -612,61 +567,26 @@ impl<T> LoreArray<T> {
     pub fn len(&self) -> usize {
         self.count
     }
+}
 
-    /// Room for `count` uninitialised elements.
-    ///
-    /// `Layout::array` is zero-sized for a zero count and for any count of a zero-sized type, and
-    /// `std::alloc::alloc` is undefined behaviour for a zero-sized layout, so neither case
-    /// allocates. A zero count returns the null pointer. A zero-sized type returns a dangling
-    /// aligned pointer and keeps the count, because `as_slice` must still answer that many
-    /// elements and a slice needs a non-null aligned pointer to start from.
-    fn new(count: usize) -> Self {
-        if count == 0 {
+/// Takes over the slice's allocation, which has the layout `Drop` frees: `Layout::array` of its
+/// length, and none at all for an empty slice or a zero-sized type.
+impl<T> From<Box<[T]>> for LoreArray<T> {
+    fn from(elements: Box<[T]>) -> Self {
+        if elements.is_empty() {
             return Self::default();
         }
-        if std::mem::size_of::<T>() == 0 {
-            return Self {
-                ptr: std::ptr::NonNull::<T>::dangling().as_ptr(),
-                count,
-            };
-        }
-        let layout =
-            std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
-        unsafe {
-            let ptr = std::alloc::alloc(layout).cast::<T>();
-            if ptr.is_null() {
-                panic!("unable to alloc for LoreArray<T>::new");
-            }
-
-            Self { ptr, count }
+        let count = elements.len();
+        Self {
+            ptr: Box::into_raw(elements).cast::<T>(),
+            count,
         }
     }
 }
 
 impl<T: Clone> Clone for LoreArray<T> {
     fn clone(&self) -> Self {
-        if self.is_empty() {
-            return Self {
-                ptr: std::ptr::null(),
-                count: 0,
-            };
-        }
-        unsafe {
-            let mut clone = Self::new(self.count);
-
-            // Deep clone the contained strings
-            let from_slice = std::slice::from_raw_parts(self.ptr, self.count);
-            let to_slice = std::slice::from_raw_parts_mut(clone.ptr.cast_mut(), self.count);
-
-            for (from, to) in from_slice.iter().zip(to_slice.iter_mut()) {
-                // Needed to ensure drop is not called on *to, which is uninitialised right now
-                std::ptr::write(to, from.clone());
-            }
-
-            clone.count = self.count;
-
-            clone
-        }
+        Self::from_vec(self.as_slice().to_vec())
     }
 }
 
@@ -676,8 +596,8 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                // A zero-sized type took no heap in `new`, which handed back a dangling pointer
-                // rather than an allocation. Every element still drops, above.
+                // A boxed slice of a zero-sized type holds a dangling pointer rather than an
+                // allocation. Every element still drops, above.
                 if std::mem::size_of::<T>() != 0 {
                     let layout = std::alloc::Layout::array::<T>(self.count)
                         .expect("layout overflow in LoreArray<T>::drop");
@@ -706,19 +626,6 @@ where
     }
 }
 
-impl<'de, T> Deserialize<'de> for LoreArray<T>
-where
-    T: serde::Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value: Vec<T> = Deserialize::deserialize(deserializer)?;
-        Ok(LoreArray::from_vec(value))
-    }
-}
-
 /// Selects which configuration sources are loaded. The values are flags
 /// that can be combined.
 /// cbindgen:prefix-with-name
@@ -744,8 +651,13 @@ pub enum LoreLoadConfig {
 pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
 
 /// Common options shared by repository operations.
+///
+/// Zero every byte of it, padding included, before setting the fields a call
+/// uses, as every structure passed to the library: a field left zero selects
+/// its default, and a field a release adds in its padding is left unset by
+/// code built against an earlier header.
 #[repr(C)]
-#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreGlobalArgs {
     /// Repository path
     pub repository_path: LoreString,
@@ -769,7 +681,8 @@ pub struct LoreGlobalArgs {
     pub remote: u8,
     /// Dry run mode, only report what would have been changed and perform no changes to local file system
     pub dry_run: u8,
-    /// Maximum number of parallel connections for bulk data transfer
+    /// Number of parallel storage connections for bulk data transfer, 0 for the default of 1.
+    /// At most 10 are opened
     pub max_connections: u32,
     /// Search limit when iterating revisions
     pub search_limit: u32,
@@ -788,9 +701,13 @@ pub struct LoreGlobalArgs {
     pub compress_task_limit: u64,
     /// Keep store references alive after a repository call completes to avoid
     /// repeated store open/close cycles for consecutive API calls in the same process.
+    /// The stores stay locked meanwhile, so another process using them waits. With
+    /// `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+    /// the call, the stores are kept after every call whether or not this is set,
+    /// unlocked, and the next call reloads them only if another process changed them.
     pub store_keep_alive: u8,
-    /// Duration in seconds to keep store references alive. Only used when
-    /// `store_keep_alive` is set. 0 means use the default (10 seconds).
+    /// Duration in seconds to keep store references alive, when `store_keep_alive` or
+    /// `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
@@ -825,6 +742,16 @@ pub struct LoreGlobalArgs {
     /// whatever `stats` is set to, statistics being reported once at the end
     /// rather than on an interval. Zero takes [`DEFAULT_EVENT_INTERVAL_MS`].
     pub event_interval_ms: u64,
+    /// Which authentication path to take if the server advertises both its
+    /// gRPC auth service and an OIDC issuer.
+    pub auth_mode: AuthMode,
+    /// Treat the remote as a trusted source, for a caller within its
+    /// infrastructure where performance comes first: payloads fetched from it
+    /// have only their sizes checked against their length, are never hashed,
+    /// and are decompressed only where their content is read. A storage handle
+    /// takes it from the globals it is opened with. Any non-zero value trusts
+    /// the remote, so a caller zeroes the whole struct, padding included
+    pub trust_remote: u8,
     /// The attempt identity this call's mutations are dispatched under, as a
     /// hyphenated lowercase `UUIDv7`. Empty for every caller that does not track
     /// attempts, which is the CLI and every embedder that has not opted in.
@@ -845,6 +772,9 @@ pub struct LoreGlobalArgs {
     /// Appended to this struct rather than inserted, so the layout only grows.
     pub attempt_id: LoreString,
 }
+
+// Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
+const _: () = assert!(std::mem::size_of::<LoreGlobalArgs>() == 208);
 
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
@@ -985,6 +915,11 @@ impl LoreGlobalArgs {
         self.cache != 0
     }
 
+    /// Whether the command trusts its remote.
+    pub fn trust_remote(&self) -> bool {
+        self.trust_remote != 0
+    }
+
     /// Whether an operation should emit statistics events at all.
     pub fn stats(&self) -> bool {
         self.stats > 0
@@ -1007,11 +942,11 @@ impl LoreGlobalArgs {
         std::time::Duration::from_millis(interval_ms)
     }
 
-    /// Returns the store keep-alive duration if enabled.
-    /// When `store_keep_alive` is not set, returns `None`.
-    /// When set with `store_keep_alive_seconds` of 0, uses the default duration.
+    /// Returns how long stores are kept after a call: `None` when neither `store_keep_alive`
+    /// is set nor this process retains stores ([`crate::store::retain_stores`]), and the
+    /// default duration where `store_keep_alive_seconds` is 0.
     pub fn store_keep_alive_duration(&self) -> Option<std::time::Duration> {
-        if self.store_keep_alive == 0 {
+        if self.store_keep_alive == 0 && !crate::store::retain_stores() {
             return None;
         }
         let seconds = if self.store_keep_alive_seconds == 0 {
@@ -1094,6 +1029,12 @@ fn execution_initialize() {
         }
 
         let _ = install_crypto_provider();
+        lore_base::env::find_context_environment_with(|context| {
+            context
+                .downcast_ref::<ExecutionContext>()?
+                .environment
+                .as_ref()
+        });
     });
 }
 
@@ -1137,6 +1078,9 @@ pub struct ExecutionContext {
     /// FORK-LOCAL (Tideshift, WP-124 K10): this call's declared, best-effort upload scope, when
     /// the command installed one. See `crate::managed_commit_uploads`.
     managed_uploads: parking_lot::Mutex<Option<Arc<lore_storage::managed_uploads::ManagedUploads>>>,
+    /// The environment of the process that relayed this call, read in place of this process's
+    /// through [`lore_base::env::var`]. `None` for a call made in this process.
+    environment: Option<CallEnvironment>,
 }
 
 impl ExecutionContext {
@@ -1189,6 +1133,14 @@ impl ExecutionContext {
         user_id: String,
     ) -> Self {
         Self::new(globals, dispatcher, user_id, ExecutionMode::Server)
+    }
+
+    /// This context, for a call relayed from a process with `environment`.
+    pub fn with_environment(self, environment: CallEnvironment) -> Self {
+        Self {
+            environment: Some(environment),
+            ..self
+        }
     }
 
     pub fn globals(&self) -> &LoreGlobalArgs {
@@ -1267,6 +1219,7 @@ impl Default for ExecutionContext {
             push_stats: OnceLock::new(),
             prewarm_expired: Arc::default(),
             managed_uploads: parking_lot::Mutex::new(None),
+            environment: None,
         }
     }
 }
@@ -1341,7 +1294,7 @@ pub enum LoreError {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C, u32)]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub enum LoreMetadata {
     /// An address value.
     Address(Address) = LoreMetadataType::Address as u32,
@@ -1369,7 +1322,7 @@ pub enum LoreMetadata {
 ///
 /// There is deliberately no zero value: a zero-initialized field has not chosen
 /// a type and must not be passed as one.
-#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreMetadataType {
     /// A content address: 48 bytes, the 32-byte hash followed by the 16-byte
@@ -1389,105 +1342,32 @@ pub enum LoreMetadataType {
     Binary = 255,
 }
 
-/// Adjacent tagging (`{"tagName": …, "data": …}`) for self-describing formats,
-/// external tagging for the rest.
-///
-/// The derive cannot express both, and one representation will not do: adjacent
-/// tagging needs `deserialize_identifier`, which the binary format used between
-/// a client and the service does not implement, while switching everything to
-/// external tagging would change the JSON that existing clients already read.
-/// The split is the same one [`crate::lore::Address`] makes.
+/// Adjacent tagging (`{"tagName": …, "data": …}`), with a boolean written as one.
 mod metadata_repr {
-    use serde::Deserialize;
     use serde::Serialize;
 
-    use super::*;
-
-    pub(super) const ADDRESS: (u32, &str) = (0, "address");
-    pub(super) const BOOLEAN: (u32, &str) = (1, "boolean");
-    pub(super) const BINARY: (u32, &str) = (2, "binary");
-    pub(super) const CONTEXT: (u32, &str) = (3, "context");
-    pub(super) const HASH: (u32, &str) = (4, "hash");
-    pub(super) const NUMERIC: (u32, &str) = (5, "numeric");
-    pub(super) const STRING: (u32, &str) = (6, "string");
+    pub(super) const ADDRESS: &str = "address";
+    pub(super) const BOOLEAN: &str = "boolean";
+    pub(super) const BINARY: &str = "binary";
+    pub(super) const CONTEXT: &str = "context";
+    pub(super) const HASH: &str = "hash";
+    pub(super) const NUMERIC: &str = "numeric";
+    pub(super) const STRING: &str = "string";
 
     pub(super) fn emit<S, T>(
         serializer: S,
-        variant: (u32, &'static str),
+        name: &'static str,
         value: &T,
     ) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
         T: Serialize + ?Sized,
     {
-        let (index, name) = variant;
-        if serializer.is_human_readable() {
-            use serde::ser::SerializeStruct;
-            let mut tagged = serializer.serialize_struct("LoreMetadata", 2)?;
-            tagged.serialize_field("tagName", name)?;
-            tagged.serialize_field("data", value)?;
-            tagged.end()
-        } else {
-            serializer.serialize_newtype_variant("LoreMetadata", index, name, value)
-        }
-    }
-
-    /// Mirrors [`LoreMetadata`]'s variants so the derive can do the reading.
-    ///
-    /// The order here is not [`LoreMetadata`]'s and need not be: what matters is
-    /// that it matches the indices the constants above carry, since the external
-    /// form is read by position. Move a variant in one and the other has to move
-    /// with it, or a value is written under one kind and read back as another.
-    #[derive(Deserialize)]
-    #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
-    pub(super) enum Tagged {
-        Address(Address),
-        Boolean(#[serde(with = "u8_as_bool")] u8),
-        Binary(LoreBinary),
-        Context(Context),
-        Hash(Hash),
-        Numeric(u64),
-        String(LoreString),
-    }
-
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub(super) enum External {
-        Address(Address),
-        Boolean(#[serde(with = "u8_as_bool")] u8),
-        Binary(LoreBinary),
-        Context(Context),
-        Hash(Hash),
-        Numeric(u64),
-        String(LoreString),
-    }
-
-    impl From<Tagged> for LoreMetadata {
-        fn from(value: Tagged) -> Self {
-            match value {
-                Tagged::Address(inner) => LoreMetadata::Address(inner),
-                Tagged::Boolean(inner) => LoreMetadata::Boolean(inner),
-                Tagged::Binary(inner) => LoreMetadata::Binary(inner),
-                Tagged::Context(inner) => LoreMetadata::Context(inner),
-                Tagged::Hash(inner) => LoreMetadata::Hash(inner),
-                Tagged::Numeric(inner) => LoreMetadata::Numeric(inner),
-                Tagged::String(inner) => LoreMetadata::String(inner),
-            }
-        }
-    }
-
-    impl From<External> for LoreMetadata {
-        fn from(value: External) -> Self {
-            match value {
-                External::Address(inner) => LoreMetadata::Address(inner),
-                External::Boolean(inner) => LoreMetadata::Boolean(inner),
-                External::Binary(inner) => LoreMetadata::Binary(inner),
-                External::Context(inner) => LoreMetadata::Context(inner),
-                External::Hash(inner) => LoreMetadata::Hash(inner),
-                External::Numeric(inner) => LoreMetadata::Numeric(inner),
-                External::String(inner) => LoreMetadata::String(inner),
-            }
-        }
+        use serde::ser::SerializeStruct;
+        let mut tagged = serializer.serialize_struct("LoreMetadata", 2)?;
+        tagged.serialize_field("tagName", name)?;
+        tagged.serialize_field("data", value)?;
+        tagged.end()
     }
 }
 
@@ -1505,19 +1385,6 @@ impl Serialize for LoreMetadata {
             LoreMetadata::Hash(value) => emit(serializer, HASH, value),
             LoreMetadata::Numeric(value) => emit(serializer, NUMERIC, value),
             LoreMetadata::String(value) => emit(serializer, STRING, value),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for LoreMetadata {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            metadata_repr::Tagged::deserialize(deserializer).map(LoreMetadata::from)
-        } else {
-            metadata_repr::External::deserialize(deserializer).map(LoreMetadata::from)
         }
     }
 }
@@ -1575,7 +1442,7 @@ impl ValidateText for LoreMetadata {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The kind of a tracked node.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreNodeType {
     /// A directory.
@@ -1614,7 +1481,7 @@ pub enum LoreNodeStagedAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The change applied to a file.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreFileAction {
     /// The file is unchanged.
@@ -1633,7 +1500,7 @@ pub enum LoreFileAction {
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// Where a branch is located.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreBranchLocation {
     /// A branch held locally.
@@ -1653,7 +1520,7 @@ impl Display for LoreBranchLocation {
 
 /// A branch paired with a revision on that branch.
 #[repr(C)]
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, bitcode::Encode, bitcode::Decode)]
 pub struct LoreBranchPoint {
     /// The branch.
     pub branch: BranchId,

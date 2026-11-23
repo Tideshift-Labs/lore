@@ -51,7 +51,7 @@ async fn no_domain_coordinator_reaches_the_legacy_repository_lookup_not_blocked_
         .scope(execution, async move {
             handler(
                 make_request(repository_id),
-                None, /* no auth_url */
+                &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
                 immutable_store,
                 mutable_store,
                 &TestInstrumentProvider,

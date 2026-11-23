@@ -550,9 +550,8 @@ mod quic_session_rebind_tests {
             jwk_service: Arc::new(StaticJwkService),
             jwt_issuer: None,
             jwt_audience: Some(vec![TEST_JWT_AUDIENCE.to_string()]),
-            // Upstream v0.10.1 fields: no `typ` check, and the default `sub` identity claim.
+            // Upstream v0.10.1 field: no `typ` check (v0.11.0 dropped `identity_claim`).
             jwt_typ: None,
-            identity_claim: lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
         }))
     }
 
@@ -1343,6 +1342,7 @@ mod quic_session_rebind_tests {
             1,
             "",
             initial_token,
+            lore_transport::auth::AuthMode::Auto,
         )
         .await
         .expect("connecting with a valid credential should succeed");
@@ -1393,6 +1393,7 @@ mod quic_session_rebind_tests {
             1,
             "",
             replacement_token,
+            lore_transport::auth::AuthMode::Auto,
         )
         .await
         .expect("adopting a replacement credential should reuse the live connection");
@@ -2919,6 +2920,7 @@ mod quic_session_rebind_tests {
                     1,
                     "",
                     "",
+                    lore_transport::auth::AuthMode::Auto,
                 )
                 .await?;
                 let storage = connection.storage().await?;

@@ -33,6 +33,10 @@ use rand::random;
 use tokio::sync::mpsc;
 use tonic::Request;
 
+use crate::grpc::push_protected::PUSH_PROTECTED;
+use crate::grpc::push_protected::TIERS;
+use crate::grpc::push_protected::Tier;
+use crate::grpc::push_protected::allow_all;
 use crate::notification::testing::MockNotificationSender;
 use crate::store::test_support::test_store_create;
 
@@ -221,6 +225,7 @@ async fn enforcing_cell_rejects_before_v1_branch_push_body() {
             false,
             false,
         ),
+        crate::grpc::push_protected::allow_all(),
         immutable_store,
         mutable_store,
         notification,
@@ -234,22 +239,6 @@ async fn enforcing_cell_rejects_before_v1_branch_push_body() {
     .await
     .expect_err("enforcement must reject missing operation carriage at entry");
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
-}
-
-fn make_service_account_request(
-    repository: RepositoryId,
-    branch: BranchId,
-    revision: Hash,
-) -> Request<BranchPushRequest> {
-    let mut request = make_request(repository, branch, revision, false, false);
-    request
-        .extensions_mut()
-        .insert(lore_server::auth::jwt::AuthorizationToken {
-            user_id: "service-bot".into(),
-            is_service_account: Some(true),
-            ..lore_server::auth::jwt::AuthorizationToken::default()
-        });
-    request
 }
 
 #[tokio::test]
@@ -277,6 +266,7 @@ async fn push_advances_branch_latest() {
         let hook_dispatcher = HookDispatcher::empty();
         let response = handler(
             make_request(repository, main, revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -318,6 +308,7 @@ async fn push_zero_revision_returns_invalid_argument() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             make_request(repository, main, Hash::default(), false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -361,6 +352,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, first, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -379,6 +371,7 @@ async fn push_with_stale_parent_returns_failed_precondition() {
         let stale = build_revision(&repository_context, Hash::default(), 2).await;
         let err = handler(
             make_request(repository, main, stale, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -422,6 +415,7 @@ async fn force_push_overrides_stale_parent() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, first, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -438,6 +432,7 @@ async fn force_push_overrides_stale_parent() {
         let stale = build_revision(&repository_context, Hash::default(), 2).await;
         let response = handler(
             make_request(repository, main, stale, true, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -490,6 +485,7 @@ async fn push_to_protected_branch_returns_permission_denied() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             make_request(repository, main, revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -543,6 +539,7 @@ async fn push_idempotent_on_current_latest() {
         )]);
         handler(
             make_request(repository, main, revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -567,6 +564,7 @@ async fn push_idempotent_on_current_latest() {
         // Re-pushing the same revision returns success with the same latest.
         let response = handler(
             make_request(repository, main, revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -620,6 +618,7 @@ async fn unknown_branch_returns_not_found() {
         let hook_dispatcher = HookDispatcher::empty();
         let err = handler(
             make_request(repository, unknown, revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -637,8 +636,11 @@ async fn unknown_branch_returns_not_found() {
     .await;
 }
 
-#[tokio::test]
-async fn service_account_bypasses_protection() {
+/// Pushes to a protected branch as a caller holding `actions`, on `tier`.
+async fn push_to_protected_branch(
+    tier: Tier,
+    actions: &'static [&'static str],
+) -> Result<(), tonic::Status> {
     let repository = random::<RepositoryId>();
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");
@@ -646,7 +648,7 @@ async fn service_account_bypasses_protection() {
     let mut notification_sender = MockNotificationSender::new();
     notification_sender
         .expect_branch_pushed()
-        .return_once(|_, _, _, _, _| ());
+        .returning(|_, _, _, _, _| ());
     let notification_sender = Arc::new(notification_sender);
     let instrument_provider = TestInstrumentProvider {};
 
@@ -663,8 +665,13 @@ async fn service_account_bypasses_protection() {
         let revision = build_revision(&repository_context, Hash::default(), 1).await;
 
         let hook_dispatcher = HookDispatcher::empty();
-        let response = handler(
-            make_service_account_request(repository, main, revision),
+        handler(
+            tier.with_token(
+                make_request(repository, main, revision, false, false),
+                repository,
+                actions,
+            ),
+            tier.authorizer(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -676,11 +683,80 @@ async fn service_account_bypasses_protection() {
             None,
         )
         .await
-        .expect("service account should bypass protection");
-        assert_eq!(
-            response.into_inner().revision_signature,
-            bytes::Bytes::from(revision)
+        .map(|_| ())
+    }))
+    .await
+}
+
+#[tokio::test]
+async fn push_protected_action_bypasses_protection() {
+    for tier in TIERS {
+        push_to_protected_branch(tier, &[PUSH_PROTECTED])
+            .await
+            .unwrap_or_else(|err| panic!("{tier:?}: holder of the action should push: {err}"));
+    }
+}
+
+#[tokio::test]
+async fn push_to_protected_branch_without_the_action_is_denied() {
+    for tier in TIERS {
+        let err = push_to_protected_branch(tier, &["read", "write"])
+            .await
+            .expect_err("a caller without the action must not push");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "{tier:?}");
+    }
+}
+
+#[tokio::test]
+async fn service_account_claim_no_longer_bypasses_protection() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+    let notification_sender = Arc::new(MockNotificationSender::new());
+    let instrument_provider = TestInstrumentProvider {};
+
+    Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let main = create_root_branch(&repository_context, "main").await;
+        branch::protect(repository_context.clone(), main)
+            .await
+            .expect("should protect");
+        let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+        let mut request = Tier::Global.with_token(
+            make_request(repository, main, revision, false, false),
+            repository,
+            &[],
         );
+        request
+            .extensions_mut()
+            .insert(lore_server::auth::jwt::AuthorizationToken {
+                user_id: "service-bot".into(),
+                is_service_account: Some(true),
+                ..Default::default()
+            });
+
+        let hook_dispatcher = HookDispatcher::empty();
+        let err = handler(
+            request,
+            Tier::Global.authorizer(),
+            immutable_store.clone(),
+            mutable_store.clone(),
+            notification_sender.clone(),
+            &hook_dispatcher,
+            DEFAULT_HISTORY_STEP_SIZE,
+            lore_server::grpc::server::RevisionListAcceleration::default(),
+            &instrument_provider,
+            None,
+            None,
+        )
+        .await
+        .expect_err("the claim alone must not waive protection");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }))
     .await;
 }
@@ -711,6 +787,7 @@ async fn push_to_deleted_branch_reinstates_name() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, main_latest, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -743,6 +820,7 @@ async fn push_to_deleted_branch_reinstates_name() {
         let child_revision = build_revision(&repository_context, main_latest, 2).await;
         let response = handler(
             make_request(repository, child, child_revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -791,6 +869,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
         let hook_dispatcher = HookDispatcher::empty();
         handler(
             make_request(repository, main, main_latest, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -815,6 +894,7 @@ async fn push_to_deleted_branch_fails_when_name_taken() {
         let stale_revision = build_revision(&repository_context, main_latest, 2).await;
         let err = handler(
             make_request(repository, original, stale_revision, false, false),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),
@@ -862,6 +942,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
         for rev in [r1, r2] {
             handler(
                 make_request(repository, main, rev, false, false),
+                allow_all(),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -885,6 +966,7 @@ async fn fast_forward_merge_succeeds_for_clean_diff() {
 
         let response = handler(
             make_request(repository, main, divergent, false, true),
+            allow_all(),
             immutable_store.clone(),
             mutable_store.clone(),
             notification_sender.clone(),

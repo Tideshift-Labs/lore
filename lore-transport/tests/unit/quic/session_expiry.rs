@@ -90,12 +90,15 @@ fn now_secs() -> u64 {
 
 /// A client whose session starts present `access_token`. The auth URL is non-empty only so the
 /// client calls `exchange`, which returns a supplied access token before it reads the URL.
-async fn connect(peer: &Peer, access_token: &str) -> StorageClient {
+async fn connect(peer: &Peer, access_token: &str) -> Arc<StorageClient> {
     StorageClient::connect(
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "session-expiry-unused://auth.example.com",
+        &lore_transport::auth::AuthEndpoint::new(
+            "session-expiry-unused://auth.example.com".to_string(),
+            lore_transport::auth::AuthEndpoint::none().auth,
+        ),
         "session-expiry",
         partition(),
         &Arc::new(SuppliedCredentials::new("", access_token)),
@@ -375,7 +378,10 @@ async fn each_session_keeps_the_exp_of_the_token_it_started_with() {
         Weak::new(),
         &peer.url(),
         "127.0.0.1".to_string(),
-        "session-expiry-unused://auth.example.com",
+        &lore_transport::auth::AuthEndpoint::new(
+            "session-expiry-unused://auth.example.com".to_string(),
+            lore_transport::auth::AuthEndpoint::none().auth,
+        ),
         "session-expiry",
         partition(),
         &credentials,
@@ -452,7 +458,7 @@ async fn the_client_alone_does_not_resend_after_a_201() {
 #[tokio::test]
 async fn a_held_201_answer_maps_to_the_typed_error_when_it_arrives() {
     let peer = Peer::start();
-    let client = Arc::new(connect(&peer, "opaque-token").await);
+    let client = connect(&peer, "opaque-token").await;
     let session = client
         .session_start(partition(), "held-201")
         .await

@@ -7,7 +7,6 @@ use lore_base::types::Hash;
 use lore_revision::change::FileAction;
 use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
-use lore_revision::immutable;
 use lore_revision::instance::InstanceId;
 use lore_revision::link::LinkFlags;
 use lore_revision::lore::*;
@@ -20,6 +19,7 @@ use lore_storage::hash;
 use zerocopy::FromZeros;
 
 mod diff;
+mod reparent;
 mod stream;
 
 /// Each action the walk settles on records a dirty flag and the staged flag standing
@@ -2062,25 +2062,26 @@ async fn a_deeply_nested_hierarchy_is_emitted_in_full() {
     );
 }
 
-/// A file metadata block's prefetch and load, and the deprecated name table's load, keep the
-/// fields of the tree they read rather than the tree, so none holds a tree across its read.
+/// A file metadata block's load and the deprecated name table's load keep the fields of the
+/// tree they read rather than the tree, so neither holds a tree across its read.
 #[tokio::test]
 async fn tree_readers_hold_its_fields_not_the_tree() {
     LORE_CONTEXT
         .scope(setup_test_execution(), async {
             let repository = null_repository().await;
             let state = State::new();
-            let options = immutable::read_options_from_repository(&repository);
 
-            let list_read = immutable::read(repository.clone(), Address::default(), None, options);
+            let block_read = NodeFileMetadataBlockData::read_box_from_immutable_compat(
+                repository.clone(),
+                Address::default(),
+                true,
+            );
             let name_table_read = NameTable::deserialize(repository.clone(), Hash::default());
-            let prefetch = state.block_file_metadata_cache(repository.clone(), 0);
             let load = state.block_file_metadata_load(repository.clone(), 0);
             let name_table = state.nametable_load(repository);
 
             for (what, future, read) in [
-                ("prefetch", size_of_val(&prefetch), size_of_val(&list_read)),
-                ("load", size_of_val(&load), size_of_val(&list_read)),
+                ("load", size_of_val(&load), size_of_val(&block_read)),
                 (
                     "name table load",
                     size_of_val(&name_table),
@@ -2094,4 +2095,90 @@ async fn tree_readers_hold_its_fields_not_the_tree() {
             }
         })
         .await;
+}
+
+/// Files under `fill/` in [`stored_with_two_blocks`]: with the root and `fill/`, they run past the
+/// first node block.
+const FILL_NODES: usize = BLOCK_NODE_COUNT;
+
+/// A stored revision of two node blocks: the root holds `fill/`, and `fill/` holds
+/// [`FILL_NODES`] files running into the second.
+async fn stored_with_two_blocks(repository: &Arc<RepositoryContext>) -> Hash {
+    let state = State::new();
+    let fill = add_dirty_node(
+        &state,
+        repository.clone(),
+        ROOT_NODE,
+        "fill",
+        NodeFlags::NoFlags,
+    )
+    .await;
+    for index in 0..FILL_NODES {
+        let name = format!("f{index}");
+        add_dirty_node(&state, repository.clone(), fill, &name, NodeFlags::File).await;
+    }
+    let token = repository
+        .try_write_token()
+        .expect("a null context carries a write token");
+    state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("the State serializes")
+}
+
+/// A State with no node block in memory puts a fresh block past the tree's blocks, its block
+/// count grows by one rather than shrinking to the fresh block's, and serializing it keeps the
+/// blocks it never loaded.
+#[tokio::test]
+async fn a_fresh_block_of_a_state_with_no_block_in_memory_goes_past_the_trees_blocks() {
+    let repository = null_repository().await;
+    let stored = stored_with_two_blocks(&repository).await;
+    let state = State::deserialize(repository.clone(), stored)
+        .await
+        .expect("the State loads");
+    let tree = state.tree(repository.clone()).await.expect("the tree");
+    let count = state.block_count();
+    assert_eq!(count, tree.block_count as usize);
+    assert_eq!(count, 2, "the tree holds two blocks");
+
+    let (index, block) = state.allocate_fresh_block().expect("a fresh block");
+    assert_eq!(index, count, "the fresh block goes past the tree's blocks");
+    assert_eq!(
+        state.block_count(),
+        count + 1,
+        "the block count grows by one"
+    );
+    let found = state
+        .block(repository.clone(), index)
+        .await
+        .expect("the fresh block");
+    assert!(
+        Arc::ptr_eq(&found, &block),
+        "the fresh block is found at its index"
+    );
+
+    state.mark_dirty();
+    let token = repository
+        .try_write_token()
+        .expect("a null context carries a write token");
+    let reserialized = state
+        .serialize(repository.clone(), token)
+        .await
+        .expect("the State serializes");
+    let reloaded = State::deserialize(repository.clone(), reserialized)
+        .await
+        .expect("the State reloads");
+    let fill = reloaded
+        .find_subnode(repository.clone(), ROOT_NODE, hash::hash_string("fill"))
+        .await
+        .expect("the root still holds fill");
+    assert_eq!(
+        reloaded
+            .node_children(repository, fill)
+            .await
+            .expect("fill's children")
+            .len(),
+        FILL_NODES,
+        "fill still holds its files"
+    );
 }

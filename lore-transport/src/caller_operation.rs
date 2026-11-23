@@ -189,7 +189,7 @@ pub async fn selected_caller_namespace(
     .await?;
     let auth = grpc
         .repository_authz(
-            &connection.auth_url,
+            connection.auth_endpoint(),
             &connection.identity,
             repository,
             connection.credentials(),

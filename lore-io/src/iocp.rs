@@ -339,7 +339,7 @@ impl IocpDriver {
     /// a double free of the entry rather than a wrong byte count. Reporting the error at the open
     /// leaves the caller a backend to fall back to; guessing here would not.
     #[lore_macro::test_pub]
-    fn register(&self, file: &File) -> std::io::Result<()> {
+    pub(crate) fn register(&self, file: &File) -> std::io::Result<()> {
         let handle: HANDLE = file.as_raw_handle();
         // SAFETY: Calling OS functions. The handle is open and owned by `file`, and a completion
         // key of zero is what every operation here carries.
@@ -781,18 +781,6 @@ impl IocpDriver {
             .await
     }
 
-    pub(crate) async fn write_file_segments_atomic<B: StableBufList>(
-        &self,
-        options: std::fs::OpenOptions,
-        temporary_path: PathBuf,
-        final_path: PathBuf,
-        buffers: B,
-    ) -> std::io::Result<()> {
-        PsyncDriver
-            .write_file_segments_atomic(options, temporary_path, final_path, buffers)
-            .await
-    }
-
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.metadata(path).await
     }
@@ -806,10 +794,6 @@ impl IocpDriver {
         file: Arc<File>,
     ) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.file_metadata(file).await
-    }
-
-    pub(crate) async fn set_len(&self, file: Arc<File>, len: u64) -> std::io::Result<()> {
-        PsyncDriver.set_len(file, len).await
     }
 
     pub(crate) async fn rename(&self, from: PathBuf, to: PathBuf) -> std::io::Result<()> {

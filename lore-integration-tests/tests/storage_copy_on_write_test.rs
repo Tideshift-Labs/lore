@@ -349,6 +349,7 @@ mod storage_copy_on_write_tests {
                         4,
                         "",
                         FIXTURE_TOKEN,
+                        lore_transport::auth::AuthMode::Auto,
                     )
                     .await?;
                     let selected =
@@ -438,6 +439,7 @@ mod storage_copy_on_write_tests {
                         4,
                         "",
                         FIXTURE_TOKEN,
+                        lore_transport::auth::AuthMode::Auto,
                     )
                     .await?;
                     let session = connection
@@ -642,6 +644,7 @@ mod storage_copy_on_write_tests {
             4,
             "",
             FIXTURE_TOKEN,
+            lore_transport::auth::AuthMode::Auto,
         )
         .await
         .unwrap();
@@ -799,6 +802,16 @@ mod storage_copy_on_write_tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.is_local()
         }

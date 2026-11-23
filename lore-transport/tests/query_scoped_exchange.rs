@@ -144,7 +144,7 @@ impl Authentication for StubAuthentication {
         _client_state: &str,
         _session_code: &str,
         _correlation_id: &str,
-    ) -> Result<Option<AuthenticationToken>, ProtocolError> {
+    ) -> Result<lore_transport::types::AuthSessionPoll, ProtocolError> {
         Err(ProtocolError::internal("repository exchanges only"))
     }
 
@@ -367,6 +367,7 @@ impl Scenario {
             1,
             &identity_token,
             "",
+            lore_transport::auth::AuthMode::Auto,
         )
         .await
         .expect("connect must succeed against the in-process test server");

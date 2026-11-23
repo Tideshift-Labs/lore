@@ -60,7 +60,6 @@ pub(crate) fn verifier() -> JwtVerifier {
         jwt_issuer: Some(vec![ISSUER.to_string()]),
         jwt_audience: Some(vec![AUDIENCE.to_string()]),
         jwt_typ: None,
-        identity_claim: "sub".to_string(),
     }
 }
 

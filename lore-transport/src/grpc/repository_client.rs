@@ -8,9 +8,11 @@ use lore_base::types::RepositoryId;
 use lore_proto::lore::repository::v1 as repository_v1;
 use lore_proto::lore::repository::v1::repository_service_client::RepositoryServiceClient;
 use tokio_stream::StreamExt;
+use tonic::service::Interceptor;
+use tonic::service::interceptor::InterceptedService;
 
-use super::AuthenticatedService;
 use super::AuthnInterceptor;
+use super::AuthzInterceptor;
 use super::Channel;
 use super::CorrelationInterceptor;
 use super::GRPCAuthRef;
@@ -23,9 +25,11 @@ use crate::error::ProtocolError;
 use crate::types::MetadataSetResult;
 use crate::types::RepositoryData;
 
+/// The repository service, sending the token its interceptor injects: the login token by
+/// default, or a partition's authorization token from [`RepositoryService::for_partition`].
 #[derive(Clone)]
-pub struct RepositoryService {
-    client: RepositoryServiceClient<AuthenticatedService>,
+pub struct RepositoryService<I = AuthnInterceptor> {
+    client: RepositoryServiceClient<InterceptedService<Channel, I>>,
     /// The same channel without [`AuthnInterceptor`], for the one call that
     /// presents a repository-scoped authorization token instead of the identity
     /// token: [`Self::query_id_with_authorization`]. The interceptor would
@@ -58,7 +62,31 @@ impl RepositoryService {
             auth,
         }
     }
+}
 
+impl RepositoryService<AuthzInterceptor> {
+    /// Calls about `repository` carrying its authorization token, for a server that
+    /// authorizes them from the token's claims alone.
+    pub fn for_partition(channel: Channel, repository: RepositoryId, auth: GRPCAuthRef) -> Self {
+        let scoped =
+            RepositoryServiceClient::with_interceptor(channel.clone(), CorrelationInterceptor);
+        let client = RepositoryServiceClient::with_interceptor(
+            channel,
+            AuthzInterceptor {
+                repository,
+                auth: auth.clone(),
+            },
+        );
+
+        Self {
+            client,
+            scoped,
+            auth,
+        }
+    }
+}
+
+impl<I: Interceptor + Clone + Send + Sync + 'static> RepositoryService<I> {
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         &self,

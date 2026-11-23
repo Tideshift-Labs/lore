@@ -193,7 +193,14 @@ async fn verify_push(
     Box::pin(LORE_CONTEXT.scope(execution, async move {
         let parent = state_with_files(&repository, &[]).await;
         let state = state_with_files(&repository, files).await;
-        verify_fragments(repository, parent, None, state).await
+        verify_fragments(
+            repository,
+            parent,
+            None,
+            state,
+            &mut lore_server::grpc::handlers::branch_push::PushStoreRequests::default(),
+        )
+        .await
     }))
     .await
 }
@@ -559,7 +566,14 @@ mod push_verification {
                 ],
             )
             .await;
-            verify_fragments(repository, parent, None, state).await
+            verify_fragments(
+                repository,
+                parent,
+                None,
+                state,
+                &mut lore_server::grpc::handlers::branch_push::PushStoreRequests::default(),
+            )
+            .await
         }))
         .await
         .expect("an unchanged file and an honest new one pass");

@@ -259,7 +259,7 @@ mod legacy_path_regression {
             .scope(execution, async move {
                 handler(
                     make_request(repository_id, "wp116-legacy-path"),
-                    None, /* no auth_url */
+                    &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
                     immutable_store,
                     mutable_store,
                     &hook_dispatcher,

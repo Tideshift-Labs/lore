@@ -7,6 +7,9 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::file;
+use lore_revision::file::audit::AuditOptions;
+pub use lore_revision::file::audit::DEFAULT_MAX_REVISIONS;
+use lore_revision::file::audit::Whitespace;
 pub use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use lore_revision::file::dump::DumpError;
 use lore_revision::file::hash::HashError;
@@ -34,8 +37,6 @@ use lore_revision::stage;
 use lore_revision::stage::StageOptions;
 use lore_revision::util::path::is_path_inside_repository;
 use lore_revision::util::path::make_absolute;
-use serde::Deserialize;
-use serde::Serialize;
 
 use crate::call::repository_call_read;
 use crate::call::repository_call_write;
@@ -44,7 +45,7 @@ use crate::util::convert_user_paths;
 
 /// Arguments for retrieving file information (size, hash, staged status).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(info_local)]
 pub struct LoreFileInfoArgs {
     /// Array of paths
@@ -113,7 +114,7 @@ async fn info_impl(
 
 /// Arguments for diffing files between two revisions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(diff_local)]
 pub struct LoreFileDiffArgs {
     /// An array of paths
@@ -196,7 +197,7 @@ async fn diff_impl(
 
 /// Arguments for clearing all metadata associated with a file.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_clear_local)]
 pub struct LoreFileMetadataClearArgs {
     /// Which file to clear metadata for
@@ -249,7 +250,7 @@ fn metadata_clear_local(
 
 /// Arguments for retrieving a single metadata value for a file by key and revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_get_local)]
 pub struct LoreFileMetadataGetArgs {
     /// Revision to get metadata for
@@ -311,7 +312,7 @@ fn metadata_get_local(
 
 /// Arguments for listing all metadata key/value pairs for a file at a revision.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_list_local)]
 pub struct LoreFileMetadataListArgs {
     /// What to list metadata for
@@ -366,7 +367,7 @@ fn metadata_list_local(
 
 /// Arguments for setting metadata key/value pairs on one or more files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(metadata_set_local)]
 pub struct LoreFileMetadataSetArgs {
     /// An array of paths
@@ -473,7 +474,7 @@ async fn metadata_set_impl(
 
 /// Arguments for staging one or more files for the next commit.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stage_local)]
 pub struct LoreFileStageArgs {
     /// An array of paths
@@ -561,7 +562,7 @@ fn stage_local(
 
 /// Arguments for staging one or more files as merge resolutions.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stage_merge_local)]
 pub struct LoreFileStageMergeArgs {
     /// Paths to files to stage as merge
@@ -617,7 +618,7 @@ fn stage_merge_local(
 
 /// Arguments for staging a file move from one path to another.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(stage_move_local)]
 pub struct LoreFileStageMoveArgs {
     /// Original path of file
@@ -687,7 +688,7 @@ fn stage_move_local(
 
 /// Arguments for marking files dirty in the staged state (add/modify/delete inferred from filesystem).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dirty_local)]
 pub struct LoreFileDirtyArgs {
     /// An array of paths
@@ -718,7 +719,7 @@ fn dirty_local(
 
 /// Arguments for marking a file dirty-moved (relocates the staged node, no filesystem checks).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dirty_move_local)]
 pub struct LoreFileDirtyMoveArgs {
     /// Original path of file
@@ -755,7 +756,7 @@ fn dirty_move_local(
 
 /// Arguments for marking a file dirty-copied (creates a new staged destination node, no filesystem checks).
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dirty_copy_local)]
 pub struct LoreFileDirtyCopyArgs {
     /// Source path of file
@@ -794,7 +795,7 @@ fn dirty_copy_local(
 
 /// Arguments for removing one or more files from the staged changeset.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(unstage_local)]
 pub struct LoreFileUnstageArgs {
     /// An array of paths
@@ -852,7 +853,7 @@ fn unstage_local(
 
 /// Arguments for resetting files to a revision, optionally purging untracked files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_local)]
 pub struct LoreFileResetArgs {
     /// Pointer to an array of paths
@@ -920,7 +921,7 @@ fn reset_local(
 
 /// Arguments for resetting files to the last merged revision on a branch.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_to_last_merged_local)]
 pub struct LoreFileResetToLastMergedArgs {
     /// Pointer to an array of paths
@@ -930,7 +931,6 @@ pub struct LoreFileResetToLastMergedArgs {
     /// Purge untracked files
     pub purge: u8,
     /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
-    #[serde(default)]
     pub merge_side: u32,
 }
 
@@ -996,7 +996,7 @@ fn reset_to_last_merged_local(
 
 /// Arguments for writing a file to a destination by path/revision or by address.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(write_local)]
 pub struct LoreFileWriteArgs {
     /// Address of data to write; takes precedence over `path` when non-empty
@@ -1108,7 +1108,7 @@ async fn write_impl(
 
 /// Arguments for permanently removing a file or address from repository history.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(obliterate_local)]
 pub struct LoreFileObliterateArgs {
     /// Address of data to obliterate; takes precedence over `path` when non-empty
@@ -1183,7 +1183,7 @@ async fn obliterate_impl(
 
 /// Arguments for dumping the binary content of a file by path or address.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(dump_local)]
 pub struct LoreFileDumpArgs {
     /// Address of data to dump; takes precedence over `path` when non-empty
@@ -1248,7 +1248,7 @@ async fn dump_impl(
 
 /// Arguments for computing the hash and size of one or more files.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(hash_local)]
 pub struct LoreFileHashArgs {
     /// An array of paths
@@ -1303,7 +1303,7 @@ async fn hash_impl(
 
 /// Arguments for retrieving the revision history of a specific file.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(history_local)]
 pub struct LoreFileHistoryArgs {
     /// A path to a file
@@ -1366,4 +1366,95 @@ fn history_local(
 
         file::history::history(repository, path, options)
     })
+}
+
+/// Arguments for attributing the lines of a file to the revisions that last changed them.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
+#[handler(audit_local)]
+pub struct LoreFileAuditArgs {
+    /// A path to a file
+    pub path: LoreString,
+
+    /// Revision to read the file at, in any form a revision specifier takes: a
+    /// whole hash signature, `[branch]@<number>`, `[branch]@LATEST` or
+    /// `<branch>@<hash>`, optionally followed by `~<count>` to step back that many
+    /// parents. Empty reads the revision the instance is synced to and accounts for
+    /// the file on disk
+    pub revision: LoreString,
+
+    /// Revisions of the file's predecessor chain to walk, `0` for the default of
+    /// 100 and `UINT32_MAX` for the whole chain. Zero means the default rather
+    /// than no limit, as `lore_file_history_args_t::length` does, so a
+    /// zero-initialized value is bounded
+    pub max_revisions: u32,
+
+    /// Count a line that differs only in trailing whitespace as changed.
+    /// Trailing whitespace is ignored by default, so the field is stated as the
+    /// refusal and a zero-initialized value carries the default
+    pub no_ignore_space_at_eol: u8,
+
+    /// Collapse runs of internal whitespace to a single space before comparing,
+    /// which leaves a reindented line with the revision that wrote its text
+    pub ignore_space_change: u8,
+}
+
+/// Attributes each line of a file to the revision that last changed it.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## File Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::FileAudit`](crate::interface::LoreEvent::FileAudit) | Emitted for each range of consecutive lines sharing an attribution |
+pub async fn audit(
+    globals: LoreGlobalArgs,
+    args: LoreFileAuditArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, audit_local).await
+}
+
+fn audit_local(
+    globals: LoreGlobalArgs,
+    args: LoreFileAuditArgs,
+    callback: LoreEventCallback,
+) -> impl Future<Output = i32> {
+    repository_call_read(globals, callback, args, audit, move |repository, args| {
+        let path = args.path.to_string();
+
+        let options = AuditOptions {
+            revision: args.revision.into(),
+            max_revisions: audit_bound(args.max_revisions),
+            whitespace: Whitespace {
+                ignore_space_at_eol: args.no_ignore_space_at_eol == 0,
+                ignore_space_change: args.ignore_space_change != 0,
+            },
+        };
+
+        file::audit::audit(repository, path, options)
+    })
+}
+
+/// The bound an audit walk runs under: none where the largest bound asks for
+/// the whole chain, and the default where the caller named no number.
+#[lore_macro::test_pub]
+fn audit_bound(max_revisions: u32) -> Option<u32> {
+    match max_revisions {
+        0 => Some(DEFAULT_MAX_REVISIONS),
+        u32::MAX => None,
+        _ => Some(max_revisions),
+    }
 }

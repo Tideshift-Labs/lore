@@ -9,9 +9,10 @@ use std::sync::Arc;
 use lore::branch::*;
 use lore::interface::LoreEventCallback;
 use lore::remote::command::LoreCommand;
-use lore::remote::message::SerializationType;
-use lore::remote::message::deserialize_message;
-use lore::remote::message::serialize_message;
+use lore::remote::message::MessageToServer;
+use lore::remote::message::blocking_read_message;
+use lore::remote::message::write_message;
+use lore_base::env::CallEnvironment;
 use lore_base::error::InvalidArguments;
 use lore_base::types::RepositoryId;
 use lore_error_set::FfiError;
@@ -55,43 +56,37 @@ fn rejected() -> i32 {
     .ffi_code()
 }
 
+/// The managed push command crosses the service relay with every field, the fork's
+/// `refuse_locked_by_others` included. Since v0.11.0 (`f301c323`) the relay is positional bitcode
+/// with no serde and no JSON form, and client and service are one build, so the former
+/// old-reader check (a JSON reader that knew only `BranchPush`) has no counterpart: a relayed
+/// command is decoded only by the build that encoded it.
 #[test]
 fn managed_service_command_roundtrips_and_old_reader_refuses_it() {
-    let command = LoreCommand::ManagedBranchPush(LoreManagedBranchPushArgs {
-        args: args(),
-        refuse_locked_by_others: false,
-    });
-    let value = serde_json::to_value(&command).expect("serialize managed command");
-    assert_eq!(
-        value,
-        serde_json::json!({"ManagedBranchPush":{
-            "args":{"branch":"feature","fast_forward_merge":1},
-            "refuse_locked_by_others":false
-        }})
-    );
-    for encoding in [SerializationType::Json, SerializationType::Bincode] {
-        let bytes = serialize_message(command.clone(), encoding).expect("encode command");
-        let decoded: LoreCommand = deserialize_message(&bytes, encoding).expect("decode command");
-        match decoded {
-            LoreCommand::ManagedBranchPush(decoded) => assert_eq!(decoded.args, args()),
+    for refuse_locked_by_others in [false, true] {
+        let message = MessageToServer {
+            globals: LoreGlobalArgs::default(),
+            command: LoreCommand::ManagedBranchPush(LoreManagedBranchPushArgs {
+                args: args(),
+                refuse_locked_by_others,
+            }),
+            environment: CallEnvironment::default(),
+        };
+        let mut written = Vec::new();
+        write_message(&mut written, &message).expect("encode command");
+        let (read, _payload): (MessageToServer, bytes::Bytes) =
+            blocking_read_message(&mut written.as_slice())
+                .expect("decode command")
+                .expect("a whole message must be present");
+        match read.command {
+            LoreCommand::ManagedBranchPush(decoded) => {
+                assert_eq!(decoded.args, args());
+                assert_eq!(decoded.refuse_locked_by_others, refuse_locked_by_others);
+            }
             other => panic!("managed command changed kind: {other:?}"),
         }
     }
-    #[derive(serde::Deserialize)]
-    enum OldReader {
-        BranchPush(LoreBranchPushArgs),
-    }
-    assert!(
-        serde_json::from_value::<OldReader>(value).is_err(),
-        "old readers must refuse the new command rather than accept a raw push"
-    );
-    let old_value =
-        serde_json::to_value(LoreCommand::BranchPush(args())).expect("old command shape");
-    match serde_json::from_value::<OldReader>(old_value).expect("legacy command still decodes") {
-        OldReader::BranchPush(decoded) => assert_eq!(decoded, args()),
-    }
 }
-
 #[test]
 fn managed_push_refuses_inherited_adoption_before_repository_access() {
     if !service_env_child(

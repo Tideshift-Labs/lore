@@ -12,12 +12,14 @@ use std::time::Instant;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
+use lore_base::lore_spawn_net;
 use lore_base::lore_spawn_net_nocontext;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
+use lore_proto::lore::user::v1::user_service_client::UserServiceClient;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -585,6 +587,20 @@ impl AuthClient<'_> {
         self.settle(result)
     }
 }
+/// Dials `url` once for one call. Upstream's per-call dial, kept for the
+/// `lore.user.v1` user directory client (the auth service itself uses the
+/// fork's shared [`AuthChannel`]). The endpoint carries the fork's
+/// [`AUTH_CONNECT_TIMEOUT`] TCP connect bound from [`auth_endpoint`].
+async fn connect(url: &str, service: &str) -> Result<Channel, Status> {
+    let endpoint = auth_endpoint(url)?;
+    // Connect from net so the hyper/h2 driver tasks this spawns bind there
+    // rather than to the core runtime the caller runs on.
+    lore_spawn_net!(async move { endpoint.connect().await })
+        .await
+        .warn_map_err(|_| Status::internal(format!("{service} connection task failed")))?
+        .warn_map_err(|_| Status::internal(format!("Failed to connect to {service}")))
+}
+
 impl LoreAuthClientHelper {
     fn new(channel: Channel) -> LoreAuthClientHelper {
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
@@ -614,6 +630,17 @@ impl LoreAuthClientHelper {
         )
         .result
     }
+}
+
+/// A `lore.user.v1.UserService` client for `user_url`, dialed like `auth_url`.
+pub async fn grpc_get_user_service_client(
+    user_url: &str,
+) -> Result<UserServiceClient<InterceptedService<Channel, CorrelationInterceptor>>, Status> {
+    let channel = connect(user_url, "user directory").await?;
+    Ok(UserServiceClient::with_interceptor(
+        channel,
+        CorrelationInterceptor,
+    ))
 }
 
 impl InstrumentProvider for LoreAuthClientHelper {

@@ -416,7 +416,7 @@ async fn get_whose_first_stream_is_reset_succeeds(reason: h2::Reason) {
     let storage = lore_transport::grpc::GRPCStorage {
         connection: connection.clone(),
         client: StorageService::new(connection.clone()),
-        auth_url: String::new(),
+        auth_endpoint: lore_transport::auth::AuthEndpoint::none(),
         identity: String::new(),
         credentials: Arc::new(lore_transport::connection::SuppliedCredentials::default()),
         session_counter: std::sync::atomic::AtomicU32::new(1),

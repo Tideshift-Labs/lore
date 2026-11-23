@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lore::remote::connection::spawn_command;
-use lore::remote::message::SerializationType;
 use lore_revision::managed_push::ManagedPushRunner;
 use lore_revision::repository_fence::RepositoryMutationGuard;
+use lore_revision::service_state::ServiceStateImpl;
 use lore_transport::AttemptId;
 use lore_transport::AttemptRecord;
 use lore_transport::AttemptResolution;
@@ -44,8 +44,10 @@ async fn disconnected_forwarder_keeps_original_stage_fenced_until_daemon_settles
     let (entered_sender, entered) = oneshot::channel();
     let (release_sender, released) = oneshot::channel();
     let release = ReleaseStage(Some(release_sender));
-    let (receiver, mut task) =
-        spawn_command(SerializationType::Json, move |_callback| async move {
+    let (receiver, mut task) = spawn_command(
+        Arc::new(ServiceStateImpl::new()),
+        bytes::Bytes::new(),
+        move |_callback| async move {
             let repository = [7; 16].into();
             let runner = ManagedPushRunner::new(guard, None);
             runner
@@ -89,7 +91,8 @@ async fn disconnected_forwarder_keeps_original_stage_fenced_until_daemon_settles
                 .await
                 .unwrap();
             0
-        });
+        },
+    );
 
     // Collect failures before asserting, so every normal failure releases and joins the daemon.
     let held = async {

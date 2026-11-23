@@ -248,6 +248,8 @@ mod tests {
                 link: LoreString::default(),
                 ignore_links: 0,
                 inherit_metadata: LoreArray::default(),
+                link_paths: LoreArray::default(),
+                link_messages: LoreArray::default(),
             };
             assert_eq!(
                 lore::branch::merge_start(self.globals.clone(), args, None).await,

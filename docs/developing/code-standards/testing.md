@@ -332,7 +332,7 @@ def test_commit(new_lore_repo):
 
 ### Running with uv
 
-Tests require Python 3.13+. Use `uv` to manage dependencies and run tests:
+Tests require Python 3.13 or 3.14. Use `uv` to manage dependencies and run tests:
 
 ```bash
 # Install dependencies
@@ -361,6 +361,59 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
 | `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
+| `--swfs` | `false` | Run the tests that mount through SWFS |
+
+### Running the SWFS tests
+
+`test_swfs.py` skips its mounting tests unless `--swfs` says to run them,
+because two of their preconditions are arranged outside the harness and neither
+is visible from it:
+
+1. A client built with the `swfs` feature, which links the SWFS library named by
+   `SWFS_LIB_DIR`: `cargo build --release -p lore-client --features swfs`. The
+   binary reports no feature list, so nothing can ask it whether it has one.
+2. The `epicvfs` filesystem driver loaded. It installs from `EpicVFS.exe` and is
+   demand-start, and the SWFS library starts it through the service control
+   manager, which takes an elevated session — `sc query epicvfs` reporting
+   `STOPPED` means the next mount will try and fail.
+
+Without the driver a mount does not fail, it hangs: the SWFS library parks the
+service process, so the client relaying to it blocks until the per-test timeout
+kills the worker. That is what `--swfs` defaulting off avoids.
+
+### Running every test through one service
+
+`LORE_TEST_SHARED_SERVICE=1` starts one service from the build under test before
+the run and stops it when the run ends. Every command of every test then runs in
+that service, except in the tests that manage a service of their own through
+`lore_service_runner`, which keep theirs, and in the tests marked
+`runs_in_process(reason)`, whose commands stay in their own process. No
+executable is named for the relayed commands, so a service that stops partway
+fails the tests that follow instead of being replaced.
+
+```bash
+LORE_TEST_SHARED_SERVICE=1 uv run pytest scripts/test/ -m smoke -n 4
+```
+
+The service listens on a socket named for the run, with a global directory of
+its own, so several runs proceed side by side. A run ended by Ctrl+C, SIGTERM or
+SIGHUP stops it as a finished run does. On Linux the kernel stops it when the run
+is killed outright, as it does every service and server a test or an xdist
+worker starts when that process ends. The server the workers share outlives the
+worker that launched it, which can finish first: the run's cleanups stop it, and
+on Linux so does the run's main process ending.
+
+`LORE_TEST_SERVICE_SOCKET` names the socket of a service started some other way,
+which the run then uses in place of starting one:
+
+```bash
+LORE_SERVICE_SOCKET=lore_service-smoke LORE_GLOBAL_PATH=$(mktemp -d) \
+    target/release/lore service run &
+LORE_TEST_SERVICE_SOCKET=lore_service-smoke uv run pytest scripts/test/ -m smoke -n 4
+```
+
+Each call carries the test's `LORE_GLOBAL_PATH` and `LORE_AUTH_PATH`, which the
+service reads in place of its own, so the tests stay isolated from each other.
 
 ### Per-test timeout
 

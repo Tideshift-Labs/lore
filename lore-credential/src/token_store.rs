@@ -15,6 +15,7 @@ use base64::prelude::BASE64_STANDARD;
 use base64::prelude::BASE64_URL_SAFE_NO_PAD;
 use base64::prelude::Engine as _;
 use lore_base::directories::project_directory;
+use lore_base::env::AUTH_PATH_VAR;
 use lore_base::error::TokenNotFound;
 use lore_base::fs::lock::FSLock;
 use lore_base::lore_debug;
@@ -36,7 +37,9 @@ use ring::rand::SecureRandom;
 use ring::rand::SystemRandom;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::MappedMutexGuard;
 use tokio::sync::Mutex;
+use tokio::sync::MutexGuard;
 use toml;
 
 use crate::jwt::domain_in_root_domains;
@@ -91,7 +94,9 @@ pub struct TokenMap {
     remotes: Vec<RemoteIdentity>,
 }
 
-static TOKEN_MAP: OnceLock<Mutex<Option<TokenMap>>> = OnceLock::new();
+/// Each token store's map as last read, keyed by the store's directory: a process carrying out
+/// calls for other processes reads the store each caller names.
+static TOKEN_MAPS: OnceLock<Mutex<HashMap<PathBuf, Option<TokenMap>>>> = OnceLock::new();
 
 pub fn tokens_only_for_recipient_domain(domain: String) -> impl FnMut(&&IdentityToken) -> bool {
     move |item: &&IdentityToken| {
@@ -112,15 +117,24 @@ pub fn vulnerable_all_tokens() -> impl FnMut(&&IdentityToken) -> bool {
     move |_item: &&IdentityToken| true
 }
 
-fn token_map() -> &'static Mutex<Option<TokenMap>> {
-    TOKEN_MAP.get_or_init(|| Mutex::new(None))
+/// The directory of the token store this call reads, which keys what is cached from it. A store
+/// that cannot be located is keyed as the empty path, leaving the failure to the operation that
+/// reads it.
+fn cache_key() -> PathBuf {
+    base_path(false).unwrap_or_default()
+}
+
+/// The cached map of the token store this call reads, `None` until it is loaded.
+async fn cached_token_map() -> MappedMutexGuard<'static, Option<TokenMap>> {
+    let maps = TOKEN_MAPS.get_or_init(Default::default).lock().await;
+    MutexGuard::map(maps, |maps| maps.entry(cache_key()).or_default())
 }
 
 /// Base directory holding the auth store files (`tokenstore.toml` and the
 /// encryption-key fallback). The `LORE_AUTH_PATH` environment variable
 /// overrides the default per-user configuration directory.
 fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
-    if let Ok(path) = std::env::var("LORE_AUTH_PATH")
+    if let Some(path) = lore_base::env::var(AUTH_PATH_VAR)
         && !path.is_empty()
     {
         let path = PathBuf::from(path);
@@ -208,8 +222,7 @@ pub async fn load_all_identities(
     include_token: bool,
 ) -> Result<Vec<StoredIdentityInfo>, TokenStoreError> {
     let identity_entries = {
-        let token_map = token_map();
-        let mut store = token_map.lock().await;
+        let mut store = cached_token_map().await;
         if store.is_none()
             && let Ok(guard) = lock_token_map().await
             && let Ok(loaded_map) = load_token_map(&guard)
@@ -259,8 +272,7 @@ pub async fn load_all_identities(
 
 /// Clear token map and token store file.
 pub async fn reset_tokens() -> Result<(), TokenStoreError> {
-    let token_map = token_map();
-    let mut store = token_map.lock().await;
+    let mut store = cached_token_map().await;
     let guard = lock_token_map().await?;
     store_token_map(&guard, &TokenMap::default())?;
     if store.is_some() {
@@ -397,16 +409,15 @@ fn store_fallback_path(name: &str, create_dir: bool) -> Result<PathBuf, TokenSto
 
 static KEYRING_ENTRIES: OnceLock<RwLock<HashMap<String, Arc<keyring::Entry>>>> = OnceLock::new();
 
-/// In-memory cache of the loaded encryption key.
+/// In-memory cache of the loaded encryption keys, keyed by the directory of the
+/// token store each protects.
 ///
-/// The key is invariant for the lifetime of the secure-store entry, so it is
-/// read once per process. Nonces are drawn at random per seal and travel with
-/// the sealed token, so nothing here has to be written back.
-static ENCRYPTION_CACHE: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
-
-fn encryption_cache() -> &'static Mutex<Option<Vec<u8>>> {
-    ENCRYPTION_CACHE.get_or_init(|| Mutex::new(None))
-}
+/// A key is invariant for the lifetime of its secure-store entry, so it is read
+/// once per token store: a fallback key lives beside its store, and a process
+/// carrying out calls for other processes reads the store each caller names.
+/// Nonces are drawn at random per seal and travel with the sealed token, so
+/// nothing here has to be written back.
+static ENCRYPTION_CACHE: OnceLock<Mutex<HashMap<PathBuf, Vec<u8>>>> = OnceLock::new();
 
 const SECURE_STORE_MSG: &str =
     "Failed to store secret in secure storage, encryption key will be stored in plain text";
@@ -499,8 +510,7 @@ pub async fn store_authentication_token(
         refresh_token: encrypted_refresh_token,
     };
 
-    let token_map = token_map();
-    let mut map_lock = token_map.lock().await;
+    let mut map_lock = cached_token_map().await;
     let guard = lock_token_map().await?;
     reload_token_map(&guard, &mut map_lock);
     let mut candidate = map_lock.clone().unwrap_or_default();
@@ -573,8 +583,7 @@ where
     lore_trace!("Load user {identity} token for auth_endpoint {auth_endpoint}");
 
     let encrypted_token = {
-        let token_map = token_map();
-        let mut store = token_map.lock().await;
+        let mut store = cached_token_map().await;
         if store.is_none()
             && let Ok(guard) = lock_token_map().await
             && let Ok(loaded_map) = load_token_map(&guard)
@@ -668,8 +677,7 @@ pub async fn remove_user_tokens_for_auth_url(
 ) -> Result<(), TokenStoreError> {
     let auth_url = auth_url.trim_end_matches('/');
 
-    let token_map = token_map();
-    let mut store = token_map.lock().await;
+    let mut store = cached_token_map().await;
     let guard = lock_token_map().await?;
     reload_token_map(&guard, &mut store);
 
@@ -723,8 +731,7 @@ pub async fn remove_user_tokens_for_auth_url(
 pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenStoreError> {
     let auth_url = auth_url.trim_end_matches('/');
 
-    let token_map = token_map();
-    let mut store = token_map.lock().await;
+    let mut store = cached_token_map().await;
     let guard = lock_token_map().await?;
     reload_token_map(&guard, &mut store);
 
@@ -749,11 +756,42 @@ pub async fn remove_all_tokens_for_auth_url(auth_url: &str) -> Result<(), TokenS
     Ok(())
 }
 
-pub async fn remove_user_token(endpoint: &str, identity: &str) -> Result<(), TokenStoreError> {
+/// Remove every token `identity` holds for `endpoint`.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+pub fn remove_user_token<'a>(
+    endpoint: &'a str,
+    identity: &'a str,
+) -> impl Future<Output = Result<(), TokenStoreError>> + 'a {
+    remove_user_token_where(endpoint, identity, |_| true)
+}
+
+/// Remove `identity`'s token for `endpoint` if it is `token`, compared in the store as reloaded
+/// under its file lock, or as this process holds it where the file does not load, so a token
+/// another process has stored in its place is left alone.
+pub async fn remove_user_token_if(
+    endpoint: &str,
+    identity: &str,
+    token: &str,
+) -> Result<(), TokenStoreError> {
+    let key = get_token_encryption_key().await?;
+    remove_user_token_where(endpoint, identity, |sealed| {
+        open_token(&key, sealed).is_ok_and(|stored| stored == token)
+    })
+    .await
+}
+
+/// Remove each of `identity`'s tokens for `endpoint` whose sealed form `removes` returns true
+/// for, in the store as reloaded under its file lock, or as this process holds it where the file
+/// does not load.
+async fn remove_user_token_where(
+    endpoint: &str,
+    identity: &str,
+    mut removes: impl FnMut(&str) -> bool,
+) -> Result<(), TokenStoreError> {
     lore_trace!("Remove user {identity} token for auth_endpoint {endpoint}");
 
-    let token_map = token_map();
-    let mut store = token_map.lock().await;
+    let mut store = cached_token_map().await;
     let guard = lock_token_map().await?;
     reload_token_map(&guard, &mut store);
 
@@ -768,9 +806,9 @@ pub async fn remove_user_token(endpoint: &str, identity: &str) -> Result<(), Tok
         {
             let before_len = map.remotes[remote_index].token.len();
 
-            map.remotes[remote_index]
-                .token
-                .retain(|token_identity| token_identity.user_id != identity);
+            map.remotes[remote_index].token.retain(|token_identity| {
+                token_identity.user_id != identity || !removes(&token_identity.token)
+            });
 
             if map.remotes[remote_index].token.len() < before_len {
                 lore_trace!("Removed token for endpoint {endpoint} identity {identity}");
@@ -796,8 +834,7 @@ pub async fn load_identities(auth_endpoint: &str) -> Result<Vec<String>, TokenSt
 
     let mut identities = vec![];
 
-    let token_map = token_map();
-    let mut store = token_map.lock().await;
+    let mut store = cached_token_map().await;
     if store.is_none()
         && let Ok(guard) = lock_token_map().await
         && let Ok(loaded_map) = load_token_map(&guard)
@@ -887,8 +924,7 @@ impl AuthenticationRefreshLease {
         let encrypted_refresh_token = encrypt_token(refresh_token).await?;
 
         let superseded_token = {
-            let token_map = token_map();
-            let mut map_lock = token_map.lock().await;
+            let mut map_lock = cached_token_map().await;
             let guard = lock_token_map().await?;
             reload_token_map(&guard, &mut map_lock);
 
@@ -977,8 +1013,7 @@ pub async fn acquire_authentication_refresh(
     let refresh_guard = lock_store_file(&lease_path).await?;
 
     let (encrypted_token, encrypted_refresh_token) = {
-        let token_map = token_map();
-        let mut map_lock = token_map.lock().await;
+        let mut map_lock = cached_token_map().await;
         let guard = lock_token_map().await?;
         reload_token_map(&guard, &mut map_lock);
 
@@ -1029,8 +1064,7 @@ pub async fn store_refresh_token(
 
     lore_trace!("Store refresh token for {identity} at {auth_endpoint}");
 
-    let token_map = token_map();
-    let mut map_lock = token_map.lock().await;
+    let mut map_lock = cached_token_map().await;
     let guard = lock_token_map().await?;
     reload_token_map(&guard, &mut map_lock);
 
@@ -1071,8 +1105,7 @@ pub async fn load_refresh_token(
     lore_trace!("Load refresh token for {identity} at {auth_endpoint}");
 
     let encrypted_refresh = {
-        let token_map = token_map();
-        let mut store = token_map.lock().await;
+        let mut store = cached_token_map().await;
         if store.is_none()
             && let Ok(guard) = lock_token_map().await
             && let Ok(loaded_map) = load_token_map(&guard)
@@ -1176,14 +1209,14 @@ fn open_token(key: &[u8], token: &str) -> Result<String, TokenStoreError> {
 /// Returns the cached encryption key, loading it from the secure store on
 /// first use.
 async fn get_token_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
-    let mut guard = encryption_cache().lock().await;
-    if guard.is_none() {
-        *guard = Some(load_or_init_encryption_key().await?);
+    let path = cache_key();
+    let mut keys = ENCRYPTION_CACHE.get_or_init(Default::default).lock().await;
+    if let Some(key) = keys.get(&path) {
+        return Ok(key.clone());
     }
-    guard
-        .as_ref()
-        .cloned()
-        .ok_or_else(|| TokenStoreError::internal("Token encryption key cache was not initialized"))
+    let key = load_or_init_encryption_key().await?;
+    keys.insert(path, key.clone());
+    Ok(key)
 }
 
 /// Loads the encryption key from the secure store.
@@ -1492,6 +1525,11 @@ pub mod test_util {
         super::split_remote_resource(store_key)
     }
 
+    /// The file the token store this call reads is kept in.
+    pub fn store_file() -> Result<std::path::PathBuf, TokenStoreError> {
+        super::token_map_path(false)
+    }
+
     pub fn is_entry_for_auth_url(remote: &str, auth_url: &str) -> bool {
         super::is_entry_for_auth_url(remote, auth_url)
     }
@@ -1507,7 +1545,9 @@ pub mod test_util {
     /// Forget the cached encryption key, so the next use reloads it from the
     /// store the environment currently points at.
     pub async fn clear_encryption_cache() {
-        *super::encryption_cache().lock().await = None;
+        if let Some(keys) = super::ENCRYPTION_CACHE.get() {
+            keys.lock().await.clear();
+        }
     }
 
     pub fn token_map_path(create_dir: bool) -> Result<std::path::PathBuf, TokenStoreError> {
@@ -1516,8 +1556,7 @@ pub mod test_util {
 
     /// Write the cached token map back to its file under the file lock.
     pub async fn store_cached_token_map() -> Result<(), TokenStoreError> {
-        let token_map = super::token_map();
-        let map_lock = token_map.lock().await;
+        let map_lock = super::cached_token_map().await;
         let guard = super::lock_token_map().await?;
         let map = map_lock
             .as_ref()

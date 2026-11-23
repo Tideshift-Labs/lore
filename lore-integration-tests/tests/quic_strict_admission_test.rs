@@ -139,7 +139,6 @@ mod quic_strict_admission_tests {
             jwt_issuer: None,
             jwt_audience: Some(vec![AUDIENCE.to_string()]),
             jwt_typ: None,
-            identity_claim: lore_server::auth::jwt::DEFAULT_IDENTITY_CLAIM.to_string(),
         }
     }
 
@@ -440,6 +439,7 @@ mod quic_strict_admission_tests {
             1,
             "",
             &token(partition),
+            lore_transport::auth::AuthMode::Auto,
         )
         .await?;
         connection.session(partition, "wp120-strict-quic").await

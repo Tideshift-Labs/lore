@@ -150,7 +150,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: Partition,
         _: usize,
@@ -163,7 +163,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: RepositoryId,
         _: &Arc<SuppliedCredentials>,
@@ -175,7 +175,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError> {
@@ -186,7 +186,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: RepositoryId,
         _: &Arc<SuppliedCredentials>,
@@ -198,7 +198,7 @@ impl Protocol for EnvironmentOnlyProtocol {
         &self,
         _: Weak<Connection>,
         _: &str,
-        _: &str,
+        _: &lore_transport::auth::AuthEndpoint,
         _: &str,
         _: RepositoryId,
         _: &Arc<SuppliedCredentials>,
@@ -226,6 +226,7 @@ async fn connection(scheme: &str) -> Arc<Connection> {
         1,
         "",
         "",
+        lore_transport::auth::AuthMode::Auto,
     )
     .await
     .expect("connect builds a connection without reaching any service")
@@ -262,6 +263,16 @@ async fn a_failed_start_stops_the_sessions_the_others_opened() {
         result.is_err_and(|err| err.is_slow_down()),
         "the build returns the start's own failure"
     );
+    // Since upstream 519a0bd7 each started session stops itself when the failed build drops it,
+    // from a spawned task (still generation-checked inside that task), so the stops land shortly
+    // after the build returns rather than before. The build also returns on the first failure
+    // while the other starts may still be running (the join set detaches them), so their start
+    // counts are read only once their stops have landed.
+    crate::quic::storage_service::test_server::wait_until(
+        || first.stops() == vec![100] && second.stops() == vec![200],
+        "the failed build never stopped the sessions the other starts opened",
+    )
+    .await;
     assert_eq!(first.starts(), 1);
     assert_eq!(second.starts(), 1);
     assert_eq!(failing.starts(), 1);
@@ -325,6 +336,14 @@ async fn the_failure_path_does_not_stop_an_id_from_a_replaced_connection() {
         .await;
 
     assert!(result.is_err_and(|err| err.is_slow_down()));
+    // The stops run from spawned tasks since upstream 519a0bd7: wait for the one that is due, then
+    // give the other a moment in which it would have been sent.
+    crate::quic::storage_service::test_server::wait_until(
+        || current.stops() == vec![100],
+        "the failed build never stopped the current connection's session",
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(current.stops(), vec![100]);
     assert!(
         replaced.stops().is_empty(),

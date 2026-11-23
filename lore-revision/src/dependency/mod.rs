@@ -12,7 +12,6 @@ use bytes::BufMut;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_error_set::prelude::*;
-use serde::Deserialize;
 use serde::Serialize;
 
 use crate::errors::*;
@@ -129,7 +128,7 @@ impl EventError for DependencyError {
 
 /// Event data reported at the start of adding file dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyAddBeginEventData {
     /// Number of source files being processed.
@@ -140,7 +139,7 @@ pub struct LoreFileDependencyAddBeginEventData {
 
 /// Event data reported for each dependency edge being added.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyAddEntryEventData {
     /// Path of the source file that gains the dependency.
@@ -153,7 +152,7 @@ pub struct LoreFileDependencyAddEntryEventData {
 
 /// Event data reported at the end of adding file dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyAddEndEventData {
     /// Number of dependency edges that were added.
@@ -162,7 +161,7 @@ pub struct LoreFileDependencyAddEndEventData {
 
 /// Event data reported at the start of removing file dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyRemoveBeginEventData {
     /// Number of source files being processed.
@@ -173,7 +172,7 @@ pub struct LoreFileDependencyRemoveBeginEventData {
 
 /// Event data reported for each dependency edge being removed.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyRemoveEntryEventData {
     /// Path of the source file that loses the dependency.
@@ -186,7 +185,7 @@ pub struct LoreFileDependencyRemoveEntryEventData {
 
 /// Event data reported at the end of removing file dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyRemoveEndEventData {
     /// Number of dependency edges that were removed.
@@ -195,7 +194,7 @@ pub struct LoreFileDependencyRemoveEndEventData {
 
 /// Event data reported at the start of listing file dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyListBeginEventData {
     /// Number of files being listed.
@@ -204,7 +203,7 @@ pub struct LoreFileDependencyListBeginEventData {
 
 /// Event data reported at the start of listing a single file's dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyListFileEventData {
     /// Path of the file whose dependencies are being listed.
@@ -215,7 +214,7 @@ pub struct LoreFileDependencyListFileEventData {
 
 /// Event data reported for each dependency entry in a listing.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyListEntryEventData {
     /// Path of the dependency.
@@ -228,7 +227,7 @@ pub struct LoreFileDependencyListEntryEventData {
 
 /// Event data reported at the end of listing a single file's dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyListFileEndEventData {
     /// Path of the file whose dependencies were listed.
@@ -237,7 +236,7 @@ pub struct LoreFileDependencyListFileEndEventData {
 
 /// Event data reported at the end of listing file dependencies.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileDependencyListEndEventData {
     /// Total number of dependency entries that were listed.
@@ -246,7 +245,7 @@ pub struct LoreFileDependencyListEndEventData {
 
 /// Event data reported at the start of dependency resolution.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreDependencyResolveBeginEventData {
     /// Number of root files resolution starts from.
@@ -255,7 +254,7 @@ pub struct LoreDependencyResolveBeginEventData {
 
 /// Event data reported for each resolved dependency edge.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreDependencyResolveItemEventData {
     /// Path of the file the dependency comes from.
@@ -268,7 +267,7 @@ pub struct LoreDependencyResolveItemEventData {
 
 /// Event data reported at the end of dependency resolution.
 #[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreDependencyResolveEndEventData {
     /// Number of dependency edges that were resolved.
