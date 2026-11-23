@@ -134,10 +134,13 @@ fn ambient_managed_uploads() -> Option<Arc<lore_storage::managed_uploads::Manage
     crate::runtime::try_execution_context()?.managed_uploads()
 }
 
-/// Construct [`WriteOptions`] from a repository context.
+/// Construct [`WriteOptions`] from a repository context. Writes reach the remote only where the
+/// context uploads and the call is not a dry run.
 pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> WriteOptions {
     let flags = WriteOptions::default();
-    if !repository.disable_upload() {
+    let dry_run =
+        crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run());
+    if !repository.disable_upload() && !dry_run {
         flags.with_remote_write()
     } else {
         flags

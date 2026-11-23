@@ -1322,6 +1322,11 @@ async fn reset_walk_named_path(
                     .await
                     .forward::<ResetError>("Failed to find staged node")?;
 
+                // `reset_staged_links_under_paths` unstaged this link, which a dry run does not
+                // store, so the link is still staged here.
+                if staged_node.is_link() && execution_context().globals().dry_run() {
+                    return Ok(());
+                }
                 if staged_node.is_staged() {
                     return Err(InvalidArguments {
                         reason: "Failed to reset staged node".into(),
@@ -1824,7 +1829,7 @@ async fn purge_untracked_children(
     if !operation
         .file_info(directory_path)
         .await
-        .is_ok_and(|info| info.exists())
+        .is_ok_and(|info| info.is_dir())
     {
         return Ok(());
     }

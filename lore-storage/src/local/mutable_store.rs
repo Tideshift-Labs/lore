@@ -19,8 +19,8 @@ use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
-use tokio::sync::RwLockReadGuard;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::error::SendError;
 use tokio::task::JoinSet;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -35,7 +35,6 @@ use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::local::fan_out::BucketGroup;
 use crate::local::fan_out::GroupLevel;
-use crate::local::immutable_store::LocalImmutableStore;
 use crate::local::immutable_store::SerializeFailureGuard;
 use crate::local::immutable_store::format_bucket_path;
 use crate::local::store_lock::Claim;
@@ -205,6 +204,10 @@ pub struct MutableStoreGroup {
     /// Contention is per group, and only between concurrent flushes of the *same*
     /// group; the 256 groups still flush in parallel.
     pub flush_lock: Arc<Mutex<()>>,
+    /// The group's layout: held for write while a fan-out moves the group's entries between
+    /// buckets and sets `bucket_count`, under [`Self::flush_lock`], and for read while a `list`
+    /// producer walks the group, which therefore reads one layout throughout.
+    pub layout: RwLock<()>,
     /// The writes in flight in this group, which taking [`Self::flush_lock`] waits for, see
     /// [`crate::local::fan_out::GroupWrites`].
     pub writes: Arc<crate::local::fan_out::GroupWrites>,
@@ -259,7 +262,8 @@ impl MutableStoreGroup {
     ///
     /// # Requirements
     ///
-    /// The caller must hold the store's flock with nothing else in flight.
+    /// As for [`crate::local::immutable_store::ImmutableStoreGroup::invalidate`]: the caller must
+    /// hold the store's flock with nothing else in flight on this store.
     pub async fn invalidate(&self, count: usize, committed: usize, serialize_version: u32) {
         for slot in 0..BUCKET_COUNT {
             if let Some(bucket) = self.try_bucket(slot) {
@@ -346,15 +350,10 @@ pub struct LocalMutableStore {
     ///
     /// Held for a span of use rather than for the store's lifetime, so a store kept
     /// alive between spans holds no flock of its own — see [`crate::local::store_lock`].
+    /// Nested in the lock of the immutable store this store was opened beside, where that
+    /// store has one: a command claims the immutable store first, and a path reaching this
+    /// store first takes the two flocks in the same order.
     lock: Option<Arc<StoreLock>>,
-    /// The lock of the immutable store this store was opened beside, whose flock this store's
-    /// unflushed changes keep as they keep its own.
-    ///
-    /// A command claims the immutable store before this one. A process keeping this store's
-    /// flock past a command for unflushed changes, without the immutable store's, would claim the
-    /// immutable store after it at its next command: out of order, and deadlocked against a
-    /// process holding the immutable store and waiting for this one.
-    immutable_lock: Option<Arc<StoreLock>>,
     /// The on-disk format version this store was opened at, which a reload needs
     /// in order to rebuild its groups the same way.
     version: MutableStoreVersion,
@@ -861,6 +860,77 @@ impl MutableStoreBucket {
         start
     }
 
+    /// Sends this bucket's keys of `key_type` under `partition`, or under every partition for the
+    /// zero one, down `stream`, the bucket being bucket `bucket_index` of a group at
+    /// `active_buckets` buckets. Fails at the first key `stream` refuses.
+    ///
+    /// The bucket holds the entries whose bucket byte, `data[1]`, falls in
+    /// `[bucket_index * stride, (bucket_index + 1) * stride)`, where `stride = 256 /
+    /// active_buckets`. `sorted_index` orders them by bucket byte, then by key-type byte, `data[2]`,
+    /// so entries of one key type are contiguous within one bucket byte only. Each bucket byte's
+    /// slice is searched with `lookup_any_with_key_type_in_range`, and its neighbours within the
+    /// slice are walked. At full fan-out, `stride == 1`, the whole bucket is one slice.
+    fn send_keys(
+        &self,
+        bucket_index: usize,
+        active_buckets: usize,
+        key_type: KeyType,
+        partition: Partition,
+        stream: &UnboundedSender<(Hash, Hash)>,
+    ) -> Result<(), SendError<(Hash, Hash)>> {
+        let take_slot = |slot: usize| {
+            let index = self.sorted_index[slot];
+            let entry = self.entry[index as usize];
+            if Key::key_type_from_hash(&entry.key) != key_type as u8 {
+                return Ok(false);
+            }
+            if partition.is_zero() || entry.partition == partition {
+                stream.send((entry.key, entry.value))?;
+            }
+            Ok(true)
+        };
+        let bucket_len = self.sorted_index.len();
+        if bucket_len == 0 {
+            return Ok(());
+        }
+        let stride = 256 / active_buckets;
+        let start_bucket_byte = bucket_index * stride;
+        let mut cursor = 0usize;
+        for byte_offset in 0..stride {
+            if cursor >= bucket_len {
+                break;
+            }
+            let hi = if stride == 1 {
+                bucket_len
+            } else {
+                let bucket_byte = (start_bucket_byte + byte_offset) as u8;
+                self.upper_bound_bucket_byte(cursor, bucket_len, bucket_byte)
+            };
+            if cursor < hi {
+                let (found, slot) = self.lookup_any_with_key_type_in_range(key_type, cursor, hi);
+                if found {
+                    take_slot(slot)?;
+                    let mut loop_slot = slot;
+                    while loop_slot > cursor {
+                        loop_slot -= 1;
+                        if !take_slot(loop_slot)? {
+                            break;
+                        }
+                    }
+                    let mut loop_slot = slot + 1;
+                    while loop_slot < hi {
+                        if !take_slot(loop_slot)? {
+                            break;
+                        }
+                        loop_slot += 1;
+                    }
+                }
+            }
+            cursor = hi;
+        }
+        Ok(())
+    }
+
     pub fn test_inject(&mut self, partition: Partition, key: Hash, value: Hash) {
         let (existing_value, match_made, insert_slot) = self.lookup(partition, key);
 
@@ -1074,6 +1144,7 @@ impl LocalMutableStore {
                 committed_level: std::sync::atomic::AtomicUsize::new(level.committed),
                 pending_level: std::sync::atomic::AtomicUsize::new(0),
                 flush_lock: Arc::new(Mutex::new(())),
+                layout: RwLock::new(()),
                 writes: Arc::default(),
                 flush: Mutex::new(JoinSet::new()),
                 scheduled: AtomicBool::new(false),
@@ -1122,8 +1193,12 @@ impl LocalMutableStore {
                     .create_dir_all(path.as_path())
                     .await;
             }
-            let lock = StoreLock::new(path.as_path(), settings.reuse_state_across_holds)
-                .internal("Failed to open the store's lock directory")?;
+            let reuse = settings.reuse_state_across_holds;
+            let lock = match immutable_store.store_lock() {
+                Some(immutable) => StoreLock::new_within(path.as_path(), reuse, &immutable),
+                None => StoreLock::new(path.as_path(), reuse),
+            }
+            .internal("Failed to open the store's lock directory")?;
 
             // Claimed across the probe, the version read, the stamp and the group survey
             // below. All of them are decisions about the store's on-disk state, so another
@@ -1218,9 +1293,6 @@ impl LocalMutableStore {
         // Read under the claim taken for the version probe, whose acquisition already
         // adopted the epoch — so the first operation does not reload what is read here.
         let group = Self::build_groups(mutable_path.as_ref(), &settings, version).await?;
-        let immutable_lock = lock
-            .as_ref()
-            .and_then(|_| LocalImmutableStore::lock_of(&immutable_store));
         if let Some(lock) = lock.as_ref() {
             for group in &group {
                 crate::local::fan_out::anchor_writes(&group.writes, lock);
@@ -1229,7 +1301,6 @@ impl LocalMutableStore {
         let store = LocalMutableStore {
             path: mutable_path,
             lock,
-            immutable_lock,
             group,
             flush_delay_seconds,
             needs_upgrade: AtomicBool::new(needs_upgrade),
@@ -1262,7 +1333,6 @@ impl LocalMutableStore {
         Self {
             path: Some(Arc::new(path)),
             lock: None,
-            immutable_lock: None,
             group: groups,
             flush_delay_seconds: 0,
             needs_upgrade: AtomicBool::new(false),
@@ -1344,11 +1414,8 @@ impl LocalMutableStore {
         let mut guard = lock
             .acquire(intent)
             .await
-            .internal("Failed to acquire mutable store lock")?;
+            .internal("Failed to acquire store lock")?;
         lock.watch(Arc::<Self>::downgrade(self));
-        if let Some(immutable) = self.immutable_lock.as_ref() {
-            immutable.watch(Arc::<Self>::downgrade(self));
-        }
         if guard.is_stale() {
             // Boxed: a reload is rare, and carried inline its state would be part of every
             // operation's future.
@@ -1365,13 +1432,10 @@ impl LocalMutableStore {
         Ok(Some(guard))
     }
 
-    /// Releases the flock, and the immutable store's this store's changes kept, if nothing is
+    /// Releases the flock, and with it the immutable store's its lock is nested in, if nothing is
     /// in flight and nothing is unflushed.
     fn note_flushed(&self) {
-        for lock in [self.lock.as_ref(), self.immutable_lock.as_ref()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(lock) = self.lock.as_ref() {
             lock.release_if_clean();
         }
     }
@@ -1517,8 +1581,8 @@ impl LocalMutableStore {
     /// group's flush lock, so that no write it started lands after the lock is released, and a
     /// share of the group's writes, so that the store stays claimed while it runs: the flush's
     /// claim goes with the flush, and a group flush has no write in flight between its writes.
-    /// Once it ends, it releases this store's flock, then the immutable store's, which this store's
-    /// changes keep as well, each if nothing keeps it, as [`Self::note_flushed`] does, see
+    /// Once it ends, it releases this store's flock, and with it the immutable store's its lock is
+    /// nested in, if nothing keeps it, as [`Self::note_flushed`] does, see
     /// [`crate::local::fan_out::releasing_once_done`].
     async fn flush_all(
         self: Arc<Self>,
@@ -1825,10 +1889,7 @@ impl LocalMutableStore {
             };
             lore_base::lore_spawn!(
                 tasks,
-                crate::local::fan_out::releasing_once_done(
-                    self.immutable_lock.clone(),
-                    crate::local::fan_out::releasing_once_done(self.lock.clone(), work)
-                )
+                crate::local::fan_out::releasing_once_done(self.lock.clone(), work)
             );
         }
 
@@ -1916,6 +1977,42 @@ async fn load_group_buckets(
         })?;
     }
     Ok(())
+}
+
+/// Sends `group`'s keys of `key_type` under `partition`, or under every partition for the zero
+/// one, down `stream`, bucket by bucket, until `stream` closes.
+///
+/// Holds the group's layout for read, which a fan-out holds for write as it moves entries between
+/// buckets, and reads `bucket_count` under it. Loads no bucket: the producer loaded those of the
+/// layout it read, and a fan-out loads every bucket it redistributes. Sends never wait: the stream
+/// is unbounded.
+async fn send_group(
+    group: &MutableStoreGroup,
+    key_type: KeyType,
+    partition: Partition,
+    stream: &UnboundedSender<(Hash, Hash)>,
+) {
+    if stream.is_closed() {
+        return;
+    }
+    let _layout = group.layout.read().await;
+    let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+    for bucket_index in 0..active_buckets {
+        #[cfg(feature = "test-util")]
+        if bucket_index > 0 {
+            crate::test_util::pause_point(crate::test_util::PausePoint::Walking).await;
+        }
+        if stream.is_closed() {
+            return;
+        }
+        let bucket = group.bucket(bucket_index).read().await;
+        if bucket
+            .send_keys(bucket_index, active_buckets, key_type, partition, stream)
+            .is_err()
+        {
+            return;
+        }
+    }
 }
 
 #[async_trait]
@@ -2187,101 +2284,11 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
                     || failed
                     || returned.wait_for(|returned| *returned).await.is_err()
                 {
-                    return Ok(());
+                    return;
                 }
                 #[cfg(feature = "test-util")]
                 crate::test_util::pause_point(crate::test_util::PausePoint::Listing).await;
-                for bucket_index in 0..active_buckets {
-                    if sender.is_closed() {
-                        break;
-                    }
-                    let bucket = group.bucket(bucket_index).read().await;
-                    let sender = sender.clone();
-
-                    fn handle_slot(
-                        key_type: KeyType,
-                        slot: usize,
-                        partition: Partition,
-                        bucket: &RwLockReadGuard<'_, MutableStoreBucket>,
-                        sender: &UnboundedSender<(Hash, Hash)>,
-                    ) -> Result<bool, StoreError> {
-                        let index = bucket.sorted_index[slot];
-                        let entry = bucket.entry[index as usize];
-                        if Key::key_type_from_hash(&entry.key) == key_type as u8 {
-                            if partition.is_zero() || entry.partition == partition {
-                                sender.send((entry.key, entry.value)).map_err(|err| {
-                                    StoreError::internal_with_context(
-                                        err,
-                                        "Failed to send mutable store entry while listing",
-                                    )
-                                })?;
-                            }
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    }
-
-                    // The bucket holds entries whose bucket byte (`data[1]`) falls in the
-                    // contiguous range `[start_bucket_byte, start_bucket_byte + stride)`
-                    // where `stride = 256 / active_buckets`. Within the bucket, sorted_index
-                    // orders entries by full hash so by bucket byte primarily and key-type
-                    // byte (`data[2]`) secondarily — equal-`key_type` entries are only
-                    // contiguous within a single bucket-byte value. Carve sorted_index into
-                    // one slice per bucket-byte value, then within each slice run the
-                    // `lookup_any_with_key_type_in_range` binary search and walk neighbours
-                    // bounded by the slice. At full fan-out (`stride == 1`) every entry
-                    // already shares the bucket byte so the bucket itself is the only
-                    // slice — skip the `upper_bound_bucket_byte` call and use
-                    // `[0, bucket_len)` directly. Lookups per bucket: 256→1, 128→2, 64→4,
-                    // 32→8, 1→256.
-                    let bucket_len = bucket.sorted_index.len();
-                    if bucket_len > 0 {
-                        let stride = 256 / active_buckets;
-                        let start_bucket_byte = bucket_index * stride;
-                        let mut cursor = 0usize;
-                        for byte_offset in 0..stride {
-                            if cursor >= bucket_len {
-                                break;
-                            }
-                            let hi = if stride == 1 {
-                                bucket_len
-                            } else {
-                                let bucket_byte = (start_bucket_byte + byte_offset) as u8;
-                                bucket.upper_bound_bucket_byte(cursor, bucket_len, bucket_byte)
-                            };
-                            if cursor < hi {
-                                let (found, slot) =
-                                    bucket.lookup_any_with_key_type_in_range(key_type, cursor, hi);
-                                if found {
-                                    handle_slot(key_type, slot, partition, &bucket, &sender)?;
-
-                                    let mut loop_slot = slot;
-                                    while loop_slot > cursor {
-                                        loop_slot -= 1;
-                                        if !handle_slot(
-                                            key_type, loop_slot, partition, &bucket, &sender,
-                                        )? {
-                                            break;
-                                        }
-                                    }
-
-                                    let mut loop_slot = slot + 1;
-                                    while loop_slot < hi {
-                                        if !handle_slot(
-                                            key_type, loop_slot, partition, &bucket, &sender,
-                                        )? {
-                                            break;
-                                        }
-                                        loop_slot += 1;
-                                    }
-                                }
-                            }
-                            cursor = hi;
-                        }
-                    }
-                }
-                Ok::<(), StoreError>(())
+                send_group(&group, key_type, partition, &sender).await;
             };
 
             lore_base::lore_spawn!(task);
@@ -2342,8 +2349,9 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
 /// Inspect dirty buckets in `group` and, if any exceeds the per-store fan-out threshold and the
 /// group is not yet at max level, atomically redistribute entries to the next ladder level.
 ///
-/// Decision 6 protocol: take write locks on every bucket in `[0..M]` (where M is the target level),
-/// redistribute, store the new `bucket_count`, then release. This is `Relaxed` on `bucket_count`
+/// Decision 6 protocol: take the group's layout for write, then write locks on every bucket in
+/// `[0..M]` (where M is the target level), redistribute, store the new `bucket_count`, then
+/// release. This is `Relaxed` on `bucket_count`
 /// because the per-bucket `RwLock` releases publish the store via happens-before — readers and
 /// writers using the CAS-retry pattern observe the change after their own re-load.
 async fn maybe_fan_out_mutable_group(
@@ -2379,6 +2387,7 @@ async fn maybe_fan_out_mutable_group(
     // Take write locks on ALL buckets [0..target] simultaneously. The [n..target] range is
     // uncontested since no caller computes an index ≥ n while bucket_count == n; their lock
     // releases publish fan-out's writes to subsequent readers/writers.
+    let _layout = group.layout.write().await;
     let mut guards: Vec<tokio::sync::OwnedRwLockWriteGuard<MutableStoreBucket>> =
         Vec::with_capacity(target);
     for i in 0..target {

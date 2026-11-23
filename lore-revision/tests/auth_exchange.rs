@@ -101,6 +101,18 @@ mod tests {
             }))
         }
 
+        async fn authenticate_client(
+            &self,
+            _auth_url: &str,
+            _client_id: &str,
+            _client_secret: &str,
+            _correlation_id: &str,
+        ) -> Result<AuthenticationToken, ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "authenticate_client".into(),
+            }))
+        }
+
         async fn refresh_authentication(
             &self,
             _auth_url: &str,
@@ -109,6 +121,17 @@ mod tests {
         ) -> Result<AuthenticationToken, ProtocolError> {
             Err(ProtocolError::from(NotSupported {
                 operation: "refresh_authentication".into(),
+            }))
+        }
+
+        async fn revoke_refresh_token(
+            &self,
+            _auth_url: &str,
+            _refresh_token: &str,
+            _correlation_id: &str,
+        ) -> Result<(), ProtocolError> {
+            Err(ProtocolError::from(NotSupported {
+                operation: "revoke_refresh_token".into(),
             }))
         }
 

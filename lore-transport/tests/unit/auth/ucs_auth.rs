@@ -287,6 +287,51 @@ async fn unanswering_h2_server() -> String {
     url
 }
 
+/// FORK (Tideshift): the refresh credential is reusable, so only an explicit refusal may read as a
+/// refusal. Every other answer reads as `Disconnected`, which keeps the stored credential.
+#[tokio::test]
+async fn refresh_answered_with_a_non_refusal_status_is_disconnected() {
+    for code in [
+        tonic::Code::DeadlineExceeded,
+        tonic::Code::Internal,
+        tonic::Code::Cancelled,
+        tonic::Code::ResourceExhausted,
+        tonic::Code::Unavailable,
+        tonic::Code::Unknown,
+    ] {
+        let (url, bearers) = super::stub::status_answering_h2_server(code).await;
+        let error = UcsAuthentication
+            .refresh_authentication(&url, "refresh-pat", "corr")
+            .await
+            .expect_err("the stub refuses every refresh");
+        assert!(error.is_disconnected(), "{code:?} gave {error:?}");
+        assert!(!error.is_not_authenticated(), "{code:?} gave {error:?}");
+        assert_eq!(*bearers.lock(), ["refresh-pat"], "{code:?}");
+    }
+}
+
+#[tokio::test]
+async fn refresh_answered_unauthenticated_is_not_authenticated() {
+    let (url, _) = super::stub::status_answering_h2_server(tonic::Code::Unauthenticated).await;
+    let error = UcsAuthentication
+        .refresh_authentication(&url, "refresh-pat", "corr")
+        .await
+        .expect_err("the stub refuses the refresh");
+    assert!(error.is_not_authenticated(), "got {error:?}");
+    assert!(!error.is_disconnected(), "got {error:?}");
+}
+
+#[tokio::test]
+async fn refresh_answered_permission_denied_is_not_disconnected() {
+    let (url, _) = super::stub::status_answering_h2_server(tonic::Code::PermissionDenied).await;
+    let error = UcsAuthentication
+        .refresh_authentication(&url, "refresh-pat", "corr")
+        .await
+        .expect_err("the stub refuses the refresh");
+    assert!(!error.is_disconnected(), "got {error:?}");
+    assert!(error.is_refusal(), "got {error:?}");
+}
+
 /// Nothing listening: the connect fails fast with an error rather than hanging.
 #[tokio::test]
 async fn auth_call_against_a_closed_port_errors_promptly() {

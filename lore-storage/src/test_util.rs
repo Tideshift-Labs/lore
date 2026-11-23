@@ -76,14 +76,21 @@ pub enum PausePoint {
     /// anything to write.
     Scanning,
     /// A mutable store list has handed its stream back, and one of its producers, which read its
-    /// group's buckets into memory before, has sent none of their keys yet.
+    /// group's buckets into memory before, has sent none of their keys yet, and holds no lock of
+    /// its group.
     Listing,
+    /// A mutable store list producer walking its group under the group's layout has sent the keys
+    /// of a bucket and not yet read the next.
+    Walking,
     /// A measurement of the packstores' size holds the claim it runs on and has measured none
     /// yet.
     Measuring,
     /// A put that verifies its writes has stored its entry and not yet found it again to read its
     /// payload back.
     Verifying,
+    /// A verification of the immutable store holds a group's flush lock, has read the group's
+    /// bucket count, and has checked none of its buckets.
+    Checking,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
@@ -550,6 +557,10 @@ impl crate::immutable_store::ImmutableStore for HoldingStore {
     ) -> Result<Option<crate::local::store_lock::StoreGuard>, crate::immutable_store::StoreError>
     {
         self.inner.clone().hold_for_command().await
+    }
+
+    fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        self.inner.store_lock()
     }
 
     /// Joins the task claim of the store this one wraps.

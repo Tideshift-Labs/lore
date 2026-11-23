@@ -934,11 +934,14 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
         vfs: args.vfs.to_lore(),
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RepositoryCreate(data) => {
                 println!(
-                    "Created repository {} in {} with ID {}",
+                    "{} repository {} in {} with ID {}",
+                    if dry_run { "Would create" } else { "Created" },
                     data.name,
                     data.path.as_str(),
                     data.id,
@@ -1413,6 +1416,7 @@ pub fn handle_repository_dump(
 
 pub fn handle_repository_gc(globals: LoreGlobalArgs) -> u8 {
     let args = LoreRepositoryGcArgs {};
+    let dry_run = globals.dry_run();
 
     // Progress events arrive one per evicted bucket / compacted group. Show a single
     // in-place bar with the running total instead of a line per event, then print the
@@ -1423,7 +1427,10 @@ pub fn handle_repository_gc(globals: LoreGlobalArgs) -> u8 {
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Complete(_) => {
+            LoreEvent::Complete(data) if data.status == 0 && dry_run => {
+                println!("Garbage collection skipped in a dry run");
+            }
+            LoreEvent::Complete(data) if data.status == 0 => {
                 println!(
                     "Garbage collection complete: compaction reclaimed {}, eviction removed {} fragments",
                     format_bytes_to_string(reclaimed.load(Ordering::Relaxed)),

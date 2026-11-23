@@ -85,8 +85,9 @@ uuid = { workspace = true }
 # WP-109 Phase 3's two-process harness, which mints the bearer tokens both live
 # loreserver processes verify against a JWKS endpoint the harness serves.
 # Verification stays `lore-server`'s: this only signs the tokens its
-# `JwtVerifier` is then asked to accept or refuse.
-jsonwebtoken = { workspace = true }
+# `JwtVerifier` is then asked to accept or refuse. FORK: the fixtures are PEM keys and the
+# workspace drops `use_pem` (upstream 5bca99d6), so the tests turn it back on.
+jsonwebtoken = { workspace = true, features = ["use_pem"] }
 ctor = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }
 lore-base = { workspace = true, features = ["test-util"] }

@@ -2,3 +2,4 @@
 // SPDX-License-Identifier: MIT
 
 mod composite;
+mod write_discarding;

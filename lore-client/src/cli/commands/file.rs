@@ -1832,12 +1832,19 @@ pub fn handle_file_write(globals: LoreGlobalArgs, args: &FileWriteArgs) -> u8 {
         output: LoreString::from(&args.output),
     };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileWrite(data) => {
                 println!(
-                    "{}File written {}{}",
+                    "{}{} {}{}",
                     CommonStyles::SUCCESS,
+                    if dry_run {
+                        "Would write"
+                    } else {
+                        "File written"
+                    },
                     data.path,
                     anstyle::Reset
                 );
@@ -1870,19 +1877,27 @@ pub fn handle_file_obliterate(globals: LoreGlobalArgs, args: &FileObliterateArgs
     let file_path = args.path.clone().unwrap_or_default();
 
     let _spinner = ProgressBar::new_spinner("Obliterating files...");
+    let dry_run = globals.dry_run();
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileObliterate(data) => {
-                if !file_path.is_empty() {
-                    println!("Obliterating file: {file_path}");
+                let action = if dry_run {
+                    "Would obliterate"
                 } else {
-                    println!("Obliterating address: {}", data.address);
+                    "Obliterating"
+                };
+                if !file_path.is_empty() {
+                    println!("{action} file: {file_path}");
+                } else {
+                    println!("{action} address: {}", data.address);
                 }
-                println!(
-                    "Obliterated {} fragments and removed {} payloads",
-                    data.num_fragments, data.num_payloads
-                );
+                if !dry_run {
+                    println!(
+                        "Obliterated {} fragments and removed {} payloads",
+                        data.num_fragments, data.num_payloads
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Error(_data) => {

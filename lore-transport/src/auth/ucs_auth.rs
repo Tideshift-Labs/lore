@@ -4,6 +4,8 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use lore_base::error::Disconnected;
+use lore_base::error::NotSupported;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::ExchangeExternalTokenForUserTokenRequest;
 use lore_proto::auth::ExchangeUserTokenForMultiresourceTokenRequest;
@@ -247,6 +249,18 @@ impl Authentication for UcsAuthentication {
         required_authentication_token(res.into_inner().user_token, "exchange")
     }
 
+    async fn authenticate_client(
+        &self,
+        _auth_url: &str,
+        _client_id: &str,
+        _client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        Err(ProtocolError::from(NotSupported {
+            operation: "client credentials login against the gRPC auth service".to_string(),
+        }))
+    }
+
     async fn refresh_authentication(
         &self,
         auth_url: &str,
@@ -257,12 +271,32 @@ impl Authentication for UcsAuthentication {
 
         let mut request = tonic::Request::new(RefreshAuthSessionRequest {});
         set_auth_header(&mut request, refresh_token)?;
+        // FORK (Tideshift): the refresh credential this backend takes is reusable (Commit0's
+        // auth-grpc refreshes with the stored PAT), not a one-time-use OAuth refresh token. Only an
+        // explicit refusal may cost the caller its stored credential, so every other failure reads
+        // as `Disconnected`: the token store keeps the credential and presents it again later.
         let res = client
             .refresh_auth_session(request)
             .await
-            .map_err(ProtocolError::from)?;
+            .map_err(|status| match status.code() {
+                tonic::Code::Unauthenticated | tonic::Code::PermissionDenied => {
+                    ProtocolError::from(status)
+                }
+                _ => ProtocolError::from(Disconnected),
+            })?;
 
         required_authentication_token(res.into_inner().user_token, "refresh")
+    }
+
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::from(NotSupported {
+            operation: "token revocation at the gRPC auth service".to_string(),
+        }))
     }
 
     async fn exchange_for_repository(

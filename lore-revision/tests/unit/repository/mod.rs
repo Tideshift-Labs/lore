@@ -4,6 +4,7 @@
 mod clone;
 mod clone_hold;
 mod connect_identity_tests;
+mod dry_run_store_tests;
 mod name_validation_tests;
 mod path_optional_tests;
 mod prefetch;

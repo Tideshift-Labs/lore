@@ -796,14 +796,41 @@ pub trait Authentication: Send + Sync {
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
 
-    /// Refreshes the authentication token using an opaque backend-defined
-    /// credential. The returned token may carry a replacement credential.
+    /// Obtains an authentication token for a confidential client registered with
+    /// the auth backend, which authenticates with its own ID and secret.
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError>;
+
+    /// Refreshes the authentication token using a refresh credential.
+    ///
+    /// The credential is opaque and backend-defined. An OIDC backend treats it as a one-time-use
+    /// refresh token. The returned token may carry a replacement credential.
+    ///
+    /// Fails with [`Disconnected`](lore_base::error::Disconnected) only when the refresh token
+    /// cannot have reached the backend, so the caller may present it again. After any other
+    /// failure the backend may have consumed it.
     async fn refresh_authentication(
         &self,
         auth_url: &str,
         refresh_token: &str,
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
+
+    /// Revokes the refresh token of a login at the auth backend.
+    ///
+    /// Fails with [`NotSupported`](lore_base::error::NotSupported) when the backend offers no
+    /// revocation.
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProtocolError>;
 
     /// Exchanges an authentication token for an authorization token scoped
     /// to the given repository.

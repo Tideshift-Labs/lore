@@ -23,6 +23,7 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::domain::DomainContext;
 use crate::domain::GovernedRepositoryDelete;
@@ -34,9 +35,9 @@ use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_authorization_optional;
 use crate::grpc::get_user_id;
+use crate::grpc::may_delete_repository;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -49,20 +50,19 @@ use crate::util::setup_execution;
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
     registry: &RepositoryRegistry,
+    authorizer: &Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
     domain_context: Option<&Arc<DomainContext>>,
 ) -> Result<Response<RepositoryDeleteResponse>, Status> {
-    // Captured before `into_inner` consumes the request: the domain-operation
-    // headers and the verified principal both live outside the message body.
-    let request_metadata = request.metadata().clone();
-    let request_authorization = get_authorization_optional(request.extensions());
-    let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
-    let req = request.into_inner();
+    // Captured before `into_parts` consumes the request: the domain-operation
+    // headers and the verified principal both live outside the message body.
+    let request_authorization = get_authorization_optional(request.extensions());
+    let (request_metadata, extensions, req) = request.into_parts();
 
     // CR-029 R-BLOCK-2: the one shared reader of the domain-operation headers,
     // at handler entry, before any handler logic or authorization side effect.
@@ -83,14 +83,6 @@ pub async fn handler(
     } else {
         None
     };
-    // TODO(mjansson): Once the authz model has read/write/admin, replace
-    // the service-account bypass with a proper permission check.
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
 
     let id: RepositoryId = Context::from(req.id).into();
     let execution = setup_execution(module_path!(), correlation_id, user_id);
@@ -108,9 +100,16 @@ pub async fn handler(
                 .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
-            if !registry.authorizes_delete() && metadata.creator != user_id && !bypass_protection {
+            // Fork (CR-029, ruling D-1): an admitted governed delete is
+            // authorized by its domain admission (verified control-plane
+            // service identity, claim and witness). Upstream's
+            // creator-or-owner/admin check guards the ungoverned path.
+            if governed.is_none()
+                && !may_delete_repository(authorizer, &extensions, id, &metadata.creator, &user_id)
+                    .await
+            {
                 info!(
-                    "Repository delete refused, user {user_id} is not creator {}",
+                    "Repository delete refused for user {user_id}, creator {}",
                     metadata.creator
                 );
                 return Err(Status::permission_denied("Not repository owner"));

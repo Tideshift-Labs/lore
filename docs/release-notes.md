@@ -7,6 +7,76 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+### Features
+
+- `lore service run` runs the Lore service in the current process, returning once it stops, whether by
+  `lore service stop` or by `lore::service::quit` from within the same process. `lore::service::quit` asks a service
+  that `lore::service::run` started in this process to shut down cleanly, and does nothing when none runs there. Neither
+  has a C API equivalent: there is no `lore_service_run` or `lore_service_quit`, so they're available from Rust only.
+  `lore service stop` (C API: `lore_service_stop`) is the way to stop a service from another process.
+- An OIDC login whose access token has expired is renewed with its refresh token (OAuth 2.0 refresh grant, RFC 6749
+  §6) on the next operation, without a new `lore auth login`. The provider's rotated refresh token replaces the used
+  one, and a refresh token the provider refuses is dropped, so the next operation asks for a new login. A client
+  credentials login stores no refresh token
+- `lore auth logout` (C API: `lore_auth_logout`) revokes an OIDC login's refresh token at the provider (OAuth 2.0
+  token revocation, RFC 7009) if the provider advertises a revocation endpoint. A failed revocation, such as at an
+  unreachable provider, now fails the logout, after the login is removed from this machine
+
+### Fixes & Improvements
+
+- `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and
+  heals every fragment a flush in the same process moves to other index buckets meanwhile
+- `lore stage` of several paths under a directory missing from the working directory stages a delete of only those
+  paths, where it staged a delete of the whole directory
+- `lore branch switch <branch> <revision>` takes a revision that names no branch, such as `1234` or `@1234`, on
+  `<branch>`, where it took it on the current branch and refused it as not on the target branch
+- `--dry-run` writes nothing to the working tree. `lore file reset --dry-run` restored, deleted and purged files as a
+  reset without it does, and other commands could write files the same way
+- `--dry-run` changes no branch, revision, staged or layer state and creates no repository. `lore branch create`,
+  `branch reset`, `branch archive`, `revision amend`, `unstage`, `file dependency add`, `layer add` and
+  `repository create` made their changes with `--dry-run` as without it, and `repository create --force --dry-run`
+  removed the existing repository
+- `lore repository clone --dry-run` into an existing directory leaves nothing in it, where it left a `.lore` directory.
+  `repository clone --force --dry-run` over an existing repository fails instead of replacing it, and
+  `repository clone --dry-run --vfs swfs` fails instead of mounting the repository
+- `lore shared-store create --dry-run` creates and registers no shared store, and with `--force` keeps the existing one.
+  `repository clone --dry-run --use-shared-store` fails where it would create the shared store, and a dry run no
+  longer moves a shared store's legacy `global.toml` config to `shared_store.toml`
+- `--dry-run` writes no missing `.lore/instance` file and saves no identity or remote URL to `.lore/config.toml`
+- `lore unstage --dry-run` and `reset --dry-run` of a staged link addition keep the link's files, where they removed
+  them, and `lore file write --dry-run` writes no output outside the repository
+- `--dry-run` changes nothing on the remote. `lore branch create --dry-run` created the branch in linked and layer
+  repositories and with `--force` deleted the existing branch on the remote, `link add` and `layer add` created the
+  current branch in the linked or layer repository, `branch metadata set` and `repository metadata set` stored their
+  values, `branch merge into` pushed the merge to the target branch, and `commit` uploaded the commit's content
+- `lore shared-store set-use-automatically`, `service set-use-automatically` and `service set-executable` change no
+  setting with `--dry-run`, and the service setters say what they would set
+- `lore file obliterate --dry-run` removes no content, where it obliterated the content in the local store and on the
+  remote
+- `lore repository gc --dry-run` collects no garbage, where it evicted and compacted the local store, and
+  `repository verify --heal --dry-run` heals nothing, reporting what it finds as `repository verify` does
+- `lore auth login --dry-run` authenticates and stores no token, and `auth logout --dry-run` and `auth clear --dry-run`
+  remove no token, where all three changed the token store
+- Processes running commands on one repository or shared store at once, such as several `lore history`, no longer wait
+  on each other forever. A command whose process still had the immutable store open from the previous command, and not
+  the mutable store, took the mutable store's lock before the immutable store's, against a process holding the immutable
+  store's lock and waiting for the mutable store's. Every process using the store needs this version: an older one still
+  takes the two locks in that order
+- TLS connections refuse a server certificate issued through one of the eMudhra intermediate CAs whose private keys can
+  be derived from their public keys (RUSTSEC-2026-0382), whichever built-in, operating system or custom root its chain
+  ends in, where they accepted it. The built-in roots no longer include emSign ECC Root CA - G3, emSign Root CA - C1 or
+  emSign ECC Root CA - C3
+- TLS connections abort on a TLS 1.3 handshake message sent at the wrong encryption level, where they accepted it
+  (RUSTSEC-2026-0285). A forged ServerHello no longer makes later connections to the same server offer only a classical
+  key share, which a server could accept without post-quantum key exchange (RUSTSEC-2026-0349). Debug output of a
+  client session leaves out its secrets (RUSTSEC-2026-0346)
+- `lore stage --case keep` of several paths under a directory spelled in another case than the repository's stages them
+  as modified under the repository's case, where on a case-sensitive file system it staged them as deleted
+
+## v0.11.0 (Oct 21st 2026) [#1892]
+
+### Breaking changes
+
 - C API: the new `LORE_EVENT_FILE_AUDIT` event adds a member to `lore_event_t`, so C consumers must rebuild against the
   new `lore.h`
 - `[environment.endpoint] user_url` now names a `lore.user.v1.UserService` (`UserGet`, `UserFind`), replacing the
@@ -23,6 +93,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   only
 - C API: `lore_branch_merge_start_args_t` gains `link_paths` and `link_messages`, changing its size; rebuild against the
   new `lore.h`. A zero-initialized struct keeps today's behavior
+- C API: `lore_auth_login_with_token_args_t` gains `client_id` and `client_secret`, changing its size; rebuild against
+  the new `lore.h`. A zero-initialized struct keeps today's behavior
 - The server refuses to start if `[server.auth] resource_id_template` or `[server.auth.oidc]`
   `resource_template`/`scope_template` lacks `{id}`, as such a template let one grant match every partition. The error
   names the setting
@@ -47,7 +119,15 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   to the issuer verbatim. Partition operations, repository metadata get/set and repository delete send the access token,
   or a per-partition token from token exchange when the server advertises `resource_template` or `scope_template`. A
   token exchange issuer on another host gets the login token only if the token's `root_domains` claim, or else `aud`,
-  names that host. ID tokens are never stored or sent. Refresh and client credentials grants aren't implemented yet
+  names that host. ID tokens are never stored or sent. The refresh grant isn't implemented yet
+- `lore auth login --client-id <ID>` against a server with an OIDC issuer logs in as a confidential client registered
+  at the provider, with the OAuth 2.0 client credentials grant (RFC 6749 §4.4), for CI. The secret comes from
+  `LORE_CLIENT_SECRET`, or from `--client-secret`. The client authenticates with HTTP Basic, or in the form when the
+  provider's discovery document lists only `client_secret_post`. No scope is requested. The C API takes the same login
+  through `client_id` and `client_secret` on `lore_auth_login_with_token_args_t`
+- `--token`, `--identity-token` and `--access-token` fall back to `LORE_TOKEN`, `LORE_IDENTITY_TOKEN` and
+  `LORE_ACCESS_TOKEN` when not given. A secret passed as a flag value, these three or `--client-secret`, now prints a
+  warning, since other users can read it in the process table and the shell history keeps it
 - The user identity is read from the token by the same rule on client and server: the `identity` claim (or
   `https://lore.org/claims/identity`), else `sub`. An issuer whose `sub` isn't a usable identity maps one into
   `identity`, such as Entra's `oid`. Tokens with an empty or non-string identity are refused. The
@@ -171,6 +251,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   written and index entries and local-only data were discarded. A listing of the local mutable store fails instead of
   missing entries, and after failing to open a new data file, the next write retries instead of every write failing with
   `No more packfiles`
+- A listing of the local mutable store no longer misses entries that a flush in the same process moves to other index
+  buckets meanwhile
 - A local store whose `version` file can't be read fails to open, where it was marked for migration again on every open,
   making every process using it reload it at each use. A store affected by this recovers at its next command connected
   to the remote; until then, commands without a connection fail with "Unable to upgrade local store to current client,

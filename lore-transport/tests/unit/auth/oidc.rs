@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+mod client_credentials;
 mod device;
 mod discovery;
 mod exchange;
+mod refresh;
+mod revocation;
 
 #[path = "../../support/oidc_provider.rs"]
 mod provider;

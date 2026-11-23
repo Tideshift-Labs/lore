@@ -1041,6 +1041,18 @@ pub async fn clone(
     let context = execution_context();
     let call = context.globals();
 
+    // An SWFS clone mounts the repository, and a mount cannot be removed again.
+    if call.dry_run()
+        && options
+            .vfs_options
+            .as_ref()
+            .is_some_and(|vfs| vfs.vfs_type.is_swfs())
+    {
+        return Err(CloneError::from(InvalidArguments {
+            reason: "--dry-run is not supported for an SWFS clone".to_string(),
+        }));
+    }
+
     // FORK-LOCAL (Tideshift): an existing working copy is only replaced under `--force`, and only
     // once the remote has answered. Removing it before the remote resolves left an unreachable
     // server costing the folder its binding.
@@ -1057,6 +1069,17 @@ pub async fn clone(
                 path: path.display().to_string(),
             }));
         }
+        // A dry run does not edit the working tree, and replacing the existing working copy
+        // (even by setting it aside) would.
+        if call.dry_run() {
+            return Err(CloneError::from(InvalidArguments {
+                reason: format!(
+                    "--dry-run with --force would replace the repository in {}, clone to \
+                     another path to preview it",
+                    path.display()
+                ),
+            }));
+        }
     }
     let holds_other_entries = holds_entries_besides_dot_dir(path, existing_dot_dir.as_path())
         .await
@@ -1067,6 +1090,7 @@ pub async fn clone(
         .forward::<CloneError>("Invalid repository URL")?;
 
     let mut repository_path_guard = RepositoryCloneGuard::new(path, call.dry_run());
+    let mut dot_directory_guard = RepositoryCloneGuard::new(&existing_dot_dir, call.dry_run());
 
     // Resolve the repository name
     let repository_data = repository::resolve_by_name(&remote_url, &name, identity)
@@ -1204,6 +1228,7 @@ pub async fn clone(
             options,
         },
         &mut repository_path_guard,
+        &mut dot_directory_guard,
     ))
     .await;
 
@@ -1238,6 +1263,7 @@ struct CloneBound<'a> {
 async fn clone_bound(
     bound: CloneBound<'_>,
     repository_path_guard: &mut RepositoryCloneGuard,
+    dot_directory_guard: &mut RepositoryCloneGuard,
 ) -> Result<(), CloneError> {
     let CloneBound {
         remote,
@@ -1319,6 +1345,7 @@ async fn clone_bound(
         layer,
         options,
         repository_path_guard,
+        dot_directory_guard,
     )
     .await
 }
@@ -1463,12 +1490,10 @@ async fn clone_into(
     layer: Option<CloneLayer>,
     options: CloneOptions,
     repository_path_guard: &mut RepositoryCloneGuard,
+    dot_directory_guard: &mut RepositoryCloneGuard,
 ) -> Result<(), CloneError> {
     let context = execution_context();
     let call = context.globals();
-
-    let mut dot_directory_guard =
-        RepositoryCloneGuard::new(repository.dot_dir_path()?, call.dry_run());
 
     // Copy the view definition if given
     let filter_view = if let Some(view) = view {

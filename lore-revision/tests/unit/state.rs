@@ -60,7 +60,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_revision::state::*;
 
 use crate::fs::filesystem_provider::setup_test_execution;
-use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+use crate::helper::RepositoryContextCreationArgsExt;
 
 /// The key every stored modification time is filed under. It has to stay the
 /// digest over the path's own lowercase form, or a scan finds nothing it wrote
@@ -169,7 +169,7 @@ async fn repository_with_unwritable_probe_path() -> Arc<RepositoryContext> {
         uuid::Uuid::now_v7()
     ));
     Arc::new(RepositoryContext::new(
-        crate::repository::test_helpers::default_repository_creation_args(immutable, mutable)
+        crate::helper::default_repository_creation_args(immutable, mutable)
             .with_path(&missing_root),
     ))
 }
@@ -182,7 +182,7 @@ async fn repository_with_writable_probe_path() -> (tempfile::TempDir, Arc<Reposi
         .expect("create in-memory stores");
     let tempdir = tempfile::tempdir().expect("create temp working-tree dir");
     let repository = Arc::new(RepositoryContext::new(
-        crate::repository::test_helpers::default_repository_creation_args(immutable, mutable)
+        crate::helper::default_repository_creation_args(immutable, mutable)
             .with_path(tempdir.path()),
     ));
     std::fs::create_dir_all(
@@ -356,13 +356,10 @@ async fn working_tree_repository(path: &std::path::Path) -> Arc<RepositoryContex
 
     // Built with the path rather than assigned one afterwards, so the filesystem provider is
     // rooted where the working tree is.
-    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::helper::RepositoryContextCreationArgsExt;
     Arc::new(RepositoryContext::new(
-        crate::repository::test_helpers::default_repository_creation_args(
-            immutable_store,
-            mutable_store,
-        )
-        .with_path(path),
+        crate::helper::default_repository_creation_args(immutable_store, mutable_store)
+            .with_path(path),
     ))
 }
 

@@ -134,6 +134,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             repository_delete::handler(
                 request,
                 &self.registry,
+                &self.authorizer,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.instrument_provider,

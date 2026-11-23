@@ -1548,3 +1548,102 @@ def test_backwards_compatible_config_file_broken(new_lore_repo):
     assert os.path.exists(legacy_config_path)
     with open(legacy_config_path, "r") as legacy_config:
         assert legacy_config.read() == config_contents
+
+
+@pytest.mark.smoke
+def test_create_dry_run_creates_nothing(new_lore_repo, scratch_dir):
+    """`shared-store create --dry-run` creates no store and registers none, and with
+    `--force` keeps an existing store."""
+    repo: Lore = new_lore_repo(create_repo=False)
+    containing_path = scratch_dir("dry-run-store")
+    store_path = per_url_store_path(str(containing_path), repo.remote)
+    registry = repo.run(["shared-store", "list"])
+
+    output = repo.shared_store_create(repo.remote, str(containing_path), dry_run=True)
+
+    assert "Would create shared store" in output, output
+    assert not os.path.exists(store_path), (
+        "shared-store create --dry-run made the store"
+    )
+    assert repo.run(["shared-store", "list"]) == registry
+
+    repo.shared_store_create(repo.remote, str(containing_path), make_default=False)
+    marker = os.path.join(store_path, "marker")
+    with open(marker, "w") as marker_file:
+        marker_file.write("kept")
+
+    repo.shared_store_create(
+        repo.remote, str(containing_path), make_default=False, force=True, dry_run=True
+    )
+
+    assert os.path.exists(marker), (
+        "shared-store create --force --dry-run replaced the store"
+    )
+
+
+@pytest.mark.smoke
+def test_clone_dry_run_creates_no_shared_store(new_lore_repo, scratch_dir):
+    """`repository clone --dry-run --use-shared-store` with no shared store yet fails
+    instead of creating one."""
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("First", {"a.txt": b"first\n"})
+    containing_path = scratch_dir("dry-run-clone-store")
+    store_path = per_url_store_path(str(containing_path), repo.remote)
+    clone_path = scratch_dir("dry-run-clone")
+
+    output = repo.run(
+        [
+            "repository",
+            "clone",
+            repo.remote_path,
+            str(clone_path),
+            "--use-shared-store",
+            "--shared-store-path",
+            str(containing_path),
+        ],
+        dry_run=True,
+        check=False,
+    )
+
+    assert "--dry-run would create a shared store" in output, output
+    assert not os.path.exists(store_path), "clone --dry-run created the shared store"
+    assert not clone_path.exists(), "clone --dry-run created the destination"
+
+
+@pytest.mark.smoke
+def test_dry_run_keeps_a_legacy_shared_store_config(new_lore_repo, scratch_dir):
+    """A dry run command on a repository whose shared store has its config in the legacy
+    `global.toml` leaves it there, where the same command without `--dry-run` moves it."""
+    repo: Lore = new_lore_repo(create_repo=False)
+    base = str(scratch_dir("legacy_config_store"))
+    repo.shared_store_create(repo.remote, base, make_default=False)
+    repo.repository_create(use_shared_store=True, shared_store_path=base)
+    store = per_url_store_path(base, repo.remote)
+    config = os.path.join(store, CONFIG_TOML)
+    legacy_config = os.path.join(store, "global.toml")
+    shutil.move(config, legacy_config)
+    repo.write_files({"a.txt": b"a\n"})
+
+    repo.stage("a.txt", dry_run=True)
+
+    assert os.path.exists(legacy_config), "a dry run moved the legacy config"
+    assert not os.path.exists(config), "a dry run wrote the shared store config"
+
+    repo.stage("a.txt")
+
+    assert os.path.exists(config) and not os.path.exists(legacy_config), (
+        "stage did not move the legacy config"
+    )
+
+
+@pytest.mark.smoke
+def test_set_use_automatically_dry_run_changes_nothing(new_lore_repo):
+    """`shared-store set-use-automatically --dry-run` leaves automatic use unset."""
+    repo: Lore = new_lore_repo(create_repo=False)
+    assert repo.shared_store_info().is_automatic is False
+
+    repo.run(["shared-store", "set-use-automatically", "true"], dry_run=True)
+
+    assert repo.shared_store_info().is_automatic is False, (
+        "a dry run turned on automatic shared store use"
+    )

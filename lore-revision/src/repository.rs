@@ -715,6 +715,12 @@ impl RepositoryContext {
         filter: Arc<Filter>,
         filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
     ) -> Self {
+        let mutable_store: Arc<dyn MutableStore> = match crate::runtime::try_execution_context() {
+            Some(context) if context.is_client() && context.globals().dry_run() => Arc::new(
+                crate::store::write_discarding::WriteDiscardingMutableStore::new(mutable_store),
+            ),
+            _ => mutable_store,
+        };
         let file_system = filesystem_provider.unwrap_or_else(|| {
             Self::default_filesystem(
                 paths
@@ -2486,6 +2492,7 @@ pub async fn load_and_connect_with_token(
     // that lock.
     let persist_identity = identity_resolved_from_auth
         && matches!(access, RepositoryAccess::ReadWrite)
+        && !global.dry_run()
         && identity.is_some();
     if persist_identity && let Some(ref auth_identity) = identity {
         config.identity = Some(auth_identity.clone());
@@ -2682,7 +2689,7 @@ pub async fn load_and_connect_with_token(
             if !identity.is_empty() {
                 config.identity = Some(identity.to_string());
             }
-            if matches!(access, RepositoryAccess::ReadWrite) {
+            if matches!(access, RepositoryAccess::ReadWrite) && !global.dry_run() {
                 let _ = save_config(config_path.as_path(), &config).await;
             }
         }
@@ -2711,9 +2718,13 @@ pub async fn load_and_connect_with_token(
             lore_debug!("No matching instance found, generating new instance ID");
             crate::instance::InstanceId::generate()
         });
-        id.write_to_file(instance_path)
-            .await
-            .internal("Failed to write local repository state: failed to write instance ID")?;
+        // A dry run uses the ID for this call only. A later command recovers the same ID or
+        // generates its own, and registers it.
+        if !global.dry_run() {
+            id.write_to_file(instance_path)
+                .await
+                .internal("Failed to write local repository state: failed to write instance ID")?;
+        }
         lore_debug!("Instance ID set to: {id}");
         id
     } else {
@@ -2778,7 +2789,9 @@ pub async fn load_and_connect_with_token(
     // contexts — read-only commands shouldn't mutate persistent state during
     // load_and_connect. A read-only invocation that hits a repository needing
     // registration/migration simply defers the work to the next write command.
-    if repository.try_write_token().is_some() {
+    // A dry run defers it too: its store discards the migrated anchors, so the
+    // migration would remove the legacy anchor files the anchors are read from.
+    if repository.try_write_token().is_some() && !global.dry_run() {
         register_instance_and_migrate_anchors(&repository, instance_id, path, &dot_path).await?;
     }
 
@@ -3373,8 +3386,8 @@ pub async fn branch_switch(
 }
 
 /// The revision a switch to `branch_id` lands on, as `(latest local, latest remote, location,
-/// signature)`: the given signature, or the local or remote latest, creating the local branch
-/// where only the remote holds it.
+/// signature)`: the given signature, taken on `branch_id` where it names no branch, or the local
+/// or remote latest, creating the local branch where only the remote holds it.
 ///
 /// A function of its own because its locals live across several awaits: kept in
 /// [`branch_switch`] they would take space in its future while the layers switch as well.
@@ -3390,11 +3403,14 @@ async fn branch_switch_target(
     let global = context.globals();
 
     let signature = if let Some(revision) = options.signature.as_ref() {
-        let resolved =
-            revision::resolve_in_branch(repository.clone(), revision, global.search_location())
-                .await
-                .forward::<RepositoryError>("Invalid revision")?;
-        let revision = resolved.revision;
+        let (revision, _named_branch) = revision::resolve_revision(
+            repository.clone(),
+            revision,
+            Some(branch_id),
+            global.search_location(),
+        )
+        .await
+        .forward::<RepositoryError>("Invalid revision")?;
 
         let state = state::State::deserialize(repository.clone(), revision)
             .await
@@ -4116,6 +4132,11 @@ pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryErro
 
     let config = load_config(config_path.as_path())?;
     let config_store = config.store.as_ref();
+
+    // Collecting evicts and compacts the store's files, which no dry run may change.
+    if crate::runtime::try_execution_context().is_some_and(|context| context.globals().dry_run()) {
+        return Ok(());
+    }
 
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());

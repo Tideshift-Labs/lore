@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT
 //! Authentication against an `OpenID` Connect provider.
 
+pub mod client_credentials;
 pub mod device;
 pub mod discovery;
 pub mod exchange;
+pub mod refresh;
+pub mod revocation;
 pub mod token;
 
 use std::future::Future;
@@ -14,7 +17,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::error::Disconnected;
-use lore_base::error::NotSupported;
 use lore_base::lore_spawn_net;
 use lore_base::lore_warn;
 use lore_base::types::RepositoryId;
@@ -151,26 +153,54 @@ impl FormResponse {
     }
 }
 
-/// POSTs `form` to `url` as `application/x-www-form-urlencoded` (RFC 6749 §4.1.3) and
-/// reads the answer. A request that never reaches the provider is [`Disconnected`]; a body
-/// over [`MAX_RESPONSE_BYTES`] is refused.
+/// Why a request to an identity provider failed, and whether the provider may have received
+/// it.
+pub(super) enum PostError {
+    /// No connection was made (DNS, TCP, TLS or the connect timeout), so nothing was sent.
+    NotSent(ProtocolError),
+    /// The request may have reached the provider, and the provider may have acted on it.
+    MaybeSent(ProtocolError),
+}
+
+impl From<PostError> for ProtocolError {
+    fn from(error: PostError) -> Self {
+        match error {
+            PostError::NotSent(error) | PostError::MaybeSent(error) => error,
+        }
+    }
+}
+
+/// POSTs `form` to `url` as `application/x-www-form-urlencoded` (RFC 6749 §4.1.3), with
+/// `authorization` as the `Authorization` header when given, and reads the answer. A request
+/// that never reaches the provider is [`Disconnected`], as is a timeout; a body over
+/// [`MAX_RESPONSE_BYTES`] is refused.
 async fn post_form(
     what: &'static str,
     url: &str,
     form: &[(&str, &str)],
-) -> Result<FormResponse, ProtocolError> {
-    let request = match http_client() {
-        Ok(client) => client.post(url).form(form).send().await,
-        Err(source) => Err(source),
-    };
-    let mut response = match request {
+    authorization: Option<&str>,
+) -> Result<FormResponse, PostError> {
+    let client = http_client()
+        .map_err(|source| PostError::NotSent(ProtocolError::internal_with_context(source, what)))?;
+    let mut request = client.post(url).form(form);
+    if let Some(authorization) = authorization {
+        request = request.header(http::header::AUTHORIZATION, authorization);
+    }
+    let mut response = match request.send().await {
         Ok(response) => response,
         Err(source) => {
             lore_warn!("OIDC {what} request failed: {source}");
-            return Err(if source.is_connect() || source.is_timeout() {
+            // A connect error, the connect timeout included, ends before any byte is written.
+            let sent = !(source.is_connect() || source.is_builder());
+            let error = if source.is_connect() || source.is_timeout() {
                 ProtocolError::from(Disconnected)
             } else {
                 ProtocolError::internal_with_context(source, what)
+            };
+            return Err(if sent {
+                PostError::MaybeSent(error)
+            } else {
+                PostError::NotSent(error)
             });
         }
     };
@@ -179,13 +209,13 @@ async fn post_form(
         Ok(Some(body)) => Ok(FormResponse { status, body }),
         Ok(None) => {
             lore_warn!("OIDC {what} response exceeds {MAX_RESPONSE_BYTES} bytes");
-            Err(ProtocolError::internal(format!(
+            Err(PostError::MaybeSent(ProtocolError::internal(format!(
                 "OIDC {what} response exceeds {MAX_RESPONSE_BYTES} bytes"
-            )))
+            ))))
         }
         Err(source) => {
             lore_warn!("OIDC {what} response could not be read: {source}");
-            Err(ProtocolError::from(Disconnected))
+            Err(PostError::MaybeSent(ProtocolError::from(Disconnected)))
         }
     }
 }
@@ -209,9 +239,11 @@ pub fn issuer(endpoint: &str) -> &str {
 /// names the issuer and not the client.
 ///
 /// The interactive login is the device authorization grant (RFC 8628), a login with an
-/// external credential the token exchange (RFC 8693), and authorization for a partition the
-/// token exchange when the server advertises a template. The refresh grant is not
-/// implemented yet, and fails with [`NotSupported`].
+/// external credential the token exchange (RFC 8693), a login as a registered confidential
+/// client the client credentials grant (RFC 6749 §4.4), a new access token for a login the
+/// refresh token grant (RFC 6749 §6), and authorization for a partition the token exchange
+/// when the server advertises a template. A logout revokes the refresh token (RFC 7009) where
+/// the provider advertises a revocation endpoint.
 pub struct OidcAuthentication {
     oidc: Oidc,
 }
@@ -219,16 +251,6 @@ pub struct OidcAuthentication {
 impl OidcAuthentication {
     pub fn new(oidc: Oidc) -> Self {
         OidcAuthentication { oidc }
-    }
-
-    fn not_implemented(operation: &str, endpoint: &str) -> ProtocolError {
-        NotSupported {
-            operation: format!(
-                "{operation} against OIDC issuer {}: not implemented yet",
-                issuer(endpoint)
-            ),
-        }
-        .into()
     }
 
     /// Refuses an `auth_url` naming an issuer other than the one the implementation was
@@ -315,13 +337,40 @@ impl Authentication for OidcAuthentication {
         exchange::login(&self.oidc, &document, token, token_type).await
     }
 
+    async fn authenticate_client(
+        &self,
+        auth_url: &str,
+        client_id: &str,
+        client_secret: &str,
+        _correlation_id: &str,
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        let document = self.discover(auth_url).await?;
+        client_credentials::login(&document, client_id, client_secret).await
+    }
+
+    /// Nothing is sent when the provider's endpoints cannot be discovered, so that failure is
+    /// [`Disconnected`] whatever its cause, as the trait requires.
     async fn refresh_authentication(
         &self,
         auth_url: &str,
-        _refresh_token: &str,
+        refresh_token: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
-        Err(Self::not_implemented("token refresh", auth_url))
+        let document = self.discover(auth_url).await.map_err(|error| {
+            lore_warn!("OIDC refresh grant not sent, the provider was not discovered: {error}");
+            ProtocolError::from(Disconnected)
+        })?;
+        refresh::refresh(&self.oidc, &document, refresh_token).await
+    }
+
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
+        let document = self.discover(auth_url).await?;
+        revocation::revoke(&self.oidc, &document, refresh_token).await
     }
 
     async fn exchange_for_repository(

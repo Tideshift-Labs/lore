@@ -15,8 +15,11 @@ use lore_base::error::Oversized;
 use lore_base::error::RepositoryNotFound;
 use lore_base::error::SlowDown;
 use lore_base::error::TokenNotFound;
+use lore_base::lore_debug;
+use lore_base::lore_warn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_credential::UserInfo;
+use lore_credential::token_store::RemovedRefreshToken;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::auth;
@@ -33,6 +36,7 @@ use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore::execution_context;
 use lore_revision::repository::RepositoryContext;
+use lore_transport::auth::AuthEndpoint;
 
 use crate::call::repository_call_no_store;
 use crate::call::repository_call_read;
@@ -247,9 +251,16 @@ pub struct LoreAuthLoginWithTokenArgs {
     /// Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`); used
     /// directly when non-empty, required when no remote URL is available
     pub auth_url: LoreString,
+    /// Client ID of a confidential client registered with the auth service. When
+    /// non-empty, logs in as that client with `client_secret`, and `token` and
+    /// `token_type` must be empty
+    pub client_id: LoreString,
+    /// Secret of the client `client_id` names
+    pub client_secret: LoreString,
 }
 
-/// Authenticates against a remote URL using a provided token.
+/// Authenticates against a remote URL using a provided token, or as a registered client
+/// with its ID and secret.
 ///
 /// # Events
 ///
@@ -290,18 +301,27 @@ async fn login_with_token_local(
 
     let execution = setup_execution(globals, callback);
 
-    let auth_url: Option<String> = args.auth_url.into();
+    let auth_url: Option<String> = args.auth_url.clone().into();
 
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                login_with_token_impl(
-                    remote_url.as_str(),
-                    args.token.as_str(),
-                    args.token_type.as_str(),
-                    auth_url.as_deref(),
-                )
-                .await
+                if args.client_id.is_empty() {
+                    login_with_token_impl(
+                        remote_url.as_str(),
+                        args.token.as_str(),
+                        args.token_type.as_str(),
+                        auth_url.as_deref(),
+                    )
+                    .await
+                } else {
+                    login_with_client_credentials_impl(
+                        remote_url.as_str(),
+                        &args,
+                        auth_url.as_deref(),
+                    )
+                    .await
+                }
             }
             .await;
             execution_context().dispatcher.complete_result(result).await
@@ -324,6 +344,27 @@ async fn login_with_token_impl(
         }
         Err(err) => Err(err),
     }
+}
+
+async fn login_with_client_credentials_impl(
+    remote_url: &str,
+    args: &LoreAuthLoginWithTokenArgs,
+    auth_url: Option<&str>,
+) -> Result<(), LoginError> {
+    if !args.token.is_empty() || !args.token_type.is_empty() {
+        return Err(LoginError::internal(
+            "Login takes either a token or client credentials, not both",
+        ));
+    }
+    let user_info = lore_revision::auth::login::with_client_credentials_boxed(
+        remote_url,
+        args.client_id.as_str(),
+        args.client_secret.as_str(),
+        auth_url,
+    )
+    .await?;
+    send_user_info(user_info);
+    Ok(())
 }
 
 /// Arguments for authenticating interactively via browser-based login flow.
@@ -502,6 +543,9 @@ pub struct LoreAuthLogoutArgs {
 /// - `user_id` set, `resource` set: removes only the specific authorization
 ///   token for that resource.
 ///
+/// Each login removed with its refresh token is then revoked if the auth service offers
+/// revocation. A failed revocation fails the call after the tokens are removed.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -535,21 +579,25 @@ async fn logout_local(
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                let auth_url =
-                    resolve_auth_endpoint(args.auth_url.as_str(), &repository_path, &identity)
-                        .await?;
+                let (auth_url, endpoint) =
+                    logout_endpoint(args.auth_url.as_str(), &repository_path, &identity).await?;
+                let auth_url = auth_url.as_str();
 
-                if args.user_id.is_empty() {
-                    lore_credential::token_store::remove_all_tokens_for_auth_url(&auth_url)
+                if execution_context().globals().dry_run() {
+                    return Ok(());
+                }
+
+                let removed = if args.user_id.is_empty() {
+                    lore_credential::token_store::remove_all_tokens_for_auth_url(auth_url)
                         .await
-                        .forward::<AuthStoreError>("accessing token store")?;
+                        .forward::<AuthStoreError>("accessing token store")?
                 } else if args.resource.is_empty() {
                     lore_credential::token_store::remove_user_tokens_for_auth_url(
-                        &auth_url,
+                        auth_url,
                         args.user_id.as_str(),
                     )
                     .await
-                    .forward::<AuthStoreError>("accessing token store")?;
+                    .forward::<AuthStoreError>("accessing token store")?
                 } else {
                     let store_key = format!("{}/{}", auth_url, args.resource.as_str());
                     lore_credential::token_store::remove_user_token(
@@ -558,8 +606,10 @@ async fn logout_local(
                     )
                     .await
                     .forward::<AuthStoreError>("accessing token store")?;
-                }
-                Ok::<(), AuthStoreError>(())
+                    Vec::new()
+                };
+                let correlation_id = execution_context().globals().correlation_id.to_string();
+                revoke_refresh_tokens(auth_url, endpoint.as_ref(), removed, &correlation_id).await
             }
             .await;
             execution_context().dispatcher.complete_result(result).await
@@ -607,9 +657,11 @@ async fn clear_local(
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                lore_credential::token_store::reset_tokens()
-                    .await
-                    .forward::<AuthStoreError>("accessing token store")?;
+                if !execution_context().globals().dry_run() {
+                    lore_credential::token_store::reset_tokens()
+                        .await
+                        .forward::<AuthStoreError>("accessing token store")?;
+                }
                 Ok::<(), AuthStoreError>(())
             }
             .await;
@@ -693,7 +745,28 @@ async fn resolve_auth_endpoint(
     if !auth_endpoint.is_empty() {
         return Ok(auth_endpoint.to_string());
     }
+    Ok(remote_auth_endpoint(repository_path, identity).await?.url)
+}
 
+/// The auth URL whose tokens a logout removes, `auth_url` when given, and the endpoint to revoke
+/// them at. An explicit OIDC endpoint has none: the scheme registry does not serve it, since its
+/// grants need the client the server advertises.
+async fn logout_endpoint(
+    auth_url: &str,
+    repository_path: &str,
+    identity: &str,
+) -> Result<(String, Option<AuthEndpoint>), AuthStoreError> {
+    if auth_url.is_empty() {
+        let endpoint = remote_auth_endpoint(repository_path, identity).await?;
+        return Ok((endpoint.url.clone(), Some(endpoint)));
+    }
+    Ok((auth_url.to_string(), AuthEndpoint::resolve(auth_url).ok()))
+}
+
+async fn remote_auth_endpoint(
+    repository_path: &str,
+    identity: &str,
+) -> Result<AuthEndpoint, AuthStoreError> {
     // Forward the connect error instead of discarding it, so the real failure
     // reaches the caller rather than collapsing into the generic error below.
     match read_repository_remote(repository_path) {
@@ -706,9 +779,9 @@ async fn resolve_auth_endpoint(
             .await
             .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
 
-            let auth_url = connection.auth_url().to_string();
-            if !auth_url.is_empty() {
-                return Ok(auth_url);
+            let endpoint = connection.auth_endpoint();
+            if !endpoint.url.is_empty() {
+                return Ok(endpoint.clone());
             }
         }
         // The repository exists and simply has no remote. Nothing is unreachable and
@@ -728,6 +801,57 @@ async fn resolve_auth_endpoint(
         operation: "authentication requires a configured auth endpoint".to_string(),
     }
     .into())
+}
+
+/// Revokes each of `removed` at `endpoint`, which serves `auth_url`. They are removed from the
+/// store already, so every one is tried, and the first failure is returned afterwards.
+///
+/// Only refresh tokens are revoked. They come from the public client's own grants, so the
+/// client revoking them is the one they were issued to (RFC 7009 §2.1). An access token may
+/// belong to a confidential client whose secret is not stored, and it expires on its own.
+#[lore_macro::test_pub]
+async fn revoke_refresh_tokens(
+    auth_url: &str,
+    endpoint: Option<&AuthEndpoint>,
+    removed: Vec<RemovedRefreshToken>,
+    correlation_id: &str,
+) -> Result<(), AuthStoreError> {
+    let Some(endpoint) = endpoint else {
+        for removed in removed {
+            lore_warn!(
+                "Removed the login of {} at {auth_url} without revoking it: revoking needs \
+                 the OIDC client ID, which only the repository's remote provides",
+                removed.user_id
+            );
+        }
+        return Ok(());
+    };
+    let mut failure = None;
+    for removed in removed {
+        let revoked = endpoint
+            .auth
+            .revoke_refresh_token(&endpoint.url, &removed.refresh_token, correlation_id)
+            .await;
+        match revoked {
+            Ok(()) => lore_debug!("Revoked the login of {} at {endpoint}", removed.user_id),
+            Err(err) if err.is_not_supported() => lore_debug!(
+                "The login of {} is removed from this machine only: {err}",
+                removed.user_id
+            ),
+            Err(err) => {
+                lore_warn!(
+                    "The login of {} is removed from this machine, but was not revoked at \
+                     {endpoint}: {err}",
+                    removed.user_id
+                );
+                failure.get_or_insert(err);
+            }
+        }
+    }
+    match failure {
+        Some(err) => Err(err).forward("revoking the login at the identity provider"),
+        None => Ok(()),
+    }
 }
 
 async fn local_user_info_impl(

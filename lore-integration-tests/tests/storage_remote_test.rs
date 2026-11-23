@@ -8775,6 +8775,10 @@ mod storage_remote_tests {
         status: i32,
         /// Every error message the clone reported, joined.
         errors: String,
+        /// The error code of the Complete event, `0` when none was reported.
+        error_code: i32,
+        /// The context of every trace location on the Complete event's error.
+        trace_contexts: Vec<String>,
         /// Remote gets that named the delta block.
         gets: usize,
         /// Remote queries that named the delta block.
@@ -8862,6 +8866,23 @@ mod storage_remote_tests {
         std::fs::write(
             source_path.join("held.txt"),
             "a file whose commit has a delta",
+        )?;
+        // The delta block's hash comes from the commit's tree. Read flights are shared
+        // process-wide, so a block with the same hash in two concurrently running tests lets one
+        // test's fetch join the other's successful one. A file named and filled uniquely per run
+        // gives each run its own delta block.
+        static RUN_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            RUN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        );
+        std::fs::write(
+            source_path.join(format!("unique-{unique}.txt")),
+            format!("content unique to this run: {unique}"),
         )?;
         let status = file::stage(
             globals(&source_path),
@@ -8954,19 +8975,34 @@ mod storage_remote_tests {
         }
         *fault.target.lock().unwrap() = Some(delta_address);
 
+        /// The Complete event's error code and trace-location contexts.
+        type CompleteError = (i32, Vec<String>);
+        let complete_error: Arc<Mutex<Option<CompleteError>>> = Arc::default();
         let (sink, callback) = {
             let errors: Arc<Mutex<Vec<String>>> = Arc::default();
             let errors_for_callback = errors.clone();
+            let complete_for_callback = complete_error.clone();
             let callback: LoreEventCallback =
                 Some(Box::new(move |event: &LoreEvent| match event {
                     LoreEvent::Error(data) => errors_for_callback
                         .lock()
                         .unwrap()
                         .push(data.error_inner.to_string()),
-                    LoreEvent::Complete(data) => errors_for_callback
-                        .lock()
-                        .unwrap()
-                        .push(data.error.message.to_string()),
+                    LoreEvent::Complete(data) => {
+                        errors_for_callback
+                            .lock()
+                            .unwrap()
+                            .push(data.error.message.to_string());
+                        *complete_for_callback.lock().unwrap() = Some((
+                            data.error.error_code,
+                            data.error
+                                .trace_locations
+                                .as_slice()
+                                .iter()
+                                .map(|location| location.context.to_string())
+                                .collect(),
+                        ));
+                    }
                     _ => {}
                 }));
             (errors, callback)
@@ -8982,6 +9018,11 @@ mod storage_remote_tests {
         )
         .await;
         let errors = sink.lock().unwrap().join(" | ");
+        let (error_code, trace_contexts) = complete_error
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap_or((0, Vec::new()));
 
         // The sync runs at the revision the clone's anchor names, as a user's retry would.
         let sync_status = if sync_after {
@@ -9042,6 +9083,8 @@ mod storage_remote_tests {
         Ok(CloneOutcome {
             status,
             errors,
+            error_code,
+            trace_contexts,
             gets: fault.gets.load(std::sync::atomic::Ordering::SeqCst),
             queries: fault.queries.load(std::sync::atomic::Ordering::SeqCst),
             delta_offline,
@@ -9103,11 +9146,21 @@ mod storage_remote_tests {
             "clone must fail: {:?}",
             outcome.delta_offline
         );
+        // The typed failure is the error; the fork's second cache pass adds its context to the
+        // trace.
+        assert_eq!(
+            outcome.error_code,
+            lore_base::error::AddressNotFound::FFI_CODE,
+            "the failure must be the missing delta block, got: {}",
+            outcome.errors
+        );
         assert!(
             outcome
-                .errors
-                .contains("Failed to cache the cloned state's fragments"),
-            "the failure must name the cache failure, got: {}",
+                .trace_contexts
+                .iter()
+                .any(|context| context == "Failed to cache the cloned state's fragments"),
+            "the failure must name the cache failure, got: {:?} / {}",
+            outcome.trace_contexts,
             outcome.errors
         );
         // A failed cache leaves the clone as a failed file walk does: workspace kept, anchor at

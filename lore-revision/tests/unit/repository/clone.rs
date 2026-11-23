@@ -17,6 +17,7 @@ use lore_revision::filter::FilterMode;
 use lore_revision::fs::filesystem_provider::FilesystemProvider;
 use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
 use lore_revision::fs::os::OsFilesystem;
+use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::node::BLOCK_NODE_COUNT;
 use lore_revision::node::Node;
 use lore_revision::repository::RepositoryContext;
@@ -28,6 +29,7 @@ use lore_revision::util::path::RelativePath;
 use zerocopy::FromZeros;
 
 use crate::fs::filesystem_provider::setup_test_execution;
+use crate::fs::filesystem_provider::test_execution_with;
 use crate::repository::test_helpers::file_node;
 use crate::repository::test_helpers::working_tree_repository;
 
@@ -360,6 +362,104 @@ async fn holds_entries_besides_dot_dir_mixed_case_control_dirs_hold_nothing() {
         .expect("listing a folder with mixed-case control dirs");
 
     assert!(!holds, "control dirs count in any letter case");
+}
+
+/// FORK-LOCAL (Tideshift): `--dry-run` with `--force` over an existing working copy is refused
+/// before the remote is contacted, because replacing the working copy (even by setting it aside)
+/// would edit the tree. The existing control directory stays exactly in place and nothing is moved
+/// aside next to the working copy. The unreachable URL proves the refusal precedes any remote work.
+#[tokio::test]
+async fn a_dry_run_force_clone_over_an_existing_working_copy_is_refused_and_leaves_it_in_place() {
+    let parent = TempDir::new("lore-clone-dry-run-force-");
+    let path = parent.path().join("working-copy");
+    let dot_dir = path.join(".lore");
+    std::fs::create_dir_all(&dot_dir).expect("creating the existing control dir");
+    std::fs::write(dot_dir.join("marker"), b"keep").expect("writing inside the control dir");
+    std::fs::write(path.join("user.txt"), b"mine").expect("writing a user file");
+
+    let execution = test_execution_with(LoreGlobalArgs {
+        force: 1,
+        dry_run: 1,
+        ..Default::default()
+    });
+    let result = LORE_CONTEXT
+        .scope(execution, async {
+            clone(
+                "lore://127.0.0.1:1/never-contacted",
+                "",
+                &path,
+                None,
+                None,
+                None,
+                CloneOptions::default(),
+            )
+            .await
+        })
+        .await;
+
+    let error = result.expect_err("a dry run may not replace an existing working copy");
+    assert!(
+        matches!(error, CloneError::InvalidArguments(_)),
+        "expected InvalidArguments, got {error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("--dry-run with --force would replace the repository"),
+        "unexpected message: {error}"
+    );
+    assert_eq!(
+        std::fs::read(dot_dir.join("marker")).expect("the control dir is still in place"),
+        b"keep"
+    );
+    assert_eq!(
+        std::fs::read(path.join("user.txt")).expect("the user file is untouched"),
+        b"mine"
+    );
+    let siblings: Vec<_> = std::fs::read_dir(parent.path())
+        .expect("listing the parent")
+        .map(|entry| entry.expect("entry").file_name())
+        .collect();
+    assert_eq!(
+        siblings,
+        vec![std::ffi::OsString::from("working-copy")],
+        "nothing may be set aside next to the working copy"
+    );
+}
+
+/// Without `--force`, the same existing working copy is refused as already existing (the dry-run
+/// refusal above is specific to `--force`).
+#[tokio::test]
+async fn a_dry_run_clone_without_force_over_an_existing_working_copy_is_already_exists() {
+    let parent = TempDir::new("lore-clone-dry-run-noforce-");
+    let path = parent.path().join("working-copy");
+    std::fs::create_dir_all(path.join(".lore")).expect("creating the existing control dir");
+
+    let execution = test_execution_with(LoreGlobalArgs {
+        dry_run: 1,
+        ..Default::default()
+    });
+    let error = LORE_CONTEXT
+        .scope(execution, async {
+            clone(
+                "lore://127.0.0.1:1/never-contacted",
+                "",
+                &path,
+                None,
+                None,
+                None,
+                CloneOptions::default(),
+            )
+            .await
+        })
+        .await
+        .expect_err("an existing working copy is not cloned over without --force");
+
+    assert!(
+        matches!(error, CloneError::RepositoryAlreadyExists(_)),
+        "expected RepositoryAlreadyExists, got {error:?}"
+    );
+    assert!(path.join(".lore").is_dir());
 }
 
 /// A node with neither the file nor the link flag, which makes it a directory, and no children. A

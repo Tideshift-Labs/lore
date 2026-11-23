@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! An `Authentication` that serves repository exchanges from a closure, so a test drives the
+//! An `Authentication` that serves exchanges from a closure, so a test drives the
 //! authorization exchange without a network, and tokens for it to trade.
 
 use std::sync::Arc;
@@ -23,14 +23,62 @@ pub(crate) const AUTHN_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3M
 pub(crate) const AUTHZ_ONE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJhdXRoeiI6Im9uZSJ9.signature";
 pub(crate) const AUTHZ_TWO: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UiLCJhdXRoeiI6InR3byJ9.signature";
 
+/// An HTTP/2 gRPC server that answers every request with a trailers-only response carrying
+/// `code`, and records the bearer each request presented. Returns its url and that record.
+pub(crate) async fn status_answering_h2_server(
+    code: tonic::Code,
+) -> (String, Arc<parking_lot::Mutex<Vec<String>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let bearers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Arc::clone(&bearers);
+    #[allow(clippy::disallowed_methods)] // Test-local server task.
+    tokio::spawn(async move {
+        while let Ok((socket, _)) = listener.accept().await {
+            let seen = Arc::clone(&seen);
+            #[allow(clippy::disallowed_methods)] // Test-local connection task.
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(socket).await else {
+                    return;
+                };
+                while let Some(Ok((request, mut respond))) = conn.accept().await {
+                    let bearer = request
+                        .headers()
+                        .get("authorization")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .trim_start_matches("Bearer ")
+                        .to_owned();
+                    seen.lock().push(bearer);
+                    let response = http::Response::builder()
+                        .status(http::StatusCode::OK)
+                        .header("content-type", "application/grpc")
+                        .header("grpc-status", (code as i32).to_string())
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(response, true);
+                }
+            });
+        }
+    });
+    (url, bearers)
+}
+
 /// Names the authorization for the authentication token traded in and the number of exchanges
 /// served before it.
 type Authorize = Box<dyn Fn(&str, usize) -> &'static str + Send + Sync>;
 
-/// Hands out the authorization `authorize` names, and counts the exchanges.
+/// Answers a refresh grant for the refresh token presented.
+type Refresh = Box<dyn Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync>;
+
+/// Hands out the authorization `authorize` names, and counts the exchanges. Refreshes are
+/// answered by `refresh`, and refused without one.
 pub(crate) struct StubAuthentication {
     exchanges: AtomicUsize,
     authorize: Authorize,
+    refresh: Option<Refresh>,
+    refresh_delay: std::time::Duration,
+    presented: parking_lot::Mutex<Vec<String>>,
 }
 
 impl StubAuthentication {
@@ -40,12 +88,48 @@ impl StubAuthentication {
         Arc::new(Self {
             exchanges: AtomicUsize::new(0),
             authorize: Box::new(authorize),
+            refresh: None,
+            refresh_delay: std::time::Duration::ZERO,
+            presented: parking_lot::Mutex::default(),
+        })
+    }
+
+    /// A stub that answers refresh grants with `refresh`, and trades [`AUTHN_ONE`] for
+    /// [`AUTHZ_ONE`] and any other token for [`AUTHZ_TWO`].
+    pub(crate) fn refreshing(
+        refresh: impl Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Self::refreshing_after(std::time::Duration::ZERO, refresh)
+    }
+
+    /// [`StubAuthentication::refreshing`], answering each refresh after `delay`.
+    pub(crate) fn refreshing_after(
+        delay: std::time::Duration,
+        refresh: impl Fn(&str) -> Result<AuthenticationToken, ProtocolError> + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            exchanges: AtomicUsize::new(0),
+            authorize: Box::new(|authn_token, _| {
+                if authn_token == AUTHN_ONE {
+                    AUTHZ_ONE
+                } else {
+                    AUTHZ_TWO
+                }
+            }),
+            refresh: Some(Box::new(refresh)),
+            refresh_delay: delay,
+            presented: parking_lot::Mutex::default(),
         })
     }
 
     /// Repository exchanges served so far.
     pub(crate) fn exchanges(&self) -> usize {
         self.exchanges.load(Ordering::Acquire)
+    }
+
+    /// The refresh tokens presented so far, in order.
+    pub(crate) fn presented(&self) -> Vec<String> {
+        self.presented.lock().clone()
     }
 }
 
@@ -101,10 +185,11 @@ impl Authentication for StubAuthentication {
         ))
     }
 
-    async fn refresh_authentication(
+    async fn authenticate_client(
         &self,
         _auth_url: &str,
-        _refresh_token: &str,
+        _client_id: &str,
+        _client_secret: &str,
         _correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError> {
         Err(ProtocolError::internal(
@@ -112,15 +197,46 @@ impl Authentication for StubAuthentication {
         ))
     }
 
-    async fn exchange_for_custom_resource(
+    async fn refresh_authentication(
         &self,
         _auth_url: &str,
-        _authn_token: &str,
-        _resource_id: &str,
+        refresh_token: &str,
         _correlation_id: &str,
-    ) -> Result<AuthorizationToken, ProtocolError> {
+    ) -> Result<AuthenticationToken, ProtocolError> {
+        self.presented.lock().push(refresh_token.to_owned());
+        tokio::time::sleep(self.refresh_delay).await;
+        match &self.refresh {
+            Some(refresh) => refresh(refresh_token),
+            None => Err(ProtocolError::internal(
+                "the stub only serves authorization exchanges",
+            )),
+        }
+    }
+
+    async fn revoke_refresh_token(
+        &self,
+        _auth_url: &str,
+        _refresh_token: &str,
+        _correlation_id: &str,
+    ) -> Result<(), ProtocolError> {
         Err(ProtocolError::internal(
-            "the stub only serves repository exchanges",
+            "the stub only serves authorization exchanges",
         ))
+    }
+
+    async fn exchange_for_custom_resource(
+        &self,
+        auth_url: &str,
+        authn_token: &str,
+        _resource_id: &str,
+        correlation_id: &str,
+    ) -> Result<AuthorizationToken, ProtocolError> {
+        self.exchange_for_repository(
+            auth_url,
+            authn_token,
+            RepositoryId::default(),
+            correlation_id,
+        )
+        .await
     }
 }

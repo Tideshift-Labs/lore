@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use crossbeam::queue::SegQueue;
+use crossbeam_queue::SegQueue;
 use futures::FutureExt;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -1546,7 +1546,7 @@ async fn create_shared_untracked_ancestors(
         &ancestors,
         |ancestor, nodes| {
             let (start, below) = match fan_out::longest_ancestor(ancestor, nodes) {
-                Some((prefix, node)) => (node, &ancestor[prefix.len() + 1..]),
+                Some((prefix, node)) => (*node, &ancestor[prefix.len() + 1..]),
                 None => (ROOT_NODE, ancestor),
             };
             state::os_diff::ensure_scan_dir_chain(

@@ -2429,6 +2429,8 @@ async fn both_repository_delete_handlers_refuse_internal_admission_before_lookup
                             },
                         ),
                         &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
+                        &(Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+                            as Arc<dyn lore_server::authnz::repository_authorizer::RepositoryAuthorizer>),
                         immutable,
                         mutable,
                         &DeleteTestInstruments,
@@ -2442,6 +2444,8 @@ async fn both_repository_delete_handlers_refuse_internal_admission_before_lookup
                             id: bytes::Bytes::from_static(&[8; 16]),
                         }),
                         &lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered,
+                        &(Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+                            as Arc<dyn lore_server::authnz::repository_authorizer::RepositoryAuthorizer>),
                         immutable,
                         mutable,
                         &DeleteTestInstruments,
@@ -2642,5 +2646,165 @@ async fn branch_delete_preflight_loads_metadata_and_returns_only_the_committed_r
                 );
             })
             .await;
+    }
+}
+
+/// Fork ruling D-1 (CR-029): upstream's creator-or-owner/admin check runs
+/// only for an ungoverned delete. An admitted governed delete is authorized by
+/// its domain admission, so the same non-creator, non-owner caller proceeds.
+///
+/// Drives the real handler end to end. `governed` admits through
+/// `admit_at_entry` with the exact control-plane carriage (carried admission,
+/// which `GovernedRepositoryDelete::prepare` accepts and the verifier never
+/// sees). Returns the handler result and the `RepositoryDeleteInput` the
+/// scripted coordinator captured (`Some` only when the commit was reached).
+async fn run_non_creator_delete(
+    v1: bool,
+    governed: bool,
+) -> (Result<(), Status>, Option<RepositoryDeleteInput>) {
+    let (immutable, mutable, execution) = crate::store::test_support::test_store_create()
+        .await
+        .unwrap();
+    LORE_CONTEXT
+        .scope(execution, async move {
+            let id = RepositoryId::from([0x55u8; 16]);
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable.clone(),
+                mutable.clone(),
+                id,
+            ));
+            let metadata_hash = repository::metadata_store(
+                repository.clone(),
+                repository::RepositoryMetadata {
+                    name: "the-repository".to_string(),
+                    creator: "alice".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            repository::metadata_store_hash(repository.clone(), metadata_hash)
+                .await
+                .unwrap();
+            repository::store_name_to_id(repository, "the-repository", id)
+                .await
+                .unwrap();
+
+            let captured = Arc::new(Mutex::new(None));
+            let store = Arc::new(RepositoryCreateScriptedStore {
+                result: MutationResult {
+                    outcome: DomainOutcome::Applied,
+                    repository_generation: Some(2),
+                    branch_generation: None,
+                    observed_pointer: None,
+                },
+                snapshot: Some(RepositorySnapshot {
+                    repository_id: vec![0x55; 16],
+                    live: true,
+                    generation: 1,
+                    name: "the-repository".to_string(),
+                    metadata_hash: metadata_hash.as_ref().to_vec(),
+                    default_branch_id: vec![0; 16],
+                }),
+                captured_input: Arc::new(Mutex::new(None)),
+                captured_delete: Arc::clone(&captured),
+                captured_branch_delete: Arc::new(Mutex::new(None)),
+                delete_branch_snapshot: None,
+            });
+            let domain = Arc::new(DomainContext::new(store, true));
+            let domain_context = governed.then_some(&domain);
+
+            // The identical principal in both arms: a service account with no
+            // owner/admin group and not the creator, so only governed
+            // admission can let it through.
+            let token = || {
+                let mut request_token = token("lorehub-control-plane", Some(true));
+                request_token.identity = Some("lorehub-control-plane".to_string());
+                request_token
+            };
+            let authorizer: Arc<
+                dyn lore_server::authnz::repository_authorizer::RepositoryAuthorizer,
+            > = Arc::new(
+                lore_server::authnz::global_grants_authorizer::GlobalGrantsAuthorizer::new(Some(
+                    "groups".to_string(),
+                )),
+            );
+            let registry =
+                lore_server::authnz::repository_registry::RepositoryRegistry::Unregistered;
+            let id_bytes = bytes::Bytes::copy_from_slice(&[0x55u8; 16]);
+
+            let result = if v1 {
+                let mut request =
+                    Request::new(lore_proto::lore::repository::v1::RepositoryDeleteRequest {
+                        id: id_bytes,
+                    });
+                if governed {
+                    *request.metadata_mut() = carriage(true);
+                }
+                request.extensions_mut().insert(token());
+                request.extensions_mut().insert(
+                    lore_server::authnz::repository_authorizer::RawToken("raw.jwt".to_string()),
+                );
+                lore_server::grpc::repository::v1::repository_delete::handler(
+                    request,
+                    &registry,
+                    &authorizer,
+                    immutable,
+                    mutable,
+                    &DeleteTestInstruments,
+                    domain_context,
+                )
+                .await
+                .map(|_| ())
+            } else {
+                let mut request =
+                    Request::new(lore_proto::RepositoryDeleteRequest { id: id_bytes });
+                if governed {
+                    *request.metadata_mut() = carriage(true);
+                }
+                request.extensions_mut().insert(token());
+                request.extensions_mut().insert(
+                    lore_server::authnz::repository_authorizer::RawToken("raw.jwt".to_string()),
+                );
+                lore_server::grpc::handlers::repository_delete::handler(
+                    request,
+                    &registry,
+                    &authorizer,
+                    immutable,
+                    mutable,
+                    &DeleteTestInstruments,
+                    domain_context,
+                )
+                .await
+                .map(|_| ())
+            };
+            let input = captured.lock().unwrap().take();
+            (result, input)
+        })
+        .await
+}
+
+#[tokio::test]
+async fn admitted_governed_delete_skips_the_owner_check_on_both_handlers() {
+    for v1 in [false, true] {
+        let (result, input) = run_non_creator_delete(v1, true).await;
+        result.unwrap_or_else(|status| {
+            panic!("v1={v1}: admitted governed delete must proceed, got {status:?}")
+        });
+        assert!(
+            input.is_some(),
+            "v1={v1}: the governed commit must have been reached"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ungoverned_delete_by_the_same_non_creator_is_refused_on_both_handlers() {
+    for v1 in [false, true] {
+        let (result, input) = run_non_creator_delete(v1, false).await;
+        let status = result.expect_err("ungoverned non-owner non-creator delete must be refused");
+        assert_eq!(status.code(), Code::PermissionDenied, "v1={v1}");
+        assert!(status.message().contains("Not repository owner"), "v1={v1}");
+        assert!(input.is_none(), "v1={v1}: no commit on a refused delete");
     }
 }

@@ -16,7 +16,7 @@ bitcode = { workspace = true }
 blake3 = { workspace = true }
 bitflags = { workspace = true }
 bytes = { workspace = true }
-crossbeam = { workspace = true }
+crossbeam-queue = { workspace = true }
 dashmap = { workspace = true }
 diffy = { workspace = true }
 fastcdc = { workspace = true }
@@ -27,7 +27,6 @@ hex = { workspace = true }
 http = { workspace = true }
 infer = { workspace = true }
 jsonwebtoken = { workspace = true }
-keyring = { workspace = true }
 libc = { workspace = true }
 open = "5.3.2"
 opentelemetry = { workspace = true }
@@ -79,6 +78,7 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 # The non-self-describing format an event crosses the service boundary in.
 bitcode = { workspace = true }
 ctor = { workspace = true }
+keyring-core = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
 # `test_seams` for the fork's `live_fixture` tests in tests/unit (WP-120).
 lore-revision = { workspace = true, features = ["test-util", "test_seams"] }
