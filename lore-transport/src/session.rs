@@ -578,8 +578,13 @@ impl StorageSession {
     /// ([`crate::error::is_session_expired`]) is the second proof that allows that rebind. It is
     /// sent before any handler runs, so it proves non-dispatch without any generation change.
     ///
+    /// FORK-LOCAL (Tideshift, CR-026 addendum): [`crate::error::ReadResendAllowed`] is the third
+    /// proof. It says a dispatched `ReadRetryable` command lost its answer to the replaced
+    /// connection, so asking again is safe. It needs the same generation change as the first.
+    /// Every pass runs on the one session the operation started on, a pooled session included.
+    ///
     /// `write` says whether the operation mutates; it only decides what a managed caller on a
-    /// foreign partition gets (see [`binding`](Self::binding)).
+    /// foreign partition gets (see [`scoped_binding`](Self::scoped_binding)).
     async fn attempt<T, Fut>(
         &self,
         write: bool,
@@ -589,12 +594,18 @@ impl StorageSession {
         Fut: std::future::Future<Output = Result<T, ProtocolError>>,
     {
         let mut attempts_left = ATTEMPT_BUDGET;
+        // FORK-LOCAL (Tideshift, CR-026 addendum): the session this operation runs on, taken once.
+        // A pooled session takes its turn here and nowhere else, so a retry rebinds the member
+        // whose connection was replaced, rather than the next member on another connection that
+        // may be just as dead and would spend the last attempt finding out.
+        let member = self.member_binding().await?;
         loop {
             attempts_left -= 1;
             // Resolves the session, and starts a replacement first if the connection has moved
-            // on since this one was issued. Chosen per call: the caller's managed scope can
-            // differ from one operation on this session to the next.
-            let binding = self.binding(write).await?;
+            // on since this one was issued. The declared binding is chosen per call from the
+            // member: the caller's managed scope can differ from one operation on this session to
+            // the next.
+            let binding = Self::scoped_binding(&member, write)?;
             let (session_id, sent_on) = binding.resolve().await?;
             let storage = binding.storage.clone();
 
@@ -631,19 +642,24 @@ impl StorageSession {
                 continue;
             }
 
+            // FORK-LOCAL (Tideshift, CR-026 addendum): a read the replaced connection lost the
+            // answer to (`ReadResendAllowed`) is the third proof, under the same guards. The
+            // transport raises it only for a `ReadRetryable` command, from its own replay class,
+            // so `write` plays no part here and no `MutableNoReplay` command is ever sent twice.
             let not_dispatched = crate::error::is_session_rebind_required(&error);
+            let read_resend = crate::error::is_read_resend_allowed(&error);
             let replaced = sent_on != storage.connection_generation();
             if attempts_left == 0
-                || !not_dispatched
+                || !(not_dispatched || read_resend)
                 || !replaced
                 || storage.connection_epoch() == GAVE_UP_EPOCH
             {
                 return Err(error);
             }
 
-            // Unbind the binding this attempt used, not whatever `binding` would pick now: with
-            // per-call selection a second lookup could name a different session. The next pass
-            // selects again, so a declared binding retries on a declared session.
+            // Unbind the binding this attempt used. The next pass selects the declared or the
+            // undeclared binding again from the same member, so a declared binding retries on a
+            // declared session over the same connection.
             binding.unbind();
         }
     }
@@ -726,7 +742,7 @@ impl StorageSession {
         }
     }
 
-    /// The binding this call runs on, driving the pending resolver on first call.
+    /// The binding this call runs on, chosen from the member `undeclared` binding.
     ///
     /// FORK-LOCAL (Tideshift, WP-124): chosen per call from the caller's managed scope, read here
     /// in the caller's own task. No scope gets the undeclared binding, always. A scope on a
@@ -735,13 +751,20 @@ impl StorageSession {
     /// declared for one parent is never used by another, and never outside a scope. A scope on
     /// another partition than its repository reads on the undeclared binding and is refused a
     /// write locally, as the gRPC managed path refuses one.
-    async fn binding(&self, write: bool) -> Result<Arc<SessionBinding>, ProtocolError> {
-        let undeclared = self.with_resolved(true, |r| r.binding.clone()).await?;
+    ///
+    /// FORK-LOCAL (Tideshift, CR-026 addendum): split in two. [`member_binding`] takes the pooled
+    /// turn and runs once per operation; this half chooses from that member on every pass.
+    ///
+    /// [`member_binding`]: Self::member_binding
+    fn scoped_binding(
+        undeclared: &Arc<SessionBinding>,
+        write: bool,
+    ) -> Result<Arc<SessionBinding>, ProtocolError> {
         let Some(context) = crate::caller_operation::current_caller_operation() else {
-            return Ok(undeclared);
+            return Ok(undeclared.clone());
         };
         if !undeclared.storage.declares_per_session() {
-            return Ok(undeclared);
+            return Ok(undeclared.clone());
         }
         if undeclared.partition != context.repository() {
             if write {
@@ -749,13 +772,21 @@ impl StorageSession {
                     "managed operation repository mismatch",
                 ));
             }
-            return Ok(undeclared);
+            return Ok(undeclared.clone());
         }
         Ok(context.declared_bindings().get_or_insert(
-            &undeclared,
+            undeclared,
             context.parent_id(),
             context.capabilities(),
         ))
+    }
+
+    /// FORK-LOCAL (Tideshift, CR-026 addendum): the undeclared binding of the session one
+    /// operation runs on, driving the pending resolver on first call. A pooled session takes its
+    /// turn here, so call it once per operation: a retry that called it again would move to
+    /// another member of the pool.
+    async fn member_binding(&self) -> Result<Arc<SessionBinding>, ProtocolError> {
+        self.with_resolved(true, |r| r.binding.clone()).await
     }
 
     /// FORK-LOCAL (Tideshift, WP-124): refuse a managed `MutableStore` or `MutableCas` on a
@@ -766,7 +797,7 @@ impl StorageSession {
     /// both verbs through `caller_operation::dispatch` and is not refused. The storage client
     /// keeps the same refusal for a caller that bypasses this session.
     ///
-    /// A foreign partition is left to [`binding`](Self::binding), which refuses that write
+    /// A foreign partition is left to [`scoped_binding`](Self::scoped_binding), which refuses that write
     /// locally as a repository mismatch, also before any byte.
     async fn refuse_managed_mutable_key(&self) -> Result<(), ProtocolError> {
         let Some(context) = crate::caller_operation::current_caller_operation() else {

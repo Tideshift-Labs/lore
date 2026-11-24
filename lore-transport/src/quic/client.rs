@@ -853,6 +853,13 @@ pub enum SendWithReconnectError {
     /// resolve a replacement session first. See [`crate::session::StorageSession`].
     #[error("Connection replaced; session must be rebound before this command is sent again")]
     SessionRebindRequired,
+    /// FORK-LOCAL (Tideshift, CR-026 addendum): a session-bearing `ReadRetryable` command was
+    /// dispatched, its answer was lost, and the connection has since been replaced. The session
+    /// layer may rebind and send it once more. Never raised for a `MutableNoReplay` command.
+    #[error(
+        "Connection replaced after a read was sent; the read may be sent again on a new session"
+    )]
+    ReadResendAllowed,
     /// FORK-LOCAL (Tideshift, WP-124): in a managed scope, the connection was not replaced within
     /// the managed bound. Either the command's first send failed before dispatch
     /// (`dispatched: false`), or it is a replay-safe read whose answer was lost
@@ -1382,11 +1389,22 @@ where
     // The connection is now a new epoch with its own server-side session namespace. A captured
     // session id from the old one is meaningless to it and must never go on the wire, so the
     // session-aware layer resolves a replacement before anything is sent.
+    //
+    // FORK-LOCAL (Tideshift, CR-026 addendum): a dispatched read whose answer the dead connection
+    // lost is handed back as `ReadResendAllowed`, so the session layer can rebind and ask once
+    // more. Keyed on the transport replay class of the command, never on the session layer's own
+    // `write` flag. A dispatched `MutableNoReplay` command cannot reach this: the guard at the top
+    // of this function returned it first. `Authorize` is excluded by name: with a session id it is
+    // a session stop, which changes server session state. A peer-reported unknown outcome is
+    // excluded too, whatever the class.
     if session_id != 0 {
         return Err(
             if first_failure.dispatched == DispatchState::NotDispatched {
                 service_client
                     .map_send_error(request_type, SendWithReconnectError::SessionRebindRequired)
+            } else if read_resend_allowed(service_client, request_type, &first_failure) {
+                service_client
+                    .map_send_error(request_type, SendWithReconnectError::ReadResendAllowed)
             } else {
                 service_client.map_send_error(
                     request_type,
@@ -1441,6 +1459,28 @@ where
             )),
         }
     }
+}
+
+/// FORK-LOCAL (Tideshift, CR-026 addendum): whether a session-bearing command that failed with
+/// `failure`, on a connection that has since been replaced, may be sent once more on a new
+/// session. Only a `ReadRetryable` command whose answer was lost in transit qualifies.
+///
+/// The caller has already established that the command carries a session and that the reconnect
+/// succeeded; this decides the rest. Synchronous, like [`classify`], so it holds nothing across
+/// an await.
+#[lore_macro::test_pub]
+fn read_resend_allowed<ServiceClientType>(
+    service_client: &ServiceClientType,
+    request_type: ServiceClientType::RequestType,
+    failure: &SendFailure,
+) -> bool
+where
+    ServiceClientType: ServiceClient,
+{
+    service_client.replay_class(request_type) == ReplayClass::ReadRetryable
+        && failure.dispatched == DispatchState::DispatchedResponseLost
+        && !matches!(failure.error, QuicClientError::OutcomeUnknown)
+        && service_client.request_name(request_type) != "authorize"
 }
 
 /// The budget this module implements structurally rather than by counting. Both dispatches are

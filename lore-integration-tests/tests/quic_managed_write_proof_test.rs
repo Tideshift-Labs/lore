@@ -36,6 +36,8 @@ mod quic_managed_write_proof_tests {
     use std::sync::atomic::Ordering;
 
     use lore_base::types::Address;
+    use lore_base::types::Hash;
+    use lore_base::types::KeyType;
     use lore_revision::fragment;
     use lore_revision::lore::RepositoryId;
     use lore_transport::Connection;
@@ -59,8 +61,10 @@ mod quic_managed_write_proof_tests {
     use crate::quic_managed_write_support::connect;
     use crate::quic_managed_write_support::eventually;
     use crate::quic_managed_write_support::fresh_stores;
+    use crate::quic_managed_write_support::hold_first_answer_of;
     use crate::quic_managed_write_support::hold_first_put_answer;
     use crate::quic_managed_write_support::in_context;
+    use crate::quic_managed_write_support::lenient_cell;
     use crate::quic_managed_write_support::lose_answer_and_restart;
     use crate::quic_managed_write_support::managed;
     use crate::quic_managed_write_support::replace_server;
@@ -540,6 +544,163 @@ mod quic_managed_write_proof_tests {
             assert_eq!(next_journal.records.load(Ordering::SeqCst), 0);
             let (_, read) = session.get(&address_b).await?;
             assert_eq!(read, payload_b);
+            Ok(())
+        })
+        .await
+    }
+
+    /// A connection over `connections` storage connections, so its sessions are a pool with one
+    /// member per connection (`connect` above takes the globals' count, which is one here).
+    async fn connect_pooled(
+        port: u16,
+        partition: RepositoryId,
+        connections: usize,
+    ) -> Arc<Connection> {
+        lore_transport::connection::connect(
+            &format!("lore://127.0.0.1:{port}"),
+            "lost-answer-resend",
+            partition,
+            connections,
+            "",
+            "",
+            lore_transport::auth::AuthMode::Auto,
+        )
+        .await
+        .expect("connect to the cell over a pool of storage connections")
+    }
+
+    /// CR-026 addendum: a dispatched `MutableStore` whose answer is lost is NEVER resent, even over
+    /// a pool of connections with the connection replaced while the answer was owed.
+    ///
+    /// This is the case where a resend is reachable at all (`replaced` is true in
+    /// `StorageSession::attempt`), and where the pool would hand a retry to the next member. The
+    /// outcome is `MutableOutcome::Unknown`, the server dispatched the store exactly once, and
+    /// nothing at all reached the replacement: no `MutableStore`, no `Authorize`, no connection.
+    #[tokio::test]
+    async fn a_lost_pooled_mutable_store_answer_is_unknown_and_never_resent_when_the_connection_was_replaced()
+    -> TestResult {
+        in_context(async {
+            let hold = hold_first_answer_of(Command::MutableStore);
+            let mut cell = lenient_cell(Some(hold.clone())).await;
+            let partition = random::<RepositoryId>();
+            let connection = connect_pooled(cell.port, partition, 2).await;
+            let session = connection.session(partition, "lost-pooled-store").await?;
+            let key = random::<Hash>();
+            let value = random::<Hash>();
+            let server = cell.quic.take().expect("the cell's QUIC server");
+            let replace_connection = replace_connection_generation(&connection);
+
+            let (result, (replacement_server, replacement)) = tokio::join!(
+                tokio::time::timeout(
+                    WAIT,
+                    session.mutable_store_outcome(key, value, KeyType::Untyped),
+                ),
+                lose_answer_and_restart(&hold, server, cell.port, &cell.stores, replace_connection),
+            );
+            cell.quic = Some(replacement_server);
+            let outcome = result
+                .expect("a lost answer must end the store, not hang it")
+                .expect("a dispatched mutation with a lost answer is Ok(Unknown), not an error");
+            assert!(
+                outcome.is_unknown(),
+                "a lost MutableStore answer is an unknown outcome: {outcome:?}"
+            );
+
+            let wire = cell.probe.wire();
+            assert_eq!(
+                cell.probe.count_opcode(Command::MutableStore),
+                1,
+                "the store was dispatched exactly once: {wire:?}"
+            );
+            assert_eq!(
+                cell.stores
+                    .1
+                    .load(partition, key, KeyType::Untyped)
+                    .await
+                    .expect("the lost answer followed a real write"),
+                value
+            );
+
+            tokio::time::sleep(RESEND_SETTLE).await;
+            let replacement_wire = replacement.wire();
+            assert_eq!(
+                replacement.count_opcode(Command::MutableStore),
+                0,
+                "the lost store was resent to the replacement: {replacement_wire:?}"
+            );
+            assert_eq!(
+                replacement.count_opcode(Command::Authorize),
+                0,
+                "no session was rebound for the lost store: {replacement_wire:?}"
+            );
+            assert!(
+                replacement.maps.lock().expect("maps mutex").is_empty(),
+                "no connection was made to the replacement for the lost store: {replacement_wire:?}"
+            );
+            Ok(())
+        })
+        .await
+    }
+
+    /// The positive twin: a dispatched `Get` whose answer is lost, on the same pooled setup, is
+    /// resent exactly once and returns its payload.
+    ///
+    /// The original server saw the first `Get`; the replacement sees one `Get` on one
+    /// connection, started by one `Authorize`. The retry stays on the pool member that dispatched
+    /// the first `Get` (it does not move on to a sibling whose own connection is also dead), so only
+    /// ONE connection reaches the replacement.
+    #[tokio::test]
+    async fn a_lost_pooled_get_answer_is_resent_once_on_the_same_member_when_the_connection_was_replaced()
+    -> TestResult {
+        in_context(async {
+            let hold = hold_first_answer_of(Command::Get);
+            let mut cell = cell(Some(hold.clone()), None, None).await;
+            let partition = random::<RepositoryId>();
+            let (fragment, address, payload) = fragment::generate_random();
+            cell.stores
+                .0
+                .clone()
+                .put(partition, address, fragment, Some(payload.clone()), false)
+                .await
+                .expect("seed the fragment on the server");
+            let connection = connect_pooled(cell.port, partition, 2).await;
+            let session = connection.session(partition, "lost-pooled-get").await?;
+            let server = cell.quic.take().expect("the cell's QUIC server");
+            let replace_connection = replace_connection_generation(&connection);
+
+            let (result, (replacement_server, replacement)) = tokio::join!(
+                tokio::time::timeout(WAIT, session.get(&address)),
+                lose_answer_and_restart(&hold, server, cell.port, &cell.stores, replace_connection),
+            );
+            cell.quic = Some(replacement_server);
+            let (_, read) = result
+                .expect("a lost read answer must be resent, not hang")
+                .expect("the lost Get is resent once and returns its payload");
+            assert_eq!(read, payload);
+
+            let wire = cell.probe.wire();
+            assert_eq!(
+                cell.probe.count_opcode(Command::Get),
+                1,
+                "the original server dispatched the Get once: {wire:?}"
+            );
+            let replacement_wire = replacement.wire();
+            assert_eq!(
+                replacement.count_opcode(Command::Get),
+                1,
+                "the replacement serves exactly one resent Get: {replacement_wire:?}"
+            );
+            assert_eq!(
+                replacement.count_action(ACTION_START),
+                1,
+                "the resend rides one replacement session: {replacement_wire:?}"
+            );
+            assert_eq!(
+                replacement.maps.lock().expect("maps mutex").len(),
+                1,
+                "the retry stays on the member that dispatched, so one connection reaches the \
+                 replacement: {replacement_wire:?}"
+            );
             Ok(())
         })
         .await

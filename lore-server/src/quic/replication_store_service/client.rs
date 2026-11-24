@@ -488,6 +488,11 @@ impl ServiceClient for ReplicationStoreClient {
             SendWithReconnectError::SessionRebindRequired => {
                 ReplicationStoreClientError::ConnectionFailed
             }
+            // FORK-LOCAL (Tideshift, CR-026 addendum): raised only for a session-bearing command,
+            // and this client sends none, so it is the same lost connection as above.
+            SendWithReconnectError::ReadResendAllowed => {
+                ReplicationStoreClientError::ConnectionFailed
+            }
             // FORK-LOCAL (Tideshift, WP-124): produced only inside a managed caller scope, which a
             // server-side replication peer never runs in.
             SendWithReconnectError::ManagedReconnectExpired { .. } => {

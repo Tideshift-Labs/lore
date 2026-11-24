@@ -801,6 +801,13 @@ impl ServiceClient for StorageClient {
                 crate::error::SessionRebindRequired,
                 "storage command was not dispatched",
             ),
+            // FORK-LOCAL (Tideshift, CR-026 addendum): a dispatched read lost its answer to a
+            // replaced connection. Typed so the session layer, and only it, may rebind and send
+            // it once more.
+            SendWithReconnectError::ReadResendAllowed => ProtocolError::internal_with_context(
+                crate::error::ReadResendAllowed,
+                "storage read answer lost to a replaced connection",
+            ),
             // FORK-LOCAL (Tideshift, WP-124): not `Disconnected` and not the rebind proof, so no
             // reconnect layer and no session retry spends a second bound on it. When nothing was
             // sent its source is `RequestNotSent`, so a journaled caller settles the attempt not

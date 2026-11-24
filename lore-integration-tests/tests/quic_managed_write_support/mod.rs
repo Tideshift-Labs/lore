@@ -102,6 +102,9 @@ pub(crate) struct Wire {
 /// the answer, so the test can close the server out from under the answer.
 #[derive(Clone)]
 pub(crate) struct HoldFirstPutAnswer {
+    /// The opcode whose applied answer is withheld: `Put` for [`hold_first_put_answer`], any
+    /// other for [`hold_first_answer_of`].
+    pub(crate) opcode: u8,
     pub(crate) applied: Arc<tokio::sync::Notify>,
     pub(crate) grace: Duration,
     pub(crate) armed: Arc<AtomicBool>,
@@ -119,6 +122,10 @@ pub(crate) struct Probe {
     /// The first 48 bytes (the fragment address) of every `Put` parsed, in arrival order, so a
     /// test can tell a fragment dispatched twice from two fragments.
     pub(crate) put_keys: Arc<StdMutex<Vec<Vec<u8>>>>,
+    /// Serve with the server's default capability policy instead of the strict
+    /// `RequireOutcomeUnknownV1`: a cell that accepts an undeclared mutation (a `MutableStore`
+    /// outside any managed scope), which the strict cell refuses as an unsupported client.
+    pub(crate) lenient: bool,
 }
 
 impl Probe {
@@ -224,13 +231,14 @@ impl QuicService for ProbeService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
-        let is_put = matches!(
+        let held_opcode = self.hold.as_ref().map(|hold| hold.opcode);
+        let is_held = matches!(
             &request,
             ParsedStorageRequestV4::StorageCommand { opcode, .. }
-                if *opcode == Command::Put as u8
+                if Some(*opcode) == held_opcode
         );
         let result = self.inner.run_request_handler(context, request).await;
-        if is_put
+        if is_held
             && result.is_ok()
             && let Some(hold) = &self.hold
             && (hold.hold_all.load(Ordering::SeqCst) || hold.armed.swap(false, Ordering::SeqCst))
@@ -294,8 +302,14 @@ impl ProbeFactory {
                     mutable.clone(),
                     false,
                     Arc::new(UserAgentFilter::default()),
-                )
-                .with_caller_capability_policy(CallerCapabilityPolicy::RequireOutcomeUnknownV1);
+                );
+                let inner = if probe.lenient {
+                    inner
+                } else {
+                    inner.with_caller_capability_policy(
+                        CallerCapabilityPolicy::RequireOutcomeUnknownV1,
+                    )
+                };
                 probe
                     .maps
                     .lock()
@@ -486,10 +500,28 @@ pub(crate) async fn cell(
     grpc_tls: Option<TlsFiles>,
     quic_tls: Option<TlsFiles>,
 ) -> Cell {
+    cell_with_policy(hold, grpc_tls, quic_tls, false).await
+}
+
+/// A plain-TCP cell as [`cell`] builds it, but with the server's default (non-strict) capability
+/// policy, so an undeclared mutation (a pooled `MutableStore` outside a managed scope) is served.
+pub(crate) async fn lenient_cell(hold: Option<HoldFirstPutAnswer>) -> Cell {
+    cell_with_policy(hold, None, None, true).await
+}
+
+async fn cell_with_policy(
+    hold: Option<HoldFirstPutAnswer>,
+    grpc_tls: Option<TlsFiles>,
+    quic_tls: Option<TlsFiles>,
+    lenient: bool,
+) -> Cell {
     let (tcp, udp) = bind_matched_pair();
     let addr: SocketAddr = tcp.local_addr().expect("local addr");
     let grpc = start_grpc_backend(tcp, addr, grpc_tls).await;
-    let probe = Probe::default();
+    let probe = Probe {
+        lenient,
+        ..Probe::default()
+    };
     let stores = fresh_stores().await;
     let quic = Some(start_quic(
         udp,
@@ -606,7 +638,13 @@ pub(crate) async fn stored(
 }
 
 pub(crate) fn hold_first_put_answer() -> HoldFirstPutAnswer {
+    hold_first_answer_of(Command::Put)
+}
+
+/// As [`hold_first_put_answer`], for the first applied answer to `command`.
+pub(crate) fn hold_first_answer_of(command: Command) -> HoldFirstPutAnswer {
     HoldFirstPutAnswer {
+        opcode: command as u8,
         applied: Arc::new(tokio::sync::Notify::new()),
         // Comfortably longer than an in-process `QuinnServer::close()` takes.
         grace: Duration::from_millis(400),

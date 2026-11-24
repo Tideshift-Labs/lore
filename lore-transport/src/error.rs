@@ -13,6 +13,21 @@ use thiserror::Error;
 #[error("Connection replaced; session must be rebound before this command is sent again")]
 pub(crate) struct SessionRebindRequired;
 
+/// FORK-LOCAL (Tideshift, CR-026 addendum): typed proof that a dispatched session-bearing READ may
+/// be sent once more on a new session.
+///
+/// The read went out, its answer was lost when the connection died, and the connection has since
+/// been replaced. The command's transport replay class is `ReadRetryable`, so a repeat returns the
+/// same answer and changes no server state. The id it carried belongs to the dead connection, so
+/// the session layer rebinds first, exactly as for [`SessionRebindRequired`].
+///
+/// Never produced for a `MutableNoReplay` command: `classify` and the guard at the top of
+/// `reconnect_and_retry` end a dispatched mutation before the branch that raises this. Inside
+/// `ProtocolError::Internal` for the same reason as that marker.
+#[derive(Debug, Clone, Error)]
+#[error("Connection replaced after a read was sent; the read may be sent again on a new session")]
+pub(crate) struct ReadResendAllowed;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("unsupported client capability")]
 pub struct UnsupportedClientCapability;
@@ -565,6 +580,19 @@ pub(crate) fn is_session_rebind_required(error: &ProtocolError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(source) = current {
         if source.downcast_ref::<SessionRebindRequired>().is_some() {
+            return true;
+        }
+        current = source.source();
+    }
+    false
+}
+
+/// FORK-LOCAL (Tideshift, CR-026 addendum): whether `error` carries [`ReadResendAllowed`].
+#[lore_macro::test_pub]
+pub(crate) fn is_read_resend_allowed(error: &ProtocolError) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(source) = current {
+        if source.downcast_ref::<ReadResendAllowed>().is_some() {
             return true;
         }
         current = source.source();
