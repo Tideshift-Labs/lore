@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 Tideshift Labs
 // SPDX-License-Identifier: MIT
 use jsonwebtoken::TokenData;
 use lore_base::lore_debug;
@@ -116,6 +117,9 @@ impl JWTUserInfo {
     }
 }
 
+/// The loopback host name RFC 6761 reserves; see [`domain_from_audience`].
+const LOCALHOST: &str = "localhost";
+
 fn domain_from_audience(aud: &str) -> Option<String> {
     if aud.contains("://") {
         let url = url::Url::parse(aud).ok()?;
@@ -126,6 +130,13 @@ fn domain_from_audience(aud: &str) -> Option<String> {
     }
 
     let apex = aud.strip_prefix('.').unwrap_or(aud);
+    // Fork rule: `localhost` is a host, not an opaque audience keyword. A local deployment
+    // names its loopback server by it, and the dot rule below would otherwise drop it, so a
+    // token could not be sent to the server it was issued for. Only this exact name is
+    // admitted; other single-label entries stay opaque.
+    if apex.eq_ignore_ascii_case(LOCALHOST) {
+        return Some(aud.to_ascii_lowercase());
+    }
     let domain_shaped = apex.contains('.')
         && apex.split('.').all(|label| {
             !label.is_empty()

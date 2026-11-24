@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+// Note: `login_with_a_lore_token_tests` points LORE_AUTH_PATH and LORE_AUTH_STORE at a sandbox for
+// this whole test binary, from a constructor. Any token-store test added here shares that store.
 mod tests {
     use std::time::Duration;
     use std::time::SystemTime;
@@ -36,6 +38,104 @@ mod tests {
         assert!(lore_transport::auth::exchange::is_expired(
             (current - Duration::from_secs(1)).as_millis() as u64
         ));
+    }
+
+    /// `lore auth login <remote> --token <jwt> --token-type lore --auth-url <url>` stores the
+    /// token under the audience's hosts. A local deployment's tokens name `localhost`, which
+    /// must stay a host so the token can be sent to the loopback server it was issued for.
+    mod login_with_a_lore_token_tests {
+        use std::sync::Arc;
+
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_credential::token_store::load_all_identities;
+        use lore_credential::token_store::load_user_token_from_store;
+        use lore_credential::token_store::tokens_only_for_recipient_domain;
+        use lore_revision::auth::login::with_token_boxed;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::interface::LoreGlobalArgs;
+        use lore_revision::relay::EventDispatcher;
+
+        /// Points the token store at a directory of this process's own, in its fallback form, so
+        /// no test reads or writes the developer's credentials or keyring. A constructor because
+        /// the environment is process-wide and this runs before the harness starts its threads.
+        #[ctor::ctor]
+        fn sandbox_token_store() {
+            let sandbox = lore_base::test_util::TempDir::new("lore-revision-auth-tests-");
+            // Safety: constructors run before `main`, the single-threaded window in which writing
+            // the environment has no reader to race.
+            unsafe {
+                std::env::set_var("LORE_AUTH_PATH", sandbox.path());
+                std::env::set_var("LORE_AUTH_STORE", "fallback");
+            }
+            // The directory lives for the process; the OS temp cleaner removes it.
+            Box::leak(Box::new(sandbox));
+        }
+
+        const REMOTE: &str = "lores://localhost:43810";
+        const AUTH_URL: &str = "https://host.docker.internal:43838";
+
+        fn authn_token() -> String {
+            let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+            let claims = URL_SAFE_NO_PAD.encode(
+                r#"{"iss":"commit0","sub":"login-localhost-user","exp":4102444800,"aud":["commit0-cli","host.docker.internal","localhost"]}"#,
+            );
+            format!("{header}.{claims}.signature")
+        }
+
+        #[tokio::test]
+        async fn a_localhost_audience_token_is_stored_for_localhost() {
+            let execution = Arc::new(ExecutionContext::new_client(
+                LoreGlobalArgs::default(),
+                EventDispatcher::new(None),
+            ));
+            let token = authn_token();
+            let user = LORE_CONTEXT
+                .scope(
+                    execution,
+                    with_token_boxed(REMOTE, &token, "lore", Some(AUTH_URL)),
+                )
+                .await
+                .expect("the lore token logs in without a network");
+            assert_eq!(user.id, "login-localhost-user");
+
+            let stored = load_all_identities(false)
+                .await
+                .expect("the sandboxed store loads")
+                .into_iter()
+                .find(|stored| stored.user_id == user.id)
+                .expect("the login stored an entry");
+            assert!(
+                stored
+                    .acceptable_root_domains
+                    .contains(&"localhost".to_string()),
+                "domains: {:?}",
+                stored.acceptable_root_domains
+            );
+            assert!(
+                !stored
+                    .acceptable_root_domains
+                    .contains(&"commit0-cli".to_string())
+            );
+
+            let for_localhost = load_user_token_from_store(
+                &stored.auth_url,
+                &user.id,
+                tokens_only_for_recipient_domain("localhost".to_string()),
+            )
+            .await
+            .expect("the token is found for the loopback server it names");
+            assert_eq!(for_localhost, token);
+
+            load_user_token_from_store(
+                &stored.auth_url,
+                &user.id,
+                tokens_only_for_recipient_domain("other.example".to_string()),
+            )
+            .await
+            .expect_err("an unrelated host finds no token");
+        }
     }
 
     mod verify_jwt_usage_for_remote_tests {

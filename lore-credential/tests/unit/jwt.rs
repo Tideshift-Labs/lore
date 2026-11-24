@@ -119,6 +119,63 @@ fn a_token_without_the_claims_falls_back_to_audience() {
     assert_eq!(domains_of(claims), vec![".epicgames.net"]);
 }
 
+/// The audience our auth service mints on a user-authn token for a local deployment.
+const LOCAL_AUTHN_CLAIMS: &str =
+    r#"{"iss":"i","sub":"s","exp":1,"aud":["commit0-cli","host.docker.internal","localhost"]}"#;
+
+fn usage_for_remote(claims: &str, remote: &str) -> Result<(), lore_credential::JwtUsageError> {
+    let token = token_with_claims(claims);
+    let decoded = lore_credential::insecure_decode_token(&token).expect("the token decodes");
+    lore_credential::verify_jwt_usage_for_remote(&decoded.claims, remote)
+}
+
+#[test]
+fn a_localhost_audience_entry_is_a_host() {
+    let domains = domains_of(LOCAL_AUTHN_CLAIMS);
+    assert_eq!(domains, vec!["host.docker.internal", "localhost"]);
+    assert!(
+        !domains.iter().any(|d| d == "commit0-cli"),
+        "the opaque audience keyword stays out"
+    );
+}
+
+#[test]
+fn a_token_with_a_localhost_audience_is_usable_for_localhost_only() {
+    usage_for_remote(LOCAL_AUTHN_CLAIMS, "localhost").expect("localhost is in the audience");
+    usage_for_remote(LOCAL_AUTHN_CLAIMS, "host.docker.internal").expect("the dotted host stays");
+    usage_for_remote(LOCAL_AUTHN_CLAIMS, "evil.example").unwrap_err();
+    usage_for_remote(LOCAL_AUTHN_CLAIMS, "notlocalhost").unwrap_err();
+    usage_for_remote(LOCAL_AUTHN_CLAIMS, "localhost.evil.com").unwrap_err();
+}
+
+#[test]
+fn a_localhost_audience_entry_is_lowercased_and_may_lead_with_a_dot() {
+    let upper = r#"{"iss":"i","sub":"s","exp":1,"aud":["LOCALHOST"]}"#;
+    assert_eq!(domains_of(upper), vec!["localhost"]);
+    usage_for_remote(upper, "localhost").expect("the lowercased host matches");
+
+    let dotted = r#"{"iss":"i","sub":"s","exp":1,"aud":[".LocalHost"]}"#;
+    assert_eq!(domains_of(dotted), vec![".localhost"]);
+}
+
+#[test]
+fn other_single_label_audience_entries_stay_opaque() {
+    let claims = r#"{"iss":"i","sub":"s","exp":1,"aud":["cell","lore-storage","commit0-cli"]}"#;
+    assert!(domains_of(claims).is_empty());
+    usage_for_remote(claims, "cell").unwrap_err();
+
+    let authz = r#"{"iss":"i","sub":"s","exp":1,"aud":["lore-storage","localhost"]}"#;
+    assert_eq!(domains_of(authz), vec!["localhost"]);
+}
+
+#[test]
+fn root_domains_claim_wins_over_a_localhost_audience() {
+    let claims =
+        r#"{"iss":"i","sub":"s","exp":1,"aud":["localhost"],"root_domains":["a.example.com"]}"#;
+    assert_eq!(domains_of(claims), vec!["a.example.com"]);
+    usage_for_remote(claims, "localhost").unwrap_err();
+}
+
 fn identity_of(claims: &str) -> Option<String> {
     user_info_from_token(token_with_claims(claims)).map(|info| info.id)
 }
